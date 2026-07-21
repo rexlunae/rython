@@ -1,0 +1,17 @@
+[package]
+name = "rythonc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A command-line Python to Rust compiler, at this point, very incomplete."
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "cargo"] }
+wild = "2"
+rust-format = "0.3"
+fern = "0.6"
+log = "0.4"
+humantime = "2.1.0"
+python-ast.workspace = true
+anyhow = { version = "1.0.79", features = ["backtrace"] }

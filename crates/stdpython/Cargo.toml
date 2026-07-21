@@ -1,0 +1,19 @@
+[package]
+name = "stdpython"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python standard library runtime for the Rython compiler ecosystem"
+
+[features]
+default = ["std"]
+std = ["pyo3", "libc"]
+nostd = ["hashbrown", "heapless"]
+
+[dependencies]
+pyo3 = {version = "0.25", features=["auto-initialize"], optional = true}
+paste = "1.0"
+hashbrown = { version = "0.15", optional = true }
+heapless = { version = "0.8", optional = true }
+libc = { version = "0.2", optional = true }
