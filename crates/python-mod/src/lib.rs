@@ -1,4 +1,3 @@
-#![feature(proc_macro_span)]
 use std::path::Path;
 use std::fs;
 
@@ -20,7 +19,7 @@ use quote::{quote, format_ident};
 
 /// Reads the named Python module from the root of the current crate.
 fn load_module(mod_name: String) -> PyResult<Module> {
-    let mod_path = Span::mixed_site().source().file();
+    let mod_path = Span::mixed_site().local_file();
 
     let mod_name_dir = format!("src/{}/__init__.py", &mod_name);
     let mod_name_file = format!("src/{}.py", &mod_name);

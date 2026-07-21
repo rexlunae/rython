@@ -414,7 +414,7 @@ mod tests {
     fn test_into_err_adapter() {
         let pyresult: std::result::Result<(), std::io::Error> =
             Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
-        let r: Result<()> = pyresult.into_err();
+        let r: Result<()> = IntoErr::into_err(pyresult);
         let e = r.expect_err("must be err");
         let display = format!("{}", e);
         assert!(display.contains("missing"));
