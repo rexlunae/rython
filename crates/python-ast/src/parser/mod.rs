@@ -69,16 +69,31 @@ pub fn parse_enhanced(input: impl AsRef<str>, filename: impl AsRef<str>) -> Crat
                     "Ensure the input contains valid Python code. Check for syntax errors or unsupported constructs."
                 };
 
-                parsing_error(location.clone(), "Python parsing failed", help_msg)
-                    .with_field_debug("py_err", &py_err)
+                // Put the Python error text in the message itself so consumers
+                // (the proc macro in particular) can show the real cause; the
+                // structured PyErr is still attached as a debug field.
+                parsing_error(
+                    location.clone(),
+                    format!("Python parsing failed: {}", py_err),
+                    help_msg,
+                )
+                .with_field_debug("py_err", &py_err)
             })?;
 
         py_tree.extract(py)
-            .map_err(|py_err| {
+            .map_err(|py_err: pyo3::PyErr| {
+                // The extraction layer produces precise "cannot convert X at
+                // line N" errors; surface that text as the message rather than
+                // burying it under a generic one.
+                let cause = py_err
+                    .value(py)
+                    .str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| py_err.to_string());
                 parsing_error(
                     location.clone(),
-                    "Failed to extract AST",
-                    "The Python code was parsed but could not be converted to our AST format. This may indicate unsupported Python features."
+                    cause,
+                    "This Python construct is not yet supported by rython. Rewrite it using supported constructs, or file an issue."
                 )
                 .with_field_debug("py_err", &py_err)
             })

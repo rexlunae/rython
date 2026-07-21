@@ -4,7 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, err_from, BoolOpNotYetImplemented, CodeGen, CodeGenContext, ExprType, Node,
+    dump, extraction_failure, err_from, BoolOpNotYetImplemented, CodeGen, CodeGenContext, ExprType,
     PythonOptions, SymbolTableScopes,
 };
 
@@ -18,13 +18,10 @@ pub enum BoolOps {
 impl<'a, 'py> FromPyObject<'a, 'py> for BoolOps {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let op_type = ob.get_type().name().expect(
-            ob.error_message(
-                "<unknown>",
-                format!("extracting type name {:?} for boolean operator", ob),
-            )
-            .as_str(),
-        );
+        let op_type = ob
+            .get_type()
+            .name()
+            .map_err(|e| extraction_failure("boolean operator type", &ob, e))?;
 
         let op_type_str: String = op_type.extract()?;
         let op = match op_type_str.as_str() {
@@ -52,27 +49,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for BoolOp {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         tracing::debug!("ob: {}", dump(&ob, None)?);
-        let op = ob.getattr("op").expect(
-            ob.error_message("<unknown>", "error getting unary operator")
-                .as_str(),
-        );
+        let op = ob.getattr("op").map_err(|e| extraction_failure("op", &ob, e))?;
 
-        let op_type = op.get_type().name().expect(
-            ob.error_message(
-                "<unknown>",
-                format!("extracting type name {:?} for binary operator", op),
-            )
-            .as_str(),
-        );
+        let op_type = op
+            .get_type()
+            .name()
+            .map_err(|e| extraction_failure("boolean operator type", &ob, e))?;
 
-        let values = ob.getattr("values").expect(
-            ob.error_message("<unknown>", "error getting binary operand")
-                .as_str(),
-        );
+        let values = ob.getattr("values").map_err(|e| extraction_failure("values", &ob, e))?;
 
         tracing::debug!("BoolOps values: {}", dump(&values, None)?);
 
-        let values: Vec<ExprType> = values.extract().expect("getting values from BoolOp");
+        let values: Vec<ExprType> = values.extract().map_err(|e| extraction_failure("getting values from BoolOp", &ob, e))?;
 
         let op_type_str: String = op_type.extract()?;
         let op = match op_type_str.as_str() {

@@ -4,7 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, err_from, CodeGen, CodeGenContext, CompareNotYetImplemented, ExprType, Node,
+    dump, extraction_failure, err_from, CodeGen, CodeGenContext, CompareNotYetImplemented, ExprType, Node,
     PythonOptions, SymbolTableScopes,
 };
 
@@ -49,23 +49,17 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Compare {
         // Python allows for multiple comparators, rust we only supports one, so we have to rewrite the comparison a little.
         let ops_bound: Vec<Bound<PyAny>> = ob
             .getattr("ops")
-            .expect(
-                ob.error_message("<unknown>", "error getting unary operator")
-                    .as_str(),
-            )
+            .map_err(|e| extraction_failure("comparison operators", &ob, e))?
             .extract()
-            .expect("getting ops from Compare");
+            .map_err(|e| extraction_failure("comparison operators", &ob, e))?;
 
         let mut op_list = Vec::new();
 
         for op in ops_bound.iter() {
-            let op_type = op.get_type().name().expect(
-                ob.error_message(
-                    "<unknown>",
-                    "error extracting type name for binary operator",
-                )
-                .as_str(),
-            );
+            let op_type = op
+                .get_type()
+                .name()
+                .map_err(|e| extraction_failure("comparison operator type", &ob, e))?;
 
             let op_type_str: String = op_type.extract()?;
             let op = match op_type_str.as_str() {
@@ -88,25 +82,19 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Compare {
             op_list.push(op);
         }
 
-        let left = ob.getattr("left").expect(
-            ob.error_message("<unknown>", "error getting comparator")
-                .as_str(),
-        );
+        let left = ob.getattr("left").map_err(|e| extraction_failure("left", &ob, e))?;
 
-        let comparators = ob.getattr("comparators").expect(
-            ob.error_message("<unknown>", "error getting compoarator")
-                .as_str(),
-        );
+        let comparators = ob.getattr("comparators").map_err(|e| extraction_failure("comparators", &ob, e))?;
         tracing::debug!(
             "left: {}, comparators: {}",
             dump(&left, None)?,
             dump(&comparators, None)?
         );
 
-        let left = left.extract().expect("getting binary operator operand");
+        let left = left.extract().map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
         let comparators: Vec<ExprType> = comparators
             .extract()
-            .expect("getting comparators from Compare");
+            .map_err(|e| extraction_failure("comparators", &ob, e))?;
 
         tracing::debug!(
             "left: {:?}, comparators: {:?}, op: {:?}",

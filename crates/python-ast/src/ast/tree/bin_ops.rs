@@ -4,7 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, err_from, BinOpNotYetImplemented, BinaryOperation, CodeGen, CodeGenContext, ExprType,
+    dump, extraction_failure, err_from, BinOpNotYetImplemented, BinaryOperation, CodeGen, CodeGenContext, ExprType,
     FromPythonString, Node, PyAttributeExtractor, PythonOperator, PythonOptions, SymbolTableScopes,
 };
 
@@ -144,8 +144,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for BinOp {
             tracing::debug!("Found unknown BinOp {:?}", op_type_str);
         }
 
-        let left = left.extract().expect("getting binary operator operand");
-        let right = right.extract().expect("getting binary operator operand");
+        let left = left.extract().map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
+        let right = right.extract().map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
 
         Ok(BinOp {
             op,

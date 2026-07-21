@@ -152,6 +152,25 @@ pub fn extraction_error(context: &str, details: &str) -> pyo3::PyErr {
     )
 }
 
+/// Build a PyErr for a failed AST-node conversion, carrying the node's source
+/// position so the error can be reported against the user's Python code
+/// instead of panicking with an internal dump.
+pub fn extraction_failure(
+    kind: &str,
+    ob: &Bound<PyAny>,
+    cause: impl std::fmt::Display,
+) -> pyo3::PyErr {
+    let position = match (ob.lineno(), ob.col_offset()) {
+        (Some(line), Some(col)) => format!(" at line {}, column {}", line, col + 1),
+        (Some(line), None) => format!(" at line {}", line),
+        _ => String::new(),
+    };
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "cannot convert {}{}: {}",
+        kind, position, cause
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

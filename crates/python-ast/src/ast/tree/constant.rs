@@ -6,7 +6,7 @@ use proc_macro2::*;
 use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 
-use crate::{CodeGen, CodeGenContext, Node, PythonOptions, SymbolTableScopes};
+use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -94,15 +94,15 @@ pub fn try_bool(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 // This will mostly be invoked when the input is None.
 pub fn try_option(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: Option<Bound<PyAny>> = value.extract()?;
-    // debug!("extracted value {:?}", v); // Debug not implemented for PyAny
-    // If we got None as a constant, return None
+    // If we got None as a constant, return None; anything else is a constant
+    // kind we don't know how to render as a Rust literal.
     match v {
         None => Ok(None),
-        // See if we can parse whatever we got that wasn't None.
-        Some(ref _c) => {
-            let l = Literal::parse(format!("{:?}", v)).expect("[5] Parsing the literal");
-            Ok(Some(l))
-        }
+        Some(other) => Err(crate::extraction_failure(
+            "constant",
+            &other,
+            "this constant kind cannot be represented as a Rust literal",
+        )),
     }
 }
 
@@ -111,10 +111,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extracts the values as a PyAny.
-        let value = ob.getattr("value").expect(
-            ob.error_message("<unknown>", "error getting constant value")
-                .as_str(),
-        );
+        let value = ob
+            .getattr("value")
+            .map_err(|e| crate::extraction_failure("constant value", &ob, e))?;
         debug!("[2] constant value: {}", value);
 
         let l = if let Ok(l) = try_string(&value) {
@@ -133,7 +132,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
         } else if let Ok(l) = try_option(&value) {
             l
         } else {
-            panic!("Failed to parse literal values {}", value);
+            return Err(crate::extraction_failure(
+                "constant",
+                &value,
+                format!("unsupported constant value `{}`", value),
+            ));
         };
 
         Ok(Self(l))

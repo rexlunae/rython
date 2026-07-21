@@ -3,7 +3,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use crate::{extraction_failure, 
     CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
     Node, impl_node_with_positions, PyAttributeExtractor
 };
@@ -26,9 +26,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for IfExp {
         let body = ob.extract_attr_with_context("body", "if expression body")?;
         let orelse = ob.extract_attr_with_context("orelse", "if expression orelse")?;
         
-        let test = test.extract().expect("getting if expression test");
-        let body = body.extract().expect("getting if expression body");
-        let orelse = orelse.extract().expect("getting if expression orelse");
+        let test = test.extract().map_err(|e| extraction_failure("getting if expression test", &ob, e))?;
+        let body = body.extract().map_err(|e| extraction_failure("getting if expression body", &ob, e))?;
+        let orelse = orelse.extract().map_err(|e| extraction_failure("getting if expression orelse", &ob, e))?;
         
         Ok(IfExp {
             test: Box::new(test),

@@ -105,11 +105,17 @@ fn main() -> Result<()> {
             } else {
                 let rust = ast
                     .to_rust(
-                        CodeGenContext::Module(module_name),
+                        CodeGenContext::Module(module_name.clone()),
                         options.clone(),
                         symbols.clone(),
                     )
-                    .expect("converting to Rust");
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to compile {}: {}",
+                            module_name,
+                            python_ast::format_error_chain(e.as_ref())
+                        )
+                    })?;
                 if args.pretty {
                     let unformatted = rust.to_string();
                     RustFmt::default().format_str(unformatted)?

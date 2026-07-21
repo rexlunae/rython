@@ -4,7 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, err_from, Attribute, Await, BinOp, BoolOp, Call, CodeGen, CodeGenContext, Compare,
+    dump, err_from, extraction_failure, Attribute, Await, BinOp, BoolOp, Call, CodeGen, CodeGenContext, Compare,
     Constant, Dict, DictComp, ExprTypeNotYetImplemented, FormattedValue, GeneratorExp, IfExp,
     JoinedStr, Lambda, ListComp, Name, NamedExpr, Node, PythonOptions, Set, SetComp, Starred,
     Subscript, SymbolTableScopes, Tuple, UnaryOp, Yield, YieldFrom,
@@ -73,273 +73,129 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExprType {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         tracing::debug!("exprtype ob: {}", dump(&ob, Some(4))?);
 
-        let expr_type = ob.get_type().name().expect(
-            ob.error_message(
-                "<unknown>",
-                format!("extracting type name {:?} in expression", dump(&ob, None)),
-            )
-            .as_str(),
-        );
+        let expr_type = ob
+            .get_type()
+            .name()
+            .map_err(|e| extraction_failure("expression type name", &ob, e))?;
         tracing::debug!("expression type: {}, value: {}", expr_type, dump(&ob, None)?);
 
         let r = match expr_type.extract::<String>()?.as_str() {
             "Attribute" => {
-                let a = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Attribute in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let a = ob.extract().map_err(|e| extraction_failure("extracting Attribute in expression", &ob, e))?;
                 Ok(Self::Attribute(a))
             }
             "Await" => {
                 //println!("await: {}", dump(&ob, None)?);
-                let a = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting await value in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let a = ob.extract().map_err(|e| extraction_failure("extracting await value in expression", &ob, e))?;
                 Ok(Self::Await(a))
             }
             "BoolOp" => {
-                let b = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting BoolOp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let b = ob.extract().map_err(|e| extraction_failure("extracting BoolOp in expression", &ob, e))?;
                 Ok(Self::BoolOp(b))
             }
             "Call" => {
-                let et = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("parsing Call expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let et = ob.extract().map_err(|e| extraction_failure("parsing Call expression", &ob, e))?;
                 Ok(Self::Call(et))
             }
             "Compare" => {
-                let c = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Compare in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let c = ob.extract().map_err(|e| extraction_failure("extracting Compare in expression", &ob, e))?;
                 Ok(Self::Compare(c))
             }
             "Constant" => {
                 tracing::debug!("constant: {}", dump(&ob, None)?);
-                let c = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Constant in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let c = ob.extract().map_err(|e| extraction_failure("extracting Constant in expression", &ob, e))?;
                 Ok(Self::Constant(c))
             }
             "List" => {
                 // Extract the list elements using the 'elts' attribute
-                let elts_attr = ob.getattr("elts")
-                    .expect(format!("getting elts attribute from List {}", dump(&ob, None)?).as_str());
-                let elts_vec: Vec<Bound<PyAny>> = elts_attr.extract()
-                    .expect(format!("extracting elts as Vec<Bound<PyAny>> from List {}", dump(&ob, None)?).as_str());
-                
+                let elts_attr = ob
+                    .getattr("elts")
+                    .map_err(|e| extraction_failure("list elements", &ob, e))?;
+                let elts_vec: Vec<Bound<PyAny>> = elts_attr
+                    .extract()
+                    .map_err(|e| extraction_failure("list elements", &ob, e))?;
+
                 // Convert each element to ExprType
                 let mut expr_list = Vec::new();
                 for elt in elts_vec {
-                    let expr: ExprType = elt.extract()
-                        .expect(format!("extracting list element {}", dump(&elt, None)?).as_str());
+                    let expr: ExprType = elt
+                        .extract()
+                        .map_err(|e| extraction_failure("list element", &elt, e))?;
                     expr_list.push(expr);
                 }
                 
                 Ok(Self::List(expr_list))
             }
             "ListComp" => {
-                let lc = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting ListComp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let lc = ob.extract().map_err(|e| extraction_failure("extracting ListComp in expression", &ob, e))?;
                 Ok(Self::ListComp(lc))
             }
             "DictComp" => {
-                let dc = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting DictComp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let dc = ob.extract().map_err(|e| extraction_failure("extracting DictComp in expression", &ob, e))?;
                 Ok(Self::DictComp(dc))
             }
             "SetComp" => {
-                let sc = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting SetComp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let sc = ob.extract().map_err(|e| extraction_failure("extracting SetComp in expression", &ob, e))?;
                 Ok(Self::SetComp(sc))
             }
             "GeneratorExp" => {
-                let ge = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting GeneratorExp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let ge = ob.extract().map_err(|e| extraction_failure("extracting GeneratorExp in expression", &ob, e))?;
                 Ok(Self::GeneratorExp(ge))
             }
             "Name" => {
-                let name = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("parsing Name expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let name = ob.extract().map_err(|e| extraction_failure("parsing Name expression", &ob, e))?;
                 Ok(Self::Name(name))
             }
             "UnaryOp" => {
-                let c = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting UnaryOp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let c = ob.extract().map_err(|e| extraction_failure("extracting UnaryOp in expression", &ob, e))?;
                 Ok(Self::UnaryOp(c))
             }
             "BinOp" => {
-                let c = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting BinOp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let c = ob.extract().map_err(|e| extraction_failure("extracting BinOp in expression", &ob, e))?;
                 Ok(Self::BinOp(c))
             }
             "Lambda" => {
-                let l = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Lambda in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let l = ob.extract().map_err(|e| extraction_failure("extracting Lambda in expression", &ob, e))?;
                 Ok(Self::Lambda(l))
             }
             "IfExp" => {
-                let i = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting IfExp in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let i = ob.extract().map_err(|e| extraction_failure("extracting IfExp in expression", &ob, e))?;
                 Ok(Self::IfExp(i))
             }
             "Dict" => {
-                let d = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Dict in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let d = ob.extract().map_err(|e| extraction_failure("extracting Dict in expression", &ob, e))?;
                 Ok(Self::Dict(d))
             }
             "Set" => {
-                let s = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Set in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let s = ob.extract().map_err(|e| extraction_failure("extracting Set in expression", &ob, e))?;
                 Ok(Self::Set(s))
             }
             "Tuple" => {
-                let t = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Tuple in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let t = ob.extract().map_err(|e| extraction_failure("extracting Tuple in expression", &ob, e))?;
                 Ok(Self::Tuple(t))
             }
             "Subscript" => {
-                let s = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Subscript in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let s = ob.extract().map_err(|e| extraction_failure("extracting Subscript in expression", &ob, e))?;
                 Ok(Self::Subscript(s))
             }
             "Starred" => {
-                let s = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Starred in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let s = ob.extract().map_err(|e| extraction_failure("extracting Starred in expression", &ob, e))?;
                 Ok(Self::Starred(s))
             }
             "Yield" => {
-                let y = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting Yield in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let y = ob.extract().map_err(|e| extraction_failure("extracting Yield in expression", &ob, e))?;
                 Ok(Self::Yield(y))
             }
             "YieldFrom" => {
-                let yf = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting YieldFrom in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let yf = ob.extract().map_err(|e| extraction_failure("extracting YieldFrom in expression", &ob, e))?;
                 Ok(Self::YieldFrom(yf))
             }
             "JoinedStr" => {
-                let js = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting JoinedStr in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let js = ob.extract().map_err(|e| extraction_failure("extracting JoinedStr in expression", &ob, e))?;
                 Ok(Self::JoinedStr(js))
             }
             "FormattedValue" => {
-                let fv = ob.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting FormattedValue in expression {}", dump(&ob, None)?),
-                    )
-                    .as_str(),
-                );
+                let fv = ob.extract().map_err(|e| extraction_failure("extracting FormattedValue in expression", &ob, e))?;
                 Ok(Self::FormattedValue(fv))
             }
             _ => {
@@ -398,8 +254,7 @@ impl<'a> CodeGen for ExprType {
                 for li in l {
                     let code = li
                         .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                        .expect(format!("Extracting list item {:?}", li).as_str());
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     
                     // Check if this is a starred expression
                     if matches!(li, ExprType::Starred(_)) {
@@ -497,7 +352,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
 
         let ob_value = ob
             .getattr("value")
-            .expect(ob.error_message("<unknown>", err_msg.as_str()).as_str());
+            .map_err(|e| extraction_failure("expression value", &ob, format!("{}: {}", err_msg, e)))?;
         tracing::debug!("ob_value: {}", dump(&ob_value, None)?);
 
         // The context is Load, Store, etc. For some types of expressions such as Constants, it does not exist.
@@ -516,13 +371,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
             end_col_offset: ob.end_col_offset(),
         };
 
-        let expr_type = ob_value.get_type().name().expect(
-            ob.error_message(
-                "<unknown>",
-                format!("extracting type name {:?} in expression", ob_value),
-            )
-            .as_str(),
-        );
+        let expr_type = ob_value
+            .get_type()
+            .name()
+            .map_err(|e| extraction_failure("expression type name", &ob, e))?;
         tracing::debug!(
             "expression type: {}, value: {}",
             expr_type,
@@ -530,100 +382,69 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
         );
         match expr_type.extract::<String>()?.as_str() {
             "Attribute" => {
-                let a = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting BinOp in expression {:?}", dump(&ob_value, None)?),
-                    )
-                    .as_str(),
-                );
+                let a = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Attribute expression", &ob_value, e))?;
                 r.value = ExprType::Attribute(a);
                 Ok(r)
             }
             "Await" => {
-                let a = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting BinOp in expression {:?}", dump(&ob_value, None)?),
-                    )
-                    .as_str(),
-                );
+                let a = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Await expression", &ob_value, e))?;
                 r.value = ExprType::Await(a);
                 Ok(r)
             }
             "BinOp" => {
-                let c = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting BinOp in expression {:?}", dump(&ob_value, None)?),
-                    )
-                    .as_str(),
-                );
+                let c = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("BinOp expression", &ob_value, e))?;
                 r.value = ExprType::BinOp(c);
                 Ok(r)
             }
             "BoolOp" => {
-                let c = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("extracting BinOp in expression {:?}", dump(&ob_value, None)?),
-                    )
-                    .as_str(),
-                );
+                let c = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("BoolOp expression", &ob_value, e))?;
                 r.value = ExprType::BoolOp(c);
                 Ok(r)
             }
             "Call" => {
-                let et = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("parsing Call expression {:?}", ob_value),
-                    )
-                    .as_str(),
-                );
+                let et = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Call expression", &ob_value, e))?;
                 r.value = ExprType::Call(et);
                 Ok(r)
             }
             "Constant" => {
-                let c = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Constant in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let c = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Constant expression", &ob_value, e))?;
                 r.value = ExprType::Constant(c);
                 Ok(r)
             }
             "Compare" => {
-                let c = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Compare in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let c = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Compare expression", &ob_value, e))?;
                 r.value = ExprType::Compare(c);
                 Ok(r)
             }
             "List" => {
                 // Extract the list elements using the 'elts' attribute
-                let elts_attr = ob_value.getattr("elts")
-                    .expect("getting elts attribute from List");
-                let elts_vec: Vec<Bound<PyAny>> = elts_attr.extract()
-                    .expect("extracting elts as Vec<Bound<PyAny>> from List");
-                
+                let elts_attr = ob_value
+                    .getattr("elts")
+                    .map_err(|e| extraction_failure("list elements", &ob_value, e))?;
+                let elts_vec: Vec<Bound<PyAny>> = elts_attr
+                    .extract()
+                    .map_err(|e| extraction_failure("list elements", &ob_value, e))?;
+
                 // Convert each element to ExprType
                 let mut expr_list = Vec::new();
                 for elt in elts_vec {
-                    let expr: ExprType = elt.extract()
-                        .expect(&format!("extracting list element {}", dump(&elt, None).unwrap_or_else(|_| "unknown".to_string())));
+                    let expr: ExprType = elt
+                        .extract()
+                        .map_err(|e| extraction_failure("list element", &elt, e))?;
                     expr_list.push(expr);
                 }
                 
@@ -631,181 +452,93 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
                 Ok(r)
             }
             "Name" => {
-                let name = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!("parsing Call expression {:?}", ob_value),
-                    )
-                    .as_str(),
-                );
+                let name = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Name expression", &ob_value, e))?;
                 r.value = ExprType::Name(name);
                 Ok(r)
             }
             "UnaryOp" => {
-                let c = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting UnaryOp in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let c = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("UnaryOp expression", &ob_value, e))?;
                 r.value = ExprType::UnaryOp(c);
                 Ok(r)
             }
             "Lambda" => {
-                let l = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Lambda in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let l = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Lambda expression", &ob_value, e))?;
                 r.value = ExprType::Lambda(l);
                 Ok(r)
             }
             "IfExp" => {
-                let i = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting IfExp in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let i = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("IfExp expression", &ob_value, e))?;
                 r.value = ExprType::IfExp(i);
                 Ok(r)
             }
             "Dict" => {
-                let d = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Dict in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let d = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Dict expression", &ob_value, e))?;
                 r.value = ExprType::Dict(d);
                 Ok(r)
             }
             "Set" => {
-                let s = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Set in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let s = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Set expression", &ob_value, e))?;
                 r.value = ExprType::Set(s);
                 Ok(r)
             }
             "Tuple" => {
-                let t = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Tuple in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let t = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Tuple expression", &ob_value, e))?;
                 r.value = ExprType::Tuple(t);
                 Ok(r)
             }
             "Subscript" => {
-                let s = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Subscript in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let s = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Subscript expression", &ob_value, e))?;
                 r.value = ExprType::Subscript(s);
                 Ok(r)
             }
             "Yield" => {
-                let y = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting Yield in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let y = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("Yield expression", &ob_value, e))?;
                 r.value = ExprType::Yield(y);
                 Ok(r)
             }
             "YieldFrom" => {
-                let yf = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting YieldFrom in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let yf = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("YieldFrom expression", &ob_value, e))?;
                 r.value = ExprType::YieldFrom(yf);
                 Ok(r)
             }
             "JoinedStr" => {
-                let js = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting JoinedStr in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let js = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("JoinedStr expression", &ob_value, e))?;
                 r.value = ExprType::JoinedStr(js);
                 Ok(r)
             }
             "FormattedValue" => {
-                let fv = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting FormattedValue in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let fv = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("FormattedValue expression", &ob_value, e))?;
                 r.value = ExprType::FormattedValue(fv);
                 Ok(r)
             }
             "GeneratorExp" => {
-                let ge = ob_value.extract().expect(
-                    ob.error_message(
-                        "<unknown>",
-                        format!(
-                            "extracting GeneratorExp in expression {:?}",
-                            dump(&ob_value, None)?
-                        ),
-                    )
-                    .as_str(),
-                );
+                let ge = ob_value
+                    .extract()
+                    .map_err(|e| extraction_failure("GeneratorExp expression", &ob_value, e))?;
                 r.value = ExprType::GeneratorExp(ge);
                 Ok(r)
             }

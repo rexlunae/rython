@@ -3,7 +3,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use crate::{extraction_failure, 
     CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
     Node, impl_node_with_positions, ParameterList, PyAttributeExtractor
 };
@@ -24,8 +24,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Lambda {
         let args = ob.extract_attr_with_context("args", "lambda arguments")?;
         let body = ob.extract_attr_with_context("body", "lambda body")?;
         
-        let args = args.extract().expect("getting lambda arguments");
-        let body = body.extract().expect("getting lambda body");
+        let args = args.extract().map_err(|e| extraction_failure("getting lambda arguments", &ob, e))?;
+        let body = body.extract().map_err(|e| extraction_failure("getting lambda body", &ob, e))?;
         
         Ok(Lambda {
             args,
