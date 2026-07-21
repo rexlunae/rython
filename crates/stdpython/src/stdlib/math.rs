@@ -575,7 +575,18 @@ python_function! {
         if y == 0.0 {
             Err(crate::value_error("math domain error"))
         } else {
-            let n = (x / y).round();
+            // IEEE 754 remainder rounds the quotient half-to-even, unlike
+            // f64::round which rounds halves away from zero.
+            let q = x / y;
+            let n = {
+                let r = q.round();
+                if (q - q.trunc()).abs() == 0.5 {
+                    // Exactly halfway: pick the even neighbour.
+                    if r % 2.0 == 0.0 { r } else { r - q.signum() }
+                } else {
+                    r
+                }
+            };
             Ok(x - n * y)
         }
     }

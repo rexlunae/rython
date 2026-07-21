@@ -135,7 +135,10 @@ impl CodeGen for Compare {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut outer_ts = TokenStream::new();
-        let left = self
+        // Python chains comparisons pairwise: `a < b < c` means
+        // `a < b && b < c`, so each comparator becomes the left operand of
+        // the next comparison.
+        let mut left = self
             .left
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -158,13 +161,14 @@ impl CodeGen for Compare {
                 Compares::GtE => quote!((#left) >= (#comparator)),
                 Compares::Is => quote!(&#left == &#comparator),
                 Compares::IsNot => quote!(&#left != &#comparator),
-                Compares::In => quote!((#comparator).get(#left) == Some(_)),
-                Compares::NotIn => quote!((#comparator).get(#left) == None),
+                Compares::In => quote!((#comparator).contains(&(#left))),
+                Compares::NotIn => quote!(!(#comparator).contains(&(#left))),
 
                 _ => return Err(err_from(CompareNotYetImplemented(self)).into()),
             };
 
             index += 1;
+            left = comparator;
 
             outer_ts.extend(tokens);
             if index < ops.len() {

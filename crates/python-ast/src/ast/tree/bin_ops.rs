@@ -179,6 +179,21 @@ impl CodeGen for BinOp {
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             return Ok(quote!((#left) as f64 / (#right) as f64));
         }
+
+        // Python's // floors toward negative infinity and % takes the
+        // divisor's sign; Rust's / and % truncate. Route through the
+        // stdpython helpers, which implement the Python semantics.
+        if matches!(self.op, BinOps::FloorDiv) {
+            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            return Ok(quote!(py_floordiv(#left, #right)));
+        }
+
+        if matches!(self.op, BinOps::Mod) {
+            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            return Ok(quote!(py_mod(#left, #right)));
+        }
         
         // Special handling for list addition (concatenation)
         if matches!(self.op, BinOps::Add) {

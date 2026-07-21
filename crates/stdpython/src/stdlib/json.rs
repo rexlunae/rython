@@ -13,7 +13,10 @@ use std::fmt;
 pub enum JSONValue {
     Null,
     Bool(bool),
-    Number(f64),
+    /// Integer number. Kept separate from `Float` so `json.dumps(1)` renders
+    /// as `1` while `json.dumps(1.0)` renders as `1.0`, like Python.
+    Int(i64),
+    Float(f64),
     String(String),
     Array(Vec<JSONValue>),
     Object(HashMap<String, JSONValue>),
@@ -32,7 +35,7 @@ impl JSONValue {
     
     /// Check if this is a number
     pub fn is_number(&self) -> bool {
-        matches!(self, JSONValue::Number(_))
+        matches!(self, JSONValue::Int(_) | JSONValue::Float(_))
     }
     
     /// Check if this is a string
@@ -61,7 +64,16 @@ impl JSONValue {
     
     /// Get as number
     pub fn as_number(&self) -> Option<f64> {
-        if let JSONValue::Number(n) = self {
+        match self {
+            JSONValue::Int(n) => Some(*n as f64),
+            JSONValue::Float(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Get as integer
+    pub fn as_int(&self) -> Option<i64> {
+        if let JSONValue::Int(n) = self {
             Some(*n)
         } else {
             None
@@ -101,14 +113,9 @@ impl fmt::Display for JSONValue {
         match self {
             JSONValue::Null => write!(f, "null"),
             JSONValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
-            JSONValue::Number(n) => {
-                if n.fract() == 0.0 && n.abs() <= (i64::MAX as f64) {
-                    write!(f, "{}", *n as i64)
-                } else {
-                    write!(f, "{}", n)
-                }
-            },
-            JSONValue::String(s) => write!(f, "\"{}\"", escape_json_string(s)),
+            JSONValue::Int(n) => write!(f, "{}", n),
+            JSONValue::Float(n) => write!(f, "{}", format_json_float(*n)),
+            JSONValue::String(s) => write!(f, "\"{}\"", escape_json_string(s, true)),
             JSONValue::Array(arr) => {
                 write!(f, "[")?;
                 for (i, item) in arr.iter().enumerate() {
@@ -127,7 +134,7 @@ impl fmt::Display for JSONValue {
                         write!(f, ", ")?;
                     }
                     first = false;
-                    write!(f, "\"{}\": {}", escape_json_string(key), value)?;
+                    write!(f, "\"{}\": {}", escape_json_string(key, true), value)?;
                 }
                 write!(f, "}}")
             }
@@ -192,24 +199,22 @@ impl JSONEncoder {
     }
     
     fn encode_compact(&self, obj: &JSONValue) -> String {
+        // Python's json.dumps default separators are (", ", ": ").
         let (item_sep, key_sep) = self.separators.as_ref()
             .map(|(is, ks)| (is.as_str(), ks.as_str()))
-            .unwrap_or((",", ":"));
-            
+            .unwrap_or((", ", ": "));
+
         match obj {
             JSONValue::Null => "null".to_string(),
             JSONValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
-            JSONValue::Number(n) => {
+            JSONValue::Int(n) => format!("{}", n),
+            JSONValue::Float(n) => {
                 if !self.allow_nan && (n.is_nan() || n.is_infinite()) {
                     panic!("NaN and Infinity not allowed");
                 }
-                if n.fract() == 0.0 && n.abs() <= (i64::MAX as f64) {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{}", n)
-                }
+                format_json_float(*n)
             },
-            JSONValue::String(s) => format!("\"{}\"", escape_json_string(s)),
+            JSONValue::String(s) => format!("\"{}\"", escape_json_string(s, self.ensure_ascii)),
             JSONValue::Array(arr) => {
                 let items: Vec<String> = arr.iter().map(|item| self.encode_compact(item)).collect();
                 format!("[{}]", items.join(item_sep))
@@ -224,7 +229,9 @@ impl JSONEncoder {
                 }
                 
                 let items: Vec<String> = pairs.into_iter()
-                    .map(|(k, v)| format!("\"{}\"{}{}", escape_json_string(&k), key_sep, v))
+                    .map(|(k, v)| {
+                        format!("\"{}\"{}{}", escape_json_string(&k, self.ensure_ascii), key_sep, v)
+                    })
                     .collect();
                 format!("{{{}}}", items.join(item_sep))
             }
@@ -238,17 +245,14 @@ impl JSONEncoder {
         match obj {
             JSONValue::Null => "null".to_string(),
             JSONValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
-            JSONValue::Number(n) => {
+            JSONValue::Int(n) => format!("{}", n),
+            JSONValue::Float(n) => {
                 if !self.allow_nan && (n.is_nan() || n.is_infinite()) {
                     panic!("NaN and Infinity not allowed");
                 }
-                if n.fract() == 0.0 && n.abs() <= (i64::MAX as f64) {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{}", n)
-                }
+                format_json_float(*n)
             },
-            JSONValue::String(s) => format!("\"{}\"", escape_json_string(s)),
+            JSONValue::String(s) => format!("\"{}\"", escape_json_string(s, self.ensure_ascii)),
             JSONValue::Array(arr) => {
                 if arr.is_empty() {
                     return "[]".to_string();
@@ -286,7 +290,11 @@ impl JSONEncoder {
                         result.push_str(",\n");
                     }
                     result.push_str(&next_indent);
-                    result.push_str(&format!("\"{}\": {}", escape_json_string(key), value));
+                    result.push_str(&format!(
+                        "\"{}\": {}",
+                        escape_json_string(key, self.ensure_ascii),
+                        value
+                    ));
                 }
                 result.push('\n');
                 result.push_str(&indent);
@@ -328,7 +336,15 @@ impl JSONDecoder {
         }
         
         let mut parser = JSONParser::new(s);
-        parser.parse_value()
+        let value = parser.parse_value()?;
+        parser.skip_whitespace();
+        if parser.pos < parser.input.len() {
+            return Err(crate::value_error(format!(
+                "Extra data: char {}",
+                parser.pos
+            )));
+        }
+        Ok(value)
     }
 }
 
@@ -407,15 +423,45 @@ impl JSONParser {
                             return Err(crate::value_error("Invalid unicode escape"));
                         }
                         let hex_chars: String = self.input[self.pos+1..=self.pos+4].iter().collect();
-                        if let Ok(code_point) = u32::from_str_radix(&hex_chars, 16) {
-                            if let Some(ch) = char::from_u32(code_point) {
-                                result.push(ch);
-                                self.pos += 4;
-                            } else {
-                                return Err(crate::value_error("Invalid unicode code point"));
-                            }
-                        } else {
+                        let Ok(code_point) = u32::from_str_radix(&hex_chars, 16) else {
                             return Err(crate::value_error("Invalid unicode escape"));
+                        };
+                        self.pos += 4;
+                        if (0xD800..0xDC00).contains(&code_point) {
+                            // High surrogate: must be followed by \uDC00-\uDFFF,
+                            // together encoding one astral code point.
+                            if self.pos + 6 < self.input.len()
+                                && self.input[self.pos + 1] == '\\'
+                                && self.input[self.pos + 2] == 'u'
+                            {
+                                let lo_hex: String =
+                                    self.input[self.pos + 3..=self.pos + 6].iter().collect();
+                                if let Ok(lo) = u32::from_str_radix(&lo_hex, 16) {
+                                    if (0xDC00..0xE000).contains(&lo) {
+                                        let combined = 0x10000
+                                            + ((code_point - 0xD800) << 10)
+                                            + (lo - 0xDC00);
+                                        if let Some(ch) = char::from_u32(combined) {
+                                            result.push(ch);
+                                            self.pos += 6;
+                                        } else {
+                                            return Err(crate::value_error(
+                                                "Invalid unicode code point",
+                                            ));
+                                        }
+                                    } else {
+                                        return Err(crate::value_error("Unpaired surrogate"));
+                                    }
+                                } else {
+                                    return Err(crate::value_error("Invalid unicode escape"));
+                                }
+                            } else {
+                                return Err(crate::value_error("Unpaired surrogate"));
+                            }
+                        } else if let Some(ch) = char::from_u32(code_point) {
+                            result.push(ch);
+                        } else {
+                            return Err(crate::value_error("Invalid unicode code point"));
                         }
                     },
                     _ => return Err(crate::value_error("Invalid escape sequence")),
@@ -598,8 +644,15 @@ impl JSONParser {
         }
         
         let number_str: String = self.input[start..self.pos].iter().collect();
+        // A literal with no fraction or exponent is an int, like Python's
+        // json.loads("1") -> 1 vs json.loads("1.0") -> 1.0.
+        if !number_str.contains(['.', 'e', 'E']) {
+            if let Ok(n) = number_str.parse::<i64>() {
+                return Ok(JSONValue::Int(n));
+            }
+        }
         match number_str.parse::<f64>() {
-            Ok(n) => Ok(JSONValue::Number(n)),
+            Ok(n) => Ok(JSONValue::Float(n)),
             Err(_) => Err(crate::value_error("Invalid number")),
         }
     }
@@ -675,7 +728,22 @@ python_function! {
 }
 
 // Helper functions
-fn escape_json_string(s: &str) -> String {
+
+/// Format a float the way Python's json module does: integer-valued floats
+/// keep their ".0", and non-finite values use Python's JSON spellings.
+fn format_json_float(n: f64) -> String {
+    if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+    } else if n.fract() == 0.0 && n.abs() < 1e16 {
+        format!("{:.1}", n)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn escape_json_string(s: &str, ensure_ascii: bool) -> String {
     let mut result = String::new();
     for ch in s.chars() {
         match ch {
@@ -687,6 +755,20 @@ fn escape_json_string(s: &str) -> String {
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             c if c.is_control() => result.push_str(&format!("\\u{:04x}", c as u32)),
+            c if ensure_ascii && !c.is_ascii() => {
+                let code = c as u32;
+                if code > 0xFFFF {
+                    // Encode astral characters as a UTF-16 surrogate pair.
+                    let v = code - 0x10000;
+                    result.push_str(&format!(
+                        "\\u{:04x}\\u{:04x}",
+                        0xD800 + (v >> 10),
+                        0xDC00 + (v & 0x3FF)
+                    ));
+                } else {
+                    result.push_str(&format!("\\u{:04x}", code));
+                }
+            }
             c => result.push(c),
         }
     }

@@ -84,8 +84,11 @@ impl CodeGen for AugAssign {
             BinOps::Sub => Ok(quote!(#target -= #value)),
             BinOps::Mult => Ok(quote!(#target *= #value)),
             BinOps::Div => Ok(quote!(#target /= #value)),
-            BinOps::FloorDiv => Ok(quote!(#target /= #value)), // Rust doesn't have floor div assign
-            BinOps::Mod => Ok(quote!(#target %= #value)),
+            // Python // and % floor toward negative infinity / take the
+            // divisor's sign; use the stdpython helpers instead of Rust's
+            // truncating operators.
+            BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target, #value))),
+            BinOps::Mod => Ok(quote!(#target = py_mod(#target, #value))),
             BinOps::BitAnd => Ok(quote!(#target &= #value)),
             BinOps::BitOr => Ok(quote!(#target |= #value)),
             BinOps::BitXor => Ok(quote!(#target ^= #value)),

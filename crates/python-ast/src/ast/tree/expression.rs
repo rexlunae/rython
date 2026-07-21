@@ -529,7 +529,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
             dump(&ob_value, None)?
         );
         match expr_type.extract::<String>()?.as_str() {
-            "Atribute" => {
+            "Attribute" => {
                 let a = ob_value.extract().expect(
                     ob.error_message(
                         "<unknown>",

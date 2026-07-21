@@ -23,7 +23,9 @@ impl LCGRandom {
     }
     
     fn random(&mut self) -> f64 {
-        (self.next() >> 1) as f64 / (i64::MAX as f64)
+        // Use the top 53 bits so the result is uniform on [0.0, 1.0) and can
+        // never round up to exactly 1.0.
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
 }
 
@@ -155,7 +157,7 @@ where
     }
     
     let u = random();
-    Ok(-(-u).ln() / lambda)
+    Ok(-(1.0 - u).ln() / lambda)
 }
 
 /// random.gammavariate - gamma distribution
@@ -282,11 +284,17 @@ pub fn randrange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<i64
         return Err(crate::value_error("empty range"));
     }
     
-    let width = (stop - start) / step;
+    // Number of values in the range, rounding the division up so the last
+    // reachable value (e.g. 9 in randrange(0, 10, 3)) can be produced.
+    let width = if step > 0 {
+        (stop - start + step - 1) / step
+    } else {
+        (stop - start + step + 1) / step
+    };
     if width <= 0 {
         return Err(crate::value_error("empty range"));
     }
-    
+
     let n = (random() * width as f64) as i64;
     Ok(start + n * step)
 }

@@ -15,8 +15,9 @@ pub struct NamedExpr {
 impl<'a, 'py> FromPyObject<'a, 'py> for NamedExpr {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let left = ob.getattr("left")?.extract::<ExprType>()?;
-        let right = ob.getattr("right")?.extract::<ExprType>()?;
+        // ast.NamedExpr stores its operands as `target` and `value`.
+        let left = ob.getattr("target")?.extract::<ExprType>()?;
+        let right = ob.getattr("value")?.extract::<ExprType>()?;
         Ok(NamedExpr {
             left: Box::new(left),
             right: Box::new(right),
