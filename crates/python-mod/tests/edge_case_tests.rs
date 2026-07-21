@@ -159,7 +159,6 @@ mod tests {
         let expected_files = vec![
             "Cargo.toml",
             "README.md",
-            "CLAUDE.md",
             "src/lib.rs",
         ];
         
