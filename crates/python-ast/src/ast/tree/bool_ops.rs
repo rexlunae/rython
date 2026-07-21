@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +15,9 @@ pub enum BoolOps {
     Unknown,
 }
 
-impl<'a> FromPyObject<'a> for BoolOps {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for BoolOps {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let op_type = ob.get_type().name().expect(
             ob.error_message(
                 "<unknown>",
@@ -46,9 +47,10 @@ pub struct BoolOp {
     right: Box<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for BoolOp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        tracing::debug!("ob: {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for BoolOp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        tracing::debug!("ob: {}", dump(&ob, None)?);
         let op = ob.getattr("op").expect(
             ob.error_message("<unknown>", "error getting unary operator")
                 .as_str(),

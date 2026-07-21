@@ -1,6 +1,6 @@
 //! The module defines Python-syntax arguments and maps them into Rust-syntax versions.
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -71,8 +71,9 @@ pub struct CallArguments {
 }
 
 // Implementation for new Argument struct
-impl<'a> FromPyObject<'a> for Argument {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Argument {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the expression value
         let value: ExprType = ob.extract()?;
         
@@ -102,8 +103,9 @@ impl CodeGen for Argument {
 }
 
 // Implementation for Parameter struct
-impl<'a> FromPyObject<'a> for Parameter {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let arg: String = ob.getattr("arg")?.extract()?;
         
         // Extract optional annotation
@@ -167,8 +169,9 @@ impl CodeGen for Parameter {
 }
 
 // Implementation for Arguments struct
-impl<'a> FromPyObject<'a> for Arguments {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Arguments {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract each field with proper error handling
         let posonlyargs: Vec<Parameter> = ob.getattr("posonlyargs")?.extract().unwrap_or_default();
         let args: Vec<Parameter> = ob.getattr("args")?.extract().unwrap_or_default();
@@ -296,8 +299,9 @@ impl CodeGen for Arguments {
 
 
 // Implementation for CallArguments
-impl<'a> FromPyObject<'a> for CallArguments {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for CallArguments {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let args: Vec<ExprType> = ob.getattr("args")?.extract().unwrap_or_default();
         let keywords: Vec<crate::Keyword> = ob.getattr("keywords")?.extract().unwrap_or_default();
         

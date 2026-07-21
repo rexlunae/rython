@@ -40,7 +40,9 @@ use alloc::string::ToString;
 
 // PyO3 only available with std
 #[cfg(feature = "std")]
-pub use pyo3::{PyAny, PyObject};
+pub use pyo3::PyAny;
+/// Alias kept for generated code; pyo3 0.29 removed the `PyObject` name.
+pub type PyObject = pyo3::Py<pyo3::PyAny>;
 
 // ============================================================================
 // GENERIC TRAITS FOR PYTHON OPERATIONS

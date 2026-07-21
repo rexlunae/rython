@@ -2,7 +2,7 @@ use std::path::Path;
 use std::fs;
 
 use proc_macro::{ Span, TokenStream  };
-use proc_macro_error::{
+use proc_macro_error2::{
     proc_macro_error,
     abort,
 };

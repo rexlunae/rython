@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
 use crate::{
@@ -19,9 +19,10 @@ pub enum Ops {
     Unknown,
 }
 
-impl<'a> FromPyObject<'a> for Ops {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented unary op {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for Ops {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let err_msg = format!("Unimplemented unary op {}", dump(&ob, None)?);
         Err(pyo3::exceptions::PyValueError::new_err(
             ob.error_message("<unknown>", err_msg),
         ))
@@ -34,11 +35,12 @@ pub struct UnaryOp {
     operand: Box<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for UnaryOp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for UnaryOp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let py = ob.py();
 
-        tracing::debug!("ob: {}", dump(ob, None)?);
+        tracing::debug!("ob: {}", dump(&ob, None)?);
         let op = ob.as_unbound().getattr(py, "op").expect(
             ob.error_message("<unknown>", "error getting unary operator")
                 .as_str(),
@@ -71,7 +73,7 @@ impl<'a> FromPyObject<'a> for UnaryOp {
 
         tracing::debug!("operand: {}", dump(&operand.bind(py), None)?);
         let bound_op = operand.bind(py);
-        let operand = ExprType::extract_bound(bound_op).expect("getting unary operator operand");
+        let operand = ExprType::extract(bound_op.as_borrowed()).expect("getting unary operator operand");
 
         return Ok(UnaryOp {
             op: op,

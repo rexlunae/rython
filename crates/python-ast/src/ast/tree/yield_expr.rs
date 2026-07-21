@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -31,8 +31,9 @@ pub struct YieldFrom {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Yield {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Yield {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract value (optional)
         let value: Option<Box<ExprType>> = if let Ok(value_attr) = ob.getattr("value") {
             if value_attr.is_none() {
@@ -54,8 +55,9 @@ impl<'a> FromPyObject<'a> for Yield {
     }
 }
 
-impl<'a> FromPyObject<'a> for YieldFrom {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for YieldFrom {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract value
         let value: ExprType = ob.getattr("value")?.extract()?;
         

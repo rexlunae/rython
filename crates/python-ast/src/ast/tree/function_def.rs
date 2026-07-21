@@ -1,6 +1,6 @@
 use tracing::debug;
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 use crate::ast::tree::statement::PyStatementTrait;
@@ -18,8 +18,9 @@ pub struct FunctionDef {
     pub decorator_list: Vec<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for FunctionDef {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let name: String = ob.getattr("name")?.extract()?;
         let args: ParameterList = ob.getattr("args")?.extract()?;
         let body: Vec<Statement> = ob.getattr("body")?.extract()?;

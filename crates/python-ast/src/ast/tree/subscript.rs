@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +18,9 @@ pub struct Subscript {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Subscript {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Subscript {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let value = ob.extract_attr_with_context("value", "subscript value")?;
         let slice = ob.extract_attr_with_context("slice", "subscript slice")?;
         

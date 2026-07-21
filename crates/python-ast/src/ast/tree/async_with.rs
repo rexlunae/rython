@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -31,13 +31,14 @@ pub struct WithItem {
     pub optional_vars: Option<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for AsyncWith {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for AsyncWith {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract items (list of withitem objects)
-        let items: Vec<WithItem> = extract_list(ob, "items", "async with items")?;
+        let items: Vec<WithItem> = extract_list(&ob, "items", "async with items")?;
         
         // Extract body
-        let body: Vec<Statement> = extract_list(ob, "body", "async with body")?;
+        let body: Vec<Statement> = extract_list(&ob, "body", "async with body")?;
         
         Ok(AsyncWith {
             items,
@@ -50,8 +51,9 @@ impl<'a> FromPyObject<'a> for AsyncWith {
     }
 }
 
-impl<'a> FromPyObject<'a> for WithItem {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for WithItem {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract context_expr
         let context_expr: ExprType = ob.getattr("context_expr")?.extract()?;
         

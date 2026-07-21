@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, PyAny, FromPyObject, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, PyAny, FromPyObject, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::{format_ident, quote};
 
 use crate::{dump, CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes};
@@ -14,8 +14,9 @@ pub struct Attribute {
     ctx: String,
 }
 
-impl<'a> FromPyObject<'a> for Attribute {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let value = ob.getattr("value").expect("Attribute.value");
         let attr = ob.getattr("attr").expect("Attribute.attr");
         let ctx = ob
@@ -26,7 +27,7 @@ impl<'a> FromPyObject<'a> for Attribute {
             .expect(
                 ob.error_message(
                     "<unknown>",
-                    format!("extracting type name {:?} in attribute", dump(ob, None)),
+                    format!("extracting type name {:?} in attribute", dump(&ob, None)),
                 )
                 .as_str(),
             );

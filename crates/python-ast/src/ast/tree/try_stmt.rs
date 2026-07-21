@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -42,19 +42,20 @@ pub struct ExceptHandler {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Try {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Try {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract body
-        let body: Vec<Statement> = extract_list(ob, "body", "try body")?;
+        let body: Vec<Statement> = extract_list(&ob, "body", "try body")?;
         
         // Extract handlers
-        let handlers: Vec<ExceptHandler> = extract_list(ob, "handlers", "try handlers")?;
+        let handlers: Vec<ExceptHandler> = extract_list(&ob, "handlers", "try handlers")?;
         
         // Extract orelse (optional)
-        let orelse: Vec<Statement> = extract_list(ob, "orelse", "try orelse").unwrap_or_default();
+        let orelse: Vec<Statement> = extract_list(&ob, "orelse", "try orelse").unwrap_or_default();
         
         // Extract finalbody (optional)
-        let finalbody: Vec<Statement> = extract_list(ob, "finalbody", "try finalbody").unwrap_or_default();
+        let finalbody: Vec<Statement> = extract_list(&ob, "finalbody", "try finalbody").unwrap_or_default();
         
         Ok(Try {
             body, 
@@ -69,8 +70,9 @@ impl<'a> FromPyObject<'a> for Try {
     }
 }
 
-impl<'a> FromPyObject<'a> for ExceptHandler {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for ExceptHandler {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract exception type (optional)
         let exception_type: Option<ExprType> = if let Ok(type_attr) = ob.getattr("type") {
             if type_attr.is_none() {
@@ -94,7 +96,7 @@ impl<'a> FromPyObject<'a> for ExceptHandler {
         };
         
         // Extract body
-        let body: Vec<Statement> = extract_list(ob, "body", "except handler body")?;
+        let body: Vec<Statement> = extract_list(&ob, "body", "except handler body")?;
         
         Ok(ExceptHandler {
             exception_type,

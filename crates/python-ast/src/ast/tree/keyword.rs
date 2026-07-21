@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 // Keyword arguments are now handled by just passing values
 use serde::{Deserialize, Serialize};
 
@@ -19,8 +19,9 @@ pub struct Keyword {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Keyword {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Keyword {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let arg = if let Ok(arg_attr) = ob.getattr("arg") {
             if arg_attr.is_none() {
                 None

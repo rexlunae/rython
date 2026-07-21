@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, PyAny, PyResult, FromPyObject, prelude::PyAnyMethods};
+use pyo3::{Borrowed, PyAny, PyResult, FromPyObject, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +12,9 @@ pub struct NamedExpr {
     right: Box<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for NamedExpr {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for NamedExpr {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let left = ob.getattr("left")?.extract::<ExprType>()?;
         let right = ob.getattr("right")?.extract::<ExprType>()?;
         Ok(NamedExpr {

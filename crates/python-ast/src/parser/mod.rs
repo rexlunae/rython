@@ -10,7 +10,7 @@ fn parse_to_py(
     input: impl AsRef<str>,
     filename: impl AsRef<str>,
     py: Python<'_>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let pymodule_code = include_str!("__init__.py");
 
     // We want to call tokenize.tokenize from Python.
@@ -53,7 +53,7 @@ pub fn parse_enhanced(input: impl AsRef<str>, filename: impl AsRef<str>) -> Crat
     
     // Empty files are valid in Python (they create empty modules), so we don't treat them as errors
     
-    let mut module: Module = Python::with_gil(|py| {
+    let mut module: Module = Python::attach(|py| {
         let py_tree = parse_to_py(input_str, filename, py)
             .map_err(|py_err| {
                 // Convert PyO3 errors to our more detailed error format.

@@ -58,7 +58,7 @@ impl AsyncRuntime {
 pub fn sys_path() -> PyResult<Vec<String>> {
     let pymodule_code = include_str!("path.py");
 
-    Python::with_gil(|py| -> PyResult<Vec<String>> {
+    Python::attach(|py| -> PyResult<Vec<String>> {
         let code_cstr = CString::new(pymodule_code)?;
         let pymodule = PyModule::from_code(py, &code_cstr, c"path.py", c"path")?;
         let t = pymodule

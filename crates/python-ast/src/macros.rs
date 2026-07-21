@@ -5,9 +5,10 @@
 #[macro_export]
 macro_rules! impl_from_py_object_for_op_enum {
     ($enum_name:ident, $error_msg:literal) => {
-        impl<'a> FromPyObject<'a> for $enum_name {
-            fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-                let err_msg = format!($error_msg, dump(ob, None)?);
+        impl<'a, 'py> FromPyObject<'a, 'py> for $enum_name {
+    type Error = pyo3::PyErr;
+            fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+                let err_msg = format!($error_msg, dump(&ob, None)?);
                 Err(pyo3::exceptions::PyValueError::new_err(
                     ob.error_message("<unknown>", err_msg),
                 ))
@@ -89,9 +90,10 @@ macro_rules! extract_py_type_name {
 #[macro_export]
 macro_rules! impl_binary_op_from_py {
     ($struct_name:ident, $enum_name:ident, $op_variants:tt) => {
-        impl<'a> FromPyObject<'a> for $struct_name {
-            fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-                tracing::debug!("ob: {}", dump(ob, None)?);
+        impl<'a, 'py> FromPyObject<'a, 'py> for $struct_name {
+    type Error = pyo3::PyErr;
+            fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+                tracing::debug!("ob: {}", dump(&ob, None)?);
                 
                 let op = extract_py_attr!(ob, "op", "operator");
                 let op_type = extract_py_type_name!(op, "binary operator")?;

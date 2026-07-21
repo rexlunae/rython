@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -22,8 +22,9 @@ pub struct Starred {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Starred {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Starred {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the value being starred
         let value = ob.extract_attr_with_context("value", "starred expression value")?;
         let value: ExprType = value.extract()?;

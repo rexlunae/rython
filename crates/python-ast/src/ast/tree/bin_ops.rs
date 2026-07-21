@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -93,9 +93,10 @@ impl PythonOperator for BinOps {
     }
 }
 
-impl<'a> FromPyObject<'a> for BinOps {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented binary op {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for BinOps {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let err_msg = format!("Unimplemented binary op {}", dump(&ob, None)?);
         Err(pyo3::exceptions::PyValueError::new_err(
             ob.error_message("<unknown>", err_msg),
         ))
@@ -125,9 +126,10 @@ impl BinaryOperation for BinOp {
     }
 }
 
-impl<'a> FromPyObject<'a> for BinOp {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        tracing::debug!("ob: {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for BinOp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        tracing::debug!("ob: {}", dump(&ob, None)?);
         
         let op = ob.extract_attr_with_context("op", "binary operator")?;
         let op_type_str = op.extract_type_name("binary operator")?;

@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -24,9 +24,10 @@ pub enum Compares {
     Unknown,
 }
 
-impl<'a> FromPyObject<'a> for Compares {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented unary op {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for Compares {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let err_msg = format!("Unimplemented unary op {}", dump(&ob, None)?);
         Err(pyo3::exceptions::PyValueError::new_err(
             ob.error_message("<unknown>", err_msg),
         ))
@@ -40,9 +41,10 @@ pub struct Compare {
     comparators: Vec<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for Compare {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        tracing::debug!("ob: {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for Compare {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        tracing::debug!("ob: {}", dump(&ob, None)?);
 
         // Python allows for multiple comparators, rust we only supports one, so we have to rewrite the comparison a little.
         let ops_bound: Vec<Bound<PyAny>> = ob

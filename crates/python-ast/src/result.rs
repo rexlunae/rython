@@ -302,7 +302,7 @@ pub fn syntax_error(
 // Use `.into_err()` instead of `?` directly when the source error doesn't have
 // a `From` impl into [`Error`]:
 //
-//     let dumped = dump(ob, None).into_err()?; // PyErr -> Error
+//     let dumped = dump(&ob, None).into_err()?; // PyErr -> Error
 // ---------------------------------------------------------------------------
 
 /// Converts foreign error results into the crate's structured [`Result`] type.

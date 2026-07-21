@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -26,8 +26,9 @@ pub struct AsyncFor {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for AsyncFor {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for AsyncFor {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract target
         let target: ExprType = ob.getattr("target")?.extract()?;
         
@@ -35,10 +36,10 @@ impl<'a> FromPyObject<'a> for AsyncFor {
         let iter: ExprType = ob.getattr("iter")?.extract()?;
         
         // Extract body
-        let body: Vec<Statement> = extract_list(ob, "body", "async for body")?;
+        let body: Vec<Statement> = extract_list(&ob, "body", "async for body")?;
         
         // Extract orelse (optional)
-        let orelse: Vec<Statement> = extract_list(ob, "orelse", "async for orelse").unwrap_or_default();
+        let orelse: Vec<Statement> = extract_list(&ob, "orelse", "async for orelse").unwrap_or_default();
         
         Ok(AsyncFor {
             target,

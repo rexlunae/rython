@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +24,9 @@ pub struct AugAssign {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for AugAssign {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for AugAssign {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract target
         let target = ob.extract_attr_with_context("target", "augmented assignment target")?;
         let target: ExprType = target.extract()?;

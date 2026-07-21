@@ -38,8 +38,8 @@ pub fn extract_binary_operands<L, R>(
     context: &str,
 ) -> PyResult<(L, R)>
 where
-    L: for<'a> pyo3::FromPyObject<'a>,
-    R: for<'a> pyo3::FromPyObject<'a>,
+    L: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
+    R: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
 {
     let left = ob.getattr(left_attr).map_err(|_| {
         pyo3::exceptions::PyAttributeError::new_err(
@@ -53,13 +53,15 @@ where
         )
     })?;
 
-    let left = left.extract().map_err(|e| {
+    let left = left.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
+        let e: pyo3::PyErr = e.into();
         pyo3::exceptions::PyValueError::new_err(
             format!("Failed to extract {} left operand: {}", context, e)
         )
     })?;
 
-    let right = right.extract().map_err(|e| {
+    let right = right.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
+        let e: pyo3::PyErr = e.into();
         pyo3::exceptions::PyValueError::new_err(
             format!("Failed to extract {} right operand: {}", context, e)
         )
@@ -75,7 +77,7 @@ pub fn extract_list<T>(
     context: &str,
 ) -> PyResult<Vec<T>>
 where
-    T: for<'a> pyo3::FromPyObject<'a>,
+    T: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
 {
     let list_obj = ob.getattr(attr_name).map_err(|_| {
         pyo3::exceptions::PyAttributeError::new_err(
@@ -83,7 +85,7 @@ where
         )
     })?;
 
-    list_obj.extract().map_err(|e| {
+    list_obj.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
         pyo3::exceptions::PyValueError::new_err(
             format!("Failed to extract {} list: {}", context, e)
         )
@@ -96,7 +98,7 @@ pub fn extract_optional<T>(
     attr_name: &str,
 ) -> Option<T>
 where
-    T: for<'a> pyo3::FromPyObject<'a>,
+    T: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
 {
     ob.getattr(attr_name)
         .ok()
@@ -106,10 +108,10 @@ where
 /// Generic function to extract position information from AST nodes.
 pub fn extract_position_info(ob: &Bound<PyAny>) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
     (
-        extract_optional(ob, "lineno"),
-        extract_optional(ob, "col_offset"),
-        extract_optional(ob, "end_lineno"),
-        extract_optional(ob, "end_col_offset"),
+        extract_optional(&ob, "lineno"),
+        extract_optional(&ob, "col_offset"),
+        extract_optional(&ob, "end_lineno"),
+        extract_optional(&ob, "end_col_offset"),
     )
 }
 
@@ -121,13 +123,13 @@ pub trait ExtractFromPython<'a>: Sized {
 
 impl<'a, T> ExtractFromPython<'a> for T
 where
-    T: pyo3::FromPyObject<'a>,
+    T: pyo3::conversion::FromPyObjectOwned<'a>,
 {
     fn extract_with_context(ob: &Bound<'a, PyAny>, context: &str) -> PyResult<Self> {
-        ob.extract().map_err(|e| {
+        ob.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
             pyo3::exceptions::PyValueError::new_err(
                 format!("Failed to extract {} from Python: {} (object: {})", 
-                    context, e, dump(ob, None).unwrap_or_else(|_| "unknown".to_string()))
+                    context, e, dump(&ob, None).unwrap_or_else(|_| "unknown".to_string()))
             )
         })
     }
@@ -136,7 +138,7 @@ where
 /// Utility function for consistent logging during Python object extraction.
 pub fn log_extraction(ob: &Bound<PyAny>, context: &str) {
     if tracing::enabled!(tracing::Level::DEBUG) {
-        match dump(ob, None) {
+        match dump(&ob, None) {
             Ok(dump_str) => tracing::debug!("Extracting {}: {}", context, dump_str),
             Err(_) => tracing::debug!("Extracting {} (dump failed)", context),
         }
@@ -157,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_extract_optional() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             use std::ffi::CString;
             // Create a simple Python integer which has some attributes
             let code = CString::new("42").unwrap();
@@ -174,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_log_extraction() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             use std::ffi::CString;
             let code = CString::new("42").unwrap();
             let obj = py.eval(&code, None, None).unwrap();
@@ -223,9 +225,9 @@ pub fn extract_with_context<'py, T>(
     attr_name: &str,
 ) -> PyResult<T>
 where
-    T: pyo3::FromPyObject<'py>,
+    T: pyo3::conversion::FromPyObjectOwned<'py>,
 {
-    value.extract().map_err(|e| {
+    value.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
         let type_name = value.get_type().name()
             .map(|s| s.to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
@@ -248,8 +250,8 @@ pub fn extract_required_attr<'py, T>(
     context: &str,
 ) -> PyResult<T>
 where
-    T: pyo3::FromPyObject<'py>,
+    T: pyo3::conversion::FromPyObjectOwned<'py>,
 {
-    let attr = get_attr_with_context(ob, attr_name, context)?;
+    let attr = get_attr_with_context(&ob, attr_name, context)?;
     extract_with_context(&attr, context, attr_name)
 }

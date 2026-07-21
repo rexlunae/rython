@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use std::ffi::CString;
 
 /// Determines if a string is a valid Python idetifier, and returns a Python object wrapping a bool.
-fn isidentifier_to_py(input: impl AsRef<str>, py: Python<'_>) -> PyResult<PyObject> {
+fn isidentifier_to_py(input: impl AsRef<str>, py: Python<'_>) -> PyResult<Py<PyAny>> {
     let pymodule_code = include_str!("__init__.py");
 
     // We want to call tokenize.tokenize from Python.
@@ -27,7 +27,7 @@ fn isidentifier_to_py(input: impl AsRef<str>, py: Python<'_>) -> PyResult<PyObje
 /// isidentifier("0alpha").expect('Should return Ok(false)')
 /// ```
 fn isidentifier(input: impl AsRef<str>) -> PyResult<bool> {
-    let isidentifier = Python::with_gil(|py| {
+    let isidentifier = Python::attach(|py| {
         let isidentifier = isidentifier_to_py(input, py)?;
         isidentifier.extract(py)
     })?;

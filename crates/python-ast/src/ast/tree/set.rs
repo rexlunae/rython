@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -17,9 +17,10 @@ pub struct Set {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Set {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        let elts: Vec<ExprType> = extract_list(ob, "elts", "set elements")?;
+impl<'a, 'py> FromPyObject<'a, 'py> for Set {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let elts: Vec<ExprType> = extract_list(&ob, "elts", "set elements")?;
         
         Ok(Set {
             elts,
