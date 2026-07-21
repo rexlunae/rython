@@ -27,8 +27,8 @@ fn main() {
     let components1 = vec!["home", "user", "docs"];
     let components2 = vec![String::from("usr"), String::from("local"), String::from("bin")];
     
-    let joined1: String = os::path::join(components1);
-    let joined2: String = os::path::join(components2);
+    let joined1: String = os::path::join_many(components1);
+    let joined2: String = os::path::join_many(components2);
     println!("Joined path 1: {}", joined1);
     println!("Joined path 2: {}", joined2);
 
