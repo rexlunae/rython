@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -79,14 +79,15 @@ pub struct Comprehension {
     pub is_async: bool,
 }
 
-impl<'a> FromPyObject<'a> for ListComp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for ListComp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the element expression
         let elt = ob.extract_attr_with_context("elt", "list comprehension element")?;
         let elt: ExprType = elt.extract()?;
         
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(ob, "generators", "list comprehension generators")?;
+        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "list comprehension generators")?;
         
         Ok(ListComp {
             elt: Box::new(elt),
@@ -99,14 +100,15 @@ impl<'a> FromPyObject<'a> for ListComp {
     }
 }
 
-impl<'a> FromPyObject<'a> for SetComp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for SetComp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the element expression
         let elt = ob.extract_attr_with_context("elt", "set comprehension element")?;
         let elt: ExprType = elt.extract()?;
         
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(ob, "generators", "set comprehension generators")?;
+        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "set comprehension generators")?;
         
         Ok(SetComp {
             elt: Box::new(elt),
@@ -119,14 +121,15 @@ impl<'a> FromPyObject<'a> for SetComp {
     }
 }
 
-impl<'a> FromPyObject<'a> for GeneratorExp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for GeneratorExp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the element expression
         let elt = ob.extract_attr_with_context("elt", "generator expression element")?;
         let elt: ExprType = elt.extract()?;
         
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(ob, "generators", "generator expression generators")?;
+        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "generator expression generators")?;
         
         Ok(GeneratorExp {
             elt: Box::new(elt),
@@ -139,8 +142,9 @@ impl<'a> FromPyObject<'a> for GeneratorExp {
     }
 }
 
-impl<'a> FromPyObject<'a> for DictComp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for DictComp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the key expression
         let key = ob.extract_attr_with_context("key", "dict comprehension key")?;
         let key: ExprType = key.extract()?;
@@ -150,7 +154,7 @@ impl<'a> FromPyObject<'a> for DictComp {
         let value: ExprType = value.extract()?;
         
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(ob, "generators", "dict comprehension generators")?;
+        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "dict comprehension generators")?;
         
         Ok(DictComp {
             key: Box::new(key),
@@ -164,8 +168,9 @@ impl<'a> FromPyObject<'a> for DictComp {
     }
 }
 
-impl<'a> FromPyObject<'a> for Comprehension {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Comprehension {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract target
         let target = ob.extract_attr_with_context("target", "comprehension target")?;
         let target: ExprType = target.extract()?;
@@ -175,7 +180,7 @@ impl<'a> FromPyObject<'a> for Comprehension {
         let iter: ExprType = iter.extract()?;
         
         // Extract ifs (list of conditions)
-        let ifs: Vec<ExprType> = extract_list(ob, "ifs", "comprehension conditions").unwrap_or_default();
+        let ifs: Vec<ExprType> = extract_list(&ob, "ifs", "comprehension conditions").unwrap_or_default();
         
         // Extract is_async
         let is_async: bool = ob.getattr("is_async")?.extract().unwrap_or(false);

@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -21,13 +21,14 @@ pub struct While {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for While {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for While {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let test = ob.extract_attr_with_context("test", "while test condition")?;
         let test = test.extract().expect("getting while test");
         
-        let body: Vec<Statement> = extract_list(ob, "body", "while body statements")?;
-        let orelse: Vec<Statement> = extract_list(ob, "orelse", "while else statements")?;
+        let body: Vec<Statement> = extract_list(&ob, "body", "while body statements")?;
+        let orelse: Vec<Statement> = extract_list(&ob, "orelse", "while else statements")?;
         
         Ok(While {
             test,

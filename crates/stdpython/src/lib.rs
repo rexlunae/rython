@@ -40,7 +40,9 @@ use alloc::string::ToString;
 
 // PyO3 only available with std
 #[cfg(feature = "std")]
-pub use pyo3::{PyAny, PyObject};
+pub use pyo3::PyAny;
+/// Alias kept for generated code; pyo3 0.29 removed the `PyObject` name.
+pub type PyObject = pyo3::Py<pyo3::PyAny>;
 
 // ============================================================================
 // GENERIC TRAITS FOR PYTHON OPERATIONS
@@ -282,6 +284,135 @@ where
     I: PySum<T>,
 {
     iterable.py_sum()
+}
+
+/// Trait backing Python's `//` and `%` operators, whose results follow the
+/// sign of the divisor (unlike Rust's truncating `/` and `%`).
+pub trait PyDivMod: Copy {
+    fn py_floordiv(self, rhs: Self) -> Self;
+    fn py_mod(self, rhs: Self) -> Self;
+}
+
+impl PyDivMod for i64 {
+    fn py_floordiv(self, rhs: Self) -> Self {
+        let q = self / rhs;
+        if self % rhs != 0 && (self < 0) != (rhs < 0) {
+            q - 1
+        } else {
+            q
+        }
+    }
+    fn py_mod(self, rhs: Self) -> Self {
+        let r = self % rhs;
+        if r != 0 && (r < 0) != (rhs < 0) {
+            r + rhs
+        } else {
+            r
+        }
+    }
+}
+
+impl PyDivMod for f64 {
+    fn py_floordiv(self, rhs: Self) -> Self {
+        (self / rhs).floor()
+    }
+    fn py_mod(self, rhs: Self) -> Self {
+        let r = self % rhs;
+        if r != 0.0 && (r < 0.0) != (rhs < 0.0) {
+            r + rhs
+        } else {
+            r
+        }
+    }
+}
+
+/// Python `//` (floor division): `-7 // 2 == -4`.
+pub fn py_floordiv<T: PyDivMod>(a: T, b: T) -> T {
+    a.py_floordiv(b)
+}
+
+/// Python `%` (modulo takes the divisor's sign): `-7 % 3 == 2`.
+pub fn py_mod<T: PyDivMod>(a: T, b: T) -> T {
+    a.py_mod(b)
+}
+
+/// Python divmod() builtin, floor-division based: `divmod(-7, 2) == (-4, 1)`.
+pub fn divmod<T: PyDivMod>(a: T, b: T) -> (T, T) {
+    (a.py_floordiv(b), a.py_mod(b))
+}
+
+/// Python round() builtin with no ndigits: rounds half to even (banker's
+/// rounding), so `round(2.5) == 2` and `round(3.5) == 4`.
+pub fn round(value: f64) -> i64 {
+    let r = value.round();
+    if (value - value.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
+        (r - value.signum()) as i64
+    } else {
+        r as i64
+    }
+}
+
+/// Python round(value, ndigits): rounds half to even at the given decimal
+/// place and returns a float.
+pub fn round_digits(value: f64, ndigits: i64) -> f64 {
+    let factor = 10f64.powi(ndigits as i32);
+    let scaled = value * factor;
+    let r = scaled.round();
+    let rounded = if (scaled - scaled.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
+        r - scaled.signum()
+    } else {
+        r
+    };
+    rounded / factor
+}
+
+/// Python ord() builtin: code point of a one-character string.
+pub fn ord<S: AsRef<str>>(c: S) -> i64 {
+    let s = c.as_ref();
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => ch as i64,
+        _ => panic!(
+            "ord() expected a character, but string of length {} found",
+            s.chars().count()
+        ),
+    }
+}
+
+/// Python chr() builtin: one-character string for a code point.
+pub fn chr(code: i64) -> String {
+    u32::try_from(code)
+        .ok()
+        .and_then(char::from_u32)
+        .map(String::from)
+        .unwrap_or_else(|| panic!("chr() arg not in range(0x110000): {}", code))
+}
+
+/// Python hex() builtin: `hex(255) == "0xff"`, `hex(-255) == "-0xff"`.
+pub fn hex(n: i64) -> String {
+    if n < 0 {
+        format!("-0x{:x}", n.unsigned_abs())
+    } else {
+        format!("0x{:x}", n)
+    }
+}
+
+/// Python oct() builtin.
+pub fn oct(n: i64) -> String {
+    if n < 0 {
+        format!("-0o{:o}", n.unsigned_abs())
+    } else {
+        format!("0o{:o}", n)
+    }
+}
+
+/// Python bin() builtin.
+pub fn bin(n: i64) -> String {
+    if n < 0 {
+        format!("-0b{:b}", n.unsigned_abs())
+    } else {
+        format!("0b{:b}", n)
+    }
 }
 
 // Implementations for PyAbs trait
@@ -558,7 +689,16 @@ impl PyToString for i64 {
 
 impl PyToString for f64 {
     fn py_str(self) -> String {
-        self.to_string()
+        // Python renders float("3") as "3.0"; Rust's Display drops the ".0".
+        if self.is_finite() && self.fract() == 0.0 && self.abs() < 1e16 {
+            format!("{:.1}", self)
+        } else if self.is_infinite() {
+            if self > 0.0 { "inf".to_string() } else { "-inf".to_string() }
+        } else if self.is_nan() {
+            "nan".to_string()
+        } else {
+            self.to_string()
+        }
     }
 }
 
@@ -1630,37 +1770,43 @@ where
 {
     let len = items.len() as i64;
     let step = step.unwrap_or(1);
-    
+
     if step == 0 {
         panic!("slice step cannot be zero");
     }
-    
-    let (start, stop) = match (start, stop) {
-        (None, None) => (0, len),
-        (Some(s), None) => (s.max(0), len),
-        (None, Some(e)) => (0, e.min(len)),
-        (Some(s), Some(e)) => (s.max(0), e.min(len)),
+
+    // Resolve an index the way Python does: negative values count from the
+    // end, then clamp to the valid range for the travel direction.
+    let resolve = |idx: i64| -> i64 {
+        let idx = if idx < 0 { idx + len } else { idx };
+        if step > 0 {
+            idx.clamp(0, len)
+        } else {
+            idx.clamp(-1, len - 1)
+        }
     };
-    
+
+    let (start, stop) = if step > 0 {
+        (start.map_or(0, resolve), stop.map_or(len, resolve))
+    } else {
+        (start.map_or(len - 1, resolve), stop.map_or(-1, resolve))
+    };
+
     let mut result = Vec::new();
     let mut current = start;
-    
+
     if step > 0 {
-        while current < stop && current < len {
-            if current >= 0 {
-                result.push(items[current as usize].clone());
-            }
+        while current < stop {
+            result.push(items[current as usize].clone());
             current += step;
         }
     } else {
-        while current > stop && current >= 0 {
-            if current < len {
-                result.push(items[current as usize].clone());
-            }
+        while current > stop {
+            result.push(items[current as usize].clone());
             current += step;
         }
     }
-    
+
     result
 }
 

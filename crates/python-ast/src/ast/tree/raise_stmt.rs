@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +21,9 @@ pub struct Raise {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Raise {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Raise {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract exc (optional)
         let exc: Option<ExprType> = if let Ok(exc_attr) = ob.getattr("exc") {
             if exc_attr.is_none() {

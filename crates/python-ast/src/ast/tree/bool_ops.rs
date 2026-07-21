@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +15,9 @@ pub enum BoolOps {
     Unknown,
 }
 
-impl<'a> FromPyObject<'a> for BoolOps {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for BoolOps {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let op_type = ob.get_type().name().expect(
             ob.error_message(
                 "<unknown>",
@@ -42,13 +43,15 @@ impl<'a> FromPyObject<'a> for BoolOps {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BoolOp {
     op: BoolOps,
-    left: Box<ExprType>,
-    right: Box<ExprType>,
+    /// All operands: Python collapses `a and b and c` into one BoolOp node
+    /// with three values.
+    values: Vec<ExprType>,
 }
 
-impl<'a> FromPyObject<'a> for BoolOp {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        tracing::debug!("ob: {}", dump(ob, None)?);
+impl<'a, 'py> FromPyObject<'a, 'py> for BoolOp {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        tracing::debug!("ob: {}", dump(&ob, None)?);
         let op = ob.getattr("op").expect(
             ob.error_message("<unknown>", "error getting unary operator")
                 .as_str(),
@@ -69,9 +72,7 @@ impl<'a> FromPyObject<'a> for BoolOp {
 
         tracing::debug!("BoolOps values: {}", dump(&values, None)?);
 
-        let value: Vec<ExprType> = values.extract().expect("getting values from BoolOp");
-        let left = value[0].clone();
-        let right = value[1].clone();
+        let values: Vec<ExprType> = values.extract().expect("getting values from BoolOp");
 
         let op_type_str: String = op_type.extract()?;
         let op = match op_type_str.as_str() {
@@ -84,19 +85,9 @@ impl<'a> FromPyObject<'a> for BoolOp {
             }
         };
 
-        tracing::debug!(
-            "left: {:?}, right: {:?}, op: {:?}/{:?}",
-            left,
-            right,
-            op_type,
-            op
-        );
+        tracing::debug!("values: {:?}, op: {:?}/{:?}", values, op_type, op);
 
-        return Ok(BoolOp {
-            op: op,
-            left: Box::new(left),
-            right: Box::new(right),
-        });
+        return Ok(BoolOp { op, values });
     }
 }
 
@@ -111,36 +102,27 @@ impl<'a> CodeGen for BoolOp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let left = self
-            .left
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let right = self
-            .right
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            
-        // Python's boolean operators are different from Rust's - they return operands, not booleans
-        // For now, we'll use a simplified approach that works for common cases
-        let right_str = right.to_string();
-        
+        // Python's boolean operators return operands, not booleans; for now we
+        // approximate with Rust's short-circuiting operators, folding every
+        // operand (a BoolOp node can carry more than two).
+        let mut rendered = Vec::new();
+        for value in self.values.clone() {
+            rendered.push(value.to_rust(ctx.clone(), options.clone(), symbols.clone())?);
+        }
+
         match self.op {
             BoolOps::Or => {
-                if right_str.trim() == "None" {
-                    // Special case for `x or None` - just return the left operand
-                    // This avoids the type mismatch error with || None
-                    Ok(quote!(#left))
-                } else {
-                    // Use simple boolean OR for other cases
-                    // TODO: Implement proper Python `or` semantics
-                    Ok(quote!((#left) || (#right)))
+                // Special case for a trailing `or None`: drop it to avoid the
+                // type mismatch with `|| None`.
+                if let Some(last) = rendered.last() {
+                    if last.to_string().trim() == "None" && rendered.len() == 2 {
+                        let first = &rendered[0];
+                        return Ok(quote!(#first));
+                    }
                 }
-            },
-            BoolOps::And => {
-                // Use simple boolean AND
-                // TODO: Implement proper Python `and` semantics
-                Ok(quote!((#left) && (#right)))
-            },
+                Ok(quote!(#((#rendered))||*))
+            }
+            BoolOps::And => Ok(quote!(#((#rendered))&&*)),
 
             _ => Err(err_from(BoolOpNotYetImplemented(self)).into()),
         }

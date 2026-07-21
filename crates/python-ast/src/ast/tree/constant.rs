@@ -1,10 +1,9 @@
 use std::fmt::*;
 
-use encoding::{all::ISO_8859_6, DecoderTrap, Encoding};
 use litrs::Literal;
 use tracing::debug;
 use proc_macro2::*;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 
 use crate::{CodeGen, CodeGenContext, Node, PythonOptions, SymbolTableScopes};
@@ -50,20 +49,23 @@ impl std::string::ToString for Constant {
 
 pub fn try_string(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: String = value.extract()?;
-    let l = Literal::parse(format!("\"{}\"", v)).expect("[4] Parsing the literal");
+    // Debug-format the string so quotes, backslashes, and control characters
+    // come out as valid Rust escape sequences.
+    let l = Literal::parse(format!("{:?}", v)).expect("[4] Parsing the literal");
 
     Ok(Some(l))
 }
 
 pub fn try_bytes(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: &[u8] = value.extract()?;
-    let l = Literal::parse(format!(
-        "b\"{}\"",
-        ISO_8859_6
-            .decode(v, DecoderTrap::Replace)
-            .expect("decoding byte string")
-    ))
-    .expect("[4] Parsing the literal");
+    // Rust byte-string literals only allow ASCII plus escapes, so escape every
+    // byte that needs it (non-ASCII bytes become \xNN).
+    let escaped: String = v
+        .iter()
+        .flat_map(|b| std::ascii::escape_default(*b))
+        .map(char::from)
+        .collect();
+    let l = Literal::parse(format!("b\"{}\"", escaped)).expect("[4] Parsing the literal");
 
     Ok(Some(l))
 }
@@ -105,8 +107,9 @@ pub fn try_option(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 }
 
 // This is the fun bit of code that is responsible from converting from Python constants to Rust ones.
-impl<'a> FromPyObject<'a> for Constant {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extracts the values as a PyAny.
         let value = ob.getattr("value").expect(
             ob.error_message("<unknown>", "error getting constant value")
@@ -121,9 +124,11 @@ impl<'a> FromPyObject<'a> for Constant {
         // We have to evaluaet bool before int because if a bool is evaluated as it, it will be cooerced to an in.
         } else if let Ok(l) = try_bool(&value) {
             l
-        } else if let Ok(l) = try_float(&value) {
-            l
+        // Ints must be tried before floats: extracting f64 from a Python int
+        // succeeds, and would silently lose precision above 2^53.
         } else if let Ok(l) = try_int(&value) {
+            l
+        } else if let Ok(l) = try_float(&value) {
             l
         } else if let Ok(l) = try_option(&value) {
             l

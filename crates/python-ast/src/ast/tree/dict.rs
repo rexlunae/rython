@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +18,11 @@ pub struct Dict {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for Dict {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        let keys: Vec<Option<ExprType>> = extract_list(ob, "keys", "dictionary keys")?;
-        let values: Vec<ExprType> = extract_list(ob, "values", "dictionary values")?;
+impl<'a, 'py> FromPyObject<'a, 'py> for Dict {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let keys: Vec<Option<ExprType>> = extract_list(&ob, "keys", "dictionary keys")?;
+        let values: Vec<ExprType> = extract_list(&ob, "values", "dictionary values")?;
         
         Ok(Dict {
             keys,

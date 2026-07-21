@@ -66,12 +66,13 @@ impl CodeGen for ClassDef {
 
         // The Python convention is that functions that begin with a single underscore,
         // it's private. Otherwise, it's public. We formalize that by default.
+        // (format_ident! panics on "" and "pub(crate)", so build token streams.)
         let visibility = if self.name.starts_with("_") && !self.name.starts_with("__") {
-            format_ident!("")
+            quote!()
         } else if self.name.starts_with("__") && self.name.ends_with("__") {
-            format_ident!("pub(crate)")
+            quote!(pub(crate))
         } else {
-            format_ident!("pub")
+            quote!(pub)
         };
 
         // bases will be empty if there are no base classes, which prevents any base traits

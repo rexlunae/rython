@@ -6,7 +6,7 @@ use std::ffi::CString;
 pub fn dump(o: &Bound<'_, PyAny>, indent: Option<u8>) -> PyResult<String> {
     let pymodule_code = include_str!("__init__.py");
 
-    Python::with_gil(|py| -> PyResult<String> {
+    Python::attach(|py| -> PyResult<String> {
         // We want to call tokenize.tokenize from Python.
         let code_cstr = CString::new(pymodule_code)?;
         let pymodule = PyModule::from_code(py, &code_cstr, c"dump.py", c"parser")?;

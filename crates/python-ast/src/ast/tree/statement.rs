@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
 use crate::{
@@ -25,14 +25,15 @@ pub struct Statement {
     pub statement: StatementType,
 }
 
-impl<'a> FromPyObject<'a> for Statement {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for Statement {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         Ok(Self {
             lineno: ob.lineno(),
             col_offset: ob.col_offset(),
             end_lineno: ob.end_lineno(),
             end_col_offset: ob.end_col_offset(),
-            statement: StatementType::extract_bound(ob)?,
+            statement: StatementType::extract(ob)?,
         })
     }
 }
@@ -108,54 +109,59 @@ pub enum StatementType {
     Unimplemented(String),
 }
 
-impl<'a> FromPyObject<'a> for StatementType {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let err_msg = format!("getting type for statement {:?}", ob);
         let ob_type = ob
             .get_type()
             .name()
             .unwrap_or_else(|_| panic!("{}", ob.error_message("<unknown>", err_msg)));
 
-        debug!("statement...ob_type: {}...{}", ob_type, dump(ob, Some(4))?);
+        debug!("statement...ob_type: {}...{}", ob_type, dump(&ob, Some(4))?);
         match ob_type.extract::<String>()?.as_str() {
             "AsyncFunctionDef" => Ok(StatementType::AsyncFunctionDef(
-                FunctionDef::extract_bound(ob).unwrap_or_else(|_| {
-                    panic!("Failed to extract async function: {:?}", dump(ob, Some(4)))
+                FunctionDef::extract(ob).unwrap_or_else(|_| {
+                    panic!("Failed to extract async function: {:?}", dump(&ob, Some(4)))
                 }),
             )),
             "Assign" => {
-                let assignment = Assign::extract_bound(ob).expect("reading assignment");
+                let assignment = Assign::extract(ob).expect("reading assignment");
                 Ok(StatementType::Assign(assignment))
             }
             "AugAssign" => {
-                let aug_assignment = AugAssign::extract_bound(ob).expect("reading augmented assignment");
+                let aug_assignment = AugAssign::extract(ob).expect("reading augmented assignment");
                 Ok(StatementType::AugAssign(aug_assignment))
             }
             "Pass" => Ok(StatementType::Pass),
             "Call" => {
                 let call =
-                    Call::extract_bound(&ob.getattr("value").unwrap_or_else(|_| {
-                        panic!("getting value from {:?} in call statement", ob)
-                    }))
+                    Call::extract(
+                        ob.getattr("value")
+                            .unwrap_or_else(|_| {
+                                panic!("getting value from {:?} in call statement", ob)
+                            })
+                            .as_borrowed(),
+                    )
                     .unwrap_or_else(|_| panic!("extracting call statement {:?}", ob));
                 debug!("call: {:?}", call);
                 Ok(StatementType::Call(call))
             }
             "ClassDef" => Ok(StatementType::ClassDef(
-                ClassDef::extract_bound(ob).unwrap_or_else(|_| panic!("Class definition {:?}", ob)),
+                ClassDef::extract(ob).unwrap_or_else(|_| panic!("Class definition {:?}", ob)),
             )),
             "Continue" => Ok(StatementType::Continue),
             "Break" => Ok(StatementType::Break),
             "FunctionDef" => Ok(StatementType::FunctionDef(
-                FunctionDef::extract_bound(ob).unwrap_or_else(|_| {
-                    panic!("Failed to extract function: {:?}", dump(ob, Some(4)))
+                FunctionDef::extract(ob).unwrap_or_else(|_| {
+                    panic!("Failed to extract function: {:?}", dump(&ob, Some(4)))
                 }),
             )),
             "Import" => Ok(StatementType::Import(
-                Import::extract_bound(ob).unwrap_or_else(|_| panic!("Import {:?}", ob)),
+                Import::extract(ob).unwrap_or_else(|_| panic!("Import {:?}", ob)),
             )),
             "ImportFrom" => Ok(StatementType::ImportFrom(
-                ImportFrom::extract_bound(ob).unwrap_or_else(|_| panic!("ImportFrom {:?}", ob)),
+                ImportFrom::extract(ob).unwrap_or_else(|_| panic!("ImportFrom {:?}", ob)),
             )),
             "Expr" => {
                 let expr = ob.extract()
@@ -163,7 +169,7 @@ impl<'a> FromPyObject<'a> for StatementType {
                 Ok(StatementType::Expr(expr))
             }
             "Return" => {
-                tracing::debug!("return expression: {}", dump(ob, None)?);
+                tracing::debug!("return expression: {}", dump(&ob, None)?);
                 // Extract the return value from the Return statement's 'value' field
                 let return_value = if let Ok(value_attr) = ob.getattr("value") {
                     if value_attr.is_none() {
@@ -195,49 +201,49 @@ impl<'a> FromPyObject<'a> for StatementType {
                 Ok(StatementType::Return(return_value))
             }
             "If" => {
-                let if_stmt = If::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("If statement {:?}", dump(ob, None)));
+                let if_stmt = If::extract(ob)
+                    .unwrap_or_else(|_| panic!("If statement {:?}", dump(&ob, None)));
                 Ok(StatementType::If(if_stmt))
             }
             "For" => {
-                let for_stmt = For::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("For statement {:?}", dump(ob, None)));
+                let for_stmt = For::extract(ob)
+                    .unwrap_or_else(|_| panic!("For statement {:?}", dump(&ob, None)));
                 Ok(StatementType::For(for_stmt))
             }
             "While" => {
-                let while_stmt = While::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("While statement {:?}", dump(ob, None)));
+                let while_stmt = While::extract(ob)
+                    .unwrap_or_else(|_| panic!("While statement {:?}", dump(&ob, None)));
                 Ok(StatementType::While(while_stmt))
             }
             "Try" => {
-                let try_stmt = Try::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("Try statement {:?}", dump(ob, None)));
+                let try_stmt = Try::extract(ob)
+                    .unwrap_or_else(|_| panic!("Try statement {:?}", dump(&ob, None)));
                 Ok(StatementType::Try(try_stmt))
             }
             "AsyncWith" => {
-                let async_with_stmt = AsyncWith::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("AsyncWith statement {:?}", dump(ob, None)));
+                let async_with_stmt = AsyncWith::extract(ob)
+                    .unwrap_or_else(|_| panic!("AsyncWith statement {:?}", dump(&ob, None)));
                 Ok(StatementType::AsyncWith(async_with_stmt))
             }
             "AsyncFor" => {
-                let async_for_stmt = AsyncFor::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("AsyncFor statement {:?}", dump(ob, None)));
+                let async_for_stmt = AsyncFor::extract(ob)
+                    .unwrap_or_else(|_| panic!("AsyncFor statement {:?}", dump(&ob, None)));
                 Ok(StatementType::AsyncFor(async_for_stmt))
             }
             "Raise" => {
-                let raise_stmt = Raise::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("Raise statement {:?}", dump(ob, None)));
+                let raise_stmt = Raise::extract(ob)
+                    .unwrap_or_else(|_| panic!("Raise statement {:?}", dump(&ob, None)));
                 Ok(StatementType::Raise(raise_stmt))
             }
             "With" => {
-                let with_stmt = With::extract_bound(ob)
-                    .unwrap_or_else(|_| panic!("With statement {:?}", dump(ob, None)));
+                let with_stmt = With::extract(ob)
+                    .unwrap_or_else(|_| panic!("With statement {:?}", dump(&ob, None)));
                 Ok(StatementType::With(with_stmt))
             }
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Unimplemented statement type {}, {}",
                 ob_type,
-                dump(ob, None)?
+                dump(&ob, None)?
             ))),
         }
     }

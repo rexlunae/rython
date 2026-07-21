@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -22,16 +22,17 @@ pub struct For {
     pub end_col_offset: Option<usize>,
 }
 
-impl<'a> FromPyObject<'a> for For {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for For {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let target = ob.extract_attr_with_context("target", "for loop target")?;
         let iter = ob.extract_attr_with_context("iter", "for loop iterator")?;
         
         let target = target.extract().expect("getting for target");
         let iter = iter.extract().expect("getting for iter");
         
-        let body: Vec<Statement> = extract_list(ob, "body", "for body statements")?;
-        let orelse: Vec<Statement> = extract_list(ob, "orelse", "for else statements")?;
+        let body: Vec<Statement> = extract_list(&ob, "body", "for body statements")?;
+        let orelse: Vec<Statement> = extract_list(&ob, "orelse", "for else statements")?;
         
         Ok(For {
             target,

@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, types::PyAnyMethods};
+use pyo3::{Borrowed, Bound, FromPyObject, PyAny, types::PyAnyMethods};
 use quote::quote;
 
 use crate::{dump, CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
@@ -24,9 +24,10 @@ impl std::fmt::Debug for List<'_> {
     }
 }
 
-impl<'a> FromPyObject<'a> for List<'a> {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> pyo3::PyResult<Self> {
-        let elts: Vec<Bound<'a, PyAny>> = ob.getattr("elts")?.extract()?;
+impl<'a, 'py> FromPyObject<'a, 'py> for List<'py> {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> pyo3::PyResult<Self> {
+        let elts: Vec<Bound<'py, PyAny>> = ob.getattr("elts")?.extract()?;
         let ctx: Option<String> = ob.getattr("ctx").ok().and_then(|v| v.extract().ok());
         Ok(List { elts, ctx })
     }

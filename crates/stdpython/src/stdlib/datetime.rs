@@ -57,13 +57,13 @@ impl date {
     
     /// Get weekday (0=Monday, 6=Sunday)
     pub fn weekday(&self) -> u32 {
-        (self.toordinal() % 7) as u32
+        // Ordinal 1 (0001-01-01) is a Monday, so subtract 1 before the mod.
+        ((self.toordinal() - 1).rem_euclid(7)) as u32
     }
     
     /// Get ISO weekday (1=Monday, 7=Sunday)
     pub fn isoweekday(&self) -> u32 {
-        let wd = self.weekday();
-        if wd == 0 { 7 } else { wd }
+        self.weekday() + 1
     }
     
     /// Get ISO calendar (year, week, weekday)

@@ -47,7 +47,7 @@ fn extract_position_attr(obj: &Bound<PyAny>, attr_name: &str) -> Option<usize> {
         .and_then(|attr| attr.extract().ok())
 }
 
-impl<'py> Node for &Bound<'py, PyAny> {
+impl<'py> Node for Bound<'py, PyAny> {
     /// A method for getting the starting line number of the node. This may not exist for all node types.
     fn lineno(&self) -> Option<usize> {
         extract_position_attr(self, "lineno")

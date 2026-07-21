@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Bound, FromPyObject, PyAny, PyResult};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
@@ -12,11 +12,12 @@ pub struct Call {
     pub keywords: Vec<Keyword>,
 }
 
-impl<'a> FromPyObject<'a> for Call {
-    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
-        let func: ExprType = extract_required_attr(ob, "func", "function call expression")?;
-        let args: Vec<ExprType> = extract_required_attr(ob, "args", "function call arguments")?;
-        let keywords: Vec<Keyword> = extract_required_attr(ob, "keywords", "function call keywords")?;
+impl<'a, 'py> FromPyObject<'a, 'py> for Call {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let func: ExprType = extract_required_attr(&ob, "func", "function call expression")?;
+        let args: Vec<ExprType> = extract_required_attr(&ob, "args", "function call arguments")?;
+        let keywords: Vec<Keyword> = extract_required_attr(&ob, "keywords", "function call keywords")?;
         
         Ok(Call {
             func: Box::new(func),

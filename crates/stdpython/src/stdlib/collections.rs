@@ -51,10 +51,9 @@ where
     
     /// Update count for single element
     pub fn update_one(&mut self, element: &T, count: i64) {
+        // Python's Counter keeps zero and negative counts after update() and
+        // subtract(); only the +/- operators drop them.
         *self.counts.entry(element.clone()).or_insert(0) += count;
-        if self.counts[element] <= 0 {
-            self.counts.remove(element);
-        }
     }
     
     /// Get count for element
@@ -278,9 +277,15 @@ impl<T> deque<T> {
         T: PartialEq,
     {
         let start = start.unwrap_or(0);
-        let stop = stop.unwrap_or(self.inner.len());
-        
-        for (i, item) in self.inner.iter().enumerate().skip(start).take(stop - start) {
+        let stop = stop.unwrap_or(self.inner.len()).min(self.inner.len());
+
+        for (i, item) in self
+            .inner
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(stop.saturating_sub(start))
+        {
             if item == value {
                 return Ok(i);
             }
