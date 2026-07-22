@@ -16,6 +16,8 @@ pub struct FunctionDef {
     pub args: ParameterList,
     pub body: Vec<Statement>,
     pub decorator_list: Vec<ExprType>,
+    /// The function's return annotation (`-> int`), if present.
+    pub returns: Option<Box<ExprType>>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
@@ -24,15 +26,22 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
         let name: String = ob.getattr("name")?.extract()?;
         let args: ParameterList = ob.getattr("args")?.extract()?;
         let body: Vec<Statement> = ob.getattr("body")?.extract()?;
-        
+
         // Extract decorator_list as Vec<ExprType>
         let decorator_list: Vec<ExprType> = ob.getattr("decorator_list")?.extract().unwrap_or_default();
-        
+
+        // Extract the return annotation, if any.
+        let returns: Option<Box<ExprType>> = match ob.getattr("returns") {
+            Ok(r) if !r.is_none() => r.extract().ok().map(Box::new),
+            _ => None,
+        };
+
         Ok(FunctionDef {
             name,
             args,
             body,
             decorator_list,
+            returns,
         })
     }
 }
@@ -96,13 +105,26 @@ impl CodeGen for FunctionDef {
             streams.extend(quote!(;));
         }
 
-        // A best-effort return type: if every `return <value>` in the body
-        // returns a value of the same obviously-inferable type (int, float,
-        // bool, string literal, or f-string), annotate the function with it.
-        // Otherwise emit no annotation, as before.
-        let return_type = match self.inferred_return_type() {
+        let return_type = match self.resolved_return_type() {
             Some(ty) => quote!(-> #ty),
             None => quote!(),
+        };
+
+        // Lossy conversions are silent semantic changes callers may not want
+        // — surface them as a compiler warning at every call site outside the
+        // generated crate via a single #[deprecated] note (the standard
+        // mechanism for user-defined warnings). An item can carry only one
+        // #[deprecated] attribute, so all notes are folded into it.
+        let lossy_warning = if options.lossy_warnings {
+            let notes = self.lossy_conversion_notes();
+            if notes.is_empty() {
+                quote!()
+            } else {
+                let note = notes.join("; ");
+                quote!(#[deprecated(note = #note)])
+            }
+        } else {
+            quote!()
         };
 
         let function = if let Some(docstring) = self.get_docstring() {
@@ -121,12 +143,14 @@ impl CodeGen for FunctionDef {
 
             quote! {
                 #(#doc_lines)*
+                #lossy_warning
                 #visibility #is_async fn #fn_name(#parameters) #return_type {
                     #streams
                 }
             }
         } else {
             quote! {
+                #lossy_warning
                 #visibility #is_async fn #fn_name(#parameters) #return_type {
                     #streams
                 }
@@ -218,6 +242,28 @@ fn collect_local_types(
     }
 }
 
+/// Whether an annotation expression means `None` (`-> None` marks a
+/// procedure): the parser may surface it as the NoneType variant, a
+/// valueless constant, or the bare name `None`.
+fn is_none_annotation(ann: &ExprType) -> bool {
+    match ann {
+        ExprType::NoneType(_) => true,
+        ExprType::Constant(c) => c.0.is_none(),
+        ExprType::Name(name) => name.id == "None",
+        _ => false,
+    }
+}
+
+/// Best-effort Python-source rendering of an annotation expression, for
+/// warning messages.
+fn annotation_display(ann: &ExprType) -> String {
+    match ann {
+        ExprType::Name(name) => name.id.clone(),
+        ExprType::Constant(c) => c.to_string(),
+        _ => "<annotation>".to_string(),
+    }
+}
+
 /// Whether a statement list is guaranteed to return a value on every
 /// control-flow path: its final statement is a `return <value>`, an
 /// `if`/`else` whose branches both guarantee a return, or a diverging
@@ -236,6 +282,93 @@ fn guarantees_return(body: &[Statement]) -> bool {
 }
 
 impl FunctionDef {
+    /// The return type the generated Rust function actually carries, if any.
+    ///
+    /// Inference from the body comes first (it reflects the type the body
+    /// actually produces — e.g. a string literal is a &'static str even
+    /// under a `-> str` annotation); an explicit annotation with a known
+    /// Rust mapping is the fallback for bodies inference can't see through.
+    /// Both require the body to return on every path: a fall-through path
+    /// yields `()`, which no concrete annotation can type. `-> None` and
+    /// unmappable annotations yield None.
+    ///
+    /// Tools generating call-through code (e.g. PyO3 wrappers) must use this
+    /// same method so their signatures match the generated function.
+    pub fn resolved_return_type(&self) -> Option<TokenStream> {
+        let annotated = if guarantees_return(&self.body) {
+            self.returns.as_deref().and_then(|ann| {
+                if is_none_annotation(ann) {
+                    None
+                } else {
+                    crate::python_annotation_to_rust_type(ann)
+                }
+            })
+        } else {
+            None
+        };
+        self.inferred_return_type().or(annotated)
+    }
+
+    /// The Python-source text of a return annotation the generated function
+    /// does not honor: the body can fall through (implicitly returning
+    /// None), so the generated function returns `()` no matter what the
+    /// annotation claims. This frequently marks a bug in the Python source
+    /// — the author declared a return type but not every path returns one —
+    /// so it must be surfaced, not silently reproduced.
+    pub fn ignored_return_annotation(&self) -> Option<String> {
+        let ann = self.returns.as_deref()?;
+        if is_none_annotation(ann) || guarantees_return(&self.body) {
+            return None;
+        }
+        Some(annotation_display(ann))
+    }
+
+    /// Human-readable notes for every lossy conversion this function's
+    /// signature underwent. These become the #[deprecated] note on the
+    /// generated function, and conversion tools report them to the user.
+    pub fn lossy_conversion_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        let dropped = self.dropped_default_parameters();
+        if !dropped.is_empty() {
+            notes.push(format!(
+                "rython: Python default value(s) for parameter(s) `{}` were dropped \
+                 (Rust has no default arguments); every argument must be passed explicitly",
+                dropped.join("`, `")
+            ));
+        }
+        if let Some(ann) = self.ignored_return_annotation() {
+            notes.push(format!(
+                "rython: the `-> {}` return annotation was ignored because the function \
+                 body does not return a value on every path; the generated function \
+                 returns `()` where Python would implicitly return None",
+                ann
+            ));
+        }
+        notes
+    }
+
+    /// Names of parameters whose Python default values cannot be carried
+    /// into the generated Rust signature (Rust has no default arguments).
+    /// Used to attach a call-site warning to the generated function and to
+    /// let tools report the loss during conversion.
+    pub fn dropped_default_parameters(&self) -> Vec<String> {
+        let mut dropped = Vec::new();
+        let defaults_offset = self
+            .args
+            .args
+            .len()
+            .saturating_sub(self.args.defaults.len());
+        for arg in &self.args.args[defaults_offset..] {
+            dropped.push(arg.arg.clone());
+        }
+        for (i, arg) in self.args.kwonlyargs.iter().enumerate() {
+            if self.args.kw_defaults.get(i).is_some_and(Option::is_some) {
+                dropped.push(arg.arg.clone());
+            }
+        }
+        dropped
+    }
+
     /// Infer a return type when the function is guaranteed to return on
     /// every control-flow path AND every return value in the body maps to
     /// the same simple type — either directly (a constant or f-string) or
@@ -243,7 +376,7 @@ impl FunctionDef {
     /// returns (which implicitly return None on the fall-through path),
     /// mixed types, and uninferable values all yield None so the function
     /// stays unannotated, as before.
-    fn inferred_return_type(&self) -> Option<TokenStream> {
+    pub fn inferred_return_type(&self) -> Option<TokenStream> {
         // A function that can fall off the end must not get a concrete
         // return annotation: the implicit tail is `()`.
         if !guarantees_return(&self.body) {

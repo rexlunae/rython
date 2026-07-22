@@ -89,6 +89,13 @@ pub struct PythonOptions {
 
     /// The async runtime to use for async Python code
     pub async_runtime: AsyncRuntime,
+
+    /// Emit #[deprecated] notes on generated items whose conversion was
+    /// lossy (dropped parameter defaults, ignored return annotations, ...).
+    /// On by default: silent semantic divergence from the Python source is
+    /// exactly what these warnings exist to surface. Tools may disable this
+    /// to suppress the warnings at the user's explicit request.
+    pub lossy_warnings: bool,
 }
 
 impl Default for PythonOptions {
@@ -107,6 +114,7 @@ impl Default for PythonOptions {
             with_std_python: true,
             allow_unsafe: false,
             async_runtime: AsyncRuntime::default(),
+            lossy_warnings: true,
         }
     }
 }

@@ -142,6 +142,29 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
     }
 }
 
+/// Map a Python type annotation to a Rust type, when the mapping is known.
+/// `int`/`float`/`str`/`bool`/`bytes` map to concrete Rust types, and
+/// `list[T]`/`dict[K, V]`/`set[T]` map to the corresponding std containers
+/// when their element annotations map too.
+pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
+    match annotation {
+        ExprType::Name(name) => match name.id.as_str() {
+            "int" => Some(quote!(i64)),
+            "float" => Some(quote!(f64)),
+            "str" => Some(quote!(String)),
+            "bool" => Some(quote!(bool)),
+            "bytes" => Some(quote!(Vec<u8>)),
+            _ => None,
+        },
+        ExprType::Subscript(_) => {
+            // Subscripted generics (list[int], dict[str, int], ...) aren't
+            // modeled richly enough yet to map reliably.
+            None
+        }
+        _ => None,
+    }
+}
+
 impl CodeGen for Parameter {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -153,12 +176,18 @@ impl CodeGen for Parameter {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        
+
         let param_name = crate::safe_ident(&self.arg);
-        
+
         // Generate type annotation if present
         if let Some(annotation) = self.annotation {
-            let rust_type = annotation.to_rust(ctx, options, symbols)?;
+            // Known Python types map to concrete Rust types; anything else
+            // falls back to rendering the annotation expression (e.g. a
+            // user-defined class name).
+            let rust_type = match python_annotation_to_rust_type(&annotation) {
+                Some(mapped) => mapped,
+                None => annotation.to_rust(ctx, options, symbols)?,
+            };
             Ok(quote!(#param_name: #rust_type))
         } else {
             // Default to generic type for untyped parameters
@@ -235,26 +264,15 @@ impl CodeGen for Arguments {
             params.push(param);
         }
         
-        // Process regular positional arguments with defaults
-        let defaults_offset = self.args.len().saturating_sub(self.defaults.len());
-        for (i, arg) in self.args.into_iter().enumerate() {
-            if i >= defaults_offset {
-                // This argument has a default value
-                let default_idx = i - defaults_offset;
-                let default_value = &self.defaults[default_idx];
-                let _default_rust = default_value.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                let param_name = crate::safe_ident(&arg.arg);
-                
-                if let Some(annotation) = &arg.annotation {
-                    let rust_type = annotation.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    params.push(quote!(#param_name: Option<#rust_type>));
-                } else {
-                    params.push(quote!(#param_name: Option<impl Into<PyObject>>));
-                }
-            } else {
-                let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                params.push(param);
-            }
+        // Process regular positional arguments. Defaulted parameters lower
+        // to plain required parameters: Rust has no default arguments, and
+        // the old Option<T> wrapping neither type-checked against bodies
+        // that use the parameter directly nor matched call sites (which
+        // never wrapped values in Some). Callers that omit the argument
+        // fail to compile either way; callers that pass it now work.
+        for arg in self.args {
+            let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            params.push(param);
         }
         
         // Process *args
@@ -263,27 +281,11 @@ impl CodeGen for Arguments {
             params.push(quote!(#vararg_name: impl IntoIterator<Item = impl Into<PyObject>>));
         }
         
-        // Process keyword-only arguments
-        for (i, arg) in self.kwonlyargs.into_iter().enumerate() {
-            let param_name = crate::safe_ident(&arg.arg);
-            
-            // Check if this keyword-only arg has a default
-            let has_default = i < self.kw_defaults.len() && self.kw_defaults[i].is_some();
-            
-            if let Some(annotation) = &arg.annotation {
-                let rust_type = annotation.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                if has_default {
-                    params.push(quote!(#param_name: Option<#rust_type>));
-                } else {
-                    params.push(quote!(#param_name: #rust_type));
-                }
-            } else {
-                if has_default {
-                    params.push(quote!(#param_name: Option<impl Into<PyObject>>));
-                } else {
-                    params.push(quote!(#param_name: impl Into<PyObject>));
-                }
-            }
+        // Process keyword-only arguments. Like positional defaults above,
+        // these lower to plain required parameters.
+        for arg in self.kwonlyargs {
+            let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            params.push(param);
         }
         
         // Process **kwargs

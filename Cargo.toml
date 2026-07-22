@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/python-ast",
     "crates/python-mod",
+    "crates/rypip",
     "crates/rythonc",
     "crates/stdpython",
 ]

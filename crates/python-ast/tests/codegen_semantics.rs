@@ -211,13 +211,13 @@ fn explicit_await_still_awaits() {
 #[test]
 fn from_import_brings_name_into_scope() {
     let out = compile("from os import path", "imp.py");
-    assert!(out.contains("use os :: path ;"), "generated: {}", out);
+    assert!(out.contains("use stdpython :: os :: path ;"), "generated: {}", out);
 }
 
 #[test]
 fn from_import_with_alias() {
     let out = compile("from os import path as p", "imp2.py");
-    assert!(out.contains("use os :: path as p ;"), "generated: {}", out);
+    assert!(out.contains("use stdpython :: os :: path as p ;"), "generated: {}", out);
 }
 
 #[test]
@@ -282,4 +282,135 @@ fn exhaustive_if_else_returns_get_annotation() {
     let src = "def f(c):\n    if c:\n        return 1\n    else:\n        return 2\n";
     let out = compile(src, "ret9.py");
     assert!(out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn annotated_parameters_map_to_rust_types() {
+    let out = compile("def f(a: int, b: float, c: str, d: bool):\n    pass\n", "ann_params.py");
+    assert!(out.contains("a : i64"), "generated: {}", out);
+    assert!(out.contains("b : f64"), "generated: {}", out);
+    assert!(out.contains("c : String"), "generated: {}", out);
+    assert!(out.contains("d : bool"), "generated: {}", out);
+    assert!(!out.contains(": int"), "generated: {}", out);
+}
+
+#[test]
+fn return_annotation_used_when_inference_fails() {
+    let out = compile("def f(x: int) -> int:\n    return x + 1\n", "ann_ret.py");
+    assert!(out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn string_repetition_uses_multiply_string() {
+    let out = compile("s = \"!\" * 3", "strmul.py");
+    assert!(out.contains("multiply_string"), "generated: {}", out);
+    let out = compile("s = 3 * \"!\"", "strmul2.py");
+    assert!(out.contains("multiply_string"), "generated: {}", out);
+    // Numeric multiplication is untouched.
+    let out = compile("n = 3 * 4", "nummul.py");
+    assert!(!out.contains("multiply_string"), "generated: {}", out);
+}
+
+#[test]
+fn stdlib_from_import_anchors_to_stdpython() {
+    let out = compile("from os import path", "imp3.py");
+    assert!(out.contains("use stdpython :: os :: path ;"), "generated: {}", out);
+}
+
+#[test]
+fn sibling_from_import_anchors_to_crate() {
+    let out = compile("from helpers import util", "imp4.py");
+    assert!(out.contains("use crate :: helpers :: util ;"), "generated: {}", out);
+}
+
+#[test]
+fn defaulted_annotated_parameter_maps_type() {
+    // Defaulted parameters lower to plain required parameters with mapped
+    // types (never the raw Python name, and no Option wrapper, which
+    // type-checked against neither bodies nor call sites).
+    let out = compile("def f(x: int = 0):\n    return x\n", "def_param.py");
+    assert!(out.contains("x : i64"), "generated: {}", out);
+    assert!(!out.contains("Option"), "generated: {}", out);
+    assert!(!out.contains(": int"), "generated: {}", out);
+}
+
+#[test]
+fn kwonly_annotated_parameter_maps_type() {
+    let out = compile("def f(*, x: int):\n    pass\n", "kwonly.py");
+    assert!(out.contains("x : i64"), "generated: {}", out);
+    assert!(!out.contains(": int"), "generated: {}", out);
+}
+
+#[test]
+fn annotation_ignored_when_body_can_fall_through() {
+    // A return annotation must not be applied when a path can reach the end
+    // of the function without returning (the implicit tail is `()`) — but
+    // ignoring it is a lossy conversion that likely marks a source bug, so
+    // the generated function must carry a warning note saying so.
+    let out = compile("def f(c) -> int:\n    if c:\n        return 1\n", "ann_partial.py");
+    assert!(!out.contains("-> i64"), "generated: {}", out);
+    assert!(out.contains("deprecated"), "generated: {}", out);
+    assert!(
+        out.contains("return annotation was ignored")
+            || out.contains("return annotation `-> int`")
+            || out.contains("`-> int` return annotation"),
+        "warning note should name the ignored annotation: {}",
+        out
+    );
+
+    // A function that honors its annotation carries no warning.
+    let out = compile("def g() -> int:\n    return 1\n", "ann_honored.py");
+    assert!(!out.contains("deprecated"), "generated: {}", out);
+
+    // `-> None` on a fall-through body is accurate, not lossy.
+    let out = compile("def h() -> None:\n    print(1)\n", "ann_none.py");
+    assert!(!out.contains("deprecated"), "generated: {}", out);
+}
+
+#[test]
+fn multiple_lossy_conversions_fold_into_one_attribute() {
+    // Rust allows only one #[deprecated] per item, so a function with both a
+    // dropped default and an ignored return annotation must fold both notes
+    // into a single attribute.
+    let out = compile(
+        "def f(c, x: int = 3) -> int:\n    if c:\n        return x\n",
+        "lossy_both.py",
+    );
+    assert_eq!(
+        out.matches("deprecated").count(),
+        1,
+        "exactly one #[deprecated] attribute: {}",
+        out
+    );
+    assert!(out.contains("were dropped"), "generated: {}", out);
+    assert!(out.contains("return annotation"), "generated: {}", out);
+}
+
+#[test]
+fn lossy_warnings_can_be_suppressed_by_options() {
+    let src = "def f(x: int = 3) -> int:\n    if x:\n        return x\n";
+    let module = parse(src, "suppress.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions {
+        lossy_warnings: false,
+        ..Default::default()
+    };
+    let out = module
+        .to_rust(CodeGenContext::Module("suppress".into()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(!out.contains("deprecated"), "generated: {}", out);
+}
+
+#[test]
+fn dropped_defaults_emit_call_site_warning() {
+    // Dropping a Python default is a semantic change; the generated function
+    // must carry a #[deprecated] note so consumer call sites are warned.
+    let out = compile("def f(x: int = 3) -> int:\n    return x\n", "warn_def.py");
+    assert!(out.contains("deprecated"), "generated: {}", out);
+    assert!(out.contains("were dropped"), "generated: {}", out);
+
+    // No defaults, no warning attribute.
+    let out = compile("def g(x: int) -> int:\n    return x\n", "no_warn.py");
+    assert!(!out.contains("deprecated"), "generated: {}", out);
 }

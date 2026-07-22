@@ -173,6 +173,26 @@ impl CodeGen for BinOp {
             return Ok(quote!(py_mod(#left, #right)));
         }
         
+        // Python's * repeats sequences when one operand is a string:
+        // "!" * 3 == "!!!". Route literal-string repetition through the
+        // stdpython multiply_string helper (numeric multiplication keeps
+        // the plain operator below).
+        if matches!(self.op, BinOps::Mult) {
+            let left_is_str = matches!(&*self.left, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))))
+                || matches!(&*self.left, ExprType::JoinedStr(_));
+            let right_is_str = matches!(&*self.right, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))))
+                || matches!(&*self.right, ExprType::JoinedStr(_));
+            if left_is_str || right_is_str {
+                let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let right = self.right.clone().to_rust(ctx, options, symbols)?;
+                return Ok(if left_is_str {
+                    quote!(multiply_string(#left, (#right) as i64))
+                } else {
+                    quote!(multiply_string(#right, (#left) as i64))
+                });
+            }
+        }
+
         // Special handling for list addition (concatenation)
         if matches!(self.op, BinOps::Add) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
