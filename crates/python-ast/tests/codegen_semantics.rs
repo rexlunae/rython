@@ -92,13 +92,32 @@ fn while_else_tracks_break() {
 
 #[test]
 fn nested_loop_break_stays_plain() {
-    // The inner loop has no else, so its break must NOT set the outer flag.
+    // The inner loop's break belongs to the inner loop, so the outer
+    // for/else needs no flag at all: its else runs unconditionally, and the
+    // break stays plain.
     let src = "for x in items:\n    for y in inner:\n        break\nelse:\n    done()\n";
     let out = compile(src, "nested.py");
-    // The outer loop's else machinery exists...
+    assert!(!out.contains("__rython_broke"), "generated: {}", out);
+    assert!(out.contains("done ()"), "generated: {}", out);
+}
+
+#[test]
+fn loop_else_without_break_has_no_flag() {
+    // No break in the body: declaring `let mut __rython_broke` would trip
+    // deny-warnings builds with unused_mut, so the else runs unconditionally.
+    let src = "for x in items:\n    f(x)\nelse:\n    done()\n";
+    let out = compile(src, "forelse2.py");
+    assert!(!out.contains("__rython_broke"), "generated: {}", out);
+    assert!(out.contains("done ()"), "generated: {}", out);
+}
+
+#[test]
+fn loop_else_break_inside_if_still_tracked() {
+    // A break nested in an if still belongs to this loop.
+    let src = "for x in items:\n    if x:\n        break\nelse:\n    done()\n";
+    let out = compile(src, "forelse3.py");
+    assert!(out.contains("__rython_broke = true"), "generated: {}", out);
     assert!(out.contains("if ! __rython_broke"), "generated: {}", out);
-    // ...but the only break (in the inner loop) stays plain.
-    assert!(!out.contains("__rython_broke = true"), "generated: {}", out);
 }
 
 #[test]
@@ -241,5 +260,26 @@ fn bare_return_gets_no_annotation() {
 #[test]
 fn return_type_inferred_through_local_variable() {
     let out = compile("def f():\n    n = 5\n    n -= 1\n    return n\n", "ret6.py");
+    assert!(out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn partial_return_gets_no_annotation() {
+    // The fall-through path implicitly returns None, so annotating -> i64
+    // would make the generated fn fail to compile.
+    let out = compile("def f(c):\n    if c:\n        return 1\n", "ret7.py");
+    assert!(!out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn return_in_loop_only_gets_no_annotation() {
+    let out = compile("def f(items):\n    for x in items:\n        return 1\n", "ret8.py");
+    assert!(!out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn exhaustive_if_else_returns_get_annotation() {
+    let src = "def f(c):\n    if c:\n        return 1\n    else:\n        return 2\n";
+    let out = compile(src, "ret9.py");
     assert!(out.contains("-> i64"), "generated: {}", out);
 }

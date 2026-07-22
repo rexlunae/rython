@@ -84,8 +84,11 @@ impl CodeGen for AsyncFor {
         let iter_expr = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let has_else = !self.orelse.is_empty();
+        // Break-tracking is only needed when a break belonging to this loop
+        // could skip the else clause.
+        let tracks_break = has_else && crate::loop_body_has_direct_break(&self.body);
         let body_ctx = crate::CodeGenContext::Loop {
-            has_else,
+            has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
@@ -108,17 +111,29 @@ impl CodeGen for AsyncFor {
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_body_tokens = else_body_tokens?;
-            Ok(quote! {
-                {
-                    let mut __rython_broke = false;
-                    for #target in #iter_expr {
-                        #(#body_tokens;)*
+            if tracks_break {
+                Ok(quote! {
+                    {
+                        let mut __rython_broke = false;
+                        for #target in #iter_expr {
+                            #(#body_tokens;)*
+                        }
+                        if !__rython_broke {
+                            #(#else_body_tokens;)*
+                        }
                     }
-                    if !__rython_broke {
+                })
+            } else {
+                // No break can skip the else clause; run it unconditionally.
+                Ok(quote! {
+                    {
+                        for #target in #iter_expr {
+                            #(#body_tokens;)*
+                        }
                         #(#else_body_tokens;)*
                     }
-                }
-            })
+                })
+            }
         }
     }
 }

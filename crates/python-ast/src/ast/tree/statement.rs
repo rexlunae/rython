@@ -283,6 +283,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
     }
 }
 
+/// Whether a loop body contains a `break` that belongs to that loop —
+/// looking through `if`/`try`/`with` blocks but not into nested loops
+/// (whose breaks are their own) or nested definitions. Loops with an `else`
+/// clause only need break-tracking machinery when this is true.
+pub fn loop_body_has_direct_break(body: &[Statement]) -> bool {
+    body.iter().any(|stmt| match &stmt.statement {
+        StatementType::Break => true,
+        StatementType::If(s) => {
+            loop_body_has_direct_break(&s.body) || loop_body_has_direct_break(&s.orelse)
+        }
+        StatementType::Try(s) => {
+            loop_body_has_direct_break(&s.body)
+                || s.handlers
+                    .iter()
+                    .any(|h| loop_body_has_direct_break(&h.body))
+                || loop_body_has_direct_break(&s.orelse)
+                || loop_body_has_direct_break(&s.finalbody)
+        }
+        StatementType::With(s) => loop_body_has_direct_break(&s.body),
+        StatementType::AsyncWith(s) => loop_body_has_direct_break(&s.body),
+        _ => false,
+    })
+}
+
 impl CodeGen for StatementType {
     type Context = CodeGenContext;
     type Options = PythonOptions;

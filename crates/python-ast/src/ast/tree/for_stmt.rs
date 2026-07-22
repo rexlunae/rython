@@ -75,10 +75,14 @@ impl CodeGen for For {
         let iter = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let has_else = !self.orelse.is_empty();
+        // Break-tracking is only needed when the else clause could be skipped
+        // by a break belonging to this loop; otherwise the flag would be
+        // declared mutable but never written.
+        let tracks_break = has_else && crate::loop_body_has_direct_break(&self.body);
         // Body statements compile inside a Loop context so `break` can honor
         // the else clause; the else clause itself is outside the loop.
         let body_ctx = crate::CodeGenContext::Loop {
-            has_else,
+            has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
         let body_stmts: Result<Vec<_>, _> = self.body
@@ -102,17 +106,29 @@ impl CodeGen for For {
                 .collect();
             let else_stmts = else_stmts?;
 
-            Ok(quote! {
-                {
-                    let mut __rython_broke = false;
-                    for #target in #iter {
-                        #(#body_stmts;)*
+            if tracks_break {
+                Ok(quote! {
+                    {
+                        let mut __rython_broke = false;
+                        for #target in #iter {
+                            #(#body_stmts;)*
+                        }
+                        if !__rython_broke {
+                            #(#else_stmts;)*
+                        }
                     }
-                    if !__rython_broke {
+                })
+            } else {
+                // No break can skip the else clause; run it unconditionally.
+                Ok(quote! {
+                    {
+                        for #target in #iter {
+                            #(#body_stmts;)*
+                        }
                         #(#else_stmts;)*
                     }
-                }
-            })
+                })
+            }
         }
     }
 }

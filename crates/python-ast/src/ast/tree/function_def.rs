@@ -218,12 +218,38 @@ fn collect_local_types(
     }
 }
 
+/// Whether a statement list is guaranteed to return a value on every
+/// control-flow path: its final statement is a `return <value>`, an
+/// `if`/`else` whose branches both guarantee a return, or a diverging
+/// `raise`. Loops and other constructs may fall through, so they never
+/// guarantee a return.
+fn guarantees_return(body: &[Statement]) -> bool {
+    match body.last().map(|stmt| &stmt.statement) {
+        Some(StatementType::Return(Some(_))) => true,
+        Some(StatementType::If(s)) => {
+            !s.orelse.is_empty() && guarantees_return(&s.body) && guarantees_return(&s.orelse)
+        }
+        // `raise` lowers to a diverging panic!, which satisfies any type.
+        Some(StatementType::Raise(_)) => true,
+        _ => false,
+    }
+}
+
 impl FunctionDef {
-    /// Infer a return type when every return value in the body maps to the
-    /// same simple type — either directly (a constant or f-string) or via a
-    /// local variable assigned a constant. Mixed, absent, or uninferable
-    /// returns yield None.
+    /// Infer a return type when the function is guaranteed to return on
+    /// every control-flow path AND every return value in the body maps to
+    /// the same simple type — either directly (a constant or f-string) or
+    /// via a local variable assigned a constant. Partial/conditional
+    /// returns (which implicitly return None on the fall-through path),
+    /// mixed types, and uninferable values all yield None so the function
+    /// stays unannotated, as before.
     fn inferred_return_type(&self) -> Option<TokenStream> {
+        // A function that can fall off the end must not get a concrete
+        // return annotation: the implicit tail is `()`.
+        if !guarantees_return(&self.body) {
+            return None;
+        }
+
         let mut returns = Vec::new();
         collect_returns(&self.body, &mut returns);
 
