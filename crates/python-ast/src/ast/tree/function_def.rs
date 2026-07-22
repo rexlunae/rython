@@ -82,6 +82,10 @@ impl CodeGen for FunctionDef {
             quote!(pub)  // regular methods are public
         };
 
+        // A nested function body is a fresh exception scope: a `raise` in it
+        // cannot return out of an enclosing try block's closure.
+        let ctx = ctx.strip_exception_scopes();
+
         let is_async = match ctx.clone() {
             CodeGenContext::Async(_) => {
                 quote!(async)
@@ -93,6 +97,34 @@ impl CodeGen for FunctionDef {
             .args
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+        // Python variables are function-scoped: hoist every assigned name to
+        // a `let mut` declaration here so assignments inside nested blocks
+        // (if/loop/try bodies) store into the same variable instead of
+        // creating a shadowing binding. Assigned parameters are rebound as
+        // mutable locals (Rust parameters are immutable).
+        let mut assigned = Vec::new();
+        crate::collect_assigned_names(&self.body, &mut assigned);
+        let param_names: std::collections::HashSet<&str> = self
+            .args
+            .args
+            .iter()
+            .chain(self.args.posonlyargs.iter())
+            .chain(self.args.kwonlyargs.iter())
+            .map(|p| p.arg.as_str())
+            .chain(self.args.vararg.iter().map(|p| p.arg.as_str()))
+            .chain(self.args.kwarg.iter().map(|p| p.arg.as_str()))
+            .collect();
+        let mut streams_prologue = TokenStream::new();
+        for name in &assigned {
+            let ident = crate::safe_ident(name);
+            if param_names.contains(name.as_str()) {
+                streams_prologue.extend(quote!(let mut #ident = #ident;));
+            } else {
+                streams_prologue.extend(quote!(let mut #ident;));
+            }
+        }
+        streams.extend(streams_prologue);
 
         // A leading docstring is emitted as doc comments below; skip it here
         // so it isn't also emitted as a statement.

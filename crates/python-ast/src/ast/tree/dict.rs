@@ -58,9 +58,12 @@ impl CodeGen for Dict {
                     pairs.push(quote! { (#key_tokens, #value_tokens) });
                 }
                 None => {
-                    // Handle dictionary unpacking (**dict)
-                    let value_tokens = value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    pairs.push(quote! { ..#value_tokens });
+                    // `{**other}` has no direct HashMap-literal equivalent;
+                    // fail the conversion rather than emitting invalid Rust.
+                    return Err("dictionary unpacking (`{**other}`) is not yet supported \
+                                in dict literals"
+                        .to_string()
+                        .into());
                 }
             }
         }

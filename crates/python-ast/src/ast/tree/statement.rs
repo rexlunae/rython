@@ -4,8 +4,8 @@ use quote::quote;
 
 use crate::{
     dump, err_from, extraction_failure, Assign, AsyncFor, AsyncWith, AugAssign, Call, ClassDef,
-    CodeGen, CodeGenContext, Expr, For, FunctionDef, If, Import, ImportFrom, Node, PythonOptions,
-    Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
+    CodeGen, CodeGenContext, Expr, ExprType, For, FunctionDef, If, Import, ImportFrom, Node,
+    PythonOptions, Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
 };
 
 use tracing::debug;
@@ -93,6 +93,10 @@ impl CodeGen for Statement {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum StatementType {
     AsyncFunctionDef(FunctionDef),
+    Assert {
+        test: Box<ExprType>,
+        msg: Option<Box<ExprType>>,
+    },
     Assign(Assign),
     AugAssign(AugAssign),
     Break,
@@ -164,6 +168,24 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 let aug_assignment = AugAssign::extract(ob)
                     .map_err(|e| extraction_failure("augmented assignment", &ob, e))?;
                 Ok(StatementType::AugAssign(aug_assignment))
+            }
+            "Assert" => {
+                let test: ExprType = ob
+                    .getattr("test")
+                    .map_err(|e| extraction_failure("assert condition", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("assert condition", &ob, e))?;
+                let msg: Option<Box<ExprType>> = match ob.getattr("msg") {
+                    Ok(m) if !m.is_none() => Some(Box::new(
+                        m.extract()
+                            .map_err(|e| extraction_failure("assert message", &ob, e))?,
+                    )),
+                    _ => None,
+                };
+                Ok(StatementType::Assert {
+                    test: Box::new(test),
+                    msg,
+                })
             }
             "Pass" => Ok(StatementType::Pass),
             "Call" => {
@@ -283,6 +305,66 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
     }
 }
 
+/// Collect, in program order and without duplicates, every plain name that
+/// an `Assign` statement binds anywhere in a statement list — recursing into
+/// control-flow bodies but not into nested function or class definitions
+/// (which are their own scopes). Python variables are function-scoped, so
+/// these names are hoisted to `let mut` declarations at the top of the
+/// enclosing scope and every assignment lowers to a plain `name = value`;
+/// per-block `let` bindings would silently shadow instead of assign.
+pub fn collect_assigned_names(body: &[Statement], out: &mut Vec<String>) {
+    fn push_target(target: &ExprType, out: &mut Vec<String>) {
+        match target {
+            ExprType::Name(name) => {
+                if !out.contains(&name.id) {
+                    out.push(name.id.clone());
+                }
+            }
+            ExprType::Tuple(tuple) => {
+                for elt in &tuple.elts {
+                    push_target(elt, out);
+                }
+            }
+            // Attribute/subscript targets assign into existing places.
+            _ => {}
+        }
+    }
+
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Assign(a) => {
+                for target in &a.targets {
+                    push_target(target, out);
+                }
+            }
+            StatementType::If(s) => {
+                collect_assigned_names(&s.body, out);
+                collect_assigned_names(&s.orelse, out);
+            }
+            StatementType::For(s) => {
+                collect_assigned_names(&s.body, out);
+                collect_assigned_names(&s.orelse, out);
+            }
+            StatementType::While(s) => {
+                collect_assigned_names(&s.body, out);
+                collect_assigned_names(&s.orelse, out);
+            }
+            StatementType::Try(s) => {
+                collect_assigned_names(&s.body, out);
+                for handler in &s.handlers {
+                    collect_assigned_names(&handler.body, out);
+                }
+                collect_assigned_names(&s.orelse, out);
+                collect_assigned_names(&s.finalbody, out);
+            }
+            StatementType::With(s) => collect_assigned_names(&s.body, out),
+            StatementType::AsyncWith(s) => collect_assigned_names(&s.body, out),
+            StatementType::AsyncFor(s) => collect_assigned_names(&s.body, out),
+            _ => {}
+        }
+    }
+}
+
 /// Whether a loop body contains a `break` that belongs to that loop —
 /// looking through `if`/`try`/`with` blocks but not into nested loops
 /// (whose breaks are their own) or nested definitions. Loops with an `else`
@@ -343,6 +425,27 @@ impl CodeGen for StatementType {
             StatementType::AsyncFunctionDef(s) => {
                 let func_def = s.to_rust(Self::Context::Async(Box::new(ctx)), options, symbols)?;
                 Ok(quote!(#func_def))
+            }
+            StatementType::Assert { test, msg } => {
+                let test_tokens = test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let msg_tokens = match msg {
+                    Some(m) => {
+                        let m = m.to_rust(ctx.clone(), options, symbols)?;
+                        quote!(format!("{}", #m))
+                    }
+                    None => quote!(String::new()),
+                };
+                // A failed assert raises AssertionError: catchable by an
+                // enclosing try, otherwise it aborts like any uncaught
+                // Python exception.
+                let raise = if ctx.in_try_block() {
+                    quote!(return Err(PyException::new("AssertionError", #msg_tokens)))
+                } else {
+                    quote!(panic!("{}", PyException::new("AssertionError", #msg_tokens)))
+                };
+                Ok(quote! {
+                    if !(#test_tokens) { #raise; }
+                })
             }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
             StatementType::AugAssign(a) => a.to_rust(ctx, options, symbols),

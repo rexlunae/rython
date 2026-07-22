@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 //#[pyo3(transparent)]
 pub struct Attribute {
-    value: Box<ExprType>,
-    attr: String,
+    pub value: Box<ExprType>,
+    pub attr: String,
     ctx: String,
 }
 

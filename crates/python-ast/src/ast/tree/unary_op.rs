@@ -83,7 +83,9 @@ impl CodeGen for UnaryOp {
         let operand = self.operand.clone().to_rust(ctx, options, symbols)?;
         match self.op {
             Ops::Invert | Ops::Not => Ok(quote!(!#operand)),
-            Ops::UAdd => Ok(quote!(+#operand)),
+            // Rust has no unary plus; Python's `+x` is the identity for
+            // numbers, so emit the operand alone (parenthesized).
+            Ops::UAdd => Ok(quote!((#operand))),
             Ops::USub => Ok(quote!(-#operand)),
             _ => Err(err_from(UnaryOpNotYetImplemented(self)).into())
         }

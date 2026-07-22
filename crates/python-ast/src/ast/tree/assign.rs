@@ -71,10 +71,14 @@ impl<'a> CodeGen for Assign {
             .value
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
-        // Render one binding for a single target. Python variables are
-        // mutable, so plain names bind with `let mut`; attribute/subscript
-        // targets are assignments to existing places, not new bindings, and
-        // tuple targets destructure.
+        // Render one assignment for a single target. Python variables are
+        // function-scoped, so name targets are declared once (hoisted to a
+        // `let mut` at the top of the enclosing function/module scope by the
+        // scope's code generator) and every assignment is a plain store —
+        // emitting `let mut` per assignment would create a fresh shadowing
+        // binding inside nested blocks, silently dropping the store.
+        // Class bodies are the exception: they aren't hoisted scopes.
+        let in_class = matches!(ctx, CodeGenContext::Class);
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -83,8 +87,10 @@ impl<'a> CodeGen for Assign {
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             Ok(match target {
-                ExprType::Name(_) => quote!(let mut #target_code = #value;),
-                ExprType::Tuple(_) => quote!(let (#target_code) = #value;),
+                ExprType::Name(_) if in_class => quote!(let mut #target_code = #value;),
+                ExprType::Name(_) => quote!(#target_code = #value;),
+                // Destructuring assignment to the hoisted names.
+                ExprType::Tuple(_) => quote!((#target_code) = #value;),
                 _ => quote!(#target_code = #value;),
             })
         };

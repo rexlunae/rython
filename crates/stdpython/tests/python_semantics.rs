@@ -206,3 +206,39 @@ fn py_pow_matches_python() {
 fn py_pow_int_negative_exponent_fails_loudly() {
     let _ = py_pow(2i64, -1i64);
 }
+
+#[test]
+fn py_contains_matches_python_in_operator() {
+    // Python: 2 in [1, 2, 3]
+    assert!(vec![1i64, 2, 3].py_contains(&2));
+    assert!(!vec![1i64, 2, 3].py_contains(&7));
+
+    // Python: "ell" in "hello" (substring, not element)
+    assert!("hello".py_contains("ell"));
+    assert!(!"hello".py_contains("xyz"));
+    assert!(String::from("hello").py_contains(&String::from("lo")));
+    assert!("hello".py_contains(&"he"));
+
+    // Python: `k in d` checks keys, not values
+    let d = std::collections::HashMap::from([("a", 1i64), ("b", 2)]);
+    assert!(d.py_contains(&"a"));
+    assert!(!d.py_contains(&"z"));
+
+    // Vec of Strings with a String probe
+    let names = vec![String::from("ada"), String::from("bo")];
+    assert!(names.py_contains(&String::from("bo")));
+}
+
+#[test]
+fn py_exception_matches_handler_names() {
+    let exc = PyException::new("ValueError", "bad input");
+    // except ValueError: catches it
+    assert!(exc.matches("ValueError"));
+    // except TypeError: does not
+    assert!(!exc.matches("TypeError"));
+    // except Exception / BaseException: catch everything
+    assert!(exc.matches("Exception"));
+    assert!(exc.matches("BaseException"));
+    // Display is "Type: message", like a Python traceback's last line
+    assert_eq!(format!("{}", exc), "ValueError: bad input");
+}
