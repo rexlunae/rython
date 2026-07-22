@@ -26,6 +26,21 @@ use crate::package::{PyModule, PyPackage};
 /// consumers still get the warning at their call sites.
 const GENERATED_ALLOWS: &str = "#![allow(unused_imports, unused_variables, unused_mut, dead_code, unreachable_code, non_snake_case, deprecated)]\n";
 
+/// How lossy-conversion warnings are treated during conversion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum WarningMode {
+    /// Report warnings and bake #[deprecated] notes into the generated code
+    /// (the default).
+    #[default]
+    Warn,
+    /// Promote warnings to errors: fail the conversion if any conversion is
+    /// lossy.
+    Deny,
+    /// Suppress warnings entirely — nothing reported, no #[deprecated]
+    /// notes in the generated code.
+    Allow,
+}
+
 /// Options controlling crate generation.
 #[derive(Debug, Clone, Default)]
 pub struct ConvertOptions {
@@ -34,6 +49,8 @@ pub struct ConvertOptions {
     pub pyo3: bool,
     /// Path to the stdpython runtime crate the generated crate depends on.
     pub stdpython_path: Option<PathBuf>,
+    /// How lossy-conversion warnings are treated.
+    pub warnings: WarningMode,
 }
 
 /// A converted crate on disk.
@@ -61,16 +78,34 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for module in &package.modules {
-        let code = transpile(module, &mut warnings)?;
+        let code = transpile(module, &mut warnings, opts.warnings)?;
         transpiled.push((module, code));
+    }
+    // Bindings are generated before files are written so their warnings
+    // (e.g. forced Python-side renames) participate in the warning mode.
+    let bindings_text = if opts.pyo3 {
+        Some(generate_bindings(package, &transpiled, &mut warnings)?)
+    } else {
+        None
+    };
+
+    match opts.warnings {
+        WarningMode::Deny if !warnings.is_empty() => bail!(
+            "lossy conversion (warnings denied):\n  {}",
+            warnings.join("\n  ")
+        ),
+        WarningMode::Allow => warnings.clear(),
+        _ => {}
     }
 
     // Parent -> children map for `pub mod` declarations. The entry module
     // still gets a lib-side module (harmless), except a dedicated
-    // `__main__.py`, which is bin-only by convention.
+    // `__main__.py`, which is bin-only by convention. Non-root __init__
+    // modules register too: a sub-package whose only file is __init__.py
+    // must still be declared by its parent or its code is silently dropped.
     let mut children: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
     for (module, _) in &transpiled {
-        if module.is_init || is_dunder_main(module) {
+        if module.path.is_empty() || is_dunder_main(module) {
             continue;
         }
         let (parent, name) = module.path.split_at(module.path.len() - 1);
@@ -115,9 +150,8 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
     }
 
     // PyO3 bindings.
-    if opts.pyo3 {
-        let bindings = generate_bindings(package, &transpiled)?;
-        fs::write(src_dir.join("python_api.rs"), format_rust(&bindings))?;
+    if let Some(bindings) = &bindings_text {
+        fs::write(src_dir.join("python_api.rs"), format_rust(bindings))?;
         let mut lib = fs::read_to_string(&lib_rs)?;
         lib.push_str("\n#[cfg(feature = \"python\")]\nmod python_api;\n");
         fs::write(&lib_rs, format_rust(&lib))?;
@@ -184,22 +218,23 @@ fn parse_filename(module: &PyModule) -> String {
 
 /// Transpile one Python module to Rust source text, appending
 /// lossy-conversion warnings (which are also baked into the generated code
-/// as #[deprecated] notes).
-fn transpile(module: &PyModule, warnings: &mut Vec<String>) -> Result<String> {
+/// as #[deprecated] notes, unless the warning mode suppresses them).
+fn transpile(
+    module: &PyModule,
+    warnings: &mut Vec<String>,
+    mode: WarningMode,
+) -> Result<String> {
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
 
     for stmt in &ast.raw.body {
         if let StatementType::FunctionDef(func) = &stmt.statement {
-            let dropped = func.dropped_default_parameters();
-            if !dropped.is_empty() {
+            for note in func.lossy_conversion_notes() {
                 warnings.push(format!(
-                    "{}: function `{}`: default value(s) for parameter(s) `{}` were dropped \
-                     (Rust has no default arguments); callers must pass every argument. \
-                     The generated function carries a #[deprecated] note so call sites warn.",
+                    "{}: function `{}`: {}",
                     parse_filename(module),
                     func.name,
-                    dropped.join("`, `"),
+                    note.trim_start_matches("rython: "),
                 ));
             }
         }
@@ -211,10 +246,14 @@ fn transpile(module: &PyModule, warnings: &mut Vec<String>) -> Result<String> {
         .last()
         .cloned()
         .unwrap_or_else(|| "lib".to_string());
+    let options = PythonOptions {
+        lossy_warnings: mode != WarningMode::Allow,
+        ..Default::default()
+    };
     let tokens = ast
         .to_rust(
             CodeGenContext::Module(module_name),
-            PythonOptions::default(),
+            options,
             symbols,
         )
         .map_err(|e| {
@@ -266,10 +305,19 @@ fn module_file_path(src_dir: &Path, module: &PyModule) -> PathBuf {
 }
 
 /// Generate the PyO3 bindings module: wrappers for every function whose
-/// signature is expressible in concrete Rust types.
-fn generate_bindings(package: &PyPackage, transpiled: &[(&PyModule, String)]) -> Result<String> {
-    let mut wrappers: Vec<TokenStream> = Vec::new();
-    let mut registrations: Vec<TokenStream> = Vec::new();
+/// signature is expressible in concrete Rust types. Wrapper identifiers are
+/// qualified by module path so same-named functions in different modules
+/// don't collide in the flat bindings file; the Python-visible name stays
+/// the bare function name when it is unique across the package, and falls
+/// back to the qualified name (with a conversion warning — it's a visible
+/// rename) when it isn't.
+fn generate_bindings(
+    package: &PyPackage,
+    transpiled: &[(&PyModule, String)],
+    warnings: &mut Vec<String>,
+) -> Result<String> {
+    type Signature = (Vec<TokenStream>, Vec<TokenStream>, Option<TokenStream>);
+    let mut candidates: Vec<(&PyModule, python_ast::FunctionDef, Signature)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
     for (module, _) in transpiled {
@@ -287,31 +335,69 @@ fn generate_bindings(package: &PyPackage, transpiled: &[(&PyModule, String)]) ->
                 continue;
             }
             match bindable_signature(func) {
-                Some((params, arg_names, ret)) => {
-                    let name = safe_ident(&func.name);
-                    let path: Vec<_> = module.path.iter().map(|p| safe_ident(p)).collect();
-                    let call = quote!(crate::#(#path::)*#name(#(#arg_names),*));
-                    let ret_tokens = match &ret {
-                        Some(ty) => quote!(-> #ty),
-                        None => quote!(),
-                    };
-                    let body = match &ret {
-                        Some(_) => quote!(#call),
-                        None => quote!(#call;),
-                    };
-                    wrappers.push(quote! {
-                        #[pyfunction]
-                        fn #name(#(#params),*) #ret_tokens {
-                            #body
-                        }
-                    });
-                    registrations.push(quote! {
-                        m.add_function(wrap_pyfunction!(#name, m)?)?;
-                    });
-                }
+                Some(sig) => candidates.push((module, func.clone(), sig)),
                 None => skipped.push(format!("{}.{}", module.path.join("."), func.name)),
             }
         }
+    }
+
+    let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, func, _) in &candidates {
+        *name_counts.entry(func.name.as_str()).or_default() += 1;
+    }
+
+    let mut wrappers: Vec<TokenStream> = Vec::new();
+    let mut registrations: Vec<TokenStream> = Vec::new();
+    let mut collisions: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (module, func, (params, arg_names, ret)) in &candidates {
+        let bare = func.name.as_str();
+        let qualified = if module.path.is_empty() {
+            bare.to_string()
+        } else {
+            format!("{}_{}", module.path.join("_"), bare)
+        };
+        let wrapper_name = safe_ident(&qualified);
+        let target = safe_ident(bare);
+        let path: Vec<_> = module.path.iter().map(|p| safe_ident(p)).collect();
+        let call = quote!(crate::#(#path::)*#target(#(#arg_names),*));
+        let ret_tokens = match ret {
+            Some(ty) => quote!(-> #ty),
+            None => quote!(),
+        };
+        let body = match ret {
+            Some(_) => quote!(#call),
+            None => quote!(#call;),
+        };
+        // Keep the bare Python-visible name when it's unambiguous; a
+        // package-wide duplicate keeps the qualified name (registering two
+        // same-named functions would silently shadow one of them).
+        let py_name = if name_counts[bare] == 1 {
+            quote!(#[pyo3(name = #bare)])
+        } else {
+            collisions.entry(bare).or_default().push(qualified.clone());
+            quote!()
+        };
+        wrappers.push(quote! {
+            #[pyfunction]
+            #py_name
+            fn #wrapper_name(#(#params),*) #ret_tokens {
+                #body
+            }
+        });
+        registrations.push(quote! {
+            m.add_function(wrap_pyfunction!(#wrapper_name, m)?)?;
+        });
+    }
+
+    for (bare, qualified) in &collisions {
+        warnings.push(format!(
+            "python bindings: {} modules define a function named `{}`; they are \
+             exposed to Python under module-qualified names (`{}`) because a \
+             module cannot hold two same-named functions",
+            qualified.len(),
+            bare,
+            qualified.join("`, `"),
+        ));
     }
 
     if wrappers.is_empty() {

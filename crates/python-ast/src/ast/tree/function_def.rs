@@ -110,21 +110,21 @@ impl CodeGen for FunctionDef {
             None => quote!(),
         };
 
-        // Rust has no default arguments, so Python defaults are dropped from
-        // the generated signature. That is a silent semantic change callers
-        // may not want — surface it as a compiler warning at every call site
-        // outside the generated crate via a #[deprecated] note (the standard
-        // mechanism for user-defined warnings).
-        let dropped = self.dropped_default_parameters();
-        let lossy_warning = if dropped.is_empty() {
-            quote!()
+        // Lossy conversions are silent semantic changes callers may not want
+        // — surface them as a compiler warning at every call site outside the
+        // generated crate via a single #[deprecated] note (the standard
+        // mechanism for user-defined warnings). An item can carry only one
+        // #[deprecated] attribute, so all notes are folded into it.
+        let lossy_warning = if options.lossy_warnings {
+            let notes = self.lossy_conversion_notes();
+            if notes.is_empty() {
+                quote!()
+            } else {
+                let note = notes.join("; ");
+                quote!(#[deprecated(note = #note)])
+            }
         } else {
-            let note = format!(
-                "rython: Python default value(s) for parameter(s) `{}` were dropped \
-                 (Rust has no default arguments); every argument must be passed explicitly",
-                dropped.join("`, `")
-            );
-            quote!(#[deprecated(note = #note)])
+            quote!()
         };
 
         let function = if let Some(docstring) = self.get_docstring() {
@@ -242,6 +242,28 @@ fn collect_local_types(
     }
 }
 
+/// Whether an annotation expression means `None` (`-> None` marks a
+/// procedure): the parser may surface it as the NoneType variant, a
+/// valueless constant, or the bare name `None`.
+fn is_none_annotation(ann: &ExprType) -> bool {
+    match ann {
+        ExprType::NoneType(_) => true,
+        ExprType::Constant(c) => c.0.is_none(),
+        ExprType::Name(name) => name.id == "None",
+        _ => false,
+    }
+}
+
+/// Best-effort Python-source rendering of an annotation expression, for
+/// warning messages.
+fn annotation_display(ann: &ExprType) -> String {
+    match ann {
+        ExprType::Name(name) => name.id.clone(),
+        ExprType::Constant(c) => c.to_string(),
+        _ => "<annotation>".to_string(),
+    }
+}
+
 /// Whether a statement list is guaranteed to return a value on every
 /// control-flow path: its final statement is a `return <value>`, an
 /// `if`/`else` whose branches both guarantee a return, or a diverging
@@ -275,7 +297,7 @@ impl FunctionDef {
     pub fn resolved_return_type(&self) -> Option<TokenStream> {
         let annotated = if guarantees_return(&self.body) {
             self.returns.as_deref().and_then(|ann| {
-                if matches!(ann, ExprType::NoneType(_)) {
+                if is_none_annotation(ann) {
                     None
                 } else {
                     crate::python_annotation_to_rust_type(ann)
@@ -285,6 +307,44 @@ impl FunctionDef {
             None
         };
         self.inferred_return_type().or(annotated)
+    }
+
+    /// The Python-source text of a return annotation the generated function
+    /// does not honor: the body can fall through (implicitly returning
+    /// None), so the generated function returns `()` no matter what the
+    /// annotation claims. This frequently marks a bug in the Python source
+    /// — the author declared a return type but not every path returns one —
+    /// so it must be surfaced, not silently reproduced.
+    pub fn ignored_return_annotation(&self) -> Option<String> {
+        let ann = self.returns.as_deref()?;
+        if is_none_annotation(ann) || guarantees_return(&self.body) {
+            return None;
+        }
+        Some(annotation_display(ann))
+    }
+
+    /// Human-readable notes for every lossy conversion this function's
+    /// signature underwent. These become the #[deprecated] note on the
+    /// generated function, and conversion tools report them to the user.
+    pub fn lossy_conversion_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        let dropped = self.dropped_default_parameters();
+        if !dropped.is_empty() {
+            notes.push(format!(
+                "rython: Python default value(s) for parameter(s) `{}` were dropped \
+                 (Rust has no default arguments); every argument must be passed explicitly",
+                dropped.join("`, `")
+            ));
+        }
+        if let Some(ann) = self.ignored_return_annotation() {
+            notes.push(format!(
+                "rython: the `-> {}` return annotation was ignored because the function \
+                 body does not return a value on every path; the generated function \
+                 returns `()` where Python would implicitly return None",
+                ann
+            ));
+        }
+        notes
     }
 
     /// Names of parameters whose Python default values cannot be carried

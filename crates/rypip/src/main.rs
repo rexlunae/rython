@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use rypip::convert::ConvertOptions;
+use rypip::convert::{ConvertOptions, WarningMode};
 
 #[derive(Parser)]
 #[command(
@@ -35,6 +35,11 @@ enum Cmd {
         /// $RYPIP_STDPYTHON_PATH or the copy shipped with this tool).
         #[arg(long)]
         stdpython: Option<PathBuf>,
+        /// How to treat lossy-conversion warnings: warn (report them, and
+        /// bake #[deprecated] notes into the generated code), deny (fail the
+        /// conversion), or allow (suppress them entirely).
+        #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
+        warnings: WarningMode,
     },
     /// Convert and compile a Python package (release profile).
     Build {
@@ -46,6 +51,9 @@ enum Cmd {
         out: Option<PathBuf>,
         #[arg(long)]
         stdpython: Option<PathBuf>,
+        /// How to treat lossy-conversion warnings: warn, deny, or allow.
+        #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
+        warnings: WarningMode,
     },
     /// Build a Python package as a native binary and install it where cargo
     /// installs binaries (~/.cargo/bin unless --root is given).
@@ -57,6 +65,9 @@ enum Cmd {
         root: Option<PathBuf>,
         #[arg(long)]
         stdpython: Option<PathBuf>,
+        /// How to treat lossy-conversion warnings: warn, deny, or allow.
+        #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
+        warnings: WarningMode,
     },
 }
 
@@ -67,6 +78,7 @@ fn main() -> Result<()> {
             out,
             pyo3,
             stdpython,
+            warnings,
         } => {
             let pkg = rypip::discover(&package)?;
             let krate = rypip::convert(
@@ -75,6 +87,7 @@ fn main() -> Result<()> {
                 &ConvertOptions {
                     pyo3,
                     stdpython_path: stdpython,
+                    warnings,
                 },
             )?;
             report_warnings(&krate);
@@ -93,6 +106,7 @@ fn main() -> Result<()> {
             package,
             out,
             stdpython,
+            warnings,
         } => {
             let pkg = rypip::discover(&package)?;
             let out = out.unwrap_or_else(|| work_dir(&pkg.name));
@@ -102,6 +116,7 @@ fn main() -> Result<()> {
                 &ConvertOptions {
                     pyo3: false,
                     stdpython_path: stdpython,
+                    warnings,
                 },
             )?;
             report_warnings(&krate);
@@ -112,6 +127,7 @@ fn main() -> Result<()> {
             package,
             root,
             stdpython,
+            warnings,
         } => {
             let pkg = rypip::discover(&package)?;
             let out = work_dir(&pkg.name);
@@ -121,6 +137,7 @@ fn main() -> Result<()> {
                 &ConvertOptions {
                     pyo3: false,
                     stdpython_path: stdpython,
+                    warnings,
                 },
             )?;
             report_warnings(&krate);

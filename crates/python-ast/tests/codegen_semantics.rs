@@ -344,9 +344,62 @@ fn kwonly_annotated_parameter_maps_type() {
 #[test]
 fn annotation_ignored_when_body_can_fall_through() {
     // A return annotation must not be applied when a path can reach the end
-    // of the function without returning (the implicit tail is `()`).
+    // of the function without returning (the implicit tail is `()`) — but
+    // ignoring it is a lossy conversion that likely marks a source bug, so
+    // the generated function must carry a warning note saying so.
     let out = compile("def f(c) -> int:\n    if c:\n        return 1\n", "ann_partial.py");
     assert!(!out.contains("-> i64"), "generated: {}", out);
+    assert!(out.contains("deprecated"), "generated: {}", out);
+    assert!(
+        out.contains("return annotation was ignored")
+            || out.contains("return annotation `-> int`")
+            || out.contains("`-> int` return annotation"),
+        "warning note should name the ignored annotation: {}",
+        out
+    );
+
+    // A function that honors its annotation carries no warning.
+    let out = compile("def g() -> int:\n    return 1\n", "ann_honored.py");
+    assert!(!out.contains("deprecated"), "generated: {}", out);
+
+    // `-> None` on a fall-through body is accurate, not lossy.
+    let out = compile("def h() -> None:\n    print(1)\n", "ann_none.py");
+    assert!(!out.contains("deprecated"), "generated: {}", out);
+}
+
+#[test]
+fn multiple_lossy_conversions_fold_into_one_attribute() {
+    // Rust allows only one #[deprecated] per item, so a function with both a
+    // dropped default and an ignored return annotation must fold both notes
+    // into a single attribute.
+    let out = compile(
+        "def f(c, x: int = 3) -> int:\n    if c:\n        return x\n",
+        "lossy_both.py",
+    );
+    assert_eq!(
+        out.matches("deprecated").count(),
+        1,
+        "exactly one #[deprecated] attribute: {}",
+        out
+    );
+    assert!(out.contains("were dropped"), "generated: {}", out);
+    assert!(out.contains("return annotation"), "generated: {}", out);
+}
+
+#[test]
+fn lossy_warnings_can_be_suppressed_by_options() {
+    let src = "def f(x: int = 3) -> int:\n    if x:\n        return x\n";
+    let module = parse(src, "suppress.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions {
+        lossy_warnings: false,
+        ..Default::default()
+    };
+    let out = module
+        .to_rust(CodeGenContext::Module("suppress".into()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(!out.contains("deprecated"), "generated: {}", out);
 }
 
 #[test]

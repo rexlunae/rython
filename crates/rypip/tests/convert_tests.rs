@@ -76,6 +76,15 @@ fn write_sample_package(root: &Path) {
         ),
     )
     .unwrap();
+    // A sub-package whose only file is __init__.py, defining a function
+    // whose name collides with cli.run across modules.
+    let util = pkg.join("util");
+    fs::create_dir_all(&util).unwrap();
+    fs::write(
+        util.join("__init__.py"),
+        "def run() -> str:\n    return \"util\"\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -89,7 +98,7 @@ fn discovers_package_metadata_and_modules() {
 
     let mut names: Vec<String> = pkg.modules.iter().map(|m| m.path.join(".")).collect();
     names.sort();
-    assert_eq!(names, vec!["", "cli", "greeting", "optional"]);
+    assert_eq!(names, vec!["", "cli", "greeting", "optional", "util"]);
     assert!(pkg.entry_module().is_some(), "cli.py has a __main__ block");
 }
 
@@ -123,6 +132,16 @@ fn converts_package_into_crate_layout() {
         "expected a dropped-default warning, got: {:?}",
         krate.warnings
     );
+    // log_it declares `-> int` but its body falls through: the annotation is
+    // ignored, and that likely-source-bug must be flagged loudly too.
+    assert!(
+        krate
+            .warnings
+            .iter()
+            .any(|w| w.contains("log_it") && w.contains("return annotation")),
+        "expected an ignored-return-annotation warning, got: {:?}",
+        krate.warnings
+    );
     let optional_rs = fs::read_to_string(out.join("src/optional.rs")).unwrap();
     assert!(
         optional_rs.contains("deprecated"),
@@ -140,6 +159,10 @@ fn converts_package_into_crate_layout() {
 
     let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
     assert!(lib.contains("pub mod greeting"), "lib.rs: {}", lib);
+    // An init-only sub-package must still be declared, or its code is
+    // silently dropped from the crate.
+    assert!(lib.contains("pub mod util"), "lib.rs: {}", lib);
+    assert!(out.join("src/util/mod.rs").is_file(), "missing src/util/mod.rs");
 
     let greeting = fs::read_to_string(out.join("src/greeting.rs")).unwrap();
     assert!(greeting.contains("fn excited"), "greeting.rs: {}", greeting);
@@ -152,6 +175,55 @@ fn converts_package_into_crate_layout() {
 
     let main_rs = fs::read_to_string(out.join("src/main.rs")).unwrap();
     assert!(main_rs.contains("fn main"), "main.rs: {}", main_rs);
+}
+
+#[test]
+fn deny_mode_promotes_warnings_to_errors() {
+    let scratch = Scratch::new("deny");
+    write_sample_package(scratch.path());
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            warnings: rypip::convert::WarningMode::Deny,
+            ..Default::default()
+        },
+    )
+    .expect_err("deny mode must fail on lossy conversions");
+    let msg = format!("{}", err);
+    assert!(msg.contains("with_default"), "error should list the warnings: {}", msg);
+    assert!(msg.contains("log_it"), "error should list the warnings: {}", msg);
+}
+
+#[test]
+fn allow_mode_suppresses_warnings() {
+    let scratch = Scratch::new("allow");
+    write_sample_package(scratch.path());
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            warnings: rypip::convert::WarningMode::Allow,
+            ..Default::default()
+        },
+    )
+    .expect("convert with allow");
+
+    assert!(krate.warnings.is_empty(), "warnings: {:?}", krate.warnings);
+    let optional_rs = fs::read_to_string(out.join("src/optional.rs")).unwrap();
+    assert!(
+        !optional_rs.contains("deprecated"),
+        "allow mode must not bake warning notes into generated code: {}",
+        optional_rs
+    );
+    let greeting_rs = fs::read_to_string(out.join("src/greeting.rs")).unwrap();
+    assert!(!greeting_rs.contains("deprecated"), "greeting.rs: {}", greeting_rs);
 }
 
 #[test]
@@ -190,7 +262,7 @@ fn pyo3_conversion_generates_bindings() {
     let out = scratch.path().join("crate");
 
     let pkg = rypip::discover(scratch.path()).expect("discover");
-    rypip::convert(
+    let krate = rypip::convert(
         &pkg,
         &out,
         &ConvertOptions {
@@ -211,9 +283,16 @@ fn pyo3_conversion_generates_bindings() {
 
     let bindings = fs::read_to_string(out.join("src/python_api.rs")).unwrap();
     assert!(bindings.contains("#[pymodule]"), "bindings: {}", bindings);
+    // Wrapper identifiers are module-qualified so same-named functions in
+    // different modules can't collide; the Python-visible name stays bare.
     assert!(
-        bindings.contains("fn shout_count(n: i64) -> i64"),
+        bindings.contains("fn greeting_shout_count(n: i64) -> i64"),
         "annotated function should be bound with concrete types: {}",
+        bindings
+    );
+    assert!(
+        bindings.contains("pyo3(name = \"shout_count\")"),
+        "unique function keeps its bare Python name: {}",
         bindings
     );
     assert!(
@@ -222,7 +301,7 @@ fn pyo3_conversion_generates_bindings() {
         bindings
     );
     assert!(
-        bindings.contains("fn excited() -> String"),
+        bindings.contains("fn greeting_excited() -> String"),
         "zero-arg function with inferable return should be bound: {}",
         bindings
     );
@@ -231,9 +310,29 @@ fn pyo3_conversion_generates_bindings() {
     // because the body can fall through; the wrapper must agree, or the
     // generated crate won't compile.
     assert!(
-        bindings.contains("fn log_it(n: i64)") && !bindings.contains("fn log_it(n: i64) -> i64"),
+        bindings.contains("fn greeting_log_it(n: i64)")
+            && !bindings.contains("fn greeting_log_it(n: i64) -> i64"),
         "wrapper return type must match the generated function, not the annotation: {}",
         bindings
+    );
+
+    // cli.run and util.run collide: both must be emitted (under qualified
+    // names), neither may claim the bare Python name `run`, and the forced
+    // rename must be flagged as a conversion warning.
+    assert!(bindings.contains("fn cli_run"), "bindings: {}", bindings);
+    assert!(bindings.contains("fn util_run"), "bindings: {}", bindings);
+    assert!(
+        !bindings.contains("pyo3(name = \"run\")"),
+        "colliding names must not shadow each other in Python: {}",
+        bindings
+    );
+    assert!(
+        krate
+            .warnings
+            .iter()
+            .any(|w| w.contains("`run`") && w.contains("qualified")),
+        "expected a rename warning, got: {:?}",
+        krate.warnings
     );
 
     // Functions with defaults can't be bound by the simple wrapper; they
@@ -255,4 +354,31 @@ fn pyo3_conversion_generates_bindings() {
         "lib.rs must include the bindings module: {}",
         lib
     );
+}
+
+#[test]
+fn pyo3_crate_compiles() {
+    let scratch = Scratch::new("pyo3-compile");
+    write_sample_package(scratch.path());
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            pyo3: true,
+            ..Default::default()
+        },
+    )
+    .expect("convert with pyo3");
+
+    // Text assertions can't catch duplicate definitions or wrapper/function
+    // signature mismatches — type-check the bindings for real.
+    let status = Command::new("cargo")
+        .args(["check", "--features", "python"])
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo check");
+    assert!(status.success(), "generated pyo3 crate failed to compile");
 }
