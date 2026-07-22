@@ -92,8 +92,7 @@ impl CodeGen for ClassDef {
         for s in self.body.clone() {
             streams.extend(
                 s.clone()
-                    .to_rust(CodeGenContext::Class, options.clone(), symbols.clone())
-                    .expect(format!("Failed to parse statement {:?}", s).as_str()),
+                    .to_rust(CodeGenContext::Class, options.clone(), symbols.clone())?,
             );
         }
 

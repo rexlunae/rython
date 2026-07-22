@@ -61,27 +61,25 @@ macro_rules! impl_codegen_with_custom {
 }
 
 /// Macro for extracting PyAny attributes with consistent error handling.
+/// Propagates a structured error (with the node's source position) instead of
+/// panicking; must be used inside a function returning `PyResult`.
 #[macro_export]
 macro_rules! extract_py_attr {
     ($obj:expr, $attr:literal, $error_context:literal) => {
-        $obj.getattr($attr).expect(
-            $obj.error_message("<unknown>", concat!("error getting ", $error_context))
-                .as_str(),
-        )
+        $obj.getattr($attr)
+            .map_err(|e| $crate::extraction_failure($error_context, &$obj, e))?
     };
 }
 
 /// Macro for extracting PyAny type names with error handling.
+/// Propagates a structured error instead of panicking; must be used inside a
+/// function returning `PyResult`.
 #[macro_export]
 macro_rules! extract_py_type_name {
     ($obj:expr, $context:literal) => {
-        $obj.get_type().name().expect(
-            $obj.error_message(
-                "<unknown>",
-                format!("extracting type name for {}", $context),
-            )
-            .as_str(),
-        )
+        $obj.get_type()
+            .name()
+            .map_err(|e| $crate::extraction_failure($context, &$obj, e))?
     };
 }
 
@@ -96,7 +94,7 @@ macro_rules! impl_binary_op_from_py {
                 tracing::debug!("ob: {}", dump(&ob, None)?);
                 
                 let op = extract_py_attr!(ob, "op", "operator");
-                let op_type = extract_py_type_name!(op, "binary operator")?;
+                let op_type = extract_py_type_name!(op, "binary operator");
                 
                 let left = extract_py_attr!(ob, "left", "binary operand");
                 let right = extract_py_attr!(ob, "right", "binary operand");
@@ -112,8 +110,12 @@ macro_rules! impl_binary_op_from_py {
                     }
                 };
 
-                let left = left.extract().expect("getting binary operator operand");
-                let right = right.extract().expect("getting binary operator operand");
+                let left = left
+                    .extract()
+                    .map_err(|e| $crate::extraction_failure("left operand", &ob, e))?;
+                let right = right
+                    .extract()
+                    .map_err(|e| $crate::extraction_failure("right operand", &ob, e))?;
 
                 Ok($struct_name {
                     op,
@@ -126,22 +128,33 @@ macro_rules! impl_binary_op_from_py {
 }
 
 /// Macro for generating test functions for AST parsing.
-/// Reduces duplication in test code.
+/// Reduces duplication in test code. Asserts that both parsing and code
+/// generation succeed and that the generated stream is non-empty, so codegen
+/// regressions actually fail the test.
 #[macro_export]
 macro_rules! create_parse_test {
     ($test_name:ident, $code:literal, $file_name:literal) => {
         #[test]
         fn $test_name() {
             let options = PythonOptions::default();
-            let result = crate::parse($code, $file_name).unwrap();
+            let result = crate::parse($code, $file_name)
+                .unwrap_or_else(|e| panic!("failed to parse {:?}: {}", $code, e));
             tracing::info!("Python tree: {:?}", result);
 
-            let code = result.to_rust(
-                CodeGenContext::Module($file_name.replace(".py", "").to_string()),
-                options,
-                SymbolTableScopes::new(),
+            let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+            let code = result
+                .to_rust(
+                    CodeGenContext::Module($file_name.replace(".py", "").to_string()),
+                    options,
+                    symbols,
+                )
+                .unwrap_or_else(|e| panic!("failed to generate code for {:?}: {}", $code, e));
+            tracing::info!("Generated code: {}", code);
+            assert!(
+                !code.to_string().trim().is_empty(),
+                "codegen produced empty output for {:?}",
+                $code
             );
-            tracing::info!("Generated code: {:?}", code);
         }
     };
 }

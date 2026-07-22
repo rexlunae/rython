@@ -83,14 +83,12 @@ impl CodeGen for FunctionDef {
         let parameters = self
             .args
             .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())
-            .expect(format!("parsing arguments {:?}", self.args).as_str());
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         for s in self.body.iter() {
             streams.extend(
                 s.clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                    .expect(format!("parsing statement {:?}", s).as_str()),
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
             );
             streams.extend(quote!(;));
         }

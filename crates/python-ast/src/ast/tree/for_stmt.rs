@@ -28,8 +28,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for For {
         let target = ob.extract_attr_with_context("target", "for loop target")?;
         let iter = ob.extract_attr_with_context("iter", "for loop iterator")?;
         
-        let target = target.extract().expect("getting for target");
-        let iter = iter.extract().expect("getting for iter");
+        let target = target
+            .extract()
+            .map_err(|e| crate::extraction_failure("for loop target", &ob, e))?;
+        let iter = iter
+            .extract()
+            .map_err(|e| crate::extraction_failure("for loop iterator", &ob, e))?;
         
         let body: Vec<Statement> = extract_list(&ob, "body", "for body statements")?;
         let orelse: Vec<Statement> = extract_list(&ob, "orelse", "for else statements")?;

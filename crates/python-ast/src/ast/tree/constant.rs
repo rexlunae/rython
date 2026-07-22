@@ -159,7 +159,7 @@ impl CodeGen for Constant {
                 let v: TokenStream = c
                     .to_string()
                     .parse()
-                    .expect(format!("parsing Constant {}", c).as_str());
+                    .map_err(|e| format!("cannot render constant `{}` as Rust tokens: {}", c, e))?;
                 Ok(quote!(#v))
             }
             None => Ok(quote!(None)),

@@ -91,3 +91,38 @@ fn supported_module_still_compiles() {
         .expect("codegen succeeds");
     assert!(rust.to_string().contains("fn add"));
 }
+
+/// Annotated assignments compile like plain assignments (annotation dropped).
+#[test]
+fn ann_assign_compiles_as_assignment() {
+    let module = parse("x: int = 5", "ann.py").expect("parses");
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let rust = module
+        .to_rust(
+            CodeGenContext::Module("ann".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect("codegen succeeds");
+    let out = rust.to_string();
+    assert!(out.contains("let x = 5"), "generated: {}", out);
+}
+
+/// A bare annotation (`x: int`) has no runtime effect and must not error.
+#[test]
+fn bare_annotation_is_a_no_op() {
+    let module = parse("x: int", "ann2.py").expect("parses");
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let result = module.to_rust(
+        CodeGenContext::Module("ann2".to_string()),
+        PythonOptions::default(),
+        symbols,
+    );
+    assert!(result.is_ok(), "bare annotation should compile: {:?}", result.err());
+}
+
+/// PythonOptions::default() must not panic even in odd environments.
+#[test]
+fn python_options_default_does_not_panic() {
+    let _ = PythonOptions::default();
+}
