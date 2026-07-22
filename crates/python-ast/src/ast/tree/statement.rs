@@ -3,9 +3,9 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types
 use quote::quote;
 
 use crate::{
-    dump, err_from, Assign, AsyncFor, AsyncWith, AugAssign, Call, ClassDef, CodeGen,
-    CodeGenContext, Expr, For, FunctionDef, If, Import, ImportFrom, Node, PythonOptions, Raise,
-    StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
+    dump, err_from, extraction_failure, Assign, AsyncFor, AsyncWith, AugAssign, Call, ClassDef,
+    CodeGen, CodeGenContext, Expr, For, FunctionDef, If, Import, ImportFrom, Node, PythonOptions,
+    Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
 };
 
 use tracing::debug;
@@ -68,17 +68,25 @@ impl CodeGen for Statement {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        Ok(self
-            .statement
+        let (lineno, col_offset) = (self.lineno, self.col_offset);
+        let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
+        self.statement
             .clone()
             .to_rust(ctx, options, symbols)
-            .expect(
-                self.error_message(
-                    "<unknown>",
-                    format!("failed to compile statement {:#?}", self),
-                )
-                .as_str(),
-            ))
+            .map_err(|e| {
+                let location = crate::SourceLocation::with_span(
+                    "<module>",
+                    lineno,
+                    col_offset.map(|c| c + 1),
+                    end_lineno,
+                    end_col_offset,
+                );
+                Box::<dyn std::error::Error>::from(crate::codegen_error(
+                    location,
+                    crate::format_error_chain(e.as_ref()),
+                    "",
+                ))
+            })
     }
 }
 
@@ -112,60 +120,58 @@ pub enum StatementType {
 impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("getting type for statement {:?}", ob);
         let ob_type = ob
             .get_type()
             .name()
-            .unwrap_or_else(|_| panic!("{}", ob.error_message("<unknown>", err_msg)));
+            .map_err(|e| extraction_failure("statement type", &ob, e))?;
 
         debug!("statement...ob_type: {}...{}", ob_type, dump(&ob, Some(4))?);
         match ob_type.extract::<String>()?.as_str() {
             "AsyncFunctionDef" => Ok(StatementType::AsyncFunctionDef(
-                FunctionDef::extract(ob).unwrap_or_else(|_| {
-                    panic!("Failed to extract async function: {:?}", dump(&ob, Some(4)))
-                }),
+                FunctionDef::extract(ob)
+                    .map_err(|e| extraction_failure("async function definition", &ob, e))?,
             )),
             "Assign" => {
-                let assignment = Assign::extract(ob).expect("reading assignment");
+                let assignment = Assign::extract(ob)
+                    .map_err(|e| extraction_failure("assignment", &ob, e))?;
                 Ok(StatementType::Assign(assignment))
             }
             "AugAssign" => {
-                let aug_assignment = AugAssign::extract(ob).expect("reading augmented assignment");
+                let aug_assignment = AugAssign::extract(ob)
+                    .map_err(|e| extraction_failure("augmented assignment", &ob, e))?;
                 Ok(StatementType::AugAssign(aug_assignment))
             }
             "Pass" => Ok(StatementType::Pass),
             "Call" => {
-                let call =
-                    Call::extract(
-                        ob.getattr("value")
-                            .unwrap_or_else(|_| {
-                                panic!("getting value from {:?} in call statement", ob)
-                            })
-                            .as_borrowed(),
-                    )
-                    .unwrap_or_else(|_| panic!("extracting call statement {:?}", ob));
+                let value = ob
+                    .getattr("value")
+                    .map_err(|e| extraction_failure("call statement value", &ob, e))?;
+                let call = Call::extract(value.as_borrowed())
+                    .map_err(|e| extraction_failure("call statement", &ob, e))?;
                 debug!("call: {:?}", call);
                 Ok(StatementType::Call(call))
             }
             "ClassDef" => Ok(StatementType::ClassDef(
-                ClassDef::extract(ob).unwrap_or_else(|_| panic!("Class definition {:?}", ob)),
+                ClassDef::extract(ob)
+                    .map_err(|e| extraction_failure("class definition", &ob, e))?,
             )),
             "Continue" => Ok(StatementType::Continue),
             "Break" => Ok(StatementType::Break),
             "FunctionDef" => Ok(StatementType::FunctionDef(
-                FunctionDef::extract(ob).unwrap_or_else(|_| {
-                    panic!("Failed to extract function: {:?}", dump(&ob, Some(4)))
-                }),
+                FunctionDef::extract(ob)
+                    .map_err(|e| extraction_failure("function definition", &ob, e))?,
             )),
             "Import" => Ok(StatementType::Import(
-                Import::extract(ob).unwrap_or_else(|_| panic!("Import {:?}", ob)),
+                Import::extract(ob).map_err(|e| extraction_failure("import", &ob, e))?,
             )),
             "ImportFrom" => Ok(StatementType::ImportFrom(
-                ImportFrom::extract(ob).unwrap_or_else(|_| panic!("ImportFrom {:?}", ob)),
+                ImportFrom::extract(ob)
+                    .map_err(|e| extraction_failure("from-import", &ob, e))?,
             )),
             "Expr" => {
-                let expr = ob.extract()
-                    .expect(format!("Expr {:?}", ob).as_str());
+                let expr = ob
+                    .extract()
+                    .map_err(|e| extraction_failure("expression statement", &ob, e))?;
                 Ok(StatementType::Expr(expr))
             }
             "Return" => {
@@ -184,8 +190,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                         })
                     } else {
                         // Return with actual expression - extract as ExprType then wrap in Expr
-                        let expr_value: crate::tree::ExprType = value_attr.extract()
-                            .unwrap_or_else(|_| panic!("return value ExprType {:?}", dump(&value_attr, None).unwrap_or_else(|_| "unknown".to_string())));
+                        let expr_value: crate::tree::ExprType = value_attr
+                            .extract()
+                            .map_err(|e| extraction_failure("return value", &ob, e))?;
                         Some(Expr {
                             value: expr_value,
                             ctx: None,
@@ -201,50 +208,53 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 Ok(StatementType::Return(return_value))
             }
             "If" => {
-                let if_stmt = If::extract(ob)
-                    .unwrap_or_else(|_| panic!("If statement {:?}", dump(&ob, None)));
+                let if_stmt =
+                    If::extract(ob).map_err(|e| extraction_failure("if statement", &ob, e))?;
                 Ok(StatementType::If(if_stmt))
             }
             "For" => {
-                let for_stmt = For::extract(ob)
-                    .unwrap_or_else(|_| panic!("For statement {:?}", dump(&ob, None)));
+                let for_stmt =
+                    For::extract(ob).map_err(|e| extraction_failure("for loop", &ob, e))?;
                 Ok(StatementType::For(for_stmt))
             }
             "While" => {
-                let while_stmt = While::extract(ob)
-                    .unwrap_or_else(|_| panic!("While statement {:?}", dump(&ob, None)));
+                let while_stmt =
+                    While::extract(ob).map_err(|e| extraction_failure("while loop", &ob, e))?;
                 Ok(StatementType::While(while_stmt))
             }
             "Try" => {
-                let try_stmt = Try::extract(ob)
-                    .unwrap_or_else(|_| panic!("Try statement {:?}", dump(&ob, None)));
+                let try_stmt =
+                    Try::extract(ob).map_err(|e| extraction_failure("try statement", &ob, e))?;
                 Ok(StatementType::Try(try_stmt))
             }
             "AsyncWith" => {
                 let async_with_stmt = AsyncWith::extract(ob)
-                    .unwrap_or_else(|_| panic!("AsyncWith statement {:?}", dump(&ob, None)));
+                    .map_err(|e| extraction_failure("async with statement", &ob, e))?;
                 Ok(StatementType::AsyncWith(async_with_stmt))
             }
             "AsyncFor" => {
                 let async_for_stmt = AsyncFor::extract(ob)
-                    .unwrap_or_else(|_| panic!("AsyncFor statement {:?}", dump(&ob, None)));
+                    .map_err(|e| extraction_failure("async for loop", &ob, e))?;
                 Ok(StatementType::AsyncFor(async_for_stmt))
             }
             "Raise" => {
-                let raise_stmt = Raise::extract(ob)
-                    .unwrap_or_else(|_| panic!("Raise statement {:?}", dump(&ob, None)));
+                let raise_stmt =
+                    Raise::extract(ob).map_err(|e| extraction_failure("raise statement", &ob, e))?;
                 Ok(StatementType::Raise(raise_stmt))
             }
             "With" => {
-                let with_stmt = With::extract(ob)
-                    .unwrap_or_else(|_| panic!("With statement {:?}", dump(&ob, None)));
+                let with_stmt =
+                    With::extract(ob).map_err(|e| extraction_failure("with statement", &ob, e))?;
                 Ok(StatementType::With(with_stmt))
             }
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unimplemented statement type {}, {}",
-                ob_type,
-                dump(&ob, None)?
-            ))),
+            other => Err(extraction_failure(
+                "statement",
+                &ob,
+                format!(
+                    "the `{}` statement is not yet supported by rython",
+                    other
+                ),
+            )),
         }
     }
 }

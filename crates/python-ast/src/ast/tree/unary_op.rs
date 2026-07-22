@@ -2,8 +2,7 @@ use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
-use crate::{
-    dump, err_from, CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
+use crate::{extraction_failure,     dump, err_from, CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
     UnaryOpNotYetImplemented,
 };
 
@@ -41,24 +40,21 @@ impl<'a, 'py> FromPyObject<'a, 'py> for UnaryOp {
         let py = ob.py();
 
         tracing::debug!("ob: {}", dump(&ob, None)?);
-        let op = ob.as_unbound().getattr(py, "op").expect(
-            ob.error_message("<unknown>", "error getting unary operator")
-                .as_str(),
-        );
+        let op = ob
+            .as_unbound()
+            .getattr(py, "op")
+            .map_err(|e| extraction_failure("unary operator", &ob, e))?;
 
         let bound_op = op.bind(py);
-        let op_type = bound_op.get_type().name().expect(
-            ob.error_message(
-                "<unknown>",
-                format!("extracting type name {:?} for unary operator", op),
-            )
-            .as_str(),
-        );
+        let op_type = bound_op
+            .get_type()
+            .name()
+            .map_err(|e| extraction_failure("unary operator type", &ob, e))?;
 
-        let operand = ob.as_unbound().getattr(py, "operand").expect(
-            ob.error_message("<unknown>", "error getting unary operand")
-                .as_str(),
-        );
+        let operand = ob
+            .as_unbound()
+            .getattr(py, "operand")
+            .map_err(|e| extraction_failure("unary operand", &ob, e))?;
 
         let op = match op_type.extract::<String>()?.as_str() {
             "Invert" => Ops::Invert,
@@ -73,7 +69,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for UnaryOp {
 
         tracing::debug!("operand: {}", dump(&operand.bind(py), None)?);
         let bound_op = operand.bind(py);
-        let operand = ExprType::extract(bound_op.as_borrowed()).expect("getting unary operator operand");
+        let operand = ExprType::extract(bound_op.as_borrowed())
+            .map_err(|e| extraction_failure("unary operator operand", &ob, e))?;
 
         return Ok(UnaryOp {
             op: op,

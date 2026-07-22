@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use pyo3::{Borrowed, PyAny, FromPyObject, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::{format_ident, quote};
 
-use crate::{dump, CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes};
+use crate::{extraction_failure, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,23 +17,17 @@ pub struct Attribute {
 impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let value = ob.getattr("value").expect("Attribute.value");
-        let attr = ob.getattr("attr").expect("Attribute.attr");
+        let value = ob.getattr("value").map_err(|e| extraction_failure("Attribute.value", &ob, e))?;
+        let attr = ob.getattr("attr").map_err(|e| extraction_failure("Attribute.attr", &ob, e))?;
         let ctx = ob
             .getattr("ctx")
-            .expect("getting attribute context")
+            .map_err(|e| extraction_failure("attribute context", &ob, e))?
             .get_type()
             .name()
-            .expect(
-                ob.error_message(
-                    "<unknown>",
-                    format!("extracting type name {:?} in attribute", dump(&ob, None)),
-                )
-                .as_str(),
-            );
+            .map_err(|e| extraction_failure("attribute context type", &ob, e))?;
         Ok(Attribute {
-            value: Box::new(value.extract().expect("Attribute.value")),
-            attr: attr.extract().expect("Attribute.attr"),
+            value: Box::new(value.extract().map_err(|e| extraction_failure("Attribute.value", &ob, e))?),
+            attr: attr.extract().map_err(|e| extraction_failure("Attribute.attr", &ob, e))?,
             ctx: ctx.to_string(),
         })
     }

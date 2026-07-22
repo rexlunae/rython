@@ -329,6 +329,19 @@ where
     Error::from(anyhow::Error::from(e))
 }
 
+/// Render an error and its full `source()` chain as a single string, so the
+/// complete causal context survives type-erased `Box<dyn Error>` boundaries
+/// (whose `Display` only shows the outermost message).
+pub fn format_error_chain(e: &dyn std::error::Error) -> String {
+    let mut message = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        message.push_str(&format!(": {}", cause));
+        source = cause.source();
+    }
+    message
+}
+
 // ---------------------------------------------------------------------------
 // PyO3 boundary conversion.
 //

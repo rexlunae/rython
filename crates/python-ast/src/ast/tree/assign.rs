@@ -3,7 +3,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use crate::{extraction_failure, 
     CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableNode,
     SymbolTableScopes,
 };
@@ -27,15 +27,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
             .extract()
             .expect("extracting assignment targets");
 
-        let python_value = ob.getattr("value").expect(
-            ob.error_message("<unknown>", "assignment statement value not found")
-                .as_str(),
-        );
+        let python_value = ob.getattr("value").map_err(|e| extraction_failure("value", &ob, e))?;
 
-        let value = python_value.extract().expect(
-            ob.error_message("<unknown>", "error getting value of assignment statement")
-                .as_str(),
-        );
+        let value = python_value.extract().map_err(|e| extraction_failure("python_value", &ob, e))?;
 
         Ok(Assign {
             targets: targets,

@@ -3,7 +3,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use crate::{extraction_failure, 
     CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
     Node, impl_node_with_positions, PyAttributeExtractor
 };
@@ -24,8 +24,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Subscript {
         let value = ob.extract_attr_with_context("value", "subscript value")?;
         let slice = ob.extract_attr_with_context("slice", "subscript slice")?;
         
-        let value = value.extract().expect("getting subscript value");
-        let slice = slice.extract().expect("getting subscript slice");
+        let value = value.extract().map_err(|e| extraction_failure("getting subscript value", &ob, e))?;
+        let slice = slice.extract().map_err(|e| extraction_failure("getting subscript slice", &ob, e))?;
         
         Ok(Subscript {
             value: Box::new(value),
