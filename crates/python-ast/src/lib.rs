@@ -8,9 +8,6 @@ pub use codegen::*;
 pub mod isidentifier;
 pub use isidentifier::*;
 
-pub mod scope;
-pub use scope::*;
-
 pub mod symbols;
 pub use symbols::*;
 

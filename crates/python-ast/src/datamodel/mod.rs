@@ -23,16 +23,6 @@ pub trait Object: Sized {
         std::option::Option::<i32>::None
     }
 
-    /// __setattribute__ is called to set an attribute of the object.
-    fn __setattribute__<T: Object>(&mut self, _name: impl AsRef<str>, _value: T) {
-        unimplemented!()
-    }
-
-    /// __delattribute__ is called to delete an attribute of the object.
-    fn __delattribute__(&mut self, _name: impl AsRef<str>) {
-        unimplemented!()
-    }
-
     /// __dir__ is called to list the attributes of the object.
     fn __dir__(&self) -> Vec<impl AsRef<str>> {
         // TODO: Implement proper attribute introspection

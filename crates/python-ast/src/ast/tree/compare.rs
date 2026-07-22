@@ -4,7 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, extraction_failure, err_from, CodeGen, CodeGenContext, CompareNotYetImplemented, ExprType, Node,
+    dump, extraction_failure, err_from, CodeGen, CodeGenContext, CompareNotYetImplemented, ExprType,
     PythonOptions, SymbolTableScopes,
 };
 
@@ -22,16 +22,6 @@ pub enum Compares {
     NotIn,
 
     Unknown,
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for Compares {
-    type Error = pyo3::PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented comparison operator {}", dump(&ob, None)?);
-        Err(pyo3::exceptions::PyValueError::new_err(
-            ob.error_message("<unknown>", err_msg),
-        ))
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -14,11 +14,6 @@ pub trait PythonOperator: Clone + std::fmt::Debug {
     /// the boxed return type and remain downcast-able.
     fn to_rust_op(&self) -> Result<TokenStream, Box<dyn std::error::Error>>;
 
-    /// Get the operator precedence for proper parenthesization.
-    fn precedence(&self) -> u8 {
-        0 // Default precedence
-    }
-
     /// Check if this operator is unknown/unimplemented.
     fn is_unknown(&self) -> bool;
 }

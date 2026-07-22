@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
-use crate::{extraction_failure,     dump, err_from, CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
+use crate::{extraction_failure,     dump, err_from, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
     UnaryOpNotYetImplemented,
 };
 
@@ -16,16 +16,6 @@ pub enum Ops {
     USub,
 
     Unknown,
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for Ops {
-    type Error = pyo3::PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented unary op {}", dump(&ob, None)?);
-        Err(pyo3::exceptions::PyValueError::new_err(
-            ob.error_message("<unknown>", err_msg),
-        ))
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

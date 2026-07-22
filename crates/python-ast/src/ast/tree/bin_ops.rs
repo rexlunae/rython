@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     dump, extraction_failure, err_from, BinOpNotYetImplemented, BinaryOperation, CodeGen, CodeGenContext, ExprType,
-    FromPythonString, Node, PyAttributeExtractor, PythonOperator, PythonOptions, SymbolTableScopes,
+    FromPythonString, PyAttributeExtractor, PythonOperator, PythonOptions, SymbolTableScopes,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -75,31 +75,8 @@ impl PythonOperator for BinOps {
         }
     }
     
-    fn precedence(&self) -> u8 {
-        match self {
-            BinOps::Pow => 8,
-            BinOps::Mult | BinOps::Div | BinOps::FloorDiv | BinOps::Mod => 7,
-            BinOps::Add | BinOps::Sub => 6,
-            BinOps::LShift | BinOps::RShift => 5,
-            BinOps::BitAnd => 4,
-            BinOps::BitXor => 3,
-            BinOps::BitOr => 2,
-            _ => 1,
-        }
-    }
-    
     fn is_unknown(&self) -> bool {
         matches!(self, BinOps::Unknown)
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for BinOps {
-    type Error = pyo3::PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented binary op {}", dump(&ob, None)?);
-        Err(pyo3::exceptions::PyValueError::new_err(
-            ob.error_message("<unknown>", err_msg),
-        ))
     }
 }
 
@@ -231,16 +208,6 @@ mod tests {
     create_parse_test!(test_divide, "8 / 2", "test_case.py");
     create_parse_test!(test_power, "2 ** 3", "test_case.py");
     create_parse_test!(test_modulo, "10 % 3", "test_case.py");
-    
-    #[test]
-    fn test_operator_precedence() {
-        let add_op = BinOps::Add;
-        let mul_op = BinOps::Mult;
-        let pow_op = BinOps::Pow;
-        
-        assert!(pow_op.precedence() > mul_op.precedence());
-        assert!(mul_op.precedence() > add_op.precedence());
-    }
     
     #[test]
     fn test_unknown_operator() {

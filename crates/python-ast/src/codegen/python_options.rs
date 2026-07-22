@@ -5,7 +5,6 @@ use std::{
     default::Default,
 };
 
-use crate::Scope;
 use pyo3::{prelude::*, PyResult};
 use std::ffi::CString;
 
@@ -82,7 +81,6 @@ pub struct PythonOptions {
     /// Collects all of the things we need to compile imports[module][asnames]
     pub imports: BTreeMap<String, HashSet<String>>,
 
-    pub scope: Scope,
 
     pub stdpython: String,
     pub with_std_python: bool,
@@ -104,7 +102,7 @@ impl Default for PythonOptions {
                 Vec::new()
             }),
             imports: BTreeMap::new(),
-            scope: Scope::default(),
+
             stdpython: "stdpython".to_string(),
             with_std_python: true,
             allow_unsafe: false,

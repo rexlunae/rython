@@ -89,7 +89,10 @@ impl CodeGen for ClassDef {
             }
         }
 
-        for s in self.body.clone() {
+        // A leading docstring is emitted as doc comments below; skip it here
+        // so it isn't also emitted as a statement.
+        let body_start = if self.get_docstring().is_some() { 1 } else { 0 };
+        for s in self.body.iter().skip(body_start) {
             streams.extend(
                 s.clone()
                     .to_rust(CodeGenContext::Class, options.clone(), symbols.clone())?,
