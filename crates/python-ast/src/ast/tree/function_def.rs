@@ -129,6 +129,23 @@ impl CodeGen for FunctionDef {
             None => quote!(),
         };
 
+        // Rust has no default arguments, so Python defaults are dropped from
+        // the generated signature. That is a silent semantic change callers
+        // may not want — surface it as a compiler warning at every call site
+        // outside the generated crate via a #[deprecated] note (the standard
+        // mechanism for user-defined warnings).
+        let dropped = self.dropped_default_parameters();
+        let lossy_warning = if dropped.is_empty() {
+            quote!()
+        } else {
+            let note = format!(
+                "rython: Python default value(s) for parameter(s) `{}` were dropped \
+                 (Rust has no default arguments); every argument must be passed explicitly",
+                dropped.join("`, `")
+            );
+            quote!(#[deprecated(note = #note)])
+        };
+
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
             let doc_lines: Vec<_> = docstring
@@ -145,12 +162,14 @@ impl CodeGen for FunctionDef {
 
             quote! {
                 #(#doc_lines)*
+                #lossy_warning
                 #visibility #is_async fn #fn_name(#parameters) #return_type {
                     #streams
                 }
             }
         } else {
             quote! {
+                #lossy_warning
                 #visibility #is_async fn #fn_name(#parameters) #return_type {
                     #streams
                 }
@@ -260,6 +279,28 @@ fn guarantees_return(body: &[Statement]) -> bool {
 }
 
 impl FunctionDef {
+    /// Names of parameters whose Python default values cannot be carried
+    /// into the generated Rust signature (Rust has no default arguments).
+    /// Used to attach a call-site warning to the generated function and to
+    /// let tools report the loss during conversion.
+    pub fn dropped_default_parameters(&self) -> Vec<String> {
+        let mut dropped = Vec::new();
+        let defaults_offset = self
+            .args
+            .args
+            .len()
+            .saturating_sub(self.args.defaults.len());
+        for arg in &self.args.args[defaults_offset..] {
+            dropped.push(arg.arg.clone());
+        }
+        for (i, arg) in self.args.kwonlyargs.iter().enumerate() {
+            if self.args.kw_defaults.get(i).is_some_and(Option::is_some) {
+                dropped.push(arg.arg.clone());
+            }
+        }
+        dropped
+    }
+
     /// Infer a return type when the function is guaranteed to return on
     /// every control-flow path AND every return value in the body maps to
     /// the same simple type — either directly (a constant or f-string) or

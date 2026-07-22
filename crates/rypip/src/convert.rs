@@ -19,8 +19,12 @@ use crate::package::{PyModule, PyPackage};
 
 /// Lint allowances for generated code: transpiled Python legitimately
 /// produces unused imports/variables and similar noise, and the generated
-/// crate must still build under a consumer's `-D warnings`.
-const GENERATED_ALLOWS: &str = "#![allow(unused_imports, unused_variables, unused_mut, dead_code, unreachable_code, non_snake_case)]\n";
+/// crate must still build under a consumer's `-D warnings`. `deprecated` is
+/// allowed *within* the generated crate because rython uses #[deprecated]
+/// notes to warn about lossy conversions (e.g. dropped parameter defaults) —
+/// internal call sites are the faithfully-transpiled Python, while external
+/// consumers still get the warning at their call sites.
+const GENERATED_ALLOWS: &str = "#![allow(unused_imports, unused_variables, unused_mut, dead_code, unreachable_code, non_snake_case, deprecated)]\n";
 
 /// Options controlling crate generation.
 #[derive(Debug, Clone, Default)]
@@ -39,6 +43,10 @@ pub struct ConvertedCrate {
     pub name: String,
     /// Whether a binary entry point (src/main.rs) was generated.
     pub has_binary: bool,
+    /// Human-readable warnings about lossy conversions (e.g. dropped
+    /// parameter defaults). These are also baked into the generated code as
+    /// #[deprecated] notes so consumers see them at their call sites.
+    pub warnings: Vec<String>,
 }
 
 /// Convert `package` into a Cargo crate under `out_dir`.
@@ -49,10 +57,11 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
 
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
-    // Transpile every module.
+    // Transpile every module, collecting lossy-conversion warnings.
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for module in &package.modules {
-        let code = transpile(module)?;
+        let code = transpile(module, &mut warnings)?;
         transpiled.push((module, code));
     }
 
@@ -150,6 +159,7 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         root: out_dir.to_path_buf(),
         name: package.name.clone(),
         has_binary,
+        warnings,
     })
 }
 
@@ -172,10 +182,29 @@ fn parse_filename(module: &PyModule) -> String {
     }
 }
 
-/// Transpile one Python module to Rust source text.
-fn transpile(module: &PyModule) -> Result<String> {
+/// Transpile one Python module to Rust source text, appending
+/// lossy-conversion warnings (which are also baked into the generated code
+/// as #[deprecated] notes).
+fn transpile(module: &PyModule, warnings: &mut Vec<String>) -> Result<String> {
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
+
+    for stmt in &ast.raw.body {
+        if let StatementType::FunctionDef(func) = &stmt.statement {
+            let dropped = func.dropped_default_parameters();
+            if !dropped.is_empty() {
+                warnings.push(format!(
+                    "{}: function `{}`: default value(s) for parameter(s) `{}` were dropped \
+                     (Rust has no default arguments); callers must pass every argument. \
+                     The generated function carries a #[deprecated] note so call sites warn.",
+                    parse_filename(module),
+                    func.name,
+                    dropped.join("`, `"),
+                ));
+            }
+        }
+    }
+
     let symbols = ast.clone().find_symbols(SymbolTableScopes::new());
     let module_name = module
         .path

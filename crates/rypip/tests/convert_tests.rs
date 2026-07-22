@@ -112,6 +112,20 @@ fn converts_package_into_crate_layout() {
 
     assert_eq!(krate.name, "greeter");
     assert!(krate.has_binary, "cli.py should produce a binary");
+
+    // The lossy conversion in optional.py (a dropped parameter default) must
+    // be flagged as a conversion warning and baked into the generated code.
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("with_default")),
+        "expected a dropped-default warning, got: {:?}",
+        krate.warnings
+    );
+    let optional_rs = fs::read_to_string(out.join("src/optional.rs")).unwrap();
+    assert!(
+        optional_rs.contains("deprecated"),
+        "generated function should carry the warning note: {}",
+        optional_rs
+    );
     for file in ["Cargo.toml", "src/lib.rs", "src/greeting.rs", "src/cli.rs", "src/main.rs"] {
         assert!(out.join(file).is_file(), "missing {}", file);
     }

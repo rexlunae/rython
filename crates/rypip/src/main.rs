@@ -77,6 +77,7 @@ fn main() -> Result<()> {
                     stdpython_path: stdpython,
                 },
             )?;
+            report_warnings(&krate);
             println!(
                 "converted `{}` -> {}{}",
                 krate.name,
@@ -103,6 +104,7 @@ fn main() -> Result<()> {
                     stdpython_path: stdpython,
                 },
             )?;
+            report_warnings(&krate);
             rypip::cargo_build(&krate)?;
             println!("built `{}` in {}", krate.name, krate.root.display());
         }
@@ -121,11 +123,19 @@ fn main() -> Result<()> {
                     stdpython_path: stdpython,
                 },
             )?;
+            report_warnings(&krate);
             rypip::cargo_install(&krate, root.as_deref())?;
             println!("installed `{}`", krate.name);
         }
     }
     Ok(())
+}
+
+/// Surface lossy-conversion warnings on stderr as they happen.
+fn report_warnings(krate: &rypip::ConvertedCrate) {
+    for warning in &krate.warnings {
+        eprintln!("warning: {}", warning);
+    }
 }
 
 /// A stable scratch location for generated crates.

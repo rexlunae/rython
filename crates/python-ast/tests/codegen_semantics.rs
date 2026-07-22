@@ -348,3 +348,16 @@ fn annotation_ignored_when_body_can_fall_through() {
     let out = compile("def f(c) -> int:\n    if c:\n        return 1\n", "ann_partial.py");
     assert!(!out.contains("-> i64"), "generated: {}", out);
 }
+
+#[test]
+fn dropped_defaults_emit_call_site_warning() {
+    // Dropping a Python default is a semantic change; the generated function
+    // must carry a #[deprecated] note so consumer call sites are warned.
+    let out = compile("def f(x: int = 3) -> int:\n    return x\n", "warn_def.py");
+    assert!(out.contains("deprecated"), "generated: {}", out);
+    assert!(out.contains("were dropped"), "generated: {}", out);
+
+    // No defaults, no warning attribute.
+    let out = compile("def g(x: int) -> int:\n    return x\n", "no_warn.py");
+    assert!(!out.contains("deprecated"), "generated: {}", out);
+}
