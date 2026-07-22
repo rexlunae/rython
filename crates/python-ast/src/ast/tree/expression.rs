@@ -309,15 +309,14 @@ impl<'a> CodeGen for ExprType {
                     } else {
                         // Other starred expressions (not sys::argv)
                         Ok(quote! {
-                            vec![#(#final_elements.to_string()),*]
+                            vec![#(#final_elements),*]
                         })
                     }
                 } else {
-                    // For regular vector creation, ensure all elements are strings
-                    // Always convert to String for consistency and compatibility
-                    // Clone to avoid ownership issues
+                    // Elements keep their own types: [1, 2, 3] must become a
+                    // Vec<i64>, not a Vec<String>.
                     Ok(quote! {
-                        vec![#((#elements).clone().to_string()),*]
+                        vec![#(#elements),*]
                     })
                 }
             }
@@ -572,43 +571,13 @@ impl CodeGen for Expr {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        let _module_name = match ctx.clone() {
-            CodeGenContext::Module(name) => name,
-            _ => "unknown".to_string(),
-        };
-
-        match self.value.clone() {
-            ExprType::Await(a) => a.to_rust(ctx.clone(), options, symbols),
-            ExprType::BinOp(binop) => binop.to_rust(ctx.clone(), options, symbols),
-            ExprType::BoolOp(boolop) => boolop.to_rust(ctx.clone(), options, symbols),
-            ExprType::Call(call) => call.to_rust(ctx.clone(), options, symbols),
-            ExprType::Constant(constant) => constant.to_rust(ctx, options, symbols),
-            ExprType::Compare(compare) => compare.to_rust(ctx, options, symbols),
-            ExprType::Lambda(l) => l.to_rust(ctx, options, symbols),
-            ExprType::IfExp(i) => i.to_rust(ctx, options, symbols),
-            ExprType::Dict(d) => d.to_rust(ctx, options, symbols),
-            ExprType::Set(s) => s.to_rust(ctx, options, symbols),
-            ExprType::GeneratorExp(ge) => ge.to_rust(ctx, options, symbols),
-            ExprType::Tuple(t) => t.to_rust(ctx, options, symbols),
-            ExprType::Subscript(s) => s.to_rust(ctx, options, symbols),
-            ExprType::UnaryOp(operand) => operand.to_rust(ctx, options, symbols),
-            ExprType::List(l) => {
-                // Use the same logic as ExprType::List in the main match above
-                let expr_type = ExprType::List(l);
-                expr_type.to_rust(ctx, options, symbols)
-            }
-            ExprType::Name(name) => name.to_rust(ctx, options, symbols),
-            ExprType::Yield(y) => y.to_rust(ctx, options, symbols),
-            ExprType::YieldFrom(yf) => yf.to_rust(ctx, options, symbols),
-            ExprType::JoinedStr(js) => js.to_rust(ctx, options, symbols),
-            ExprType::FormattedValue(fv) => fv.to_rust(ctx, options, symbols),
-            // NoneType expressions generate no code.
-            ExprType::NoneType(_c) => Ok(quote!()),
-            _ => {
-                let error = err_from(ExprTypeNotYetImplemented(self.value));
-                Err(error.into())
-            }
+        // Delegate to the (complete) ExprType dispatch rather than keeping a
+        // second, drifting copy of the match here. NoneType statements
+        // generate no code.
+        if matches!(self.value, ExprType::NoneType(_)) {
+            return Ok(quote!());
         }
+        self.value.to_rust(ctx, options, symbols)
     }
 }
 

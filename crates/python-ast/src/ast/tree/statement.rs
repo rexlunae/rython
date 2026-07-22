@@ -322,7 +322,15 @@ impl CodeGen for StatementType {
             }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
             StatementType::AugAssign(a) => a.to_rust(ctx, options, symbols),
-            StatementType::Break => Ok(quote! {break;}),
+            StatementType::Break => {
+                // Inside a loop that has an `else` clause, breaking must also
+                // record that the loop did not complete normally.
+                if matches!(ctx, Self::Context::Loop { has_else: true, .. }) {
+                    Ok(quote! {{ __rython_broke = true; break; }})
+                } else {
+                    Ok(quote! {break;})
+                }
+            }
             StatementType::Call(c) => c.to_rust(ctx, options, symbols),
             StatementType::ClassDef(c) => c.to_rust(ctx, options, symbols),
             StatementType::Continue => Ok(quote! {continue;}),

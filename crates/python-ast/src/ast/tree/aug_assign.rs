@@ -96,7 +96,7 @@ impl CodeGen for AugAssign {
             BinOps::RShift => Ok(quote!(#target >>= #value)),
             BinOps::Pow => {
                 // Rust doesn't have **= operator, so we need to expand it
-                Ok(quote!(#target = (#target).pow(#value)))
+                Ok(quote!(#target = py_pow(#target, #value)))
             },
             BinOps::MatMult => {
                 // Matrix multiplication assignment - not directly supported in Rust

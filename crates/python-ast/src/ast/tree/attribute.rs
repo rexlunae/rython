@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, PyAny, FromPyObject, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
-use quote::{format_ident, quote};
+use quote::quote;
 
 use crate::{extraction_failure, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes};
 
@@ -46,7 +46,7 @@ impl<'a> CodeGen for Attribute {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
-        let attr = format_ident!("{}", self.attr);
+        let attr = crate::safe_ident(&self.attr);
         
         // Determine if this is a module access or a field/method access
         // Module names are typically lowercase and match Python stdlib modules

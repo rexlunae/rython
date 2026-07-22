@@ -153,9 +153,8 @@ impl CodeGen for Parameter {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        use quote::format_ident;
         
-        let param_name = format_ident!("{}", self.arg);
+        let param_name = crate::safe_ident(&self.arg);
         
         // Generate type annotation if present
         if let Some(annotation) = self.annotation {
@@ -244,7 +243,7 @@ impl CodeGen for Arguments {
                 let default_idx = i - defaults_offset;
                 let default_value = &self.defaults[default_idx];
                 let _default_rust = default_value.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                let param_name = quote::format_ident!("{}", arg.arg);
+                let param_name = crate::safe_ident(&arg.arg);
                 
                 if let Some(annotation) = &arg.annotation {
                     let rust_type = annotation.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -260,13 +259,13 @@ impl CodeGen for Arguments {
         
         // Process *args
         if let Some(vararg) = self.vararg {
-            let vararg_name = quote::format_ident!("{}", vararg.arg);
+            let vararg_name = crate::safe_ident(&vararg.arg);
             params.push(quote!(#vararg_name: impl IntoIterator<Item = impl Into<PyObject>>));
         }
         
         // Process keyword-only arguments
         for (i, arg) in self.kwonlyargs.into_iter().enumerate() {
-            let param_name = quote::format_ident!("{}", arg.arg);
+            let param_name = crate::safe_ident(&arg.arg);
             
             // Check if this keyword-only arg has a default
             let has_default = i < self.kw_defaults.len() && self.kw_defaults[i].is_some();
@@ -289,7 +288,7 @@ impl CodeGen for Arguments {
         
         // Process **kwargs
         if let Some(kwarg) = self.kwarg {
-            let kwarg_name = quote::format_ident!("{}", kwarg.arg);
+            let kwarg_name = crate::safe_ident(&kwarg.arg);
             params.push(quote!(#kwarg_name: impl IntoIterator<Item = (impl AsRef<str>, impl Into<PyObject>)>));
         }
         

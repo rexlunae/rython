@@ -75,7 +75,7 @@ impl CodeGen for If {
         if self.orelse.is_empty() {
             Ok(quote! {
                 if #test {
-                    #(#body_stmts)*
+                    #(#body_stmts;)*
                 }
             })
         } else {
@@ -87,9 +87,9 @@ impl CodeGen for If {
             
             Ok(quote! {
                 if #test {
-                    #(#body_stmts)*
+                    #(#body_stmts;)*
                 } else {
-                    #(#else_stmts)*
+                    #(#else_stmts;)*
                 }
             })
         }

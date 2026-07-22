@@ -341,6 +341,55 @@ pub fn divmod<T: PyDivMod>(a: T, b: T) -> (T, T) {
     (a.py_floordiv(b), a.py_mod(b))
 }
 
+/// Trait backing Python's `**` operator. Integer bases with non-negative
+/// integer exponents stay integers; anything involving a float is a float.
+pub trait PyPow<Rhs = Self> {
+    type Output;
+    fn py_pow(self, rhs: Rhs) -> Self::Output;
+}
+
+impl PyPow for i64 {
+    type Output = i64;
+    fn py_pow(self, rhs: i64) -> i64 {
+        if rhs < 0 {
+            // Python promotes to float here; an integer-typed context can't,
+            // so fail loudly rather than return a wrong integer.
+            panic!("integer ** negative exponent yields a float; use a float base");
+        }
+        self.checked_pow(rhs as u32)
+            .unwrap_or_else(|| panic!("{} ** {} overflows i64", self, rhs))
+    }
+}
+
+impl PyPow<i64> for f64 {
+    type Output = f64;
+    fn py_pow(self, rhs: i64) -> f64 {
+        self.powi(rhs as i32)
+    }
+}
+
+impl PyPow for f64 {
+    type Output = f64;
+    fn py_pow(self, rhs: f64) -> f64 {
+        self.powf(rhs)
+    }
+}
+
+impl PyPow<f64> for i64 {
+    type Output = f64;
+    fn py_pow(self, rhs: f64) -> f64 {
+        (self as f64).powf(rhs)
+    }
+}
+
+/// Python `**` (power). `py_pow(2, 10) == 1024`, `py_pow(2.0, -1) == 0.5`.
+pub fn py_pow<L, R>(a: L, b: R) -> L::Output
+where
+    L: PyPow<R>,
+{
+    a.py_pow(b)
+}
+
 /// Python round() builtin with no ndigits: rounds half to even (banker's
 /// rounding), so `round(2.5) == 2` and `round(3.5) == 4`.
 pub fn round(value: f64) -> i64 {

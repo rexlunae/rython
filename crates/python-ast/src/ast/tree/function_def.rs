@@ -1,7 +1,7 @@
 use tracing::debug;
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
-use quote::{format_ident, quote};
+use quote::quote;
 use serde::{Deserialize, Serialize};
 use crate::ast::tree::statement::PyStatementTrait;
 
@@ -61,7 +61,7 @@ impl CodeGen for FunctionDef {
         symbols: SymbolTableScopes,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
-        let fn_name = format_ident!("{}", self.name);
+        let fn_name = crate::safe_ident(&self.name);
 
         // The Python convention is that functions that begin with a single underscore,
         // it's private. Otherwise, it's public. We formalize that by default.
@@ -96,6 +96,15 @@ impl CodeGen for FunctionDef {
             streams.extend(quote!(;));
         }
 
+        // A best-effort return type: if every `return <value>` in the body
+        // returns a value of the same obviously-inferable type (int, float,
+        // bool, string literal, or f-string), annotate the function with it.
+        // Otherwise emit no annotation, as before.
+        let return_type = match self.inferred_return_type() {
+            Some(ty) => quote!(-> #ty),
+            None => quote!(),
+        };
+
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
             let doc_lines: Vec<_> = docstring
@@ -109,16 +118,16 @@ impl CodeGen for FunctionDef {
                     }
                 })
                 .collect();
-            
+
             quote! {
                 #(#doc_lines)*
-                #visibility #is_async fn #fn_name(#parameters) {
+                #visibility #is_async fn #fn_name(#parameters) #return_type {
                     #streams
                 }
             }
         } else {
             quote! {
-                #visibility #is_async fn #fn_name(#parameters) {
+                #visibility #is_async fn #fn_name(#parameters) #return_type {
                     #streams
                 }
             }
@@ -126,6 +135,115 @@ impl CodeGen for FunctionDef {
 
         debug!("function: {}", function);
         Ok(function)
+    }
+}
+
+/// Collect every `return` statement's value (None for a bare `return`)
+/// from a statement list, recursing into nested control-flow bodies but not
+/// into nested function or class definitions.
+fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>>) {
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Return(value) => {
+                out.push(value.as_ref().map(|e| &e.value));
+            }
+            StatementType::If(s) => {
+                collect_returns(&s.body, out);
+                collect_returns(&s.orelse, out);
+            }
+            StatementType::For(s) => {
+                collect_returns(&s.body, out);
+                collect_returns(&s.orelse, out);
+            }
+            StatementType::While(s) => {
+                collect_returns(&s.body, out);
+                collect_returns(&s.orelse, out);
+            }
+            StatementType::With(s) => collect_returns(&s.body, out),
+            StatementType::AsyncWith(s) => collect_returns(&s.body, out),
+            StatementType::AsyncFor(s) => collect_returns(&s.body, out),
+            // Nested defs/classes have their own return scopes; everything
+            // else contains no return statements we care about.
+            _ => {}
+        }
+    }
+}
+
+/// Map an expression to an obviously-inferable Rust type, if any.
+fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
+    match expr {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+            Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
+            Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
+            // A string constant lowers to a &'static str literal.
+            Some(litrs::Literal::String(_)) => Some(quote!(&'static str)),
+            _ => None,
+        },
+        ExprType::JoinedStr(_) => Some(quote!(String)),
+        _ => None,
+    }
+}
+
+/// Collect `name = <simply-typed constant>` assignments (recursing into
+/// control-flow bodies) so returns of those names can be inferred too.
+fn collect_local_types(
+    body: &[Statement],
+    out: &mut std::collections::HashMap<String, TokenStream>,
+) {
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Assign(assign) => {
+                if let [ExprType::Name(name)] = assign.targets.as_slice() {
+                    if let Some(ty) = simple_expr_type(&assign.value) {
+                        out.insert(name.id.clone(), ty);
+                    }
+                }
+            }
+            StatementType::If(s) => {
+                collect_local_types(&s.body, out);
+                collect_local_types(&s.orelse, out);
+            }
+            StatementType::For(s) => {
+                collect_local_types(&s.body, out);
+                collect_local_types(&s.orelse, out);
+            }
+            StatementType::While(s) => {
+                collect_local_types(&s.body, out);
+                collect_local_types(&s.orelse, out);
+            }
+            StatementType::With(s) => collect_local_types(&s.body, out),
+            _ => {}
+        }
+    }
+}
+
+impl FunctionDef {
+    /// Infer a return type when every return value in the body maps to the
+    /// same simple type — either directly (a constant or f-string) or via a
+    /// local variable assigned a constant. Mixed, absent, or uninferable
+    /// returns yield None.
+    fn inferred_return_type(&self) -> Option<TokenStream> {
+        let mut returns = Vec::new();
+        collect_returns(&self.body, &mut returns);
+
+        let mut locals = std::collections::HashMap::new();
+        collect_local_types(&self.body, &mut locals);
+
+        let mut inferred: Option<TokenStream> = None;
+        for ret in &returns {
+            let value = (*ret)?; // a bare `return` means the type is unit
+            let ty = match value {
+                ExprType::Name(name) => locals.get(&name.id)?.clone(),
+                other => simple_expr_type(other)?,
+            };
+            match &inferred {
+                None => inferred = Some(ty),
+                Some(prev) if prev.to_string() == ty.to_string() => {}
+                _ => return None,
+            }
+        }
+        inferred
     }
 }
 

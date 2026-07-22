@@ -102,23 +102,12 @@ impl<'a> CodeGen for Call {
             call_expr
         };
         
-        match ctx {
-            CodeGenContext::Async(_) => {
-                // In async context, we assume Python async functions need .await
-                // We'll check if the function name suggests it's async
-                if name_str.contains("async") || 
-                   name_str.starts_with("a") || // Common async function naming
-                   // TODO: Better async function detection based on symbol table
-                   false {
-                    Ok(quote!(#final_call.await))
-                } else {
-                    // For now, just return the regular call
-                    // In a full implementation, we'd track which functions are async
-                    Ok(final_call)
-                }
-            },
-            _ => Ok(final_call)
-        }
+        // `.await` is added only by an explicit `await` expression (the Await
+        // node), mirroring Python: calling an async function without await
+        // does not implicitly run it. The old behavior appended `.await` to
+        // any call whose name started with "a" in async contexts, which broke
+        // calls like abs(x).
+        Ok(final_call)
     }
 }
 

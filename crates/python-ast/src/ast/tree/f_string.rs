@@ -122,21 +122,100 @@ impl CodeGen for JoinedStr {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Generate each part of the f-string
-        let part_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.values.into_iter()
-            .map(|val| val.to_rust(ctx.clone(), options.clone(), symbols.clone()))
-            .collect();
-        let part_tokens = part_tokens?;
+        // Build a single format! call: literal parts go into the format
+        // string (with `{`/`}` escaped), interpolated parts each get a
+        // placeholder and become an argument.
+        let mut fmt = String::new();
+        let mut args: Vec<TokenStream> = Vec::new();
 
-        // For now, generate a simple format! macro call
-        // This is a simplified translation - real f-strings are more complex
-        if part_tokens.is_empty() {
+        for val in self.values {
+            match val {
+                ExprType::Constant(c) => {
+                    fmt.push_str(&escape_format_braces(&constant_text(&c)));
+                }
+                ExprType::FormattedValue(fv) => {
+                    let placeholder = fv.rust_placeholder();
+                    let expr = (*fv.value).to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    fmt.push_str(&placeholder);
+                    args.push(expr);
+                }
+                other => {
+                    let expr = other.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    fmt.push_str("{}");
+                    args.push(expr);
+                }
+            }
+        }
+
+        if fmt.is_empty() && args.is_empty() {
             Ok(quote! { String::new() })
         } else {
-            Ok(quote! {
-                format!("{}", #(#part_tokens)+*)
-            })
+            Ok(quote! { format!(#fmt #(, #args)*) })
         }
+    }
+}
+
+/// Recover the unescaped text of a string constant (its stored form is a
+/// quoted, escaped Rust literal).
+fn constant_text(c: &crate::Constant) -> String {
+    match &c.0 {
+        Some(litrs::Literal::String(s)) => s.value().to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Escape literal braces so they survive inside a format! string.
+fn escape_format_braces(s: &str) -> String {
+    s.replace('{', "{{").replace('}', "}}")
+}
+
+impl FormattedValue {
+    /// Choose a Rust format placeholder for this interpolation: `!r`/`!a`
+    /// conversions map to `{:?}`, and a constant `.N f` format spec maps to
+    /// `{:.N}`. Anything else falls back to plain `{}` (lossy, but valid).
+    fn rust_placeholder(&self) -> String {
+        // Python conversion codes are the ASCII values of 's', 'r', 'a'.
+        if matches!(self.conversion, Some(114) | Some(97)) {
+            return "{:?}".to_string();
+        }
+
+        if let Some(spec) = &self.format_spec {
+            if let Some(spec_text) = static_spec_text(spec) {
+                // Recognize [.precision][f] with an optional leading width we
+                // don't support; anything unrecognized falls back to {}.
+                let spec_text = spec_text.trim();
+                if let Some(rest) = spec_text.strip_prefix('.') {
+                    let digits: String =
+                        rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                    let tail = &rest[digits.len()..];
+                    if !digits.is_empty() && (tail.is_empty() || tail == "f") {
+                        return format!("{{:.{}}}", digits);
+                    }
+                }
+            }
+        }
+
+        "{}".to_string()
+    }
+}
+
+/// If a format spec is a purely constant expression, return its text.
+fn static_spec_text(spec: &ExprType) -> Option<String> {
+    match spec {
+        ExprType::Constant(c) => Some(constant_text(c)),
+        ExprType::JoinedStr(js) => {
+            let mut out = String::new();
+            for part in &js.values {
+                if let ExprType::Constant(c) = part {
+                    out.push_str(&constant_text(c));
+                } else {
+                    return None;
+                }
+            }
+            Some(out)
+        }
+        _ => None,
     }
 }
 

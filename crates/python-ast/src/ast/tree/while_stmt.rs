@@ -64,35 +64,43 @@ impl CodeGen for While {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let test = self.test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        
+
+        let has_else = !self.orelse.is_empty();
+        // Body statements compile inside a Loop context so `break` can honor
+        // the else clause; the test and else clause are outside the loop.
+        let body_ctx = crate::CodeGenContext::Loop {
+            has_else,
+            parent: Box::new(ctx.clone()),
+        };
         let body_stmts: Result<Vec<_>, _> = self.body
             .into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
-        
-        if self.orelse.is_empty() {
+
+        if !has_else {
             Ok(quote! {
                 while #test {
-                    #(#body_stmts)*
+                    #(#body_stmts;)*
                 }
             })
         } else {
-            // Note: Rust doesn't have while-else, so we need to track completion
+            // Python's while/else: the else clause runs iff the loop exited
+            // because the condition became false, not via `break`.
             let else_stmts: Result<Vec<_>, _> = self.orelse
                 .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
-            
+
             Ok(quote! {
                 {
-                    let mut broke = false;
+                    let mut __rython_broke = false;
                     while #test {
-                        #(#body_stmts)*
+                        #(#body_stmts;)*
                     }
-                    if !broke {
-                        #(#else_stmts)*
+                    if !__rython_broke {
+                        #(#else_stmts;)*
                     }
                 }
             })

@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use pyo3::{FromPyObject, PyErr};
-use quote::{format_ident, quote};
+use quote::quote;
 
 use crate::{CodeGen, CodeGenContext, IsIdentifier, PythonOptions, SymbolTableScopes};
 
@@ -87,10 +87,10 @@ impl CodeGen for Name {
         // Handle dotted names (like "os.path") by converting them to Rust module paths
         if self.id.contains('.') {
             let parts: Vec<&str> = self.id.split('.').collect();
-            let idents: Vec<_> = parts.iter().map(|part| format_ident!("{}", part)).collect();
+            let idents: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
             Ok(quote!(#(#idents)::*))
         } else {
-            let name = format_ident!("{}", self.id);
+            let name = crate::safe_ident(&self.id);
             Ok(quote!(#name))
         }
     }

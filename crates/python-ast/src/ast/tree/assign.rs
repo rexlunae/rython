@@ -67,28 +67,38 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let mut target_streams = Vec::new();
-        
-        // Convert each target to Rust code
-        for target in self.targets {
-            let target_code = target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            target_streams.push(target_code);
-        }
-        
-        let value = self.value.to_rust(ctx, options, symbols)?;
-        
-        // For single target assignment
-        if target_streams.len() == 1 {
-            let target = &target_streams[0];
-            // Check if this is a new variable declaration or reassignment
-            // For now, we'll use `let` for new declarations
-            Ok(quote!(let #target = #value;))
-        } else {
-            // For multiple assignment targets like: a, b = 1, 2
-            // Use tuple destructuring in Rust
-            Ok(quote! {
-                let (#(#target_streams),*) = #value;
+        let value = self
+            .value
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+        // Render one binding for a single target. Python variables are
+        // mutable, so plain names bind with `let mut`; attribute/subscript
+        // targets are assignments to existing places, not new bindings, and
+        // tuple targets destructure.
+        let render_one = |target: &ExprType,
+                          value: &TokenStream|
+         -> Result<TokenStream, Box<dyn std::error::Error>> {
+            let target_code =
+                target
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            Ok(match target {
+                ExprType::Name(_) => quote!(let mut #target_code = #value;),
+                ExprType::Tuple(_) => quote!(let (#target_code) = #value;),
+                _ => quote!(#target_code = #value;),
             })
+        };
+
+        if self.targets.len() == 1 {
+            render_one(&self.targets[0], &value)
+        } else {
+            // Chained assignment (`a = b = expr`): Python evaluates the value
+            // once and assigns it to each target in turn.
+            let mut stream = quote!(let __rython_chain = #value;);
+            for target in &self.targets {
+                stream.extend(render_one(target, &quote!(__rython_chain.clone()))?);
+            }
+            Ok(stream)
         }
     }
 }

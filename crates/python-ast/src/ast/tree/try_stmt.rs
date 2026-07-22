@@ -168,7 +168,7 @@ impl CodeGen for Try {
                 // In a real implementation, you'd want to match specific exception types
                 Ok::<TokenStream, Box<dyn std::error::Error>>(quote! {
                     // Exception handler - simplified translation
-                    #(#handler_body_tokens)*
+                    #(#handler_body_tokens;)*
                 })
             })
             .collect();
@@ -182,7 +182,7 @@ impl CodeGen for Try {
             let else_body_tokens = else_body_tokens?;
             quote! {
                 // Else clause (executed when no exception occurs)
-                #(#else_body_tokens)*
+                #(#else_body_tokens;)*
             }
         } else {
             quote!()
@@ -196,7 +196,7 @@ impl CodeGen for Try {
             let finally_body_tokens = finally_body_tokens?;
             quote! {
                 // Finally clause (always executed)
-                #(#finally_body_tokens)*
+                #(#finally_body_tokens;)*
             }
         } else {
             quote!()
@@ -208,7 +208,7 @@ impl CodeGen for Try {
             {
                 // Try block - simplified translation to Rust
                 // Python's exception handling doesn't map directly to Rust's Result/Option patterns
-                #(#try_body_tokens)*
+                #(#try_body_tokens;)*
                 
                 // Catch blocks (simplified)
                 #(#catch_blocks)*

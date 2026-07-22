@@ -105,7 +105,7 @@ fn ann_assign_compiles_as_assignment() {
         )
         .expect("codegen succeeds");
     let out = rust.to_string();
-    assert!(out.contains("let x = 5"), "generated: {}", out);
+    assert!(out.contains("let mut x = 5"), "generated: {}", out);
 }
 
 /// A bare annotation (`x: int`) has no runtime effect and must not error.
