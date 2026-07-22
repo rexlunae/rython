@@ -109,15 +109,21 @@ impl CodeGen for FunctionDef {
         // reflects the type the body actually produces — e.g. a string
         // literal is a &'static str even under a `-> str` annotation); an
         // explicit annotation with a known Rust mapping is the fallback for
-        // bodies inference can't see through. `-> None` and unmappable
+        // bodies inference can't see through. Both require the body to
+        // return on every path: a fall-through path yields `()`, which no
+        // concrete annotation can type. `-> None` and unmappable
         // annotations emit no annotation.
-        let annotated = self.returns.as_deref().and_then(|ann| {
-            if matches!(ann, ExprType::NoneType(_)) {
-                None
-            } else {
-                crate::python_annotation_to_rust_type(ann)
-            }
-        });
+        let annotated = if guarantees_return(&self.body) {
+            self.returns.as_deref().and_then(|ann| {
+                if matches!(ann, ExprType::NoneType(_)) {
+                    None
+                } else {
+                    crate::python_annotation_to_rust_type(ann)
+                }
+            })
+        } else {
+            None
+        };
         let return_type = match self.inferred_return_type().or(annotated) {
             Some(ty) => quote!(-> #ty),
             None => quote!(),

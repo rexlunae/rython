@@ -340,3 +340,11 @@ fn kwonly_annotated_parameter_maps_type() {
     assert!(out.contains("x : i64"), "generated: {}", out);
     assert!(!out.contains(": int"), "generated: {}", out);
 }
+
+#[test]
+fn annotation_ignored_when_body_can_fall_through() {
+    // A return annotation must not be applied when a path can reach the end
+    // of the function without returning (the implicit tail is `()`).
+    let out = compile("def f(c) -> int:\n    if c:\n        return 1\n", "ann_partial.py");
+    assert!(!out.contains("-> i64"), "generated: {}", out);
+}
