@@ -330,7 +330,12 @@ fn bindable_signature(
     func: &python_ast::FunctionDef,
 ) -> Option<(Vec<TokenStream>, Vec<TokenStream>, Option<TokenStream>)> {
     // Keep to plain positional parameters.
-    if func.args.vararg.is_some() || !func.args.kwonlyargs.is_empty() {
+    if func.args.vararg.is_some()
+        || !func.args.kwonlyargs.is_empty()
+        || !func.args.posonlyargs.is_empty()
+        || !func.args.defaults.is_empty()
+        || func.args.kwarg.is_some()
+    {
         return None;
     }
     let mut params = Vec::new();
