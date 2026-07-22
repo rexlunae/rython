@@ -105,26 +105,7 @@ impl CodeGen for FunctionDef {
             streams.extend(quote!(;));
         }
 
-        // Best-effort return type. Inference from the body comes first (it
-        // reflects the type the body actually produces — e.g. a string
-        // literal is a &'static str even under a `-> str` annotation); an
-        // explicit annotation with a known Rust mapping is the fallback for
-        // bodies inference can't see through. Both require the body to
-        // return on every path: a fall-through path yields `()`, which no
-        // concrete annotation can type. `-> None` and unmappable
-        // annotations emit no annotation.
-        let annotated = if guarantees_return(&self.body) {
-            self.returns.as_deref().and_then(|ann| {
-                if matches!(ann, ExprType::NoneType(_)) {
-                    None
-                } else {
-                    crate::python_annotation_to_rust_type(ann)
-                }
-            })
-        } else {
-            None
-        };
-        let return_type = match self.inferred_return_type().or(annotated) {
+        let return_type = match self.resolved_return_type() {
             Some(ty) => quote!(-> #ty),
             None => quote!(),
         };
@@ -279,6 +260,33 @@ fn guarantees_return(body: &[Statement]) -> bool {
 }
 
 impl FunctionDef {
+    /// The return type the generated Rust function actually carries, if any.
+    ///
+    /// Inference from the body comes first (it reflects the type the body
+    /// actually produces — e.g. a string literal is a &'static str even
+    /// under a `-> str` annotation); an explicit annotation with a known
+    /// Rust mapping is the fallback for bodies inference can't see through.
+    /// Both require the body to return on every path: a fall-through path
+    /// yields `()`, which no concrete annotation can type. `-> None` and
+    /// unmappable annotations yield None.
+    ///
+    /// Tools generating call-through code (e.g. PyO3 wrappers) must use this
+    /// same method so their signatures match the generated function.
+    pub fn resolved_return_type(&self) -> Option<TokenStream> {
+        let annotated = if guarantees_return(&self.body) {
+            self.returns.as_deref().and_then(|ann| {
+                if matches!(ann, ExprType::NoneType(_)) {
+                    None
+                } else {
+                    crate::python_annotation_to_rust_type(ann)
+                }
+            })
+        } else {
+            None
+        };
+        self.inferred_return_type().or(annotated)
+    }
+
     /// Names of parameters whose Python default values cannot be carried
     /// into the generated Rust signature (Rust has no default arguments).
     /// Used to attach a call-site warning to the generated function and to

@@ -380,13 +380,11 @@ fn bindable_signature(
         params.push(quote!(#name: #ty));
         names.push(quote!(#name));
     }
-    // Return type: body inference first (mirrors the generated signature),
-    // then the annotation; a function with neither binds as returning unit.
-    let ret = func.inferred_return_type().or_else(|| {
-        func.returns
-            .as_deref()
-            .and_then(python_annotation_to_rust_type)
-    });
+    // The wrapper's return type must be exactly what the generated function
+    // carries — resolved_return_type is the single source of truth (it gates
+    // annotations on all-paths-return, so a function that can fall through
+    // binds as returning unit, matching the generated `()`).
+    let ret = func.resolved_return_type();
     Some((params, names, ret))
 }
 

@@ -54,6 +54,9 @@ fn write_sample_package(root: &Path) {
             "    for i in [1, 2, 3]:\n",
             "        total += i\n",
             "    return total\n",
+            "\n",
+            "def log_it(n: int) -> int:\n",
+            "    print(n)\n",
         ),
     )
     .unwrap();
@@ -221,6 +224,15 @@ fn pyo3_conversion_generates_bindings() {
     assert!(
         bindings.contains("fn excited() -> String"),
         "zero-arg function with inferable return should be bound: {}",
+        bindings
+    );
+
+    // log_it's `-> int` annotation is ignored by the function generator
+    // because the body can fall through; the wrapper must agree, or the
+    // generated crate won't compile.
+    assert!(
+        bindings.contains("fn log_it(n: i64)") && !bindings.contains("fn log_it(n: i64) -> i64"),
+        "wrapper return type must match the generated function, not the annotation: {}",
         bindings
     );
 
