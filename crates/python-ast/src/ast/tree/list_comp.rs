@@ -222,6 +222,53 @@ impl Node for DictComp {
     fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
 
+/// Lower a comprehension's generator clauses into nested `for` loops around
+/// `inner`, binding each generator's real target name (so the element and
+/// condition expressions can reference it) and applying `if` guards with
+/// `continue`. Generators nest left-to-right, matching Python's evaluation
+/// order, and later generators may reference earlier targets.
+fn build_comprehension_loops(
+    generators: &[Comprehension],
+    inner: TokenStream,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let mut acc = inner;
+    for generator in generators.iter().rev() {
+        let target = generator
+            .target
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let iter_expr = generator
+            .iter
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let conditions: Result<Vec<_>, _> = generator
+            .ifs
+            .iter()
+            .map(|if_expr| {
+                if_expr
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+            })
+            .collect();
+        let conditions = conditions?;
+        let guard = if conditions.is_empty() {
+            quote!()
+        } else {
+            quote! { if !( #((#conditions))&&* ) { continue; } }
+        };
+        acc = quote! {
+            for #target in #iter_expr {
+                #guard
+                #acc
+            }
+        };
+    }
+    Ok(acc)
+}
+
 impl CodeGen for ListComp {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -243,38 +290,21 @@ impl CodeGen for ListComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // For now, generate a simple Vec collection since Rust doesn't have list comprehensions
-        // This is a simplified translation that doesn't handle all cases
-        if self.generators.len() == 1 {
-            let generator = &self.generators[0];
-            let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let iter_expr = generator.iter.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            
-            if generator.ifs.is_empty() {
-                // Simple case: [expr for x in iter] -> iter.map(|x| expr).collect()
-                Ok(quote! {
-                    (#iter_expr).into_iter().map(|_item| #elt).collect::<Vec<_>>()
-                })
-            } else {
-                // With conditions: [expr for x in iter if cond] -> iter.filter(cond).map(expr).collect()
-                let conditions: Result<Vec<_>, _> = generator.ifs.iter()
-                    .map(|if_expr| if_expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                    .collect();
-                let conditions = conditions?;
-                Ok(quote! {
-                    (#iter_expr).into_iter()
-                        .filter(|_item| { #(#conditions)&&* })
-                        .map(|_item| #elt)
-                        .collect::<Vec<_>>()
-                })
+        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let loops = build_comprehension_loops(
+            &self.generators,
+            quote! { __rython_comp.push(#elt); },
+            &ctx,
+            &options,
+            &symbols,
+        )?;
+        Ok(quote! {
+            {
+                let mut __rython_comp = Vec::new();
+                #loops
+                __rython_comp
             }
-        } else {
-            // Multiple generators would need nested iteration - this is complex
-            // For now, return a placeholder
-            Ok(quote! {
-                vec![] // Complex list comprehension with multiple generators not fully supported
-            })
-        }
+        })
     }
 }
 
@@ -299,38 +329,21 @@ impl CodeGen for SetComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // For now, generate a simple HashSet collection since Rust doesn't have set comprehensions
-        // This is a simplified translation that doesn't handle all cases
-        if self.generators.len() == 1 {
-            let generator = &self.generators[0];
-            let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let iter_expr = generator.iter.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            
-            if generator.ifs.is_empty() {
-                // Simple case: {expr for x in iter} -> iter.map(|x| expr).collect()
-                Ok(quote! {
-                    (#iter_expr).into_iter().map(|_item| #elt).collect::<std::collections::HashSet<_>>()
-                })
-            } else {
-                // With conditions: {expr for x in iter if cond} -> iter.filter(cond).map(expr).collect()
-                let conditions: Result<Vec<_>, _> = generator.ifs.iter()
-                    .map(|if_expr| if_expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                    .collect();
-                let conditions = conditions?;
-                Ok(quote! {
-                    (#iter_expr).into_iter()
-                        .filter(|_item| { #(#conditions)&&* })
-                        .map(|_item| #elt)
-                        .collect::<std::collections::HashSet<_>>()
-                })
+        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let loops = build_comprehension_loops(
+            &self.generators,
+            quote! { __rython_comp.insert(#elt); },
+            &ctx,
+            &options,
+            &symbols,
+        )?;
+        Ok(quote! {
+            {
+                let mut __rython_comp = std::collections::HashSet::new();
+                #loops
+                __rython_comp
             }
-        } else {
-            // Multiple generators would need nested iteration - this is complex
-            // For now, return a placeholder
-            Ok(quote! {
-                std::collections::HashSet::new() // Complex set comprehension with multiple generators not fully supported
-            })
-        }
+        })
     }
 }
 
@@ -355,37 +368,24 @@ impl CodeGen for GeneratorExp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // For now, generate a simple iterator since Rust doesn't have generator expressions
-        // This is a simplified translation that doesn't handle all cases
-        if self.generators.len() == 1 {
-            let generator = &self.generators[0];
-            let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let iter_expr = generator.iter.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            
-            if generator.ifs.is_empty() {
-                // Simple case: (expr for x in iter) -> iter.map(|x| expr)
-                Ok(quote! {
-                    (#iter_expr).into_iter().map(|_item| #elt)
-                })
-            } else {
-                // With conditions: (expr for x in iter if cond) -> iter.filter(cond).map(expr)
-                let conditions: Result<Vec<_>, _> = generator.ifs.iter()
-                    .map(|if_expr| if_expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                    .collect();
-                let conditions = conditions?;
-                Ok(quote! {
-                    (#iter_expr).into_iter()
-                        .filter(|_item| { #(#conditions)&&* })
-                        .map(|_item| #elt)
-                })
+        // Generator expressions are lowered eagerly (like a list
+        // comprehension) and then turned back into an iterator; Python's lazy
+        // evaluation is not modeled yet.
+        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let loops = build_comprehension_loops(
+            &self.generators,
+            quote! { __rython_comp.push(#elt); },
+            &ctx,
+            &options,
+            &symbols,
+        )?;
+        Ok(quote! {
+            {
+                let mut __rython_comp = Vec::new();
+                #loops
+                __rython_comp.into_iter()
             }
-        } else {
-            // Multiple generators would need nested iteration - this is complex
-            // For now, return a placeholder
-            Ok(quote! {
-                std::iter::empty() // Complex generator expression with multiple generators not fully supported
-            })
-        }
+        })
     }
 }
 
@@ -411,37 +411,22 @@ impl CodeGen for DictComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // For now, generate a simple HashMap collection since Rust doesn't have dict comprehensions
-        if self.generators.len() == 1 {
-            let generator = &self.generators[0];
-            let key = (*self.key).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let value = (*self.value).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let iter_expr = generator.iter.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            
-            if generator.ifs.is_empty() {
-                // Simple case: {k: v for x in iter} -> iter.map(|x| (k, v)).collect()
-                Ok(quote! {
-                    (#iter_expr).into_iter().map(|_item| (#key, #value)).collect::<std::collections::HashMap<_, _>>()
-                })
-            } else {
-                // With conditions: {k: v for x in iter if cond}
-                let conditions: Result<Vec<_>, _> = generator.ifs.iter()
-                    .map(|if_expr| if_expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                    .collect();
-                let conditions = conditions?;
-                Ok(quote! {
-                    (#iter_expr).into_iter()
-                        .filter(|_item| { #(#conditions)&&* })
-                        .map(|_item| (#key, #value))
-                        .collect::<std::collections::HashMap<_, _>>()
-                })
+        let key = (*self.key).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value = (*self.value).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let loops = build_comprehension_loops(
+            &self.generators,
+            quote! { __rython_comp.insert(#key, #value); },
+            &ctx,
+            &options,
+            &symbols,
+        )?;
+        Ok(quote! {
+            {
+                let mut __rython_comp = std::collections::HashMap::new();
+                #loops
+                __rython_comp
             }
-        } else {
-            // Multiple generators would need nested iteration - this is complex
-            Ok(quote! {
-                std::collections::HashMap::new() // Complex dict comprehension with multiple generators not fully supported
-            })
-        }
+        })
     }
 }
 

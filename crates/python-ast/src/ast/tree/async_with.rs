@@ -106,19 +106,34 @@ impl CodeGen for AsyncWith {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Generate body
+        // Evaluate each context manager and bind its `as` target, mirroring
+        // the synchronous `with` lowering (async __aenter__/__aexit__
+        // protocol semantics are not modeled yet).
+        let mut item_tokens = Vec::new();
+        for item in self.items {
+            let context_expr =
+                item.context_expr
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            match item.optional_vars {
+                Some(vars) => {
+                    let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    item_tokens.push(quote! { let mut #target = #context_expr; });
+                }
+                None => {
+                    item_tokens.push(quote! { let _ = #context_expr; });
+                }
+            }
+        }
+
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_tokens = body_tokens?;
 
-        // For now, generate a simplified async block
-        // In practice, this would need proper async context management
         Ok(quote! {
             {
-                // Async with block - simplified translation
-                // Python's async with doesn't map directly to Rust patterns
-                #(#body_tokens)*
+                #(#item_tokens)*
+                #(#body_tokens;)*
             }
         })
     }

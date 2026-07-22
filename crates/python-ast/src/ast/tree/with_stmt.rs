@@ -73,19 +73,36 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Generate body
+        // Evaluate each context manager and bind its `as` target (or a
+        // throwaway binding when there is none, so side effects still run).
+        // __enter__/__exit__ protocol semantics are not modeled yet, but the
+        // expression is no longer dropped and the target is in scope; Rust's
+        // Drop at end of block approximates __exit__ cleanup.
+        let mut item_tokens = Vec::new();
+        for item in self.items {
+            let context_expr =
+                item.context_expr
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            match item.optional_vars {
+                Some(vars) => {
+                    let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    item_tokens.push(quote! { let mut #target = #context_expr; });
+                }
+                None => {
+                    item_tokens.push(quote! { let _ = #context_expr; });
+                }
+            }
+        }
+
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_tokens = body_tokens?;
 
-        // For now, generate a simplified block
-        // In practice, this would need proper context management
         Ok(quote! {
             {
-                // With block - simplified translation
-                // Python's with doesn't map directly to Rust patterns
-                #(#body_tokens)*
+                #(#item_tokens)*
+                #(#body_tokens;)*
             }
         })
     }

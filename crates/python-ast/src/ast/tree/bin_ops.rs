@@ -143,11 +143,12 @@ impl CodeGen for BinOp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        // Special handling for Pow operator which needs different syntax
+        // Python's ** promotes based on operand types; route through the
+        // stdpython py_pow helper, which implements those semantics.
         if matches!(self.op, BinOps::Pow) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
-            return Ok(quote!((#left).pow(#right)));
+            return Ok(quote!(py_pow(#left, #right)));
         }
         
         // For Div, we need to cast to f64

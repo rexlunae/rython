@@ -25,7 +25,7 @@
 
 use proc_macro2::TokenStream;
 use pyo3::FromPyObject;
-use quote::{format_ident, quote};
+use quote::quote;
 
 use crate::{
     CodeGen, CodeGenContext, ExprType, Name, PythonOptions, Statement, StatementType,
@@ -62,7 +62,7 @@ impl CodeGen for ClassDef {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
-        let class_name = format_ident!("{}", self.name);
+        let class_name = crate::safe_ident(&self.name);
 
         // The Python convention is that functions that begin with a single underscore,
         // it's private. Otherwise, it's public. We formalize that by default.
@@ -80,11 +80,11 @@ impl CodeGen for ClassDef {
         let mut bases = TokenStream::new();
         if self.bases.len() > 0 {
             bases.extend(quote!(:));
-            let base_name = format_ident!("{}", self.bases[0].id);
+            let base_name = crate::safe_ident(&self.bases[0].id);
             bases.extend(quote!(#base_name::Cls));
             for base in &self.bases[1..] {
                 bases.extend(quote!(+));
-                let base_name = format_ident!("{}", base.id);
+                let base_name = crate::safe_ident(&base.id);
                 bases.extend(quote!(#base_name));
             }
         }

@@ -51,11 +51,19 @@ impl CodeGen for Lambda {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let args = self.args.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // Closure parameters must be bare names — `impl Trait` (which typed
+        // function parameters use) is illegal in closure position; Rust
+        // infers closure parameter types.
+        let params: Vec<_> = self
+            .args
+            .args
+            .iter()
+            .map(|param| crate::safe_ident(&param.arg))
+            .collect();
         let body = self.body.to_rust(ctx, options, symbols)?;
-        
+
         Ok(quote! {
-            |#args| #body
+            |#(#params),*| #body
         })
     }
 }

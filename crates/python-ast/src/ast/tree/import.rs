@@ -1,7 +1,7 @@
 use tracing::debug;
 use proc_macro2::TokenStream;
 use pyo3::FromPyObject;
-use quote::{format_ident, quote};
+use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableNode, SymbolTableScopes};
@@ -64,10 +64,10 @@ impl CodeGen for Import {
                     // Handle other imports normally
                     let names = if alias.name.contains('.') {
                         let parts: Vec<&str> = alias.name.split('.').collect();
-                        let idents: Vec<_> = parts.iter().map(|part| format_ident!("{}", part)).collect();
+                        let idents: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
                         quote!(#(#idents)::*)
                     } else {
-                        let single_name = format_ident!("{}", alias.name);
+                        let single_name = crate::safe_ident(&alias.name);
                         quote!(#single_name)
                     };
                     
@@ -76,7 +76,7 @@ impl CodeGen for Import {
                             quote! {use #names;}
                         }
                         Some(n) => {
-                            let name = format_ident!("{}", n);
+                            let name = crate::safe_ident(n);
                             quote! {use #names as #name;}
                         }
                     }
@@ -122,6 +122,35 @@ impl CodeGen for ImportFrom {
         _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         debug!("ctx: {:?}", ctx);
-        Ok(quote! {})
+
+        // `from X import y` must bring `y` into scope; previously this
+        // emitted nothing and later uses of `y` were undefined. Python
+        // stdlib modules are provided by the stdpython glob import, so map
+        // `from os import path` to `use os::path;` etc. Wildcard imports
+        // map to glob uses.
+        let module_path: Vec<_> = self
+            .module
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .map(crate::safe_ident)
+            .collect();
+
+        let mut tokens = TokenStream::new();
+        for alias in self.names.iter() {
+            if alias.name == "*" {
+                tokens.extend(quote! { use #(#module_path)::*::*; });
+                continue;
+            }
+            let name = crate::safe_ident(&alias.name);
+            let import = match &alias.asname {
+                None => quote! { use #(#module_path)::*::#name; },
+                Some(asname) => {
+                    let asname = crate::safe_ident(asname);
+                    quote! { use #(#module_path)::*::#name as #asname; }
+                }
+            };
+            tokens.extend(import);
+        }
+        Ok(tokens)
     }
 }

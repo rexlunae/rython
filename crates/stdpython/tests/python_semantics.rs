@@ -186,3 +186,23 @@ fn math_remainder_rounds_half_to_even() {
     // Python: math.remainder(7, 2) == -1.0 (quotient 3.5 rounds to 4)
     assert_eq!(stdpython::math::remainder(7.0, 2.0).unwrap(), -1.0);
 }
+
+#[test]
+fn py_pow_matches_python() {
+    // Python: 2 ** 10 == 1024 (int stays int)
+    assert_eq!(py_pow(2i64, 10i64), 1024);
+    assert_eq!(py_pow(-2i64, 3i64), -8);
+    assert_eq!(py_pow(5i64, 0i64), 1);
+    // Python: 2.0 ** -1 == 0.5
+    assert_eq!(py_pow(2.0f64, -1i64), 0.5);
+    // Python: 9 ** 0.5 == 3.0
+    assert_eq!(py_pow(9i64, 0.5f64), 3.0);
+    // Python: 2.5 ** 2.0 == 6.25
+    assert_eq!(py_pow(2.5f64, 2.0f64), 6.25);
+}
+
+#[test]
+#[should_panic(expected = "negative exponent")]
+fn py_pow_int_negative_exponent_fails_loudly() {
+    let _ = py_pow(2i64, -1i64);
+}

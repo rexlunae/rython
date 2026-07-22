@@ -80,42 +80,61 @@ impl CodeGen for AsyncFor {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Generate iter expression
-        let _iter_expr = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        
-        // Generate body
+        let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let iter_expr = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+        let has_else = !self.orelse.is_empty();
+        // Break-tracking is only needed when a break belonging to this loop
+        // could skip the else clause.
+        let tracks_break = has_else && crate::loop_body_has_direct_break(&self.body);
+        let body_ctx = crate::CodeGenContext::Loop {
+            has_else: tracks_break,
+            parent: Box::new(ctx.clone()),
+        };
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_tokens = body_tokens?;
 
-        // Generate else clause if present
-        let else_tokens = if !self.orelse.is_empty() {
+        // Full `async for` semantics need an async-stream protocol; until
+        // then, iterate the expression synchronously. This preserves the
+        // loop's iteration and target binding (previously the body ran once
+        // and the iterator was discarded entirely).
+        if !has_else {
+            Ok(quote! {
+                for #target in #iter_expr {
+                    #(#body_tokens;)*
+                }
+            })
+        } else {
             let else_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.orelse.into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_body_tokens = else_body_tokens?;
-            quote! {
-                // Else clause (executed when loop completes normally)
-                #(#else_body_tokens)*
+            if tracks_break {
+                Ok(quote! {
+                    {
+                        let mut __rython_broke = false;
+                        for #target in #iter_expr {
+                            #(#body_tokens;)*
+                        }
+                        if !__rython_broke {
+                            #(#else_body_tokens;)*
+                        }
+                    }
+                })
+            } else {
+                // No break can skip the else clause; run it unconditionally.
+                Ok(quote! {
+                    {
+                        for #target in #iter_expr {
+                            #(#body_tokens;)*
+                        }
+                        #(#else_body_tokens;)*
+                    }
+                })
             }
-        } else {
-            quote!()
-        };
-
-        // For now, generate a simplified async iteration
-        // In practice, this would need proper async stream handling
-        Ok(quote! {
-            {
-                // Async for loop - simplified translation  
-                // Python's async for doesn't map directly to Rust's async streams
-                // This would typically use futures::stream::StreamExt
-                #(#body_tokens)*
-                
-                // Else clause
-                #else_tokens
-            }
-        })
+        }
     }
 }
 

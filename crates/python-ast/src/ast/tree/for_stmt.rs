@@ -73,40 +73,62 @@ impl CodeGen for For {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let iter = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        
+
+        let has_else = !self.orelse.is_empty();
+        // Break-tracking is only needed when the else clause could be skipped
+        // by a break belonging to this loop; otherwise the flag would be
+        // declared mutable but never written.
+        let tracks_break = has_else && crate::loop_body_has_direct_break(&self.body);
+        // Body statements compile inside a Loop context so `break` can honor
+        // the else clause; the else clause itself is outside the loop.
+        let body_ctx = crate::CodeGenContext::Loop {
+            has_else: tracks_break,
+            parent: Box::new(ctx.clone()),
+        };
         let body_stmts: Result<Vec<_>, _> = self.body
             .into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
-        
-        if self.orelse.is_empty() {
+
+        if !has_else {
             Ok(quote! {
                 for #target in #iter {
-                    #(#body_stmts)*
+                    #(#body_stmts;)*
                 }
             })
         } else {
-            // Note: Rust doesn't have for-else, so we need to track completion
+            // Python's for/else: the else clause runs iff the loop finished
+            // without hitting `break` (which sets __rython_broke).
             let else_stmts: Result<Vec<_>, _> = self.orelse
                 .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
-            
-            Ok(quote! {
-                {
-                    let mut completed = true;
-                    for #target in #iter {
-                        #(#body_stmts)*
-                        completed = false;
-                        break;
+
+            if tracks_break {
+                Ok(quote! {
+                    {
+                        let mut __rython_broke = false;
+                        for #target in #iter {
+                            #(#body_stmts;)*
+                        }
+                        if !__rython_broke {
+                            #(#else_stmts;)*
+                        }
                     }
-                    if completed {
-                        #(#else_stmts)*
+                })
+            } else {
+                // No break can skip the else clause; run it unconditionally.
+                Ok(quote! {
+                    {
+                        for #target in #iter {
+                            #(#body_stmts;)*
+                        }
+                        #(#else_stmts;)*
                     }
-                }
-            })
+                })
+            }
         }
     }
 }

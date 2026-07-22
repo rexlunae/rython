@@ -15,4 +15,11 @@ pub enum CodeGenContext {
     Class,
     Function,
     Async(Box<CodeGenContext>),
+    /// Directly inside a loop body. `has_else` is true when the loop carries
+    /// a Python `else` clause, in which case `break` statements must also set
+    /// the `__rython_broke` flag the loop lowering declares.
+    Loop {
+        has_else: bool,
+        parent: Box<CodeGenContext>,
+    },
 }
