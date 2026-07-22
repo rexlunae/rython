@@ -322,3 +322,21 @@ fn sibling_from_import_anchors_to_crate() {
     let out = compile("from helpers import util", "imp4.py");
     assert!(out.contains("use crate :: helpers :: util ;"), "generated: {}", out);
 }
+
+#[test]
+fn defaulted_annotated_parameter_maps_type() {
+    // Defaulted parameters lower to plain required parameters with mapped
+    // types (never the raw Python name, and no Option wrapper, which
+    // type-checked against neither bodies nor call sites).
+    let out = compile("def f(x: int = 0):\n    return x\n", "def_param.py");
+    assert!(out.contains("x : i64"), "generated: {}", out);
+    assert!(!out.contains("Option"), "generated: {}", out);
+    assert!(!out.contains(": int"), "generated: {}", out);
+}
+
+#[test]
+fn kwonly_annotated_parameter_maps_type() {
+    let out = compile("def f(*, x: int):\n    pass\n", "kwonly.py");
+    assert!(out.contains("x : i64"), "generated: {}", out);
+    assert!(!out.contains(": int"), "generated: {}", out);
+}

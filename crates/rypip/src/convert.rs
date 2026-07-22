@@ -329,12 +329,16 @@ fn generate_bindings(package: &PyPackage, transpiled: &[(&PyModule, String)]) ->
 fn bindable_signature(
     func: &python_ast::FunctionDef,
 ) -> Option<(Vec<TokenStream>, Vec<TokenStream>, Option<TokenStream>)> {
-    // Keep to plain positional parameters.
+    // Keep to plain positional parameters without defaults: *args/**kwargs
+    // and positional-only parameters add generated parameters this simple
+    // wrapper doesn't model, and defaulted parameters would lose their
+    // Python-side optionality (a #[pyo3(signature = ...)] attribute could
+    // lift that restriction later).
     if func.args.vararg.is_some()
+        || func.args.kwarg.is_some()
         || !func.args.kwonlyargs.is_empty()
         || !func.args.posonlyargs.is_empty()
         || !func.args.defaults.is_empty()
-        || func.args.kwarg.is_some()
     {
         return None;
     }

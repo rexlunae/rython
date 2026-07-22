@@ -58,6 +58,11 @@ fn write_sample_package(root: &Path) {
     )
     .unwrap();
     fs::write(
+        pkg.join("optional.py"),
+        "def with_default(n: int = 3) -> int:\n    return n\n",
+    )
+    .unwrap();
+    fs::write(
         pkg.join("cli.py"),
         concat!(
             "def run():\n",
@@ -81,7 +86,7 @@ fn discovers_package_metadata_and_modules() {
 
     let mut names: Vec<String> = pkg.modules.iter().map(|m| m.path.join(".")).collect();
     names.sort();
-    assert_eq!(names, vec!["", "cli", "greeting"]);
+    assert_eq!(names, vec!["", "cli", "greeting", "optional"]);
     assert!(pkg.entry_module().is_some(), "cli.py has a __main__ block");
 }
 
@@ -202,6 +207,19 @@ fn pyo3_conversion_generates_bindings() {
     assert!(
         bindings.contains("fn excited() -> String"),
         "zero-arg function with inferable return should be bound: {}",
+        bindings
+    );
+
+    // Functions with defaults can't be bound by the simple wrapper; they
+    // must be skipped (noted in the header), not emitted broken.
+    assert!(
+        !bindings.contains("fn with_default"),
+        "defaulted function must not be bound: {}",
+        bindings
+    );
+    assert!(
+        bindings.contains("optional.with_default"),
+        "skipped function should be listed: {}",
         bindings
     );
 

@@ -264,26 +264,15 @@ impl CodeGen for Arguments {
             params.push(param);
         }
         
-        // Process regular positional arguments with defaults
-        let defaults_offset = self.args.len().saturating_sub(self.defaults.len());
-        for (i, arg) in self.args.into_iter().enumerate() {
-            if i >= defaults_offset {
-                // This argument has a default value
-                let default_idx = i - defaults_offset;
-                let default_value = &self.defaults[default_idx];
-                let _default_rust = default_value.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                let param_name = crate::safe_ident(&arg.arg);
-                
-                if let Some(annotation) = &arg.annotation {
-                    let rust_type = annotation.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    params.push(quote!(#param_name: Option<#rust_type>));
-                } else {
-                    params.push(quote!(#param_name: Option<impl Into<PyObject>>));
-                }
-            } else {
-                let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                params.push(param);
-            }
+        // Process regular positional arguments. Defaulted parameters lower
+        // to plain required parameters: Rust has no default arguments, and
+        // the old Option<T> wrapping neither type-checked against bodies
+        // that use the parameter directly nor matched call sites (which
+        // never wrapped values in Some). Callers that omit the argument
+        // fail to compile either way; callers that pass it now work.
+        for arg in self.args {
+            let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            params.push(param);
         }
         
         // Process *args
@@ -292,27 +281,11 @@ impl CodeGen for Arguments {
             params.push(quote!(#vararg_name: impl IntoIterator<Item = impl Into<PyObject>>));
         }
         
-        // Process keyword-only arguments
-        for (i, arg) in self.kwonlyargs.into_iter().enumerate() {
-            let param_name = crate::safe_ident(&arg.arg);
-            
-            // Check if this keyword-only arg has a default
-            let has_default = i < self.kw_defaults.len() && self.kw_defaults[i].is_some();
-            
-            if let Some(annotation) = &arg.annotation {
-                let rust_type = annotation.as_ref().clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                if has_default {
-                    params.push(quote!(#param_name: Option<#rust_type>));
-                } else {
-                    params.push(quote!(#param_name: #rust_type));
-                }
-            } else {
-                if has_default {
-                    params.push(quote!(#param_name: Option<impl Into<PyObject>>));
-                } else {
-                    params.push(quote!(#param_name: impl Into<PyObject>));
-                }
-            }
+        // Process keyword-only arguments. Like positional defaults above,
+        // these lower to plain required parameters.
+        for arg in self.kwonlyargs {
+            let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            params.push(param);
         }
         
         // Process **kwargs
