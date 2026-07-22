@@ -39,12 +39,8 @@ impl CodeGen for NamedExpr {
         let left = self
             .left
             .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())
-            .expect(format!("parsing left side of named expression {:?}", self.left).as_str());
-        let right =
-            self.right.clone().to_rust(ctx, options, symbols).expect(
-                format!("parsing right side of named expression {:?}", self.right).as_str(),
-            );
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let right = self.right.clone().to_rust(ctx, options, symbols)?;
         Ok(quote!(#left = #right))
     }
 }

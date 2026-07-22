@@ -4,7 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{extraction_failure, 
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableNode,
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableNode,
     SymbolTableScopes,
 };
 
@@ -20,12 +20,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let targets: Vec<ExprType> = ob
             .getattr("targets")
-            .expect(
-                ob.error_message("<unknown>", "error getting assignment targets")
-                    .as_str(),
-            )
+            .map_err(|e| extraction_failure("assignment targets", &ob, e))?
             .extract()
-            .expect("extracting assignment targets");
+            .map_err(|e| extraction_failure("assignment targets", &ob, e))?;
 
         let python_value = ob.getattr("value").map_err(|e| extraction_failure("value", &ob, e))?;
 

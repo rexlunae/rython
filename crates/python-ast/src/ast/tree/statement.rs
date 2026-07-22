@@ -136,6 +136,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                     .map_err(|e| extraction_failure("assignment", &ob, e))?;
                 Ok(StatementType::Assign(assignment))
             }
+            "AnnAssign" => {
+                // An annotated assignment (`x: int = 5`) is an ordinary
+                // assignment with a type annotation we don't yet consume; a
+                // bare annotation (`x: int`) declares nothing at runtime.
+                let value = ob
+                    .getattr("value")
+                    .map_err(|e| extraction_failure("annotated assignment value", &ob, e))?;
+                if value.is_none() {
+                    return Ok(StatementType::Pass);
+                }
+                let target = ob
+                    .getattr("target")
+                    .map_err(|e| extraction_failure("annotated assignment target", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("annotated assignment target", &ob, e))?;
+                let value = value
+                    .extract()
+                    .map_err(|e| extraction_failure("annotated assignment value", &ob, e))?;
+                Ok(StatementType::Assign(Assign {
+                    targets: vec![target],
+                    value,
+                    type_comment: None,
+                }))
+            }
             "AugAssign" => {
                 let aug_assignment = AugAssign::extract(ob)
                     .map_err(|e| extraction_failure("augmented assignment", &ob, e))?;
@@ -293,9 +317,7 @@ impl CodeGen for StatementType {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         match self {
             StatementType::AsyncFunctionDef(s) => {
-                let func_def = s
-                    .to_rust(Self::Context::Async(Box::new(ctx)), options, symbols)
-                    .expect("Parsing async function");
+                let func_def = s.to_rust(Self::Context::Async(Box::new(ctx)), options, symbols)?;
                 Ok(quote!(#func_def))
             }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
@@ -311,10 +333,7 @@ impl CodeGen for StatementType {
             StatementType::Expr(s) => s.to_rust(ctx, options, symbols),
             StatementType::Return(None) => Ok(quote!(return)),
             StatementType::Return(Some(e)) => {
-                let exp = e
-                    .clone()
-                    .to_rust(ctx, options, symbols)
-                    .unwrap_or_else(|_| panic!("parsing expression {:#?}", e));
+                let exp = e.clone().to_rust(ctx, options, symbols)?;
                 Ok(quote!(return #exp))
             }
             StatementType::If(i) => i.to_rust(ctx, options, symbols),

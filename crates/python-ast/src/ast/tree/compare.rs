@@ -27,7 +27,7 @@ pub enum Compares {
 impl<'a, 'py> FromPyObject<'a, 'py> for Compares {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let err_msg = format!("Unimplemented unary op {}", dump(&ob, None)?);
+        let err_msg = format!("Unimplemented comparison operator {}", dump(&ob, None)?);
         Err(pyo3::exceptions::PyValueError::new_err(
             ob.error_message("<unknown>", err_msg),
         ))
@@ -137,7 +137,7 @@ impl CodeGen for Compare {
         for op in ops.iter() {
             let comparator = comparators
                 .get(index)
-                .expect("getting comparator")
+                .ok_or("comparison has more operators than comparators")?
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let tokens = match op {

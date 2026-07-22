@@ -61,9 +61,7 @@ pub fn sys_path() -> PyResult<Vec<String>> {
     Python::attach(|py| -> PyResult<Vec<String>> {
         let code_cstr = CString::new(pymodule_code)?;
         let pymodule = PyModule::from_code(py, &code_cstr, c"path.py", c"path")?;
-        let t = pymodule
-            .getattr("path")
-            .expect("Reading path variable from interpretter");
+        let t = pymodule.getattr("path")?;
         assert!(t.is_callable());
         let args = ();
         let paths: Vec<String> = t.call1(args)?.extract()?;
@@ -99,8 +97,12 @@ impl Default for PythonOptions {
     fn default() -> Self {
         Self {
             python_namespace: String::from("__python_namespace__"),
-            // XXX: Remove unwrap.
-            python_path: sys_path().unwrap(),
+            // Default must not panic: fall back to an empty search path if
+            // the embedded interpreter can't report sys.path.
+            python_path: sys_path().unwrap_or_else(|e| {
+                tracing::warn!("could not read Python sys.path: {}; using empty path", e);
+                Vec::new()
+            }),
             imports: BTreeMap::new(),
             scope: Scope::default(),
             stdpython: "stdpython".to_string(),

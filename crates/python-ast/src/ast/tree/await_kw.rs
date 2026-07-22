@@ -33,10 +33,7 @@ impl<'a> CodeGen for Await {
         _options: Self::Options,
         _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value = self
-            .value
-            .to_rust(_ctx, _options, _symbols)
-            .expect("Failed to convert async function to rust");
+        let value = self.value.to_rust(_ctx, _options, _symbols)?;
         Ok(quote!(#value.await))
     }
 }

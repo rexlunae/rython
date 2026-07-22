@@ -25,7 +25,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for While {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let test = ob.extract_attr_with_context("test", "while test condition")?;
-        let test = test.extract().expect("getting while test");
+        let test = test
+            .extract()
+            .map_err(|e| crate::extraction_failure("while condition", &ob, e))?;
         
         let body: Vec<Statement> = extract_list(&ob, "body", "while body statements")?;
         let orelse: Vec<Statement> = extract_list(&ob, "orelse", "while else statements")?;
