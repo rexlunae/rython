@@ -211,13 +211,13 @@ fn explicit_await_still_awaits() {
 #[test]
 fn from_import_brings_name_into_scope() {
     let out = compile("from os import path", "imp.py");
-    assert!(out.contains("use os :: path ;"), "generated: {}", out);
+    assert!(out.contains("use stdpython :: os :: path ;"), "generated: {}", out);
 }
 
 #[test]
 fn from_import_with_alias() {
     let out = compile("from os import path as p", "imp2.py");
-    assert!(out.contains("use os :: path as p ;"), "generated: {}", out);
+    assert!(out.contains("use stdpython :: os :: path as p ;"), "generated: {}", out);
 }
 
 #[test]
@@ -282,4 +282,43 @@ fn exhaustive_if_else_returns_get_annotation() {
     let src = "def f(c):\n    if c:\n        return 1\n    else:\n        return 2\n";
     let out = compile(src, "ret9.py");
     assert!(out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn annotated_parameters_map_to_rust_types() {
+    let out = compile("def f(a: int, b: float, c: str, d: bool):\n    pass\n", "ann_params.py");
+    assert!(out.contains("a : i64"), "generated: {}", out);
+    assert!(out.contains("b : f64"), "generated: {}", out);
+    assert!(out.contains("c : String"), "generated: {}", out);
+    assert!(out.contains("d : bool"), "generated: {}", out);
+    assert!(!out.contains(": int"), "generated: {}", out);
+}
+
+#[test]
+fn return_annotation_used_when_inference_fails() {
+    let out = compile("def f(x: int) -> int:\n    return x + 1\n", "ann_ret.py");
+    assert!(out.contains("-> i64"), "generated: {}", out);
+}
+
+#[test]
+fn string_repetition_uses_multiply_string() {
+    let out = compile("s = \"!\" * 3", "strmul.py");
+    assert!(out.contains("multiply_string"), "generated: {}", out);
+    let out = compile("s = 3 * \"!\"", "strmul2.py");
+    assert!(out.contains("multiply_string"), "generated: {}", out);
+    // Numeric multiplication is untouched.
+    let out = compile("n = 3 * 4", "nummul.py");
+    assert!(!out.contains("multiply_string"), "generated: {}", out);
+}
+
+#[test]
+fn stdlib_from_import_anchors_to_stdpython() {
+    let out = compile("from os import path", "imp3.py");
+    assert!(out.contains("use stdpython :: os :: path ;"), "generated: {}", out);
+}
+
+#[test]
+fn sibling_from_import_anchors_to_crate() {
+    let out = compile("from helpers import util", "imp4.py");
+    assert!(out.contains("use crate :: helpers :: util ;"), "generated: {}", out);
 }

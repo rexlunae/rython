@@ -6,6 +6,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableNode, SymbolTableScopes};
 
+/// Python stdlib modules that the stdpython runtime crate provides. Imports
+/// of these resolve under the runtime crate; anything else is assumed to be
+/// a sibling module of the generated crate.
+pub(crate) fn is_stdpython_module(name: &str) -> bool {
+    matches!(
+        name,
+        "os" | "sys"
+            | "json"
+            | "math"
+            | "random"
+            | "datetime"
+            | "collections"
+            | "itertools"
+            | "glob"
+            | "pathlib"
+            | "tempfile"
+            | "subprocess"
+            | "string"
+            | "sysconfig"
+            | "venv"
+    )
+}
+
 #[derive(Clone, Debug, FromPyObject, Serialize, Deserialize, PartialEq)]
 pub struct Alias {
     pub name: String,
@@ -124,29 +147,36 @@ impl CodeGen for ImportFrom {
         debug!("ctx: {:?}", ctx);
 
         // `from X import y` must bring `y` into scope; previously this
-        // emitted nothing and later uses of `y` were undefined. Python
-        // stdlib modules are provided by the stdpython glob import, so map
-        // `from os import path` to `use os::path;` etc. Wildcard imports
-        // map to glob uses.
-        let module_path: Vec<_> = self
+        // emitted nothing and later uses of `y` were undefined. `use` paths
+        // can't resolve through glob imports, so anchor the path explicitly:
+        // stdlib modules live under the stdpython runtime crate, and
+        // anything else is assumed to be a sibling module of the generated
+        // crate. Wildcard imports map to glob uses.
+        let parts: Vec<&str> = self
             .module
             .split('.')
             .filter(|part| !part.is_empty())
-            .map(crate::safe_ident)
             .collect();
+        let module_path: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
+        let root = if parts.first().is_some_and(|first| is_stdpython_module(first)) {
+            let runtime = crate::safe_ident(&_options.stdpython);
+            quote!(#runtime)
+        } else {
+            quote!(crate)
+        };
 
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
             if alias.name == "*" {
-                tokens.extend(quote! { use #(#module_path)::*::*; });
+                tokens.extend(quote! { use #root #(::#module_path)*::*; });
                 continue;
             }
             let name = crate::safe_ident(&alias.name);
             let import = match &alias.asname {
-                None => quote! { use #(#module_path)::*::#name; },
+                None => quote! { use #root #(::#module_path)*::#name; },
                 Some(asname) => {
                     let asname = crate::safe_ident(asname);
-                    quote! { use #(#module_path)::*::#name as #asname; }
+                    quote! { use #root #(::#module_path)*::#name as #asname; }
                 }
             };
             tokens.extend(import);

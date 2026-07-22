@@ -16,6 +16,8 @@ pub struct FunctionDef {
     pub args: ParameterList,
     pub body: Vec<Statement>,
     pub decorator_list: Vec<ExprType>,
+    /// The function's return annotation (`-> int`), if present.
+    pub returns: Option<Box<ExprType>>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
@@ -24,15 +26,22 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
         let name: String = ob.getattr("name")?.extract()?;
         let args: ParameterList = ob.getattr("args")?.extract()?;
         let body: Vec<Statement> = ob.getattr("body")?.extract()?;
-        
+
         // Extract decorator_list as Vec<ExprType>
         let decorator_list: Vec<ExprType> = ob.getattr("decorator_list")?.extract().unwrap_or_default();
-        
+
+        // Extract the return annotation, if any.
+        let returns: Option<Box<ExprType>> = match ob.getattr("returns") {
+            Ok(r) if !r.is_none() => r.extract().ok().map(Box::new),
+            _ => None,
+        };
+
         Ok(FunctionDef {
             name,
             args,
             body,
             decorator_list,
+            returns,
         })
     }
 }
@@ -96,11 +105,20 @@ impl CodeGen for FunctionDef {
             streams.extend(quote!(;));
         }
 
-        // A best-effort return type: if every `return <value>` in the body
-        // returns a value of the same obviously-inferable type (int, float,
-        // bool, string literal, or f-string), annotate the function with it.
-        // Otherwise emit no annotation, as before.
-        let return_type = match self.inferred_return_type() {
+        // Best-effort return type. Inference from the body comes first (it
+        // reflects the type the body actually produces — e.g. a string
+        // literal is a &'static str even under a `-> str` annotation); an
+        // explicit annotation with a known Rust mapping is the fallback for
+        // bodies inference can't see through. `-> None` and unmappable
+        // annotations emit no annotation.
+        let annotated = self.returns.as_deref().and_then(|ann| {
+            if matches!(ann, ExprType::NoneType(_)) {
+                None
+            } else {
+                crate::python_annotation_to_rust_type(ann)
+            }
+        });
+        let return_type = match self.inferred_return_type().or(annotated) {
             Some(ty) => quote!(-> #ty),
             None => quote!(),
         };
@@ -243,7 +261,7 @@ impl FunctionDef {
     /// returns (which implicitly return None on the fall-through path),
     /// mixed types, and uninferable values all yield None so the function
     /// stays unannotated, as before.
-    fn inferred_return_type(&self) -> Option<TokenStream> {
+    pub fn inferred_return_type(&self) -> Option<TokenStream> {
         // A function that can fall off the end must not get a concrete
         // return annotation: the implicit tail is `()`.
         if !guarantees_return(&self.body) {
