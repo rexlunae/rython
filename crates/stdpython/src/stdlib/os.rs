@@ -419,7 +419,17 @@ pub mod path {
             }
             let cwd = std::env::current_dir()
                 .map_err(|e| crate::runtime_error(format!("Failed to get current directory: {}", e)))?;
-            Ok(normpath(&format!("{}/{}", cwd.to_string_lossy(), p)))
+            // posixpath.join does not duplicate the separator when the base
+            // already ends in one — otherwise running from "/" would build
+            // "//p", which normpath deliberately preserves (POSIX
+            // two-leading-slash rule) where Python returns "/p".
+            let cwd = cwd.to_string_lossy();
+            let joined = if cwd.ends_with('/') {
+                format!("{}{}", cwd, p)
+            } else {
+                format!("{}/{}", cwd, p)
+            };
+            Ok(normpath(&joined))
         }
     }
 
