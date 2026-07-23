@@ -67,6 +67,8 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let value_is_none_early = crate::is_none_expr(&self.value);
+        let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
         let value = self
             .value
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -79,6 +81,11 @@ impl<'a> CodeGen for Assign {
         // binding inside nested blocks, silently dropping the store.
         // Class bodies are the exception: they aren't hoisted scopes.
         let in_class = matches!(ctx, CodeGenContext::Class);
+        // A name that holds an Option (assigned None on some path) wraps
+        // its non-None stores in Some, so both arms unify to Option<T> —
+        // unless the value is already an Option (dict.get, another optional
+        // name, an Optional-returning call), which stores through unchanged.
+        let value_is_none = value_is_none_early;
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -88,7 +95,16 @@ impl<'a> CodeGen for Assign {
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             Ok(match target {
                 ExprType::Name(_) if in_class => quote!(let mut #target_code = #value;),
-                ExprType::Name(_) => quote!(#target_code = #value;),
+                ExprType::Name(name) => {
+                    if !value_is_none
+                        && !value_yields_option
+                        && options.optional_names.contains(&name.id)
+                    {
+                        quote!(#target_code = Some(#value);)
+                    } else {
+                        quote!(#target_code = #value;)
+                    }
+                }
                 // Destructuring assignment to the hoisted names.
                 ExprType::Tuple(_) => quote!((#target_code) = #value;),
                 _ => quote!(#target_code = #value;),

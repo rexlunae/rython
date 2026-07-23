@@ -1034,6 +1034,123 @@ fn dict_comprehensions_build_ordered_pydicts() {
 }
 
 #[test]
+fn none_lowers_to_option() {
+    // x = None initializes an Option; later non-None stores wrap in Some
+    // so both arms unify to Option<T>.
+    let src = concat!(
+        "def f(items: list[int]) -> int:\n",
+        "    found = None\n",
+        "    for x in items:\n",
+        "        found = x\n",
+        "    if found is None:\n",
+        "        return -1\n",
+        "    return 0\n",
+    );
+    let out = compile(src, "opt.py");
+    assert!(out.contains("found = None"), "generated: {}", out);
+    assert!(out.contains("found = Some (x)"), "generated: {}", out);
+    assert!(out.contains("(found) . py_is_none ()"), "generated: {}", out);
+}
+
+#[test]
+fn optional_annotations_map_to_option() {
+    let out = compile(
+        "def f(tag: Optional[int], n: int | None) -> int:\n    return 0\n",
+        "optann.py",
+    );
+    assert!(out.contains("tag : Option < i64 >"), "generated: {}", out);
+    assert!(out.contains("n : Option < i64 >"), "generated: {}", out);
+}
+
+#[test]
+fn optional_parameters_wrap_arguments_at_call_sites() {
+    let src = concat!(
+        "def label(tag: Optional[int]) -> int:\n",
+        "    return 0\n",
+        "\n",
+        "def f() -> int:\n",
+        "    a = label(7)\n",
+        "    b = label(None)\n",
+        "    return a + b\n",
+    );
+    let out = compile(src, "optcall.py");
+    assert!(out.contains("label (Some (7)) ?"), "generated: {}", out);
+    assert!(out.contains("label (None) ?"), "generated: {}", out);
+}
+
+#[test]
+fn optional_stores_from_option_values_do_not_double_wrap() {
+    // The RHS already yields an Option (dict.get, another optional name, an
+    // Optional-returning call): wrapping it again would bury an absent value
+    // as Some(None) and flip a later `is None` check.
+    let src = concat!(
+        "def probe(d: dict[str, int], keys: list[str]) -> int:\n",
+        "    result = None\n",
+        "    for k in keys:\n",
+        "        result = d.get(k)\n",
+        "    alias = None\n",
+        "    alias = result\n",
+        "    if alias is None:\n",
+        "        return -1\n",
+        "    return 0\n",
+    );
+    let out = compile(src, "optget.py");
+    assert!(
+        out.contains("result = (d) . py_get"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some ((d) . py_get"),
+        "double-wrapped dict.get store, generated: {}",
+        out
+    );
+    assert!(out.contains("alias = result"), "generated: {}", out);
+    assert!(
+        !out.contains("Some (result)"),
+        "double-wrapped optional-name store, generated: {}",
+        out
+    );
+}
+
+#[test]
+fn optional_returning_calls_store_and_pass_without_rewrap() {
+    // find() generates Result<Option<i64>, PyException>; the call site's `?`
+    // leaves an Option, which must flow into optional names and Optional
+    // parameters as-is.
+    let src = concat!(
+        "def find(d: dict[str, int], k: str) -> Optional[int]:\n",
+        "    return d.get(k)\n",
+        "\n",
+        "def label(tag: Optional[int]) -> int:\n",
+        "    return 0\n",
+        "\n",
+        "def f(d: dict[str, int]) -> int:\n",
+        "    hit = None\n",
+        "    hit = find(d, \"a\")\n",
+        "    return label(find(d, \"b\"))\n",
+    );
+    let out = compile(src, "optret.py");
+    assert!(out.contains("hit = find"), "generated: {}", out);
+    assert!(
+        !out.contains("hit = Some (find"),
+        "double-wrapped Optional-returning call store, generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("label (Some (find"),
+        "double-wrapped Optional-returning call argument, generated: {}",
+        out
+    );
+}
+
+#[test]
+fn typing_imports_lower_to_nothing() {
+    let out = compile("from typing import Optional\nx = 1\n", "typing.py");
+    assert!(!out.contains("typing"), "generated: {}", out);
+}
+
+#[test]
 fn membership_uses_py_contains() {
     let out = compile("found = x in items", "in.py");
     assert!(out.contains("py_contains"), "generated: {}", out);

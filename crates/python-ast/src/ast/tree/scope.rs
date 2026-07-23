@@ -27,6 +27,9 @@ pub struct ScopeBindings {
     /// The subset of names (assigned names and parameters) that need a
     /// mutable binding.
     pub needs_mut: HashSet<String>,
+    /// Names assigned `None` on some path: they hold an Option, and every
+    /// non-None store into them wraps in `Some`.
+    pub optional: HashSet<String>,
 }
 
 /// How definitely a variable holds a value at a program point.
@@ -63,6 +66,7 @@ const MUTATING_METHODS: &[&str] = &[
 struct Analysis {
     assigned: Vec<String>,
     needs_mut: HashSet<String>,
+    optional: HashSet<String>,
     state: HashMap<String, Init>,
 }
 
@@ -125,6 +129,7 @@ pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBinding
     let mut a = Analysis {
         assigned: Vec::new(),
         needs_mut: HashSet::new(),
+        optional: HashSet::new(),
         state: initialized
             .iter()
             .map(|n| (n.clone(), Init::Yes))
@@ -140,6 +145,7 @@ pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBinding
     ScopeBindings {
         assigned,
         needs_mut: a.needs_mut,
+        optional: a.optional,
     }
 }
 
@@ -190,8 +196,14 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis, multi: bool) {
         match &stmt.statement {
             StatementType::Assign(assign) => {
                 walk_expr(&assign.value, a);
+                let value_is_none = crate::is_none_expr(&assign.value);
                 for target in &assign.targets {
                     record_target(target, a, multi);
+                    if value_is_none {
+                        if let ExprType::Name(name) = target {
+                            a.optional.insert(name.id.clone());
+                        }
+                    }
                 }
             }
             StatementType::AugAssign(aug) => {

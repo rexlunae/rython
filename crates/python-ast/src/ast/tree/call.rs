@@ -187,9 +187,21 @@ impl<'a> CodeGen for Call {
                 callee_def.args.vararg.is_none() && callee_def.args.kwarg.is_none();
             let pos_param_count =
                 callee_def.args.posonlyargs.len() + callee_def.args.args.len();
+            let has_optional_params = callee_def
+                .args
+                .posonlyargs
+                .iter()
+                .chain(callee_def.args.args.iter())
+                .chain(callee_def.args.kwonlyargs.iter())
+                .any(|p| {
+                    p.annotation
+                        .as_deref()
+                        .is_some_and(crate::is_optional_annotation)
+                });
             let needs_mapping = !self.keywords.is_empty()
                 || !callee_def.args.kwonlyargs.is_empty()
-                || self.args.len() < pos_param_count;
+                || self.args.len() < pos_param_count
+                || has_optional_params;
             if simple_signature && needs_mapping {
                 let mapped = map_call_arguments(
                     callee_def,
@@ -316,8 +328,25 @@ fn map_call_arguments(
     symbols: &SymbolTableScopes,
 ) -> Result<Vec<TokenStream>, Box<dyn std::error::Error>> {
     let fname = &func.name;
-    let lower = |e: &ExprType| -> Result<TokenStream, Box<dyn std::error::Error>> {
-        e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+    // Optional-annotated parameters take Option values: non-None arguments
+    // wrap in Some, while None and already-Option values (dict.get, another
+    // optional name, an Optional-returning call) pass through unwrapped.
+    let fill = |param: &crate::Parameter,
+                expr: &ExprType|
+     -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let tokens = expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let optional = param
+            .annotation
+            .as_deref()
+            .is_some_and(crate::is_optional_annotation);
+        Ok(if optional
+            && !crate::is_none_expr(expr)
+            && !crate::expr_yields_option(expr, options, symbols)
+        {
+            quote!(Some(#tokens))
+        } else {
+            tokens
+        })
     };
 
     let pos_params: Vec<&crate::Parameter> = func
@@ -339,7 +368,7 @@ fn map_call_arguments(
 
     let mut slots: Vec<Option<TokenStream>> = vec![None; n];
     for (i, arg) in args.iter().enumerate() {
-        slots[i] = Some(lower(arg)?);
+        slots[i] = Some(fill(pos_params[i], arg)?);
     }
 
     let mut kwonly_slots: Vec<Option<TokenStream>> = vec![None; func.args.kwonlyargs.len()];
@@ -351,8 +380,8 @@ fn map_call_arguments(
             )
             .into());
         };
-        let value = lower(&kw.value)?;
         if let Some(idx) = pos_params.iter().position(|p| &p.arg == kw_name) {
+            let value = fill(pos_params[idx], &kw.value)?;
             if idx < func.args.posonlyargs.len() {
                 return Err(format!(
                     "{}(): parameter `{}` is positional-only and cannot be passed by keyword",
@@ -374,6 +403,7 @@ fn map_call_arguments(
             .iter()
             .position(|p| &p.arg == kw_name)
         {
+            let value = fill(&func.args.kwonlyargs[idx], &kw.value)?;
             if kwonly_slots[idx].is_some() {
                 return Err(format!(
                     "{}() got multiple values for argument `{}`",
@@ -396,7 +426,7 @@ fn map_call_arguments(
     for i in 0..n {
         if slots[i].is_none() {
             if i >= default_offset {
-                slots[i] = Some(lower(&func.args.defaults[i - default_offset])?);
+                slots[i] = Some(fill(pos_params[i], &func.args.defaults[i - default_offset])?);
             } else {
                 return Err(format!(
                     "{}() missing required argument `{}`",
@@ -409,7 +439,7 @@ fn map_call_arguments(
     for (i, param) in func.args.kwonlyargs.iter().enumerate() {
         if kwonly_slots[i].is_none() {
             match func.args.kw_defaults.get(i).and_then(|d| d.as_ref()) {
-                Some(default) => kwonly_slots[i] = Some(lower(default)?),
+                Some(default) => kwonly_slots[i] = Some(fill(param, default)?),
                 None => {
                     return Err(format!(
                         "{}() missing required keyword-only argument `{}`",

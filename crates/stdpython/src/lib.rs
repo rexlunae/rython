@@ -1755,6 +1755,28 @@ string_add!(
     str, str,
 );
 
+/// `+` on a maybe-None value: Python raises TypeError at runtime when the
+/// value actually is None, and proceeds when it holds one. The panic
+/// carries the TypeError display (it is not catchable by except yet).
+impl<L, R: ?Sized> PyAdd<R> for Option<L>
+where
+    L: PyAdd<R>,
+{
+    type Output = L::Output;
+    fn py_add(&self, rhs: &R) -> L::Output {
+        match self {
+            Some(l) => l.py_add(rhs),
+            None => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    "unsupported operand type(s) for +: 'NoneType'"
+                )
+            ),
+        }
+    }
+}
+
 /// Python list concatenation: [1] + [2] == [1, 2].
 impl<T: Clone> PyAdd<Vec<T>> for Vec<T> {
     type Output = Vec<T>;

@@ -117,6 +117,27 @@ impl CodeGen for FunctionDef {
             .chain(self.args.kwarg.iter().map(|p| p.arg.clone()))
             .collect();
         let scope = crate::analyze_scope(&self.body, &param_names);
+        // Optional names (assigned None on some path, or parameters with an
+        // Optional annotation) are visible to every assignment in the body:
+        // their non-None stores wrap in Some.
+        let mut options = options;
+        {
+            let mut optional = scope.optional.clone();
+            for p in self
+                .args
+                .posonlyargs
+                .iter()
+                .chain(self.args.args.iter())
+                .chain(self.args.kwonlyargs.iter())
+            {
+                if let Some(ann) = p.annotation.as_deref() {
+                    if crate::is_optional_annotation(ann) {
+                        optional.insert(p.arg.clone());
+                    }
+                }
+            }
+            options.optional_names = std::rc::Rc::new(optional);
+        }
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self
@@ -332,6 +353,38 @@ pub(crate) fn is_none_expr(ann: &ExprType) -> bool {
         ExprType::NoneType(_) => true,
         ExprType::Constant(c) => c.0.is_none(),
         ExprType::Name(name) => name.id == "None",
+        _ => false,
+    }
+}
+
+/// Whether an expression already lowers to an `Option` value, so a store
+/// into an optional-tracked name (or an Optional parameter slot) must NOT
+/// wrap it in `Some` — double-wrapping turns an absent value into
+/// `Some(None)`, and a later `is None` check silently answers wrongly.
+pub(crate) fn expr_yields_option(
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    match expr {
+        // A name that itself holds an Option (assigned None on some path,
+        // or an Optional-annotated parameter).
+        ExprType::Name(name) => options.optional_names.contains(&name.id),
+        ExprType::Call(call) => match call.func.as_ref() {
+            // dict.get(k) lowers to py_get, which returns Option<V>.
+            ExprType::Attribute(attr) => attr.attr == "get" && call.args.len() == 1,
+            // A user function annotated `-> Optional[T]` generates
+            // `Result<Option<T>, PyException>`; the call site's `?` strips
+            // only the Result layer, leaving an Option.
+            ExprType::Name(name) => match symbols.get(&name.id) {
+                Some(SymbolTableNode::FunctionDef(f)) => f
+                    .returns
+                    .as_deref()
+                    .is_some_and(crate::is_optional_annotation),
+                _ => false,
+            },
+            _ => false,
+        },
         _ => false,
     }
 }

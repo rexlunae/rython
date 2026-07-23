@@ -96,6 +96,11 @@ pub struct PythonOptions {
     /// exactly what these warnings exist to surface. Tools may disable this
     /// to suppress the warnings at the user's explicit request.
     pub lossy_warnings: bool,
+
+    /// Names in the CURRENT scope that hold an Option (assigned None on
+    /// some path, or annotated Optional): non-None stores into them wrap
+    /// in Some. Set per scope by the function/module generators.
+    pub optional_names: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 impl Default for PythonOptions {
@@ -115,6 +120,7 @@ impl Default for PythonOptions {
             allow_unsafe: false,
             async_runtime: AsyncRuntime::default(),
             lossy_warnings: true,
+            optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
         }
     }
 }

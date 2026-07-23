@@ -146,6 +146,13 @@ impl CodeGen for ImportFrom {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         debug!("ctx: {:?}", ctx);
 
+        // typing imports (Optional, List, Dict, ...) are annotation-only:
+        // annotations map to Rust types directly, so the import itself
+        // lowers to nothing.
+        if self.module.split('.').next() == Some("typing") {
+            return Ok(TokenStream::new());
+        }
+
         // `from X import y` must bring `y` into scope; previously this
         // emitted nothing and later uses of `y` were undefined. `use` paths
         // can't resolve through glob imports, so anchor the path explicitly:
