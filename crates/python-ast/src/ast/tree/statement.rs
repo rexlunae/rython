@@ -464,7 +464,19 @@ impl CodeGen for StatementType {
                 let value = if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
                 } else {
-                    e.clone().to_rust(ctx.clone(), options, symbols)?
+                    let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
+                    // A `-> str` function returning an attribute chain reads
+                    // a String field through the shared receiver: clone it
+                    // out. Python strings are immutable, so the clone
+                    // reproduces Python's semantics exactly (a bare field
+                    // read would move out of &self and not compile).
+                    if options.clone_str_attribute_returns
+                        && matches!(e.value, ExprType::Attribute(_))
+                    {
+                        quote!((#tokens).clone())
+                    } else {
+                        tokens
+                    }
                 };
                 Ok(return_tokens(&ctx, value))
             }

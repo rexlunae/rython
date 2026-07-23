@@ -80,13 +80,18 @@ impl<'a> CodeGen for Assign {
         // scope's code generator) and every assignment is a plain store —
         // emitting `let mut` per assignment would create a fresh shadowing
         // binding inside nested blocks, silently dropping the store.
-        // Class bodies are the exception: they aren't hoisted scopes.
-        let in_class = matches!(ctx, CodeGenContext::Class);
         // A name that holds an Option (assigned None on some path) wraps
         // its non-None stores in Some, so both arms unify to Option<T> —
         // unless the value is already an Option (dict.get, another optional
         // name, an Optional-returning call), which stores through unchanged.
         let value_is_none = value_is_none_early;
+        // A string literal stored into an attribute becomes an owned String:
+        // struct fields hold String (Python strings are owned values), while
+        // the literal itself is a &'static str.
+        let value_is_str_literal = matches!(
+            &value_expr,
+            ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_)))
+        );
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -95,7 +100,6 @@ impl<'a> CodeGen for Assign {
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             Ok(match target {
-                ExprType::Name(_) if in_class => quote!(let mut #target_code = #value;),
                 ExprType::Name(name) => {
                     if !value_is_none
                         && !value_yields_option
@@ -108,6 +112,9 @@ impl<'a> CodeGen for Assign {
                 }
                 // Destructuring assignment to the hoisted names.
                 ExprType::Tuple(_) => quote!((#target_code) = #value;),
+                ExprType::Attribute(_) if value_is_str_literal => {
+                    quote!(#target_code = (#value).to_string();)
+                }
                 _ => quote!(#target_code = #value;),
             })
         };
@@ -158,7 +165,7 @@ impl<'a> CodeGen for Assign {
             // wraps plain values in Some, and handles conditional arms
             // independently (`x if c else None`).
             if let ExprType::Name(name) = &self.targets[0] {
-                if !in_class && options.optional_names.contains(&name.id) {
+                if options.optional_names.contains(&name.id) {
                     let target_code = self.targets[0].clone().to_rust(
                         ctx.clone(),
                         options.clone(),

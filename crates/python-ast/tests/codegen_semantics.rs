@@ -1279,3 +1279,189 @@ fn dropped_defaults_emit_call_site_warning() {
     let out = compile("def g(x: int) -> int:\n    return x\n", "no_warn.py");
     assert!(!out.contains("deprecated"), "generated: {}", out);
 }
+
+// ---- Struct-based classes ----
+
+fn compile_err(src: &str, name: &str) -> String {
+    let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed: {}", e));
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("conversion must fail loudly");
+    format!("{}", err)
+}
+
+const COUNTER: &str = concat!(
+    "class Counter:\n",
+    "    def __init__(self, label: str, start: int = 0):\n",
+    "        self.label = label\n",
+    "        self.count = start\n",
+    "\n",
+    "    def bump(self, amount: int) -> int:\n",
+    "        self.count += amount\n",
+    "        return self.count\n",
+    "\n",
+    "    def double_bump(self, amount: int) -> int:\n",
+    "        self.bump(amount)\n",
+    "        self.bump(amount)\n",
+    "        return self.count\n",
+    "\n",
+    "    def peek(self) -> int:\n",
+    "        return self.count\n",
+);
+
+#[test]
+fn classes_lower_to_structs_with_inferred_fields() {
+    let out = compile(COUNTER, "counter.py");
+    assert!(out.contains("pub struct Counter"), "generated: {}", out);
+    assert!(out.contains("pub label : String"), "generated: {}", out);
+    assert!(out.contains("pub count : i64"), "generated: {}", out);
+    assert!(
+        out.contains("pub fn new (label : impl Into < String > , start : i64) -> Result < Self , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_self . __init__ (label , start) ?"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn method_receivers_follow_mutation_including_transitive_calls() {
+    let out = compile(COUNTER, "receivers.py");
+    // __init__ and bump store through self; double_bump only via calling
+    // bump; peek reads only.
+    assert!(out.contains("fn __init__ (& mut self ,"), "generated: {}", out);
+    assert!(out.contains("fn bump (& mut self ,"), "generated: {}", out);
+    assert!(
+        out.contains("fn double_bump (& mut self ,"),
+        "transitive self-call must select &mut self: {}",
+        out
+    );
+    assert!(out.contains("fn peek (& self ,"), "generated: {}", out);
+}
+
+#[test]
+fn construction_and_method_calls_propagate_exceptions() {
+    let src = format!(
+        "{}\n\ndef run() -> int:\n    c = Counter(\"hits\")\n    c.bump(amount=2)\n    return c.peek()\n",
+        COUNTER
+    );
+    let out = compile(&src, "classcalls.py");
+    // Construction resolves defaults against __init__ (minus self) and
+    // lowers to new()?; the omitted `start` fills with its default.
+    assert!(
+        out.contains("Counter :: new (\"hits\" , 0) ?"),
+        "generated: {}",
+        out
+    );
+    // Keyword arguments map against the method signature; calls take `?`.
+    assert!(out.contains("(c) . bump (2) ?"), "generated: {}", out);
+    assert!(out.contains("(c) . peek () ?"), "generated: {}", out);
+    // A local constructing a mutating class needs a mutable binding.
+    assert!(out.contains("let mut c ;"), "generated: {}", out);
+}
+
+#[test]
+fn user_methods_shadow_builtin_method_rewrites() {
+    // A user-defined method named like a dict/list builtin must resolve to
+    // the class, not the py_get rewrite.
+    let src = concat!(
+        "class Box:\n",
+        "    def __init__(self, v: int):\n",
+        "        self.v = v\n",
+        "\n",
+        "    def get(self, bonus: int) -> int:\n",
+        "        return self.v + bonus\n",
+        "\n",
+        "def run() -> int:\n",
+        "    b = Box(3)\n",
+        "    return b.get(1)\n",
+    );
+    let out = compile(src, "shadow.py");
+    assert!(out.contains("(b) . get (1) ?"), "generated: {}", out);
+    assert!(!out.contains("py_get"), "generated: {}", out);
+}
+
+#[test]
+fn composed_fields_type_and_resolve_through_chains() {
+    let src = concat!(
+        "class Point:\n",
+        "    def __init__(self, x: int):\n",
+        "        self.x = x\n",
+        "\n",
+        "    def shift(self, dx: int):\n",
+        "        self.x += dx\n",
+        "\n",
+        "class Holder:\n",
+        "    def __init__(self, p: Point):\n",
+        "        self.p = p\n",
+        "\n",
+        "    def nudge(self):\n",
+        "        self.p.shift(1)\n",
+    );
+    let out = compile(src, "compose.py");
+    assert!(out.contains("pub p : Point"), "generated: {}", out);
+    // shift mutates Point, so nudge mutates self through the field chain.
+    assert!(out.contains("fn nudge (& mut self ,"), "generated: {}", out);
+    assert!(
+        out.contains(". shift (1) ?"),
+        "field-chain method calls propagate exceptions: {}",
+        out
+    );
+}
+
+#[test]
+fn unsupported_class_constructs_error_loudly() {
+    let err = compile_err(
+        "class Base:\n    pass\n\nclass Child(Base):\n    pass\n",
+        "inherit.py",
+    );
+    assert!(err.contains("inheritance"), "error: {}", err);
+
+    let err = compile_err("class C:\n    VERSION = 3\n", "classattr.py");
+    assert!(err.contains("class attribute"), "error: {}", err);
+
+    let err = compile_err(
+        "class C:\n    def __init__(self):\n        self.x = None\n",
+        "noneattr.py",
+    );
+    assert!(err.contains("cannot infer a type"), "error: {}", err);
+}
+
+#[test]
+fn str_getters_clone_the_field_out_of_the_shared_receiver() {
+    // `def name(self) -> str: return self.name` reads a String field
+    // through &self: the return clones it — semantically exact, since
+    // Python strings are immutable.
+    let src = concat!(
+        "class Tag:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def get_name(self) -> str:\n",
+        "        return self.name\n",
+    );
+    let out = compile(src, "getter.py");
+    assert!(
+        out.contains("Ok ((self . name) . clone ())"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn class_method_named_new_errors_loudly() {
+    let err = compile_err(
+        "class C:\n    def new(self) -> int:\n        return 1\n",
+        "newclash.py",
+    );
+    assert!(err.contains("`new`"), "error: {}", err);
+    assert!(err.contains("constructor"), "error: {}", err);
+}
