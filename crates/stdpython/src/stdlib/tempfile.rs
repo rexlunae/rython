@@ -395,25 +395,35 @@ impl SpooledTemporaryFile {
 // Helper functions
 
 fn generate_random_string(length: usize) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    // Simple pseudo-random string generator
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    
-    let seed = hasher.finish();
+    // Names draw 6 bits of cryptographic OS entropy per character,
+    // independent of the seeded `random` module — like Python's tempfile,
+    // which keeps its own private Random over os.urandom seeding. The old
+    // implementation cycled 8 bits of one time-derived hash, so every call
+    // in the same instant produced the SAME name and the mkstemp/mkdtemp
+    // retry loops could burn all their attempts on one candidate.
     let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let char_bytes = chars.as_bytes();
-    
-    (0..length)
-        .map(|i| {
-            let idx = ((seed >> (i % 8)) as usize) % char_bytes.len();
-            char_bytes[idx] as char
-        })
-        .collect()
+
+    let mut out = String::with_capacity(length);
+    let mut pool: u64 = 0;
+    let mut pool_bits = 0u32;
+    while out.len() < length {
+        if pool_bits < 6 {
+            let mut bytes = [0u8; 8];
+            crate::random::os_entropy(&mut bytes);
+            pool = u64::from_le_bytes(bytes);
+            pool_bits = 64;
+        }
+        let idx = (pool & 0x3f) as usize;
+        pool >>= 6;
+        pool_bits -= 6;
+        // 62 characters: indices 62/63 are rejection-sampled away so the
+        // distribution stays uniform.
+        if idx < char_bytes.len() {
+            out.push(char_bytes[idx] as char);
+        }
+    }
+    out
 }
 
 // Module constants
