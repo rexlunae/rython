@@ -3,7 +3,8 @@
 //! This module provides functions creating iterators for efficient looping.
 //! Implementation matches Python's itertools module API.
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+use alloc::{vec, vec::Vec};
 
 /// count - infinite iterator starting from start
 #[derive(Debug, Clone)]
@@ -14,7 +15,7 @@ pub struct Count<T> {
 
 impl<T> Count<T> 
 where
-    T: Clone + std::ops::Add<Output = T>,
+    T: Clone + core::ops::Add<Output = T>,
 {
     /// Create new count iterator
     pub fn new(start: T, step: T) -> Self {
@@ -482,7 +483,7 @@ where
 /// count - create count iterator
 pub fn count<T>(start: T, step: T) -> Count<T> 
 where
-    T: Clone + std::ops::Add<Output = T>,
+    T: Clone + core::ops::Add<Output = T>,
 {
     Count::new(start, step)
 }
@@ -687,7 +688,7 @@ where
 /// accumulate - running totals
 pub fn accumulate<T, F>(iterable: &[T], func: Option<F>) -> Vec<T> 
 where
-    T: Clone + std::ops::Add<Output = T>,
+    T: Clone + core::ops::Add<Output = T>,
     F: Fn(&T, &T) -> T,
 {
     if iterable.is_empty() {

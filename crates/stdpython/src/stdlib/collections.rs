@@ -4,26 +4,31 @@
 //! Implementation matches Python's collections module API.
 
 use crate::{PyException, Len, Truthy, python_function};
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use alloc::collections::VecDeque;
+use alloc::{format, string::String, vec, vec::Vec};
+use core::hash::Hash;
+#[cfg(feature = "std")]
+use std::collections::{HashMap, HashSet};
+#[cfg(not(feature = "std"))]
+use hashbrown::{HashMap, HashSet};
 
 /// Counter - dict subclass for counting hashable objects
 #[derive(Debug, Clone)]
 pub struct Counter<T> 
 where 
-    T: Hash + Eq + Clone + std::fmt::Debug,
+    T: Hash + Eq + Clone + core::fmt::Debug,
 {
-    counts: indexmap::IndexMap<T, i64>,
+    counts: crate::PyDict<T, i64>,
 }
 
 impl<T> Counter<T> 
 where 
-    T: Hash + Eq + Clone + std::fmt::Debug,
+    T: Hash + Eq + Clone + core::fmt::Debug,
 {
     /// Create a new Counter
     pub fn new() -> Self {
         Self {
-            counts: indexmap::IndexMap::new(),
+            counts: crate::PyDict::default(),
         }
     }
     
@@ -122,7 +127,7 @@ where
 
 impl<T> Default for Counter<T> 
 where 
-    T: Hash + Eq + Clone + std::fmt::Debug,
+    T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn default() -> Self {
         Self::new()
@@ -131,7 +136,7 @@ where
 
 impl<T> Len for Counter<T> 
 where 
-    T: Hash + Eq + Clone + std::fmt::Debug,
+    T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn len(&self) -> usize {
         self.counts.len()
@@ -140,7 +145,7 @@ where
 
 impl<T> Truthy for Counter<T> 
 where 
-    T: Hash + Eq + Clone + std::fmt::Debug,
+    T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn is_truthy(&self) -> bool {
         !self.counts.is_empty()
@@ -666,7 +671,7 @@ where
     
     /// Get all keys
     pub fn keys(&self) -> Vec<K> {
-        let mut keys = std::collections::HashSet::new();
+        let mut keys = HashSet::new();
         for map in &self.maps {
             keys.extend(map.keys().cloned());
         }
@@ -675,7 +680,7 @@ where
     
     /// Get all values
     pub fn values(&self) -> Vec<V> {
-        let mut seen_keys = std::collections::HashSet::new();
+        let mut seen_keys = HashSet::new();
         let mut values = Vec::new();
         
         for map in &self.maps {

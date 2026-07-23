@@ -6,16 +6,39 @@ license.workspace = true
 repository.workspace = true
 description = "Python standard library runtime for the Rython compiler ecosystem"
 
+# Feature ladder (no_std-by-absence): core ⊂ alloc ⊂ std.
+#   --no-default-features --features alloc  → #![no_std] + alloc (strings,
+#     lists, dicts, exceptions — everything that doesn't touch the OS)
+#   default ("std")                          → the full runtime
+# A strictly-core tier (no alloc) is not implemented yet and fails loudly.
 [features]
 default = ["std"]
-std = ["pyo3", "libc"]
-nostd = ["hashbrown", "heapless"]
+std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "indexmap/std"]
+alloc = ["dep:hashbrown", "dep:libm"]
 
 [dependencies]
 pyo3 = {version = "0.29", features=["auto-initialize"], optional = true}
 paste = "1.0"
-indexmap = "2"
-getrandom = "0.3"
+indexmap = { version = "2", default-features = false }
+getrandom = { version = "0.3", optional = true }
 hashbrown = { version = "0.15", optional = true }
-heapless = { version = "0.8", optional = true }
+libm = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
+
+[[bin]]
+name = "comprehensive_rollout_summary"
+required-features = ["std"]
+
+# These suites pin OS-facing behavior (I/O, os.path, datetime, entropy…);
+# nostd_basic.rs stays feature-agnostic and builds on every tier.
+[[test]]
+name = "python_semantics"
+required-features = ["std"]
+
+[[test]]
+name = "integration_manual"
+required-features = ["std"]
+
+[[test]]
+name = "integration_comprehensive"
+required-features = ["std"]

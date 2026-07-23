@@ -24,7 +24,10 @@ pub mod sysconfig;
 #[cfg(feature = "std")]
 pub mod venv;
 
-/// Python math module - mathematical functions
+/// Python math module - mathematical functions.
+/// std-gated: float math (sin, sqrt, …) lives on std's f64, not core's.
+/// A no_std tier would need libm — tracked in issue #22.
+#[cfg(feature = "std")]
 pub mod math;
 
 /// Python random module - random number generation

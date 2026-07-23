@@ -91,10 +91,21 @@ rython_stdpython = "1.0"
 ```
 
 ### No-Std Mode (embedded systems)
+
+The crate is layered as a `core ⊂ alloc ⊂ std` feature ladder; no_std is
+reached by turning the default `std` feature off:
+
 ```toml
 [dependencies]
-rython_stdpython = { version = "1.0", default-features = false, features = ["nostd"] }
+rython_stdpython = { version = "1.0", default-features = false, features = ["alloc"] }
 ```
+
+The `alloc` tier keeps heap-backed Python semantics (strings, lists,
+dicts/sets, exceptions, json) with no OS dependency; everything that
+touches the OS (I/O, os/os.path, datetime, subprocess, tempfile, glob,
+pathlib, random, math's float intrinsics) is `std`-only. A strictly-core
+tier without an allocator is not implemented yet and fails loudly at
+compile time.
 
 ### Example Usage
 
@@ -151,9 +162,13 @@ print(str(total));          // Uses PyToString trait
 cargo build
 cargo test
 
-# No-std version  
-cargo build --no-default-features --features nostd
-cargo test --no-default-features --features nostd
+# No-std version (no_std + alloc)
+cargo build --no-default-features --features alloc
+cargo test --no-default-features --features alloc
+
+# Prove it on a bare-metal target
+rustup target add thumbv7m-none-eabi
+cargo check --no-default-features --features alloc --target thumbv7m-none-eabi
 
 # Run specific test modules
 cargo test test_python_functions  # Built-in function tests
