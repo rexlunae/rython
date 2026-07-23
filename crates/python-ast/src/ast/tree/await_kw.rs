@@ -34,6 +34,16 @@ impl<'a> CodeGen for Await {
         _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let value = self.value.to_rust(_ctx, _options, _symbols)?;
+        // A call to a user async function lowers to `f(...)?` — but the `?`
+        // must apply to the awaited Result, not the future: reorder to
+        // `f(...).await?`.
+        let rendered = value.to_string();
+        if let Some(inner) = rendered.trim_end().strip_suffix('?') {
+            let inner: TokenStream = inner
+                .parse()
+                .map_err(|e| format!("re-parsing awaited call: {:?}", e))?;
+            return Ok(quote!(#inner.await?));
+        }
         Ok(quote!(#value.await))
     }
 }

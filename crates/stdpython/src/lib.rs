@@ -1409,6 +1409,38 @@ impl PyException {
     }
 }
 
+/// Map a raised PyException onto the corresponding real Python exception
+/// class, so PyO3 bindings surface `raise ValueError(...)` as an actual
+/// ValueError to Python callers.
+#[cfg(feature = "std")]
+impl From<PyException> for pyo3::PyErr {
+    fn from(e: PyException) -> pyo3::PyErr {
+        use pyo3::exceptions::*;
+        let msg = e.message.clone();
+        match e.exception_type.as_str() {
+            "ValueError" => PyValueError::new_err(msg),
+            "TypeError" => PyTypeError::new_err(msg),
+            "KeyError" => PyKeyError::new_err(msg),
+            "IndexError" => PyIndexError::new_err(msg),
+            "AttributeError" => PyAttributeError::new_err(msg),
+            "AssertionError" => PyAssertionError::new_err(msg),
+            "ZeroDivisionError" => PyZeroDivisionError::new_err(msg),
+            "RuntimeError" => PyRuntimeError::new_err(msg),
+            "NotImplementedError" => PyNotImplementedError::new_err(msg),
+            "OSError" => PyOSError::new_err(msg),
+            "FileNotFoundError" => PyFileNotFoundError::new_err(msg),
+            "PermissionError" => PyPermissionError::new_err(msg),
+            "StopIteration" => PyStopIteration::new_err(msg),
+            "OverflowError" => PyOverflowError::new_err(msg),
+            "NameError" => PyNameError::new_err(msg),
+            "LookupError" => PyLookupError::new_err(msg),
+            "ArithmeticError" => PyArithmeticError::new_err(msg),
+            // Anything unrecognized keeps its full "Type: message" display.
+            _ => PyRuntimeError::new_err(format!("{}", e)),
+        }
+    }
+}
+
 impl Display for PyException {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}: {}", self.exception_type, self.message)

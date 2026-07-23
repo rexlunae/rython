@@ -283,37 +283,38 @@ fn lambda_parameters_are_bare_names() {
 #[test]
 fn return_type_inferred_from_int_constant() {
     let out = compile("def f():\n    return 42\n", "ret.py");
-    assert!(out.contains("-> i64"), "generated: {}", out);
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
 }
 
 #[test]
 fn return_type_inferred_from_fstring() {
     let out = compile("def f():\n    return f\"x={x}\"\n", "ret2.py");
-    assert!(out.contains("-> String"), "generated: {}", out);
+    assert!(out.contains("-> Result < String , PyException >"), "generated: {}", out);
 }
 
 #[test]
 fn return_type_inferred_from_string_literal() {
     let out = compile("def f():\n    return \"hi\"\n", "ret3.py");
-    assert!(out.contains("-> & 'static str"), "generated: {}", out);
+    assert!(out.contains("-> Result < & 'static str , PyException >"), "generated: {}", out);
 }
 
 #[test]
 fn mixed_returns_get_no_annotation() {
     let out = compile("def f(c):\n    if c:\n        return 1\n    return \"s\"\n", "ret4.py");
-    assert!(!out.contains("->"), "generated: {}", out);
+    assert!(out.contains("-> Result < () , PyException >"), "generated: {}", out);
 }
 
 #[test]
 fn bare_return_gets_no_annotation() {
     let out = compile("def f():\n    return\n", "ret5.py");
-    assert!(!out.contains("->"), "generated: {}", out);
+    assert!(out.contains("-> Result < () , PyException >"), "generated: {}", out);
+    assert!(out.contains("return Ok (())"), "generated: {}", out);
 }
 
 #[test]
 fn return_type_inferred_through_local_variable() {
     let out = compile("def f():\n    n = 5\n    n -= 1\n    return n\n", "ret6.py");
-    assert!(out.contains("-> i64"), "generated: {}", out);
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
 }
 
 #[test]
@@ -334,7 +335,7 @@ fn return_in_loop_only_gets_no_annotation() {
 fn exhaustive_if_else_returns_get_annotation() {
     let src = "def f(c):\n    if c:\n        return 1\n    else:\n        return 2\n";
     let out = compile(src, "ret9.py");
-    assert!(out.contains("-> i64"), "generated: {}", out);
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
 }
 
 #[test]
@@ -350,7 +351,7 @@ fn annotated_parameters_map_to_rust_types() {
 #[test]
 fn return_annotation_used_when_inference_fails() {
     let out = compile("def f(x: int) -> int:\n    return x + 1\n", "ann_ret.py");
-    assert!(out.contains("-> i64"), "generated: {}", out);
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
 }
 
 #[test]
@@ -457,8 +458,12 @@ fn try_except_lowers_to_result_handling() {
     );
     // `as e` binds the caught exception.
     assert!(out.contains("let mut e = __rython_exc . clone ()"), "generated: {}", out);
-    // An unmatched exception re-raises (aborts at top level, like Python).
-    assert!(out.contains("panic ! (\"{}\" , __rython_exc)"), "generated: {}", out);
+    // An unmatched exception re-raises as an Err out of the function.
+    assert!(
+        out.contains("Err (__rython_exc) => { return Err (__rython_exc) ; }"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -522,18 +527,64 @@ fn finally_runs_before_reraise() {
 }
 
 #[test]
-fn raise_outside_try_panics_with_exception_display() {
+fn raise_returns_err_from_the_function() {
+    // Functions return Result<T, PyException>, so raising anywhere is
+    // returning Err — callers propagate it with `?`, as Python propagates
+    // exceptions up the call stack.
     let out = compile(
         "def f():\n    raise RuntimeError(\"boom\")\n",
         "raise.py",
     );
     assert!(
-        out.contains("panic ! (\"{}\" , PyException :: new (\"RuntimeError\""),
+        out.contains("return Err (PyException :: new (\"RuntimeError\""),
         "generated: {}",
         out
     );
-    // Not the old debug-format placeholder that referenced undefined names.
-    assert!(!out.contains("Exception : {:?}"), "generated: {}", out);
+    assert!(!out.contains("panic !"), "generated: {}", out);
+}
+
+#[test]
+fn calls_to_user_functions_propagate_with_question_mark() {
+    let src = concat!(
+        "def helper() -> int:\n",
+        "    return 1\n",
+        "\n",
+        "def caller() -> int:\n",
+        "    return helper() + 1\n",
+    );
+    let out = compile(src, "prop.py");
+    assert!(out.contains("helper () ?"), "generated: {}", out);
+
+    // Builtins that don't raise stay plain.
+    let out = compile("def f(x: int):\n    print(x)\n", "plaincall.py");
+    assert!(out.contains("print (x)"), "generated: {}", out);
+    assert!(!out.contains("print (x) ?"), "generated: {}", out);
+}
+
+#[test]
+fn return_inside_try_threads_through_controlflow() {
+    // A return in a try body must escape the closure, run the finally, and
+    // return from the function.
+    let src = concat!(
+        "def f(n: int) -> int:\n",
+        "    try:\n",
+        "        return n\n",
+        "    except ValueError:\n",
+        "        return 0\n",
+        "    finally:\n",
+        "        cleanup()\n",
+    );
+    let out = compile(src, "trystmt_ret.py");
+    assert!(
+        out.contains("ControlFlow :: Break (n)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("Ok (std :: ops :: ControlFlow :: Break (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }"),
+        "finally must run before the returned value leaves: {}",
+        out
+    );
 }
 
 #[test]

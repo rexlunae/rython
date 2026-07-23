@@ -305,6 +305,51 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
     }
 }
 
+/// A Python `return` lowered for the current context: inside a try-block
+/// closure it breaks out via ControlFlow so the try lowering can run the
+/// finally body and re-return; elsewhere it returns Ok directly.
+fn return_tokens(ctx: &CodeGenContext, value: TokenStream) -> TokenStream {
+    if ctx.in_try_block() {
+        quote!(return Ok(std::ops::ControlFlow::Break(#value)))
+    } else {
+        quote!(return Ok(#value))
+    }
+}
+
+/// Whether a statement list contains a function-level `return` anywhere —
+/// looking through control flow (including nested trys and their handlers)
+/// but not into nested function or class definitions. The try lowering uses
+/// this to pick its closure's carrier type: bodies with returns thread the
+/// returned value out through ControlFlow.
+pub fn body_contains_function_return(body: &[Statement]) -> bool {
+    body.iter().any(|stmt| match &stmt.statement {
+        StatementType::Return(_) => true,
+        StatementType::If(s) => {
+            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
+        }
+        StatementType::For(s) => {
+            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
+        }
+        StatementType::While(s) => {
+            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
+        }
+        StatementType::AsyncFor(s) => {
+            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
+        }
+        StatementType::Try(s) => {
+            body_contains_function_return(&s.body)
+                || s.handlers
+                    .iter()
+                    .any(|h| body_contains_function_return(&h.body))
+                || body_contains_function_return(&s.orelse)
+                || body_contains_function_return(&s.finalbody)
+        }
+        StatementType::With(s) => body_contains_function_return(&s.body),
+        StatementType::AsyncWith(s) => body_contains_function_return(&s.body),
+        _ => false,
+    })
+}
+
 /// Whether a loop body contains a `break` that belongs to that loop —
 /// looking through `if`/`try`/`with` blocks but not into nested loops
 /// (whose breaks are their own) or nested definitions. Loops with an `else`
@@ -375,16 +420,14 @@ impl CodeGen for StatementType {
                     }
                     None => quote!(String::new()),
                 };
-                // A failed assert raises AssertionError: catchable by an
-                // enclosing try, otherwise it aborts like any uncaught
-                // Python exception.
-                let raise = if ctx.in_try_block() {
-                    quote!(return Err(PyException::new("AssertionError", #msg_tokens)))
-                } else {
-                    quote!(panic!("{}", PyException::new("AssertionError", #msg_tokens)))
-                };
+                // A failed assert raises AssertionError. Functions return
+                // Result<T, PyException>, so raising is returning Err: it is
+                // caught by an enclosing try's closure or propagates out of
+                // the function, as in Python.
                 Ok(quote! {
-                    if !(#test_tokens) { #raise; }
+                    if !(#test_tokens) {
+                        return Err(PyException::new("AssertionError", #msg_tokens));
+                    }
                 })
             }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
@@ -406,10 +449,20 @@ impl CodeGen for StatementType {
             StatementType::Import(s) => s.to_rust(ctx, options, symbols),
             StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols),
             StatementType::Expr(s) => s.to_rust(ctx, options, symbols),
-            StatementType::Return(None) => Ok(quote!(return)),
+            // Functions return Result<T, PyException>; a Python return wraps
+            // its value in Ok (bare return / return None yield Ok(())).
+            // Inside a try block's closure, a return must first break out of
+            // the closure: it becomes Ok(ControlFlow::Break(value)), which
+            // the try lowering turns back into a function return — after
+            // running the finally body, as Python requires.
+            StatementType::Return(None) => Ok(return_tokens(&ctx, quote!(()))),
             StatementType::Return(Some(e)) => {
-                let exp = e.clone().to_rust(ctx, options, symbols)?;
-                Ok(quote!(return #exp))
+                let value = if matches!(e.value, ExprType::NoneType(_)) {
+                    quote!(())
+                } else {
+                    e.clone().to_rust(ctx.clone(), options, symbols)?
+                };
+                Ok(return_tokens(&ctx, value))
             }
             StatementType::If(i) => i.to_rust(ctx, options, symbols),
             StatementType::For(f) => f.to_rust(ctx, options, symbols),

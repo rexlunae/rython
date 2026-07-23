@@ -233,11 +233,14 @@ impl CodeGen for Module {
             main_body_stmts.insert(0, main_decls);
         }
 
-        // Generate module initialization function if needed
+        // Generate module initialization function if needed. Like all
+        // generated functions it returns Result so module-level raises and
+        // calls propagate.
         if has_module_init_code {
             stream.extend(quote! {
-                fn __module_init__() {
-                    #(#module_init_stmts)*
+                fn __module_init__() -> Result<(), PyException> {
+                    #(#module_init_stmts;)*
+                    Ok(())
                 }
             });
         }
@@ -271,12 +274,19 @@ impl CodeGen for Module {
                         let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
                         stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
                             .unwrap_or_else(|_| stream);
-                        
+
                         stream.extend(quote! {
                             #[#attr_tokens]
                             async fn main() {
-                                __module_init__();
-                                python_main();
+                                let __rython_result: Result<(), PyException> = async {
+                                    __module_init__()?;
+                                    python_main().await?;
+                                    Ok(())
+                                }.await;
+                                if let Err(e) = __rython_result {
+                                    eprintln!("{}", e);
+                                    std::process::exit(1);
+                                }
                             }
                         });
                     }
@@ -293,11 +303,18 @@ impl CodeGen for Module {
                         let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
                         stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
                             .unwrap_or_else(|_| stream);
-                        
+
                         stream.extend(quote! {
                             fn main() {
-                                __module_init__();
-                                python_main();
+                                let __rython_result = (|| -> Result<(), PyException> {
+                                    __module_init__()?;
+                                    python_main()?;
+                                    Ok(())
+                                })();
+                                if let Err(e) = __rython_result {
+                                    eprintln!("{}", e);
+                                    std::process::exit(1);
+                                }
                             }
                         });
                     }
@@ -332,37 +349,44 @@ impl CodeGen for Module {
                     let attr_tokens: proc_macro2::TokenStream = runtime_attr.parse()
                         .unwrap_or_else(|_| quote!(tokio::main)); // fallback to tokio::main
                     
-                    if has_module_init_code {
-                        stream.extend(quote! {
-                            #[#attr_tokens]
-                            async fn main() {
-                                __module_init__();
-                                #(#main_body_stmts)*
-                            }
-                        });
+                    let init_call = if has_module_init_code {
+                        quote!(__module_init__()?;)
                     } else {
-                        stream.extend(quote! {
-                            #[#attr_tokens]
-                            async fn main() {
-                                #(#main_body_stmts)*
+                        quote!()
+                    };
+                    stream.extend(quote! {
+                        #[#attr_tokens]
+                        async fn main() {
+                            let __rython_result: Result<(), PyException> = async {
+                                #init_call
+                                #(#main_body_stmts;)*
+                                Ok(())
+                            }.await;
+                            if let Err(e) = __rython_result {
+                                eprintln!("{}", e);
+                                std::process::exit(1);
                             }
-                        });
-                    }
+                        }
+                    });
                 } else {
-                    if has_module_init_code {
-                        stream.extend(quote! {
-                            fn main() {
-                                __module_init__();
-                                #(#main_body_stmts)*
-                            }
-                        });
+                    let init_call = if has_module_init_code {
+                        quote!(__module_init__()?;)
                     } else {
-                        stream.extend(quote! {
-                            fn main() {
-                                #(#main_body_stmts)*
+                        quote!()
+                    };
+                    stream.extend(quote! {
+                        fn main() {
+                            let __rython_result = (|| -> Result<(), PyException> {
+                                #init_call
+                                #(#main_body_stmts;)*
+                                Ok(())
+                            })();
+                            if let Err(e) = __rython_result {
+                                eprintln!("{}", e);
+                                std::process::exit(1);
                             }
-                        });
-                    }
+                        }
+                    });
                 }
             }
         } else if has_module_init_code {
@@ -370,7 +394,10 @@ impl CodeGen for Module {
             // Generate a main function that just runs module initialization
             stream.extend(quote! {
                 fn main() {
-                    __module_init__();
+                    if let Err(e) = __module_init__() {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
                 }
             });
         }

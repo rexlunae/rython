@@ -123,14 +123,11 @@ impl CodeGen for Raise {
             }
         };
 
-        // Inside a try block, raising returns an Err out of the block's
-        // Result closure so the handlers can catch it; anywhere else an
-        // exception is uncaught and aborts, as in Python.
-        if ctx.in_try_block() {
-            Ok(quote!(return Err(#exc_tokens)))
-        } else {
-            Ok(quote!(panic!("{}", #exc_tokens)))
-        }
+        // Functions return Result<T, PyException>, so raising is returning
+        // Err: inside a try block it returns out of the block's Result
+        // closure to be caught by the handlers, and anywhere else it
+        // propagates out of the function, as in Python.
+        Ok(quote!(return Err(#exc_tokens)))
     }
 }
 

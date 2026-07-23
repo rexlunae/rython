@@ -150,9 +150,13 @@ impl CodeGen for Try {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The try body runs inside an immediately-invoked closure returning
-        // Result<(), PyException>; `raise` (and failed `assert`) inside it
-        // lower to `return Err(...)`.
+        // The try body runs inside an immediately-invoked closure; `raise`
+        // (and failed `assert`) inside it lower to `return Err(...)`. When
+        // the body contains function-level returns, the closure's Ok value
+        // is a ControlFlow carrying the returned value out (Break) or
+        // marking normal completion (Continue).
+        let has_return = crate::body_contains_function_return(&self.body);
+        let body_for_guarantee = self.body.clone();
         let body_ctx = CodeGenContext::TryBlock {
             parent: Box::new(ctx.clone()),
         };
@@ -219,6 +223,16 @@ impl CodeGen for Try {
             quote!()
         };
 
+        // When the try body terminates on every path (return/raise), the
+        // completed-normally arm is provably dead — mark it unreachable so
+        // the surrounding function (which emits no fall-through tail when
+        // all paths terminate) still typechecks.
+        let ok_arm_body = if crate::guarantees_return(&body_for_guarantee) {
+            quote!(unreachable!("try body terminates on every path"))
+        } else {
+            else_tokens
+        };
+
         let finally_tokens = if !self.finalbody.is_empty() {
             let finally_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
                 .finalbody
@@ -231,34 +245,61 @@ impl CodeGen for Try {
             quote!()
         };
 
-        // An exception no handler matched propagates: to the enclosing try's
-        // closure when there is one, otherwise it aborts like an uncaught
-        // Python exception. The finally body still runs first.
+        // An exception no handler matched propagates as an Err — to the
+        // enclosing try's closure when there is one, otherwise out of the
+        // function, as in Python. The finally body still runs first.
         if !has_catch_all {
-            let reraise = if ctx.in_try_block() {
-                quote!(return Err(__rython_exc);)
-            } else {
-                quote!(panic!("{}", __rython_exc);)
-            };
             arms.push(quote! {
-                Err(__rython_exc) => { #finally_tokens #reraise }
+                Err(__rython_exc) => { #finally_tokens return Err(__rython_exc); }
             });
         }
 
-        Ok(quote! {
-            {
-                #[allow(unreachable_code)]
-                let __rython_try_result: std::result::Result<(), PyException> = (|| {
-                    #(#try_body_tokens;)*
-                    Ok(())
-                })();
-                match __rython_try_result {
-                    Ok(()) => { #else_tokens }
-                    #(#arms)*
+        if has_return {
+            // A return that broke out of the closure runs the finally body,
+            // then returns from the function — re-wrapped as another Break
+            // when this try is itself inside an enclosing try's closure.
+            let break_return = if ctx.in_try_block() {
+                quote!(return Ok(std::ops::ControlFlow::Break(__rython_ret));)
+            } else {
+                quote!(return Ok(__rython_ret);)
+            };
+            Ok(quote! {
+                {
+                    #[allow(unreachable_code)]
+                    let __rython_try_result: std::result::Result<
+                        std::ops::ControlFlow<_>,
+                        PyException,
+                    > = (|| {
+                        #(#try_body_tokens;)*
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    })();
+                    match __rython_try_result {
+                        Ok(std::ops::ControlFlow::Break(__rython_ret)) => {
+                            #finally_tokens
+                            #break_return
+                        }
+                        Ok(std::ops::ControlFlow::Continue(())) => { #ok_arm_body }
+                        #(#arms)*
+                    }
+                    #finally_tokens
                 }
-                #finally_tokens
-            }
-        })
+            })
+        } else {
+            Ok(quote! {
+                {
+                    #[allow(unreachable_code)]
+                    let __rython_try_result: std::result::Result<(), PyException> = (|| {
+                        #(#try_body_tokens;)*
+                        Ok(())
+                    })();
+                    match __rython_try_result {
+                        Ok(()) => { #ok_arm_body }
+                        #(#arms)*
+                    }
+                    #finally_tokens
+                }
+            })
+        }
     }
 }
 
