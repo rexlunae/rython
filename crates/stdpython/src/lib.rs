@@ -1517,6 +1517,192 @@ impl PyStrOps for str {
 }
 
 // ============================================================================
+// PYTHON DICTS: insertion-ordered, with the Python method surface
+// ============================================================================
+
+/// The type Python dict literals lower to. Python dicts preserve insertion
+/// order (guaranteed since 3.7), which HashMap does not — IndexMap keeps
+/// keys()/values()/items() and iteration faithful to Python.
+pub type PyDict<K, V> = indexmap::IndexMap<K, V>;
+
+/// Python dict methods. Named as in Python where no inherent conflicts;
+/// `get` conflicts with IndexMap's borrowed-Option accessor, so codegen
+/// maps `d.get(k)` / `d.get(k, default)` to the py_-prefixed versions.
+pub trait PyDictOps<K, V> {
+    /// dict.get(k): the value or None (an Option, never an exception).
+    fn py_get(&self, key: &K) -> Option<V>;
+    /// dict.get(k, default)
+    fn py_get_default(&self, key: &K, default: V) -> V;
+    /// dict.keys(), in insertion order.
+    fn py_keys(&self) -> Vec<K>;
+    /// dict.values(), in insertion order.
+    fn py_values(&self) -> Vec<V>;
+    /// dict.items(), in insertion order.
+    fn py_items(&self) -> Vec<(K, V)>;
+    /// dict.setdefault(k, default): insert if missing, return the value.
+    fn py_setdefault(&mut self, key: K, default: V) -> V;
+    /// dict.update(other): insert/overwrite, appending new keys in order.
+    fn update(&mut self, other: PyDict<K, V>);
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> PyDictOps<K, V> for PyDict<K, V> {
+    fn py_get(&self, key: &K) -> Option<V> {
+        self.get(key).cloned()
+    }
+    fn py_get_default(&self, key: &K, default: V) -> V {
+        self.get(key).cloned().unwrap_or(default)
+    }
+    fn py_keys(&self) -> Vec<K> {
+        self.keys().cloned().collect()
+    }
+    fn py_values(&self) -> Vec<V> {
+        self.values().cloned().collect()
+    }
+    fn py_items(&self) -> Vec<(K, V)> {
+        self.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+    fn py_setdefault(&mut self, key: K, default: V) -> V {
+        self.entry(key).or_insert(default).clone()
+    }
+    fn update(&mut self, other: PyDict<K, V>) {
+        for (k, v) in other {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> PyDictOps<K, V> for HashMap<K, V> {
+    fn py_get(&self, key: &K) -> Option<V> {
+        self.get(key).cloned()
+    }
+    fn py_get_default(&self, key: &K, default: V) -> V {
+        self.get(key).cloned().unwrap_or(default)
+    }
+    fn py_keys(&self) -> Vec<K> {
+        self.keys().cloned().collect()
+    }
+    fn py_values(&self) -> Vec<V> {
+        self.values().cloned().collect()
+    }
+    fn py_items(&self) -> Vec<(K, V)> {
+        self.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+    fn py_setdefault(&mut self, key: K, default: V) -> V {
+        self.entry(key).or_insert(default).clone()
+    }
+    fn update(&mut self, other: PyDict<K, V>) {
+        for (k, v) in other {
+            self.insert(k, v);
+        }
+    }
+}
+
+/// Python's `pop` — dispatched by receiver: list.pop(i) removes by index
+/// (IndexError), dict.pop(k) removes by key (KeyError). Both catchable.
+pub trait PyPop<I> {
+    type Output;
+    fn py_pop(&mut self, index: I) -> Result<Self::Output, PyException>;
+}
+
+impl<T> PyPop<i64> for Vec<T> {
+    type Output = T;
+    fn py_pop(&mut self, index: i64) -> Result<T, PyException> {
+        let len = self.len();
+        normalize_index(index, len)
+            .map(|i| self.remove(i))
+            .ok_or_else(|| PyException::new("IndexError", "pop index out of range"))
+    }
+}
+
+impl<K: Eq + Hash + Debug, V> PyPop<K> for PyDict<K, V> {
+    type Output = V;
+    fn py_pop(&mut self, key: K) -> Result<V, PyException> {
+        let msg = format!("{:?}", key);
+        // shift_remove preserves the insertion order of remaining keys,
+        // matching Python.
+        self.shift_remove(&key)
+            .ok_or_else(|| PyException::new("KeyError", msg))
+    }
+}
+
+impl<K: Eq + Hash + Debug, V> PyPop<K> for HashMap<K, V> {
+    type Output = V;
+    fn py_pop(&mut self, key: K) -> Result<V, PyException> {
+        let msg = format!("{:?}", key);
+        self.remove(&key)
+            .ok_or_else(|| PyException::new("KeyError", msg))
+    }
+}
+
+/// dict.pop(k, default): remove and return, or the default when missing.
+pub trait PyPopDefault<K, V> {
+    fn py_pop_default(&mut self, key: K, default: V) -> V;
+}
+
+impl<K: Eq + Hash, V> PyPopDefault<K, V> for PyDict<K, V> {
+    fn py_pop_default(&mut self, key: K, default: V) -> V {
+        self.shift_remove(&key).unwrap_or(default)
+    }
+}
+
+impl<K: Eq + Hash, V> PyPopDefault<K, V> for HashMap<K, V> {
+    fn py_pop_default(&mut self, key: K, default: V) -> V {
+        self.remove(&key).unwrap_or(default)
+    }
+}
+
+// PyDict participates in every container protocol HashMap does.
+
+impl<K: Eq + Hash + Debug, V: Clone> PyIndex<K> for PyDict<K, V> {
+    type Output = V;
+    fn py_index(&self, key: K) -> Result<V, PyException> {
+        self.get(&key)
+            .cloned()
+            .ok_or_else(|| PyException::new("KeyError", format!("{:?}", key)))
+    }
+}
+
+impl<K: Eq + Hash + Debug, V> PyIndexMut<K> for PyDict<K, V> {
+    type Output = V;
+    fn py_index_mut(&mut self, key: K) -> Result<&mut V, PyException> {
+        let msg = format!("{:?}", key);
+        self.get_mut(&key)
+            .ok_or_else(|| PyException::new("KeyError", msg))
+    }
+}
+
+impl<K: Eq + Hash, V> PySetIndex<K, V> for PyDict<K, V> {
+    fn py_set_index(&mut self, key: K, value: V) -> Result<(), PyException> {
+        self.insert(key, value);
+        Ok(())
+    }
+}
+
+impl<K: Eq + Hash, V> PyContains<K> for PyDict<K, V> {
+    fn py_contains(&self, item: &K) -> bool {
+        self.contains_key(item)
+    }
+}
+
+impl<K, V> Truthy for PyDict<K, V> {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl<K, V> PyIsNone for PyDict<K, V> {
+    fn py_is_none(&self) -> bool {
+        false
+    }
+}
+
+impl<K: Eq + Hash, V> Len for PyDict<K, V> {
+    fn len(&self) -> usize {
+        PyDict::len(self)
+    }
+}
+
+// ============================================================================
 // PYTHON `+`: numeric addition, string and list concatenation
 // ============================================================================
 

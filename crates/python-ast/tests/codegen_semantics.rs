@@ -218,7 +218,7 @@ fn multi_generator_comprehension_nests_loops() {
 fn dict_comprehension_inserts_pairs() {
     let out = compile("m = {k: v for k in keys}", "comp4.py");
     assert!(out.contains("insert"), "generated: {}", out);
-    assert!(out.contains("HashMap"), "generated: {}", out);
+    assert!(out.contains("PyDict"), "generated: {}", out);
 }
 
 #[test]
@@ -857,7 +857,7 @@ fn container_annotations_map_to_rust_types() {
     let out = compile("def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n", "generics.py");
     assert!(out.contains("a : Vec < i64 >"), "generated: {}", out);
     assert!(
-        out.contains("b : std :: collections :: HashMap < String , i64 >"),
+        out.contains("b : PyDict < String , i64 >"),
         "generated: {}",
         out
     );
@@ -927,6 +927,110 @@ fn addition_lowers_through_py_add() {
 
     let out = compile("def f(n: int) -> int:\n    n += 1\n    return n\n", "addaug.py");
     assert!(out.contains("n = (n) . py_add (& (1))"), "generated: {}", out);
+}
+
+#[test]
+fn dict_literals_and_methods_lower_through_pydict() {
+    // Dict literals are insertion-ordered PyDicts, not HashMaps.
+    let out = compile("d = {\"a\": 1}", "dictlit.py");
+    assert!(out.contains("PyDict :: from"), "generated: {}", out);
+    assert!(!out.contains("HashMap :: from"), "generated: {}", out);
+
+    // Method mappings: get/pop/setdefault/views.
+    let src = concat!(
+        "def f() -> int:\n",
+        "    d = {\"a\": 1}\n",
+        "    x = d.get(\"a\", 0)\n",
+        "    y = d.pop(\"a\")\n",
+        "    z = d.pop(\"gone\", 9)\n",
+        "    d.setdefault(\"b\", 2)\n",
+        "    ks = d.keys()\n",
+        "    vs = d.values()\n",
+        "    it = d.items()\n",
+        "    return x + y + z\n",
+    );
+    let out = compile(src, "dictops.py");
+    assert!(out.contains("py_get_default (& (\"a\") , 0)"), "generated: {}", out);
+    assert!(out.contains("py_pop (\"a\") ?"), "generated: {}", out);
+    assert!(out.contains("py_pop_default (\"gone\" , 9)"), "generated: {}", out);
+    assert!(out.contains("py_setdefault (\"b\" , 2)"), "generated: {}", out);
+    assert!(out.contains("py_keys ()"), "generated: {}", out);
+    assert!(out.contains("py_values ()"), "generated: {}", out);
+    assert!(out.contains("py_items ()"), "generated: {}", out);
+
+    // get with one argument returns an Option (value-or-None).
+    let out = compile("def g(d: dict[str, int]):\n    v = d.get(\"k\")\n", "dictget.py");
+    assert!(out.contains("py_get (& (\"k\"))"), "generated: {}", out);
+}
+
+#[test]
+fn keyword_arguments_map_to_parameter_positions() {
+    let src = concat!(
+        "def volume(w: int, h: int, d: int) -> int:\n",
+        "    return w * h * d\n",
+        "\n",
+        "def f() -> int:\n",
+        "    return volume(d=2, w=3, h=4)\n",
+    );
+    let out = compile(src, "kw.py");
+    // Keywords land in signature order regardless of call order.
+    assert!(out.contains("volume (3 , 4 , 2) ?"), "generated: {}", out);
+}
+
+#[test]
+fn omitted_defaults_fill_at_the_call_site() {
+    let src = concat!(
+        "def greet(name: str = \"world\", excited: bool = False) -> str:\n",
+        "    return name\n",
+        "\n",
+        "def f() -> str:\n",
+        "    return greet()\n",
+        "\n",
+        "def g() -> str:\n",
+        "    return greet(excited=True)\n",
+    );
+    let out = compile(src, "kwdef.py");
+    assert!(
+        out.contains("greet (\"world\" , false) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("greet (\"world\" , true) ?"),
+        "keyword for the second param leaves the first defaulted: {}",
+        out
+    );
+}
+
+#[test]
+fn keywords_on_unknown_callees_error_loudly() {
+    // Without a signature the keyword order can't be checked — refusing
+    // beats silently reordering arguments.
+    let module = parse("unknown_func(a=1)\n", "kwunknown.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("kwunknown".into()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("keywords on unknown callee must not convert");
+    assert!(
+        format!("{}", err).contains("signature"),
+        "error: {}",
+        err
+    );
+}
+
+#[test]
+fn dict_comprehensions_build_ordered_pydicts() {
+    // Comprehension-built dicts preserve insertion order like literals.
+    let out = compile(
+        "def f(items: list[int]):\n    return {x: x * 2 for x in items}\n",
+        "dictcomp.py",
+    );
+    assert!(out.contains("PyDict :: new ()"), "generated: {}", out);
+    assert!(!out.contains("HashMap :: new ()"), "generated: {}", out);
 }
 
 #[test]

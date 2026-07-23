@@ -425,3 +425,51 @@ fn py_index_mut_writes_land_in_place() {
         "KeyError"
     );
 }
+
+#[test]
+fn py_dict_matches_python_dict_semantics() {
+    // Insertion order is preserved (Python 3.7+ guarantee), including
+    // through later inserts and pops.
+    let mut d: PyDict<&str, i64> = PyDict::from([("x", 1), ("m", 2), ("a", 3)]);
+    d.py_set_index("q", 4).unwrap();
+    assert_eq!(d.py_keys(), vec!["x", "m", "a", "q"]);
+    assert_eq!(d.py_values(), vec![1, 2, 3, 4]);
+    assert_eq!(d.py_items()[1], ("m", 2));
+
+    // get: value-or-None, never raising; with default
+    assert_eq!(d.py_get(&"x"), Some(1));
+    assert_eq!(d.py_get(&"nope"), None);
+    assert_eq!(d.py_get_default(&"nope", 9), 9);
+
+    // pop: KeyError on missing, order of survivors preserved
+    assert_eq!(d.py_pop("m").unwrap(), 2);
+    assert_eq!(d.py_keys(), vec!["x", "a", "q"]);
+    assert_eq!(d.py_pop("m").unwrap_err().exception_type, "KeyError");
+    assert_eq!(d.py_pop_default("m", 42), 42);
+
+    // setdefault: inserts only when missing, returns the live value
+    assert_eq!(d.py_setdefault("z", 50), 50);
+    assert_eq!(d.py_setdefault("x", 999), 1);
+
+    // update: insert/overwrite, new keys appended in order
+    d.update(PyDict::from([("x", 10), ("w", 7)]));
+    assert_eq!(d.py_get(&"x"), Some(10));
+    assert_eq!(*d.py_keys().last().unwrap(), "w");
+
+    // Container protocols: subscripts, membership, truthiness, len
+    assert_eq!(d.py_index("a").unwrap(), 3);
+    assert_eq!(d.py_index("gone").unwrap_err().exception_type, "KeyError");
+    assert!(d.py_contains(&"z"));
+    assert!(d.is_truthy());
+    assert_eq!(len(&d), 5);
+}
+
+#[test]
+fn py_pop_on_lists_uses_index_semantics() {
+    // list.pop(i): by index with negatives, IndexError out of range
+    let mut v = vec![10i64, 20, 30];
+    assert_eq!(v.py_pop(1).unwrap(), 20);
+    assert_eq!(v, vec![10, 30]);
+    assert_eq!(v.py_pop(-1).unwrap(), 30);
+    assert_eq!(v.py_pop(5).unwrap_err().exception_type, "IndexError");
+}

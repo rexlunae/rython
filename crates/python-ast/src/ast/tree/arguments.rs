@@ -175,11 +175,13 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 }
                 (crate::SubscriptKind::Index(kv), "dict") => {
                     // dict[K, V] parses as a subscript with a tuple index.
+                    // PyDict is the insertion-ordered map dict literals
+                    // lower to.
                     if let ExprType::Tuple(t) = kv.as_ref() {
                         if let [k, v] = t.elts.as_slice() {
                             let k = python_annotation_to_rust_type(k)?;
                             let v = python_annotation_to_rust_type(v)?;
-                            return Some(quote!(std::collections::HashMap<#k, #v>));
+                            return Some(quote!(PyDict<#k, #v>));
                         }
                     }
                     None
@@ -413,34 +415,34 @@ mod tests {
 
     #[test]
     fn test_keyword_arguments() {
-        let code = "func(a=1, b=2)";
+        // Keywords resolve against the callee's signature and land in
+        // parameter order.
+        let code = "def func(a, b):\n    pass\n\nfunc(b=2, a=1)";
         let result = parse(code, "test.py").unwrap();
-        
+
         let options = PythonOptions::default();
-        let symbols = SymbolTableScopes::new();
-        let _rust_code = result.to_rust(
+        let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+        let rust_code = result.to_rust(
             CodeGenContext::Module("test".to_string()),
             options,
             symbols,
-        ).unwrap();
-        
-        // Should generate function call with keyword arguments
+        ).unwrap().to_string();
+        assert!(rust_code.contains("func (1 , 2)"), "generated: {}", rust_code);
     }
 
     #[test]
     fn test_mixed_arguments() {
-        let code = "func(1, 2, c=3, d=4)";
+        let code = "def func(a, b, c, d):\n    pass\n\nfunc(1, 2, d=4, c=3)";
         let result = parse(code, "test.py").unwrap();
-        
+
         let options = PythonOptions::default();
-        let symbols = SymbolTableScopes::new();
-        let _rust_code = result.to_rust(
+        let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+        let rust_code = result.to_rust(
             CodeGenContext::Module("test".to_string()),
             options,
             symbols,
-        ).unwrap();
-        
-        // Should generate function call with mixed positional and keyword arguments
+        ).unwrap().to_string();
+        assert!(rust_code.contains("func (1 , 2 , 3 , 4)"), "generated: {}", rust_code);
     }
 
     #[test]

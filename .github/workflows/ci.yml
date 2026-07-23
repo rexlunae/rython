@@ -18,8 +18,6 @@ jobs:
         with:
           toolchain: stable
       - name: Build all crates
-        run: cargo build --workspace
+        run: cargo build --workspace --all-targets
       - name: Run tests
-        run: cargo test --workspace
-      - name: Check formatting
-        run: cargo fmt --check || true
+        run: cargo test --workspace --all-targets
