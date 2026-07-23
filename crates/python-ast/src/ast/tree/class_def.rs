@@ -118,29 +118,24 @@ impl ClassDef {
             return false;
         };
         let params = method_param_names(m);
-        if crate::analyze_scope(&m.body, &params)
+        let ctx = CodeGenContext::Class(self.name.clone());
+        // The same resolver-backed analysis codegen uses, threading the
+        // visited set through recursive method resolution (RefCell because
+        // the resolver is a shared Fn).
+        let visited = std::cell::RefCell::new(visited);
+        let resolve = |call: &crate::Call| -> Option<bool> {
+            let ExprType::Attribute(attr) = call.func.as_ref() else {
+                return None;
+            };
+            let class = crate::receiver_class(&attr.value, &ctx, symbols)?;
+            if !class.methods().any(|mm| mm.name == attr.attr) {
+                return None;
+            }
+            Some(class.method_mut_inner(&attr.attr, symbols, &mut **visited.borrow_mut()))
+        };
+        crate::analyze_scope_with(&m.body, &params, &resolve)
             .needs_mut
             .contains("self")
-        {
-            return true;
-        }
-        let ctx = CodeGenContext::Class(self.name.clone());
-        let mut needs = false;
-        crate::for_each_call(&m.body, &mut |call| {
-            if needs {
-                return;
-            }
-            if let ExprType::Attribute(attr) = call.func.as_ref() {
-                if crate::chain_base_name(&attr.value) == Some("self") {
-                    if let Some(class) = crate::receiver_class(&attr.value, &ctx, symbols) {
-                        if class.method_mut_inner(&attr.attr, symbols, visited) {
-                            needs = true;
-                        }
-                    }
-                }
-            }
-        });
-        needs
     }
 }
 

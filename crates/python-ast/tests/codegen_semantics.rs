@@ -1465,3 +1465,29 @@ fn class_method_named_new_errors_loudly() {
     assert!(err.contains("`new`"), "error: {}", err);
     assert!(err.contains("constructor"), "error: {}", err);
 }
+
+#[test]
+fn read_only_methods_with_mutator_names_do_not_force_mut() {
+    // A user method shadowing a builtin mutator name (`pop`) that only
+    // reads must not force a mutable receiver binding — class resolution
+    // is authoritative over the syntactic method-name list.
+    let src = concat!(
+        "class Box:\n",
+        "    def __init__(self, v: int):\n",
+        "        self.v = v\n",
+        "\n",
+        "    def pop(self) -> int:\n",
+        "        return self.v\n",
+        "\n",
+        "def run() -> int:\n",
+        "    b = Box(3)\n",
+        "    return b.pop()\n",
+    );
+    let out = compile(src, "romut.py");
+    assert!(out.contains("fn pop (& self ,"), "generated: {}", out);
+    assert!(
+        out.contains("let b ;") && !out.contains("let mut b ;"),
+        "read-only pop must not force `mut`: {}",
+        out
+    );
+}
