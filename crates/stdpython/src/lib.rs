@@ -1489,8 +1489,6 @@ impl PyStrOps for str {
         self.ends_with(suffix)
     }
     fn py_find(&self, needle: &str) -> i64 {
-        // Python returns a character (code point) index; str::find returns
-        // a byte offset — they diverge on any non-ASCII prefix.
         match self.find(needle) {
             Some(byte_idx) => self[..byte_idx].chars().count() as i64,
             None => -1,
