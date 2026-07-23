@@ -163,18 +163,56 @@ impl CodeGen for Module {
         let mut main_body_raw: Vec<crate::Statement> = Vec::new();
         let mut module_init_raw: Vec<crate::Statement> = Vec::new();
 
+        // Module-level names assigned exactly once from a literal, with no
+        // augmented assignment, are CONSTANTS: they lower to static items so
+        // functions in the module can see them (Python module globals are
+        // visible everywhere; a store hidden inside __module_init__ is not).
+        let mut module_assign_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for s in &self.raw.body {
+            match &s.statement {
+                crate::StatementType::Assign(a) => {
+                    for target in &a.targets {
+                        if let crate::ExprType::Name(n) = target {
+                            *module_assign_counts.entry(n.id.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                crate::StatementType::AugAssign(a) => {
+                    if let crate::ExprType::Name(n) = &a.target {
+                        // Reassignment: not a constant.
+                        *module_assign_counts.entry(n.id.clone()).or_insert(0) += 2;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A user `main` that returns a value cannot serve as the Rust entry
+        // point directly (Result<i64, _> does not implement Termination);
+        // route it through the renaming wrapper, which discards the value —
+        // exactly what Python's `if __name__: main()` does.
+        let user_main_returns_value = self.raw.body.iter().any(|s| {
+            matches!(
+                &s.statement,
+                crate::StatementType::FunctionDef(f)
+                    if f.name == "main" && f.resolved_return_type().is_some()
+            )
+        });
+
         for s in self.raw.body {
             // Check if this statement is an async function
             if let crate::StatementType::AsyncFunctionDef(_) = &s.statement {
                 has_async_functions = true;
             }
-            
+
             // Check for if __name__ == "__main__" blocks at the AST level before generating code
             if let crate::StatementType::If(if_stmt) = &s.statement {
                 let test_str = format!("{:?}", if_stmt.test);
                 if test_str.contains("__name__") && test_str.contains("__main__") {
                     // Check if this is a simple main() call pattern
-                    let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body);
+                    let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body)
+                        && !user_main_returns_value;
                     
                     if is_simple_main_call {
                         // For simple main() calls, we'll use the user's main function directly
@@ -201,9 +239,28 @@ impl CodeGen for Module {
                 }
             }
             
+            // Module-level constants become static items visible to every
+            // function in the module.
+            if let crate::StatementType::Assign(a) = &s.statement {
+                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
+                    if module_assign_counts.get(&n.id) == Some(&1) {
+                        if let Some(ty) = const_static_type(&a.value) {
+                            let ident = crate::safe_ident(&n.id);
+                            let value = a.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            stream.extend(quote!(pub static #ident: #ty = #value;));
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Categorize statements into declarations vs executable code
             let is_declaration = Self::is_declaration_statement(&s.statement);
-            
+
             let statement = s
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())
@@ -402,6 +459,33 @@ impl CodeGen for Module {
             });
         }
         Ok(stream)
+    }
+}
+
+/// The static-item type for a module-level constant, when its value is a
+/// literal a static can hold (numbers, bools, strings — including a
+/// leading unary minus). Non-literal or reassigned module globals keep
+/// the old __module_init__ lowering, where referencing them from a
+/// function is a loud compile error rather than a silent divergence.
+fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {
+    match value {
+        crate::ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+            Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
+            Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
+            Some(litrs::Literal::String(_)) => Some(quote!(&'static str)),
+            _ => None,
+        },
+        crate::ExprType::UnaryOp(op) => {
+            if !matches!(op.op, crate::ast::tree::unary_op::Ops::USub) {
+                return None;
+            }
+            match const_static_type(&op.operand) {
+                Some(ty) if ty.to_string() == "i64" || ty.to_string() == "f64" => Some(ty),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

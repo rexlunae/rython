@@ -106,8 +106,9 @@ fn ann_assign_compiles_as_assignment() {
         )
         .expect("codegen succeeds");
     let out = rust.to_string();
-    assert!(out.contains("let x"), "generated: {}", out);
-    assert!(out.contains("x = 5"), "generated: {}", out);
+    // A once-assigned literal at module level now lowers to a constant
+    // static (visible to functions, like a Python module global).
+    assert!(out.contains("pub static x : i64 = 5"), "generated: {}", out);
 }
 
 /// A bare annotation (`x: int`) has no runtime effect and must not error.
