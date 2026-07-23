@@ -378,16 +378,19 @@ impl CodeGen for Module {
     }
 }
 
-/// `let mut name;` declarations for every name assigned in a statement
-/// list, so nested-block assignments store into function-scoped variables
-/// instead of creating shadowing bindings.
+/// Declarations for every name assigned in a statement list, so
+/// nested-block assignments store into scope-level variables instead of
+/// creating shadowing bindings. Scope analysis decides which need `mut`.
 fn hoisted_declarations(body: &[crate::Statement]) -> TokenStream {
-    let mut names = Vec::new();
-    crate::collect_assigned_names(body, &mut names);
+    let scope = crate::analyze_scope(body, &[]);
     let mut out = TokenStream::new();
-    for name in names {
-        let ident = crate::safe_ident(&name);
-        out.extend(quote!(let mut #ident;));
+    for name in &scope.assigned {
+        let ident = crate::safe_ident(name);
+        if scope.needs_mut.contains(name) {
+            out.extend(quote!(let mut #ident;));
+        } else {
+            out.extend(quote!(let #ident;));
+        }
     }
     out
 }

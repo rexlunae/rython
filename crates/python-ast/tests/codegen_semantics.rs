@@ -48,13 +48,37 @@ fn rust_keywords_are_escaped() {
 }
 
 #[test]
-fn assignments_bind_mutably() {
-    // Assigned names are hoisted to a mutable declaration and each
-    // assignment is a plain store (a `let mut` per assignment would shadow
-    // inside nested blocks instead of assigning).
+fn assignments_hoist_declaration_and_store() {
+    // Assigned names are hoisted to a declaration and each assignment is a
+    // plain store (a `let mut` per assignment would shadow inside nested
+    // blocks instead of assigning). A single store needs no `mut`.
     let out = compile("x = 1", "mut.py");
-    assert!(out.contains("let mut x"), "generated: {}", out);
+    assert!(out.contains("let x"), "generated: {}", out);
     assert!(out.contains("x = 1"), "generated: {}", out);
+    assert!(!out.contains("let mut x"), "single store needs no mut: {}", out);
+}
+
+#[test]
+fn mut_is_inferred_only_where_needed() {
+    // Branch-exclusive initialization: no path assigns twice, so no mut —
+    // rustc would warn unused_mut otherwise.
+    let src = "def f(c) -> int:\n    if c:\n        x = 1\n    else:\n        x = 2\n    return x\n";
+    let out = compile(src, "branches.py");
+    assert!(out.contains("let x ;"), "generated: {}", out);
+    assert!(!out.contains("let mut x"), "generated: {}", out);
+
+    // A store inside a loop may execute repeatedly: mut required.
+    let src = "def g(items):\n    total = 0\n    for i in items:\n        total = total + i\n    return total\n";
+    let out = compile(src, "loopmut.py");
+    assert!(out.contains("let mut total"), "generated: {}", out);
+
+    // A mutating method call requires a mutable binding.
+    let out = compile("def h():\n    items = []\n    items.append(1)\n", "append.py");
+    assert!(out.contains("let mut items"), "generated: {}", out);
+
+    // A parameter that is only read is not rebound.
+    let out = compile("def k(n: int) -> int:\n    return n\n", "readonly.py");
+    assert!(!out.contains("let mut n"), "generated: {}", out);
 }
 
 #[test]
@@ -84,8 +108,10 @@ fn assigned_parameters_are_rebound_mutably() {
 fn chained_assignment_assigns_each_target() {
     let out = compile("a = b = 1", "chain.py");
     assert!(out.contains("__rython_chain"), "generated: {}", out);
-    assert!(out.contains("let mut a"), "generated: {}", out);
-    assert!(out.contains("let mut b"), "generated: {}", out);
+    assert!(out.contains("let a"), "generated: {}", out);
+    assert!(out.contains("let b"), "generated: {}", out);
+    assert!(out.contains("a = __rython_chain"), "generated: {}", out);
+    assert!(out.contains("b = __rython_chain"), "generated: {}", out);
 }
 
 #[test]

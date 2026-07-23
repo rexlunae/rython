@@ -105,7 +105,7 @@ fn ann_assign_compiles_as_assignment() {
         )
         .expect("codegen succeeds");
     let out = rust.to_string();
-    assert!(out.contains("let mut x"), "generated: {}", out);
+    assert!(out.contains("let x"), "generated: {}", out);
     assert!(out.contains("x = 5"), "generated: {}", out);
 }
 

@@ -99,29 +99,37 @@ impl CodeGen for FunctionDef {
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         // Python variables are function-scoped: hoist every assigned name to
-        // a `let mut` declaration here so assignments inside nested blocks
-        // (if/loop/try bodies) store into the same variable instead of
-        // creating a shadowing binding. Assigned parameters are rebound as
-        // mutable locals (Rust parameters are immutable).
-        let mut assigned = Vec::new();
-        crate::collect_assigned_names(&self.body, &mut assigned);
-        let param_names: std::collections::HashSet<&str> = self
+        // a declaration here so assignments inside nested blocks (if/loop/
+        // try bodies) store into the same variable instead of creating a
+        // shadowing binding. Scope analysis decides which declarations need
+        // `mut` (mirroring rustc's rules, so the generated code carries
+        // neither unused_mut warnings nor missing-mut errors), and which
+        // parameters must be rebound as mutable locals (Rust parameters are
+        // immutable; Python's are ordinary variables).
+        let param_names: Vec<String> = self
             .args
             .args
             .iter()
             .chain(self.args.posonlyargs.iter())
             .chain(self.args.kwonlyargs.iter())
-            .map(|p| p.arg.as_str())
-            .chain(self.args.vararg.iter().map(|p| p.arg.as_str()))
-            .chain(self.args.kwarg.iter().map(|p| p.arg.as_str()))
+            .map(|p| p.arg.clone())
+            .chain(self.args.vararg.iter().map(|p| p.arg.clone()))
+            .chain(self.args.kwarg.iter().map(|p| p.arg.clone()))
             .collect();
+        let scope = crate::analyze_scope(&self.body, &param_names);
         let mut streams_prologue = TokenStream::new();
-        for name in &assigned {
-            let ident = crate::safe_ident(name);
-            if param_names.contains(name.as_str()) {
+        for name in &param_names {
+            if scope.needs_mut.contains(name) {
+                let ident = crate::safe_ident(name);
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
-            } else {
+            }
+        }
+        for name in &scope.assigned {
+            let ident = crate::safe_ident(name);
+            if scope.needs_mut.contains(name) {
                 streams_prologue.extend(quote!(let mut #ident;));
+            } else {
+                streams_prologue.extend(quote!(let #ident;));
             }
         }
         streams.extend(streams_prologue);

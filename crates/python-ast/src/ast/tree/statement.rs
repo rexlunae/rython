@@ -305,66 +305,6 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
     }
 }
 
-/// Collect, in program order and without duplicates, every plain name that
-/// an `Assign` statement binds anywhere in a statement list — recursing into
-/// control-flow bodies but not into nested function or class definitions
-/// (which are their own scopes). Python variables are function-scoped, so
-/// these names are hoisted to `let mut` declarations at the top of the
-/// enclosing scope and every assignment lowers to a plain `name = value`;
-/// per-block `let` bindings would silently shadow instead of assign.
-pub fn collect_assigned_names(body: &[Statement], out: &mut Vec<String>) {
-    fn push_target(target: &ExprType, out: &mut Vec<String>) {
-        match target {
-            ExprType::Name(name) => {
-                if !out.contains(&name.id) {
-                    out.push(name.id.clone());
-                }
-            }
-            ExprType::Tuple(tuple) => {
-                for elt in &tuple.elts {
-                    push_target(elt, out);
-                }
-            }
-            // Attribute/subscript targets assign into existing places.
-            _ => {}
-        }
-    }
-
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Assign(a) => {
-                for target in &a.targets {
-                    push_target(target, out);
-                }
-            }
-            StatementType::If(s) => {
-                collect_assigned_names(&s.body, out);
-                collect_assigned_names(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_assigned_names(&s.body, out);
-                collect_assigned_names(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_assigned_names(&s.body, out);
-                collect_assigned_names(&s.orelse, out);
-            }
-            StatementType::Try(s) => {
-                collect_assigned_names(&s.body, out);
-                for handler in &s.handlers {
-                    collect_assigned_names(&handler.body, out);
-                }
-                collect_assigned_names(&s.orelse, out);
-                collect_assigned_names(&s.finalbody, out);
-            }
-            StatementType::With(s) => collect_assigned_names(&s.body, out),
-            StatementType::AsyncWith(s) => collect_assigned_names(&s.body, out),
-            StatementType::AsyncFor(s) => collect_assigned_names(&s.body, out),
-            _ => {}
-        }
-    }
-}
-
 /// Whether a loop body contains a `break` that belongs to that loop —
 /// looking through `if`/`try`/`with` blocks but not into nested loops
 /// (whose breaks are their own) or nested definitions. Loops with an `else`

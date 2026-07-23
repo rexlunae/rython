@@ -26,9 +26,9 @@ pub enum Compares {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Compare {
-    ops: Vec<Compares>,
-    left: Box<ExprType>,
-    comparators: Vec<ExprType>,
+    pub ops: Vec<Compares>,
+    pub left: Box<ExprType>,
+    pub comparators: Vec<ExprType>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Compare {

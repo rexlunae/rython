@@ -20,8 +20,8 @@ pub enum Ops {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UnaryOp {
-    op: Ops,
-    operand: Box<ExprType>,
+    pub op: Ops,
+    pub operand: Box<ExprType>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for UnaryOp {
