@@ -63,7 +63,8 @@ impl CodeGen for While {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let test = self.test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let test =
+            crate::condition_to_rust(&self.test, ctx.clone(), options.clone(), symbols.clone())?;
 
         let has_else = !self.orelse.is_empty();
         // Break-tracking is only needed when the else clause could be skipped

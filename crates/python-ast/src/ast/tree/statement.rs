@@ -415,7 +415,8 @@ impl CodeGen for StatementType {
                 Ok(quote!(#func_def))
             }
             StatementType::Assert { test, msg } => {
-                let test_tokens = test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let test_tokens =
+                    crate::condition_to_rust(&test, ctx.clone(), options.clone(), symbols.clone())?;
                 let msg_tokens = match msg {
                     Some(m) => {
                         let m = m.to_rust(ctx.clone(), options, symbols)?;

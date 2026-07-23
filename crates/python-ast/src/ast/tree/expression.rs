@@ -621,3 +621,50 @@ mod tests {
         );
     }
 }
+
+/// Lower an expression in condition position (if/while/ternary/assert
+/// tests): Python implicitly calls bool() on it. Boolean operators recurse
+/// into their operands and `not` negates a condition; comparisons already
+/// yield bool; anything else is wrapped in stdpython's Truthy::is_truthy,
+/// giving Python's truth table (empty string/collection and zero are
+/// false).
+pub fn condition_to_rust(
+    expr: &ExprType,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    match expr {
+        ExprType::BoolOp(op)
+            if matches!(op.op, crate::BoolOps::And | crate::BoolOps::Or) =>
+        {
+            let mut parts = Vec::new();
+            for value in &op.values {
+                parts.push(condition_to_rust(
+                    value,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            Ok(match op.op {
+                crate::BoolOps::And => quote!(#((#parts))&&*),
+                _ => quote!(#((#parts))||*),
+            })
+        }
+        ExprType::UnaryOp(u) if matches!(u.op, crate::Ops::Not) => {
+            let inner = condition_to_rust(&u.operand, ctx, options, symbols)?;
+            Ok(quote!(!(#inner)))
+        }
+        // Comparisons (including `in` and `is None`) already produce bool.
+        ExprType::Compare(_) => expr.clone().to_rust(ctx, options, symbols),
+        // Bool literals are already bool.
+        ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Bool(_))) => {
+            expr.clone().to_rust(ctx, options, symbols)
+        }
+        other => {
+            let tokens = other.clone().to_rust(ctx, options, symbols)?;
+            Ok(quote!((#tokens).is_truthy()))
+        }
+    }
+}

@@ -63,8 +63,10 @@ impl CodeGen for If {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Regular if statement handling
-        let test = self.test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // Regular if statement handling; the test is a condition position,
+        // so Python truthiness applies.
+        let test =
+            crate::condition_to_rust(&self.test, ctx.clone(), options.clone(), symbols.clone())?;
         
         let body_stmts: Result<Vec<_>, _> = self.body
             .into_iter()

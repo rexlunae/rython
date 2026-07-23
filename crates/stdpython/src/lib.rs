@@ -1293,6 +1293,214 @@ impl<T> Len for Vec<T> {
 }
 
 // ============================================================================
+// TRUTHINESS OF STD TYPES (conditions lower through Truthy)
+// ============================================================================
+
+impl Truthy for String {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl Truthy for str {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl Truthy for &str {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl<T> Truthy for Vec<T> {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl<K, V> Truthy for HashMap<K, V> {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl<T> Truthy for HashSet<T> {
+    fn is_truthy(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+/// Python: bool(None) is False; bool(Some-like values) follows the value.
+impl<T: Truthy> Truthy for Option<T> {
+    fn is_truthy(&self) -> bool {
+        match self {
+            Some(v) => v.is_truthy(),
+            None => false,
+        }
+    }
+}
+
+// ============================================================================
+// `is None` / `is not None`
+// ============================================================================
+
+/// Python's `x is None`. Option values report their None-ness; plain values
+/// are never None (a non-Option Rust value always holds something).
+pub trait PyIsNone {
+    fn py_is_none(&self) -> bool;
+}
+
+impl<T> PyIsNone for Option<T> {
+    fn py_is_none(&self) -> bool {
+        self.is_none()
+    }
+}
+
+macro_rules! never_none {
+    ($($t:ty),* $(,)?) => {
+        $(impl PyIsNone for $t {
+            fn py_is_none(&self) -> bool {
+                false
+            }
+        })*
+    };
+}
+
+never_none!(bool, i8, i16, i32, i64, i128, u8, u16, u32, u64, usize, f32, f64, char, String, str, &str, PyException);
+
+impl<T> PyIsNone for Vec<T> {
+    fn py_is_none(&self) -> bool {
+        false
+    }
+}
+
+impl<K, V> PyIsNone for HashMap<K, V> {
+    fn py_is_none(&self) -> bool {
+        false
+    }
+}
+
+impl<T> PyIsNone for HashSet<T> {
+    fn py_is_none(&self) -> bool {
+        false
+    }
+}
+
+// ============================================================================
+// PYTHON LIST METHODS (on Vec)
+// ============================================================================
+
+/// Python list methods with no inherent Rust equivalent under the same
+/// name. Methods whose Rust inherents already match Python (extend, clear,
+/// reverse, sort) need nothing; methods whose inherents CONFLICT with
+/// Python semantics (append, pop, remove, insert) are mapped in codegen
+/// instead.
+pub trait PyListOps<T> {
+    /// list.count(x)
+    fn count(&self, item: &T) -> i64
+    where
+        T: PartialEq;
+}
+
+impl<T> PyListOps<T> for Vec<T> {
+    fn count(&self, item: &T) -> i64
+    where
+        T: PartialEq,
+    {
+        self.iter().filter(|e| *e == item).count() as i64
+    }
+}
+
+// ============================================================================
+// PYTHON STRING METHODS (on str / String via deref)
+// ============================================================================
+
+/// Python str methods. Named exactly as in Python where no inherent Rust
+/// method conflicts; where one does (split, find), codegen maps the call to
+/// the py_-prefixed name here.
+pub trait PyStrOps {
+    fn upper(&self) -> String;
+    fn lower(&self) -> String;
+    fn strip(&self) -> String;
+    fn lstrip(&self) -> String;
+    fn rstrip(&self) -> String;
+    fn capitalize(&self) -> String;
+    fn startswith(&self, prefix: &str) -> bool;
+    fn endswith(&self, suffix: &str) -> bool;
+    /// str.find: byte index of the first match, or -1 (not an Option).
+    fn py_find(&self, needle: &str) -> i64;
+    /// str.split(sep)
+    fn py_split(&self, sep: &str) -> Vec<String>;
+    /// str.split() with no argument: split on runs of whitespace.
+    fn py_split_whitespace(&self) -> Vec<String>;
+    fn splitlines(&self) -> Vec<String>;
+    /// sep.join(iterable)
+    fn join<I, S>(&self, parts: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>;
+}
+
+impl PyStrOps for str {
+    fn upper(&self) -> String {
+        self.to_uppercase()
+    }
+    fn lower(&self) -> String {
+        self.to_lowercase()
+    }
+    fn strip(&self) -> String {
+        self.trim().to_string()
+    }
+    fn lstrip(&self) -> String {
+        self.trim_start().to_string()
+    }
+    fn rstrip(&self) -> String {
+        self.trim_end().to_string()
+    }
+    fn capitalize(&self) -> String {
+        // Python: first char uppercased, the rest lowercased.
+        let mut chars = self.chars();
+        match chars.next() {
+            Some(first) => {
+                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+            }
+            None => String::new(),
+        }
+    }
+    fn startswith(&self, prefix: &str) -> bool {
+        self.starts_with(prefix)
+    }
+    fn endswith(&self, suffix: &str) -> bool {
+        self.ends_with(suffix)
+    }
+    fn py_find(&self, needle: &str) -> i64 {
+        self.find(needle).map(|i| i as i64).unwrap_or(-1)
+    }
+    fn py_split(&self, sep: &str) -> Vec<String> {
+        self.split(sep).map(str::to_string).collect()
+    }
+    fn py_split_whitespace(&self) -> Vec<String> {
+        self.split_whitespace().map(str::to_string).collect()
+    }
+    fn splitlines(&self) -> Vec<String> {
+        self.lines().map(str::to_string).collect()
+    }
+    fn join<I, S>(&self, parts: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        parts
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join(self)
+    }
+}
+
+// ============================================================================
 // MEMBERSHIP (the `in` operator)
 // ============================================================================
 

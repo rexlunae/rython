@@ -181,6 +181,12 @@ impl CodeGen for Parameter {
 
         // Generate type annotation if present
         if let Some(annotation) = self.annotation {
+            // A str parameter accepts anything convertible to String, so
+            // call sites can pass &str literals as well as owned Strings;
+            // the function prologue converts it (`let s: String = s.into()`).
+            if matches!(&*annotation, ExprType::Name(n) if n.id == "str") {
+                return Ok(quote!(#param_name: impl Into<String>));
+            }
             // Known Python types map to concrete Rust types; anything else
             // falls back to rendering the annotation expression (e.g. a
             // user-defined class name).
