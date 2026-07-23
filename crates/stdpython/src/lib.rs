@@ -328,14 +328,188 @@ pub fn abs<T: PyAbs>(x: T) -> T::Output {
     x.py_abs()
 }
 
-/// Python min() function
-pub fn min<T: Ord + Clone>(iterable: &[T]) -> Option<T> {
-    iterable.iter().min().cloned()
+/// Python min() on an iterable. PartialOrd (not Ord) so floats work, with
+/// the fold Python's own comparison loop produces: the current best is
+/// replaced only when a later element is STRICTLY smaller, which is
+/// exactly why `min([nan, 1.0])` is nan but `min([1.0, nan])` is 1.0.
+/// An empty iterable raises ValueError, as in Python.
+pub fn min<T: PartialOrd + Clone>(iterable: &[T]) -> Result<T, PyException> {
+    let mut it = iterable.iter();
+    let mut best = it
+        .next()
+        .ok_or_else(|| PyException::new("ValueError", "min() arg is an empty sequence"))?;
+    for x in it {
+        if x < best {
+            best = x;
+        }
+    }
+    Ok(best.clone())
 }
 
-/// Python max() function
-pub fn max<T: Ord + Clone>(iterable: &[T]) -> Option<T> {
-    iterable.iter().max().cloned()
+/// Python max() on an iterable; see min() for the comparison semantics.
+pub fn max<T: PartialOrd + Clone>(iterable: &[T]) -> Result<T, PyException> {
+    let mut it = iterable.iter();
+    let mut best = it
+        .next()
+        .ok_or_else(|| PyException::new("ValueError", "max() arg is an empty sequence"))?;
+    for x in it {
+        if x > best {
+            best = x;
+        }
+    }
+    Ok(best.clone())
+}
+
+/// Python min(a, b): b wins only when strictly smaller (ties and
+/// incomparable NaNs keep the first argument, as in Python). The n-ary
+/// form folds through this.
+pub fn min2<T: PartialOrd>(a: T, b: T) -> T {
+    if b < a { b } else { a }
+}
+
+/// Python max(a, b); see min2.
+pub fn max2<T: PartialOrd>(a: T, b: T) -> T {
+    if b > a { b } else { a }
+}
+
+/// Python min(iterable, default=d): the default only covers emptiness.
+pub fn min_default<T: PartialOrd + Clone>(iterable: &[T], default: T) -> T {
+    min(iterable).unwrap_or(default)
+}
+
+/// Python max(iterable, default=d).
+pub fn max_default<T: PartialOrd + Clone>(iterable: &[T], default: T) -> T {
+    max(iterable).unwrap_or(default)
+}
+
+/// Python min(iterable, key=f): comparisons use f(x), the ELEMENT is
+/// returned, and f runs once per element. Ties keep the earliest element.
+pub fn min_key<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
+    iterable: &[T],
+    mut key: F,
+) -> Result<T, PyException> {
+    let mut it = iterable.iter();
+    let first = it
+        .next()
+        .ok_or_else(|| PyException::new("ValueError", "min() arg is an empty sequence"))?;
+    let mut best = first;
+    let mut best_key = key(first);
+    for x in it {
+        let k = key(x);
+        if k < best_key {
+            best = x;
+            best_key = k;
+        }
+    }
+    Ok(best.clone())
+}
+
+/// Python max(iterable, key=f); see min_key.
+pub fn max_key<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
+    iterable: &[T],
+    mut key: F,
+) -> Result<T, PyException> {
+    let mut it = iterable.iter();
+    let first = it
+        .next()
+        .ok_or_else(|| PyException::new("ValueError", "max() arg is an empty sequence"))?;
+    let mut best = first;
+    let mut best_key = key(first);
+    for x in it {
+        let k = key(x);
+        if k > best_key {
+            best = x;
+            best_key = k;
+        }
+    }
+    Ok(best.clone())
+}
+
+/// Python min(iterable, key=f, default=d).
+pub fn min_key_default<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
+    iterable: &[T],
+    key: F,
+    default: T,
+) -> T {
+    min_key(iterable, key).unwrap_or(default)
+}
+
+/// Python max(iterable, key=f, default=d).
+pub fn max_key_default<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
+    iterable: &[T],
+    key: F,
+    default: T,
+) -> T {
+    max_key(iterable, key).unwrap_or(default)
+}
+
+/// The comparator behind sorted(): Python's sort only needs `<`, which
+/// PartialOrd supplies for every type we lower — except NaN, where
+/// CPython's timsort silently produces an arbitrary-looking (though
+/// deterministic) order no other sort reproduces. Exactness being
+/// impossible, sorting NaN fails loudly instead of quietly diverging.
+fn py_sort_cmp<T: PartialOrd>(a: &T, b: &T) -> core::cmp::Ordering {
+    a.partial_cmp(b).unwrap_or_else(|| {
+        panic!(
+            "{}",
+            PyException::new(
+                "ValueError",
+                "cannot sort values without a total order (NaN); Python's NaN sort \
+                 order is not reproducible",
+            )
+        )
+    })
+}
+
+/// Python sorted(iterable): a new, stably ascending list.
+pub fn sorted<T: PartialOrd + Clone>(iterable: &[T]) -> Vec<T> {
+    let mut out = iterable.to_vec();
+    out.sort_by(py_sort_cmp);
+    out
+}
+
+/// Python sorted(iterable, reverse=...): stable descending when true —
+/// equal elements keep their original order (this is NOT a plain
+/// reversal, which would flip ties).
+pub fn sorted_reverse<T: PartialOrd + Clone>(iterable: &[T], reverse: bool) -> Vec<T> {
+    let mut out = iterable.to_vec();
+    if reverse {
+        out.sort_by(|a, b| py_sort_cmp(b, a));
+    } else {
+        out.sort_by(py_sort_cmp);
+    }
+    out
+}
+
+/// Python sorted(iterable, key=f): decorate-sort-undecorate, so the key
+/// function runs exactly once per element, as in Python.
+pub fn sorted_key<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
+    iterable: &[T],
+    mut key: F,
+) -> Vec<T> {
+    let mut decorated: Vec<(K, T)> = iterable.iter().map(|x| (key(x), x.clone())).collect();
+    decorated.sort_by(|a, b| py_sort_cmp(&a.0, &b.0));
+    decorated.into_iter().map(|(_, x)| x).collect()
+}
+
+/// Python sorted(iterable, key=f, reverse=...).
+pub fn sorted_key_reverse<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
+    iterable: &[T],
+    mut key: F,
+    reverse: bool,
+) -> Vec<T> {
+    let mut decorated: Vec<(K, T)> = iterable.iter().map(|x| (key(x), x.clone())).collect();
+    if reverse {
+        decorated.sort_by(|a, b| py_sort_cmp(&b.0, &a.0));
+    } else {
+        decorated.sort_by(|a, b| py_sort_cmp(&a.0, &b.0));
+    }
+    decorated.into_iter().map(|(_, x)| x).collect()
+}
+
+/// Python reversed(sequence), materialized.
+pub fn reversed<T: Clone>(iterable: &[T]) -> Vec<T> {
+    iterable.iter().rev().cloned().collect()
 }
 
 /// Python sum() function
@@ -448,6 +622,69 @@ where
     L: PyPow<R>,
 {
     a.py_pow(b)
+}
+
+/// Python's two-argument pow() builtin — same semantics as `**`.
+pub fn pow<L, R>(a: L, b: R) -> L::Output
+where
+    L: PyPow<R>,
+{
+    a.py_pow(b)
+}
+
+/// Python pow(base, exp, mod): modular exponentiation, with the modular
+/// inverse for negative exponents (Python 3.8+). The result takes the
+/// modulus's sign, like Python's floored `%`.
+pub fn pow_mod(base: i64, exp: i64, modulus: i64) -> Result<i64, PyException> {
+    if modulus == 0 {
+        return Err(PyException::new(
+            "ValueError",
+            "pow() 3rd argument cannot be 0",
+        ));
+    }
+    let m = (modulus as i128).abs();
+    let mut b = (base as i128).rem_euclid(m);
+    let mut e = exp as i128;
+    if e < 0 {
+        // Invert base mod m via extended gcd; only units are invertible.
+        let (g, x) = egcd(b, m);
+        if g != 1 {
+            return Err(PyException::new(
+                "ValueError",
+                "base is not invertible for the given modulus",
+            ));
+        }
+        b = x.rem_euclid(m);
+        e = -e;
+    }
+    let mut result: i128 = 1 % m;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = result * b % m;
+        }
+        b = b * b % m;
+        e >>= 1;
+    }
+    // Fold the non-negative residue onto the modulus's sign: Python's
+    // pow(5, 3, -7) is -1, not 6.
+    let signed = if modulus < 0 && result != 0 {
+        result - m
+    } else {
+        result
+    };
+    Ok(signed as i64)
+}
+
+/// Extended gcd on non-negative i128s: returns (g, x) with a*x ≡ g (mod b).
+fn egcd(a: i128, b: i128) -> (i128, i128) {
+    let (mut old_r, mut r) = (a, b);
+    let (mut old_x, mut x) = (1i128, 0i128);
+    while r != 0 {
+        let q = old_r / r;
+        (old_r, r) = (r, old_r - q * r);
+        (old_x, x) = (x, old_x - q * x);
+    }
+    (old_r, old_x)
 }
 
 /// Python round() builtin with no ndigits: rounds half to even (banker's
@@ -605,9 +842,24 @@ pub fn any<T: Truthy>(iterable: &[T]) -> bool {
     iterable.iter().any(|x| x.is_truthy())
 }
 
-/// Python enumerate() function - returns iterator with index and value pairs
-pub fn enumerate<T>(iterable: Vec<T>) -> Vec<(usize, T)> {
-    iterable.into_iter().enumerate().collect()
+/// Python enumerate() function - returns iterator with index and value
+/// pairs. The index is an i64 because Python's is an int, and generated
+/// arithmetic on it must not need casts.
+pub fn enumerate<T>(iterable: Vec<T>) -> Vec<(i64, T)> {
+    iterable
+        .into_iter()
+        .enumerate()
+        .map(|(i, x)| (i as i64, x))
+        .collect()
+}
+
+/// Python enumerate(iterable, start=n).
+pub fn enumerate_start<T>(iterable: Vec<T>, start: i64) -> Vec<(i64, T)> {
+    iterable
+        .into_iter()
+        .enumerate()
+        .map(|(i, x)| (start + i as i64, x))
+        .collect()
 }
 
 /// Python zip() function - combines multiple iterables
@@ -866,17 +1118,165 @@ impl PyToString for i64 {
 
 impl PyToString for f64 {
     fn py_str(self) -> String {
-        // Python renders float("3") as "3.0"; Rust's Display drops the ".0".
-        if self.is_finite() && flt::fract(self) == 0.0 && flt::abs(self) < 1e16 {
-            format!("{:.1}", self)
-        } else if self.is_infinite() {
-            if self > 0.0 { "inf".to_string() } else { "-inf".to_string() }
-        } else if self.is_nan() {
-            "nan".to_string()
+        // Python 3's str(float) IS repr(float).
+        py_float_repr(self)
+    }
+}
+
+/// Python's float repr, exactly: shortest round-trip digits (which Rust's
+/// Display also produces), rendered positionally for decimal exponents in
+/// [-4, 16) and as `d.dddde±EE` outside — Python prints 1e16 as "1e+16"
+/// where Rust's Display (which never uses exponent form) prints
+/// "10000000000000000".
+pub fn py_float_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let display = format!("{}", x);
+    let (sign, body) = match display.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", display.as_str()),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    // Decimal exponent of the leading significant digit.
+    let (exp, digits): (i64, String) = if int_part != "0" {
+        (
+            int_part.len() as i64 - 1,
+            format!("{}{}", int_part, frac_part),
+        )
+    } else {
+        let zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
+        (
+            -(zeros as i64) - 1,
+            frac_part.trim_start_matches('0').to_string(),
+        )
+    };
+    if (-4..16).contains(&exp) {
+        return if frac_part.is_empty() {
+            format!("{}{}.0", sign, int_part)
         } else {
-            self.to_string()
+            format!("{}{}", sign, body)
+        };
+    }
+    let digits = digits.trim_end_matches('0');
+    let mantissa = if digits.len() > 1 {
+        format!("{}.{}", &digits[..1], &digits[1..])
+    } else {
+        digits.to_string()
+    };
+    format!("{}{}e{}{:02}", sign, mantissa, if exp < 0 { "-" } else { "+" }, exp.abs())
+}
+
+/// Python's repr() for the types generated code produces. str gets
+/// Python's quoting rules (single quotes unless the text contains a single
+/// quote and no double quote); containers recurse.
+pub trait PyRepr {
+    fn py_repr(&self) -> String;
+}
+
+impl PyRepr for i64 {
+    fn py_repr(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl PyRepr for f64 {
+    fn py_repr(&self) -> String {
+        py_float_repr(*self)
+    }
+}
+
+impl PyRepr for bool {
+    fn py_repr(&self) -> String {
+        if *self { "True" } else { "False" }.to_string()
+    }
+}
+
+impl PyRepr for str {
+    fn py_repr(&self) -> String {
+        py_str_repr(self)
+    }
+}
+
+impl PyRepr for String {
+    fn py_repr(&self) -> String {
+        py_str_repr(self)
+    }
+}
+
+impl<T: PyRepr + ?Sized> PyRepr for &T {
+    fn py_repr(&self) -> String {
+        (**self).py_repr()
+    }
+}
+
+impl<T: PyRepr> PyRepr for Vec<T> {
+    fn py_repr(&self) -> String {
+        let items: Vec<String> = self.iter().map(|x| x.py_repr()).collect();
+        format!("[{}]", items.join(", "))
+    }
+}
+
+/// In the Option-based None model, None reprs as Python's None and a
+/// present value reprs as itself.
+impl<T: PyRepr> PyRepr for Option<T> {
+    fn py_repr(&self) -> String {
+        match self {
+            Some(x) => x.py_repr(),
+            None => "None".to_string(),
         }
     }
+}
+
+/// Python's str repr: preferred single quotes (double when the text holds
+/// a single quote but no double quote), backslash/newline/return/tab
+/// escapes, and \xNN for ASCII control characters. Non-ASCII control
+/// characters use \u{NNNN}-style Python escapes; other non-ASCII text is
+/// kept literal (Python additionally escapes some exotic non-printables,
+/// e.g. paragraph separators, which is not reproduced here).
+pub fn py_str_repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if c.is_control() => {
+                if (c as u32) < 0x100 {
+                    out.push_str(&format!("\\x{:02x}", c as u32));
+                } else {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// Python repr() builtin.
+pub fn repr<T: PyRepr + ?Sized>(x: &T) -> String {
+    x.py_repr()
 }
 
 impl PyToString for bool {
@@ -904,6 +1304,14 @@ impl PyToString for String {
 /// Trait for objects that have a length
 pub trait Len {
     fn len(&self) -> usize;
+}
+
+// References measure like their referents, so len() works on the &T
+// elements that key-function closures (min/max/sorted key=) receive.
+impl<T: Len + ?Sized> Len for &T {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
 }
 
 /// Trait for objects that can be evaluated for truthiness
@@ -1377,12 +1785,93 @@ where
     }
 }
 
-impl<T> Truthy for PySet<T> 
-where 
+impl<T> Truthy for PySet<T>
+where
     T: Eq + Hash,
 {
     fn is_truthy(&self) -> bool {
         !self.inner.is_empty()
+    }
+}
+
+/// Python frozenset: a set with no mutating surface. Immutability comes
+/// from the API — only read operations exist — so the frozen contract
+/// holds regardless of `mut` bindings.
+#[derive(Debug, Clone)]
+pub struct FrozenSet<T>
+where
+    T: Eq + Hash,
+{
+    inner: HashSet<T>,
+}
+
+impl<T> FrozenSet<T>
+where
+    T: Eq + Hash,
+{
+    pub fn contains(&self, item: &T) -> bool {
+        self.inner.contains(item)
+    }
+
+    pub fn union(&self, other: &FrozenSet<T>) -> FrozenSet<T>
+    where
+        T: Clone,
+    {
+        let mut inner = self.inner.clone();
+        inner.extend(other.inner.iter().cloned());
+        FrozenSet { inner }
+    }
+
+    pub fn intersection(&self, other: &FrozenSet<T>) -> FrozenSet<T>
+    where
+        T: Clone,
+    {
+        FrozenSet {
+            inner: self.inner.intersection(&other.inner).cloned().collect(),
+        }
+    }
+
+    pub fn difference(&self, other: &FrozenSet<T>) -> FrozenSet<T>
+    where
+        T: Clone,
+    {
+        FrozenSet {
+            inner: self.inner.difference(&other.inner).cloned().collect(),
+        }
+    }
+}
+
+impl<T> Len for FrozenSet<T>
+where
+    T: Eq + Hash,
+{
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<T> Truthy for FrozenSet<T>
+where
+    T: Eq + Hash,
+{
+    fn is_truthy(&self) -> bool {
+        !self.inner.is_empty()
+    }
+}
+
+impl<T> PyContains<T> for FrozenSet<T>
+where
+    T: Eq + Hash,
+{
+    fn py_contains(&self, item: &T) -> bool {
+        self.inner.contains(item)
+    }
+}
+
+/// Python's frozenset() builtin, from any list/sequence.
+pub fn frozenset<T: Eq + Hash>(items: Vec<T>) -> FrozenSet<T> {
+    FrozenSet {
+        inner: items.into_iter().collect(),
     }
 }
 
@@ -3123,8 +3612,8 @@ mod tests {
         assert_eq!(sum(&pylist), 6);
         
         // Test min/max
-        assert_eq!(min(&nums_i64), Some(1));
-        assert_eq!(max(&nums_i64), Some(5));
+        assert_eq!(min(&nums_i64).unwrap(), 1);
+        assert_eq!(max(&nums_i64).unwrap(), 5);
         
         // Test all/any
         let bools = vec![true, true, false];

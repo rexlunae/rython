@@ -35,8 +35,8 @@ fn test_python_builtin_functions() {
     assert_eq!(abs(-42i64), 42);
     assert_eq!(abs(-3.14), 3.14);
     assert_eq!(sum(&vec![1, 2, 3, 4, 5][..]), 15);
-    assert_eq!(min(&vec![5, 1, 9, 3]), Some(1));
-    assert_eq!(max(&vec![5, 1, 9, 3]), Some(9));
+    assert_eq!(min(&vec![5, 1, 9, 3]).unwrap(), 1);
+    assert_eq!(max(&vec![5, 1, 9, 3]).unwrap(), 9);
     
     // Boolean functions
     assert_eq!(all(&vec![true, true, true]), true);
