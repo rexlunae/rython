@@ -57,9 +57,11 @@ impl<'a> CodeGen for Attribute {
         
         if is_module_access {
             // Use :: for module access (Python's sys.executable becomes sys::executable)
-            // Special handling for LazyLock static variables that need dereferencing
-            let needs_deref = matches!((value_str.as_str(), self.attr.as_str()), 
-                ("sys", "executable") | ("sys", "argv") | ("os", "environ")
+            // Special handling for LazyLock static variables that need
+            // dereferencing. os::environ is NOT here: it is a live-view
+            // unit struct whose methods auto-ref.
+            let needs_deref = matches!((value_str.as_str(), self.attr.as_str()),
+                ("sys", "executable") | ("sys", "argv")
             );
             
             if needs_deref {

@@ -639,3 +639,103 @@ fn random_state_round_trips_and_seed_resets_gauss() {
     random::seed(Some(55i64));
     assert_eq!(random::gauss(0.0, 1.0), first);
 }
+
+// ---- os.path: lexical semantics matching posixpath ----
+
+#[test]
+fn normpath_matches_posixpath() {
+    use stdpython::os::path::normpath;
+    // Values verified against python3 posixpath.normpath.
+    assert_eq!(normpath("A//B"), "A/B");
+    assert_eq!(normpath("A/./B"), "A/B");
+    assert_eq!(normpath("A/foo/../B"), "A/B");
+    assert_eq!(normpath("/.."), "/");
+    assert_eq!(normpath("//a"), "//a"); // exactly two leading slashes survive
+    assert_eq!(normpath("///a"), "/a");
+    assert_eq!(normpath(""), ".");
+    assert_eq!(normpath("../x"), "../x");
+}
+
+#[test]
+fn abspath_is_lexical_and_never_touches_the_filesystem() {
+    use stdpython::os::path::abspath;
+    // Absolute inputs normalize without consulting the filesystem: the
+    // path does not exist and contains an up-level through a nonexistent
+    // directory (canonicalize would fail on both counts).
+    assert_eq!(abspath("/a/../b//c/./d").unwrap(), "/b/c/d");
+    // Relative nonexistent paths join onto the cwd (Python behavior; the
+    // old canonicalize-based version errored here).
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        abspath("does/not/exist").unwrap(),
+        format!("{}/does/not/exist", cwd.to_string_lossy())
+    );
+}
+
+#[test]
+fn relpath_traverses_up_like_python() {
+    use stdpython::os::path::relpath;
+    // Values verified against python3 posixpath.relpath.
+    assert_eq!(relpath("/a/b", Some("/a/c".to_string())).unwrap(), "../b");
+    assert_eq!(relpath("/a/b/c", Some("/a".to_string())).unwrap(), "b/c");
+    assert_eq!(relpath("/a", Some("/a".to_string())).unwrap(), ".");
+    assert_eq!(
+        relpath("/x/y", Some("/a/b/c".to_string())).unwrap(),
+        "../../../x/y"
+    );
+}
+
+#[test]
+fn basename_dirname_edge_cases_match_posixpath() {
+    use stdpython::os::path::{basename, dirname};
+    // Values verified against python3 posixpath.
+    assert_eq!(basename("dir/"), "");
+    assert_eq!(basename("/a/b"), "b");
+    assert_eq!(basename("abc"), "abc");
+    assert_eq!(dirname("/"), "/");
+    assert_eq!(dirname("abc"), "");
+    assert_eq!(dirname("a/b/"), "a/b");
+    assert_eq!(dirname("//a"), "//");
+    assert_eq!(dirname("/a/b"), "/a");
+}
+
+#[test]
+fn environ_is_a_live_view() {
+    use stdpython::PyIndex;
+    let key = "RYTHON_TEST_ENV_LIVE_VIEW";
+    stdpython::os::setenv(key, "first");
+    assert_eq!(stdpython::os::environ.py_get(key).as_deref(), Some("first"));
+    // Mutations after first access must be visible (the old snapshot
+    // silently disagreed with os.getenv).
+    stdpython::os::setenv(key, "second");
+    assert_eq!(stdpython::os::environ.py_get(key).as_deref(), Some("second"));
+    assert_eq!(stdpython::os::environ.py_index(key).unwrap(), "second");
+    assert!(stdpython::os::environ.py_contains(key));
+    // Missing keys raise KeyError like Python's os.environ[...].
+    let err = stdpython::os::environ
+        .py_index("RYTHON_TEST_ENV_DEFINITELY_MISSING")
+        .unwrap_err();
+    assert!(err.to_string().contains("KeyError"), "got: {}", err);
+}
+
+#[test]
+fn glob_wildcards_skip_hidden_files() {
+    let dir = std::env::temp_dir().join(format!("rython-glob-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("visible.txt"), "v").unwrap();
+    std::fs::write(dir.join(".hidden.txt"), "h").unwrap();
+
+    // Python: glob("*.txt") excludes dotfiles; a literal-dot pattern
+    // includes them.
+    let star = stdpython::glob::glob(format!("{}/*.txt", dir.to_string_lossy())).unwrap();
+    assert_eq!(star.len(), 1, "hidden file must not match *: {:?}", star);
+    assert!(star[0].ends_with("visible.txt"));
+
+    let dotted =
+        stdpython::glob::glob(format!("{}/.*.txt", dir.to_string_lossy())).unwrap();
+    assert_eq!(dotted.len(), 1, "literal-dot pattern must match: {:?}", dotted);
+    assert!(dotted[0].ends_with(".hidden.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

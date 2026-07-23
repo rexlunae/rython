@@ -56,12 +56,17 @@ fn glob_recursive_helper(
     if current_pattern == "**" {
         // Try matching current directory first
         glob_recursive_helper(current_path, pattern_parts, part_index + 1, results)?;
-        
-        // Then recursively search subdirectories
+
+        // Then recursively search subdirectories. Python's ** does not
+        // descend into hidden directories.
         if let Ok(entries) = std::fs::read_dir(current_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
+                let hidden = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'));
+                if path.is_dir() && !hidden {
                     glob_recursive_helper(&path, pattern_parts, part_index, results)?;
                 }
             }
@@ -81,7 +86,14 @@ fn glob_recursive_helper(
         let filename = path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        
+
+        // Python's glob never matches a leading dot with a wildcard: a
+        // hidden file only matches a pattern component that itself starts
+        // with a literal dot.
+        if filename.starts_with('.') && !current_pattern.starts_with('.') {
+            continue;
+        }
+
         if matches_pattern(filename, current_pattern) {
             if part_index == pattern_parts.len() - 1 {
                 // Last part - add to results

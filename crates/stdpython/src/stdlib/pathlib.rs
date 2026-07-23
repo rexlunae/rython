@@ -326,38 +326,46 @@ impl Path {
             })
     }
     
-    /// Glob pattern matching
+    /// Glob pattern matching. Like Python's Path.glob, wildcards never
+    /// match a leading dot: hidden entries only match patterns that start
+    /// with a literal dot.
     #[cfg(feature = "std")]
     pub fn glob(&self, pattern: &str) -> Result<Vec<Path>, PyException> {
-        // Simple implementation - in a real implementation you'd want to use a proper glob library
         let entries = self.iterdir()?;
         let mut matches = Vec::new();
-        
+
         for entry in entries {
+            if entry.pure_path.name().starts_with('.') && !pattern.starts_with('.') {
+                continue;
+            }
             if entry.pure_path.match_pattern(pattern) {
                 matches.push(entry);
             }
         }
-        
+
         Ok(matches)
     }
-    
-    /// Recursive glob
+
+    /// Recursive glob (hidden entries and hidden directories are skipped
+    /// for wildcard patterns, as in Python).
     #[cfg(feature = "std")]
     pub fn rglob(&self, pattern: &str) -> Result<Vec<Path>, PyException> {
         let mut matches = Vec::new();
         self.rglob_recursive(pattern, &mut matches)?;
         Ok(matches)
     }
-    
+
     #[cfg(feature = "std")]
     fn rglob_recursive(&self, pattern: &str, matches: &mut Vec<Path>) -> Result<(), PyException> {
         if let Ok(entries) = self.iterdir() {
             for entry in entries {
-                if entry.pure_path.match_pattern(pattern) {
-                    matches.push(entry.clone());
+                let hidden = entry.pure_path.name().starts_with('.');
+                if !hidden || pattern.starts_with('.') {
+                    if entry.pure_path.match_pattern(pattern) {
+                        matches.push(entry.clone());
+                    }
                 }
-                if entry.is_dir() {
+                if entry.is_dir() && !hidden {
                     entry.rglob_recursive(pattern, matches)?;
                 }
             }
