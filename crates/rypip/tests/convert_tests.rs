@@ -1239,3 +1239,72 @@ fn no_std_profile_rejects_std_constructs_loudly() {
     .expect_err("pyo3 + no_std must fail");
     assert!(format!("{:#}", err).contains("PyO3"), "err: {:#}", err);
 }
+
+#[test]
+fn builtins_match_python_at_runtime() {
+    // min/max (n-ary, default=, key=), sorted (reverse=, key=, stability),
+    // reversed, enumerate(start=), 2/3-arg pow, and repr (including
+    // Python's float scientific-notation thresholds and str quoting),
+    // through generated code.
+    let scratch = Scratch::new("builtins");
+    let file = scratch.path().join("builtins_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    nums = [5, 1, 9, 3]\n",
+            "    print(f\"min={min(nums)} max={max(nums)}\")\n",
+            "    print(f\"pair={min(4, 2)} triple={max(4, 2, 6)}\")\n",
+            "    print(f\"mindef={min([], default=7)}\")\n",
+            "    words = [\"pear\", \"fig\", \"apple\"]\n",
+            "    print(f\"minkey={min(words, key=lambda w: len(w))}\")\n",
+            "    print(f\"sorted={repr(sorted(nums))}\")\n",
+            "    print(f\"sortedrev={repr(sorted(words, reverse=True))}\")\n",
+            "    print(f\"sortedkey={repr(sorted(words, key=lambda w: len(w)))}\")\n",
+            "    for i, v in enumerate(reversed(nums), start=1):\n",
+            "        print(f\"rev{i}={v}\")\n",
+            "    print(f\"powm={pow(3, -1, 7)} pow2={pow(2, 10)}\")\n",
+            "    print(f\"fbig={repr(1e16)} fsum={repr(0.1 + 0.2)}\")\n",
+            "    s = \"it's\"\n",
+            "    print(f\"sq={repr(s)}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/builtins_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "min=1 max=9",
+            "pair=2 triple=6",
+            "mindef=7",
+            "minkey=fig",
+            "sorted=[1, 3, 5, 9]",
+            "sortedrev=['pear', 'fig', 'apple']",
+            "sortedkey=['fig', 'pear', 'apple']",
+            "rev1=3",
+            "rev2=9",
+            "rev3=1",
+            "rev4=5",
+            "powm=5 pow2=1024",
+            "fbig=1e+16 fsum=0.30000000000000004",
+            "sq=\"it's\"",
+        ],
+        "builtin semantics diverged from CPython"
+    );
+}

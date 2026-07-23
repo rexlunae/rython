@@ -961,3 +961,226 @@ fn timestamp_one_second_before_epoch_is_minus_one() {
     let d = datetime::new(1969, 12, 31, Some(23), Some(59), Some(59), None).unwrap();
     assert_eq!(d.timestamp(), -1.0);
 }
+
+// ---------------------------------------------------------------------------
+// Builtins: min/max/sorted/reversed/enumerate/pow/repr/frozenset (issue #19)
+// All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod builtin_min_max {
+    use stdpython::*;
+
+    #[test]
+    fn empty_iterables_raise_value_error_with_pythons_message() {
+        let e = min(&Vec::<i64>::new()).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: min() arg is an empty sequence");
+        let e = max(&Vec::<i64>::new()).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: max() arg is an empty sequence");
+    }
+
+    #[test]
+    fn floats_follow_pythons_comparison_fold_including_nan() {
+        // python3: min([nan, 1.0]) is nan, min([1.0, nan]) is 1.0 — the
+        // current best only changes on a strictly-smaller later element.
+        assert!(min(&[f64::NAN, 1.0]).unwrap().is_nan());
+        assert_eq!(min(&[1.0, f64::NAN]).unwrap(), 1.0);
+        assert!(max(&[f64::NAN, 1.0]).unwrap().is_nan());
+        assert_eq!(max(&[2.0, f64::NAN]).unwrap(), 2.0);
+        assert_eq!(min(&[2.5, 1.25, 3.0]).unwrap(), 1.25);
+    }
+
+    #[test]
+    fn scalar_forms_and_defaults_match_python() {
+        assert_eq!(min2(3, 1), 1);
+        assert_eq!(max2(1.5, 2.5), 2.5);
+        // min(a, b) keeps the FIRST argument on ties/incomparables.
+        assert!(min2(f64::NAN, 1.0).is_nan());
+        assert_eq!(min_default(&Vec::<i64>::new(), 7), 7);
+        assert_eq!(min_default(&[3, 1], 7), 1);
+        assert_eq!(max_default(&Vec::<i64>::new(), -1), -1);
+    }
+
+    #[test]
+    fn key_functions_run_on_elements_and_ties_keep_the_first() {
+        let words = ["pear".to_string(), "fig".to_string(), "apple".to_string()];
+        assert_eq!(min_key(&words, |w| w.len() as i64).unwrap(), "fig");
+        // python3: max([(1,'a'),(1,'b')], key=lambda t: t[0]) == (1, 'a')
+        let pairs = [(1i64, "a"), (1i64, "b")];
+        assert_eq!(max_key(&pairs, |t| t.0).unwrap(), (1, "a"));
+        assert_eq!(min_key(&[3i64, 1, 2], |x| -x).unwrap(), 3);
+        assert_eq!(
+            min_key_default(&Vec::<i64>::new(), |x| -x, 42),
+            42
+        );
+        let e = min_key(&Vec::<i64>::new(), |x| *x).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: min() arg is an empty sequence");
+    }
+}
+
+mod builtin_sorted_reversed {
+    use stdpython::*;
+
+    #[test]
+    fn sorted_is_stable_and_reverse_keeps_tie_order() {
+        // python3: sorted(xs, key=t[0]) == [(0,'b'),(0,'d'),(1,'a'),(1,'c')];
+        // reverse=True == [(1,'a'),(1,'c'),(0,'b'),(0,'d')] — reverse
+        // sorts descending but equal elements KEEP original order.
+        let xs = [(1i64, "a"), (0, "b"), (1, "c"), (0, "d")];
+        assert_eq!(
+            sorted_key(&xs, |t| t.0),
+            vec![(0, "b"), (0, "d"), (1, "a"), (1, "c")]
+        );
+        assert_eq!(
+            sorted_key_reverse(&xs, |t| t.0, true),
+            vec![(1, "a"), (1, "c"), (0, "b"), (0, "d")]
+        );
+    }
+
+    #[test]
+    fn sorted_handles_floats_strings_and_reverse() {
+        assert_eq!(sorted(&[3.0, 1.5, 2.25]), vec![1.5, 2.25, 3.0]);
+        let words = ["b".to_string(), "a".to_string(), "c".to_string()];
+        assert_eq!(
+            sorted_reverse(&words, true),
+            vec!["c".to_string(), "b".to_string(), "a".to_string()]
+        );
+        assert_eq!(sorted_reverse(&[1i64, 3, 2], false), vec![1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot sort values without a total order")]
+    fn sorting_nan_fails_loudly_instead_of_diverging() {
+        // CPython's timsort produces an arbitrary-looking NaN order no
+        // other sort reproduces; rython refuses rather than diverge.
+        let _ = sorted(&[1.0, f64::NAN]);
+    }
+
+    #[test]
+    fn reversed_matches_python() {
+        assert_eq!(reversed(&[1i64, 2, 3]), vec![3, 2, 1]);
+        assert_eq!(reversed(&Vec::<i64>::new()), Vec::<i64>::new());
+    }
+}
+
+mod builtin_enumerate_pow {
+    use stdpython::*;
+
+    #[test]
+    fn enumerate_indexes_are_ints_with_optional_start() {
+        // python3: list(enumerate(["a","b"], start=5)) == [(5,'a'),(6,'b')]
+        assert_eq!(
+            enumerate_start(vec!["a", "b"], 5),
+            vec![(5i64, "a"), (6i64, "b")]
+        );
+        assert_eq!(enumerate(vec!["a"]), vec![(0i64, "a")]);
+        assert_eq!(enumerate_start(vec!["a"], -3), vec![(-3i64, "a")]);
+    }
+
+    #[test]
+    fn pow_mod_matches_python_including_negative_exponents_and_moduli() {
+        assert_eq!(pow_mod(2, 10, 1000).unwrap(), 24);
+        assert_eq!(pow_mod(7, 256, 13).unwrap(), 9);
+        // python3: pow(3, -1, 7) == 5 (modular inverse, 3.8+)
+        assert_eq!(pow_mod(3, -1, 7).unwrap(), 5);
+        assert_eq!(pow_mod(-3, -3, 11).unwrap(), 2);
+        assert_eq!(pow_mod(-5, 3, 7).unwrap(), 1);
+        // The result takes the modulus's sign: pow(5, 3, -7) == -1.
+        assert_eq!(pow_mod(5, 3, -7).unwrap(), -1);
+        assert_eq!(pow_mod(2, 0, 5).unwrap(), 1);
+
+        let e = pow_mod(2, 3, 0).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: pow() 3rd argument cannot be 0");
+        let e = pow_mod(2, -1, 4).unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "ValueError: base is not invertible for the given modulus"
+        );
+    }
+
+    #[test]
+    fn two_argument_pow_matches_the_power_operator() {
+        assert_eq!(pow(2i64, 10i64), 1024);
+        assert_eq!(pow(2.0f64, -1i64), 0.5);
+    }
+}
+
+mod builtin_repr {
+    use stdpython::*;
+
+    #[test]
+    fn float_repr_matches_python_exactly() {
+        // python3-pinned battery, including the scientific-notation
+        // thresholds Rust's Display never uses.
+        assert_eq!(py_float_repr(1.0), "1.0");
+        assert_eq!(py_float_repr(0.1), "0.1");
+        assert_eq!(py_float_repr(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(py_float_repr(1234567.0), "1234567.0");
+        assert_eq!(py_float_repr(9999999999999998.0), "9999999999999998.0");
+        assert_eq!(py_float_repr(1e16), "1e+16");
+        assert_eq!(py_float_repr(-1e16), "-1e+16");
+        assert_eq!(py_float_repr(123456789012345680.0), "1.2345678901234568e+17");
+        assert_eq!(py_float_repr(1e100), "1e+100");
+        assert_eq!(py_float_repr(0.0001), "0.0001");
+        assert_eq!(py_float_repr(0.00001), "1e-05");
+        assert_eq!(py_float_repr(0.000015), "1.5e-05");
+        assert_eq!(py_float_repr(2.5e-10), "2.5e-10");
+        assert_eq!(py_float_repr(0.0), "0.0");
+        assert_eq!(py_float_repr(-0.0), "-0.0");
+        assert_eq!(py_float_repr(f64::INFINITY), "inf");
+        assert_eq!(py_float_repr(f64::NEG_INFINITY), "-inf");
+        assert_eq!(py_float_repr(f64::NAN), "nan");
+    }
+
+    #[test]
+    fn str_of_float_is_repr_as_in_python_3() {
+        use stdpython::PyToString;
+        assert_eq!(1e16.py_str(), "1e+16");
+        assert_eq!(3.0.py_str(), "3.0");
+    }
+
+    #[test]
+    fn string_repr_follows_pythons_quoting_rules() {
+        assert_eq!(repr("a"), "'a'");
+        // Single quote in the text and no double quote: switch quotes.
+        assert_eq!(repr("a'b"), "\"a'b\"");
+        assert_eq!(repr("a\"b"), "'a\"b'");
+        // Both kinds present: single quotes with the single quote escaped.
+        assert_eq!(repr("mixed'\"q"), "'mixed\\'\"q'");
+        assert_eq!(repr("tab\t\n\\x"), "'tab\\t\\n\\\\x'");
+        assert_eq!(repr("\x00\x1b del:\x7f"), "'\\x00\\x1b del:\\x7f'");
+        // Printable non-ASCII stays literal.
+        assert_eq!(repr("café"), "'café'");
+    }
+
+    #[test]
+    fn repr_covers_the_generated_type_surface() {
+        assert_eq!(repr(&5i64), "5");
+        assert_eq!(repr(&true), "True");
+        assert_eq!(repr(&vec![1i64, 2]), "[1, 2]");
+        // python3: repr(['a', "b'c"]) == "['a', \"b'c\"]"
+        assert_eq!(
+            repr(&vec!["a".to_string(), "b'c".to_string()]),
+            "['a', \"b'c\"]"
+        );
+        assert_eq!(repr(&Option::<i64>::None), "None");
+        assert_eq!(repr(&Some(3i64)), "3");
+    }
+}
+
+mod builtin_frozenset {
+    use stdpython::*;
+
+    #[test]
+    fn frozenset_supports_reads_and_set_algebra_but_no_mutation() {
+        let a = frozenset(vec![1i64, 2, 3]);
+        let b = frozenset(vec![3i64, 4]);
+        assert_eq!(len(&a), 3);
+        assert!(a.contains(&2));
+        assert!(!a.contains(&9));
+        assert_eq!(len(&a.union(&b)), 4);
+        assert_eq!(len(&a.intersection(&b)), 1);
+        assert_eq!(len(&a.difference(&b)), 2);
+        assert!(a.is_truthy());
+        assert!(!frozenset(Vec::<i64>::new()).is_truthy());
+    }
+}

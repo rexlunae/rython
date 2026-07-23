@@ -19,8 +19,8 @@ fn test_simulated_compiled_python_basic_math() {
     let numbers = vec![5, 1, 9, 3, 7];
     let min_result = min(&numbers);
     let max_result = max(&numbers);
-    assert_eq!(min_result, Some(1));
-    assert_eq!(max_result, Some(9));
+    assert_eq!(min_result.unwrap(), 1);
+    assert_eq!(max_result.unwrap(), 9);
 }
 
 #[test]

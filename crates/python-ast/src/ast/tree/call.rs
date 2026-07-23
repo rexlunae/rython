@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult};
-use quote::quote;
+use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -106,6 +106,213 @@ impl<'a> CodeGen for Call {
                     let (a, b, c) = (&rendered[0], &rendered[1], &rendered[2]);
                     quote!(range_start_stop_step(#a, #b, #c)?)
                 });
+            }
+        }
+
+        // Builtins with keyword variants or by-reference runtime shapes:
+        // min/max (key=, default=, n-ary), sorted (key=, reverse=),
+        // enumerate (start=), pow (3-arg modular), and the by-reference
+        // len/repr/reversed. Each spelling maps to its runtime variant; a
+        // user definition of the same name shadows the builtin, and
+        // unknown or duplicate keywords are loud errors, as Python raises
+        // TypeError for them.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            let bname = n.id.as_str();
+            if matches!(
+                bname,
+                "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
+                    | "reversed" | "frozenset"
+            ) && symbols.get(bname).is_none()
+            {
+                let mut rendered = Vec::new();
+                for arg in &self.args {
+                    rendered.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                let unexpected = |kw: Option<&str>| -> Box<dyn std::error::Error> {
+                    format!(
+                        "{}() got an unexpected or duplicate keyword argument '{}'",
+                        bname,
+                        kw.unwrap_or("**kwargs")
+                    )
+                    .into()
+                };
+                match bname {
+                    "min" | "max" => {
+                        let mut key = None;
+                        let mut default = None;
+                        for kw in &self.keywords {
+                            match kw.arg.as_deref() {
+                                Some("key") if key.is_none() => key = Some(kw.value.clone()),
+                                Some("default") if default.is_none() => {
+                                    default = Some(kw.value.clone())
+                                }
+                                other => return Err(unexpected(other)),
+                            }
+                        }
+                        if rendered.is_empty() {
+                            return Err(
+                                format!("{}() expected at least 1 argument", bname).into()
+                            );
+                        }
+                        if rendered.len() >= 2 {
+                            if key.is_some() || default.is_some() {
+                                return Err(format!(
+                                    "{}() with multiple positional values and keywords \
+                                     is not supported yet; pass a list instead",
+                                    bname
+                                )
+                                .into());
+                            }
+                            // Python min(a, b, c) folds pairwise; ties keep
+                            // the earlier argument.
+                            let two = format_ident!("{}2", bname);
+                            let mut acc = rendered[0].clone();
+                            for next in &rendered[1..] {
+                                acc = quote!(#two(#acc, #next));
+                            }
+                            return Ok(acc);
+                        }
+                        let a = &rendered[0];
+                        let render = |e: crate::ExprType| {
+                            e.to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        };
+                        return Ok(match (key, default) {
+                            (None, None) => {
+                                let f = format_ident!("{}", bname);
+                                quote!(#f(&(#a))?)
+                            }
+                            (Some(k), None) => {
+                                let k = render(k)?;
+                                let f = format_ident!("{}_key", bname);
+                                quote!(#f(&(#a), #k)?)
+                            }
+                            (None, Some(d)) => {
+                                let d = render(d)?;
+                                let f = format_ident!("{}_default", bname);
+                                quote!(#f(&(#a), #d))
+                            }
+                            (Some(k), Some(d)) => {
+                                let k = render(k)?;
+                                let d = render(d)?;
+                                let f = format_ident!("{}_key_default", bname);
+                                quote!(#f(&(#a), #k, #d))
+                            }
+                        });
+                    }
+                    "sorted" => {
+                        let mut key = None;
+                        let mut reverse = None;
+                        for kw in &self.keywords {
+                            match kw.arg.as_deref() {
+                                Some("key") if key.is_none() => key = Some(kw.value.clone()),
+                                Some("reverse") if reverse.is_none() => {
+                                    reverse = Some(kw.value.clone())
+                                }
+                                other => return Err(unexpected(other)),
+                            }
+                        }
+                        if rendered.len() != 1 {
+                            return Err("sorted() takes exactly one positional argument"
+                                .to_string()
+                                .into());
+                        }
+                        let a = &rendered[0];
+                        let render = |e: crate::ExprType| {
+                            e.to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        };
+                        return Ok(match (key, reverse) {
+                            (None, None) => quote!(sorted(&(#a))),
+                            (Some(k), None) => {
+                                let k = render(k)?;
+                                quote!(sorted_key(&(#a), #k))
+                            }
+                            (None, Some(r)) => {
+                                let r = render(r)?;
+                                quote!(sorted_reverse(&(#a), #r))
+                            }
+                            (Some(k), Some(r)) => {
+                                let k = render(k)?;
+                                let r = render(r)?;
+                                quote!(sorted_key_reverse(&(#a), #k, #r))
+                            }
+                        });
+                    }
+                    "enumerate" => {
+                        let mut start = self.args.get(1).cloned();
+                        if self.args.len() > 2 {
+                            return Err("enumerate() takes at most 2 arguments"
+                                .to_string()
+                                .into());
+                        }
+                        for kw in &self.keywords {
+                            match kw.arg.as_deref() {
+                                Some("start") if start.is_none() => {
+                                    start = Some(kw.value.clone())
+                                }
+                                other => return Err(unexpected(other)),
+                            }
+                        }
+                        if rendered.is_empty() {
+                            return Err("enumerate() expected an iterable".to_string().into());
+                        }
+                        let a = &rendered[0];
+                        return Ok(match start {
+                            None => quote!(enumerate(#a)),
+                            Some(s) => {
+                                let s =
+                                    s.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                quote!(enumerate_start(#a, #s))
+                            }
+                        });
+                    }
+                    "pow" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(
+                                self.keywords[0].arg.as_deref(),
+                            ));
+                        }
+                        return match rendered.as_slice() {
+                            [b, e] => Ok(quote!(pow(#b, #e))),
+                            [b, e, m] => Ok(quote!(pow_mod(#b, #e, #m)?)),
+                            _ => Err("pow() takes 2 or 3 arguments".to_string().into()),
+                        };
+                    }
+                    // The by-reference builtins: their runtime functions
+                    // borrow, and Python's calls never consume the value.
+                    "len" | "repr" | "reversed" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err(
+                                format!("{}() takes exactly one argument", bname).into()
+                            );
+                        }
+                        let f = format_ident!("{}", bname);
+                        let a = &rendered[0];
+                        return Ok(quote!(#f(&(#a))));
+                    }
+                    "frozenset" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err(
+                                "frozenset() requires an iterable argument in rython \
+                                 (an empty frozenset has no inferable element type)"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                        let a = &rendered[0];
+                        return Ok(quote!(frozenset(#a)));
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
 

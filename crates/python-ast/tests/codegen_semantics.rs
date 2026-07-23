@@ -1830,3 +1830,100 @@ fn nostd_main_blocks_error_loudly() {
     .expect_err("__main__ needs a process entry point");
     assert!(err.contains("no_std profile"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// Builtin lowering: min/max/sorted/enumerate/pow/len/repr/reversed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn min_max_lower_to_variant_functions_with_exception_propagation() {
+    // Single-iterable form raises on empty, so it propagates with `?`.
+    let out = compile("def f(xs: list[int]) -> int:\n    return min(xs)\n", "m1.py");
+    assert!(out.contains("min (& (xs)) ?"), "generated: {}", out);
+
+    // Two and three scalar arguments fold pairwise.
+    let out = compile("def f(a: int, b: int) -> int:\n    return max(a, b)\n", "m2.py");
+    assert!(out.contains("max2 (a , b)"), "generated: {}", out);
+    let out = compile(
+        "def f(a: int, b: int, c: int) -> int:\n    return min(a, b, c)\n",
+        "m3.py",
+    );
+    assert!(out.contains("min2 (min2 (a , b) , c)"), "generated: {}", out);
+
+    // default= never raises; key= does.
+    let out = compile(
+        "def f(xs: list[int]) -> int:\n    return min(xs, default=7)\n",
+        "m4.py",
+    );
+    assert!(out.contains("min_default (& (xs) , 7)"), "generated: {}", out);
+    let out = compile(
+        "def f(xs: list[int]) -> int:\n    return max(xs, key=lambda x: -x)\n",
+        "m5.py",
+    );
+    assert!(out.contains("max_key (& (xs) ,"), "generated: {}", out);
+    assert!(out.contains(") ?"), "generated: {}", out);
+
+    // Unknown keywords stay loud.
+    let err = compile_err("x = min([1], foo=2)\n", "m6.py");
+    assert!(err.contains("unexpected"), "error: {}", err);
+}
+
+#[test]
+fn sorted_lowers_by_keyword_combination() {
+    let out = compile("def f(xs: list[int]) -> list[int]:\n    return sorted(xs)\n", "s1.py");
+    assert!(out.contains("sorted (& (xs))"), "generated: {}", out);
+    let out = compile(
+        "def f(xs: list[int]) -> list[int]:\n    return sorted(xs, reverse=True)\n",
+        "s2.py",
+    );
+    assert!(out.contains("sorted_reverse (& (xs) , true)"), "generated: {}", out);
+    let out = compile(
+        "def f(xs: list[int]) -> list[int]:\n    return sorted(xs, key=lambda x: -x)\n",
+        "s3.py",
+    );
+    assert!(out.contains("sorted_key (& (xs) ,"), "generated: {}", out);
+    let out = compile(
+        "def f(xs: list[int]) -> list[int]:\n    return sorted(xs, key=lambda x: -x, reverse=True)\n",
+        "s4.py",
+    );
+    assert!(out.contains("sorted_key_reverse (& (xs) ,"), "generated: {}", out);
+}
+
+#[test]
+fn enumerate_start_and_pow_arities_lower_to_their_variants() {
+    let out = compile(
+        "for i, x in enumerate([10, 20], start=5):\n    pass\n",
+        "e1.py",
+    );
+    assert!(out.contains("enumerate_start ("), "generated: {}", out);
+    let out = compile("for i, x in enumerate([10]):\n    pass\n", "e2.py");
+    assert!(out.contains("enumerate ("), "generated: {}", out);
+    assert!(!out.contains("enumerate_start"), "generated: {}", out);
+
+    let out = compile("y = pow(2, 5)\n", "p1.py");
+    assert!(out.contains("pow (2 , 5)"), "generated: {}", out);
+    let out = compile("y = pow(2, 5, 7)\n", "p2.py");
+    assert!(out.contains("pow_mod (2 , 5 , 7) ?"), "generated: {}", out);
+}
+
+#[test]
+fn by_reference_builtins_borrow_their_argument() {
+    // len/repr/reversed take references at the runtime layer; Python's
+    // calls never consume the value.
+    let out = compile("def f(xs: list[int]) -> int:\n    return len(xs)\n", "b1.py");
+    assert!(out.contains("len (& (xs))"), "generated: {}", out);
+    let out = compile("def f(xs: list[int]) -> str:\n    return repr(xs)\n", "b2.py");
+    assert!(out.contains("repr (& (xs))"), "generated: {}", out);
+    let out = compile(
+        "def f(xs: list[int]) -> list[int]:\n    return reversed(xs)\n",
+        "b3.py",
+    );
+    assert!(out.contains("reversed (& (xs))"), "generated: {}", out);
+
+    // A user-defined function of the same name shadows the builtin shape.
+    let out = compile(
+        "def len(x: int) -> int:\n    return x\n\ndef g(v: int) -> int:\n    return len(v)\n",
+        "b4.py",
+    );
+    assert!(out.contains("len (v)"), "generated: {}", out);
+}

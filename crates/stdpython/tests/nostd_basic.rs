@@ -21,8 +21,8 @@ fn test_nostd_basic_functions() {
     assert_eq!(sum(&nums[..]), 15);
     
     // Test min/max
-    assert_eq!(min(&nums), Some(1));
-    assert_eq!(max(&nums), Some(5));
+    assert_eq!(min(&nums).unwrap(), 1);
+    assert_eq!(max(&nums).unwrap(), 5);
     
     // Test type conversions
     assert_eq!(bool(42i64), true);
