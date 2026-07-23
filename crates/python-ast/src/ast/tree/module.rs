@@ -139,6 +139,24 @@ impl CodeGen for Module {
             // The runtime specification is just for dependency management
             stream.extend(quote!(use stdpython::*;));
         }
+
+        // Under no_std the prelude has no String/Vec/format!: bring the
+        // alloc surface generated code leans on into scope. Emitted per
+        // module — each module file in the generated crate lowers through
+        // here — while `extern crate alloc` itself binds locally too, so
+        // the imports resolve regardless of what the crate root declares.
+        // allow(unused_imports): this is harness plumbing, and the lint
+        // posture should keep surfacing only source-Python weaknesses.
+        if options.no_std {
+            stream.extend(quote! {
+                extern crate alloc;
+                #[allow(unused_imports)]
+                use alloc::{
+                    format, vec, borrow::ToOwned, string::String, string::ToString,
+                    vec::Vec,
+                };
+            });
+        }
         
         // Add async runtime dependency if async functions are detected
         // We'll check this early so we can add the import at the top
@@ -290,6 +308,19 @@ impl CodeGen for Module {
             });
         }
         
+        // A `__main__` block wants a process entry point, and a no_std
+        // target has no OS to enter from: refuse loudly instead of emitting
+        // a fn main() that cannot link.
+        if has_main_code && options.no_std {
+            return Err(
+                "`if __name__ == \"__main__\":` needs a process entry point, which \
+                 the no_std profile does not provide; remove the block (convert the \
+                 module as a library) or convert without the no_std profile"
+                    .to_string()
+                    .into(),
+            );
+        }
+
         // If we collected any main code, generate a single consolidated main function
         if has_main_code {
             if is_simple_main_call_pattern {

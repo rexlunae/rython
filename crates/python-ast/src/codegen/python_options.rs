@@ -107,6 +107,12 @@ pub struct PythonOptions {
     /// receiver. Python strings are immutable, so the clone reproduces
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
+
+    /// Target stdpython's no_std (alloc) tier. Python constructs that need
+    /// the OS — print/input/open, imports of os/datetime/random/…, and
+    /// `__main__` entry points — fail loudly at conversion time instead of
+    /// surfacing as resolution errors when the generated crate builds.
+    pub no_std: bool,
 }
 
 impl Default for PythonOptions {
@@ -128,6 +134,7 @@ impl Default for PythonOptions {
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
+            no_std: false,
         }
     }
 }

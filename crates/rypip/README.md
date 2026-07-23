@@ -16,6 +16,9 @@ rypip convert path/to/package --out my-crate
 # Convert with PyO3 bindings so the crate can also be imported from Python:
 rypip convert path/to/package --out my-crate --pyo3
 
+# Convert into a #![no_std] library crate (embedded/wasm targets):
+rypip convert path/to/package --out my-crate --no-std
+
 # Convert and compile without installing:
 rypip build path/to/package
 ```
@@ -36,6 +39,15 @@ to library crates and cannot be `install`ed.
 Each Python module becomes a Rust module; subpackages become nested modules.
 The crate depends on the `stdpython` runtime (locate it with `--stdpython`,
 `RYPIP_STDPYTHON_PATH`, or the copy alongside this tool's source tree).
+
+With `--no-std`, the generated crate is a `#![no_std]` library on
+stdpython's `alloc` tier (`default-features = false, features = ["alloc"]`):
+no OS dependency, suitable for embedded/wasm targets. Python constructs
+that need the OS — `print`/`input`/`open`, imports of
+`os`/`sys`/`datetime`/`random`/`math`/…, and `__main__` blocks — fail the
+conversion loudly rather than surfacing later as build errors in the
+generated crate; `json`, `string`, `collections`, and `itertools` stay
+available.
 
 With `--pyo3`, the crate gains a `python` cargo feature, a `cdylib` target,
 and a generated `#[pymodule]` exposing every top-level function whose
