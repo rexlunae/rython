@@ -1402,6 +1402,10 @@ pub trait PyListOps<T> {
     fn count(&self, item: &T) -> i64
     where
         T: PartialEq;
+    /// list.insert(i, x) with Python index rules: negative indices count
+    /// from the end, and out-of-range indices clamp (insert past the end
+    /// appends, before the start prepends) — never a panic.
+    fn py_insert(&mut self, index: i64, item: T);
 }
 
 impl<T> PyListOps<T> for Vec<T> {
@@ -1410,6 +1414,15 @@ impl<T> PyListOps<T> for Vec<T> {
         T: PartialEq,
     {
         self.iter().filter(|e| *e == item).count() as i64
+    }
+    fn py_insert(&mut self, index: i64, item: T) {
+        let len = self.len() as i64;
+        let idx = if index < 0 {
+            (len + index).max(0)
+        } else {
+            index.min(len)
+        } as usize;
+        self.insert(idx, item);
     }
 }
 

@@ -310,3 +310,23 @@ fn py_list_and_str_methods_match_python() {
     assert_eq!("-".join(vec!["a", "b"]), "a-b");
     assert_eq!("-".join(Vec::<String>::new()), "");
 }
+
+#[test]
+fn py_insert_matches_python_index_rules() {
+    // Python: [1, 2, 3].insert(-1, 9) -> [1, 2, 9, 3]
+    let mut v = vec![1i64, 2, 3];
+    v.py_insert(-1, 9);
+    assert_eq!(v, vec![1, 2, 9, 3]);
+    // insert(100, x) clamps to append
+    let mut v = vec![1i64, 2];
+    v.py_insert(100, 9);
+    assert_eq!(v, vec![1, 2, 9]);
+    // insert(-100, x) clamps to prepend
+    let mut v = vec![1i64, 2];
+    v.py_insert(-100, 9);
+    assert_eq!(v, vec![9, 1, 2]);
+    // plain positive index
+    let mut v = vec![1i64, 3];
+    v.py_insert(1, 2);
+    assert_eq!(v, vec![1, 2, 3]);
+}

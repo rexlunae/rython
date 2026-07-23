@@ -115,9 +115,11 @@ impl<'a> CodeGen for Call {
                         }
                     });
                 }
-                // list.insert takes a Python int index; Vec::insert a usize.
+                // list.insert follows Python index rules (negative counts
+                // from the end, out-of-range clamps); Vec::insert takes a
+                // usize and panics past len.
                 ("insert", [idx, value]) => {
-                    return Ok(quote!((#receiver).insert((#idx) as usize, #value)));
+                    return Ok(quote!((#receiver).py_insert(#idx, #value)));
                 }
                 // str.split() with no argument splits on whitespace runs;
                 // str::split (inherent) returns an iterator, so both forms

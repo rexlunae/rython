@@ -770,8 +770,8 @@ fn python_list_methods_map_to_correct_rust() {
     // remove removes by value and raises ValueError when absent.
     assert!(out.contains("position"), "generated: {}", out);
     assert!(out.contains("\"ValueError\""), "generated: {}", out);
-    // insert casts the Python int index to usize.
-    assert!(out.contains("(0) as usize"), "generated: {}", out);
+    // insert applies Python index rules (negatives, clamping) via py_insert.
+    assert!(out.contains("py_insert (0 , 9)"), "generated: {}", out);
     // pop raises a catchable IndexError instead of returning an Option.
     assert!(out.contains("\"IndexError\""), "generated: {}", out);
     assert!(out.contains("pop () . ok_or_else"), "generated: {}", out);
