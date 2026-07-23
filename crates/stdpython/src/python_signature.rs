@@ -170,6 +170,7 @@ macro_rules! python_function {
 }
 
 /// Trait to register Python-compatible functions for a module
+#[cfg(feature = "std")]
 pub trait PythonModule {
     /// Register all Python-compatible functions in this module
     fn register_python_functions() -> Vec<&'static str>;
@@ -202,10 +203,12 @@ macro_rules! impl_python_module {
 }
 
 /// Generate a registry of all Python functions across all modules
+#[cfg(feature = "std")]
 pub struct PythonFunctionRegistry {
     functions: std::collections::HashMap<String, String>,
 }
 
+#[cfg(feature = "std")]
 impl PythonFunctionRegistry {
     pub fn new() -> Self {
         Self {
@@ -231,13 +234,16 @@ impl PythonFunctionRegistry {
     }
 }
 
+#[cfg(feature = "std")]
 use std::sync::Mutex;
 
 /// Global registry instance
-static PYTHON_FUNCTION_REGISTRY: std::sync::LazyLock<Mutex<PythonFunctionRegistry>> = 
+#[cfg(feature = "std")]
+static PYTHON_FUNCTION_REGISTRY: std::sync::LazyLock<Mutex<PythonFunctionRegistry>> =
     std::sync::LazyLock::new(|| Mutex::new(PythonFunctionRegistry::new()));
 
 /// Get the global Python function registry
+#[cfg(feature = "std")]
 pub fn get_registry() -> std::sync::MutexGuard<'static, PythonFunctionRegistry> {
     PYTHON_FUNCTION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }

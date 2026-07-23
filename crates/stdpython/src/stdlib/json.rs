@@ -5,8 +5,12 @@
 
 use crate::PyException;
 use crate::python_function;
+use alloc::{format, string::String, string::ToString, vec::Vec};
+use core::fmt;
+#[cfg(feature = "std")]
 use std::collections::HashMap;
-use std::fmt;
+#[cfg(not(feature = "std"))]
+use hashbrown::HashMap;
 
 /// JSONValue - represents any JSON value
 #[derive(Debug, Clone, PartialEq)]
@@ -748,7 +752,7 @@ fn format_json_float(n: f64) -> String {
         "NaN".to_string()
     } else if n.is_infinite() {
         if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
-    } else if n.fract() == 0.0 && n.abs() < 1e16 {
+    } else if crate::flt::fract(n) == 0.0 && crate::flt::abs(n) < 1e16 {
         format!("{:.1}", n)
     } else {
         format!("{}", n)

@@ -21,3 +21,22 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: Run tests
         run: cargo test --workspace --all-targets
+
+  # no_std tier: keeps the alloc build honest so it can't silently rot.
+  nostd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Build stdpython (no_std + alloc)
+        run: cargo build -p stdpython --no-default-features --features alloc --all-targets
+      - name: Test stdpython (no_std + alloc)
+        run: cargo test -p stdpython --no-default-features --features alloc
+      # A bare-metal target has no std to fall back on, so this also catches
+      # any dependency quietly linking std.
+      - name: Cross-check on bare-metal (thumbv7m-none-eabi)
+        run: |
+          rustup target add thumbv7m-none-eabi
+          cargo check -p stdpython --no-default-features --features alloc --target thumbv7m-none-eabi

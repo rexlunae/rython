@@ -4,6 +4,11 @@
 //! Implementation matches Python's string module API.
 
 use crate::{PyException, python_function};
+use alloc::{format, string::String, string::ToString, vec::Vec};
+#[cfg(feature = "std")]
+use std::collections::HashSet;
+#[cfg(not(feature = "std"))]
+use hashbrown::HashSet;
 
 // String constants
 pub const ascii_lowercase: &str = "abcdefghijklmnopqrstuvwxyz";
@@ -90,7 +95,7 @@ impl Template {
         V: AsRef<str>,
     {
         let mut result = self.template.clone();
-        let mut substituted = std::collections::HashSet::new();
+        let mut substituted = HashSet::new();
         
         // Find all variable references
         for (key, value) in mapping {
@@ -191,8 +196,8 @@ impl Template {
     }
 }
 
-impl std::fmt::Display for Template {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl core::fmt::Display for Template {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(f, "{}", self.template)
     }
 }
@@ -203,7 +208,7 @@ pub struct Formatter;
 
 impl Formatter {
     /// Format string with positional arguments
-    pub fn format<S: AsRef<str>>(template: S, args: &[&dyn std::fmt::Display]) -> String {
+    pub fn format<S: AsRef<str>>(template: S, args: &[&dyn core::fmt::Display]) -> String {
         let template = template.as_ref();
         let mut result = template.to_string();
         
@@ -216,7 +221,7 @@ impl Formatter {
     }
     
     /// Format string with named arguments
-    pub fn format_map<S: AsRef<str>, K: AsRef<str>, V: std::fmt::Display>(
+    pub fn format_map<S: AsRef<str>, K: AsRef<str>, V: core::fmt::Display>(
         template: S, 
         kwargs: &[(K, V)]
     ) -> String {

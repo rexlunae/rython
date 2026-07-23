@@ -6,8 +6,18 @@
 //!
 //! ## Features
 //!
-//! - `std` (default): Full standard library support with I/O operations
-//! - `nostd`: No-std compatible version for embedded systems
+//! The crate is layered as a `core ⊂ alloc ⊂ std` feature ladder, with
+//! no_std reached by *absence* of the `std` feature:
+//!
+//! - `std` (default): the full runtime, including everything that touches
+//!   the OS (I/O, os/os.path, datetime, subprocess, tempfile, glob,
+//!   pathlib, random's OS entropy, pyo3 interop).
+//! - `alloc` (implied by `std`): heap-backed Python semantics with no OS
+//!   dependency — strings, lists, dicts/sets, exceptions, str.format.
+//!   Build with `--no-default-features --features alloc` for
+//!   `#![no_std]` + `alloc` output suitable for embedded/wasm targets.
+//! - A strictly-core tier (no allocator at all) is not implemented yet;
+//!   building without `alloc` fails loudly rather than pretending.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // Allow non-conventional naming for Python API compatibility
@@ -15,33 +25,82 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 
-// Import conditional on std feature
+#[cfg(all(not(feature = "std"), not(feature = "alloc")))]
+compile_error!(
+    "stdpython requires the `alloc` feature when `std` is disabled: build with \
+     `--no-default-features --features alloc`. A strictly-core tier (no allocator) \
+     is not implemented yet — see https://github.com/rexlunae/rython/issues/22."
+);
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+// One import surface for both tiers: under `std`, these alloc/core paths
+// name exactly the types the std prelude re-exports.
+#[cfg(feature = "alloc")]
+use alloc::{format, string::String, string::ToString, vec::Vec};
+
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "std")]
-use std::fmt::{Display, Debug};
-#[cfg(feature = "std")]
-use std::hash::Hash;
-
-// Import conditional on nostd - using alternative crates
-#[cfg(not(feature = "std"))]
+#[cfg(all(feature = "alloc", not(feature = "std")))]
 use hashbrown::{HashMap, HashSet};
-#[cfg(not(feature = "std"))]
-use core::fmt::{Display, Debug};
-#[cfg(not(feature = "std"))]
-use core::hash::Hash;
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::{vec::Vec, string::String, format};
-#[cfg(not(feature = "std"))]
-use alloc::string::ToString;
 
+use core::fmt::{Debug, Display};
+use core::hash::Hash;
+
+/// f64 math used by core Python semantics (`//`, `**`, round(), float
+/// repr). The inherent f64 methods live in std, not core, so without std
+/// these delegate to libm; the two agree on every case we rely on.
+pub(crate) mod flt {
+    #[cfg(feature = "std")]
+    pub(crate) fn floor(x: f64) -> f64 { x.floor() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn floor(x: f64) -> f64 { libm::floor(x) }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn trunc(x: f64) -> f64 { x.trunc() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn trunc(x: f64) -> f64 { libm::trunc(x) }
+
+    /// Rounds half away from zero, like f64::round and libm::round both do.
+    #[cfg(feature = "std")]
+    pub(crate) fn round(x: f64) -> f64 { x.round() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn round(x: f64) -> f64 { libm::round(x) }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn fract(x: f64) -> f64 { x.fract() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn fract(x: f64) -> f64 { x - libm::trunc(x) }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn abs(x: f64) -> f64 { x.abs() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn abs(x: f64) -> f64 { libm::fabs(x) }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn signum(x: f64) -> f64 { x.signum() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn signum(x: f64) -> f64 {
+        if x.is_nan() { f64::NAN } else if x.is_sign_negative() { -1.0 } else { 1.0 }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn powf(x: f64, y: f64) -> f64 { x.powf(y) }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn powf(x: f64, y: f64) -> f64 { libm::pow(x, y) }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn powi(x: f64, n: i32) -> f64 { x.powi(n) }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn powi(x: f64, n: i32) -> f64 { libm::pow(x, n as f64) }
+}
 
 // PyO3 only available with std
 #[cfg(feature = "std")]
 pub use pyo3::PyAny;
 /// Alias kept for generated code; pyo3 0.29 removed the `PyObject` name.
+#[cfg(feature = "std")]
 pub type PyObject = pyo3::Py<pyo3::PyAny>;
 
 // ============================================================================
@@ -315,7 +374,7 @@ impl PyDivMod for i64 {
 
 impl PyDivMod for f64 {
     fn py_floordiv(self, rhs: Self) -> Self {
-        (self / rhs).floor()
+        flt::floor(self / rhs)
     }
     fn py_mod(self, rhs: Self) -> Self {
         let r = self % rhs;
@@ -365,21 +424,21 @@ impl PyPow for i64 {
 impl PyPow<i64> for f64 {
     type Output = f64;
     fn py_pow(self, rhs: i64) -> f64 {
-        self.powi(rhs as i32)
+        flt::powi(self, rhs as i32)
     }
 }
 
 impl PyPow for f64 {
     type Output = f64;
     fn py_pow(self, rhs: f64) -> f64 {
-        self.powf(rhs)
+        flt::powf(self, rhs)
     }
 }
 
 impl PyPow<f64> for i64 {
     type Output = f64;
     fn py_pow(self, rhs: f64) -> f64 {
-        (self as f64).powf(rhs)
+        flt::powf(self as f64, rhs)
     }
 }
 
@@ -394,9 +453,9 @@ where
 /// Python round() builtin with no ndigits: rounds half to even (banker's
 /// rounding), so `round(2.5) == 2` and `round(3.5) == 4`.
 pub fn round(value: f64) -> i64 {
-    let r = value.round();
-    if (value - value.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
-        (r - value.signum()) as i64
+    let r = flt::round(value);
+    if flt::abs(value - flt::trunc(value)) == 0.5 && r % 2.0 != 0.0 {
+        (r - flt::signum(value)) as i64
     } else {
         r as i64
     }
@@ -405,11 +464,11 @@ pub fn round(value: f64) -> i64 {
 /// Python round(value, ndigits): rounds half to even at the given decimal
 /// place and returns a float.
 pub fn round_digits(value: f64, ndigits: i64) -> f64 {
-    let factor = 10f64.powi(ndigits as i32);
+    let factor = flt::powi(10f64, ndigits as i32);
     let scaled = value * factor;
-    let r = scaled.round();
-    let rounded = if (scaled - scaled.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
-        r - scaled.signum()
+    let r = flt::round(scaled);
+    let rounded = if flt::abs(scaled - flt::trunc(scaled)) == 0.5 && r % 2.0 != 0.0 {
+        r - flt::signum(scaled)
     } else {
         r
     };
@@ -808,7 +867,7 @@ impl PyToString for i64 {
 impl PyToString for f64 {
     fn py_str(self) -> String {
         // Python renders float("3") as "3.0"; Rust's Display drops the ".0".
-        if self.is_finite() && self.fract() == 0.0 && self.abs() < 1e16 {
+        if self.is_finite() && flt::fract(self) == 0.0 && flt::abs(self) < 1e16 {
             format!("{:.1}", self)
         } else if self.is_infinite() {
             if self > 0.0 { "inf".to_string() } else { "-inf".to_string() }
@@ -1887,10 +1946,18 @@ impl PyStrOps for str {
 // PYTHON DICTS: insertion-ordered, with the Python method surface
 // ============================================================================
 
+/// The hasher backing PyDict. Under `std` this is the same RandomState an
+/// unadorned IndexMap would use; without `std`, indexmap has no default
+/// hasher, so hashbrown's supplies one.
+#[cfg(feature = "std")]
+pub type PyHashBuilder = std::collections::hash_map::RandomState;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+pub type PyHashBuilder = hashbrown::DefaultHashBuilder;
+
 /// The type Python dict literals lower to. Python dicts preserve insertion
 /// order (guaranteed since 3.7), which HashMap does not — IndexMap keeps
 /// keys()/values()/items() and iteration faithful to Python.
-pub type PyDict<K, V> = indexmap::IndexMap<K, V>;
+pub type PyDict<K, V> = indexmap::IndexMap<K, V, PyHashBuilder>;
 
 /// Python dict methods. Named as in Python where no inherent conflicts;
 /// `get` conflicts with IndexMap's borrowed-Option accessor, so codegen
@@ -2562,6 +2629,7 @@ pub use stdlib::sysconfig::{
 };
 #[cfg(feature = "std")]
 pub use stdlib::venv;
+#[cfg(feature = "std")]
 pub use stdlib::math;
 #[cfg(feature = "std")]
 pub use stdlib::random;
@@ -2689,17 +2757,16 @@ pub use sys::{
     get_platform_py, get_platform_wrapper,
 };
 
-pub use string::{
-    // String functions
-    capwords_py, capwords_wrapper,
-};
+// The `_py` wrappers only exist with std (they're the pyo3-facing shapes);
+// the `_wrapper` forms are plain Rust and stay available on every tier.
+#[cfg(feature = "std")]
+pub use string::capwords_py;
+pub use string::capwords_wrapper;
 
+#[cfg(feature = "std")]
+pub use collections::{counter_py, create_deque_py, defaultdict_int_py, defaultdict_list_py};
 pub use collections::{
-    // Collections functions
-    counter_py, counter_wrapper,
-    create_deque_py, create_deque_wrapper,
-    defaultdict_int_py, defaultdict_int_wrapper,
-    defaultdict_list_py, defaultdict_list_wrapper,
+    counter_wrapper, create_deque_wrapper, defaultdict_int_wrapper, defaultdict_list_wrapper,
 };
 
 #[cfg(feature = "std")]
