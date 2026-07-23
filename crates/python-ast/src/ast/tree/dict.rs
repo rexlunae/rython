@@ -68,8 +68,11 @@ impl CodeGen for Dict {
             }
         }
         
+        // PyDict (an insertion-ordered map) rather than HashMap: Python
+        // dicts preserve insertion order, and keys()/items()/iteration
+        // must match.
         Ok(quote! {
-            std::collections::HashMap::from([#(#pairs),*])
+            PyDict::from([#(#pairs),*])
         })
     }
 }

@@ -97,6 +97,37 @@ impl<'a> CodeGen for Call {
                         })?
                     });
                 }
+                // pop with an argument dispatches by receiver through the
+                // PyPop trait: list.pop(i) by index (IndexError), dict.pop(k)
+                // by key (KeyError).
+                ("pop", [arg]) => {
+                    return Ok(quote!((#receiver).py_pop(#arg)?));
+                }
+                ("pop", [key, default]) => {
+                    return Ok(quote!((#receiver).py_pop_default(#key, #default)));
+                }
+                // dict.get never raises: value-or-None (an Option), or the
+                // provided default. IndexMap's inherent get returns a
+                // borrowed Option, so both forms map to py_ versions.
+                ("get", [key]) => {
+                    return Ok(quote!((#receiver).py_get(&(#key))));
+                }
+                ("get", [key, default]) => {
+                    return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
+                }
+                // Views materialize as Vecs in insertion order.
+                ("keys", []) => {
+                    return Ok(quote!((#receiver).py_keys()));
+                }
+                ("values", []) => {
+                    return Ok(quote!((#receiver).py_values()));
+                }
+                ("items", []) => {
+                    return Ok(quote!((#receiver).py_items()));
+                }
+                ("setdefault", [key, default]) => {
+                    return Ok(quote!((#receiver).py_setdefault(#key, #default)));
+                }
                 // list.remove(x) removes by VALUE and raises ValueError;
                 // Vec::remove removes by index — silently different.
                 ("remove", [value]) => {

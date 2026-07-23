@@ -175,11 +175,13 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 }
                 (crate::SubscriptKind::Index(kv), "dict") => {
                     // dict[K, V] parses as a subscript with a tuple index.
+                    // PyDict is the insertion-ordered map dict literals
+                    // lower to.
                     if let ExprType::Tuple(t) = kv.as_ref() {
                         if let [k, v] = t.elts.as_slice() {
                             let k = python_annotation_to_rust_type(k)?;
                             let v = python_annotation_to_rust_type(v)?;
-                            return Some(quote!(std::collections::HashMap<#k, #v>));
+                            return Some(quote!(PyDict<#k, #v>));
                         }
                     }
                     None

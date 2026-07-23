@@ -479,6 +479,61 @@ fn exceptions_propagate_across_functions_at_runtime() {
 }
 
 #[test]
+fn dict_methods_match_python_at_runtime() {
+    let scratch = Scratch::new("dicts");
+    let file = scratch.path().join("dicts.py");
+    fs::write(
+        &file,
+        concat!(
+            "def stats() -> int:\n",
+            "    d = {\"b\": 2, \"a\": 1}\n",
+            "    d[\"c\"] = 3\n",
+            "    total = 0\n",
+            "    for k in d.keys():\n",
+            "        total += d[k]\n",
+            "    picked = d.get(\"a\", 0) + d.get(\"missing\", 100)\n",
+            "    popped = d.pop(\"b\")\n",
+            "    d.setdefault(\"z\", 50)\n",
+            "    d.setdefault(\"a\", 999)\n",
+            "    leftover = d.pop(\"gone\", 7)\n",
+            "    return total + picked + popped + d[\"z\"] + d[\"a\"] + leftover\n",
+            "\n",
+            "def ordered() -> str:\n",
+            "    d = {\"x\": 1, \"m\": 2, \"a\": 3}\n",
+            "    d[\"q\"] = 4\n",
+            "    return \"-\".join(d.keys())\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(stats())\n",
+            "    print(ordered())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo build");
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/dicts"))
+        .output()
+        .expect("running generated binary");
+    // Values verified against python3; "x-m-a-q" pins insertion order.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["167", "x-m-a-q"],
+        "dict semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn pyo3_crate_compiles() {
     let scratch = Scratch::new("pyo3-compile");
     write_sample_package(scratch.path());

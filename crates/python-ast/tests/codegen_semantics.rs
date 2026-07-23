@@ -857,7 +857,7 @@ fn container_annotations_map_to_rust_types() {
     let out = compile("def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n", "generics.py");
     assert!(out.contains("a : Vec < i64 >"), "generated: {}", out);
     assert!(
-        out.contains("b : std :: collections :: HashMap < String , i64 >"),
+        out.contains("b : PyDict < String , i64 >"),
         "generated: {}",
         out
     );
@@ -927,6 +927,40 @@ fn addition_lowers_through_py_add() {
 
     let out = compile("def f(n: int) -> int:\n    n += 1\n    return n\n", "addaug.py");
     assert!(out.contains("n = (n) . py_add (& (1))"), "generated: {}", out);
+}
+
+#[test]
+fn dict_literals_and_methods_lower_through_pydict() {
+    // Dict literals are insertion-ordered PyDicts, not HashMaps.
+    let out = compile("d = {\"a\": 1}", "dictlit.py");
+    assert!(out.contains("PyDict :: from"), "generated: {}", out);
+    assert!(!out.contains("HashMap :: from"), "generated: {}", out);
+
+    // Method mappings: get/pop/setdefault/views.
+    let src = concat!(
+        "def f() -> int:\n",
+        "    d = {\"a\": 1}\n",
+        "    x = d.get(\"a\", 0)\n",
+        "    y = d.pop(\"a\")\n",
+        "    z = d.pop(\"gone\", 9)\n",
+        "    d.setdefault(\"b\", 2)\n",
+        "    ks = d.keys()\n",
+        "    vs = d.values()\n",
+        "    it = d.items()\n",
+        "    return x + y + z\n",
+    );
+    let out = compile(src, "dictops.py");
+    assert!(out.contains("py_get_default (& (\"a\") , 0)"), "generated: {}", out);
+    assert!(out.contains("py_pop (\"a\") ?"), "generated: {}", out);
+    assert!(out.contains("py_pop_default (\"gone\" , 9)"), "generated: {}", out);
+    assert!(out.contains("py_setdefault (\"b\" , 2)"), "generated: {}", out);
+    assert!(out.contains("py_keys ()"), "generated: {}", out);
+    assert!(out.contains("py_values ()"), "generated: {}", out);
+    assert!(out.contains("py_items ()"), "generated: {}", out);
+
+    // get with one argument returns an Option (value-or-None).
+    let out = compile("def g(d: dict[str, int]):\n    v = d.get(\"k\")\n", "dictget.py");
+    assert!(out.contains("py_get (& (\"k\"))"), "generated: {}", out);
 }
 
 #[test]
