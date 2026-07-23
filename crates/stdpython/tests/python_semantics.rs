@@ -813,3 +813,23 @@ fn strip_title_zfill_just_match_python() {
     assert!(err.to_string().contains("TypeError"), "got: {}", err);
     assert!("hi".py_rjust(5, "").is_err());
 }
+
+#[test]
+fn whitespace_maxsplit_matches_python() {
+    // Values verified against python3.
+    assert_eq!(
+        " a b  c ".py_split_whitespace_maxsplit(1),
+        vec!["a", "b  c "]
+    );
+    assert_eq!(
+        " a b  c ".py_rsplit_whitespace_maxsplit(2),
+        vec![" a", "b", "c"]
+    );
+    assert_eq!("a b".py_split_whitespace_maxsplit(0), vec!["a b"]);
+    assert_eq!(" a b ".py_rsplit_whitespace_maxsplit(0), vec![" a b"]);
+    // Negative means unlimited.
+    assert_eq!(
+        " a b  c ".py_split_whitespace_maxsplit(-1),
+        vec!["a", "b", "c"]
+    );
+}

@@ -1475,6 +1475,10 @@ pub trait PyStrOps {
     fn py_split_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException>;
     /// str.split() with no argument: split on runs of whitespace.
     fn py_split_whitespace(&self) -> Vec<String>;
+    /// str.split(None, maxsplit) / str.rsplit(None, maxsplit): whitespace
+    /// mode with a split limit; the remainder keeps its whitespace.
+    fn py_split_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String>;
+    fn py_rsplit_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String>;
     /// str.rsplit(sep): like split for full splits, but named separately
     /// (str::rsplit is an inherent iterator method).
     fn py_rsplit(&self, sep: &str) -> Result<Vec<String>, PyException>;
@@ -1568,6 +1572,59 @@ impl PyStrOps for str {
     }
     fn py_split_whitespace(&self) -> Vec<String> {
         self.split_whitespace().map(str::to_string).collect()
+    }
+    fn py_split_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
+        if maxsplit < 0 {
+            return self.py_split_whitespace();
+        }
+        // Python: leading whitespace is consumed, at most maxsplit splits
+        // are made, and the remainder keeps its internal/trailing
+        // whitespace: " a b  c ".split(None, 1) == ["a", "b  c "].
+        let mut out = Vec::new();
+        let mut rest = self.trim_start();
+        let mut splits = 0;
+        while !rest.is_empty() && splits < maxsplit {
+            match rest.find(char::is_whitespace) {
+                Some(i) => {
+                    out.push(rest[..i].to_string());
+                    rest = rest[i..].trim_start();
+                    splits += 1;
+                }
+                None => break,
+            }
+        }
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+        out
+    }
+    fn py_rsplit_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
+        if maxsplit < 0 {
+            return self.py_split_whitespace();
+        }
+        // Mirror image: trailing whitespace is consumed, splits count from
+        // the right, and the remainder keeps its LEADING whitespace:
+        // " a b  c ".rsplit(None, 2) == [" a", "b", "c"].
+        let mut tail = Vec::new();
+        let mut rest = self.trim_end();
+        let mut splits = 0;
+        while !rest.is_empty() && splits < maxsplit {
+            match rest.rfind(char::is_whitespace) {
+                Some(i) => {
+                    let sep_len = rest[i..].chars().next().map_or(1, char::len_utf8);
+                    tail.push(rest[i + sep_len..].to_string());
+                    rest = rest[..i].trim_end();
+                    splits += 1;
+                }
+                None => break,
+            }
+        }
+        let mut out = Vec::new();
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+        out.extend(tail.into_iter().rev());
+        out
     }
     fn py_rsplit(&self, sep: &str) -> Result<Vec<String>, PyException> {
         self.py_split(sep)
