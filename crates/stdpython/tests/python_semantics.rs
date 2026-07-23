@@ -557,6 +557,15 @@ fn seeded_integer_functions_match_cpython() {
         .collect();
     assert_eq!(got, vec![9, 9, 9, 3, 3, 9]);
 
+    // Negative steps floor-divide the candidate count like Python:
+    // range(10, 1, -3) has exactly [10, 7, 4] — the excluded endpoint 1
+    // must never appear. python3: random.seed(13); six draws.
+    random::seed(Some(13i64));
+    let got: Vec<i64> = (0..6)
+        .map(|_| random::randrange(10, Some(1), Some(-3)).unwrap())
+        .collect();
+    assert_eq!(got, vec![7, 7, 4, 4, 10, 4]);
+
     // random.seed(9); random.uniform(1, 10); getrandbits(16); getrandbits(64)
     random::seed(Some(9i64));
     assert_eq!(random::uniform(1.0, 10.0), 5.167066220335193);

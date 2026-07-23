@@ -94,17 +94,14 @@ impl PyRandom {
         self.seeded = true;
     }
 
-    /// Seed from OS entropy (std's RandomState draws from the OS), used for
-    /// `seed()` with no argument and for first use of an unseeded generator.
+    /// Seed from OS entropy, used for `seed()` with no argument and for
+    /// first use of an unseeded generator (as CPython seeds from urandom).
     fn seed_from_entropy(&mut self) {
-        use std::hash::{BuildHasher, Hasher};
+        let mut bytes = [0u8; 16];
+        os_entropy(&mut bytes);
         let mut key = [0u32; 4];
-        for pair in 0..2 {
-            let word = std::collections::hash_map::RandomState::new()
-                .build_hasher()
-                .finish();
-            key[pair * 2] = (word & 0xffff_ffff) as u32;
-            key[pair * 2 + 1] = (word >> 32) as u32;
+        for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+            key[i] = u32::from_le_bytes(chunk.try_into().unwrap());
         }
         self.init_by_array(&key);
         self.gauss_next = None;
@@ -497,7 +494,16 @@ pub fn randrange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<i64
     let n = if step > 0 {
         (width + step - 1).div_euclid(step)
     } else {
-        (width + step + 1).div_euclid(step)
+        // Python uses floor division; div_euclid rounds the other way for
+        // a negative divisor when inexact (e.g. -11 // -3: floor 3,
+        // euclid 4), which would overcount and let randbelow reach past
+        // the excluded endpoint.
+        let num = width + step + 1;
+        let mut q = num / step;
+        if num % step != 0 && ((num < 0) != (step < 0)) {
+            q -= 1;
+        }
+        q
     };
     if n <= 0 {
         return Err(crate::value_error("empty range for randrange()"));
@@ -669,8 +675,16 @@ where
     })
 }
 
-/// SystemRandom - draws from OS entropy (std's RandomState), independent
-/// of the seeded generator, like Python's os.urandom-backed SystemRandom.
+/// Fill a buffer with cryptographic OS entropy (getrandom syscall /
+/// /dev/urandom equivalent — what backs Python's os.urandom). Entropy
+/// being unavailable is unrecoverable and must not silently degrade to a
+/// weaker source, so it panics loudly, like os.urandom raising OSError.
+pub(crate) fn os_entropy(buf: &mut [u8]) {
+    getrandom::fill(buf).expect("OS entropy source unavailable");
+}
+
+/// SystemRandom - draws from OS entropy, independent of the seeded
+/// generator, like Python's os.urandom-backed SystemRandom.
 pub struct SystemRandom;
 
 impl SystemRandom {
@@ -679,24 +693,15 @@ impl SystemRandom {
     }
 
     fn entropy_word() -> u64 {
-        use std::hash::{BuildHasher, Hasher};
-        std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish()
+        let mut bytes = [0u8; 8];
+        os_entropy(&mut bytes);
+        u64::from_le_bytes(bytes)
     }
 
     /// Generate random bytes.
     pub fn randbytes(&self, n: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
-            let word = Self::entropy_word();
-            for b in word.to_le_bytes() {
-                if out.len() == n {
-                    break;
-                }
-                out.push(b);
-            }
-        }
+        let mut out = vec![0u8; n];
+        os_entropy(&mut out);
         out
     }
 

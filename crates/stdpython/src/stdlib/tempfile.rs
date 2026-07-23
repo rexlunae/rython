@@ -395,11 +395,9 @@ impl SpooledTemporaryFile {
 // Helper functions
 
 fn generate_random_string(length: usize) -> String {
-    use std::hash::{BuildHasher, Hasher};
-
-    // Each character draws 6 fresh bits of OS entropy (std's RandomState is
-    // OS-seeded per instance), independent of the seeded `random` module —
-    // like Python's tempfile, which keeps its own private Random. The old
+    // Names draw 6 bits of cryptographic OS entropy per character,
+    // independent of the seeded `random` module — like Python's tempfile,
+    // which keeps its own private Random over os.urandom seeding. The old
     // implementation cycled 8 bits of one time-derived hash, so every call
     // in the same instant produced the SAME name and the mkstemp/mkdtemp
     // retry loops could burn all their attempts on one candidate.
@@ -411,9 +409,9 @@ fn generate_random_string(length: usize) -> String {
     let mut pool_bits = 0u32;
     while out.len() < length {
         if pool_bits < 6 {
-            pool = std::collections::hash_map::RandomState::new()
-                .build_hasher()
-                .finish();
+            let mut bytes = [0u8; 8];
+            crate::random::os_entropy(&mut bytes);
+            pool = u64::from_le_bytes(bytes);
             pool_bits = 64;
         }
         let idx = (pool & 0x3f) as usize;
