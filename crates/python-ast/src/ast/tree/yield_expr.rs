@@ -1,6 +1,5 @@
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
-use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -100,25 +99,19 @@ impl CodeGen for Yield {
 
     fn to_rust(
         self,
-        ctx: Self::Context,
-        options: Self::Options,
-        symbols: Self::SymbolTable,
+        _ctx: Self::Context,
+        _options: Self::Options,
+        _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        if let Some(value) = self.value {
-            let value_tokens = (*value).to_rust(ctx, options, symbols)?;
-            // For now, generate a simple return since Rust doesn't have yield expressions
-            // In practice, this would need to be part of an async generator or similar
-            Ok(quote! {
-                // Yield expression - simplified translation
-                // Python's yield doesn't map directly to Rust
-                #value_tokens
-            })
-        } else {
-            Ok(quote! {
-                // Bare yield - simplified translation
-                ()
-            })
-        }
+        // A generator silently becoming a plain function is exactly the kind
+        // of divergence that must fail loudly instead.
+        Err(
+            "generators (`yield`) are not supported yet: the function would \
+             silently evaluate a single value instead of producing a \
+             generator. Rewrite it to build and return a list."
+                .to_string()
+                .into(),
+        )
     }
 }
 
@@ -133,16 +126,17 @@ impl CodeGen for YieldFrom {
 
     fn to_rust(
         self,
-        ctx: Self::Context,
-        options: Self::Options,
-        symbols: Self::SymbolTable,
+        _ctx: Self::Context,
+        _options: Self::Options,
+        _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value_tokens = (*self.value).to_rust(ctx, options, symbols)?;
-        // For now, generate a simple expression since Rust doesn't have yield from
-        Ok(quote! {
-            // Yield from expression - simplified translation
-            #value_tokens
-        })
+        Err(
+            "generators (`yield from`) are not supported yet: the function \
+             would silently evaluate the iterable once instead of delegating \
+             to it. Rewrite it to build and return a list."
+                .to_string()
+                .into(),
+        )
     }
 }
 

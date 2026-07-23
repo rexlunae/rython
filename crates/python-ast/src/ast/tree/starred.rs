@@ -1,6 +1,5 @@
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
-use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -63,20 +62,19 @@ impl CodeGen for Starred {
 
     fn to_rust(
         self,
-        ctx: Self::Context,
-        options: Self::Options,
-        symbols: Self::SymbolTable,
+        _ctx: Self::Context,
+        _options: Self::Options,
+        _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value = (*self.value).clone().to_rust(ctx, options, symbols)?;
-        let _value_str = value.to_string();
-        
-        // Handle starred expressions for unpacking collections
-        // In Rust context, we need to indicate this is an unpacking operation
-        // The parent context (like vec! or function call) will handle the actual unpacking
-        Ok(quote! {
-            // STARRED: This indicates unpacking - parent context should handle
-            #value
-        })
+        // Emitting the bare value would pass the whole collection as ONE
+        // argument/element — silently different from unpacking it.
+        Err(
+            "starred unpacking (`*expr`) is not supported yet: it would \
+             silently pass the collection as a single value instead of \
+             spreading its elements. Spell the elements out explicitly."
+                .to_string()
+                .into(),
+        )
     }
 }
 
