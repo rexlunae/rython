@@ -61,6 +61,34 @@ impl<'a> CodeGen for Call {
             _ => false,
         };
 
+        // Multi-argument range() maps to the arity-specific runtime
+        // functions (Rust has no overloading); the 3-argument form can
+        // raise ValueError on a zero step, hence `?`. A user-defined
+        // `range` shadows the builtin and skips this mapping.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            if n.id == "range"
+                && symbols.get("range").is_none()
+                && self.keywords.is_empty()
+                && matches!(self.args.len(), 2 | 3)
+            {
+                let mut rendered = Vec::new();
+                for arg in &self.args {
+                    rendered.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                return Ok(if rendered.len() == 2 {
+                    let (a, b) = (&rendered[0], &rendered[1]);
+                    quote!(range_start_stop(#a, #b))
+                } else {
+                    let (a, b, c) = (&rendered[0], &rendered[1], &rendered[2]);
+                    quote!(range_start_stop_step(#a, #b, #c)?)
+                });
+            }
+        }
+
         // Constructing a class instance: `Point(args)` lowers to
         // `Point::new(args)?`, with arguments resolved against __init__'s
         // signature (minus self) so keywords and defaults follow Python

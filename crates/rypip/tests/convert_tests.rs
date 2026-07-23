@@ -724,6 +724,56 @@ fn string_methods_match_python_at_runtime() {
 }
 
 #[test]
+fn range_variants_match_python_at_runtime() {
+    // Multi-argument range (including negative steps) and the catchable
+    // zero-step ValueError, through generated code over the LAZY range.
+    let scratch = Scratch::new("ranges");
+    let file = scratch.path().join("ranges.py");
+    fs::write(
+        &file,
+        concat!(
+            "def run() -> int:\n",
+            "    total = 0\n",
+            "    for i in range(5):\n",
+            "        total += i\n",
+            "    print(total)\n",
+            "    for i in range(2, 8, 2):\n",
+            "        print(i)\n",
+            "    for i in range(3, 0, -1):\n",
+            "        print(i)\n",
+            "    try:\n",
+            "        for i in range(0, 5, 0):\n",
+            "            pass\n",
+            "    except ValueError:\n",
+            "        print(\"zero step caught\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/ranges"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["10", "2", "4", "6", "3", "2", "1", "zero step caught"],
+        "range semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn module_constants_match_python_at_runtime() {
     // Module-level constants are visible to functions (Python globals);
     // a value-returning `main` runs through the wrapper entry point.

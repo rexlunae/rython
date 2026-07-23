@@ -53,9 +53,9 @@ fn test_python_builtin_functions() {
     let zipped = zip(nums, letters);
     assert_eq!(zipped, vec![(1, "a"), (2, "b"), (3, "c")]);
     
-    assert_eq!(range(5), vec![0, 1, 2, 3, 4]);
-    assert_eq!(range_start_stop(2, 6), vec![2, 3, 4, 5]);
-    assert_eq!(range_start_stop_step(0, 10, 2), vec![0, 2, 4, 6, 8]);
+    assert_eq!(range(5).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    assert_eq!(range_start_stop(2, 6).collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+    assert_eq!(range_start_stop_step(0, 10, 2).unwrap().collect::<Vec<_>>(), vec![0, 2, 4, 6, 8]);
     
     println!("  ✓ All built-in functions working correctly");
 }
@@ -193,16 +193,16 @@ fn test_python_iteration_functions() {
     println!("📋 Testing Python iteration functions...");
     
     // Range function variations
-    let simple_range = range(5);
+    let simple_range: Vec<i64> = range(5).collect();
     assert_eq!(simple_range, vec![0, 1, 2, 3, 4]);
     
-    let start_stop_range = range_start_stop(3, 8);
+    let start_stop_range: Vec<i64> = range_start_stop(3, 8).collect();
     assert_eq!(start_stop_range, vec![3, 4, 5, 6, 7]);
     
-    let step_range = range_start_stop_step(0, 20, 3);
+    let step_range: Vec<i64> = range_start_stop_step(0, 20, 3).unwrap().collect();
     assert_eq!(step_range, vec![0, 3, 6, 9, 12, 15, 18]);
     
-    let negative_step_range = range_start_stop_step(10, 0, -2);
+    let negative_step_range: Vec<i64> = range_start_stop_step(10, 0, -2).unwrap().collect();
     assert_eq!(negative_step_range, vec![10, 8, 6, 4, 2]);
     
     // Enumerate function

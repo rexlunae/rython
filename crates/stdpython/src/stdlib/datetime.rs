@@ -202,61 +202,133 @@ impl datetime {
         Ok(Self { date, time })
     }
     
-    /// Get current datetime
+    /// Get current datetime in LOCAL time, like Python's datetime.now()
+    /// (via localtime on unix; non-unix hosts fall back to UTC).
     pub fn now() -> Self {
         let now = SystemTime::now();
         let duration = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
-        let total_seconds = duration.as_secs();
-        let microseconds = duration.subsec_micros();
-        
-        let days_since_epoch = total_seconds / 86400;
-        let seconds_today = total_seconds % 86400;
-        
-        let date = days_to_date(days_since_epoch as i64 + 719163);
-        let hour = (seconds_today / 3600) as u32;
-        let minute = ((seconds_today % 3600) / 60) as u32;
-        let second = (seconds_today % 60) as u32;
-        
-        Self {
-            date,
-            time: time::new(hour, minute, Some(second), Some(microseconds)).unwrap(),
-        }
+        let micros = duration.subsec_micros();
+        Self::from_unix_local(duration.as_secs() as i64, micros)
+            .unwrap_or_else(|_| Self::from_unix_utc(duration.as_secs() as i64, micros))
     }
-    
-    /// Get UTC datetime
+
+    /// Get current datetime in UTC — decomposed from the UNIX clock, NOT an
+    /// alias of now() (which is local time).
     pub fn utcnow() -> Self {
-        Self::now() // Simplified - same as now() for this implementation
+        let now = SystemTime::now();
+        let duration = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+        Self::from_unix_utc(duration.as_secs() as i64, duration.subsec_micros())
     }
-    
-    /// Create from timestamp
-    pub fn fromtimestamp(timestamp: f64) -> Result<Self, PyException> {
-        let duration = Duration::from_secs_f64(timestamp);
-        let total_seconds = duration.as_secs();
-        let microseconds = duration.subsec_micros();
-        
-        let days_since_epoch = (total_seconds / 86400) as i64;
-        let seconds_today = total_seconds % 86400;
-        
+
+    /// Decompose UNIX seconds as UTC.
+    fn from_unix_utc(secs: i64, microsecond: u32) -> Self {
+        let days_since_epoch = secs.div_euclid(86400);
+        let seconds_today = secs.rem_euclid(86400);
         let date = days_to_date(days_since_epoch + 719163);
         let hour = (seconds_today / 3600) as u32;
         let minute = ((seconds_today % 3600) / 60) as u32;
         let second = (seconds_today % 60) as u32;
-        
-        Ok(Self {
+        Self {
             date,
-            time: time::new(hour, minute, Some(second), Some(microseconds))?,
+            time: time::new(hour, minute, Some(second), Some(microsecond))
+                .expect("decomposed clock fields are in range"),
+        }
+    }
+
+    /// Decompose UNIX seconds in the host's LOCAL timezone (unix only).
+    #[cfg(unix)]
+    fn from_unix_local(secs: i64, microsecond: u32) -> Result<Self, PyException> {
+        let t: libc::time_t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::localtime_r(&t, &mut tm) };
+        if ok.is_null() {
+            return Err(crate::value_error("timestamp out of range for localtime"));
+        }
+        Ok(Self {
+            date: date::new(tm.tm_year + 1900, (tm.tm_mon + 1) as u32, tm.tm_mday as u32)?,
+            time: time::new(
+                tm.tm_hour as u32,
+                tm.tm_min as u32,
+                Some(tm.tm_sec as u32),
+                Some(microsecond),
+            )?,
         })
     }
-    
-    /// Convert to timestamp
+
+    #[cfg(not(unix))]
+    fn from_unix_local(secs: i64, microsecond: u32) -> Result<Self, PyException> {
+        // No portable localtime without a timezone database; UTC is the
+        // documented fallback on non-unix hosts.
+        Ok(Self::from_unix_utc(secs, microsecond))
+    }
+
+    /// Create from timestamp, interpreted in LOCAL time like Python.
+    /// Negative timestamps (pre-1970) are valid.
+    pub fn fromtimestamp(timestamp: f64) -> Result<Self, PyException> {
+        if !timestamp.is_finite() {
+            return Err(crate::value_error("Invalid value NaN or Infinity for timestamp"));
+        }
+        let secs = timestamp.floor();
+        let micros = ((timestamp - secs) * 1_000_000.0).round() as u32;
+        let (secs, micros) = if micros >= 1_000_000 {
+            (secs as i64 + 1, 0)
+        } else {
+            (secs as i64, micros)
+        };
+        Self::from_unix_local(secs, micros)
+    }
+
+    /// Convert to timestamp. A naive datetime is interpreted as LOCAL time
+    /// (Python semantics), via mktime on unix; pre-1970 datetimes produce
+    /// negative timestamps instead of wrapping.
     pub fn timestamp(&self) -> f64 {
+        let micros = self.time.microsecond as f64 / 1_000_000.0;
+        self.unix_seconds_local() as f64 + micros
+    }
+
+    #[cfg(unix)]
+    fn unix_seconds_local(&self) -> i64 {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = self.date.year - 1900;
+        tm.tm_mon = self.date.month as i32 - 1;
+        tm.tm_mday = self.date.day as i32;
+        tm.tm_hour = self.time.hour as i32;
+        tm.tm_min = self.time.minute as i32;
+        tm.tm_sec = self.time.second as i32;
+        tm.tm_isdst = -1; // let mktime resolve DST, like Python
+        let t = unsafe { libc::mktime(&mut tm) };
+        if t == -1 {
+            // -1 is ambiguous: mktime's error value, but ALSO the valid
+            // epoch-seconds for the local wall clock one second before
+            // 1970. Disambiguate portably (errno's location differs per
+            // platform) by decomposing -1 back and comparing fields.
+            if let Ok(at_minus_one) = Self::from_unix_local(-1, 0) {
+                if at_minus_one.date == self.date
+                    && at_minus_one.time.hour == self.time.hour
+                    && at_minus_one.time.minute == self.time.minute
+                    && at_minus_one.time.second == self.time.second
+                {
+                    return -1;
+                }
+            }
+            // A real mktime failure: fall back to the UTC computation
+            // (signed, so pre-1970 stays negative instead of wrapping).
+            return self.unix_seconds_utc();
+        }
+        t as i64
+    }
+
+    #[cfg(not(unix))]
+    fn unix_seconds_local(&self) -> i64 {
+        self.unix_seconds_utc()
+    }
+
+    fn unix_seconds_utc(&self) -> i64 {
         let days_since_epoch = self.date.toordinal() - 719163;
-        let seconds_since_midnight = self.time.hour as u64 * 3600 + 
-                                   self.time.minute as u64 * 60 + 
-                                   self.time.second as u64;
-        let microseconds = self.time.microsecond as u64;
-        
-        (days_since_epoch as u64 * 86400 + seconds_since_midnight) as f64 + microseconds as f64 / 1_000_000.0
+        let seconds_since_midnight = self.time.hour as i64 * 3600
+            + self.time.minute as i64 * 60
+            + self.time.second as i64;
+        days_since_epoch * 86400 + seconds_since_midnight
     }
     
     /// Get date component

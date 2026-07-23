@@ -849,3 +849,115 @@ fn int_radix_format_matches_python_sign_magnitude() {
     assert_eq!(py_int_radix_format(255, ' ', '\0', false, false, true, 8, 'X'), "000000FF");
     assert_eq!(py_int_radix_format(5, ' ', '\0', true, false, false, 0, 'x'), "+5");
 }
+
+// ---- Issue 23: lazy range, frexp, Counter ties, datetime ----
+
+#[test]
+fn range_is_lazy_and_matches_python() {
+    // Values verified against python3.
+    assert_eq!(range(5).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    assert_eq!(
+        range_start_stop_step(5, 1, -1).unwrap().collect::<Vec<_>>(),
+        vec![5, 4, 3, 2]
+    );
+    let r = range_start_stop_step(0, 10, 3).unwrap();
+    assert_eq!(r.py_len(), 4);
+    assert!(r.py_contains(&9));
+    assert!(!r.py_contains(&8));
+    // A zero step raises ValueError like Python.
+    let err = range_start_stop_step(0, 5, 0).unwrap_err();
+    assert!(err.to_string().contains("ValueError"), "got: {}", err);
+    // Laziness: a range Python-sized at a billion iterates in O(1) memory —
+    // taking 3 elements must not allocate anything.
+    let first3: Vec<i64> = range(1_000_000_000).take(3).collect();
+    assert_eq!(first3, vec![0, 1, 2]);
+    assert_eq!(range(1_000_000_000).py_len(), 1_000_000_000);
+}
+
+#[test]
+fn frexp_handles_subnormals_and_edge_values() {
+    use stdpython::math::frexp;
+    // Values verified against python3.
+    assert_eq!(frexp(8.0), (0.5, 4));
+    assert_eq!(frexp(0.5), (0.5, 0));
+    // The smallest subnormal: the old bit trick misread the zero exponent
+    // field and returned garbage.
+    assert_eq!(frexp(5e-324), (0.5, -1073));
+    assert_eq!(frexp(0.0), (0.0, 0));
+    let (m, e) = frexp(f64::INFINITY);
+    assert!(m.is_infinite());
+    assert_eq!(e, 0);
+    let (m, e) = frexp(f64::NAN);
+    assert!(m.is_nan());
+    assert_eq!(e, 0);
+}
+
+#[test]
+fn counter_most_common_breaks_ties_by_insertion_order() {
+    use stdpython::collections::Counter;
+    let mut c: Counter<String> = Counter::new();
+    for x in ["b", "a", "c", "a", "b", "c", "b"] {
+        c.update_one(&x.to_string(), 1);
+    }
+    // python3: [('b', 3), ('a', 2), ('c', 2)] — a before c because a was
+    // inserted first (the old Debug-string tiebreak had no Python meaning).
+    let got: Vec<(String, i64)> = c.most_common(None);
+    assert_eq!(
+        got,
+        vec![
+            ("b".to_string(), 3),
+            ("a".to_string(), 2),
+            ("c".to_string(), 2)
+        ]
+    );
+}
+
+#[test]
+fn datetime_timestamps_round_trip_and_handle_pre_epoch() {
+    use stdpython::datetime::datetime;
+    // This host runs UTC, so local == UTC and values match python3 exactly.
+    // fromtimestamp(-1) is 1969-12-31 23:59:59 — the old code wrapped
+    // negatives into a panic via Duration::from_secs_f64.
+    let d = datetime::fromtimestamp(-1.0).unwrap();
+    assert_eq!(d.date_component().year, 1969);
+    assert_eq!(d.time_component().second, 59);
+    // python3: datetime(2026, 7, 23, 12, 0).timestamp() == 1784808000.0
+    let d = datetime::new(2026, 7, 23, Some(12), Some(0), Some(0), None).unwrap();
+    assert_eq!(d.timestamp(), 1784808000.0);
+    // Round trip.
+    let back = datetime::fromtimestamp(1784808000.0).unwrap();
+    assert_eq!(back.date_component().day, 23);
+    assert_eq!(back.time_component().hour, 12);
+}
+
+#[test]
+fn abs_of_i64_min_fails_loudly_not_silently() {
+    assert_eq!(abs(-5i64), 5);
+    let result = std::panic::catch_unwind(|| abs(i64::MIN));
+    assert!(result.is_err(), "abs(i64::MIN) must be a defined, loud failure");
+}
+
+#[test]
+fn range_len_survives_extreme_endpoints() {
+    // Values verified against python3: no overflow near the i64 limits.
+    assert_eq!(
+        range_start_stop_step(0, i64::MAX, 2).unwrap().py_len(),
+        4_611_686_018_427_387_904
+    );
+    assert_eq!(range_start_stop_step(0, 100, i64::MAX).unwrap().py_len(), 1);
+    assert_eq!(range_start_stop_step(100, 0, i64::MIN).unwrap().py_len(), 1);
+    assert!(range_start_stop_step(i64::MIN, i64::MAX, 1)
+        .unwrap()
+        .py_contains(&i64::MAX.wrapping_sub(1)));
+}
+
+#[test]
+fn timestamp_one_second_before_epoch_is_minus_one() {
+    use stdpython::datetime::datetime;
+    // mktime returns -1 BOTH as its error value and as the valid result
+    // for this exact moment; the disambiguation must return -1.0 here
+    // (python3: datetime(1969, 12, 31, 23, 59, 59).timestamp() == -1.0
+    // on a UTC host).
+    let d = datetime::new(1969, 12, 31, Some(23), Some(59), Some(59), None).unwrap();
+    assert_eq!(d.timestamp(), -1.0);
+}

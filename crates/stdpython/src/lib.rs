@@ -469,7 +469,15 @@ pub fn bin(n: i64) -> String {
 impl PyAbs for i64 {
     type Output = i64;
     fn py_abs(self) -> Self::Output {
-        self.abs()
+        // Python promotes to bigint; i64 cannot, so the boundary case is a
+        // defined, loud failure in every build profile (release previously
+        // WRAPPED to a negative value silently).
+        self.checked_abs().unwrap_or_else(|| {
+            panic!(
+                "{}",
+                PyException::new("OverflowError", "abs(i64::MIN) overflows i64")
+            )
+        })
     }
 }
 
@@ -548,34 +556,94 @@ pub fn zip<T, U>(iter1: Vec<T>, iter2: Vec<U>) -> Vec<(T, U)> {
     iter1.into_iter().zip(iter2.into_iter()).collect()
 }
 
-/// Python range() function - generates sequence of numbers
-pub fn range(stop: i64) -> Vec<i64> {
-    (0..stop).collect()
+/// Python's range object: LAZY, like Python's — `for i in range(10**9)`
+/// iterates in O(1) memory where the old Vec materialization allocated
+/// gigabytes. Iterating yields i64s; len/contains follow Python range
+/// semantics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PyRange {
+    next: i64,
+    stop: i64,
+    step: i64,
 }
 
-pub fn range_start_stop(start: i64, stop: i64) -> Vec<i64> {
-    (start..stop).collect()
+impl Iterator for PyRange {
+    type Item = i64;
+    fn next(&mut self) -> Option<i64> {
+        let more = if self.step > 0 {
+            self.next < self.stop
+        } else {
+            self.next > self.stop
+        };
+        if !more {
+            return None;
+        }
+        let v = self.next;
+        // Saturating: the value AFTER the final element may not be
+        // representable (e.g. range up to i64::MAX); saturation still
+        // terminates the loop correctly.
+        self.next = self.next.saturating_add(self.step);
+        Some(v)
+    }
 }
 
-pub fn range_start_stop_step(start: i64, stop: i64, step: i64) -> Vec<i64> {
+impl PyRange {
+    /// Python len(range(...)): the number of elements remaining. Computed
+    /// in i128 so extreme endpoints and steps (spans near i64::MAX,
+    /// step == i64::MIN) can never overflow.
+    pub fn py_len(&self) -> usize {
+        let (span, step) = if self.step > 0 {
+            (
+                self.stop as i128 - self.next as i128,
+                self.step as i128,
+            )
+        } else {
+            (
+                self.next as i128 - self.stop as i128,
+                -(self.step as i128),
+            )
+        };
+        if span <= 0 {
+            0
+        } else {
+            ((span - 1) / step + 1) as usize
+        }
+    }
+
+    /// Python `x in range(...)`: O(1) membership (i128 keeps the
+    /// difference overflow-free for extreme endpoints).
+    pub fn py_contains(&self, value: &i64) -> bool {
+        let v = *value;
+        let in_span = if self.step > 0 {
+            v >= self.next && v < self.stop
+        } else {
+            v <= self.next && v > self.stop
+        };
+        in_span && (v as i128 - self.next as i128) % (self.step as i128) == 0
+    }
+}
+
+impl Len for PyRange {
+    fn len(&self) -> usize {
+        self.py_len()
+    }
+}
+
+/// Python range() function - a lazy range of numbers.
+pub fn range(stop: i64) -> PyRange {
+    PyRange { next: 0, stop, step: 1 }
+}
+
+pub fn range_start_stop(start: i64, stop: i64) -> PyRange {
+    PyRange { next: start, stop, step: 1 }
+}
+
+/// range(start, stop, step): a zero step raises ValueError, as in Python.
+pub fn range_start_stop_step(start: i64, stop: i64, step: i64) -> Result<PyRange, PyException> {
     if step == 0 {
-        panic!("range() step argument must not be zero");
+        return Err(PyException::new("ValueError", "range() arg 3 must not be zero"));
     }
-    let mut result = Vec::new();
-    let mut current = start;
-    
-    if step > 0 {
-        while current < stop {
-            result.push(current);
-            current += step;
-        }
-    } else {
-        while current > stop {
-            result.push(current);
-            current += step;
-        }
-    }
-    result
+    Ok(PyRange { next: start, stop, step })
 }
 
 // ============================================================================
@@ -2643,13 +2711,6 @@ pub use subprocess::{
     check_output_py, check_output_wrapper,
 };
 
-/// Placeholder for ensure_venv_ready function (from pyperformance or similar)
-/// This is not a standard Python built-in, so we provide a stub that returns dummy values
-pub fn ensure_venv_ready<K: AsRef<str>>(kind: K) -> (String, String) {
-    // In a real implementation, this would set up a virtual environment
-    // For now, return placeholder values
-    (format!("/tmp/venv_{}", kind.as_ref()), "python".to_string())
-}
 
 /// Python special variables
 pub const __file__: &str = "script.py";
@@ -2862,34 +2923,16 @@ pub fn format_string<T: AsRef<str>>(template: T, args: &[&dyn Display]) -> Strin
 }
 
 /// Helper for range() function with optional parameters - more flexible than the basic range
-pub fn range_flexible(start: i64, stop: Option<i64>, step: Option<i64>) -> Vec<i64> {
-    let (actual_start, actual_stop, actual_step) = match (stop, step) {
+pub fn range_flexible(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<PyRange, PyException> {
+    let (start, stop, step) = match (stop, step) {
         (None, None) => (0, start, 1),
         (Some(stop), None) => (start, stop, 1),
         (Some(stop), Some(step)) => (start, stop, step),
-        (None, Some(_)) => panic!("range() missing required argument 'stop'"),
+        (None, Some(_)) => {
+            return Err(type_error("range() missing required argument 'stop'"));
+        }
     };
-    
-    if actual_step == 0 {
-        panic!("range() step argument must not be zero");
-    }
-    
-    let mut result = Vec::new();
-    let mut current = actual_start;
-    
-    if actual_step > 0 {
-        while current < actual_stop {
-            result.push(current);
-            current += actual_step;
-        }
-    } else {
-        while current > actual_stop {
-            result.push(current);
-            current += actual_step;
-        }
-    }
-    
-    result
+    range_start_stop_step(start, stop, step)
 }
 
 /// Helper for enumerate() function with slice input - returns pairs of (index, reference)
@@ -2911,7 +2954,7 @@ where
     let step = step.unwrap_or(1);
 
     if step == 0 {
-        panic!("slice step cannot be zero");
+        panic!("{}", PyException::new("ValueError", "slice step cannot be zero"));
     }
 
     // Resolve an index the way Python does: negative values count from the
@@ -3099,9 +3142,18 @@ mod tests {
     #[test]
     fn test_compiler_helpers() {
         // Test range function
-        assert_eq!(range_flexible(3, None, None), vec![0, 1, 2]);
-        assert_eq!(range_flexible(1, Some(4), None), vec![1, 2, 3]);
-        assert_eq!(range_flexible(0, Some(10), Some(2)), vec![0, 2, 4, 6, 8]);
+        assert_eq!(
+            range_flexible(3, None, None).unwrap().collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            range_flexible(1, Some(4), None).unwrap().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            range_flexible(0, Some(10), Some(2)).unwrap().collect::<Vec<_>>(),
+            vec![0, 2, 4, 6, 8]
+        );
         
         // Test enumerate
         let items = vec!["a", "b", "c"];

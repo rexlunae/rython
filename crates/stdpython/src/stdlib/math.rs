@@ -506,16 +506,26 @@ python_function! {
     [signature: (x)]
     [concrete_types: (f64) -> (f64, i32)]
     {
-        let val = x.into();
-        if val == 0.0 {
+        let mut val = x.into();
+        // Python: frexp(0.0) == (0.0, 0); inf/nan pass through with e == 0.
+        if val == 0.0 || !val.is_finite() {
             return (val, 0);
         }
-        
+
+        // Subnormals have a zero exponent field and an implicit leading 0
+        // bit — the normalized-number bit trick misreads them. Scale into
+        // the normal range first and compensate in the exponent.
+        let mut adjust = 0i32;
+        if (val.to_bits() >> 52) & 0x7ff == 0 {
+            val *= (2.0f64).powi(64);
+            adjust = -64;
+        }
+
         let bits = val.to_bits();
-        let exponent = ((bits >> 52) & 0x7ff) as i32 - 1023;
+        let exponent = ((bits >> 52) & 0x7ff) as i32 - 1022 + adjust;
         let mantissa = f64::from_bits((bits & 0x800fffffffffffff) | 0x3fe0000000000000);
-        
-        (mantissa, exponent + 1)
+
+        (mantissa, exponent)
     }
 }
 

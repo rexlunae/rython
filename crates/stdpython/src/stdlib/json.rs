@@ -210,7 +210,13 @@ impl JSONEncoder {
             JSONValue::Int(n) => format!("{}", n),
             JSONValue::Float(n) => {
                 if !self.allow_nan && (n.is_nan() || n.is_infinite()) {
-                    panic!("NaN and Infinity not allowed");
+                    panic!(
+                        "{}",
+                        crate::PyException::new(
+                            "ValueError",
+                            "Out of range float values are not JSON compliant"
+                        )
+                    );
                 }
                 format_json_float(*n)
             },
@@ -248,7 +254,13 @@ impl JSONEncoder {
             JSONValue::Int(n) => format!("{}", n),
             JSONValue::Float(n) => {
                 if !self.allow_nan && (n.is_nan() || n.is_infinite()) {
-                    panic!("NaN and Infinity not allowed");
+                    panic!(
+                        "{}",
+                        crate::PyException::new(
+                            "ValueError",
+                            "Out of range float values are not JSON compliant"
+                        )
+                    );
                 }
                 format_json_float(*n)
             },

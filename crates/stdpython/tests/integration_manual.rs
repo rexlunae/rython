@@ -83,15 +83,15 @@ fn test_simulated_compiled_python_iteration() {
     assert_eq!(zipped, vec![(1, "a"), (2, "b"), (3, "c")]);
     
     // Simulate: list(range(5)) in Python
-    let range_result = range(5);
+    let range_result: Vec<i64> = range(5).collect();
     assert_eq!(range_result, vec![0, 1, 2, 3, 4]);
     
     // Simulate: list(range(2, 8)) in Python
-    let range_result = range_start_stop(2, 8);
+    let range_result: Vec<i64> = range_start_stop(2, 8).collect();
     assert_eq!(range_result, vec![2, 3, 4, 5, 6, 7]);
 
     // Simulate: list(range(0, 10, 2)) in Python
-    let range_result = range_start_stop_step(0, 10, 2);
+    let range_result: Vec<i64> = range_start_stop_step(0, 10, 2).unwrap().collect();
     assert_eq!(range_result, vec![0, 2, 4, 6, 8]);
 }
 
