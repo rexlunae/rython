@@ -159,6 +159,22 @@ pub(crate) enum SpecLowering {
     },
 }
 
+/// The lowering for a field that carries a `!r`/`!a` conversion: the
+/// translated spec's fill/align/width/precision apply to the debug
+/// rendering (Rust `{:>10?}`), matching Python's repr-then-format order.
+/// Numeric presentation types cannot combine with a conversion — Python
+/// applies them to the repr STRING and raises — so those stay loud.
+pub(crate) fn conversion_lowering(spec: &str) -> Result<SpecLowering, String> {
+    match translate_format_spec(spec)? {
+        SpecLowering::Inline(suffix) => Ok(SpecLowering::Inline(format!("{}?", suffix))),
+        _ => Err(
+            "numeric presentation types cannot combine with !r/!a (Python applies \
+             the spec to the repr string and raises)"
+                .into(),
+        ),
+    }
+}
+
 /// Translate a Python format spec (the text after `:`) into a lowering
 /// producing IDENTICAL output, or a descriptive error when Rust's
 /// formatter cannot reproduce it.

@@ -185,58 +185,65 @@ impl FormattedValue {
         value: TokenStream,
     ) -> Result<(String, TokenStream), Box<dyn std::error::Error>> {
         // Python conversion codes are the ASCII values of 's', 'r', 'a'.
-        if matches!(self.conversion, Some(114) | Some(97)) {
-            return Ok(("{:?}".to_string(), value));
-        }
+        let is_repr = matches!(self.conversion, Some(114) | Some(97));
 
-        match &self.format_spec {
-            None => Ok(("{}".to_string(), value)),
+        let spec_text = match &self.format_spec {
+            None => String::new(),
             Some(spec) => match static_spec_text(spec) {
-                None => Err(
-                    "f-string format specs that interpolate other values (e.g. \
-                     f\"{x:{width}}\") are not supported yet"
-                        .to_string()
-                        .into(),
-                ),
-                Some(spec_text) => {
-                    use crate::pyformat::SpecLowering;
-                    match crate::pyformat::translate_format_spec(spec_text.trim())
-                        .map_err(|e| format!("f-string: {}", e))?
-                    {
-                        SpecLowering::Inline(suffix) => Ok((
-                            if suffix.is_empty() {
-                                "{}".to_string()
-                            } else {
-                                format!("{{:{}}}", suffix)
-                            },
-                            value,
-                        )),
-                        SpecLowering::CastF64(suffix) => Ok((
-                            if suffix.is_empty() {
-                                "{}".to_string()
-                            } else {
-                                format!("{{:{}}}", suffix)
-                            },
-                            quote!(((#value) as f64)),
-                        )),
-                        SpecLowering::IntRadix {
-                            fill,
-                            align,
-                            plus,
-                            alternate,
-                            zero,
-                            width,
-                            radix,
-                        } => Ok((
-                            "{}".to_string(),
-                            quote!(py_int_radix_format(
-                                #value, #fill, #align, #plus, #alternate, #zero, #width,
-                                #radix,
-                            )),
-                        )),
-                    }
+                None => {
+                    return Err(
+                        "f-string format specs that interpolate other values (e.g. \
+                         f\"{x:{width}}\") are not supported yet"
+                            .to_string()
+                            .into(),
+                    );
                 }
+                Some(text) => text.trim().to_string(),
             },
+        };
+
+        use crate::pyformat::SpecLowering;
+        let lowering = if is_repr {
+            // The spec applies to the debug rendering, so f"{x!r:>10}"
+            // pads the repr like Python.
+            crate::pyformat::conversion_lowering(&spec_text)
+                .map_err(|e| format!("f-string: {}", e))?
+        } else {
+            crate::pyformat::translate_format_spec(&spec_text)
+                .map_err(|e| format!("f-string: {}", e))?
+        };
+        match lowering {
+            SpecLowering::Inline(suffix) => Ok((
+                if suffix.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{:{}}}", suffix)
+                },
+                value,
+            )),
+            SpecLowering::CastF64(suffix) => Ok((
+                if suffix.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{:{}}}", suffix)
+                },
+                quote!(((#value) as f64)),
+            )),
+            SpecLowering::IntRadix {
+                fill,
+                align,
+                plus,
+                alternate,
+                zero,
+                width,
+                radix,
+            } => Ok((
+                "{}".to_string(),
+                quote!(py_int_radix_format(
+                    #value, #fill, #align, #plus, #alternate, #zero, #width,
+                    #radix,
+                )),
+            )),
         }
     }
 }

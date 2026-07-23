@@ -635,7 +635,8 @@ fn lower_str_format(
                     );
                 }
                 let lowering = if matches!(conversion, Some('r') | Some('a')) {
-                    crate::pyformat::SpecLowering::Inline("?".to_string())
+                    crate::pyformat::conversion_lowering(spec)
+                        .map_err(|e| format!("str.format: {}", e))?
                 } else {
                     translate_format_spec(spec).map_err(|e| format!("str.format: {}", e))?
                 };

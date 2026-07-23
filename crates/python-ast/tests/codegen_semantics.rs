@@ -1624,3 +1624,26 @@ fn fstring_specs_translate_or_error_loudly() {
     );
     assert!(err.contains("presentation type"), "error: {}", err);
 }
+
+#[test]
+fn repr_conversion_keeps_its_format_spec() {
+    // "{0!r:>10}" pads the repr — the spec must not be dropped.
+    let out = compile(
+        "def f(n: int) -> str:\n    return \"{0!r:>10}\".format(n)\n",
+        "reprspec.py",
+    );
+    assert!(out.contains(":>10?}"), "generated: {}", out);
+
+    let out = compile(
+        "def f(n: int) -> str:\n    return f\"{n!r:>10}\"\n",
+        "freprspec.py",
+    );
+    assert!(out.contains(":>10?}"), "generated: {}", out);
+
+    // Numeric presentation types on a repr are Python errors; loud here.
+    let err = compile_err(
+        "def f(n: int) -> str:\n    return \"{0!r:.2f}\".format(n)\n",
+        "reprbad.py",
+    );
+    assert!(err.contains("cannot combine"), "error: {}", err);
+}
