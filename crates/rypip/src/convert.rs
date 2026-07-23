@@ -24,20 +24,38 @@ use crate::package::{PyModule, PyPackage};
 /// notes to warn about lossy conversions (e.g. dropped parameter defaults) —
 /// internal call sites are the faithfully-transpiled Python, while external
 /// consumers still get the warning at their call sites.
-const GENERATED_ALLOWS: &str = "#![allow(unused_imports, unused_variables, unused_mut, unused_assignments, dead_code, unreachable_code, non_snake_case, deprecated, noop_method_call)]\n";
+/// Rustc lints the generated code interacts with. Most surface genuine
+/// weaknesses in the source Python — unused imports and variables, dead and
+/// unreachable code, dead stores (a None seed that is never read),
+/// non-snake-case names, calls to lossily-converted (#[deprecated])
+/// functions — so they are NOT suppressed by default: surfacing them is
+/// part of the point of the tooling. The generated crate's lint posture
+/// follows the warning mode: warn leaves rustc's default (warnings at
+/// build time), deny promotes them to hard errors, allow suppresses them.
+const GENERATED_LINTS: &str = "unused_imports, unused_variables, unused_mut, unused_assignments, dead_code, unreachable_code, non_snake_case, deprecated, noop_method_call";
+
+fn generated_lint_attrs(mode: WarningMode) -> String {
+    match mode {
+        WarningMode::Warn => String::new(),
+        WarningMode::Deny => format!("#![deny({})]\n", GENERATED_LINTS),
+        WarningMode::Allow => format!("#![allow({})]\n", GENERATED_LINTS),
+    }
+}
 
 /// How lossy-conversion warnings are treated during conversion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WarningMode {
-    /// Report warnings and bake #[deprecated] notes into the generated code
-    /// (the default).
+    /// Report warnings and bake #[deprecated] notes into the generated
+    /// code; the generated crate keeps rustc's default lint warnings, which
+    /// surface source-Python weaknesses at build time (the default).
     #[default]
     Warn,
     /// Promote warnings to errors: fail the conversion if any conversion is
-    /// lossy.
+    /// lossy, and deny the surfaced lints in the generated crate so its
+    /// build fails on them.
     Deny,
     /// Suppress warnings entirely — nothing reported, no #[deprecated]
-    /// notes in the generated code.
+    /// notes, and the surfaced lints are allowed in the generated crate.
     Allow,
 }
 
@@ -132,7 +150,11 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         }
         let is_root = module.path.is_empty();
         let decls = mod_decls(&children, &module.path, module.is_init || is_root);
-        let allows = if is_root { GENERATED_ALLOWS } else { "" };
+        let allows = if is_root {
+            generated_lint_attrs(opts.warnings)
+        } else {
+            String::new()
+        };
         let contents = format!("{}{}\n{}", allows, code, decls);
         let file = module_file_path(&src_dir, module);
         if let Some(parent) = file.parent() {
@@ -146,7 +168,10 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
     let lib_rs = src_dir.join("lib.rs");
     if !lib_rs.exists() {
         let decls = mod_decls(&children, &[], true);
-        fs::write(&lib_rs, format_rust(&format!("{}{}", GENERATED_ALLOWS, decls)))?;
+        fs::write(
+            &lib_rs,
+            format_rust(&format!("{}{}", generated_lint_attrs(opts.warnings), decls)),
+        )?;
     }
 
     // PyO3 bindings.
@@ -182,7 +207,12 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         } else {
             mod_decls(&children, &[], true).replace("pub mod", "mod")
         };
-        let main_contents = format!("{}{}\n{}", GENERATED_ALLOWS, code, decls);
+        let main_contents = format!(
+            "{}{}\n{}",
+            generated_lint_attrs(opts.warnings),
+            code,
+            decls
+        );
         fs::write(src_dir.join("main.rs"), format_rust(&main_contents))?;
         has_binary = true;
     }

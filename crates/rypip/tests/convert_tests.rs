@@ -32,6 +32,19 @@ impl Drop for Scratch {
     }
 }
 
+/// Build a generated crate. RUSTFLAGS is scrubbed: in the default warn mode
+/// generated crates intentionally surface rustc warnings about the source
+/// Python (unused variables, dead stores, ...), and these semantic tests
+/// must not fail when the outer test run sets -D warnings.
+fn build_generated(root: &Path) -> std::process::ExitStatus {
+    Command::new("cargo")
+        .arg("build")
+        .env_remove("RUSTFLAGS")
+        .current_dir(root)
+        .status()
+        .expect("running cargo build")
+}
+
 /// Lay out a small Python project: pyproject.toml plus a package with an
 /// __init__.py, a library module, and a __main__-style entry module.
 fn write_sample_package(root: &Path) {
@@ -261,6 +274,56 @@ fn allow_mode_suppresses_warnings() {
 }
 
 #[test]
+fn warning_mode_sets_generated_lint_posture() {
+    // The rustc lints that surface source-Python weaknesses (unused
+    // variables, dead stores, unreachable code, ...) follow the warning
+    // mode: warn leaves rustc's defaults so they show at build time, deny
+    // makes the generated crate fail on them, allow suppresses them.
+    use rypip::convert::WarningMode;
+    let scratch = Scratch::new("lints");
+    let file = scratch.path().join("clean.py");
+    fs::write(&file, "def f(n: int) -> int:\n    return n + 1\n").unwrap();
+
+    for (mode, tag) in [
+        (WarningMode::Warn, "warn"),
+        (WarningMode::Deny, "deny"),
+        (WarningMode::Allow, "allow"),
+    ] {
+        let out = scratch.path().join(format!("crate-{}", tag));
+        let pkg = rypip::discover(&file).expect("discover");
+        rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                warnings: mode,
+                ..Default::default()
+            },
+        )
+        .expect("convert");
+        // Inner lint attributes live at the crate root and apply
+        // crate-wide; module files carry none.
+        let root = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+        match mode {
+            WarningMode::Warn => assert!(
+                !root.contains("#![allow(") && !root.contains("#![deny("),
+                "warn mode must leave rustc's default lint posture: {}",
+                root
+            ),
+            WarningMode::Deny => assert!(
+                root.contains("#![deny(") && root.contains("unreachable_code"),
+                "deny mode must deny the surfaced lints: {}",
+                root
+            ),
+            WarningMode::Allow => assert!(
+                root.contains("#![allow(") && root.contains("unreachable_code"),
+                "allow mode must suppress the surfaced lints: {}",
+                root
+            ),
+        }
+    }
+}
+
+#[test]
 fn converted_crate_compiles_and_binary_runs() {
     let scratch = Scratch::new("compile");
     write_sample_package(scratch.path());
@@ -269,11 +332,7 @@ fn converted_crate_compiles_and_binary_runs() {
     let pkg = rypip::discover(scratch.path()).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
 
-    let status = Command::new("cargo")
-        .arg("build")
-        .current_dir(&krate.root)
-        .status()
-        .expect("running cargo build");
+    let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
 
     // The installed-binary path: run the built binary and check its output.
@@ -444,11 +503,7 @@ fn exceptions_propagate_across_functions_at_runtime() {
     let pkg = rypip::discover(&file).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
 
-    let status = Command::new("cargo")
-        .arg("build")
-        .current_dir(&krate.root)
-        .status()
-        .expect("running cargo build");
+    let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
 
     let output = Command::new(krate.root.join("target/debug/app"))
@@ -513,11 +568,7 @@ fn dict_methods_match_python_at_runtime() {
 
     let pkg = rypip::discover(&file).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
-    let status = Command::new("cargo")
-        .arg("build")
-        .current_dir(&krate.root)
-        .status()
-        .expect("running cargo build");
+    let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
 
     let output = Command::new(krate.root.join("target/debug/dicts"))
@@ -584,11 +635,7 @@ fn optional_from_dict_get_matches_python_at_runtime() {
 
     let pkg = rypip::discover(&file).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
-    let status = Command::new("cargo")
-        .arg("build")
-        .current_dir(&krate.root)
-        .status()
-        .expect("running cargo build");
+    let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
 
     let output = Command::new(krate.root.join("target/debug/optget"))
@@ -633,11 +680,7 @@ fn keyword_arguments_and_defaults_match_python_at_runtime() {
 
     let pkg = rypip::discover(&file).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
-    let status = Command::new("cargo")
-        .arg("build")
-        .current_dir(&krate.root)
-        .status()
-        .expect("running cargo build");
+    let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
 
     let output = Command::new(krate.root.join("target/debug/kw"))
@@ -674,6 +717,7 @@ fn pyo3_crate_compiles() {
     // signature mismatches — type-check the bindings for real.
     let status = Command::new("cargo")
         .args(["check", "--features", "python"])
+        .env_remove("RUSTFLAGS")
         .current_dir(&krate.root)
         .status()
         .expect("running cargo check");
@@ -706,11 +750,7 @@ fn nested_subscript_stores_mutate_in_place_at_runtime() {
 
     let pkg = rypip::discover(&file).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
-    let status = Command::new("cargo")
-        .arg("build")
-        .current_dir(&krate.root)
-        .status()
-        .expect("running cargo build");
+    let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
 
     let output = Command::new(krate.root.join("target/debug/grid"))
