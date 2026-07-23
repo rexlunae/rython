@@ -1325,3 +1325,115 @@ mod time_module {
         stdpython::time::sleep(-1.0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// itertools gaps: accumulate initial=, product repeat=, pairwise,
+// zip_longest, groupby, starmap, combinations_with_replacement (issue #19)
+// All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod itertools_gaps {
+    use stdpython::itertools::*;
+
+    #[test]
+    fn accumulate_variants_match_python() {
+        assert_eq!(accumulate_sum(&[1i64, 2, 3, 4]), vec![1, 3, 6, 10]);
+        assert_eq!(accumulate_sum_initial(&[1i64, 2, 3], 100), vec![100, 101, 103, 106]);
+        assert_eq!(
+            accumulate_func(&[1i64, 2, 3, 4], |a, b| a * b),
+            vec![1, 2, 6, 24]
+        );
+        assert_eq!(
+            accumulate_func_initial(&[2i64, 3], |a, b| a * b, 10),
+            vec![10, 20, 60]
+        );
+        // initial= leads the output even when the iterable is empty.
+        assert_eq!(accumulate_sum_initial(&Vec::<i64>::new(), 5), vec![5]);
+        assert_eq!(accumulate_sum(&Vec::<i64>::new()), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn product_orders_match_python() {
+        assert_eq!(
+            product2(&[1i64, 2], &["a", "b"]),
+            vec![(1, "a"), (1, "b"), (2, "a"), (2, "b")]
+        );
+        assert_eq!(
+            product_repeat2(&[0i64, 1]),
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
+        assert_eq!(product3(&[1i64], &[2i64], &[3i64, 4]), vec![(1, 2, 3), (1, 2, 4)]);
+        assert_eq!(product_repeat3(&[0i64, 1]).len(), 8);
+        assert_eq!(product2(&Vec::<i64>::new(), &[1i64]), Vec::<(i64, i64)>::new());
+    }
+
+    #[test]
+    fn combinations_with_replacement_matches_python() {
+        assert_eq!(
+            combinations_with_replacement(&[1i64, 2, 3], 2),
+            vec![
+                vec![1, 1],
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 2],
+                vec![2, 3],
+                vec![3, 3]
+            ]
+        );
+        assert_eq!(combinations_with_replacement(&[1i64], 0), vec![Vec::<i64>::new()]);
+        assert_eq!(
+            combinations_with_replacement(&Vec::<i64>::new(), 2),
+            Vec::<Vec<i64>>::new()
+        );
+    }
+
+    #[test]
+    fn pairwise_and_zip_longest_match_python() {
+        assert_eq!(pairwise(&[1i64, 2, 3, 4]), vec![(1, 2), (2, 3), (3, 4)]);
+        assert_eq!(pairwise(&[1i64]), Vec::<(i64, i64)>::new());
+        assert_eq!(
+            zip_longest(&[1i64, 2, 3], &["a"]),
+            vec![
+                (Some(1), Some("a")),
+                (Some(2), None),
+                (Some(3), None)
+            ]
+        );
+        assert_eq!(
+            zip_longest_fill(&[1i64], &[10i64, 20, 30], 0),
+            vec![(1, 10), (0, 20), (0, 30)]
+        );
+        assert_eq!(
+            zip_longest(&Vec::<i64>::new(), &Vec::<i64>::new()),
+            Vec::<(Option<i64>, Option<i64>)>::new()
+        );
+    }
+
+    #[test]
+    fn groupby_groups_consecutive_runs_like_python() {
+        // python3: [1,1,2,2,2,1] yields THREE groups — non-adjacent equal
+        // elements do not merge.
+        assert_eq!(
+            groupby(&[1i64, 1, 2, 2, 2, 1]),
+            vec![(1, vec![1, 1]), (2, vec![2, 2, 2]), (1, vec![1])]
+        );
+        let words = ["ab".to_string(), "ac".to_string(), "b".to_string()];
+        let grouped = groupby_key(&words, |w| w.chars().next().unwrap());
+        assert_eq!(
+            grouped,
+            vec![
+                ('a', vec!["ab".to_string(), "ac".to_string()]),
+                ('b', vec!["b".to_string()])
+            ]
+        );
+    }
+
+    #[test]
+    fn starmap_splats_tuples_of_two_and_three() {
+        assert_eq!(starmap(|a: i64, b: i64| a * b, &[(2, 3), (4, 5)]), vec![6, 20]);
+        assert_eq!(
+            starmap(|a: i64, b: i64, c: i64| a + b + c, &[(1, 2, 3)]),
+            vec![6]
+        );
+    }
+}

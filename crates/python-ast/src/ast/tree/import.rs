@@ -253,6 +253,39 @@ impl CodeGen for ImportFrom {
                 }
             };
             tokens.extend(import);
+
+            // Some runtime functions split into arity/keyword-specific
+            // variants (accumulate with initial=, product with repeat=,
+            // ...); importing the Python name brings its variants along so
+            // the call lowering can pick one. allow(unused_imports): which
+            // variant is used depends on the call sites, and unused ones
+            // are harness plumbing, not source-Python weaknesses.
+            if self.module == "itertools" {
+                let variants: &[&str] = match alias.name.as_str() {
+                    "accumulate" => &[
+                        "accumulate_sum",
+                        "accumulate_func",
+                        "accumulate_sum_initial",
+                        "accumulate_func_initial",
+                    ],
+                    "product" => &[
+                        "product2",
+                        "product3",
+                        "product_repeat2",
+                        "product_repeat3",
+                    ],
+                    "zip_longest" => &["zip_longest_fill"],
+                    "groupby" => &["groupby_key"],
+                    _ => &[],
+                };
+                for variant in variants {
+                    let v = crate::safe_ident(variant);
+                    tokens.extend(quote! {
+                        #[allow(unused_imports)]
+                        use #root #(::#module_path)*::#v;
+                    });
+                }
+            }
         }
         Ok(tokens)
     }

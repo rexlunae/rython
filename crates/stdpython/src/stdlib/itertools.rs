@@ -709,10 +709,231 @@ where
     result
 }
 
+/// accumulate with only the default operator (running sums). A separate
+/// entry point so codegen never has to name an uninferable Option<F>.
+pub fn accumulate_sum<T>(iterable: &[T]) -> Vec<T>
+where
+    T: Clone + core::ops::Add<Output = T>,
+{
+    let mut result: Vec<T> = Vec::with_capacity(iterable.len());
+    for x in iterable {
+        match result.last() {
+            Some(prev) => {
+                let next = prev.clone() + x.clone();
+                result.push(next);
+            }
+            None => result.push(x.clone()),
+        }
+    }
+    result
+}
+
+/// accumulate(iterable, func)
+pub fn accumulate_func<T, F>(iterable: &[T], mut func: F) -> Vec<T>
+where
+    T: Clone,
+    F: FnMut(T, T) -> T,
+{
+    let mut result: Vec<T> = Vec::with_capacity(iterable.len());
+    for x in iterable {
+        match result.last() {
+            Some(prev) => {
+                let next = func(prev.clone(), x.clone());
+                result.push(next);
+            }
+            None => result.push(x.clone()),
+        }
+    }
+    result
+}
+
+/// accumulate(iterable, initial=v): the initial value leads the output,
+/// so an empty iterable still yields [initial].
+pub fn accumulate_sum_initial<T>(iterable: &[T], initial: T) -> Vec<T>
+where
+    T: Clone + core::ops::Add<Output = T>,
+{
+    let mut result = vec![initial];
+    for x in iterable {
+        let next = result.last().unwrap().clone() + x.clone();
+        result.push(next);
+    }
+    result
+}
+
+/// accumulate(iterable, func, initial=v)
+pub fn accumulate_func_initial<T, F>(iterable: &[T], mut func: F, initial: T) -> Vec<T>
+where
+    T: Clone,
+    F: FnMut(T, T) -> T,
+{
+    let mut result = vec![initial];
+    for x in iterable {
+        let next = func(result.last().unwrap().clone(), x.clone());
+        result.push(next);
+    }
+    result
+}
+
+/// product(a, b): typed pairs, so heterogeneous element types work.
+pub fn product2<A: Clone, B: Clone>(a: &[A], b: &[B]) -> Vec<(A, B)> {
+    let mut out = Vec::with_capacity(a.len() * b.len());
+    for x in a {
+        for y in b {
+            out.push((x.clone(), y.clone()));
+        }
+    }
+    out
+}
+
+/// product(a, b, c)
+pub fn product3<A: Clone, B: Clone, C: Clone>(a: &[A], b: &[B], c: &[C]) -> Vec<(A, B, C)> {
+    let mut out = Vec::with_capacity(a.len() * b.len() * c.len());
+    for x in a {
+        for y in b {
+            for z in c {
+                out.push((x.clone(), y.clone(), z.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// product(iterable, repeat=2)
+pub fn product_repeat2<T: Clone>(iterable: &[T]) -> Vec<(T, T)> {
+    product2(iterable, iterable)
+}
+
+/// product(iterable, repeat=3)
+pub fn product_repeat3<T: Clone>(iterable: &[T]) -> Vec<(T, T, T)> {
+    product3(iterable, iterable, iterable)
+}
+
+/// combinations_with_replacement(iterable, r) — same Vec-of-Vec shape as
+/// combinations(), in the same lexicographic-by-index order as Python.
+pub fn combinations_with_replacement<T: Clone>(iterable: &[T], r: usize) -> Vec<Vec<T>> {
+    let n = iterable.len();
+    let mut result = Vec::new();
+    if r == 0 {
+        result.push(Vec::new());
+        return result;
+    }
+    if n == 0 {
+        return result;
+    }
+    // indices are non-decreasing; advance like CPython's implementation.
+    let mut indices = vec![0usize; r];
+    loop {
+        result.push(indices.iter().map(|&i| iterable[i].clone()).collect());
+        // Find the rightmost index that can still grow.
+        let mut i = r;
+        loop {
+            if i == 0 {
+                return result;
+            }
+            i -= 1;
+            if indices[i] != n - 1 {
+                break;
+            }
+        }
+        let next = indices[i] + 1;
+        for j in i..r {
+            indices[j] = next;
+        }
+    }
+}
+
+/// pairwise(iterable): consecutive overlapping pairs.
+pub fn pairwise<T: Clone>(iterable: &[T]) -> Vec<(T, T)> {
+    iterable
+        .windows(2)
+        .map(|w| (w[0].clone(), w[1].clone()))
+        .collect()
+}
+
+/// zip_longest(a, b): exhausted sides fill with None, which is exactly
+/// the Option in rython's None model.
+pub fn zip_longest<A: Clone, B: Clone>(a: &[A], b: &[B]) -> Vec<(Option<A>, Option<B>)> {
+    let len = a.len().max(b.len());
+    (0..len)
+        .map(|i| (a.get(i).cloned(), b.get(i).cloned()))
+        .collect()
+}
+
+/// zip_longest(a, b, fillvalue=v)
+pub fn zip_longest_fill<T: Clone>(a: &[T], b: &[T], fill: T) -> Vec<(T, T)> {
+    let len = a.len().max(b.len());
+    (0..len)
+        .map(|i| {
+            (
+                a.get(i).cloned().unwrap_or_else(|| fill.clone()),
+                b.get(i).cloned().unwrap_or_else(|| fill.clone()),
+            )
+        })
+        .collect()
+}
+
+/// groupby(iterable): CONSECUTIVE runs of equal elements, like Python —
+/// [1,1,2,1] yields three groups, not two. Groups are materialized.
+pub fn groupby<T: Clone + PartialEq>(iterable: &[T]) -> Vec<(T, Vec<T>)> {
+    groupby_key(iterable, |x| x.clone())
+}
+
+/// groupby(iterable, key=f)
+pub fn groupby_key<T, K, F>(iterable: &[T], mut key: F) -> Vec<(K, Vec<T>)>
+where
+    T: Clone,
+    K: Clone + PartialEq,
+    F: FnMut(&T) -> K,
+{
+    let mut out: Vec<(K, Vec<T>)> = Vec::new();
+    for x in iterable {
+        let k = key(x);
+        match out.last_mut() {
+            Some((current, group)) if *current == k => group.push(x.clone()),
+            _ => out.push((k, vec![x.clone()])),
+        }
+    }
+    out
+}
+
+/// The tuple arities starmap() can splat into a function call.
+pub trait StarArgs<F> {
+    type Out;
+    fn star_call(self, f: &mut F) -> Self::Out;
+}
+
+impl<A, B, U, F: FnMut(A, B) -> U> StarArgs<F> for (A, B) {
+    type Out = U;
+    fn star_call(self, f: &mut F) -> U {
+        f(self.0, self.1)
+    }
+}
+
+impl<A, B, C, U, F: FnMut(A, B, C) -> U> StarArgs<F> for (A, B, C) {
+    type Out = U;
+    fn star_call(self, f: &mut F) -> U {
+        f(self.0, self.1, self.2)
+    }
+}
+
+/// starmap(f, iterable-of-tuples): each tuple splats into f's parameters,
+/// so `starmap(lambda a, b: a * b, pairs)` works for 2- and 3-tuples.
+pub fn starmap<T, F>(mut f: F, iterable: &[T]) -> Vec<T::Out>
+where
+    T: StarArgs<F> + Clone,
+{
+    iterable
+        .iter()
+        .cloned()
+        .map(|t| t.star_call(&mut f))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_count() {
         let mut counter = count(0, 2);
