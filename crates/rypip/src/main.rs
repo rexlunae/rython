@@ -40,6 +40,12 @@ enum Cmd {
         /// conversion), or allow (suppress them entirely).
         #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
         warnings: WarningMode,
+        /// Generate a #![no_std] library crate on stdpython's alloc tier
+        /// (no OS dependency, for embedded/wasm targets). Python constructs
+        /// that need the OS — print/input/open, os/datetime/random/...
+        /// imports, __main__ blocks — fail the conversion loudly.
+        #[arg(long)]
+        no_std: bool,
     },
     /// Convert and compile a Python package (release profile).
     Build {
@@ -79,6 +85,7 @@ fn main() -> Result<()> {
             pyo3,
             stdpython,
             warnings,
+            no_std,
         } => {
             let pkg = rypip::discover(&package)?;
             let krate = rypip::convert(
@@ -88,6 +95,7 @@ fn main() -> Result<()> {
                     pyo3,
                     stdpython_path: stdpython,
                     warnings,
+                    no_std,
                 },
             )?;
             report_warnings(&krate);
@@ -117,6 +125,7 @@ fn main() -> Result<()> {
                     pyo3: false,
                     stdpython_path: stdpython,
                     warnings,
+                    no_std: false,
                 },
             )?;
             report_warnings(&krate);
@@ -138,6 +147,7 @@ fn main() -> Result<()> {
                     pyo3: false,
                     stdpython_path: stdpython,
                     warnings,
+                    no_std: false,
                 },
             )?;
             report_warnings(&krate);

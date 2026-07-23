@@ -61,6 +61,26 @@ impl<'a> CodeGen for Call {
             _ => false,
         };
 
+        // The I/O builtins have no no_std lowering (stdpython gates them
+        // behind std): fail at conversion time with the reason, rather than
+        // let the generated crate fail with a bare unresolved-name error. A
+        // user definition of the same name shadows the builtin as usual.
+        if options.no_std {
+            if let ExprType::Name(n) = self.func.as_ref() {
+                if matches!(n.id.as_str(), "print" | "input" | "open")
+                    && symbols.get(&n.id).is_none()
+                {
+                    return Err(format!(
+                        "`{}()` requires OS I/O, which the no_std profile does not \
+                         provide; remove the call or convert without the no_std \
+                         profile",
+                        n.id
+                    )
+                    .into());
+                }
+            }
+        }
+
         // Multi-argument range() maps to the arity-specific runtime
         // functions (Rust has no overloading); the 3-argument form can
         // raise ValueError on a zero step, hence `?`. A user-defined

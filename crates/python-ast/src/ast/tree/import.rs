@@ -29,6 +29,39 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
     )
 }
 
+/// Runtime modules that only exist on stdpython's std tier: they touch the
+/// OS (or, for math, std's float intrinsics), so the no_std profile has
+/// nothing to lower them to. json/string/collections/itertools live on the
+/// alloc tier and stay importable.
+pub(crate) fn is_std_only_module(name: &str) -> bool {
+    matches!(
+        name,
+        "os" | "sys"
+            | "math"
+            | "random"
+            | "datetime"
+            | "glob"
+            | "pathlib"
+            | "tempfile"
+            | "subprocess"
+            | "sysconfig"
+            | "venv"
+    )
+}
+
+/// The conversion-time error for a std-tier import under the no_std
+/// profile. Failing here beats failing later with an unresolved-name error
+/// in the generated crate.
+fn std_only_import_error(module: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "`import {}` requires stdpython's std tier (it needs the OS), which the \
+         no_std profile does not provide; remove the import or convert without \
+         the no_std profile",
+        module
+    )
+    .into()
+}
+
 #[derive(Clone, Debug, FromPyObject, Serialize, Deserialize, PartialEq)]
 pub struct Alias {
     pub name: String,
@@ -68,6 +101,12 @@ impl CodeGen for Import {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
+            if options.no_std {
+                let root = alias.name.split('.').next().unwrap_or(&alias.name);
+                if is_std_only_module(root) {
+                    return Err(std_only_import_error(&alias.name));
+                }
+            }
             // Check if this is a Python standard library module that needs special handling
             let rust_import = match alias.name.as_str() {
                 // Python stdlib modules that don't have direct Rust equivalents
@@ -151,6 +190,13 @@ impl CodeGen for ImportFrom {
         // lowers to nothing.
         if self.module.split('.').next() == Some("typing") {
             return Ok(TokenStream::new());
+        }
+
+        if _options.no_std {
+            let root = self.module.split('.').next().unwrap_or(&self.module);
+            if is_std_only_module(root) {
+                return Err(std_only_import_error(&self.module));
+            }
         }
 
         // `from X import y` must bring `y` into scope; previously this

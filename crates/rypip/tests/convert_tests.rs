@@ -1116,3 +1116,126 @@ fn nested_subscript_stores_mutate_in_place_at_runtime() {
         "nested stores must mutate the real containers"
     );
 }
+
+/// cargo-check a generated crate (the no_std profile emits a library, so
+/// there is no binary to run). RUSTFLAGS is scrubbed for the same reason as
+/// build_generated.
+fn check_generated(root: &Path) -> std::process::ExitStatus {
+    Command::new("cargo")
+        .arg("check")
+        .env_remove("RUSTFLAGS")
+        .current_dir(root)
+        .status()
+        .expect("running cargo check")
+}
+
+#[test]
+fn no_std_profile_generates_a_nostd_crate_that_compiles() {
+    let scratch = Scratch::new("nostd");
+    let file = scratch.path().join("gauges.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Accumulator:\n",
+            "    def __init__(self, label: str):\n",
+            "        self.label = label\n",
+            "        self.total = 0\n",
+            "\n",
+            "    def add(self, n: int) -> int:\n",
+            "        self.total += n\n",
+            "        return self.total\n",
+            "\n",
+            "def describe(n: int) -> str:\n",
+            "    tags = [\"low\", \"high\"]\n",
+            "    tag = tags[0] if n < 10 else tags[1]\n",
+            "    return f\"{n}:{tag}\"\n",
+            "\n",
+            "def total_priced(prices: dict[int, int]) -> int:\n",
+            "    total = 0\n",
+            "    for key in [1, 2, 3]:\n",
+            "        total += prices.get(key, 0)\n",
+            "    return total\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            no_std: true,
+            ..Default::default()
+        },
+    )
+    .expect("no_std convert of an OS-free module");
+    assert!(!krate.has_binary, "no_std output is a library");
+
+    let root = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(root.contains("#![no_std]"), "lib.rs: {}", root);
+    let manifest = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains("default-features = false") && manifest.contains("\"alloc\""),
+        "Cargo.toml must pin stdpython to the alloc tier: {}",
+        manifest
+    );
+
+    // The proof: the generated crate compiles as a genuine #![no_std]
+    // library, where any std path would be an unresolved-name error.
+    let status = check_generated(&out);
+    assert!(status.success(), "generated no_std crate failed to compile");
+}
+
+#[test]
+fn no_std_profile_rejects_std_constructs_loudly() {
+    let scratch = Scratch::new("nostd-loud");
+    let cases: &[(&str, &str, &str)] = &[
+        ("uses_print.py", "print(\"hi\")\n", "no_std profile"),
+        ("uses_os.py", "import os\n", "std tier"),
+        (
+            "uses_datetime.py",
+            "from datetime import datetime\n",
+            "std tier",
+        ),
+        ("uses_math.py", "import math\n", "std tier"),
+        (
+            "has_entry.py",
+            "def main() -> int:\n    return 0\n\nif __name__ == \"__main__\":\n    main()\n",
+            "no_std profile",
+        ),
+    ];
+    for (name, src, needle) in cases {
+        let file = scratch.path().join(name);
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join(format!("crate-{}", name.replace('.', "-")));
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                no_std: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("std-tier construct must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(needle), "{}: {}", name, msg);
+    }
+
+    // PyO3 bindings need the Python runtime — contradictory with no_std.
+    let file = scratch.path().join("plain.py");
+    fs::write(&file, "def f(n: int) -> int:\n    return n\n").unwrap();
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &scratch.path().join("crate-pyo3"),
+        &ConvertOptions {
+            no_std: true,
+            pyo3: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("pyo3 + no_std must fail");
+    assert!(format!("{:#}", err).contains("PyO3"), "err: {:#}", err);
+}

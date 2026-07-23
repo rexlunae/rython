@@ -1752,3 +1752,81 @@ fn conditionally_reassigned_module_names_are_not_constants() {
     );
     assert!(!out.contains("pub static MODE"), "generated: {}", out);
 }
+
+// ---------------------------------------------------------------------------
+// no_std profile: OS-facing constructs fail at conversion time
+// ---------------------------------------------------------------------------
+
+fn compile_nostd(src: &str, name: &str) -> Result<String, String> {
+    let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed: {}", e));
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions {
+        no_std: true,
+        ..Default::default()
+    };
+    module
+        .to_rust(CodeGenContext::Module(name.replace(".py", "")), options, symbols)
+        .map(|tokens| tokens.to_string())
+        .map_err(|e| python_ast::format_error_chain(e.as_ref()))
+}
+
+#[test]
+fn nostd_modules_carry_an_alloc_prelude() {
+    // Under #![no_std] the prelude has no String/Vec/format!; every module
+    // brings the alloc surface generated code leans on into scope itself.
+    let out = compile_nostd("def f(n: int) -> str:\n    return f\"n={n}\"\n", "np.py")
+        .expect("OS-free module must convert");
+    assert!(out.contains("extern crate alloc"), "generated: {}", out);
+    assert!(out.contains("use alloc ::"), "generated: {}", out);
+
+    // The std profile stays exactly as before: no alloc plumbing.
+    let std_out = compile("def f(n: int) -> str:\n    return f\"n={n}\"\n", "sp.py");
+    assert!(!std_out.contains("extern crate alloc"), "generated: {}", std_out);
+}
+
+#[test]
+fn nostd_io_builtins_error_loudly() {
+    for src in ["print(\"hi\")\n", "x = input()\n", "f = open(\"a.txt\")\n"] {
+        let err = compile_nostd(src, "io.py").expect_err("I/O builtin must fail");
+        assert!(err.contains("no_std profile"), "{:?}: {}", src, err);
+    }
+
+    // A user definition shadows the builtin as usual and stays convertible.
+    let out = compile_nostd(
+        "def print(s: str) -> str:\n    return s\n\ndef f() -> str:\n    return print(\"x\")\n",
+        "shadow.py",
+    )
+    .expect("shadowed print is the user's own function");
+    assert!(out.contains("fn print"), "generated: {}", out);
+}
+
+#[test]
+fn nostd_std_tier_imports_error_loudly() {
+    for src in [
+        "import os\n",
+        "import sys\n",
+        "from datetime import datetime\n",
+        "import math\n",
+        "from os.path import join\n",
+    ] {
+        let err = compile_nostd(src, "imp.py").expect_err("std-tier import must fail");
+        assert!(err.contains("std tier"), "{:?}: {}", src, err);
+    }
+
+    // alloc-tier runtime modules stay importable.
+    for src in ["import json\n", "import collections\n", "import itertools\n"] {
+        compile_nostd(src, "ok.py").unwrap_or_else(|e| {
+            panic!("alloc-tier import must convert: {:?}: {}", src, e)
+        });
+    }
+}
+
+#[test]
+fn nostd_main_blocks_error_loudly() {
+    let err = compile_nostd(
+        "def main() -> int:\n    return 0\n\nif __name__ == \"__main__\":\n    main()\n",
+        "entry.py",
+    )
+    .expect_err("__main__ needs a process entry point");
+    assert!(err.contains("no_std profile"), "error: {}", err);
+}
