@@ -58,6 +58,9 @@ fn write_sample_package(root: &Path) {
             "def log_it(n: int) -> int:\n",
             "    print(n)\n",
             "\n",
+            "def shout(name: str) -> str:\n",
+            "    return name.upper()\n",
+            "\n",
             "def small(n: int) -> bool:\n",
             "    return n in {1, 2, 3}\n",
             "\n",
@@ -84,12 +87,14 @@ fn write_sample_package(root: &Path) {
         pkg.join("cli.py"),
         concat!(
             "from greeting import classify\n",
+            "from greeting import shout\n",
             "\n",
             "def run():\n",
             "    print(\"greetings\")\n",
             "    print(classify(-5))\n",
             "    print(classify(13))\n",
             "    print(classify(2))\n",
+            "    print(shout(\"world\"))\n",
             "\n",
             "if __name__ == \"__main__\":\n",
             "    run()\n",
@@ -282,9 +287,9 @@ fn converted_crate_compiles_and_binary_runs() {
     // path must each take the right handler at runtime.
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
-        &lines[1..4],
-        &["negative", "unlucky", "fine"],
-        "try/except runtime behavior diverged: {}",
+        &lines[1..5],
+        &["negative", "unlucky", "fine", "WORLD"],
+        "runtime behavior diverged: {}",
         stdout
     );
 }

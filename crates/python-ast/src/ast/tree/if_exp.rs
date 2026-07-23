@@ -55,7 +55,8 @@ impl CodeGen for IfExp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let test = self.test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let test =
+            crate::condition_to_rust(&self.test, ctx.clone(), options.clone(), symbols.clone())?;
         let body = self.body.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let orelse = self.orelse.to_rust(ctx, options, symbols)?;
         

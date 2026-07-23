@@ -117,10 +117,32 @@ impl CodeGen for FunctionDef {
             .chain(self.args.kwarg.iter().map(|p| p.arg.clone()))
             .collect();
         let scope = crate::analyze_scope(&self.body, &param_names);
+        // str parameters arrive as impl Into<String>; convert them to owned
+        // Strings up front so the body works with a concrete type.
+        let str_params: std::collections::HashSet<&str> = self
+            .args
+            .args
+            .iter()
+            .chain(self.args.posonlyargs.iter())
+            .chain(self.args.kwonlyargs.iter())
+            .filter(|p| {
+                matches!(
+                    p.annotation.as_deref(),
+                    Some(ExprType::Name(n)) if n.id == "str"
+                )
+            })
+            .map(|p| p.arg.as_str())
+            .collect();
         let mut streams_prologue = TokenStream::new();
         for name in &param_names {
-            if scope.needs_mut.contains(name) {
-                let ident = crate::safe_ident(name);
+            let ident = crate::safe_ident(name);
+            if str_params.contains(name.as_str()) {
+                if scope.needs_mut.contains(name) {
+                    streams_prologue.extend(quote!(let mut #ident: String = #ident.into();));
+                } else {
+                    streams_prologue.extend(quote!(let #ident: String = #ident.into();));
+                }
+            } else if scope.needs_mut.contains(name) {
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
             }
         }
@@ -305,7 +327,7 @@ fn collect_local_types(
 /// Whether an annotation expression means `None` (`-> None` marks a
 /// procedure): the parser may surface it as the NoneType variant, a
 /// valueless constant, or the bare name `None`.
-fn is_none_annotation(ann: &ExprType) -> bool {
+pub(crate) fn is_none_expr(ann: &ExprType) -> bool {
     match ann {
         ExprType::NoneType(_) => true,
         ExprType::Constant(c) => c.0.is_none(),
@@ -370,7 +392,7 @@ impl FunctionDef {
     pub fn resolved_return_type(&self) -> Option<TokenStream> {
         let annotated = if guarantees_return(&self.body) {
             self.returns.as_deref().and_then(|ann| {
-                if is_none_annotation(ann) {
+                if is_none_expr(ann) {
                     None
                 } else {
                     crate::python_annotation_to_rust_type(ann)
@@ -390,7 +412,7 @@ impl FunctionDef {
     /// so it must be surfaced, not silently reproduced.
     pub fn ignored_return_annotation(&self) -> Option<String> {
         let ann = self.returns.as_deref()?;
-        if is_none_annotation(ann) || guarantees_return(&self.body) {
+        if is_none_expr(ann) || guarantees_return(&self.body) {
             return None;
         }
         Some(annotation_display(ann))

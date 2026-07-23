@@ -61,10 +61,87 @@ impl<'a> CodeGen for Call {
             _ => false,
         };
 
+        // Python methods whose Rust inherent namesakes have DIFFERENT
+        // semantics (or the wrong shape) are rewritten here; methods with no
+        // Rust conflict resolve through the stdpython PyListOps/PyStrOps
+        // traits without any rewriting.
+        if let ExprType::Attribute(attr) = self.func.as_ref() {
+            let receiver = attr
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let mut rendered_args = Vec::new();
+            for arg in &self.args {
+                rendered_args.push(arg.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            match (attr.attr.as_str(), rendered_args.as_slice()) {
+                // list.append(x) pushes one element; Vec::append (inherent)
+                // concatenates another Vec — silently different.
+                ("append", [value]) => {
+                    return Ok(quote!((#receiver).push(#value)));
+                }
+                // list.count(x): the PyListOps method takes a reference.
+                ("count", [value]) => {
+                    return Ok(quote!((#receiver).count(&(#value))));
+                }
+                // list.pop() returns the last element or raises IndexError
+                // (Vec::pop returns an Option).
+                ("pop", []) => {
+                    return Ok(quote! {
+                        (#receiver).pop().ok_or_else(|| {
+                            PyException::new("IndexError", "pop from empty list")
+                        })?
+                    });
+                }
+                // list.remove(x) removes by VALUE and raises ValueError;
+                // Vec::remove removes by index — silently different.
+                ("remove", [value]) => {
+                    return Ok(quote! {
+                        {
+                            let __rython_pos = (#receiver)
+                                .iter()
+                                .position(|__rython_e| __rython_e == &(#value))
+                                .ok_or_else(|| {
+                                    PyException::new(
+                                        "ValueError",
+                                        "list.remove(x): x not in list",
+                                    )
+                                })?;
+                            (#receiver).remove(__rython_pos);
+                        }
+                    });
+                }
+                // list.insert follows Python index rules (negative counts
+                // from the end, out-of-range clamps); Vec::insert takes a
+                // usize and panics past len.
+                ("insert", [idx, value]) => {
+                    return Ok(quote!((#receiver).py_insert(#idx, #value)));
+                }
+                // str.split() with no argument splits on whitespace runs;
+                // str::split (inherent) returns an iterator, so both forms
+                // map to the PyStrOps versions returning Vec<String>.
+                ("split", []) => {
+                    return Ok(quote!((#receiver).py_split_whitespace()));
+                }
+                ("split", [sep]) => {
+                    return Ok(quote!((#receiver).py_split(&(#sep))));
+                }
+                // str.find returns -1 when absent; str::find an Option.
+                ("find", [needle]) => {
+                    return Ok(quote!((#receiver).py_find(&(#needle))));
+                }
+                _ => {}
+            }
+        }
+
         let name = self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        
+
         let mut all_args = Vec::new();
-        
+
         // Add positional arguments
         for arg in self.args {
             let rust_arg = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;

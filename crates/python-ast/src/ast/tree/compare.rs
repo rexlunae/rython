@@ -125,9 +125,44 @@ impl CodeGen for Compare {
 
         let mut index = 0;
         for op in ops.iter() {
-            let comparator = comparators
+            let comparator_ast = comparators
                 .get(index)
-                .ok_or("comparison has more operators than comparators")?
+                .ok_or("comparison has more operators than comparators")?;
+            // The operand AST feeding this comparison's left side: the
+            // original left for the first op, the previous comparator after.
+            let left_ast = if index == 0 {
+                self.left.as_ref()
+            } else {
+                &comparators[index - 1]
+            };
+            // `x is None` / `x is not None` test None-ness, not equality:
+            // Option values report is_none(), plain values are never None.
+            if matches!(op, Compares::Is | Compares::IsNot) {
+                let none_check = if crate::is_none_expr(comparator_ast) {
+                    Some(left_ast)
+                } else if crate::is_none_expr(left_ast) {
+                    Some(comparator_ast)
+                } else {
+                    None
+                };
+                if let Some(operand) = none_check {
+                    let operand_tokens = operand
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let tokens = match op {
+                        Compares::Is => quote!((#operand_tokens).py_is_none()),
+                        _ => quote!(!(#operand_tokens).py_is_none()),
+                    };
+                    index += 1;
+                    left = quote!(#operand_tokens);
+                    outer_ts.extend(tokens);
+                    if index < ops.len() {
+                        outer_ts.extend(quote!( && ));
+                    }
+                    continue;
+                }
+            }
+            let comparator = comparator_ast
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let tokens = match op {

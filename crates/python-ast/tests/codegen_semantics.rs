@@ -93,7 +93,11 @@ fn nested_block_assignment_stores_into_the_outer_variable() {
         "one declaration, plain stores elsewhere: {}",
         out
     );
-    assert!(out.contains("if c { x = 2"), "generated: {}", out);
+    assert!(
+        out.contains("if (c) . is_truthy () { x = 2"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -711,6 +715,100 @@ fn unary_plus_emits_no_invalid_operator() {
     let out = compile("y = +x", "uadd.py");
     assert!(!out.contains("= + x"), "generated: {}", out);
     assert!(out.contains("y = (x)"), "generated: {}", out);
+}
+
+#[test]
+fn conditions_apply_python_truthiness() {
+    // Non-bool condition: wrapped in is_truthy (empty string/list and zero
+    // are false, as in Python).
+    let out = compile("def f(items):\n    if items:\n        work()\n", "truthy.py");
+    assert!(out.contains("if (items) . is_truthy ()"), "generated: {}", out);
+
+    let out = compile("def f(n):\n    while n:\n        work()\n", "truthy_while.py");
+    assert!(out.contains("while (n) . is_truthy ()"), "generated: {}", out);
+
+    // Comparisons already yield bool: no wrapping.
+    let out = compile("def f(n: int):\n    if n < 0:\n        work()\n", "truthy_cmp.py");
+    assert!(!out.contains("is_truthy"), "generated: {}", out);
+
+    // Boolean operators recurse into operands; `not` negates a condition.
+    let out = compile("def f(a, b):\n    if a and not b:\n        work()\n", "truthy_bool.py");
+    assert!(
+        out.contains("((a) . is_truthy ()) && (! ((b) . is_truthy ()))"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn is_none_lowers_to_py_is_none() {
+    let out = compile("def f(x):\n    if x is None:\n        work()\n", "isnone.py");
+    assert!(out.contains("(x) . py_is_none ()"), "generated: {}", out);
+
+    let out = compile("def f(x):\n    if x is not None:\n        work()\n", "isnotnone.py");
+    assert!(out.contains("! (x) . py_is_none ()"), "generated: {}", out);
+
+    // `is` between two non-None values keeps the identity approximation.
+    let out = compile("found = a is b", "isplain.py");
+    assert!(out.contains("& a == & b"), "generated: {}", out);
+}
+
+#[test]
+fn python_list_methods_map_to_correct_rust() {
+    let src = concat!(
+        "def f() -> int:\n",
+        "    items = [1, 2, 3]\n",
+        "    items.append(4)\n",
+        "    items.remove(2)\n",
+        "    items.insert(0, 9)\n",
+        "    last = items.pop()\n",
+        "    return last + items.count(9)\n",
+    );
+    let out = compile(src, "listops.py");
+    // append pushes one element (Vec::append concatenates — wrong).
+    assert!(out.contains("(items) . push (4)"), "generated: {}", out);
+    // remove removes by value and raises ValueError when absent.
+    assert!(out.contains("position"), "generated: {}", out);
+    assert!(out.contains("\"ValueError\""), "generated: {}", out);
+    // insert applies Python index rules (negatives, clamping) via py_insert.
+    assert!(out.contains("py_insert (0 , 9)"), "generated: {}", out);
+    // pop raises a catchable IndexError instead of returning an Option.
+    assert!(out.contains("\"IndexError\""), "generated: {}", out);
+    assert!(out.contains("pop () . ok_or_else"), "generated: {}", out);
+    // count passes by reference to the PyListOps method.
+    assert!(out.contains("count (& (9))"), "generated: {}", out);
+}
+
+#[test]
+fn python_str_methods_map_through_pystrops() {
+    let src = concat!(
+        "def f(s: str) -> str:\n",
+        "    parts = s.split()\n",
+        "    head = s.split(\",\")\n",
+        "    n = s.find(\"x\")\n",
+        "    return \"-\".join(parts)\n",
+    );
+    let out = compile(src, "strops.py");
+    assert!(out.contains("py_split_whitespace ()"), "generated: {}", out);
+    assert!(out.contains("py_split (& (\",\"))"), "generated: {}", out);
+    assert!(out.contains("py_find (& (\"x\"))"), "generated: {}", out);
+    assert!(out.contains(". join (parts)"), "generated: {}", out);
+}
+
+#[test]
+fn str_parameters_accept_borrowed_and_owned_strings() {
+    let out = compile("def shout(name: str) -> str:\n    return name.upper()\n", "strparam.py");
+    // The parameter is generic over Into<String>, converted once up front.
+    assert!(
+        out.contains("name : impl Into < String >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("let name : String = name . into ()"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]

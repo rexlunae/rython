@@ -247,3 +247,86 @@ fn py_exception_matches_handler_names() {
     // Display is "Type: message", like a Python traceback's last line
     assert_eq!(format!("{}", exc), "ValueError: bad input");
 }
+
+#[test]
+fn truthiness_matches_python_bool() {
+    // Python: bool("") is False, bool("x") is True
+    assert!(!"".is_truthy());
+    assert!("x".is_truthy());
+    assert!(!String::new().is_truthy());
+    // bool(0) is False, bool(-1) is True; bool(0.0) is False
+    assert!(!0i64.is_truthy());
+    assert!((-1i64).is_truthy());
+    assert!(!0.0f64.is_truthy());
+    // bool([]) is False, bool([0]) is True (contents don't matter)
+    assert!(!Vec::<i64>::new().is_truthy());
+    assert!(vec![0i64].is_truthy());
+    // bool({}) is False
+    assert!(!std::collections::HashMap::<i64, i64>::new().is_truthy());
+    assert!(!std::collections::HashSet::<i64>::new().is_truthy());
+    // bool(None) is False; Some follows the value
+    assert!(!Option::<i64>::None.is_truthy());
+    assert!(Some(5i64).is_truthy());
+    assert!(!Some(0i64).is_truthy());
+}
+
+#[test]
+fn py_is_none_matches_python_is_none() {
+    assert!(Option::<i64>::None.py_is_none());
+    assert!(!Some(1i64).py_is_none());
+    // Plain values are never None
+    assert!(!0i64.py_is_none());
+    assert!(!"".py_is_none());
+    assert!(!String::new().py_is_none());
+    assert!(!Vec::<i64>::new().py_is_none());
+}
+
+#[test]
+fn py_list_and_str_methods_match_python() {
+    // [1, 2, 2, 3].count(2) == 2
+    assert_eq!(vec![1i64, 2, 2, 3].count(&2), 2);
+    assert_eq!(vec![1i64, 3].count(&2), 0);
+
+    // str methods vs CPython
+    assert_eq!("hi there".upper(), "HI THERE");
+    assert_eq!("Hi There".lower(), "hi there");
+    assert_eq!("  pad  ".strip(), "pad");
+    assert_eq!("  pad  ".lstrip(), "pad  ");
+    assert_eq!("  pad  ".rstrip(), "  pad");
+    assert_eq!("hELLO wORLD".capitalize(), "Hello world");
+    assert!("hello".startswith("he"));
+    assert!(!"hello".startswith("lo"));
+    assert!("hello".endswith("lo"));
+    // "hello".find("l") == 2; missing -> -1 (not None/Option)
+    assert_eq!("hello".py_find("l"), 2);
+    assert_eq!("hello".py_find("z"), -1);
+    // "a,b,,c".split(",") == ['a', 'b', '', 'c'] (keeps empties)
+    assert_eq!("a,b,,c".py_split(","), vec!["a", "b", "", "c"]);
+    // "  a b  c ".split() == ['a', 'b', 'c'] (whitespace runs, no empties)
+    assert_eq!("  a b  c ".py_split_whitespace(), vec!["a", "b", "c"]);
+    // "x\ny".splitlines() == ['x', 'y']
+    assert_eq!("x\ny".splitlines(), vec!["x", "y"]);
+    // "-".join(['a', 'b']) == "a-b"
+    assert_eq!("-".join(vec!["a", "b"]), "a-b");
+    assert_eq!("-".join(Vec::<String>::new()), "");
+}
+
+#[test]
+fn py_insert_matches_python_index_rules() {
+    // Python: [1, 2, 3].insert(-1, 9) -> [1, 2, 9, 3]
+    let mut v = vec![1i64, 2, 3];
+    v.py_insert(-1, 9);
+    assert_eq!(v, vec![1, 2, 9, 3]);
+    // insert(100, x) clamps to append
+    let mut v = vec![1i64, 2];
+    v.py_insert(100, 9);
+    assert_eq!(v, vec![1, 2, 9]);
+    // insert(-100, x) clamps to prepend
+    let mut v = vec![1i64, 2];
+    v.py_insert(-100, 9);
+    assert_eq!(v, vec![9, 1, 2]);
+    // plain positive index
+    let mut v = vec![1i64, 3];
+    v.py_insert(1, 2);
+    assert_eq!(v, vec![1, 2, 3]);
+}
