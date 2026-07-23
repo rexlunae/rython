@@ -145,10 +145,22 @@ impl CodeGen for FunctionDef {
             streams.extend(quote!(;));
         }
 
+        // Every generated function returns Result<T, PyException> so raised
+        // exceptions propagate across function boundaries the way Python's
+        // do: call sites append `?`, and an uncaught exception surfaces at
+        // the entry point. T is the resolved Python return type (unit when
+        // there is none).
         let return_type = match self.resolved_return_type() {
-            Some(ty) => quote!(-> #ty),
-            None => quote!(),
+            Some(ty) => quote!(-> Result<#ty, PyException>),
+            None => quote!(-> Result<(), PyException>),
         };
+
+        // A body that can fall off the end implicitly returns None: give the
+        // generated block an Ok(()) tail. Bodies that return (or raise) on
+        // every path end with `return`/`return Err`, which need no tail.
+        if !guarantees_return(&self.body) {
+            streams.extend(quote!(Ok(())));
+        }
 
         // Lossy conversions are silent semantic changes callers may not want
         // — surface them as a compiler warning at every call site outside the
@@ -226,6 +238,14 @@ fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>
             StatementType::With(s) => collect_returns(&s.body, out),
             StatementType::AsyncWith(s) => collect_returns(&s.body, out),
             StatementType::AsyncFor(s) => collect_returns(&s.body, out),
+            StatementType::Try(s) => {
+                collect_returns(&s.body, out);
+                for handler in &s.handlers {
+                    collect_returns(&handler.body, out);
+                }
+                collect_returns(&s.orelse, out);
+                collect_returns(&s.finalbody, out);
+            }
             // Nested defs/classes have their own return scopes; everything
             // else contains no return statements we care about.
             _ => {}
@@ -309,14 +329,27 @@ fn annotation_display(ann: &ExprType) -> String {
 /// `if`/`else` whose branches both guarantee a return, or a diverging
 /// `raise`. Loops and other constructs may fall through, so they never
 /// guarantee a return.
-fn guarantees_return(body: &[Statement]) -> bool {
+pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
     match body.last().map(|stmt| &stmt.statement) {
         Some(StatementType::Return(Some(_))) => true,
         Some(StatementType::If(s)) => {
             !s.orelse.is_empty() && guarantees_return(&s.body) && guarantees_return(&s.orelse)
         }
-        // `raise` lowers to a diverging panic!, which satisfies any type.
+        // `raise` lowers to `return Err(...)`, which terminates the path.
         Some(StatementType::Raise(_)) => true,
+        // A try guarantees a return when its no-exception path does (the
+        // body, or the else clause the body falls into) and every handler
+        // does too — or when the finally clause returns unconditionally.
+        // Unhandled exceptions exit via Err, which also terminates.
+        Some(StatementType::Try(t)) => {
+            let normal_path = if t.orelse.is_empty() {
+                guarantees_return(&t.body)
+            } else {
+                guarantees_return(&t.body) || guarantees_return(&t.orelse)
+            };
+            let handlers = t.handlers.iter().all(|h| guarantees_return(&h.body));
+            (normal_path && handlers) || guarantees_return(&t.finalbody)
+        }
         _ => false,
     }
 }

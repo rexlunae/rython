@@ -186,7 +186,11 @@ fn converts_package_into_crate_layout() {
 
     let greeting = fs::read_to_string(out.join("src/greeting.rs")).unwrap();
     assert!(greeting.contains("fn excited"), "greeting.rs: {}", greeting);
-    assert!(greeting.contains("-> String"), "greeting.rs: {}", greeting);
+    assert!(
+        greeting.contains("-> Result<String, PyException>"),
+        "functions return Result so exceptions propagate: {}",
+        greeting
+    );
     assert!(
         greeting.contains("fn shout_count"),
         "greeting.rs: {}",
@@ -316,7 +320,7 @@ fn pyo3_conversion_generates_bindings() {
     // Wrapper identifiers are module-qualified so same-named functions in
     // different modules can't collide; the Python-visible name stays bare.
     assert!(
-        bindings.contains("fn greeting_shout_count(n: i64) -> i64"),
+        bindings.contains("fn greeting_shout_count(n: i64) -> pyo3::PyResult<i64>"),
         "annotated function should be bound with concrete types: {}",
         bindings
     );
@@ -331,7 +335,7 @@ fn pyo3_conversion_generates_bindings() {
         bindings
     );
     assert!(
-        bindings.contains("fn greeting_excited() -> String"),
+        bindings.contains("fn greeting_excited() -> pyo3::PyResult<String>"),
         "zero-arg function with inferable return should be bound: {}",
         bindings
     );
@@ -383,6 +387,84 @@ fn pyo3_conversion_generates_bindings() {
         lib.contains("mod python_api"),
         "lib.rs must include the bindings module: {}",
         lib
+    );
+}
+
+#[test]
+fn exceptions_propagate_across_functions_at_runtime() {
+    // The full Python exception model: a callee's raise propagates to the
+    // caller, is catchable there by type, a return inside try threads out
+    // through the finally, and an uncaught exception prints the exception
+    // and exits nonzero — exactly CPython's observable behavior.
+    let scratch = Scratch::new("propagate");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def divide(a: int, b: int) -> int:\n",
+            "    if b == 0:\n",
+            "        raise ZeroDivisionError(\"division by zero\")\n",
+            "    return a // b\n",
+            "\n",
+            "def safe_divide(a: int, b: int) -> int:\n",
+            "    try:\n",
+            "        return divide(a, b)\n",
+            "    except ZeroDivisionError:\n",
+            "        return 0\n",
+            "\n",
+            "def tracked_divide(a: int, b: int) -> int:\n",
+            "    try:\n",
+            "        return divide(a, b)\n",
+            "    except ZeroDivisionError:\n",
+            "        return -1\n",
+            "    finally:\n",
+            "        print(\"cleanup\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(safe_divide(10, 2))\n",
+            "    print(safe_divide(5, 0))\n",
+            "    print(tracked_divide(8, 2))\n",
+            "    print(tracked_divide(8, 0))\n",
+            "    print(divide(1, 0))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = Command::new("cargo")
+        .arg("build")
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo build");
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // tracked_divide's finally must print "cleanup" before the returned
+    // value is printed — on both the return-through-try path and the
+    // handler-return path.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["5", "0", "cleanup", "4", "cleanup", "-1"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stderr.contains("ZeroDivisionError: division by zero"),
+        "uncaught exception must be reported: {}",
+        stderr
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "uncaught exception must exit nonzero"
     );
 }
 

@@ -360,14 +360,14 @@ fn generate_bindings(
         let target = safe_ident(bare);
         let path: Vec<_> = module.path.iter().map(|p| safe_ident(p)).collect();
         let call = quote!(crate::#(#path::)*#target(#(#arg_names),*));
+        // Generated functions return Result<T, PyException>; the wrapper
+        // maps a raised exception onto the corresponding real Python
+        // exception class (From<PyException> for PyErr in stdpython).
         let ret_tokens = match ret {
-            Some(ty) => quote!(-> #ty),
-            None => quote!(),
+            Some(ty) => quote!(-> pyo3::PyResult<#ty>),
+            None => quote!(-> pyo3::PyResult<()>),
         };
-        let body = match ret {
-            Some(_) => quote!(#call),
-            None => quote!(#call;),
-        };
+        let body = quote!(#call.map_err(pyo3::PyErr::from));
         // Keep the bare Python-visible name when it's unambiguous; a
         // package-wide duplicate keeps the qualified name (registering two
         // same-named functions would silently shadow one of them).

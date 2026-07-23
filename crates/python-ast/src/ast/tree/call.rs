@@ -3,7 +3,10 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions, SymbolTableScopes, extract_required_attr};
+use crate::{
+    extract_required_attr, CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions,
+    SymbolTableNode, SymbolTableScopes,
+};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Call {
@@ -38,6 +41,26 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // Calls to functions that return Result<T, PyException> get `?` so
+        // exceptions propagate to the caller (or an enclosing try block),
+        // as in Python: user-defined functions (known from the symbol
+        // table), names imported from user modules, and the Result-returning
+        // stdpython builtins.
+        let propagates_exceptions = match self.func.as_ref() {
+            ExprType::Name(name) => {
+                matches!(name.id.as_str(), "int" | "float")
+                    || match symbols.get(&name.id) {
+                        Some(SymbolTableNode::FunctionDef(_)) => true,
+                        Some(SymbolTableNode::ImportFrom(import)) => {
+                            let root = import.module.split('.').next().unwrap_or("");
+                            !crate::is_stdpython_module(root)
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+
         let name = self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         
         let mut all_args = Vec::new();
@@ -66,7 +89,9 @@ impl<'a> CodeGen for Call {
         );
         
         // Special handling for subprocess.run and os.execv with fallback for compatibility
-        let final_call = if name_str == "subprocess :: run" {
+        let final_call = if propagates_exceptions {
+            quote!(#call_expr?)
+        } else if name_str == "subprocess :: run" {
             // Try mixed_args version first, fallback to regular version
             if all_args.len() >= 2 {
                 let args_param = &all_args[0];
