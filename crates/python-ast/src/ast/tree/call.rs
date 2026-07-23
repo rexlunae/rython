@@ -169,6 +169,65 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // Keyword arguments and omitted defaulted parameters resolve
+        // against the callee's signature: keywords map to their parameter
+        // positions and missing parameters fill from their default values,
+        // matching Python call semantics. Without a known signature,
+        // keywords would silently become misordered positional arguments —
+        // that is a loud conversion error instead.
+        let callee = match self.func.as_ref() {
+            ExprType::Name(n) => match symbols.get(&n.id) {
+                Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(callee_def) = &callee {
+            let simple_signature =
+                callee_def.args.vararg.is_none() && callee_def.args.kwarg.is_none();
+            let pos_param_count =
+                callee_def.args.posonlyargs.len() + callee_def.args.args.len();
+            let needs_mapping = !self.keywords.is_empty()
+                || !callee_def.args.kwonlyargs.is_empty()
+                || self.args.len() < pos_param_count;
+            if simple_signature && needs_mapping {
+                let mapped = map_call_arguments(
+                    callee_def,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                )?;
+                let name = self.func.to_rust(ctx, options, symbols)?;
+                let call = quote!(#name(#(#mapped),*));
+                return Ok(if propagates_exceptions {
+                    quote!(#call?)
+                } else {
+                    call
+                });
+            }
+            if !simple_signature && !self.keywords.is_empty() {
+                return Err(format!(
+                    "keyword arguments in a call to `{}` are not supported yet: \
+                     its signature takes *args/**kwargs",
+                    callee_def.name
+                )
+                .into());
+            }
+        } else if !self.keywords.is_empty() {
+            return Err(format!(
+                "keyword arguments require the callee's signature, and `{}` is not \
+                 a function defined in this module; pass the arguments positionally",
+                self.func
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|_| "<callee>".to_string())
+            )
+            .into());
+        }
+
         let name = self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let mut all_args = Vec::new();
@@ -244,6 +303,131 @@ impl<'a> CodeGen for Call {
     }
 }
 
+/// Resolve a call's arguments against the callee's signature, in Python's
+/// order: positionals fill left to right, keywords map by name, missing
+/// parameters take their default values, and every mismatch Python would
+/// raise a TypeError for is a conversion-time error.
+fn map_call_arguments(
+    func: &crate::FunctionDef,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<Vec<TokenStream>, Box<dyn std::error::Error>> {
+    let fname = &func.name;
+    let lower = |e: &ExprType| -> Result<TokenStream, Box<dyn std::error::Error>> {
+        e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+    };
+
+    let pos_params: Vec<&crate::Parameter> = func
+        .args
+        .posonlyargs
+        .iter()
+        .chain(func.args.args.iter())
+        .collect();
+    let n = pos_params.len();
+    if args.len() > n {
+        return Err(format!(
+            "{}() takes {} positional argument(s) but {} were given",
+            fname,
+            n,
+            args.len()
+        )
+        .into());
+    }
+
+    let mut slots: Vec<Option<TokenStream>> = vec![None; n];
+    for (i, arg) in args.iter().enumerate() {
+        slots[i] = Some(lower(arg)?);
+    }
+
+    let mut kwonly_slots: Vec<Option<TokenStream>> = vec![None; func.args.kwonlyargs.len()];
+    for kw in keywords {
+        let Some(kw_name) = &kw.arg else {
+            return Err(format!(
+                "**kwargs unpacking in a call to {}() is not supported",
+                fname
+            )
+            .into());
+        };
+        let value = lower(&kw.value)?;
+        if let Some(idx) = pos_params.iter().position(|p| &p.arg == kw_name) {
+            if idx < func.args.posonlyargs.len() {
+                return Err(format!(
+                    "{}(): parameter `{}` is positional-only and cannot be passed by keyword",
+                    fname, kw_name
+                )
+                .into());
+            }
+            if slots[idx].is_some() {
+                return Err(format!(
+                    "{}() got multiple values for argument `{}`",
+                    fname, kw_name
+                )
+                .into());
+            }
+            slots[idx] = Some(value);
+        } else if let Some(idx) = func
+            .args
+            .kwonlyargs
+            .iter()
+            .position(|p| &p.arg == kw_name)
+        {
+            if kwonly_slots[idx].is_some() {
+                return Err(format!(
+                    "{}() got multiple values for argument `{}`",
+                    fname, kw_name
+                )
+                .into());
+            }
+            kwonly_slots[idx] = Some(value);
+        } else {
+            return Err(format!(
+                "{}() got an unexpected keyword argument `{}`",
+                fname, kw_name
+            )
+            .into());
+        }
+    }
+
+    // Defaults align with the tail of the positional parameter list.
+    let default_offset = n - func.args.defaults.len();
+    for i in 0..n {
+        if slots[i].is_none() {
+            if i >= default_offset {
+                slots[i] = Some(lower(&func.args.defaults[i - default_offset])?);
+            } else {
+                return Err(format!(
+                    "{}() missing required argument `{}`",
+                    fname, pos_params[i].arg
+                )
+                .into());
+            }
+        }
+    }
+    for (i, param) in func.args.kwonlyargs.iter().enumerate() {
+        if kwonly_slots[i].is_none() {
+            match func.args.kw_defaults.get(i).and_then(|d| d.as_ref()) {
+                Some(default) => kwonly_slots[i] = Some(lower(default)?),
+                None => {
+                    return Err(format!(
+                        "{}() missing required keyword-only argument `{}`",
+                        fname, param.arg
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    Ok(slots
+        .into_iter()
+        .chain(kwonly_slots)
+        .map(|s| s.expect("all argument slots filled"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,16 +439,47 @@ mod tests {
             "def foo(a = 7):
     pass
 
+foo(a=9)",
+            "test.py",
+        )
+        .unwrap();
+        let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+        let code = result
+            .to_rust(
+                CodeGenContext::Module("test".to_string()),
+                options,
+                symbols,
+            )
+            .unwrap()
+            .to_string();
+        assert!(code.contains("foo (9)"), "generated: {}", code);
+    }
+
+    #[test]
+    fn unknown_keyword_argument_is_a_conversion_error() {
+        // Python raises TypeError for foo(b=9) when foo has no parameter b;
+        // silently passing it positionally would be wrong.
+        let options = PythonOptions::default();
+        let result = crate::parse(
+            "def foo(a = 7):
+    pass
+
 foo(b=9)",
             "test.py",
         )
         .unwrap();
-        let _code = result
+        let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+        let err = result
             .to_rust(
                 CodeGenContext::Module("test".to_string()),
                 options,
-                SymbolTableScopes::new(),
+                symbols,
             )
-            .unwrap();
+            .expect_err("unexpected keyword must not convert");
+        assert!(
+            format!("{}", err).contains("unexpected keyword"),
+            "error: {}",
+            err
+        );
     }
 }

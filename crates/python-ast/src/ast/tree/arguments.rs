@@ -415,34 +415,34 @@ mod tests {
 
     #[test]
     fn test_keyword_arguments() {
-        let code = "func(a=1, b=2)";
+        // Keywords resolve against the callee's signature and land in
+        // parameter order.
+        let code = "def func(a, b):\n    pass\n\nfunc(b=2, a=1)";
         let result = parse(code, "test.py").unwrap();
-        
+
         let options = PythonOptions::default();
-        let symbols = SymbolTableScopes::new();
-        let _rust_code = result.to_rust(
+        let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+        let rust_code = result.to_rust(
             CodeGenContext::Module("test".to_string()),
             options,
             symbols,
-        ).unwrap();
-        
-        // Should generate function call with keyword arguments
+        ).unwrap().to_string();
+        assert!(rust_code.contains("func (1 , 2)"), "generated: {}", rust_code);
     }
 
     #[test]
     fn test_mixed_arguments() {
-        let code = "func(1, 2, c=3, d=4)";
+        let code = "def func(a, b, c, d):\n    pass\n\nfunc(1, 2, d=4, c=3)";
         let result = parse(code, "test.py").unwrap();
-        
+
         let options = PythonOptions::default();
-        let symbols = SymbolTableScopes::new();
-        let _rust_code = result.to_rust(
+        let symbols = result.clone().find_symbols(SymbolTableScopes::new());
+        let rust_code = result.to_rust(
             CodeGenContext::Module("test".to_string()),
             options,
             symbols,
-        ).unwrap();
-        
-        // Should generate function call with mixed positional and keyword arguments
+        ).unwrap().to_string();
+        assert!(rust_code.contains("func (1 , 2 , 3 , 4)"), "generated: {}", rust_code);
     }
 
     #[test]

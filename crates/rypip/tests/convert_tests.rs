@@ -534,6 +534,53 @@ fn dict_methods_match_python_at_runtime() {
 }
 
 #[test]
+fn keyword_arguments_and_defaults_match_python_at_runtime() {
+    let scratch = Scratch::new("kwargs");
+    let file = scratch.path().join("kw.py");
+    fs::write(
+        &file,
+        concat!(
+            "def greet(greeting: str, name: str = \"world\", excited: bool = False) -> str:\n",
+            "    tail = \"!\" if excited else \".\"\n",
+            "    return greeting + \", \" + name + tail\n",
+            "\n",
+            "def volume(w: int, h: int, d: int) -> int:\n",
+            "    return w * h * d\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(greet(\"hi\"))\n",
+            "    print(greet(\"hello\", name=\"rython\"))\n",
+            "    print(greet(\"hey\", excited=True))\n",
+            "    print(greet(name=\"bob\", greeting=\"yo\", excited=True))\n",
+            "    print(volume(d=2, w=3, h=4))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo build");
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/kw"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["hi, world.", "hello, rython.", "hey, world!", "yo, bob!", "24"],
+        "keyword/default call semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn pyo3_crate_compiles() {
     let scratch = Scratch::new("pyo3-compile");
     write_sample_package(scratch.path());

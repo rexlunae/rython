@@ -420,9 +420,11 @@ impl CodeGen for DictComp {
             &options,
             &symbols,
         )?;
+        // PyDict, like dict literals: comprehension-built dicts preserve
+        // insertion order too.
         Ok(quote! {
             {
-                let mut __rython_comp = std::collections::HashMap::new();
+                let mut __rython_comp = PyDict::new();
                 #loops
                 __rython_comp
             }
