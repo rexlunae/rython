@@ -1079,6 +1079,72 @@ fn optional_parameters_wrap_arguments_at_call_sites() {
 }
 
 #[test]
+fn optional_stores_from_option_values_do_not_double_wrap() {
+    // The RHS already yields an Option (dict.get, another optional name, an
+    // Optional-returning call): wrapping it again would bury an absent value
+    // as Some(None) and flip a later `is None` check.
+    let src = concat!(
+        "def probe(d: dict[str, int], keys: list[str]) -> int:\n",
+        "    result = None\n",
+        "    for k in keys:\n",
+        "        result = d.get(k)\n",
+        "    alias = None\n",
+        "    alias = result\n",
+        "    if alias is None:\n",
+        "        return -1\n",
+        "    return 0\n",
+    );
+    let out = compile(src, "optget.py");
+    assert!(
+        out.contains("result = (d) . py_get"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some ((d) . py_get"),
+        "double-wrapped dict.get store, generated: {}",
+        out
+    );
+    assert!(out.contains("alias = result"), "generated: {}", out);
+    assert!(
+        !out.contains("Some (result)"),
+        "double-wrapped optional-name store, generated: {}",
+        out
+    );
+}
+
+#[test]
+fn optional_returning_calls_store_and_pass_without_rewrap() {
+    // find() generates Result<Option<i64>, PyException>; the call site's `?`
+    // leaves an Option, which must flow into optional names and Optional
+    // parameters as-is.
+    let src = concat!(
+        "def find(d: dict[str, int], k: str) -> Optional[int]:\n",
+        "    return d.get(k)\n",
+        "\n",
+        "def label(tag: Optional[int]) -> int:\n",
+        "    return 0\n",
+        "\n",
+        "def f(d: dict[str, int]) -> int:\n",
+        "    hit = None\n",
+        "    hit = find(d, \"a\")\n",
+        "    return label(find(d, \"b\"))\n",
+    );
+    let out = compile(src, "optret.py");
+    assert!(out.contains("hit = find"), "generated: {}", out);
+    assert!(
+        !out.contains("hit = Some (find"),
+        "double-wrapped Optional-returning call store, generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("label (Some (find"),
+        "double-wrapped Optional-returning call argument, generated: {}",
+        out
+    );
+}
+
+#[test]
 fn typing_imports_lower_to_nothing() {
     let out = compile("from typing import Optional\nx = 1\n", "typing.py");
     assert!(!out.contains("typing"), "generated: {}", out);

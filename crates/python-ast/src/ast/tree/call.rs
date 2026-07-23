@@ -329,7 +329,8 @@ fn map_call_arguments(
 ) -> Result<Vec<TokenStream>, Box<dyn std::error::Error>> {
     let fname = &func.name;
     // Optional-annotated parameters take Option values: non-None arguments
-    // wrap in Some, None passes through.
+    // wrap in Some, while None and already-Option values (dict.get, another
+    // optional name, an Optional-returning call) pass through unwrapped.
     let fill = |param: &crate::Parameter,
                 expr: &ExprType|
      -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -338,7 +339,10 @@ fn map_call_arguments(
             .annotation
             .as_deref()
             .is_some_and(crate::is_optional_annotation);
-        Ok(if optional && !crate::is_none_expr(expr) {
+        Ok(if optional
+            && !crate::is_none_expr(expr)
+            && !crate::expr_yields_option(expr, options, symbols)
+        {
             quote!(Some(#tokens))
         } else {
             tokens

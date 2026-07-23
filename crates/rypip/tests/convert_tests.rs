@@ -534,6 +534,57 @@ fn dict_methods_match_python_at_runtime() {
 }
 
 #[test]
+fn optional_from_dict_get_matches_python_at_runtime() {
+    // A None-seeded variable reassigned from dict.get must NOT double-wrap:
+    // an absent key would become Some(None) and the `is None` branch below
+    // would silently never fire (PR #38 review finding).
+    let scratch = Scratch::new("optget");
+    let file = scratch.path().join("optget.py");
+    fs::write(
+        &file,
+        concat!(
+            "def probe(keys: list[int]) -> int:\n",
+            "    d = {1: 10, 2: 20}\n",
+            "    result = None\n",
+            "    for k in keys:\n",
+            "        result = d.get(k)\n",
+            "    if result is None:\n",
+            "        return -1\n",
+            "    return result + 100\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(probe([1]))\n",
+            "    print(probe([9]))\n",
+            "    print(probe([2, 9]))\n",
+            "    print(probe([9, 2]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo build");
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/optget"))
+        .output()
+        .expect("running generated binary");
+    // Values verified against python3: hit, miss, hit-then-miss, miss-then-hit.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["110", "-1", "-1", "120"],
+        "optional dict.get semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn keyword_arguments_and_defaults_match_python_at_runtime() {
     let scratch = Scratch::new("kwargs");
     let file = scratch.path().join("kw.py");
