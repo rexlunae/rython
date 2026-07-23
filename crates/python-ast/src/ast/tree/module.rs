@@ -164,29 +164,17 @@ impl CodeGen for Module {
         let mut module_init_raw: Vec<crate::Statement> = Vec::new();
 
         // Module-level names assigned exactly once from a literal, with no
-        // augmented assignment, are CONSTANTS: they lower to static items so
-        // functions in the module can see them (Python module globals are
-        // visible everywhere; a store hidden inside __module_init__ is not).
+        // other store ANYWHERE in module scope, are CONSTANTS: they lower
+        // to static items so functions in the module can see them (Python
+        // module globals are visible everywhere; a store hidden inside
+        // __module_init__ is not). The tally recurses through module-level
+        // control flow — `DEBUG = False` conditionally overwritten inside
+        // an `if` is NOT a constant, and treating it as one would silently
+        // freeze the original value. (Function bodies need no scan: without
+        // `global` — unsupported — their assignments create locals.)
         let mut module_assign_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for s in &self.raw.body {
-            match &s.statement {
-                crate::StatementType::Assign(a) => {
-                    for target in &a.targets {
-                        if let crate::ExprType::Name(n) = target {
-                            *module_assign_counts.entry(n.id.clone()).or_insert(0) += 1;
-                        }
-                    }
-                }
-                crate::StatementType::AugAssign(a) => {
-                    if let crate::ExprType::Name(n) = &a.target {
-                        // Reassignment: not a constant.
-                        *module_assign_counts.entry(n.id.clone()).or_insert(0) += 2;
-                    }
-                }
-                _ => {}
-            }
-        }
+        count_module_stores(&self.raw.body, &mut module_assign_counts);
 
         // A user `main` that returns a value cannot serve as the Rust entry
         // point directly (Result<i64, _> does not implement Termination);
@@ -459,6 +447,93 @@ impl CodeGen for Module {
             });
         }
         Ok(stream)
+    }
+}
+
+/// Count stores to each name across MODULE scope: top-level assignments
+/// plus everything nested in module-level control flow — if/while/for
+/// bodies (and the for target itself, which rebinds every iteration),
+/// with bodies and their `as` targets, try bodies and handlers. Nested
+/// stores count double so a name assigned once at top level and again in
+/// a branch never tallies as once-assigned. Function and class bodies are
+/// their own scopes and are not walked.
+fn count_module_stores(
+    body: &[crate::Statement],
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    fn bump_target(target: &crate::ExprType, by: usize, counts: &mut std::collections::HashMap<String, usize>) {
+        match target {
+            crate::ExprType::Name(n) => {
+                *counts.entry(n.id.clone()).or_insert(0) += by;
+            }
+            crate::ExprType::Tuple(t) => {
+                for elt in &t.elts {
+                    bump_target(elt, by, counts);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in body {
+        match &s.statement {
+            crate::StatementType::Assign(a) => {
+                for target in &a.targets {
+                    bump_target(target, 1, counts);
+                }
+            }
+            crate::StatementType::AugAssign(a) => bump_target(&a.target, 2, counts),
+            crate::StatementType::If(i) => {
+                let mut nested = std::collections::HashMap::new();
+                count_module_stores(&i.body, &mut nested);
+                count_module_stores(&i.orelse, &mut nested);
+                for (name, n) in nested {
+                    *counts.entry(name).or_insert(0) += n * 2;
+                }
+            }
+            crate::StatementType::While(w) => {
+                let mut nested = std::collections::HashMap::new();
+                count_module_stores(&w.body, &mut nested);
+                count_module_stores(&w.orelse, &mut nested);
+                for (name, n) in nested {
+                    *counts.entry(name).or_insert(0) += n * 2;
+                }
+            }
+            crate::StatementType::For(f) => {
+                bump_target(&f.target, 2, counts);
+                let mut nested = std::collections::HashMap::new();
+                count_module_stores(&f.body, &mut nested);
+                count_module_stores(&f.orelse, &mut nested);
+                for (name, n) in nested {
+                    *counts.entry(name).or_insert(0) += n * 2;
+                }
+            }
+            crate::StatementType::With(w) => {
+                for item in &w.items {
+                    if let Some(vars) = &item.optional_vars {
+                        bump_target(vars, 2, counts);
+                    }
+                }
+                let mut nested = std::collections::HashMap::new();
+                count_module_stores(&w.body, &mut nested);
+                for (name, n) in nested {
+                    *counts.entry(name).or_insert(0) += n * 2;
+                }
+            }
+            crate::StatementType::Try(t) => {
+                let mut nested = std::collections::HashMap::new();
+                count_module_stores(&t.body, &mut nested);
+                for h in &t.handlers {
+                    count_module_stores(&h.body, &mut nested);
+                }
+                count_module_stores(&t.orelse, &mut nested);
+                count_module_stores(&t.finalbody, &mut nested);
+                for (name, n) in nested {
+                    *counts.entry(name).or_insert(0) += n * 2;
+                }
+            }
+            // Function and class bodies are separate scopes.
+            _ => {}
+        }
     }
 }
 

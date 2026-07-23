@@ -1729,3 +1729,26 @@ fn integral_float_literals_keep_their_float_type() {
     assert!(out.contains("y = 2.0"), "generated: {}", out);
     assert!(!out.contains("y = 2 ;"), "generated: {}", out);
 }
+
+#[test]
+fn conditionally_reassigned_module_names_are_not_constants() {
+    // DEBUG = False overwritten inside a module-level `if` must NOT freeze
+    // as a static: the nested store would land on a shadowing local inside
+    // __module_init__ while functions read the stale static.
+    let out = compile(
+        "DEBUG = False\nif 1 > 0:\n    DEBUG = True\n",
+        "condglobal.py",
+    );
+    assert!(!out.contains("pub static DEBUG"), "generated: {}", out);
+
+    // A for-loop target at module level is rebound each iteration.
+    let out = compile("I = 0\nfor I in [1, 2]:\n    pass\n", "forglobal.py");
+    assert!(!out.contains("pub static I"), "generated: {}", out);
+
+    // Reassignment inside a module-level try body.
+    let out = compile(
+        "MODE = \"a\"\ntry:\n    MODE = \"b\"\nexcept ValueError:\n    pass\n",
+        "tryglobal.py",
+    );
+    assert!(!out.contains("pub static MODE"), "generated: {}", out);
+}
