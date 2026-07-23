@@ -598,7 +598,7 @@ impl PyRange {
         if span <= 0 {
             0
         } else {
-            ((span + step - 1) / step) as usize
+            ((span - 1) / step + 1) as usize
         }
     }
 
