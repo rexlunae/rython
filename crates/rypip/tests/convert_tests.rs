@@ -552,11 +552,31 @@ fn optional_from_dict_get_matches_python_at_runtime() {
             "        return -1\n",
             "    return result + 100\n",
             "\n",
+            "def pick(n: int) -> int:\n",
+            "    d = {1: 10, 2: 20}\n",
+            "    choice = None\n",
+            "    choice = d.get(n) if n > 0 else None\n",
+            "    if choice is None:\n",
+            "        return -1\n",
+            "    return choice + 200\n",
+            "\n",
+            "def sign_label(n: int) -> int:\n",
+            "    tag = None\n",
+            "    tag = n if n > 0 else None\n",
+            "    if tag is None:\n",
+            "        return 0\n",
+            "    return tag + 300\n",
+            "\n",
             "if __name__ == \"__main__\":\n",
             "    print(probe([1]))\n",
             "    print(probe([9]))\n",
             "    print(probe([2, 9]))\n",
             "    print(probe([9, 2]))\n",
+            "    print(pick(1))\n",
+            "    print(pick(-1))\n",
+            "    print(pick(9))\n",
+            "    print(sign_label(5))\n",
+            "    print(sign_label(-2))\n",
         ),
     )
     .unwrap();
@@ -574,12 +594,14 @@ fn optional_from_dict_get_matches_python_at_runtime() {
     let output = Command::new(krate.root.join("target/debug/optget"))
         .output()
         .expect("running generated binary");
-    // Values verified against python3: hit, miss, hit-then-miss, miss-then-hit.
+    // Values verified against python3: hit, miss, hit-then-miss,
+    // miss-then-hit, then the conditional-expression cases (Option arms and
+    // a plain/None arm mix).
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        vec!["110", "-1", "-1", "120"],
+        vec!["110", "-1", "-1", "120", "210", "-1", "-1", "305", "0"],
         "optional dict.get semantics diverged from CPython"
     );
 }

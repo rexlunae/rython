@@ -24,7 +24,7 @@ use crate::package::{PyModule, PyPackage};
 /// notes to warn about lossy conversions (e.g. dropped parameter defaults) —
 /// internal call sites are the faithfully-transpiled Python, while external
 /// consumers still get the warning at their call sites.
-const GENERATED_ALLOWS: &str = "#![allow(unused_imports, unused_variables, unused_mut, dead_code, unreachable_code, non_snake_case, deprecated, noop_method_call)]\n";
+const GENERATED_ALLOWS: &str = "#![allow(unused_imports, unused_variables, unused_mut, unused_assignments, dead_code, unreachable_code, non_snake_case, deprecated, noop_method_call)]\n";
 
 /// How lossy-conversion warnings are treated during conversion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
