@@ -244,24 +244,18 @@ impl CodeGen for ImportFrom {
                 tokens.extend(quote! { use #root #(::#module_path)*::*; });
                 continue;
             }
-            let name = crate::safe_ident(&alias.name);
-            let import = match &alias.asname {
-                None => quote! { use #root #(::#module_path)*::#name; },
-                Some(asname) => {
-                    let asname = crate::safe_ident(asname);
-                    quote! { use #root #(::#module_path)*::#name as #asname; }
-                }
-            };
-            tokens.extend(import);
-
             // Some runtime functions split into arity/keyword-specific
             // variants (accumulate with initial=, product with repeat=,
             // ...); importing the Python name brings its variants along so
-            // the call lowering can pick one. allow(unused_imports): which
-            // variant is used depends on the call sites, and unused ones
-            // are harness plumbing, not source-Python weaknesses.
-            if self.module == "itertools" {
-                let variants: &[&str] = match alias.name.as_str() {
+            // the call lowering can pick one. For these names, the BASE
+            // import is allow(unused_imports) too: the lowering may rewrite
+            // every call site to a variant (accumulate/product always are),
+            // orphaning the bare name through no fault of the source
+            // Python. Names without variants keep the plain import, so a
+            // genuinely unused `from itertools import pairwise` still
+            // surfaces as the source weakness it is.
+            let variants: &[&str] = if self.module == "itertools" {
+                match alias.name.as_str() {
                     "accumulate" => &[
                         "accumulate_sum",
                         "accumulate_func",
@@ -277,14 +271,33 @@ impl CodeGen for ImportFrom {
                     "zip_longest" => &["zip_longest_fill"],
                     "groupby" => &["groupby_key"],
                     _ => &[],
-                };
-                for variant in variants {
-                    let v = crate::safe_ident(variant);
-                    tokens.extend(quote! {
-                        #[allow(unused_imports)]
-                        use #root #(::#module_path)*::#v;
-                    });
                 }
+            } else {
+                &[]
+            };
+
+            let name = crate::safe_ident(&alias.name);
+            let import = match &alias.asname {
+                None if variants.is_empty() => {
+                    quote! { use #root #(::#module_path)*::#name; }
+                }
+                None => quote! {
+                    #[allow(unused_imports)]
+                    use #root #(::#module_path)*::#name;
+                },
+                Some(asname) => {
+                    let asname = crate::safe_ident(asname);
+                    quote! { use #root #(::#module_path)*::#name as #asname; }
+                }
+            };
+            tokens.extend(import);
+
+            for variant in variants {
+                let v = crate::safe_ident(variant);
+                tokens.extend(quote! {
+                    #[allow(unused_imports)]
+                    use #root #(::#module_path)*::#v;
+                });
             }
         }
         Ok(tokens)

@@ -1452,4 +1452,43 @@ fn itertools_gaps_match_python_at_runtime() {
         ],
         "itertools semantics diverged from CPython"
     );
+
+    // Deny mode regression: calls rewritten to variant functions must not
+    // orphan the base imports (`use ...::accumulate;`), or
+    // #![deny(unused_imports)] fails this perfectly clean source. A
+    // LIBRARY module, because entry modules have a separate pre-existing
+    // deny-mode issue (the lib-side copy of fn main is dead code).
+    let lib_file = scratch.path().join("it_lib.py");
+    fs::write(
+        &lib_file,
+        concat!(
+            "from itertools import accumulate, product\n",
+            "\n",
+            "def running(xs: list[int]) -> list[int]:\n",
+            "    return accumulate(xs, initial=0)\n",
+            "\n",
+            "def grid(xs: list[int]) -> int:\n",
+            "    total = 0\n",
+            "    for a, b in product(xs, repeat=2):\n",
+            "        total += a * b\n",
+            "    return total\n",
+        ),
+    )
+    .unwrap();
+    let deny_out = scratch.path().join("crate-deny");
+    let lib_pkg = rypip::discover(&lib_file).expect("discover");
+    let krate = rypip::convert(
+        &lib_pkg,
+        &deny_out,
+        &ConvertOptions {
+            warnings: rypip::convert::WarningMode::Deny,
+            ..Default::default()
+        },
+    )
+    .expect("deny-mode convert of a clean module");
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "deny-mode generated crate failed to compile (orphaned imports?)"
+    );
 }
