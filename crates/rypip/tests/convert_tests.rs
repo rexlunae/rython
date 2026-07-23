@@ -1308,3 +1308,73 @@ fn builtins_match_python_at_runtime() {
         "builtin semantics diverged from CPython"
     );
 }
+
+#[test]
+fn datetime_and_time_match_python_at_runtime() {
+    // date/datetime/timedelta constructors with keywords, arithmetic
+    // operators, strptime (including its catchable ValueError), and the
+    // time module, through generated code.
+    let scratch = Scratch::new("datetimes");
+    let file = scratch.path().join("dt_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from datetime import date, datetime, timedelta\n",
+            "import time\n",
+            "\n",
+            "def main() -> int:\n",
+            "    d1 = date(2024, 3, 1)\n",
+            "    d2 = date(2024, 2, 27)\n",
+            "    gap = d1 - d2\n",
+            "    print(f\"gap={gap} days={gap.days}\")\n",
+            "    print(f\"shift={d1 + timedelta(days=3)} back={d1 - timedelta(weeks=1)}\")\n",
+            "    dt = datetime.strptime(\"2024-01-05 08:30:15\", \"%Y-%m-%d %H:%M:%S\")\n",
+            "    print(f\"dt={dt}\")\n",
+            "    dt2 = dt + timedelta(hours=25, minutes=90)\n",
+            "    print(f\"dt2={dt2}\")\n",
+            "    diff = dt2 - dt\n",
+            "    print(f\"diff={diff} d={diff.days} s={diff.seconds}\")\n",
+            "    try:\n",
+            "        print(datetime.strptime(\"nope\", \"%Y-%m-%d\"))\n",
+            "    except ValueError:\n",
+            "        print(\"bad format caught\")\n",
+            "    t0 = time.monotonic()\n",
+            "    time.sleep(0.01)\n",
+            "    elapsed = time.monotonic() - t0\n",
+            "    print(\"monotonic_ok\" if elapsed >= 0.009 else \"monotonic_bad\")\n",
+            "    print(\"wall_ok\" if time.time() > 1577836800.0 else \"wall_bad\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/dt_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "gap=3 days, 0:00:00 days=3",
+            "shift=2024-03-04 back=2024-02-23",
+            "dt=2024-01-05 08:30:15",
+            "dt2=2024-01-06 11:00:15",
+            "diff=1 day, 2:30:00 d=1 s=9000",
+            "bad format caught",
+            "monotonic_ok",
+            "wall_ok",
+        ],
+        "datetime/time semantics diverged from CPython"
+    );
+}

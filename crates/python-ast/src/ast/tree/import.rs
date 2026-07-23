@@ -17,6 +17,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "math"
             | "random"
             | "datetime"
+            | "time"
             | "collections"
             | "itertools"
             | "glob"
@@ -40,6 +41,7 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
             | "math"
             | "random"
             | "datetime"
+            | "time"
             | "glob"
             | "pathlib"
             | "tempfile"
@@ -109,8 +111,26 @@ impl CodeGen for Import {
             }
             // Check if this is a Python standard library module that needs special handling
             let rust_import = match alias.name.as_str() {
+                // Runtime-provided modules are already in scope through
+                // `use stdpython::*` (each is re-exported at the crate
+                // root), so the import lowers to nothing — a bare
+                // `use math;` would not even resolve.
+                name if is_stdpython_module(name) => {
+                    if let Some(asname) = &alias.asname {
+                        // The module can't be re-bound with `use` (it's a
+                        // glob-imported name, not a path), so aliasing
+                        // would silently leave the alias undefined.
+                        return Err(format!(
+                            "`import {} as {}`: aliasing runtime modules is not \
+                             supported yet; use `import {}`",
+                            name, asname, name
+                        )
+                        .into());
+                    }
+                    quote! {}
+                }
                 // Python stdlib modules that don't have direct Rust equivalents
-                "os" | "sys" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" => {
+                "urllib" | "xml" | "asyncio" => {
                     // These will be provided by the stdpython runtime
                     // Generate a comment instead of a use statement
                     quote! {

@@ -364,7 +364,9 @@ impl datetime {
 
 impl fmt::Display for datetime {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.isoformat(None, None))
+        // Python's str(datetime) separates date and time with a SPACE
+        // (isoformat's default 'T' is only for isoformat()).
+        write!(f, "{}", self.isoformat(Some(' '), None))
     }
 }
 
@@ -426,12 +428,327 @@ impl timedelta {
     pub fn total_seconds(&self) -> f64 {
         self.days as f64 * 86400.0 + self.seconds as f64 + self.microseconds as f64 / 1_000_000.0
     }
+
+    /// Total duration in microseconds — the exact integer form the
+    /// datetime operators compute with.
+    fn total_micros(&self) -> i128 {
+        self.days as i128 * 86_400_000_000 + self.seconds as i128 * 1_000_000
+            + self.microseconds as i128
+    }
+
+    fn from_total_micros(micros: i128) -> Self {
+        // Python's normalization: microseconds and seconds non-negative,
+        // days carries the sign — exactly what new() produces.
+        let days = micros.div_euclid(86_400_000_000);
+        let rem = micros.rem_euclid(86_400_000_000);
+        Self {
+            days: days as i64,
+            seconds: (rem / 1_000_000) as i64,
+            microseconds: (rem % 1_000_000) as i64,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic operators, so `d2 - d1` and `dt + timedelta(...)` lower to
+// plain Rust operators. Python raises OverflowError when a result leaves
+// date's range (year 1..9999); operator traits can't return Result, so
+// that surfaces as a loud panic carrying the Python exception display.
+// ---------------------------------------------------------------------------
+
+/// Python date range in ordinal days: 0001-01-01 ..= 9999-12-31.
+const MAX_ORDINAL: i64 = 3_652_059;
+
+fn checked_ordinal(ordinal: i64) -> date {
+    if !(1..=MAX_ORDINAL).contains(&ordinal) {
+        panic!(
+            "{}",
+            crate::PyException::new("OverflowError", "date value out of range")
+        );
+    }
+    days_to_date(ordinal)
+}
+
+impl core::ops::Sub for date {
+    type Output = timedelta;
+    fn sub(self, rhs: date) -> timedelta {
+        timedelta {
+            days: self.toordinal() - rhs.toordinal(),
+            seconds: 0,
+            microseconds: 0,
+        }
+    }
+}
+
+impl core::ops::Add<timedelta> for date {
+    type Output = date;
+    fn add(self, rhs: timedelta) -> date {
+        // Python's date math uses only timedelta.days: the sub-day part
+        // is ignored, so date(2024,1,1) + timedelta(hours=25) is Jan 2.
+        checked_ordinal(self.toordinal() + rhs.days)
+    }
+}
+
+impl core::ops::Sub<timedelta> for date {
+    type Output = date;
+    fn sub(self, rhs: timedelta) -> date {
+        checked_ordinal(self.toordinal() - rhs.days)
+    }
+}
+
+impl datetime {
+    fn total_micros(&self) -> i128 {
+        self.date.toordinal() as i128 * 86_400_000_000
+            + (self.time.hour as i128 * 3600 + self.time.minute as i128 * 60
+                + self.time.second as i128)
+                * 1_000_000
+            + self.time.microsecond as i128
+    }
+
+    fn from_total_micros(micros: i128) -> Self {
+        let ordinal = micros.div_euclid(86_400_000_000);
+        let rem = micros.rem_euclid(86_400_000_000);
+        let date = checked_ordinal(ordinal as i64);
+        let secs = rem / 1_000_000;
+        Self {
+            date,
+            time: time::new(
+                (secs / 3600) as u32,
+                ((secs % 3600) / 60) as u32,
+                Some((secs % 60) as u32),
+                Some((rem % 1_000_000) as u32),
+            )
+            .expect("decomposed fields are in range"),
+        }
+    }
+}
+
+impl core::ops::Sub for datetime {
+    type Output = timedelta;
+    fn sub(self, rhs: datetime) -> timedelta {
+        timedelta::from_total_micros(self.total_micros() - rhs.total_micros())
+    }
+}
+
+impl core::ops::Add<timedelta> for datetime {
+    type Output = datetime;
+    fn add(self, rhs: timedelta) -> datetime {
+        datetime::from_total_micros(self.total_micros() + rhs.total_micros())
+    }
+}
+
+impl core::ops::Sub<timedelta> for datetime {
+    type Output = datetime;
+    fn sub(self, rhs: timedelta) -> datetime {
+        datetime::from_total_micros(self.total_micros() - rhs.total_micros())
+    }
+}
+
+impl core::ops::Add for timedelta {
+    type Output = timedelta;
+    fn add(self, rhs: timedelta) -> timedelta {
+        timedelta::from_total_micros(self.total_micros() + rhs.total_micros())
+    }
+}
+
+impl core::ops::Sub for timedelta {
+    type Output = timedelta;
+    fn sub(self, rhs: timedelta) -> timedelta {
+        timedelta::from_total_micros(self.total_micros() - rhs.total_micros())
+    }
+}
+
+impl core::ops::Neg for timedelta {
+    type Output = timedelta;
+    fn neg(self) -> timedelta {
+        timedelta::from_total_micros(-self.total_micros())
+    }
+}
+
+impl core::ops::Mul<i64> for timedelta {
+    type Output = timedelta;
+    fn mul(self, rhs: i64) -> timedelta {
+        timedelta::from_total_micros(self.total_micros() * rhs as i128)
+    }
+}
+
+impl core::ops::Mul<timedelta> for i64 {
+    type Output = timedelta;
+    fn mul(self, rhs: timedelta) -> timedelta {
+        rhs * self
+    }
+}
+
+// Python `+` lowers through PyAdd (it must handle string concatenation),
+// so the date types implement it too, delegating to the operators above.
+impl crate::PyAdd<timedelta> for date {
+    type Output = date;
+    fn py_add(&self, rhs: &timedelta) -> date {
+        *self + *rhs
+    }
+}
+
+impl crate::PyAdd<timedelta> for datetime {
+    type Output = datetime;
+    fn py_add(&self, rhs: &timedelta) -> datetime {
+        *self + *rhs
+    }
+}
+
+impl crate::PyAdd<timedelta> for timedelta {
+    type Output = timedelta;
+    fn py_add(&self, rhs: &timedelta) -> timedelta {
+        *self + *rhs
+    }
+}
+
+// ---------------------------------------------------------------------------
+// strptime
+// ---------------------------------------------------------------------------
+
+impl datetime {
+    /// Python datetime.strptime(text, format). Supported directives:
+    /// %Y %m %d %H %M %S %f %b %B %I %p %%; anything else is a loud
+    /// ValueError with Python's message. Missing fields default to
+    /// 1900-01-01 00:00:00, as in Python.
+    pub fn strptime(text: &str, format: &str) -> Result<Self, PyException> {
+        let mismatch = || {
+            crate::value_error(format!(
+                "time data '{}' does not match format '{}'",
+                text, format
+            ))
+        };
+        let mut year: i32 = 1900;
+        let mut month: u32 = 1;
+        let mut day: u32 = 1;
+        let mut hour: u32 = 0;
+        let mut minute: u32 = 0;
+        let mut second: u32 = 0;
+        let mut microsecond: u32 = 0;
+        let mut hour12: Option<u32> = None;
+        let mut pm: Option<bool> = None;
+
+        let input: Vec<char> = text.chars().collect();
+        let mut pos = 0usize;
+        let mut fmt = format.chars().peekable();
+
+        // Parse 1..=max digits greedily; Err is the whole-input mismatch.
+        let take_number = |pos: &mut usize, max: usize| -> Option<i64> {
+            let start = *pos;
+            while *pos < input.len() && *pos - start < max && input[*pos].is_ascii_digit() {
+                *pos += 1;
+            }
+            if *pos == start {
+                return None;
+            }
+            input[start..*pos].iter().collect::<String>().parse().ok()
+        };
+
+        while let Some(c) = fmt.next() {
+            if c != '%' {
+                if pos < input.len() && input[pos] == c {
+                    pos += 1;
+                    continue;
+                }
+                return Err(mismatch());
+            }
+            let directive = fmt.next().ok_or_else(|| {
+                crate::value_error(format!("stray %% in format '{}'", format))
+            })?;
+            match directive {
+                '%' => {
+                    if pos < input.len() && input[pos] == '%' {
+                        pos += 1;
+                    } else {
+                        return Err(mismatch());
+                    }
+                }
+                'Y' => year = take_number(&mut pos, 4).ok_or_else(mismatch)? as i32,
+                'm' => month = take_number(&mut pos, 2).ok_or_else(mismatch)? as u32,
+                'd' => day = take_number(&mut pos, 2).ok_or_else(mismatch)? as u32,
+                'H' => hour = take_number(&mut pos, 2).ok_or_else(mismatch)? as u32,
+                'I' => hour12 = Some(take_number(&mut pos, 2).ok_or_else(mismatch)? as u32),
+                'M' => minute = take_number(&mut pos, 2).ok_or_else(mismatch)? as u32,
+                'S' => second = take_number(&mut pos, 2).ok_or_else(mismatch)? as u32,
+                'f' => {
+                    // 1..=6 digits, right-padded: ".25" is 250000 µs.
+                    let start = pos;
+                    let n = take_number(&mut pos, 6).ok_or_else(mismatch)?;
+                    let width = pos - start;
+                    microsecond = (n as u32) * 10u32.pow(6 - width as u32);
+                }
+                'b' | 'B' => {
+                    let full = directive == 'B';
+                    let mut found = None;
+                    for m in 1..=12u32 {
+                        let name = if full { month_name(m) } else { month_abbr(m) };
+                        let matches = input[pos..]
+                            .iter()
+                            .take(name.chars().count())
+                            .collect::<String>()
+                            .eq_ignore_ascii_case(name);
+                        if matches {
+                            found = Some((m, name.chars().count()));
+                            break;
+                        }
+                    }
+                    let (m, len) = found.ok_or_else(mismatch)?;
+                    month = m;
+                    pos += len;
+                }
+                'p' => {
+                    let rest: String = input[pos..].iter().take(2).collect();
+                    if rest.eq_ignore_ascii_case("am") {
+                        pm = Some(false);
+                        pos += 2;
+                    } else if rest.eq_ignore_ascii_case("pm") {
+                        pm = Some(true);
+                        pos += 2;
+                    } else {
+                        return Err(mismatch());
+                    }
+                }
+                other => {
+                    return Err(crate::value_error(format!(
+                        "'{}' is a bad directive in format '{}'",
+                        other, format
+                    )));
+                }
+            }
+        }
+        if pos < input.len() {
+            let rest: String = input[pos..].iter().collect();
+            return Err(crate::value_error(format!(
+                "unconverted data remains: {}",
+                rest
+            )));
+        }
+        if let Some(h12) = hour12 {
+            if !(1..=12).contains(&h12) {
+                return Err(mismatch());
+            }
+            hour = match pm {
+                Some(true) => {
+                    if h12 == 12 { 12 } else { h12 + 12 }
+                }
+                _ => {
+                    if h12 == 12 { 0 } else { h12 }
+                }
+            };
+        }
+        let date = date::new(year, month, day).map_err(|_| mismatch())?;
+        let time = time::new(hour, minute, Some(second), Some(microsecond))
+            .map_err(|_| mismatch())?;
+        Ok(Self { date, time })
+    }
 }
 
 impl fmt::Display for timedelta {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.days != 0 {
-            write!(f, "{} day{}, ", self.days, if self.days == 1 { "" } else { "s" })?;
+            // Python pluralizes on |days| — "-1 day, 1:00:00" is singular.
+            let plural = if self.days.abs() == 1 { "" } else { "s" };
+            write!(f, "{} day{}, ", self.days, plural)?;
         }
         
         let hours = self.seconds / 3600;

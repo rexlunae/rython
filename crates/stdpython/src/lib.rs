@@ -3124,6 +3124,8 @@ pub use stdlib::math;
 pub use stdlib::random;
 #[cfg(feature = "std")]
 pub use stdlib::datetime;
+#[cfg(feature = "std")]
+pub use stdlib::time;
 pub use stdlib::string;
 pub use stdlib::json;
 pub use stdlib::collections;

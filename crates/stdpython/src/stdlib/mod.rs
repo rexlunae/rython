@@ -38,6 +38,10 @@ pub mod random;
 #[cfg(feature = "std")]
 pub mod datetime;
 
+/// Python time module - wall-clock and monotonic time, sleep
+#[cfg(feature = "std")]
+pub mod time;
+
 /// Python string module - string constants and classes
 pub mod string;
 

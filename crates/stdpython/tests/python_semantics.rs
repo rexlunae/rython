@@ -1184,3 +1184,144 @@ mod builtin_frozenset {
         assert!(!frozenset(Vec::<i64>::new()).is_truthy());
     }
 }
+
+// ---------------------------------------------------------------------------
+// datetime arithmetic, strptime, and the time module (issue #19)
+// All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod datetime_arithmetic {
+    use stdpython::datetime::{date, datetime, timedelta};
+
+    fn td(days: i64, hours: i64, minutes: i64) -> timedelta {
+        timedelta::new(Some(days), None, None, None, Some(minutes), Some(hours), None)
+    }
+
+    #[test]
+    fn date_differences_and_shifts_match_python() {
+        let d1 = date::new(2024, 3, 1).unwrap();
+        let d2 = date::new(2024, 2, 27).unwrap();
+        let gap = d1 - d2;
+        assert_eq!((gap.days, gap.seconds, gap.microseconds), (3, 0, 0));
+        assert_eq!(format!("{}", gap), "3 days, 0:00:00");
+        assert_eq!(format!("{}", d1 + td(3, 0, 0)), "2024-03-04");
+        assert_eq!(format!("{}", d1 - td(30, 0, 0)), "2024-01-31");
+        // Python's date math uses only whole days from the timedelta:
+        // date(2024,1,1) + timedelta(hours=25) == 2024-01-02, and
+        // date(2024,1,2) - timedelta(hours=23) stays 2024-01-02.
+        let jan1 = date::new(2024, 1, 1).unwrap();
+        assert_eq!(format!("{}", jan1 + td(0, 25, 0)), "2024-01-02");
+        let jan2 = date::new(2024, 1, 2).unwrap();
+        assert_eq!(format!("{}", jan2 - td(0, 23, 0)), "2024-01-02");
+        assert_eq!(format!("{}", jan2 - td(0, 25, 0)), "2024-01-01");
+    }
+
+    #[test]
+    fn datetime_arithmetic_keeps_microseconds_exact() {
+        let dt1 = datetime::new(2024, 3, 1, Some(10), Some(30), Some(0), None).unwrap();
+        let dt2 =
+            datetime::new(2024, 2, 28, Some(23), Some(45), Some(30), Some(500_000)).unwrap();
+        let diff = dt1 - dt2;
+        assert_eq!(format!("{}", diff), "1 day, 10:44:29.500000");
+        assert_eq!(diff.total_seconds(), 125069.5);
+        assert_eq!(format!("{}", dt1 + td(0, 25, 90)), "2024-03-02 13:00:00");
+        let micro = timedelta::new(None, None, Some(1), None, None, None, None);
+        assert_eq!(format!("{}", dt1 - micro), "2024-03-01 10:29:59.999999");
+    }
+
+    #[test]
+    fn timedelta_algebra_and_display_match_python() {
+        let a = td(1, 2, 0) + td(0, 0, 30);
+        assert_eq!(format!("{}", a), "1 day, 2:30:00");
+        assert_eq!(format!("{}", -a), "-2 days, 21:30:00");
+        assert_eq!(format!("{}", a * 3), "3 days, 7:30:00");
+        let sec = timedelta::new(None, Some(1), None, None, None, None, None);
+        let two_micro = timedelta::new(None, None, Some(2), None, None, None, None);
+        assert_eq!(format!("{}", sec - two_micro), "0:00:00.999998");
+        // Singular/plural follows |days|: Python says "-1 day, 1:00:00".
+        let neg = timedelta::new(Some(-1), Some(3600), None, None, None, None, None);
+        assert_eq!(format!("{}", neg), "-1 day, 1:00:00");
+        assert_eq!(format!("{}", td(2, 0, 0)), "2 days, 0:00:00");
+        assert_eq!(
+            format!("{}", timedelta::new(None, None, None, None, None, None, None)),
+            "0:00:00"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "date value out of range")]
+    fn date_overflow_fails_loudly_like_pythons_overflowerror() {
+        let _ = date::new(9999, 12, 31).unwrap() + td(1, 0, 0);
+    }
+}
+
+mod datetime_strptime {
+    use stdpython::datetime::datetime;
+
+    #[test]
+    fn common_formats_parse_exactly() {
+        let dt = datetime::strptime("2024-01-05 08:30:15", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(format!("{}", dt), "2024-01-05 08:30:15");
+        // Missing fields default to 1900-01-01 00:00:00, as in Python.
+        let dt = datetime::strptime("05/01/2024", "%d/%m/%Y").unwrap();
+        assert_eq!(format!("{}", dt), "2024-01-05 00:00:00");
+        let dt = datetime::strptime("Jan 5 2024", "%b %d %Y").unwrap();
+        assert_eq!(format!("{}", dt), "2024-01-05 00:00:00");
+        let dt = datetime::strptime("January 5 2024", "%B %d %Y").unwrap();
+        assert_eq!(format!("{}", dt), "2024-01-05 00:00:00");
+        // %f right-pads: ".250" is 250000 microseconds.
+        let dt = datetime::strptime("2024-01-05T08:30:15.250", "%Y-%m-%dT%H:%M:%S.%f").unwrap();
+        assert_eq!(dt.time_component().microsecond, 250_000);
+        // %I/%p: 7:5 PM is 19:05; 12 AM is 0; 12 PM stays 12.
+        let dt = datetime::strptime("7:5 PM", "%I:%M %p").unwrap();
+        assert_eq!(dt.time_component().hour, 19);
+        let dt = datetime::strptime("12:00 AM", "%I:%M %p").unwrap();
+        assert_eq!(dt.time_component().hour, 0);
+        let dt = datetime::strptime("12:00 PM", "%I:%M %p").unwrap();
+        assert_eq!(dt.time_component().hour, 12);
+    }
+
+    #[test]
+    fn errors_carry_pythons_messages() {
+        let e = datetime::strptime("2024-13-05", "%Y-%m-%d").unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "ValueError: time data '2024-13-05' does not match format '%Y-%m-%d'"
+        );
+        let e = datetime::strptime("abc", "%Y").unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "ValueError: time data 'abc' does not match format '%Y'"
+        );
+        let e = datetime::strptime("2024 rest", "%Y").unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: unconverted data remains:  rest");
+        let e = datetime::strptime("2024", "%Q").unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "ValueError: 'Q' is a bad directive in format '%Q'"
+        );
+    }
+}
+
+mod time_module {
+    #[test]
+    fn wall_clock_and_monotonic_behave() {
+        let t = stdpython::time::time();
+        // A sane wall clock: after 2020, before 2100.
+        assert!(t > 1_577_836_800.0 && t < 4_102_444_800.0, "time(): {}", t);
+        let ns = stdpython::time::time_ns();
+        assert!((ns as f64 / 1e9 - t).abs() < 5.0, "time_ns disagrees with time()");
+
+        let a = stdpython::time::monotonic();
+        stdpython::time::sleep(0.01);
+        let b = stdpython::time::monotonic();
+        assert!(b >= a + 0.009, "monotonic did not advance across sleep");
+        assert!(stdpython::time::perf_counter() >= b);
+    }
+
+    #[test]
+    #[should_panic(expected = "sleep length must be non-negative")]
+    fn negative_sleep_fails_loudly() {
+        stdpython::time::sleep(-1.0);
+    }
+}
