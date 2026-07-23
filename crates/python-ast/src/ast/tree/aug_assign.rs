@@ -80,7 +80,9 @@ impl CodeGen for AugAssign {
         
         // Generate the appropriate augmented assignment operator
         match self.op {
-            BinOps::Add => Ok(quote!(#target += #value)),
+            // `+=` mirrors Python's `+` (string concat, list concat,
+            // numeric promotion) via PyAdd.
+            BinOps::Add => Ok(quote!(#target = (#target).py_add(&(#value)))),
             BinOps::Sub => Ok(quote!(#target -= #value)),
             BinOps::Mult => Ok(quote!(#target *= #value)),
             BinOps::Div => Ok(quote!(#target /= #value)),

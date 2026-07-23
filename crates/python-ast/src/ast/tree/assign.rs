@@ -95,14 +95,49 @@ impl<'a> CodeGen for Assign {
             })
         };
 
+        // Subscript stores don't go through the Load-position lowering
+        // (which reads via py_index): `x[i] = v` follows Python index rules
+        // through py_set_index — negatives from the end, catchable
+        // IndexError for lists, insert-or-overwrite for dicts.
+        let render_subscript_store = |sub: &crate::Subscript,
+                                      value: &TokenStream|
+         -> Result<TokenStream, Box<dyn std::error::Error>> {
+            let receiver = sub
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            match &sub.kind {
+                crate::SubscriptKind::Index(index) => {
+                    let index = index
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    Ok(quote!((#receiver).py_set_index(#index, #value)?;))
+                }
+                crate::SubscriptKind::Slice { .. } => Err(
+                    "slice assignment (`x[a:b] = ...`) is not yet supported"
+                        .to_string()
+                        .into(),
+                ),
+            }
+        };
+
+        let render = |target: &ExprType,
+                      value: &TokenStream|
+         -> Result<TokenStream, Box<dyn std::error::Error>> {
+            match target {
+                ExprType::Subscript(sub) => render_subscript_store(sub, value),
+                _ => render_one(target, value),
+            }
+        };
+
         if self.targets.len() == 1 {
-            render_one(&self.targets[0], &value)
+            render(&self.targets[0], &value)
         } else {
             // Chained assignment (`a = b = expr`): Python evaluates the value
             // once and assigns it to each target in turn.
             let mut stream = quote!(let __rython_chain = #value;);
             for target in &self.targets {
-                stream.extend(render_one(target, &quote!(__rython_chain.clone()))?);
+                stream.extend(render(target, &quote!(__rython_chain.clone()))?);
             }
             Ok(stream)
         }

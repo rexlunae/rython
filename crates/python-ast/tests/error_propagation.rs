@@ -37,9 +37,10 @@ fn del_statement_returns_err_with_location() {
 
 /// Slice subscripts are not yet representable; they must error, not panic.
 #[test]
-fn slice_subscript_returns_err() {
+fn slice_subscript_parses() {
+    // Slices are supported now: they parse and lower to py_slice.
     let result = parse("a[1:3]", "slice_test.py");
-    assert!(result.is_err(), "slice subscript should be rejected");
+    assert!(result.is_ok(), "slice subscript should parse");
 }
 
 /// Syntax errors keep flowing through the enhanced parser with location and

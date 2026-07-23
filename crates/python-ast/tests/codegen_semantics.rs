@@ -812,6 +812,74 @@ fn str_parameters_accept_borrowed_and_owned_strings() {
 }
 
 #[test]
+fn subscripts_lower_through_py_index() {
+    // Reads follow Python index rules (negatives, catchable IndexError).
+    let out = compile("def f(items: list[int], i: int) -> int:\n    return items[i]\n", "sub.py");
+    assert!(out.contains("(items) . py_index (i) ?"), "generated: {}", out);
+
+    // Stores go through py_set_index, not the Load lowering.
+    let out = compile(
+        "def f(items: list[int]):\n    items[0] = 5\n",
+        "substore.py",
+    );
+    assert!(
+        out.contains("(items) . py_set_index (0 , 5) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(!out.contains("py_index (0) ? ="), "generated: {}", out);
+
+    // Dict stores insert; catchable KeyError on reads comes from PyIndex.
+    let out = compile("def f():\n    d = {\"a\": 1}\n    d[\"b\"] = 2\n    return d[\"a\"]\n", "dictsub.py");
+    assert!(out.contains("py_set_index (\"b\" , 2) ?"), "generated: {}", out);
+    assert!(out.contains("py_index (\"a\") ?"), "generated: {}", out);
+}
+
+#[test]
+fn slices_lower_through_py_slice() {
+    let out = compile("def f(items: list[int]):\n    return items[1:3]\n", "slice1.py");
+    assert!(
+        out.contains("py_slice (Some (1) , Some (3) , None)"),
+        "generated: {}",
+        out
+    );
+
+    let out = compile("def f(s: str) -> str:\n    return s[::-1]\n", "slice2.py");
+    assert!(
+        out.contains("py_slice (None , None , Some (- 1))"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn container_annotations_map_to_rust_types() {
+    let out = compile("def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n", "generics.py");
+    assert!(out.contains("a : Vec < i64 >"), "generated: {}", out);
+    assert!(
+        out.contains("b : std :: collections :: HashMap < String , i64 >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("c : std :: collections :: HashSet < i64 >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn addition_lowers_through_py_add() {
+    // Python + covers String + String and list concat, which Rust's Add
+    // doesn't; operands are borrowed so variables stay usable.
+    let out = compile("def f(a: str, b: str) -> str:\n    return a + b\n", "addstr.py");
+    assert!(out.contains("(a) . py_add (& (b))"), "generated: {}", out);
+
+    let out = compile("def f(n: int) -> int:\n    n += 1\n    return n\n", "addaug.py");
+    assert!(out.contains("n = (n) . py_add (& (1))"), "generated: {}", out);
+}
+
+#[test]
 fn membership_uses_py_contains() {
     let out = compile("found = x in items", "in.py");
     assert!(out.contains("py_contains"), "generated: {}", out);

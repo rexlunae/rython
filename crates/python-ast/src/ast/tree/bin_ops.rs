@@ -193,26 +193,15 @@ impl CodeGen for BinOp {
             }
         }
 
-        // Special handling for list addition (concatenation)
+        // Python `+` covers cases Rust's Add doesn't (String + String,
+        // int/float promotion, list concatenation): lower through the
+        // stdpython PyAdd trait, which borrows both operands.
         if matches!(self.op, BinOps::Add) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let right = self.right.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let left_str = left.to_string();
-            let right_str = right.to_string();
-            
-            // Check if we're adding vectors or lists together
-            if left_str.contains("vec !") || right_str.contains("iter ()") || right_str.contains("sys :: argv") {
-                // This is vector concatenation - use Vec::extend pattern
-                return Ok(quote! {
-                    {
-                        let mut vec = #left;
-                        vec.extend(#right);
-                        vec
-                    }
-                });
-            }
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            return Ok(quote!((#left).py_add(&(#right))));
         }
-        
+
         // Use the generic binary operation implementation for everything else
         self.generate_rust_code(ctx, options, symbols)
     }

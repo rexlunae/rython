@@ -1517,6 +1517,190 @@ impl PyStrOps for str {
 }
 
 // ============================================================================
+// PYTHON `+`: numeric addition, string and list concatenation
+// ============================================================================
+
+/// Python's `+`, which Rust's Add can't fully model: String + String,
+/// int/float promotion, and list concatenation. Operands are borrowed so
+/// `a + b` doesn't consume the variables.
+pub trait PyAdd<R: ?Sized> {
+    type Output;
+    fn py_add(&self, rhs: &R) -> Self::Output;
+}
+
+macro_rules! numeric_add {
+    ($($l:ty, $r:ty => $out:ty),* $(,)?) => {
+        $(impl PyAdd<$r> for $l {
+            type Output = $out;
+            fn py_add(&self, rhs: &$r) -> $out {
+                (*self as $out) + (*rhs as $out)
+            }
+        })*
+    };
+}
+
+numeric_add!(
+    i64, i64 => i64,
+    f64, f64 => f64,
+    i64, f64 => f64,
+    f64, i64 => f64,
+);
+
+macro_rules! string_add {
+    ($($l:ty, $r:ty),* $(,)?) => {
+        $(impl PyAdd<$r> for $l {
+            type Output = String;
+            fn py_add(&self, rhs: &$r) -> String {
+                format!("{}{}", self, rhs)
+            }
+        })*
+    };
+}
+
+string_add!(
+    String, String,
+    String, &str,
+    &str, String,
+    &str, &str,
+    str, String,
+    str, &str,
+    String, str,
+    &str, str,
+    str, str,
+);
+
+/// Python list concatenation: [1] + [2] == [1, 2].
+impl<T: Clone> PyAdd<Vec<T>> for Vec<T> {
+    type Output = Vec<T>;
+    fn py_add(&self, rhs: &Vec<T>) -> Vec<T> {
+        let mut out = self.clone();
+        out.extend_from_slice(rhs);
+        out
+    }
+}
+
+// ============================================================================
+// SUBSCRIPTS: x[i] reads, x[i] = v stores, and x[a:b:c] slices
+// ============================================================================
+
+/// Normalize a Python index against a length: negative counts from the
+/// end. Returns None when out of range (the caller raises).
+fn normalize_index(index: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let idx = if index < 0 { len + index } else { index };
+    if idx < 0 || idx >= len {
+        None
+    } else {
+        Some(idx as usize)
+    }
+}
+
+/// Python's subscript read `x[i]`: negative indices count from the end,
+/// out-of-range raises IndexError, and a missing dict key raises KeyError —
+/// both catchable by an enclosing try.
+pub trait PyIndex<I> {
+    type Output;
+    fn py_index(&self, index: I) -> Result<Self::Output, PyException>;
+}
+
+impl<T: Clone> PyIndex<i64> for Vec<T> {
+    type Output = T;
+    fn py_index(&self, index: i64) -> Result<T, PyException> {
+        normalize_index(index, self.len())
+            .map(|i| self[i].clone())
+            .ok_or_else(|| PyException::new("IndexError", "list index out of range"))
+    }
+}
+
+/// Python string indexing is by character (code point), yielding a
+/// one-character string.
+impl PyIndex<i64> for str {
+    type Output = String;
+    fn py_index(&self, index: i64) -> Result<String, PyException> {
+        let count = self.chars().count();
+        normalize_index(index, count)
+            .and_then(|i| self.chars().nth(i))
+            .map(|c| c.to_string())
+            .ok_or_else(|| PyException::new("IndexError", "string index out of range"))
+    }
+}
+
+impl PyIndex<i64> for String {
+    type Output = String;
+    fn py_index(&self, index: i64) -> Result<String, PyException> {
+        self.as_str().py_index(index)
+    }
+}
+
+impl<K: Eq + Hash + Debug, V: Clone> PyIndex<K> for HashMap<K, V> {
+    type Output = V;
+    fn py_index(&self, key: K) -> Result<V, PyException> {
+        self.get(&key)
+            .cloned()
+            .ok_or_else(|| PyException::new("KeyError", format!("{:?}", key)))
+    }
+}
+
+/// Python's subscript store `x[i] = v`: Vec stores follow Python index
+/// rules and raise IndexError; dict stores insert or overwrite.
+pub trait PySetIndex<I, V> {
+    fn py_set_index(&mut self, index: I, value: V) -> Result<(), PyException>;
+}
+
+impl<T> PySetIndex<i64, T> for Vec<T> {
+    fn py_set_index(&mut self, index: i64, value: T) -> Result<(), PyException> {
+        let len = self.len();
+        match normalize_index(index, len) {
+            Some(i) => {
+                self[i] = value;
+                Ok(())
+            }
+            None => Err(PyException::new(
+                "IndexError",
+                "list assignment index out of range",
+            )),
+        }
+    }
+}
+
+impl<K: Eq + Hash, V> PySetIndex<K, V> for HashMap<K, V> {
+    fn py_set_index(&mut self, key: K, value: V) -> Result<(), PyException> {
+        self.insert(key, value);
+        Ok(())
+    }
+}
+
+/// Python slicing `x[a:b:c]`: clamps out-of-range bounds (never raises),
+/// supports negative bounds and steps. Lists slice to lists, strings by
+/// character to strings.
+pub trait PySlice {
+    type Output;
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Self::Output;
+}
+
+impl<T: Clone> PySlice for Vec<T> {
+    type Output = Vec<T>;
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Vec<T> {
+        slice(self, start, stop, step)
+    }
+}
+
+impl PySlice for str {
+    type Output = String;
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> String {
+        let chars: Vec<char> = self.chars().collect();
+        slice(&chars, start, stop, step).into_iter().collect()
+    }
+}
+
+impl PySlice for String {
+    type Output = String;
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> String {
+        self.as_str().py_slice(start, stop, step)
+    }
+}
+
+// ============================================================================
 // MEMBERSHIP (the `in` operator)
 // ============================================================================
 
