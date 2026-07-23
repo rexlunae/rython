@@ -300,6 +300,9 @@ fn py_list_and_str_methods_match_python() {
     // "hello".find("l") == 2; missing -> -1 (not None/Option)
     assert_eq!("hello".py_find("l"), 2);
     assert_eq!("hello".py_find("z"), -1);
+    // Python indexes by character, not byte: "café x".find("x") == 5
+    assert_eq!("café x".py_find("x"), 5);
+    assert_eq!("日本語abc".py_find("abc"), 3);
     // "a,b,,c".split(",") == ['a', 'b', '', 'c'] (keeps empties)
     assert_eq!("a,b,,c".py_split(","), vec!["a", "b", "", "c"]);
     // "  a b  c ".split() == ['a', 'b', 'c'] (whitespace runs, no empties)
