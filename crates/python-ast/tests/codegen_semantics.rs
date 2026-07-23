@@ -1994,3 +1994,47 @@ fn runtime_module_imports_lower_to_nothing_and_aliases_stay_loud() {
     let err = compile_err("import time as t\n", "alias.py");
     assert!(err.contains("aliasing"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// itertools lowering: keyword variants and by-reference iterables
+// ---------------------------------------------------------------------------
+
+#[test]
+fn itertools_keyword_spellings_lower_to_variants() {
+    let base = "from itertools import accumulate, product, zip_longest, groupby\n";
+    let out = compile(&format!("{}a = accumulate([1, 2])\n", base), "i1.py");
+    assert!(out.contains("accumulate_sum (& (vec ! [1 , 2]))"), "generated: {}", out);
+    let out = compile(
+        &format!("{}a = accumulate([1, 2], initial=10)\n", base),
+        "i2.py",
+    );
+    assert!(out.contains("accumulate_sum_initial ("), "generated: {}", out);
+    let out = compile(
+        &format!("{}a = accumulate([1, 2], lambda x, y: x * y)\n", base),
+        "i3.py",
+    );
+    assert!(out.contains("accumulate_func ("), "generated: {}", out);
+
+    let out = compile(&format!("{}p = product([1], [2])\n", base), "i4.py");
+    assert!(out.contains("product2 ("), "generated: {}", out);
+    let out = compile(&format!("{}p = product([1], repeat=2)\n", base), "i5.py");
+    assert!(out.contains("product_repeat2 ("), "generated: {}", out);
+    // repeat must be a literal arity — tuple width is a compile-time shape.
+    let err = compile_err(&format!("{}p = product([1], repeat=5)\n", base), "i6.py");
+    assert!(err.contains("literal 2 or 3"), "error: {}", err);
+
+    let out = compile(
+        &format!("{}z = zip_longest([1], [2], fillvalue=0)\n", base),
+        "i7.py",
+    );
+    assert!(out.contains("zip_longest_fill ("), "generated: {}", out);
+    let out = compile(
+        &format!("{}g = groupby([1], key=lambda x: x)\n", base),
+        "i8.py",
+    );
+    assert!(out.contains("groupby_key ("), "generated: {}", out);
+
+    // Unknown keywords stay loud.
+    let err = compile_err(&format!("{}g = groupby([1], foo=1)\n", base), "i9.py");
+    assert!(err.contains("unexpected"), "error: {}", err);
+}

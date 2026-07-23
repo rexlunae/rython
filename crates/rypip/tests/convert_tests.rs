@@ -1378,3 +1378,117 @@ fn datetime_and_time_match_python_at_runtime() {
         "datetime/time semantics diverged from CPython"
     );
 }
+
+#[test]
+fn itertools_gaps_match_python_at_runtime() {
+    // accumulate (default, func, initial=), product (pairs and repeat=),
+    // combinations_with_replacement, pairwise, zip_longest with
+    // fillvalue=, consecutive groupby, and starmap, through generated
+    // code.
+    let scratch = Scratch::new("itertools");
+    let file = scratch.path().join("it_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from itertools import accumulate, product, combinations_with_replacement, pairwise, zip_longest, groupby, starmap\n",
+            "\n",
+            "def main() -> int:\n",
+            "    for v in accumulate([1, 2, 3, 4]):\n",
+            "        print(f\"acc={v}\")\n",
+            "    for v in accumulate([1, 2, 3], initial=100):\n",
+            "        print(f\"acci={v}\")\n",
+            "    for v in accumulate([1, 2, 3, 4], lambda a, b: a * b):\n",
+            "        print(f\"accf={v}\")\n",
+            "    for a, b in product([1, 2], [10, 20]):\n",
+            "        print(f\"prod={a},{b}\")\n",
+            "    for a, b in product([0, 1], repeat=2):\n",
+            "        print(f\"rep={a},{b}\")\n",
+            "    for c in combinations_with_replacement([1, 2, 3], 2):\n",
+            "        print(f\"cwr={c[0]},{c[1]}\")\n",
+            "    for a, b in pairwise([1, 2, 3, 4]):\n",
+            "        print(f\"pw={a},{b}\")\n",
+            "    for a, b in zip_longest([1], [10, 20, 30], fillvalue=0):\n",
+            "        print(f\"zl={a},{b}\")\n",
+            "    for k, g in groupby([1, 1, 2, 2, 2, 1]):\n",
+            "        total = 0\n",
+            "        for _x in g:\n",
+            "            total += 1\n",
+            "        print(f\"g={k}:{total}\")\n",
+            "    for v in starmap(lambda a, b: a * b, [(2, 3), (4, 5)]):\n",
+            "        print(f\"sm={v}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/it_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "acc=1", "acc=3", "acc=6", "acc=10",
+            "acci=100", "acci=101", "acci=103", "acci=106",
+            "accf=1", "accf=2", "accf=6", "accf=24",
+            "prod=1,10", "prod=1,20", "prod=2,10", "prod=2,20",
+            "rep=0,0", "rep=0,1", "rep=1,0", "rep=1,1",
+            "cwr=1,1", "cwr=1,2", "cwr=1,3", "cwr=2,2", "cwr=2,3", "cwr=3,3",
+            "pw=1,2", "pw=2,3", "pw=3,4",
+            "zl=1,10", "zl=0,20", "zl=0,30",
+            "g=1:2", "g=2:3", "g=1:1",
+            "sm=6", "sm=20",
+        ],
+        "itertools semantics diverged from CPython"
+    );
+
+    // Deny mode regression: calls rewritten to variant functions must not
+    // orphan the base imports (`use ...::accumulate;`), or
+    // #![deny(unused_imports)] fails this perfectly clean source. A
+    // LIBRARY module, because entry modules have a separate pre-existing
+    // deny-mode issue (the lib-side copy of fn main is dead code).
+    let lib_file = scratch.path().join("it_lib.py");
+    fs::write(
+        &lib_file,
+        concat!(
+            "from itertools import accumulate, product\n",
+            "\n",
+            "def running(xs: list[int]) -> list[int]:\n",
+            "    return accumulate(xs, initial=0)\n",
+            "\n",
+            "def grid(xs: list[int]) -> int:\n",
+            "    total = 0\n",
+            "    for a, b in product(xs, repeat=2):\n",
+            "        total += a * b\n",
+            "    return total\n",
+        ),
+    )
+    .unwrap();
+    let deny_out = scratch.path().join("crate-deny");
+    let lib_pkg = rypip::discover(&lib_file).expect("discover");
+    let krate = rypip::convert(
+        &lib_pkg,
+        &deny_out,
+        &ConvertOptions {
+            warnings: rypip::convert::WarningMode::Deny,
+            ..Default::default()
+        },
+    )
+    .expect("deny-mode convert of a clean module");
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "deny-mode generated crate failed to compile (orphaned imports?)"
+    );
+}

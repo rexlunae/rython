@@ -413,6 +413,201 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // itertools functions imported via `from itertools import ...`:
+        // keyword spellings (initial=, repeat=, fillvalue=, key=) map to
+        // arity-specific runtime variants, and iterable arguments are
+        // borrowed (the runtime takes slices; Python calls never consume).
+        if let ExprType::Name(n) = self.func.as_ref() {
+            let from_itertools = matches!(
+                symbols.get(&n.id),
+                Some(SymbolTableNode::ImportFrom(import))
+                    if import.module == "itertools"
+            );
+            let handled = matches!(
+                n.id.as_str(),
+                "accumulate"
+                    | "product"
+                    | "zip_longest"
+                    | "groupby"
+                    | "pairwise"
+                    | "combinations"
+                    | "combinations_with_replacement"
+                    | "permutations"
+                    | "starmap"
+            );
+            if from_itertools && handled {
+                let name = n.id.as_str();
+                let mut rendered = Vec::new();
+                for arg in &self.args {
+                    rendered.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                let render = |e: crate::ExprType| {
+                    e.to_rust(ctx.clone(), options.clone(), symbols.clone())
+                };
+                let kw_of = |allowed: &[&str]| -> Result<
+                    Vec<Option<crate::ExprType>>,
+                    Box<dyn std::error::Error>,
+                > {
+                    let mut out: Vec<Option<crate::ExprType>> = vec![None; allowed.len()];
+                    for kw in &self.keywords {
+                        let idx = kw
+                            .arg
+                            .as_deref()
+                            .and_then(|k| allowed.iter().position(|a| *a == k));
+                        match idx {
+                            Some(i) if out[i].is_none() => out[i] = Some(kw.value.clone()),
+                            _ => {
+                                return Err(format!(
+                                    "{}() got an unexpected or duplicate keyword \
+                                     argument '{}'",
+                                    name,
+                                    kw.arg.as_deref().unwrap_or("**kwargs")
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    Ok(out)
+                };
+                match name {
+                    "accumulate" => {
+                        let kws = kw_of(&["initial"])?;
+                        let initial = kws.into_iter().next().unwrap();
+                        let (xs, func) = match rendered.as_slice() {
+                            [xs] => (xs.clone(), None),
+                            [xs, f] => (xs.clone(), Some(f.clone())),
+                            _ => {
+                                return Err("accumulate() takes 1 or 2 positional \
+                                            arguments"
+                                    .to_string()
+                                    .into());
+                            }
+                        };
+                        return Ok(match (func, initial) {
+                            (None, None) => quote!(accumulate_sum(&(#xs))),
+                            (Some(f), None) => quote!(accumulate_func(&(#xs), #f)),
+                            (None, Some(init)) => {
+                                let init = render(init)?;
+                                quote!(accumulate_sum_initial(&(#xs), #init))
+                            }
+                            (Some(f), Some(init)) => {
+                                let init = render(init)?;
+                                quote!(accumulate_func_initial(&(#xs), #f, #init))
+                            }
+                        });
+                    }
+                    "product" => {
+                        let kws = kw_of(&["repeat"])?;
+                        let repeat = kws.into_iter().next().unwrap();
+                        if let Some(r) = repeat {
+                            if rendered.len() != 1 {
+                                return Err("product(iterable, repeat=n) takes one \
+                                            iterable"
+                                    .to_string()
+                                    .into());
+                            }
+                            let r = render(r)?;
+                            let xs = &rendered[0];
+                            return match r.to_string().as_str() {
+                                "2" => Ok(quote!(product_repeat2(&(#xs)))),
+                                "3" => Ok(quote!(product_repeat3(&(#xs)))),
+                                other => Err(format!(
+                                    "product() repeat must be the literal 2 or 3 \
+                                     (tuple arity is a compile-time shape); got {}",
+                                    other
+                                )
+                                .into()),
+                            };
+                        }
+                        return match rendered.as_slice() {
+                            [a, b] => Ok(quote!(product2(&(#a), &(#b)))),
+                            [a, b, c] => Ok(quote!(product3(&(#a), &(#b), &(#c)))),
+                            _ => Err("product() supports 2 or 3 iterables, or one \
+                                      iterable with repeat=2/3"
+                                .to_string()
+                                .into()),
+                        };
+                    }
+                    "zip_longest" => {
+                        let kws = kw_of(&["fillvalue"])?;
+                        let fill = kws.into_iter().next().unwrap();
+                        if rendered.len() != 2 {
+                            return Err("zip_longest() supports exactly 2 iterables"
+                                .to_string()
+                                .into());
+                        }
+                        let (a, b) = (&rendered[0], &rendered[1]);
+                        return Ok(match fill {
+                            Some(v) => {
+                                let v = render(v)?;
+                                quote!(zip_longest_fill(&(#a), &(#b), #v))
+                            }
+                            None => quote!(zip_longest(&(#a), &(#b))),
+                        });
+                    }
+                    "groupby" => {
+                        let kws = kw_of(&["key"])?;
+                        let key = kws.into_iter().next().unwrap();
+                        if rendered.len() != 1 {
+                            return Err("groupby() takes one iterable".to_string().into());
+                        }
+                        let xs = &rendered[0];
+                        return Ok(match key {
+                            Some(f) => {
+                                let f = render(f)?;
+                                quote!(groupby_key(&(#xs), #f))
+                            }
+                            None => quote!(groupby(&(#xs))),
+                        });
+                    }
+                    "pairwise" => {
+                        kw_of(&[])?;
+                        if rendered.len() != 1 {
+                            return Err("pairwise() takes one iterable".to_string().into());
+                        }
+                        let xs = &rendered[0];
+                        return Ok(quote!(pairwise(&(#xs))));
+                    }
+                    "combinations" | "combinations_with_replacement" => {
+                        kw_of(&[])?;
+                        if rendered.len() != 2 {
+                            return Err(
+                                format!("{}() takes an iterable and r", name).into()
+                            );
+                        }
+                        let f = format_ident!("{}", name);
+                        let (xs, r) = (&rendered[0], &rendered[1]);
+                        return Ok(quote!(#f(&(#xs), (#r) as usize)));
+                    }
+                    "permutations" => {
+                        kw_of(&[])?;
+                        return match rendered.as_slice() {
+                            [xs] => Ok(quote!(permutations(&(#xs), None))),
+                            [xs, r] => Ok(quote!(permutations(&(#xs), Some((#r) as usize)))),
+                            _ => Err("permutations() takes an iterable and optional r"
+                                .to_string()
+                                .into()),
+                        };
+                    }
+                    "starmap" => {
+                        kw_of(&[])?;
+                        if rendered.len() != 2 {
+                            return Err("starmap() takes a function and an iterable"
+                                .to_string()
+                                .into());
+                        }
+                        let (f, xs) = (&rendered[0], &rendered[1]);
+                        return Ok(quote!(starmap(#f, &(#xs))));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
         // Constructing a class instance: `Point(args)` lowers to
         // `Point::new(args)?`, with arguments resolved against __init__'s
         // signature (minus self) so keywords and defaults follow Python
