@@ -1641,6 +1641,34 @@ impl<K: Eq + Hash + Debug, V: Clone> PyIndex<K> for HashMap<K, V> {
     }
 }
 
+/// Mutable subscript access for stores through nested containers
+/// (`grid[i][j] = v`): yields a mutable reference into the container so
+/// the write lands in place, never on a clone. Strings are excluded —
+/// Python strings are immutable (`s[i] = c` is a TypeError).
+pub trait PyIndexMut<I> {
+    type Output;
+    fn py_index_mut(&mut self, index: I) -> Result<&mut Self::Output, PyException>;
+}
+
+impl<T> PyIndexMut<i64> for Vec<T> {
+    type Output = T;
+    fn py_index_mut(&mut self, index: i64) -> Result<&mut T, PyException> {
+        let len = self.len();
+        normalize_index(index, len)
+            .map(move |i| &mut self[i])
+            .ok_or_else(|| PyException::new("IndexError", "list index out of range"))
+    }
+}
+
+impl<K: Eq + Hash + Debug, V> PyIndexMut<K> for HashMap<K, V> {
+    type Output = V;
+    fn py_index_mut(&mut self, key: K) -> Result<&mut V, PyException> {
+        let msg = format!("{:?}", key);
+        self.get_mut(&key)
+            .ok_or_else(|| PyException::new("KeyError", msg))
+    }
+}
+
 /// Python's subscript store `x[i] = v`: Vec stores follow Python index
 /// rules and raise IndexError; dict stores insert or overwrite.
 pub trait PySetIndex<I, V> {

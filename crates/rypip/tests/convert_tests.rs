@@ -504,3 +504,47 @@ fn pyo3_crate_compiles() {
         .expect("running cargo check");
     assert!(status.success(), "generated pyo3 crate failed to compile");
 }
+
+#[test]
+fn nested_subscript_stores_mutate_in_place_at_runtime() {
+    // grid[0][1] = 9 previously wrote into a clone of the row and silently
+    // kept the old values; the store must land in the real container.
+    let scratch = Scratch::new("nested");
+    let file = scratch.path().join("grid.py");
+    fs::write(
+        &file,
+        concat!(
+            "def build() -> int:\n",
+            "    grid = [[1, 2], [3, 4]]\n",
+            "    grid[0][1] = 9\n",
+            "    grid[1][0] += 10\n",
+            "    table = {\"row\": [5, 6]}\n",
+            "    table[\"row\"][1] = 7\n",
+            "    return grid[0][1] + grid[1][0] + table[\"row\"][1]\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(build())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo build");
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/grid"))
+        .output()
+        .expect("running generated binary");
+    // Python: 9 + 13 + 7 == 29
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "29",
+        "nested stores must mutate the real containers"
+    );
+}

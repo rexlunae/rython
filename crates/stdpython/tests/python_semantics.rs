@@ -402,3 +402,26 @@ fn py_add_matches_python_plus() {
     // Lists concatenate: [1] + [2] == [1, 2]
     assert_eq!(vec![1i64].py_add(&vec![2i64]), vec![1, 2]);
 }
+
+#[test]
+fn py_index_mut_writes_land_in_place() {
+    // grid[0][1] = 9 must mutate the real nested list.
+    let mut grid = vec![vec![1i64, 2], vec![3, 4]];
+    *grid.py_index_mut(0).unwrap().py_index_mut(1).unwrap() = 9;
+    assert_eq!(grid, vec![vec![1, 9], vec![3, 4]]);
+    // Negative indices and IndexError, as with reads.
+    *grid.py_index_mut(-1).unwrap().py_index_mut(0).unwrap() = 30;
+    assert_eq!(grid[1][0], 30);
+    assert_eq!(
+        grid.py_index_mut(5).unwrap_err().exception_type,
+        "IndexError"
+    );
+    // Dicts: KeyError on missing key, mutation in place otherwise.
+    let mut table = std::collections::HashMap::from([("row", vec![5i64, 6])]);
+    table.py_index_mut("row").unwrap().py_set_index(1, 7).unwrap();
+    assert_eq!(table["row"][1], 7);
+    assert_eq!(
+        table.py_index_mut("nope").unwrap_err().exception_type,
+        "KeyError"
+    );
+}

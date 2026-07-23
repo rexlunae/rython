@@ -78,6 +78,52 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Subscript {
 
 impl_node_with_positions!(Subscript { lineno, col_offset, end_lineno, end_col_offset });
 
+/// Lower the receiver of a subscript STORE as a place. Names and
+/// attributes are places already; a nested subscript (`grid[i][j] = v`)
+/// threads through py_index_mut so the store mutates the real container —
+/// the Load lowering would yield a clone and silently drop the write.
+/// Anything else (e.g. a call result) is rejected loudly.
+pub(crate) fn subscript_receiver_place(
+    expr: &ExprType,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    match expr {
+        ExprType::Subscript(sub) => {
+            let inner = subscript_receiver_place(
+                &sub.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
+            match &sub.kind {
+                SubscriptKind::Index(index) => {
+                    let index = index
+                        .clone()
+                        .to_rust(ctx, options, symbols)?;
+                    Ok(quote!((#inner).py_index_mut(#index)?))
+                }
+                SubscriptKind::Slice { .. } => Err(
+                    "cannot assign through a slice (`x[a:b][...] = ...`)"
+                        .to_string()
+                        .into(),
+                ),
+            }
+        }
+        ExprType::Name(_) | ExprType::Attribute(_) => {
+            expr.clone().to_rust(ctx, options, symbols)
+        }
+        other => Err(format!(
+            "cannot assign into a subscript of this expression: {:?} (only \
+             variables, attributes, and nested subscripts can be stored \
+             through)",
+            other
+        )
+        .into()),
+    }
+}
+
 impl CodeGen for Subscript {
     type Context = CodeGenContext;
     type Options = PythonOptions;

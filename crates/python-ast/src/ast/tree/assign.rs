@@ -102,10 +102,15 @@ impl<'a> CodeGen for Assign {
         let render_subscript_store = |sub: &crate::Subscript,
                                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
-            let receiver = sub
-                .value
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // The receiver must be a PLACE (nested subscripts thread
+            // through py_index_mut): the Load lowering would clone, and the
+            // store would silently land on the clone.
+            let receiver = crate::subscript_receiver_place(
+                &sub.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
                     let index = index

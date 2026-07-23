@@ -80,10 +80,14 @@ impl CodeGen for AugAssign {
         // temporary (py_index), not a place, so read via py_index, combine,
         // and store back via py_set_index. The index is evaluated once.
         if let ExprType::Subscript(sub) = &self.target {
-            let receiver = sub
-                .value
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // The receiver must be a place (see subscript_receiver_place);
+            // a cloned receiver would silently drop the write-back.
+            let receiver = crate::subscript_receiver_place(
+                &sub.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
             let index = match &sub.kind {
                 crate::SubscriptKind::Index(index) => index
                     .clone()

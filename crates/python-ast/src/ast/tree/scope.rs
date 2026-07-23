@@ -157,19 +157,31 @@ fn record_target(target: &ExprType, a: &mut Analysis, multi: bool) {
                 }
             }
         }
-        // Stores through the base name: `x[i] = v`, `x.f = v`.
+        // Stores through the base name: `x[i] = v`, `x.f = v`, and nested
+        // chains like `grid[i][j] = v` all mutate the chain's base binding.
         ExprType::Subscript(sub) => {
-            if let ExprType::Name(name) = sub.value.as_ref() {
-                a.record_mutation(&name.id);
+            if let Some(name) = chain_base_name(&sub.value) {
+                a.record_mutation(name);
             }
             walk_subscript_kind(&sub.kind, a);
         }
         ExprType::Attribute(attr) => {
-            if let ExprType::Name(name) = attr.value.as_ref() {
-                a.record_mutation(&name.id);
+            if let Some(name) = chain_base_name(&attr.value) {
+                a.record_mutation(name);
             }
         }
         _ => {}
+    }
+}
+
+/// The name at the base of a subscript/attribute chain (`grid` in
+/// `grid[i][j]` or `obj.rows[i]`), if the chain bottoms out in one.
+fn chain_base_name(expr: &ExprType) -> Option<&str> {
+    match expr {
+        ExprType::Name(name) => Some(&name.id),
+        ExprType::Subscript(sub) => chain_base_name(&sub.value),
+        ExprType::Attribute(attr) => chain_base_name(&attr.value),
+        _ => None,
     }
 }
 
