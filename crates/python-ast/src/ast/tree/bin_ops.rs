@@ -82,9 +82,9 @@ impl PythonOperator for BinOps {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BinOp {
-    op: BinOps,
-    left: Box<ExprType>,
-    right: Box<ExprType>,
+    pub op: BinOps,
+    pub left: Box<ExprType>,
+    pub right: Box<ExprType>,
 }
 
 impl BinaryOperation for BinOp {

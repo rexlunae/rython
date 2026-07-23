@@ -8,8 +8,8 @@ use crate::{CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes}
 /// A keyword argument, gnerally used in function calls.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct NamedExpr {
-    left: Box<ExprType>,
-    right: Box<ExprType>,
+    pub left: Box<ExprType>,
+    pub right: Box<ExprType>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for NamedExpr {

@@ -1293,6 +1293,96 @@ impl<T> Len for Vec<T> {
 }
 
 // ============================================================================
+// MEMBERSHIP (the `in` operator)
+// ============================================================================
+
+/// Python's `in` operator, dispatching on the container type: substring
+/// search for strings, key lookup for dicts, element lookup for sequences
+/// and sets. `x in c` lowers to `c.py_contains(&x)`.
+pub trait PyContains<T: ?Sized> {
+    fn py_contains(&self, item: &T) -> bool;
+}
+
+impl<T: PartialEq> PyContains<T> for Vec<T> {
+    fn py_contains(&self, item: &T) -> bool {
+        self.as_slice().contains(item)
+    }
+}
+
+impl<T: PartialEq> PyContains<T> for [T] {
+    fn py_contains(&self, item: &T) -> bool {
+        self.contains(item)
+    }
+}
+
+impl<T: PartialEq, const N: usize> PyContains<T> for [T; N] {
+    fn py_contains(&self, item: &T) -> bool {
+        self.as_slice().contains(item)
+    }
+}
+
+impl<K: Eq + Hash, V> PyContains<K> for HashMap<K, V> {
+    fn py_contains(&self, item: &K) -> bool {
+        self.contains_key(item)
+    }
+}
+
+impl<K: Eq + Hash, V> PyContains<K> for PyDictionary<K, V> {
+    fn py_contains(&self, item: &K) -> bool {
+        self.contains_key(item)
+    }
+}
+
+impl<T: Eq + Hash> PyContains<T> for PySet<T> {
+    fn py_contains(&self, item: &T) -> bool {
+        self.contains(item)
+    }
+}
+
+// Set literals lower to a std HashSet, so `x in {1, 2, 3}` needs this.
+impl<T: Eq + Hash> PyContains<T> for HashSet<T> {
+    fn py_contains(&self, item: &T) -> bool {
+        self.contains(item)
+    }
+}
+
+impl PyContains<str> for str {
+    fn py_contains(&self, item: &str) -> bool {
+        self.contains(item)
+    }
+}
+
+impl PyContains<&str> for str {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.contains(*item)
+    }
+}
+
+impl PyContains<String> for str {
+    fn py_contains(&self, item: &String) -> bool {
+        self.contains(item.as_str())
+    }
+}
+
+impl PyContains<str> for String {
+    fn py_contains(&self, item: &str) -> bool {
+        self.as_str().contains(item)
+    }
+}
+
+impl PyContains<&str> for String {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.as_str().contains(*item)
+    }
+}
+
+impl PyContains<String> for String {
+    fn py_contains(&self, item: &String) -> bool {
+        self.as_str().contains(item.as_str())
+    }
+}
+
+// ============================================================================
 // PYTHON EXCEPTIONS
 // ============================================================================
 
@@ -1309,6 +1399,13 @@ impl PyException {
             message: message.as_ref().to_string(),
             exception_type: exception_type.as_ref().to_string(),
         }
+    }
+
+    /// Whether this exception is caught by an `except <name>:` clause.
+    /// `Exception` and `BaseException` catch everything (rython does not
+    /// model the full class hierarchy between them yet).
+    pub fn matches(&self, name: &str) -> bool {
+        name == "Exception" || name == "BaseException" || self.exception_type == name
     }
 }
 

@@ -150,76 +150,154 @@ impl CodeGen for Try {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Generate the try body
-        let try_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+        // The try body runs inside an immediately-invoked closure returning
+        // Result<(), PyException>; `raise` (and failed `assert`) inside it
+        // lower to `return Err(...)`.
+        let body_ctx = CodeGenContext::TryBlock {
+            parent: Box::new(ctx.clone()),
+        };
+        let try_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+            .body
+            .into_iter()
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let try_body_tokens = try_body_tokens?;
 
-        // Generate catch blocks for each handler
-        let catch_blocks: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.handlers.into_iter()
-            .map(|handler| {
-                let handler_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = handler.body.into_iter()
-                    .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                    .collect();
-                let handler_body_tokens = handler_body_tokens?;
+        // Handler bodies run outside the closure (their exceptions are not
+        // caught by this try), with the caught exception in scope.
+        let handler_ctx = CodeGenContext::ExceptHandler {
+            parent: Box::new(ctx.clone()),
+        };
+        let mut arms: Vec<TokenStream> = Vec::new();
+        let mut has_catch_all = false;
+        for handler in self.handlers {
+            let guard = match &handler.exception_type {
+                None => None,
+                Some(t) => exception_match_guard(t)?,
+            };
+            let bind = match &handler.name {
+                Some(name) => {
+                    let ident = crate::safe_ident(name);
+                    quote! {
+                        #[allow(unused_variables, unused_mut)]
+                        let mut #ident = __rython_exc.clone();
+                    }
+                }
+                None => quote!(),
+            };
+            let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = handler
+                .body
+                .into_iter()
+                .map(|stmt| stmt.to_rust(handler_ctx.clone(), options.clone(), symbols.clone()))
+                .collect();
+            let body_tokens = body_tokens?;
+            match guard {
+                Some(g) => arms.push(quote! {
+                    Err(__rython_exc) if #g => { #bind #(#body_tokens;)* }
+                }),
+                None => {
+                    has_catch_all = true;
+                    arms.push(quote! {
+                        Err(__rython_exc) => { #bind #(#body_tokens;)* }
+                    });
+                    break; // later handlers are unreachable, as in Python
+                }
+            }
+        }
 
-                // For now, generate a generic catch block
-                // In a real implementation, you'd want to match specific exception types
-                Ok::<TokenStream, Box<dyn std::error::Error>>(quote! {
-                    // Exception handler - simplified translation
-                    #(#handler_body_tokens;)*
-                })
-            })
-            .collect();
-        let catch_blocks = catch_blocks?;
-
-        // Generate else clause if present
+        // Else clause: runs only when the body completed without raising;
+        // its own exceptions are not caught by this try's handlers.
         let else_tokens = if !self.orelse.is_empty() {
-            let else_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.orelse.into_iter()
+            let else_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+                .orelse
+                .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_body_tokens = else_body_tokens?;
-            quote! {
-                // Else clause (executed when no exception occurs)
-                #(#else_body_tokens;)*
-            }
+            quote! { #(#else_body_tokens;)* }
         } else {
             quote!()
         };
 
-        // Generate finally clause if present
         let finally_tokens = if !self.finalbody.is_empty() {
-            let finally_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.finalbody.into_iter()
+            let finally_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+                .finalbody
+                .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let finally_body_tokens = finally_body_tokens?;
-            quote! {
-                // Finally clause (always executed)
-                #(#finally_body_tokens;)*
-            }
+            quote! { #(#finally_body_tokens;)* }
         } else {
             quote!()
         };
 
-        // Generate a simplified try-catch structure
-        // Note: This is a basic translation - Rust's error handling is quite different from Python's
+        // An exception no handler matched propagates: to the enclosing try's
+        // closure when there is one, otherwise it aborts like an uncaught
+        // Python exception. The finally body still runs first.
+        if !has_catch_all {
+            let reraise = if ctx.in_try_block() {
+                quote!(return Err(__rython_exc);)
+            } else {
+                quote!(panic!("{}", __rython_exc);)
+            };
+            arms.push(quote! {
+                Err(__rython_exc) => { #finally_tokens #reraise }
+            });
+        }
+
         Ok(quote! {
             {
-                // Try block - simplified translation to Rust
-                // Python's exception handling doesn't map directly to Rust's Result/Option patterns
-                #(#try_body_tokens;)*
-                
-                // Catch blocks (simplified)
-                #(#catch_blocks)*
-                
-                // Else clause
-                #else_tokens
-                
-                // Finally clause  
+                #[allow(unreachable_code)]
+                let __rython_try_result: std::result::Result<(), PyException> = (|| {
+                    #(#try_body_tokens;)*
+                    Ok(())
+                })();
+                match __rython_try_result {
+                    Ok(()) => { #else_tokens }
+                    #(#arms)*
+                }
                 #finally_tokens
             }
         })
+    }
+}
+
+/// The match guard testing whether the caught exception matches an except
+/// clause's type expression: a name (`except ValueError`), a dotted name
+/// (`except os.error` — matched by its final attribute), or a tuple of
+/// either (`except (ValueError, TypeError)`).
+fn exception_match_guard(
+    exception_type: &ExprType,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    match exception_type {
+        ExprType::Name(name) => {
+            let n = &name.id;
+            Ok(Some(quote!(__rython_exc.matches(#n))))
+        }
+        ExprType::Attribute(attr) => {
+            let n = &attr.attr;
+            Ok(Some(quote!(__rython_exc.matches(#n))))
+        }
+        ExprType::Tuple(tuple) => {
+            let mut guards = Vec::new();
+            for elt in &tuple.elts {
+                match exception_match_guard(elt)? {
+                    Some(g) => guards.push(g),
+                    None => return Ok(None),
+                }
+            }
+            if guards.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(quote!(#(#guards)||*)))
+            }
+        }
+        other => Err(format!(
+            "unsupported exception type in except clause: {:?} (use a name, \
+             dotted name, or tuple of names)",
+            other
+        )
+        .into()),
     }
 }
 

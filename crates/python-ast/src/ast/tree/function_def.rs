@@ -82,6 +82,10 @@ impl CodeGen for FunctionDef {
             quote!(pub)  // regular methods are public
         };
 
+        // A nested function body is a fresh exception scope: a `raise` in it
+        // cannot return out of an enclosing try block's closure.
+        let ctx = ctx.strip_exception_scopes();
+
         let is_async = match ctx.clone() {
             CodeGenContext::Async(_) => {
                 quote!(async)
@@ -93,6 +97,42 @@ impl CodeGen for FunctionDef {
             .args
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+        // Python variables are function-scoped: hoist every assigned name to
+        // a declaration here so assignments inside nested blocks (if/loop/
+        // try bodies) store into the same variable instead of creating a
+        // shadowing binding. Scope analysis decides which declarations need
+        // `mut` (mirroring rustc's rules, so the generated code carries
+        // neither unused_mut warnings nor missing-mut errors), and which
+        // parameters must be rebound as mutable locals (Rust parameters are
+        // immutable; Python's are ordinary variables).
+        let param_names: Vec<String> = self
+            .args
+            .args
+            .iter()
+            .chain(self.args.posonlyargs.iter())
+            .chain(self.args.kwonlyargs.iter())
+            .map(|p| p.arg.clone())
+            .chain(self.args.vararg.iter().map(|p| p.arg.clone()))
+            .chain(self.args.kwarg.iter().map(|p| p.arg.clone()))
+            .collect();
+        let scope = crate::analyze_scope(&self.body, &param_names);
+        let mut streams_prologue = TokenStream::new();
+        for name in &param_names {
+            if scope.needs_mut.contains(name) {
+                let ident = crate::safe_ident(name);
+                streams_prologue.extend(quote!(let mut #ident = #ident;));
+            }
+        }
+        for name in &scope.assigned {
+            let ident = crate::safe_ident(name);
+            if scope.needs_mut.contains(name) {
+                streams_prologue.extend(quote!(let mut #ident;));
+            } else {
+                streams_prologue.extend(quote!(let #ident;));
+            }
+        }
+        streams.extend(streams_prologue);
 
         // A leading docstring is emitted as doc comments below; skip it here
         // so it isn't also emitted as a statement.

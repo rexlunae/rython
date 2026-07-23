@@ -57,6 +57,21 @@ fn write_sample_package(root: &Path) {
             "\n",
             "def log_it(n: int) -> int:\n",
             "    print(n)\n",
+            "\n",
+            "def small(n: int) -> bool:\n",
+            "    return n in {1, 2, 3}\n",
+            "\n",
+            "def classify(n: int) -> str:\n",
+            "    label = \"fine\"\n",
+            "    try:\n",
+            "        if n < 0:\n",
+            "            raise ValueError(\"negative\")\n",
+            "        assert n != 13, \"unlucky\"\n",
+            "    except ValueError:\n",
+            "        label = \"negative\"\n",
+            "    except AssertionError:\n",
+            "        label = \"unlucky\"\n",
+            "    return label\n",
         ),
     )
     .unwrap();
@@ -68,8 +83,13 @@ fn write_sample_package(root: &Path) {
     fs::write(
         pkg.join("cli.py"),
         concat!(
+            "from greeting import classify\n",
+            "\n",
             "def run():\n",
             "    print(\"greetings\")\n",
+            "    print(classify(-5))\n",
+            "    print(classify(13))\n",
+            "    print(classify(2))\n",
             "\n",
             "if __name__ == \"__main__\":\n",
             "    run()\n",
@@ -251,6 +271,16 @@ fn converted_crate_compiles_and_binary_runs() {
     assert!(
         stdout.contains("greetings"),
         "unexpected binary output: {}",
+        stdout
+    );
+    // classify() exercises try/except/assert end to end: a raised
+    // ValueError, a failed assert (AssertionError), and the no-exception
+    // path must each take the right handler at runtime.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        &lines[1..4],
+        &["negative", "unlucky", "fine"],
+        "try/except runtime behavior diverged: {}",
         stdout
     );
 }

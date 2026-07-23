@@ -157,6 +157,11 @@ impl CodeGen for Module {
         let mut module_init_stmts = Vec::new();
         let mut has_module_init_code = false;
         let mut is_simple_main_call_pattern = false;
+        // The raw statements behind main_body_stmts/module_init_stmts, kept
+        // so assigned names can be hoisted to declarations (assignments
+        // lower to plain stores; see collect_assigned_names).
+        let mut main_body_raw: Vec<crate::Statement> = Vec::new();
+        let mut module_init_raw: Vec<crate::Statement> = Vec::new();
 
         for s in self.raw.body {
             // Check if this statement is an async function
@@ -186,6 +191,7 @@ impl CodeGen for Module {
                                 .map_err(|e| wrap_module_error(&module_filename, e))?;
                             if !stmt_token.to_string().trim().is_empty() {
                                 main_body_stmts.push(stmt_token);
+                                main_body_raw.push(body_stmt.clone());
                                 has_main_code = true;
                             }
                         }
@@ -210,11 +216,23 @@ impl CodeGen for Module {
                 } else {
                     // Executable statements go in module initialization function
                     module_init_stmts.push(statement);
+                    module_init_raw.push(s.clone());
                     has_module_init_code = true;
                 }
             }
         }
-        
+
+        // Hoist assigned names to declarations at the top of each generated
+        // scope (assignments themselves lower to plain stores).
+        let init_decls = hoisted_declarations(&module_init_raw);
+        if !init_decls.is_empty() {
+            module_init_stmts.insert(0, init_decls);
+        }
+        let main_decls = hoisted_declarations(&main_body_raw);
+        if !main_decls.is_empty() {
+            main_body_stmts.insert(0, main_decls);
+        }
+
         // Generate module initialization function if needed
         if has_module_init_code {
             stream.extend(quote! {
@@ -360,6 +378,23 @@ impl CodeGen for Module {
     }
 }
 
+/// Declarations for every name assigned in a statement list, so
+/// nested-block assignments store into scope-level variables instead of
+/// creating shadowing bindings. Scope analysis decides which need `mut`.
+fn hoisted_declarations(body: &[crate::Statement]) -> TokenStream {
+    let scope = crate::analyze_scope(body, &[]);
+    let mut out = TokenStream::new();
+    for name in &scope.assigned {
+        let ident = crate::safe_ident(name);
+        if scope.needs_mut.contains(name) {
+            out.extend(quote!(let mut #ident;));
+        } else {
+            out.extend(quote!(let #ident;));
+        }
+    }
+    out
+}
+
 /// Rebuild a statement-level codegen error so it points at the module's real
 /// source file. Statement errors carry a `<module>` placeholder filename in
 /// their location; this substitutes the actual filename and preserves the
@@ -448,7 +483,7 @@ impl Module {
             // These are executable statements that must go in the init function
             Assign(_) | AugAssign(_) | Call(_) | Return(_) |
             If(_) | For(_) | While(_) | Try(_) | With(_) | AsyncWith(_) | AsyncFor(_) |
-            Raise(_) | Pass | Break | Continue => false,
+            Raise(_) | Assert { .. } | Pass | Break | Continue => false,
             
             // Handle unimplemented statements conservatively as executable
             Unimplemented(_) => false,

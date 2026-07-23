@@ -39,10 +39,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for BoolOps {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BoolOp {
-    op: BoolOps,
+    pub op: BoolOps,
     /// All operands: Python collapses `a and b and c` into one BoolOp node
     /// with three values.
-    values: Vec<ExprType>,
+    pub values: Vec<ExprType>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for BoolOp {

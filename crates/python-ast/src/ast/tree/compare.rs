@@ -26,9 +26,9 @@ pub enum Compares {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Compare {
-    ops: Vec<Compares>,
-    left: Box<ExprType>,
-    comparators: Vec<ExprType>,
+    pub ops: Vec<Compares>,
+    pub left: Box<ExprType>,
+    pub comparators: Vec<ExprType>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Compare {
@@ -139,8 +139,11 @@ impl CodeGen for Compare {
                 Compares::GtE => quote!((#left) >= (#comparator)),
                 Compares::Is => quote!(&#left == &#comparator),
                 Compares::IsNot => quote!(&#left != &#comparator),
-                Compares::In => quote!((#comparator).contains(&(#left))),
-                Compares::NotIn => quote!(!(#comparator).contains(&(#left))),
+                // Python `in` dispatches on the container: substring for
+                // strings, key lookup for dicts, element lookup for
+                // sequences. The stdpython PyContains trait models that.
+                Compares::In => quote!((#comparator).py_contains(&(#left))),
+                Compares::NotIn => quote!(!(#comparator).py_contains(&(#left))),
 
                 _ => return Err(err_from(CompareNotYetImplemented(self)).into()),
             };

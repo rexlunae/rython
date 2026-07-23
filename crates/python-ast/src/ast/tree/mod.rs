@@ -63,6 +63,9 @@ pub use unary_op::*;
 pub mod module;
 pub use module::*;
 
+pub mod scope;
+pub use scope::*;
+
 pub mod statement;
 pub use statement::*;
 

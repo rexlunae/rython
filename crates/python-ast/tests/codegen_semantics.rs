@@ -48,17 +48,70 @@ fn rust_keywords_are_escaped() {
 }
 
 #[test]
-fn assignments_bind_mutably() {
+fn assignments_hoist_declaration_and_store() {
+    // Assigned names are hoisted to a declaration and each assignment is a
+    // plain store (a `let mut` per assignment would shadow inside nested
+    // blocks instead of assigning). A single store needs no `mut`.
     let out = compile("x = 1", "mut.py");
-    assert!(out.contains("let mut x = 1"), "generated: {}", out);
+    assert!(out.contains("let x"), "generated: {}", out);
+    assert!(out.contains("x = 1"), "generated: {}", out);
+    assert!(!out.contains("let mut x"), "single store needs no mut: {}", out);
+}
+
+#[test]
+fn mut_is_inferred_only_where_needed() {
+    // Branch-exclusive initialization: no path assigns twice, so no mut —
+    // rustc would warn unused_mut otherwise.
+    let src = "def f(c) -> int:\n    if c:\n        x = 1\n    else:\n        x = 2\n    return x\n";
+    let out = compile(src, "branches.py");
+    assert!(out.contains("let x ;"), "generated: {}", out);
+    assert!(!out.contains("let mut x"), "generated: {}", out);
+
+    // A store inside a loop may execute repeatedly: mut required.
+    let src = "def g(items):\n    total = 0\n    for i in items:\n        total = total + i\n    return total\n";
+    let out = compile(src, "loopmut.py");
+    assert!(out.contains("let mut total"), "generated: {}", out);
+
+    // A mutating method call requires a mutable binding.
+    let out = compile("def h():\n    items = []\n    items.append(1)\n", "append.py");
+    assert!(out.contains("let mut items"), "generated: {}", out);
+
+    // A parameter that is only read is not rebound.
+    let out = compile("def k(n: int) -> int:\n    return n\n", "readonly.py");
+    assert!(!out.contains("let mut n"), "generated: {}", out);
+}
+
+#[test]
+fn nested_block_assignment_stores_into_the_outer_variable() {
+    // `x = 2` inside the if must update the function-scoped x, not create a
+    // shadowing binding that dies at the end of the block.
+    let src = "def pick(c) -> int:\n    x = 1\n    if c:\n        x = 2\n    return x\n";
+    let out = compile(src, "scope.py");
+    assert_eq!(
+        out.matches("let mut x").count(),
+        1,
+        "one declaration, plain stores elsewhere: {}",
+        out
+    );
+    assert!(out.contains("if c { x = 2"), "generated: {}", out);
+}
+
+#[test]
+fn assigned_parameters_are_rebound_mutably() {
+    // Rust parameters are immutable; a parameter the body assigns to is
+    // rebound as a mutable local first.
+    let out = compile("def f(n: int) -> int:\n    n = n + 1\n    return n\n", "param.py");
+    assert!(out.contains("let mut n = n"), "generated: {}", out);
 }
 
 #[test]
 fn chained_assignment_assigns_each_target() {
     let out = compile("a = b = 1", "chain.py");
     assert!(out.contains("__rython_chain"), "generated: {}", out);
-    assert!(out.contains("let mut a"), "generated: {}", out);
-    assert!(out.contains("let mut b"), "generated: {}", out);
+    assert!(out.contains("let a"), "generated: {}", out);
+    assert!(out.contains("let b"), "generated: {}", out);
+    assert!(out.contains("a = __rython_chain"), "generated: {}", out);
+    assert!(out.contains("b = __rython_chain"), "generated: {}", out);
 }
 
 #[test]
@@ -365,6 +418,165 @@ fn annotation_ignored_when_body_can_fall_through() {
     // `-> None` on a fall-through body is accurate, not lossy.
     let out = compile("def h() -> None:\n    print(1)\n", "ann_none.py");
     assert!(!out.contains("deprecated"), "generated: {}", out);
+}
+
+#[test]
+fn try_except_lowers_to_result_handling() {
+    let src = concat!(
+        "def f(n):\n",
+        "    try:\n",
+        "        raise ValueError(\"bad\")\n",
+        "    except ValueError as e:\n",
+        "        print(e)\n",
+        "    except (TypeError, KeyError):\n",
+        "        print(\"other\")\n",
+    );
+    let out = compile(src, "try.py");
+    // The body runs in a closure returning Result<(), PyException>.
+    assert!(
+        out.contains("Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
+    // raise inside the try returns an Err the handlers can match.
+    assert!(
+        out.contains("return Err (PyException :: new (\"ValueError\""),
+        "generated: {}",
+        out
+    );
+    // Handlers are guard-matched arms, in order; the tuple form ORs.
+    assert!(
+        out.contains("if __rython_exc . matches (\"ValueError\")"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("matches (\"TypeError\") || __rython_exc . matches (\"KeyError\")"),
+        "generated: {}",
+        out
+    );
+    // `as e` binds the caught exception.
+    assert!(out.contains("let mut e = __rython_exc . clone ()"), "generated: {}", out);
+    // An unmatched exception re-raises (aborts at top level, like Python).
+    assert!(out.contains("panic ! (\"{}\" , __rython_exc)"), "generated: {}", out);
+}
+
+#[test]
+fn try_handler_bodies_only_run_on_matching_error() {
+    // The old lowering ran every handler body unconditionally after the try
+    // body; the handler statements must now live inside match arms.
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        work()\n",
+        "    except Exception:\n",
+        "        cleanup()\n",
+    );
+    let out = compile(src, "tryarm.py");
+    let arm_pos = out.find("Err (__rython_exc)").expect("handler arm");
+    let cleanup_pos = out.find("cleanup ()").expect("handler body");
+    assert!(
+        cleanup_pos > arm_pos,
+        "handler body must be inside the Err arm: {}",
+        out
+    );
+}
+
+#[test]
+fn nested_raise_propagates_to_outer_try() {
+    // A try inside a try: the inner unmatched arm returns Err out of the
+    // *outer* closure instead of panicking.
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        try:\n",
+        "            raise KeyError(\"k\")\n",
+        "        except ValueError:\n",
+        "            pass\n",
+        "    except KeyError:\n",
+        "        pass\n",
+    );
+    let out = compile(src, "nested_try.py");
+    assert!(
+        out.contains("Err (__rython_exc) => { return Err (__rython_exc) ; }"),
+        "inner unmatched exception must propagate as Err: {}",
+        out
+    );
+}
+
+#[test]
+fn finally_runs_before_reraise() {
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        work()\n",
+        "    except ValueError:\n",
+        "        pass\n",
+        "    finally:\n",
+        "        cleanup()\n",
+    );
+    let out = compile(src, "finally.py");
+    // finally body appears both after the match (normal paths) and in the
+    // unmatched-reraise arm (before propagation).
+    assert!(out.matches("cleanup ()").count() >= 2, "generated: {}", out);
+}
+
+#[test]
+fn raise_outside_try_panics_with_exception_display() {
+    let out = compile(
+        "def f():\n    raise RuntimeError(\"boom\")\n",
+        "raise.py",
+    );
+    assert!(
+        out.contains("panic ! (\"{}\" , PyException :: new (\"RuntimeError\""),
+        "generated: {}",
+        out
+    );
+    // Not the old debug-format placeholder that referenced undefined names.
+    assert!(!out.contains("Exception : {:?}"), "generated: {}", out);
+}
+
+#[test]
+fn assert_lowers_to_assertion_error() {
+    let out = compile("def f(n):\n    assert n > 0, \"need positive\"\n", "assert.py");
+    assert!(out.contains("if ! ((n) > (0))"), "generated: {}", out);
+    assert!(
+        out.contains("PyException :: new (\"AssertionError\""),
+        "generated: {}",
+        out
+    );
+
+    // Inside a try, a failed assert is catchable.
+    let src = concat!(
+        "def f(n):\n",
+        "    try:\n",
+        "        assert n > 0\n",
+        "    except AssertionError:\n",
+        "        pass\n",
+    );
+    let out = compile(src, "assert_try.py");
+    assert!(
+        out.contains("return Err (PyException :: new (\"AssertionError\""),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn unary_plus_emits_no_invalid_operator() {
+    // Rust has no unary +; `+x` is the identity.
+    let out = compile("y = +x", "uadd.py");
+    assert!(!out.contains("= + x"), "generated: {}", out);
+    assert!(out.contains("y = (x)"), "generated: {}", out);
+}
+
+#[test]
+fn membership_uses_py_contains() {
+    let out = compile("found = x in items", "in.py");
+    assert!(out.contains("py_contains"), "generated: {}", out);
+
+    let out = compile("missing = x not in items", "notin.py");
+    assert!(out.contains("! (items) . py_contains"), "generated: {}", out);
 }
 
 #[test]

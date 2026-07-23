@@ -4,8 +4,8 @@ use quote::quote;
 
 use crate::{
     dump, err_from, extraction_failure, Assign, AsyncFor, AsyncWith, AugAssign, Call, ClassDef,
-    CodeGen, CodeGenContext, Expr, For, FunctionDef, If, Import, ImportFrom, Node, PythonOptions,
-    Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
+    CodeGen, CodeGenContext, Expr, ExprType, For, FunctionDef, If, Import, ImportFrom, Node,
+    PythonOptions, Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
 };
 
 use tracing::debug;
@@ -93,6 +93,10 @@ impl CodeGen for Statement {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum StatementType {
     AsyncFunctionDef(FunctionDef),
+    Assert {
+        test: Box<ExprType>,
+        msg: Option<Box<ExprType>>,
+    },
     Assign(Assign),
     AugAssign(AugAssign),
     Break,
@@ -164,6 +168,24 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 let aug_assignment = AugAssign::extract(ob)
                     .map_err(|e| extraction_failure("augmented assignment", &ob, e))?;
                 Ok(StatementType::AugAssign(aug_assignment))
+            }
+            "Assert" => {
+                let test: ExprType = ob
+                    .getattr("test")
+                    .map_err(|e| extraction_failure("assert condition", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("assert condition", &ob, e))?;
+                let msg: Option<Box<ExprType>> = match ob.getattr("msg") {
+                    Ok(m) if !m.is_none() => Some(Box::new(
+                        m.extract()
+                            .map_err(|e| extraction_failure("assert message", &ob, e))?,
+                    )),
+                    _ => None,
+                };
+                Ok(StatementType::Assert {
+                    test: Box::new(test),
+                    msg,
+                })
             }
             "Pass" => Ok(StatementType::Pass),
             "Call" => {
@@ -343,6 +365,27 @@ impl CodeGen for StatementType {
             StatementType::AsyncFunctionDef(s) => {
                 let func_def = s.to_rust(Self::Context::Async(Box::new(ctx)), options, symbols)?;
                 Ok(quote!(#func_def))
+            }
+            StatementType::Assert { test, msg } => {
+                let test_tokens = test.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let msg_tokens = match msg {
+                    Some(m) => {
+                        let m = m.to_rust(ctx.clone(), options, symbols)?;
+                        quote!(format!("{}", #m))
+                    }
+                    None => quote!(String::new()),
+                };
+                // A failed assert raises AssertionError: catchable by an
+                // enclosing try, otherwise it aborts like any uncaught
+                // Python exception.
+                let raise = if ctx.in_try_block() {
+                    quote!(return Err(PyException::new("AssertionError", #msg_tokens)))
+                } else {
+                    quote!(panic!("{}", PyException::new("AssertionError", #msg_tokens)))
+                };
+                Ok(quote! {
+                    if !(#test_tokens) { #raise; }
+                })
             }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
             StatementType::AugAssign(a) => a.to_rust(ctx, options, symbols),
