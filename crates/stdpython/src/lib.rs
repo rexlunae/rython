@@ -200,10 +200,11 @@ pub fn print_args_to_string<T: Display, S: AsRef<str>, E: AsRef<str>>(objects: &
     format!("{}{}", output, end.as_ref())
 }
 
-/// Python len() function - returns the length of an object
-pub fn len<T>(obj: &T) -> usize 
-where 
-    T: Len,
+/// Python len() function - returns the length of an object. String
+/// lengths are CODE POINTS, as in Python: len("café") == 4.
+pub fn len<T>(obj: &T) -> usize
+where
+    T: Len + ?Sized,
 {
     obj.len()
 }
@@ -878,7 +879,7 @@ impl Display for PyStr {
 
 impl Len for PyStr {
     fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.chars().count()
     }
 }
 
@@ -1282,7 +1283,14 @@ impl Truthy for f64 {
 
 impl Len for String {
     fn len(&self) -> usize {
-        self.len()
+        // Python counts code points, not bytes: len("café") == 4.
+        self.chars().count()
+    }
+}
+
+impl Len for str {
+    fn len(&self) -> usize {
+        self.chars().count()
     }
 }
 
@@ -1442,12 +1450,40 @@ pub trait PyStrOps {
     fn capitalize(&self) -> String;
     fn startswith(&self, prefix: &str) -> bool;
     fn endswith(&self, suffix: &str) -> bool;
-    /// str.find: byte index of the first match, or -1 (not an Option).
+    /// str.find: CHARACTER index of the first match, or -1 (not an Option).
     fn py_find(&self, needle: &str) -> i64;
-    /// str.split(sep)
-    fn py_split(&self, sep: &str) -> Vec<String>;
+    /// str.count(sub): non-overlapping occurrences ("abc".count("") is 4).
+    fn count<S: AsRef<str>>(&self, sub: S) -> i64;
+    /// str.split(sep); an empty separator raises ValueError like Python
+    /// (Rust's split would yield empty edge strings instead).
+    fn py_split(&self, sep: &str) -> Result<Vec<String>, PyException>;
+    /// str.split(sep, maxsplit): at most maxsplit splits from the left
+    /// (maxsplit < 0 means unlimited).
+    fn py_split_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException>;
     /// str.split() with no argument: split on runs of whitespace.
     fn py_split_whitespace(&self) -> Vec<String>;
+    /// str.rsplit(sep): like split for full splits, but named separately
+    /// (str::rsplit is an inherent iterator method).
+    fn py_rsplit(&self, sep: &str) -> Result<Vec<String>, PyException>;
+    /// str.rsplit(sep, maxsplit): at most maxsplit splits from the RIGHT,
+    /// pieces in left-to-right order.
+    fn py_rsplit_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException>;
+    /// str.partition(sep): (head, sep, tail) around the FIRST match, or
+    /// (self, "", "") when absent.
+    fn partition(&self, sep: &str) -> Result<(String, String, String), PyException>;
+    /// str.rpartition(sep): around the LAST match, or ("", "", self).
+    fn rpartition(&self, sep: &str) -> Result<(String, String, String), PyException>;
+    /// str.strip(chars): strip any of the given characters from both ends.
+    fn py_strip_chars(&self, chars: &str) -> String;
+    fn py_lstrip_chars(&self, chars: &str) -> String;
+    fn py_rstrip_chars(&self, chars: &str) -> String;
+    /// str.title(): first letter of each alphabetic run uppercased.
+    fn title(&self) -> String;
+    /// str.zfill(width): zero-pad to width CHARACTERS, after any sign.
+    fn zfill(&self, width: i64) -> String;
+    /// str.ljust / str.rjust with a fill character, width in CHARACTERS.
+    fn py_ljust(&self, width: i64, fill: &str) -> String;
+    fn py_rjust(&self, width: i64, fill: &str) -> String;
     fn splitlines(&self) -> Vec<String>;
     /// sep.join(iterable)
     fn join<I, S>(&self, parts: I) -> String
@@ -1494,11 +1530,135 @@ impl PyStrOps for str {
             None => -1,
         }
     }
-    fn py_split(&self, sep: &str) -> Vec<String> {
-        self.split(sep).map(str::to_string).collect()
+    fn count<S: AsRef<str>>(&self, sub: S) -> i64 {
+        self.matches(sub.as_ref()).count() as i64
+    }
+    fn py_split(&self, sep: &str) -> Result<Vec<String>, PyException> {
+        if sep.is_empty() {
+            return Err(PyException::new("ValueError", "empty separator"));
+        }
+        Ok(self.split(sep).map(str::to_string).collect())
+    }
+    fn py_split_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
+        if sep.is_empty() {
+            return Err(PyException::new("ValueError", "empty separator"));
+        }
+        if maxsplit < 0 {
+            return self.py_split(sep);
+        }
+        Ok(self
+            .splitn(maxsplit as usize + 1, sep)
+            .map(str::to_string)
+            .collect())
     }
     fn py_split_whitespace(&self) -> Vec<String> {
         self.split_whitespace().map(str::to_string).collect()
+    }
+    fn py_rsplit(&self, sep: &str) -> Result<Vec<String>, PyException> {
+        self.py_split(sep)
+    }
+    fn py_rsplit_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
+        if sep.is_empty() {
+            return Err(PyException::new("ValueError", "empty separator"));
+        }
+        if maxsplit < 0 {
+            return self.py_split(sep);
+        }
+        let mut parts: Vec<String> = self
+            .rsplitn(maxsplit as usize + 1, sep)
+            .map(str::to_string)
+            .collect();
+        parts.reverse();
+        Ok(parts)
+    }
+    fn partition(&self, sep: &str) -> Result<(String, String, String), PyException> {
+        if sep.is_empty() {
+            return Err(PyException::new("ValueError", "empty separator"));
+        }
+        match self.find(sep) {
+            Some(i) => Ok((
+                self[..i].to_string(),
+                sep.to_string(),
+                self[i + sep.len()..].to_string(),
+            )),
+            None => Ok((self.to_string(), String::new(), String::new())),
+        }
+    }
+    fn rpartition(&self, sep: &str) -> Result<(String, String, String), PyException> {
+        if sep.is_empty() {
+            return Err(PyException::new("ValueError", "empty separator"));
+        }
+        match self.rfind(sep) {
+            Some(i) => Ok((
+                self[..i].to_string(),
+                sep.to_string(),
+                self[i + sep.len()..].to_string(),
+            )),
+            None => Ok((String::new(), String::new(), self.to_string())),
+        }
+    }
+    fn py_strip_chars(&self, chars: &str) -> String {
+        let set: Vec<char> = chars.chars().collect();
+        self.trim_matches(|c| set.contains(&c)).to_string()
+    }
+    fn py_lstrip_chars(&self, chars: &str) -> String {
+        let set: Vec<char> = chars.chars().collect();
+        self.trim_start_matches(|c| set.contains(&c)).to_string()
+    }
+    fn py_rstrip_chars(&self, chars: &str) -> String {
+        let set: Vec<char> = chars.chars().collect();
+        self.trim_end_matches(|c| set.contains(&c)).to_string()
+    }
+    fn title(&self) -> String {
+        // Python: the first letter after any non-alphabetic character is
+        // uppercased, the rest lowercased ("3rd" becomes "3Rd").
+        let mut out = String::with_capacity(self.len());
+        let mut prev_alpha = false;
+        for c in self.chars() {
+            if c.is_alphabetic() {
+                if prev_alpha {
+                    out.extend(c.to_lowercase());
+                } else {
+                    out.extend(c.to_uppercase());
+                }
+                prev_alpha = true;
+            } else {
+                out.push(c);
+                prev_alpha = false;
+            }
+        }
+        out
+    }
+    fn zfill(&self, width: i64) -> String {
+        let width = width.max(0) as usize;
+        let count = self.chars().count();
+        if count >= width {
+            return self.to_string();
+        }
+        let zeros = "0".repeat(width - count);
+        if let Some(rest) = self.strip_prefix(['+', '-']) {
+            format!("{}{}{}", &self[..1], zeros, rest)
+        } else {
+            format!("{}{}", zeros, self)
+        }
+    }
+    fn py_ljust(&self, width: i64, fill: &str) -> String {
+        let width = width.max(0) as usize;
+        let count = self.chars().count();
+        if count >= width {
+            return self.to_string();
+        }
+        let fill_char = fill.chars().next().unwrap_or(' ');
+        format!("{}{}", self, fill_char.to_string().repeat(width - count))
+    }
+    fn py_rjust(&self, width: i64, fill: &str) -> String {
+        let width = width.max(0) as usize;
+        let count = self.chars().count();
+        if count >= width {
+            return self.to_string();
+        }
+        let fill_char = fill.chars().next().unwrap_or(' ');
+        format!("{}{}", fill_char.to_string().repeat(width - count), self)
     }
     fn splitlines(&self) -> Vec<String> {
         self.lines().map(str::to_string).collect()
@@ -1837,6 +1997,33 @@ impl PyIndex<i64> for String {
     type Output = String;
     fn py_index(&self, index: i64) -> Result<String, PyException> {
         self.as_str().py_index(index)
+    }
+}
+
+/// Homogeneous Rust tuples (e.g. str.partition results) subscript like
+/// Python tuples: negative indices from the end, IndexError past the end.
+impl<T: Clone> PyIndex<i64> for (T, T) {
+    type Output = T;
+    fn py_index(&self, index: i64) -> Result<T, PyException> {
+        let i = if index < 0 { index + 2 } else { index };
+        match i {
+            0 => Ok(self.0.clone()),
+            1 => Ok(self.1.clone()),
+            _ => Err(PyException::new("IndexError", "tuple index out of range")),
+        }
+    }
+}
+
+impl<T: Clone> PyIndex<i64> for (T, T, T) {
+    type Output = T;
+    fn py_index(&self, index: i64) -> Result<T, PyException> {
+        let i = if index < 0 { index + 3 } else { index };
+        match i {
+            0 => Ok(self.0.clone()),
+            1 => Ok(self.1.clone()),
+            2 => Ok(self.2.clone()),
+            _ => Err(PyException::new("IndexError", "tuple index out of range")),
+        }
     }
 }
 

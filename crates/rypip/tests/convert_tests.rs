@@ -654,6 +654,76 @@ fn optional_from_dict_get_matches_python_at_runtime() {
 }
 
 #[test]
+fn string_methods_match_python_at_runtime() {
+    // Code-point len/find, count, maxsplit/rsplit, partition tuples,
+    // strip(chars), title, zfill, ljust/rjust, and the empty-separator
+    // ValueError — all through generated code.
+    let scratch = Scratch::new("strings");
+    let file = scratch.path().join("strings.py");
+    fs::write(
+        &file,
+        concat!(
+            "def run() -> int:\n",
+            "    s = \"café latte café\"\n",
+            "    print(len(s))\n",
+            "    print(s.count(\"café\"))\n",
+            "    print(s.find(\"é\"))\n",
+            "    parts = \"x-y-z\".split(\"-\", 1)\n",
+            "    print(f\"{parts[0]} {parts[1]}\")\n",
+            "    tail = \"a-b-c-d\".rsplit(\"-\", 2)\n",
+            "    print(f\"{tail[0]} {tail[1]} {tail[2]}\")\n",
+            "    trio = \"key=val=ue\".partition(\"=\")\n",
+            "    print(f\"{trio[0]} {trio[2]}\")\n",
+            "    print(\"xxhixx\".strip(\"x\"))\n",
+            "    print(\"hello wOrld\".title())\n",
+            "    print(\"-42\".zfill(6))\n",
+            "    print(\"hi\".ljust(5, \".\"))\n",
+            "    print(\"hi\".rjust(5, \"*\"))\n",
+            "    try:\n",
+            "        \"ab\".split(\"\")\n",
+            "    except ValueError:\n",
+            "        print(\"caught empty separator\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/strings"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "15",
+            "2",
+            "3",
+            "x y-z",
+            "a-b c d",
+            "key val=ue",
+            "hi",
+            "Hello World",
+            "-00042",
+            "hi...",
+            "***hi",
+            "caught empty separator"
+        ],
+        "string semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn classes_match_python_at_runtime() {
     // Struct-based classes: field inference, defaults, keyword method
     // calls, transitive &mut receivers, exceptions raised from methods and

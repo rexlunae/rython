@@ -231,13 +231,63 @@ impl<'a> CodeGen for Call {
                     return Ok(quote!((#receiver).py_insert(#idx, #value)));
                 }
                 // str.split() with no argument splits on whitespace runs;
-                // str::split (inherent) returns an iterator, so both forms
-                // map to the PyStrOps versions returning Vec<String>.
+                // str::split (inherent) returns an iterator, so all forms
+                // map to the PyStrOps versions returning Vec<String>. An
+                // empty separator raises ValueError (hence `?`), and
+                // maxsplit selects a distinct method (Rust lacks
+                // overloading).
                 ("split", []) => {
                     return Ok(quote!((#receiver).py_split_whitespace()));
                 }
                 ("split", [sep]) => {
-                    return Ok(quote!((#receiver).py_split(&(#sep))));
+                    return Ok(quote!((#receiver).py_split(&(#sep))?));
+                }
+                ("split", [sep, maxsplit]) => {
+                    return Ok(quote!((#receiver).py_split_maxsplit(&(#sep), #maxsplit)?));
+                }
+                // str.rsplit: str::rsplit is an inherent iterator method.
+                // With no separator (or full splits) it equals split.
+                ("rsplit", []) => {
+                    return Ok(quote!((#receiver).py_split_whitespace()));
+                }
+                ("rsplit", [sep]) => {
+                    return Ok(quote!((#receiver).py_rsplit(&(#sep))?));
+                }
+                ("rsplit", [sep, maxsplit]) => {
+                    return Ok(quote!((#receiver).py_rsplit_maxsplit(&(#sep), #maxsplit)?));
+                }
+                // partition/rpartition raise ValueError on an empty
+                // separator, so the calls take `?`.
+                ("partition", [sep]) => {
+                    return Ok(quote!((#receiver).partition(&(#sep))?));
+                }
+                ("rpartition", [sep]) => {
+                    return Ok(quote!((#receiver).rpartition(&(#sep))?));
+                }
+                // strip family with a chars argument (the no-arg forms
+                // resolve through PyStrOps directly).
+                ("strip", [chars]) => {
+                    return Ok(quote!((#receiver).py_strip_chars(&(#chars))));
+                }
+                ("lstrip", [chars]) => {
+                    return Ok(quote!((#receiver).py_lstrip_chars(&(#chars))));
+                }
+                ("rstrip", [chars]) => {
+                    return Ok(quote!((#receiver).py_rstrip_chars(&(#chars))));
+                }
+                // ljust/rjust: the optional fillchar selects the py_ form
+                // (space by default).
+                ("ljust", [width]) => {
+                    return Ok(quote!((#receiver).py_ljust(#width, " ")));
+                }
+                ("ljust", [width, fill]) => {
+                    return Ok(quote!((#receiver).py_ljust(#width, &(#fill))));
+                }
+                ("rjust", [width]) => {
+                    return Ok(quote!((#receiver).py_rjust(#width, " ")));
+                }
+                ("rjust", [width, fill]) => {
+                    return Ok(quote!((#receiver).py_rjust(#width, &(#fill))));
                 }
                 // str.find returns -1 when absent; str::find an Option.
                 ("find", [needle]) => {

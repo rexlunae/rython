@@ -790,7 +790,7 @@ fn python_str_methods_map_through_pystrops() {
     );
     let out = compile(src, "strops.py");
     assert!(out.contains("py_split_whitespace ()"), "generated: {}", out);
-    assert!(out.contains("py_split (& (\",\"))"), "generated: {}", out);
+    assert!(out.contains("py_split (& (\",\")) ?"), "generated: {}", out);
     assert!(out.contains("py_find (& (\"x\"))"), "generated: {}", out);
     assert!(out.contains(". join (parts)"), "generated: {}", out);
 }

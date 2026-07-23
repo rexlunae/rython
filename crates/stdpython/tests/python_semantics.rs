@@ -316,7 +316,7 @@ fn py_list_and_str_methods_match_python() {
     assert_eq!("café x".py_find("x"), 5);
     assert_eq!("日本語abc".py_find("abc"), 3);
     // "a,b,,c".split(",") == ['a', 'b', '', 'c'] (keeps empties)
-    assert_eq!("a,b,,c".py_split(","), vec!["a", "b", "", "c"]);
+    assert_eq!("a,b,,c".py_split(",").unwrap(), vec!["a", "b", "", "c"]);
     // "  a b  c ".split() == ['a', 'b', 'c'] (whitespace runs, no empties)
     assert_eq!("  a b  c ".py_split_whitespace(), vec!["a", "b", "c"]);
     // "x\ny".splitlines() == ['x', 'y']
@@ -738,4 +738,73 @@ fn glob_wildcards_skip_hidden_files() {
     assert!(dotted[0].ends_with(".hidden.txt"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- str operations: code points and the Python method surface ----
+
+#[test]
+fn len_counts_code_points() {
+    // Python: len("café") == 4, len("😀ab") == 3.
+    assert_eq!(len("café"), 4);
+    assert_eq!(len(&"café".to_string()), 4);
+    assert_eq!(len("😀ab"), 3);
+}
+
+#[test]
+fn str_count_is_nonoverlapping() {
+    // Values verified against python3.
+    assert_eq!("café latte café".count("café"), 2);
+    assert_eq!("abc".count(""), 4);
+    assert_eq!("aaa".count("aa"), 1);
+}
+
+#[test]
+fn split_variants_match_python() {
+    // Values verified against python3.
+    assert_eq!("x-y-z".py_split_maxsplit("-", 1).unwrap(), vec!["x", "y-z"]);
+    assert_eq!("a-b-c-d".py_rsplit_maxsplit("-", 2).unwrap(), vec!["a-b", "c", "d"]);
+    assert_eq!("café".py_rsplit("a").unwrap(), vec!["c", "fé"]);
+    // Python: "ab".split("") raises ValueError: empty separator.
+    let err = "ab".py_split("").unwrap_err();
+    assert!(err.to_string().contains("ValueError"), "got: {}", err);
+    // maxsplit < 0 means unlimited.
+    assert_eq!(
+        "a-b-c".py_split_maxsplit("-", -1).unwrap(),
+        vec!["a", "b", "c"]
+    );
+}
+
+#[test]
+fn partition_matches_python() {
+    // Values verified against python3.
+    assert_eq!(
+        "key=val=ue".partition("=").unwrap(),
+        ("key".to_string(), "=".to_string(), "val=ue".to_string())
+    );
+    assert_eq!(
+        "key=val=ue".rpartition("=").unwrap(),
+        ("key=val".to_string(), "=".to_string(), "ue".to_string())
+    );
+    assert_eq!(
+        "no-sep".partition(",").unwrap(),
+        ("no-sep".to_string(), String::new(), String::new())
+    );
+    assert!("x".partition("").is_err());
+}
+
+#[test]
+fn strip_title_zfill_just_match_python() {
+    // Values verified against python3.
+    assert_eq!("xxhixx".py_strip_chars("x"), "hi");
+    assert_eq!("xxhixx".py_lstrip_chars("x"), "hixx");
+    assert_eq!("xxhixx".py_rstrip_chars("x"), "xxhi");
+    assert_eq!("mississippi".py_strip_chars("ipz"), "mississ");
+    assert_eq!("hello wOrld 3rd".title(), "Hello World 3Rd");
+    assert_eq!("-42".zfill(6), "-00042");
+    assert_eq!("7".zfill(3), "007");
+    assert_eq!("abcd".zfill(2), "abcd");
+    assert_eq!("hi".py_ljust(5, "."), "hi...");
+    assert_eq!("hi".py_rjust(5, " "), "   hi");
+    // Widths count characters, not bytes.
+    assert_eq!("héllo".py_ljust(7, "*"), "héllo**");
 }
