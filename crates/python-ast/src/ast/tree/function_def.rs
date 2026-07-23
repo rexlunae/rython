@@ -153,11 +153,18 @@ impl CodeGen for FunctionDef {
             // mutations select `&mut self` above instead.
             param_names.push("self".to_string());
         }
-        let mut scope = crate::analyze_scope(&self.body, &param_names);
+        // The resolver makes class knowledge authoritative for method
+        // calls: `c.bump()` marks `c` mutable when bump takes &mut self,
+        // and a read-only user method shadowing a builtin mutator name
+        // (`pop`, `update`, ...) does NOT force a spurious `mut`.
+        let scope = crate::analyze_scope_with(
+            &self.body,
+            &param_names,
+            &crate::class_call_resolver(&ctx, &symbols),
+        );
         if is_method {
             param_names.pop();
         }
-        crate::add_class_mut_facts(&self.body, &ctx, &symbols, &mut scope.needs_mut);
         let receiver = if is_method {
             if method_mutates_self || scope.needs_mut.contains("self") {
                 quote!(&mut self,)

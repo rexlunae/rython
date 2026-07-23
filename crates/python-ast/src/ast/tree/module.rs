@@ -413,14 +413,14 @@ fn hoisted_declarations(
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
 ) -> TokenStream {
-    let mut scope = crate::analyze_scope(body, &[]);
     // Class-aware mutation facts need the block's own assignments in the
     // symbol table (`c = Counter(...)` then `c.bump()` needs `c` mutable).
     let mut symbols = symbols.clone();
     for s in body {
         symbols = s.clone().find_symbols(symbols);
     }
-    crate::add_class_mut_facts(body, ctx, &symbols, &mut scope.needs_mut);
+    let scope =
+        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
     let mut out = TokenStream::new();
     for name in &scope.assigned {
         let ident = crate::safe_ident(name);

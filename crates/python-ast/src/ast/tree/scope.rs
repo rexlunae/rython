@@ -63,14 +63,20 @@ const MUTATING_METHODS: &[&str] = &[
     "push",
 ];
 
-struct Analysis {
+struct Analysis<'r> {
     assigned: Vec<String>,
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
     state: HashMap<String, Init>,
+    /// Classifies a method call's effect on its receiver when the
+    /// receiver's class is statically known: Some(needs_mut) resolves the
+    /// question authoritatively (a user method shadowing a builtin mutator
+    /// name may be read-only); None means unknown, falling back to the
+    /// syntactic MUTATING_METHODS list.
+    resolve_call: &'r dyn Fn(&crate::Call) -> Option<bool>,
 }
 
-impl Analysis {
+impl Analysis<'_> {
     fn init_of(&self, name: &str) -> Init {
         self.state.get(name).copied().unwrap_or(Init::No)
     }
@@ -126,6 +132,18 @@ fn merge_states(
 /// the parameters — hold values at entry, so any store into them needs a
 /// mutable rebinding.
 pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBindings {
+    analyze_scope_with(body, initialized, &|_| None)
+}
+
+/// analyze_scope with a call resolver: when the resolver classifies a
+/// method call (receiver class statically known), its answer is
+/// authoritative for whether the call mutates the receiver chain's base
+/// binding; unresolved calls fall back to the syntactic method-name list.
+pub(crate) fn analyze_scope_with(
+    body: &[Statement],
+    initialized: &[String],
+    resolve_call: &dyn Fn(&crate::Call) -> Option<bool>,
+) -> ScopeBindings {
     let mut a = Analysis {
         assigned: Vec::new(),
         needs_mut: HashSet::new(),
@@ -134,6 +152,7 @@ pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBinding
             .iter()
             .map(|n| (n.clone(), Init::Yes))
             .collect(),
+        resolve_call,
     };
     walk_stmts(body, &mut a, false);
     // Parameters are tracked for needs_mut but are not hoisted declarations.
@@ -149,7 +168,7 @@ pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBinding
     }
 }
 
-fn record_target(target: &ExprType, a: &mut Analysis, multi: bool) {
+fn record_target(target: &ExprType, a: &mut Analysis<'_>, multi: bool) {
     match target {
         ExprType::Name(name) => a.record_store(&name.id, multi),
         ExprType::Tuple(tuple) => {
@@ -191,187 +210,27 @@ pub(crate) fn chain_base_name(expr: &ExprType) -> Option<&str> {
     }
 }
 
-/// Invoke `f` on every Call expression in a body, recursing through
-/// control flow and nested expressions. Used for analyses that need to
-/// resolve calls against the symbol table (which the pure syntactic scope
-/// analysis here cannot).
-pub(crate) fn for_each_call(body: &[Statement], f: &mut impl FnMut(&crate::Call)) {
-    fn expr(e: &ExprType, f: &mut impl FnMut(&crate::Call)) {
-        if let ExprType::Call(call) = e {
-            f(call);
-            expr(&call.func, f);
-            for a in &call.args {
-                expr(a, f);
-            }
-            for k in &call.keywords {
-                expr(&k.value, f);
-            }
-            return;
+/// The standard call resolver for analyze_scope_with, backed by the symbol
+/// table: a call whose receiver class is statically known resolves to that
+/// class's own method, and the method's receiver kind (&self / &mut self)
+/// decides whether the call mutates.
+pub(crate) fn class_call_resolver<'a>(
+    ctx: &'a crate::CodeGenContext,
+    symbols: &'a crate::SymbolTableScopes,
+) -> impl Fn(&crate::Call) -> Option<bool> + 'a {
+    move |call| {
+        let ExprType::Attribute(attr) = call.func.as_ref() else {
+            return None;
+        };
+        let class = crate::receiver_class(&attr.value, ctx, symbols)?;
+        if !class.methods().any(|m| m.name == attr.attr) {
+            return None;
         }
-        match e {
-            ExprType::BinOp(op) => {
-                expr(&op.left, f);
-                expr(&op.right, f);
-            }
-            ExprType::BoolOp(op) => {
-                for v in &op.values {
-                    expr(v, f);
-                }
-            }
-            ExprType::UnaryOp(op) => expr(&op.operand, f),
-            ExprType::Compare(cmp) => {
-                expr(&cmp.left, f);
-                for c in &cmp.comparators {
-                    expr(c, f);
-                }
-            }
-            ExprType::IfExp(i) => {
-                expr(&i.test, f);
-                expr(&i.body, f);
-                expr(&i.orelse, f);
-            }
-            ExprType::Attribute(attr) => expr(&attr.value, f),
-            ExprType::Subscript(sub) => {
-                expr(&sub.value, f);
-                match &sub.kind {
-                    crate::SubscriptKind::Index(i) => expr(i, f),
-                    crate::SubscriptKind::Slice { lower, upper, step } => {
-                        for b in [lower, upper, step].into_iter().flatten() {
-                            expr(b, f);
-                        }
-                    }
-                }
-            }
-            ExprType::List(elts) => {
-                for e in elts {
-                    expr(e, f);
-                }
-            }
-            ExprType::Tuple(t) => {
-                for e in &t.elts {
-                    expr(e, f);
-                }
-            }
-            ExprType::Dict(d) => {
-                for k in d.keys.iter().flatten() {
-                    expr(k, f);
-                }
-                for v in &d.values {
-                    expr(v, f);
-                }
-            }
-            ExprType::Set(s) => {
-                for e in &s.elts {
-                    expr(e, f);
-                }
-            }
-            ExprType::JoinedStr(j) => {
-                for v in &j.values {
-                    expr(v, f);
-                }
-            }
-            ExprType::FormattedValue(v) => expr(&v.value, f),
-            ExprType::Starred(s) => expr(&s.value, f),
-            ExprType::Await(a) => expr(&a.value, f),
-            ExprType::NamedExpr(n) => {
-                expr(&n.left, f);
-                expr(&n.right, f);
-            }
-            _ => {}
-        }
-    }
-    fn stmt(s: &Statement, f: &mut impl FnMut(&crate::Call)) {
-        match &s.statement {
-            StatementType::Assign(a) => expr(&a.value, f),
-            StatementType::AugAssign(a) => expr(&a.value, f),
-            StatementType::Expr(e) => expr(&e.value, f),
-            StatementType::Call(c) => f(c),
-            StatementType::Return(Some(e)) => expr(&e.value, f),
-            StatementType::Assert { test, msg } => {
-                expr(test, f);
-                if let Some(m) = msg {
-                    expr(m, f);
-                }
-            }
-            StatementType::Raise(r) => {
-                if let Some(e) = &r.exc {
-                    expr(e, f);
-                }
-                if let Some(c) = &r.cause {
-                    expr(c, f);
-                }
-            }
-            StatementType::If(i) => {
-                expr(&i.test, f);
-                for st in i.body.iter().chain(i.orelse.iter()) {
-                    stmt(st, f);
-                }
-            }
-            StatementType::While(w) => {
-                expr(&w.test, f);
-                for st in w.body.iter().chain(w.orelse.iter()) {
-                    stmt(st, f);
-                }
-            }
-            StatementType::For(l) => {
-                expr(&l.iter, f);
-                for st in l.body.iter().chain(l.orelse.iter()) {
-                    stmt(st, f);
-                }
-            }
-            StatementType::Try(t) => {
-                for st in t
-                    .body
-                    .iter()
-                    .chain(t.handlers.iter().flat_map(|h| h.body.iter()))
-                    .chain(t.orelse.iter())
-                    .chain(t.finalbody.iter())
-                {
-                    stmt(st, f);
-                }
-            }
-            StatementType::With(w) => {
-                for item in &w.items {
-                    expr(&item.context_expr, f);
-                }
-                for st in &w.body {
-                    stmt(st, f);
-                }
-            }
-            _ => {}
-        }
-    }
-    for s in body {
-        stmt(s, f);
+        Some(class.method_needs_mut_self(&attr.attr, symbols))
     }
 }
 
-/// Add class-aware mutation facts the syntactic analysis can't see:
-/// calling a `&mut self` method of a known class mutates the receiver
-/// chain's base binding (`c.bump()` needs `c` mutable; `self.inner.bump()`
-/// needs `&mut self`).
-pub(crate) fn add_class_mut_facts(
-    body: &[Statement],
-    ctx: &crate::CodeGenContext,
-    symbols: &crate::SymbolTableScopes,
-    needs_mut: &mut HashSet<String>,
-) {
-    for_each_call(body, &mut |call| {
-        if let ExprType::Attribute(attr) = call.func.as_ref() {
-            if let Some(class) = crate::receiver_class(&attr.value, ctx, symbols) {
-                if class.methods().any(|m| m.name == attr.attr)
-                    && class.method_needs_mut_self(&attr.attr, symbols)
-                {
-                    if let Some(base) = chain_base_name(&attr.value) {
-                        needs_mut.insert(base.to_string());
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn walk_stmts(body: &[Statement], a: &mut Analysis, multi: bool) {
+fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
     for stmt in body {
         match &stmt.statement {
             StatementType::Assign(assign) => {
@@ -479,7 +338,7 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis, multi: bool) {
 fn walk_loop(
     body: &[Statement],
     orelse: &[Statement],
-    a: &mut Analysis,
+    a: &mut Analysis<'_>,
     outer_multi: bool,
 ) {
     let before = a.state.clone();
@@ -489,12 +348,19 @@ fn walk_loop(
     walk_stmts(orelse, a, outer_multi);
 }
 
-fn walk_call(call: &crate::Call, a: &mut Analysis) {
+fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
     if let ExprType::Attribute(attr) = call.func.as_ref() {
         // A mutating method mutates the base binding of the whole receiver
         // chain: `self.items.append(x)` mutates `self`, `rows[i].push(x)`
-        // mutates `rows`.
-        if MUTATING_METHODS.contains(&attr.attr.as_str()) {
+        // mutates `rows`. When the receiver's class is statically known,
+        // the resolver's verdict is authoritative — a user method may
+        // shadow a builtin mutator name yet be read-only, or mutate under
+        // a name the syntactic list doesn't know.
+        let mutates = match (a.resolve_call)(call) {
+            Some(verdict) => verdict,
+            None => MUTATING_METHODS.contains(&attr.attr.as_str()),
+        };
+        if mutates {
             if let Some(name) = chain_base_name(&attr.value) {
                 a.record_mutation(name);
             }
@@ -506,9 +372,14 @@ fn walk_call(call: &crate::Call, a: &mut Analysis) {
     for arg in &call.args {
         walk_expr(arg, a);
     }
+    // Keyword-argument values carry mutations too: `foo(x=c.bump())`
+    // mutates `c` just as surely as a positional argument would.
+    for kw in &call.keywords {
+        walk_expr(&kw.value, a);
+    }
 }
 
-fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis) {
+fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis<'_>) {
     match kind {
         crate::SubscriptKind::Index(i) => walk_expr(i, a),
         crate::SubscriptKind::Slice { lower, upper, step } => {
@@ -519,7 +390,7 @@ fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis) {
     }
 }
 
-fn walk_expr(expr: &ExprType, a: &mut Analysis) {
+fn walk_expr(expr: &ExprType, a: &mut Analysis<'_>) {
     match expr {
         ExprType::Call(call) => walk_call(call, a),
         ExprType::BinOp(op) => {
