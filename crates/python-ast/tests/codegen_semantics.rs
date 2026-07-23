@@ -527,6 +527,64 @@ fn finally_runs_before_reraise() {
 }
 
 #[test]
+fn finally_runs_before_handler_and_else_returns() {
+    // Python: finally always executes before control leaves the try
+    // statement — including when an except handler or else clause returns
+    // or raises. Handler/else bodies must route through the finally, not
+    // return straight out of the function.
+    let src = concat!(
+        "def f(n: int) -> int:\n",
+        "    try:\n",
+        "        check(n)\n",
+        "    except ValueError:\n",
+        "        return 0\n",
+        "    else:\n",
+        "        return 1\n",
+        "    finally:\n",
+        "        cleanup()\n",
+    );
+    let out = compile(src, "finally_handler.py");
+    // Both the handler return and the else return thread out through a
+    // ControlFlow closure whose Break arm runs cleanup() first.
+    assert_eq!(
+        out.matches("Ok (std :: ops :: ControlFlow :: Break (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }")
+            .count(),
+        2,
+        "handler and else returns must run the finally first: {}",
+        out
+    );
+
+    // A raise inside a handler also runs the finally before propagating.
+    let src = concat!(
+        "def g(n: int):\n",
+        "    try:\n",
+        "        check(n)\n",
+        "    except ValueError:\n",
+        "        raise RuntimeError(\"rethrown\")\n",
+        "    finally:\n",
+        "        cleanup()\n",
+    );
+    let out = compile(src, "finally_reraise.py");
+    assert!(
+        out.contains("Err (__rython_reraise) => { cleanup () ; return Err (__rython_reraise) ; }"),
+        "handler raise must run the finally first: {}",
+        out
+    );
+
+    // Without a finally clause, handler bodies stay inline — no closure.
+    let src = concat!(
+        "def h(n: int) -> int:\n",
+        "    try:\n",
+        "        check(n)\n",
+        "    except ValueError:\n",
+        "        return 0\n",
+        "    return 1\n",
+    );
+    let out = compile(src, "no_finally.py");
+    assert!(!out.contains("__rython_inner"), "generated: {}", out);
+}
+
+#[test]
 fn raise_returns_err_from_the_function() {
     // Functions return Result<T, PyException>, so raising anywhere is
     // returning Err — callers propagate it with `?`, as Python propagates

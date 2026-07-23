@@ -167,8 +167,35 @@ impl CodeGen for Try {
             .collect();
         let try_body_tokens = try_body_tokens?;
 
-        // Handler bodies run outside the closure (their exceptions are not
-        // caught by this try), with the caught exception in scope.
+        // A return that broke out of any of the closures below runs the
+        // finally body, then returns from the function — re-wrapped as
+        // another Break when this try is itself inside an enclosing try's
+        // closure.
+        let break_return = if ctx.in_try_block() {
+            quote!(return Ok(std::ops::ControlFlow::Break(__rython_ret));)
+        } else {
+            quote!(return Ok(__rython_ret);)
+        };
+
+        let has_finally = !self.finalbody.is_empty();
+        let finally_tokens = if has_finally {
+            let finally_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+                .finalbody
+                .clone()
+                .into_iter()
+                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+                .collect();
+            let finally_body_tokens = finally_body_tokens?;
+            quote! { #(#finally_body_tokens;)* }
+        } else {
+            quote!()
+        };
+
+        // Handler bodies run outside the try closure (their exceptions are
+        // not caught by this try), with the caught exception in scope. When
+        // a finally clause exists, each handler body runs in its own
+        // closure so a return or raise inside it still executes the finally
+        // body before leaving the function, as Python requires.
         let handler_ctx = CodeGenContext::ExceptHandler {
             parent: Box::new(ctx.clone()),
         };
@@ -189,20 +216,24 @@ impl CodeGen for Try {
                 }
                 None => quote!(),
             };
-            let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = handler
-                .body
-                .into_iter()
-                .map(|stmt| stmt.to_rust(handler_ctx.clone(), options.clone(), symbols.clone()))
-                .collect();
-            let body_tokens = body_tokens?;
+            let arm_body = lower_finally_guarded_body(
+                handler.body,
+                handler_ctx.clone(),
+                &options,
+                &symbols,
+                has_finally,
+                &finally_tokens,
+                &break_return,
+                "handler body terminates on every path",
+            )?;
             match guard {
                 Some(g) => arms.push(quote! {
-                    Err(__rython_exc) if #g => { #bind #(#body_tokens;)* }
+                    Err(__rython_exc) if #g => { #bind #arm_body }
                 }),
                 None => {
                     has_catch_all = true;
                     arms.push(quote! {
-                        Err(__rython_exc) => { #bind #(#body_tokens;)* }
+                        Err(__rython_exc) => { #bind #arm_body }
                     });
                     break; // later handlers are unreachable, as in Python
                 }
@@ -210,15 +241,19 @@ impl CodeGen for Try {
         }
 
         // Else clause: runs only when the body completed without raising;
-        // its own exceptions are not caught by this try's handlers.
+        // its own exceptions are not caught by this try's handlers — but a
+        // return or raise in it must still run the finally body first.
         let else_tokens = if !self.orelse.is_empty() {
-            let else_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
-                .orelse
-                .into_iter()
-                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                .collect();
-            let else_body_tokens = else_body_tokens?;
-            quote! { #(#else_body_tokens;)* }
+            lower_finally_guarded_body(
+                self.orelse,
+                ctx.clone(),
+                &options,
+                &symbols,
+                has_finally,
+                &finally_tokens,
+                &break_return,
+                "else clause terminates on every path",
+            )?
         } else {
             quote!()
         };
@@ -233,18 +268,6 @@ impl CodeGen for Try {
             else_tokens
         };
 
-        let finally_tokens = if !self.finalbody.is_empty() {
-            let finally_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
-                .finalbody
-                .into_iter()
-                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
-                .collect();
-            let finally_body_tokens = finally_body_tokens?;
-            quote! { #(#finally_body_tokens;)* }
-        } else {
-            quote!()
-        };
-
         // An exception no handler matched propagates as an Err — to the
         // enclosing try's closure when there is one, otherwise out of the
         // function, as in Python. The finally body still runs first.
@@ -255,14 +278,6 @@ impl CodeGen for Try {
         }
 
         if has_return {
-            // A return that broke out of the closure runs the finally body,
-            // then returns from the function — re-wrapped as another Break
-            // when this try is itself inside an enclosing try's closure.
-            let break_return = if ctx.in_try_block() {
-                quote!(return Ok(std::ops::ControlFlow::Break(__rython_ret));)
-            } else {
-                quote!(return Ok(__rython_ret);)
-            };
             Ok(quote! {
                 {
                     #[allow(unreachable_code)]
@@ -300,6 +315,88 @@ impl CodeGen for Try {
                 }
             })
         }
+    }
+}
+
+/// Lower an except-handler or else-clause body. Without a finally clause
+/// the statements run inline. With one, the body runs in its own closure —
+/// like the try body — so a `return` (threaded out as ControlFlow::Break)
+/// or a raise (an Err) still executes the finally body before leaving the
+/// function, as Python guarantees.
+#[allow(clippy::too_many_arguments)]
+fn lower_finally_guarded_body(
+    body: Vec<Statement>,
+    base_ctx: CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+    has_finally: bool,
+    finally_tokens: &TokenStream,
+    break_return: &TokenStream,
+    unreachable_note: &str,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if !has_finally {
+        let tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = body
+            .into_iter()
+            .map(|stmt| stmt.to_rust(base_ctx.clone(), options.clone(), symbols.clone()))
+            .collect();
+        let tokens = tokens?;
+        return Ok(quote! { #(#tokens;)* });
+    }
+
+    let guarantees = crate::guarantees_return(&body);
+    let has_ret = crate::body_contains_function_return(&body);
+    let inner_ctx = CodeGenContext::TryBlock {
+        parent: Box::new(base_ctx),
+    };
+    let tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = body
+        .into_iter()
+        .map(|stmt| stmt.to_rust(inner_ctx.clone(), options.clone(), symbols.clone()))
+        .collect();
+    let tokens = tokens?;
+
+    let completed_arm = if guarantees {
+        quote!(unreachable!(#unreachable_note))
+    } else {
+        quote!()
+    };
+
+    if has_ret {
+        Ok(quote! {
+            #[allow(unreachable_code)]
+            let __rython_inner: std::result::Result<
+                std::ops::ControlFlow<_>,
+                PyException,
+            > = (|| {
+                #(#tokens;)*
+                Ok(std::ops::ControlFlow::Continue(()))
+            })();
+            match __rython_inner {
+                Ok(std::ops::ControlFlow::Break(__rython_ret)) => {
+                    #finally_tokens
+                    #break_return
+                }
+                Ok(std::ops::ControlFlow::Continue(())) => { #completed_arm }
+                Err(__rython_reraise) => {
+                    #finally_tokens
+                    return Err(__rython_reraise);
+                }
+            }
+        })
+    } else {
+        Ok(quote! {
+            #[allow(unreachable_code)]
+            let __rython_inner: std::result::Result<(), PyException> = (|| {
+                #(#tokens;)*
+                Ok(())
+            })();
+            match __rython_inner {
+                Ok(()) => { #completed_arm }
+                Err(__rython_reraise) => {
+                    #finally_tokens
+                    return Err(__rython_reraise);
+                }
+            }
+        })
     }
 }
 

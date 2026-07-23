@@ -412,9 +412,19 @@ fn exceptions_propagate_across_functions_at_runtime() {
             "    except ZeroDivisionError:\n",
             "        return 0\n",
             "\n",
+            "def tracked_divide(a: int, b: int) -> int:\n",
+            "    try:\n",
+            "        return divide(a, b)\n",
+            "    except ZeroDivisionError:\n",
+            "        return -1\n",
+            "    finally:\n",
+            "        print(\"cleanup\")\n",
+            "\n",
             "if __name__ == \"__main__\":\n",
             "    print(safe_divide(10, 2))\n",
             "    print(safe_divide(5, 0))\n",
+            "    print(tracked_divide(8, 2))\n",
+            "    print(tracked_divide(8, 0))\n",
             "    print(divide(1, 0))\n",
         ),
     )
@@ -436,9 +446,12 @@ fn exceptions_propagate_across_functions_at_runtime() {
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // tracked_divide's finally must print "cleanup" before the returned
+    // value is printed — on both the return-through-try path and the
+    // handler-return path.
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        vec!["5", "0"],
+        vec!["5", "0", "cleanup", "4", "cleanup", "-1"],
         "stdout: {} stderr: {}",
         stdout,
         stderr
