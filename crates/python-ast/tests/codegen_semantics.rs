@@ -1556,3 +1556,111 @@ fn split_keyword_arguments_map_or_error_loudly() {
     );
     assert!(err.contains("signature"), "error: {}", err);
 }
+
+// ---- str.format ----
+
+#[test]
+fn str_format_lowers_to_format_macro() {
+    let out = compile(
+        "def f(a: int, b: str) -> str:\n    return \"{} and {}\".format(a, b)\n",
+        "fmt1.py",
+    );
+    assert!(out.contains("format !"), "generated: {}", out);
+    assert!(out.contains("__rython_fmt0"), "generated: {}", out);
+
+    // Positional reuse, keywords, and specs translate.
+    let out = compile(
+        "def f(x: float) -> str:\n    return \"{0} {0} {v:.2f}\".format(x, v=x)\n",
+        "fmt2.py",
+    );
+    assert!(out.contains("__rython_fmt_v"), "generated: {}", out);
+}
+
+#[test]
+fn str_format_errors_are_loud() {
+    // Mixing auto and manual numbering is Python's ValueError.
+    let err = compile_err(
+        "def f(a: int, b: int) -> str:\n    return \"{} {1}\".format(a, b)\n",
+        "fmtmix.py",
+    );
+    assert!(err.contains("automatic field numbering"), "error: {}", err);
+
+    // A template name with no matching keyword.
+    let err = compile_err(
+        "def f() -> str:\n    return \"{missing}\".format(present=1)\n",
+        "fmtname.py",
+    );
+    assert!(err.contains("missing"), "error: {}", err);
+
+    // Specs Rust renders differently are rejected, not approximated.
+    let err = compile_err(
+        "def f(x: int) -> str:\n    return \"{:,}\".format(x)\n",
+        "fmtgroup.py",
+    );
+    assert!(err.contains("thousands separator"), "error: {}", err);
+
+    // Non-literal templates can't be checked at conversion time.
+    let err = compile_err(
+        "def f(t: str, x: int) -> str:\n    return t.format(x)\n",
+        "fmtdyn.py",
+    );
+    assert!(err.contains("non-literal template"), "error: {}", err);
+}
+
+#[test]
+fn fstring_specs_translate_or_error_loudly() {
+    let out = compile(
+        "def f(n: int) -> str:\n    return f\"{n:05d}|{n:>4}\"\n",
+        "fspec.py",
+    );
+    assert!(out.contains("{:05}"), "generated: {}", out);
+    assert!(out.contains("{:>4}"), "generated: {}", out);
+
+    // The old behavior silently fell back to {} for unsupported specs;
+    // now they fail at conversion time.
+    let err = compile_err(
+        "def f(x: float) -> str:\n    return f\"{x:e}\"\n",
+        "fspecbad.py",
+    );
+    assert!(err.contains("presentation type"), "error: {}", err);
+}
+
+#[test]
+fn repr_conversion_keeps_its_format_spec() {
+    // "{0!r:>10}" pads the repr — the spec must not be dropped.
+    let out = compile(
+        "def f(n: int) -> str:\n    return \"{0!r:>10}\".format(n)\n",
+        "reprspec.py",
+    );
+    assert!(out.contains(":>10?}"), "generated: {}", out);
+
+    let out = compile(
+        "def f(n: int) -> str:\n    return f\"{n!r:>10}\"\n",
+        "freprspec.py",
+    );
+    assert!(out.contains(":>10?}"), "generated: {}", out);
+
+    // Numeric presentation types on a repr are Python errors; loud here.
+    let err = compile_err(
+        "def f(n: int) -> str:\n    return \"{0!r:.2f}\".format(n)\n",
+        "reprbad.py",
+    );
+    assert!(err.contains("cannot combine"), "error: {}", err);
+}
+
+#[test]
+fn bare_precision_without_type_errors_loudly() {
+    // Python's "{:.3}" on a float is GENERAL format (significant figures,
+    // possibly scientific); Rust's is fixed decimals. Unknowable operand
+    // type means loud rejection, pointing at .Ns / .Nf.
+    let err = compile_err(
+        "def f(x: float) -> str:\n    return \"{:.3}\".format(x)\n",
+        "barep.py",
+    );
+    assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+    let err = compile_err(
+        "def f(x: float) -> str:\n    return f\"{x:.3}\"\n",
+        "barepf.py",
+    );
+    assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+}

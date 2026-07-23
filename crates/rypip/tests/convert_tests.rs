@@ -724,6 +724,76 @@ fn string_methods_match_python_at_runtime() {
 }
 
 #[test]
+fn str_format_matches_python_at_runtime() {
+    // Auto-numbering, explicit positions with reuse, keywords, {{ escaping,
+    // and format specs — through str.format and f-strings alike.
+    let scratch = Scratch::new("format");
+    let file = scratch.path().join("format.py");
+    fs::write(
+        &file,
+        concat!(
+            "def run() -> int:\n",
+            "    print(\"{} and {}\".format(1, \"x\"))\n",
+            "    print(\"{1}-{0}\".format(\"a\", \"b\"))\n",
+            "    print(\"{:.2f}\".format(3.14159))\n",
+            "    print(\"{:f}\".format(1.5))\n",
+            "    print(\"{:>6}|\".format(\"hi\"))\n",
+            "    print(\"{:*^7}|\".format(\"mid\"))\n",
+            "    print(\"{:05d}\".format(42))\n",
+            "    print(\"{{literal}} {}\".format(7))\n",
+            "    print(\"{name}={val}\".format(name=\"x\", val=3))\n",
+            "    print(\"{:#x} {:b}\".format(255, 5))\n",
+            "    print(\"{0} {0}\".format(\"dup\"))\n",
+            "    n = 42\n",
+            "    print(f\"{3.14159:.2f} {n:05d} {'hi':>6}|\")\n",
+            "    m = -255\n",
+            "    print(\"{:x} {:#x} {:#06x}\".format(m, m, m))\n",
+            "    print(\"{:.2f} {:f}\".format(5, 2))\n",
+            "    print(f\"{m:#x} {5:.1f}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/format"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "1 and x",
+            "b-a",
+            "3.14",
+            "1.500000",
+            "    hi|",
+            "**mid**|",
+            "00042",
+            "{literal} 7",
+            "x=3",
+            "0xff 101",
+            "dup dup",
+            "3.14 00042     hi|",
+            "-ff -0xff -0x0ff",
+            "5.00 2.000000",
+            "-0xff 5.0"
+        ],
+        "format semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn classes_match_python_at_runtime() {
     // Struct-based classes: field inference, defaults, keyword method
     // calls, transitive &mut receivers, exceptions raised from methods and

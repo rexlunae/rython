@@ -27,6 +27,9 @@ pub use datamodel::*;
 pub mod macros;
 
 pub mod traits;
+
+/// Python format-string translation (str.format templates, format specs).
+pub(crate) mod pyformat;
 pub use traits::*;
 
 pub mod parser_utils;

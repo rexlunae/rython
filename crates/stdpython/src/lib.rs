@@ -1441,6 +1441,73 @@ impl<T> PyListOps<T> for Vec<T> {
 /// Python str methods. Named exactly as in Python where no inherent Rust
 /// method conflicts; where one does (split, find), codegen maps the call to
 /// the py_-prefixed name here.
+/// Python's integer radix formatting (the x/X/o/b presentation types),
+/// used by generated format code: Python renders negative values as
+/// sign+magnitude (`format(-255, 'x') == "-ff"`) where Rust's radix
+/// formatters print the two's-complement bit pattern. `align` is one of
+/// '<', '>', '^', or '\0' for the default (right, with sign-aware zero
+/// padding when `zero` is set).
+pub fn py_int_radix_format(
+    v: i64,
+    fill: char,
+    align: char,
+    plus: bool,
+    alternate: bool,
+    zero: bool,
+    width: usize,
+    radix: char,
+) -> String {
+    let mag = v.unsigned_abs();
+    let digits = match radix {
+        'x' => format!("{:x}", mag),
+        'X' => format!("{:X}", mag),
+        'o' => format!("{:o}", mag),
+        _ => format!("{:b}", mag),
+    };
+    let sign = if v < 0 {
+        "-"
+    } else if plus {
+        "+"
+    } else {
+        ""
+    };
+    let prefix = if alternate {
+        match radix {
+            'x' => "0x",
+            'X' => "0X",
+            'o' => "0o",
+            _ => "0b",
+        }
+    } else {
+        ""
+    };
+    let body_len = sign.len() + prefix.len() + digits.len();
+    if zero && align == '\0' {
+        // Zero padding goes BETWEEN the sign/prefix and the digits:
+        // format(-255, '#06x') == "-0x0ff".
+        if body_len < width {
+            let zeros = "0".repeat(width - body_len);
+            return format!("{}{}{}{}", sign, prefix, zeros, digits);
+        }
+        return format!("{}{}{}", sign, prefix, digits);
+    }
+    let body = format!("{}{}{}", sign, prefix, digits);
+    if body_len >= width {
+        return body;
+    }
+    let pad = width - body_len;
+    let filler = fill.to_string();
+    match align {
+        '<' => format!("{}{}", body, filler.repeat(pad)),
+        '^' => {
+            let left = pad / 2;
+            format!("{}{}{}", filler.repeat(left), body, filler.repeat(pad - left))
+        }
+        // '>' and the default: numbers right-align.
+        _ => format!("{}{}", filler.repeat(pad), body),
+    }
+}
+
 /// Python requires ljust/rjust fill arguments to be exactly one
 /// character: "hi".ljust(5, "ab") raises TypeError.
 fn single_fill_char(fill: &str) -> Result<char, PyException> {
