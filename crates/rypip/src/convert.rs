@@ -32,7 +32,7 @@ use crate::package::{PyModule, PyPackage};
 /// part of the point of the tooling. The generated crate's lint posture
 /// follows the warning mode: warn leaves rustc's default (warnings at
 /// build time), deny promotes them to hard errors, allow suppresses them.
-const GENERATED_LINTS: &str = "unused_imports, unused_variables, unused_mut, unused_assignments, dead_code, unreachable_code, non_snake_case, deprecated, noop_method_call";
+const GENERATED_LINTS: &str = "unused_imports, unused_variables, unused_mut, unused_assignments, dead_code, unreachable_code, non_snake_case, non_upper_case_globals, deprecated, noop_method_call";
 
 fn generated_lint_attrs(mode: WarningMode) -> String {
     match mode {

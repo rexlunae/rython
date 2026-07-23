@@ -724,6 +724,60 @@ fn string_methods_match_python_at_runtime() {
 }
 
 #[test]
+fn module_constants_match_python_at_runtime() {
+    // Module-level constants are visible to functions (Python globals);
+    // a value-returning `main` runs through the wrapper entry point.
+    let scratch = Scratch::new("globals");
+    let file = scratch.path().join("globals.py");
+    fs::write(
+        &file,
+        concat!(
+            "PI = 3.14159\n",
+            "GREETING = \"hello\"\n",
+            "DEBUG = True\n",
+            "LIMIT = 10\n",
+            "OFFSET = -3\n",
+            "\n",
+            "def area(r: float) -> float:\n",
+            "    return PI * r * r\n",
+            "\n",
+            "def describe() -> str:\n",
+            "    return f\"{GREETING} {LIMIT}\"\n",
+            "\n",
+            "def main() -> int:\n",
+            "    print(f\"{area(2.0):.4f}\")\n",
+            "    print(describe())\n",
+            "    if DEBUG:\n",
+            "        print(LIMIT + 5)\n",
+            "    print(LIMIT + OFFSET)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/globals"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["12.5664", "hello 10", "15", "7"],
+        "module-global semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn str_format_matches_python_at_runtime() {
     // Auto-numbering, explicit positions with reuse, keywords, {{ escaping,
     // and format specs — through str.format and f-strings alike.

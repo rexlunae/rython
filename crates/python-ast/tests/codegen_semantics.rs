@@ -52,9 +52,10 @@ fn assignments_hoist_declaration_and_store() {
     // Assigned names are hoisted to a declaration and each assignment is a
     // plain store (a `let mut` per assignment would shadow inside nested
     // blocks instead of assigning). A single store needs no `mut`.
-    let out = compile("x = 1", "mut.py");
+    // (A literal here would become a module constant static instead, so
+    // use a computed value.)
+    let out = compile("x = 1 + 1", "mut.py");
     assert!(out.contains("let x"), "generated: {}", out);
-    assert!(out.contains("x = 1"), "generated: {}", out);
     assert!(!out.contains("let mut x"), "single store needs no mut: {}", out);
 }
 
@@ -1663,4 +1664,91 @@ fn bare_precision_without_type_errors_loudly() {
         "barepf.py",
     );
     assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+}
+
+// ---- Module-level globals and entry points ----
+
+#[test]
+fn module_constants_lower_to_statics() {
+    let out = compile(
+        concat!(
+            "PI = 3.14159\n",
+            "GREETING = \"hello\"\n",
+            "DEBUG = True\n",
+            "OFFSET = -3\n",
+            "\n",
+            "def area(r: float) -> float:\n",
+            "    return PI * r * r\n",
+        ),
+        "consts.py",
+    );
+    assert!(out.contains("pub static PI : f64 = 3.14159"), "generated: {}", out);
+    assert!(
+        out.contains("pub static GREETING : & 'static str = \"hello\""),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("pub static DEBUG : bool = true"), "generated: {}", out);
+    assert!(out.contains("pub static OFFSET : i64 = - 3"), "generated: {}", out);
+
+    // A reassigned module name is NOT a constant; it keeps the old
+    // module-init lowering.
+    let out = compile("X = 1\nX = 2\n", "reassigned.py");
+    assert!(!out.contains("pub static X"), "generated: {}", out);
+}
+
+#[test]
+fn value_returning_main_gets_a_wrapper_entry_point() {
+    // `def main() -> int` cannot be the Rust entry point (Result<i64, _>
+    // does not implement Termination); the wrapper discards the value like
+    // Python's `if __name__: main()` does.
+    let out = compile(
+        concat!(
+            "def main() -> int:\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "intmain.py",
+    );
+    assert!(out.contains("fn python_main ()"), "generated: {}", out);
+    assert!(
+        out.contains("fn main () {"),
+        "wrapper entry point expected: {}",
+        out
+    );
+}
+
+#[test]
+fn integral_float_literals_keep_their_float_type() {
+    // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
+    // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
+    // Python, but 2 / 4 as integers is 0).
+    let out = compile("def f() -> float:\n    y = 2.0\n    return y\n", "flit.py");
+    assert!(out.contains("y = 2.0"), "generated: {}", out);
+    assert!(!out.contains("y = 2 ;"), "generated: {}", out);
+}
+
+#[test]
+fn conditionally_reassigned_module_names_are_not_constants() {
+    // DEBUG = False overwritten inside a module-level `if` must NOT freeze
+    // as a static: the nested store would land on a shadowing local inside
+    // __module_init__ while functions read the stale static.
+    let out = compile(
+        "DEBUG = False\nif 1 > 0:\n    DEBUG = True\n",
+        "condglobal.py",
+    );
+    assert!(!out.contains("pub static DEBUG"), "generated: {}", out);
+
+    // A for-loop target at module level is rebound each iteration.
+    let out = compile("I = 0\nfor I in [1, 2]:\n    pass\n", "forglobal.py");
+    assert!(!out.contains("pub static I"), "generated: {}", out);
+
+    // Reassignment inside a module-level try body.
+    let out = compile(
+        "MODE = \"a\"\ntry:\n    MODE = \"b\"\nexcept ValueError:\n    pass\n",
+        "tryglobal.py",
+    );
+    assert!(!out.contains("pub static MODE"), "generated: {}", out);
 }

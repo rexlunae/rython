@@ -79,7 +79,14 @@ pub fn try_int(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 
 pub fn try_float(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: f64 = value.extract()?;
-    let l = Literal::parse(format!("{}", v)).expect("[4] Parsing the literal");
+    // Rust's Display for integral floats drops the ".0" ("2.0" becomes
+    // "2"), which would re-parse as an INTEGER literal and silently change
+    // the generated type (and semantics — Python's 2.0 / 4 is 0.5).
+    let mut s = format!("{}", v);
+    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    let l = Literal::parse(s).expect("[4] Parsing the literal");
 
     Ok(Some(l))
 }
