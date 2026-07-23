@@ -136,14 +136,37 @@ fn parse_field(field: &str) -> Result<Piece, String> {
     })
 }
 
-/// Translate a Python format spec (the text after `:`) into the Rust
-/// format-spec suffix producing IDENTICAL output, or a descriptive error
-/// when Rust's formatter cannot reproduce it.
+/// How a translated spec lowers into generated code.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SpecLowering {
+    /// A Rust format-spec suffix (after `:`) producing identical output.
+    Inline(String),
+    /// Same, but the operand must first coerce to f64: Python's `f` type
+    /// formats integers as floats ("{:.2f}".format(5) == "5.00"), while
+    /// Rust ignores precision on integers.
+    CastF64(String),
+    /// Radix types (x/X/o/b): Rust renders negative integers as their
+    /// two's-complement bit pattern where Python uses sign+magnitude, so
+    /// these route through the stdpython runtime formatter.
+    IntRadix {
+        fill: char,
+        align: char,
+        plus: bool,
+        alternate: bool,
+        zero: bool,
+        width: usize,
+        radix: char,
+    },
+}
+
+/// Translate a Python format spec (the text after `:`) into a lowering
+/// producing IDENTICAL output, or a descriptive error when Rust's
+/// formatter cannot reproduce it.
 ///
 /// Python: [[fill]align][sign][#][0][width][,][.precision][type]
-pub(crate) fn translate_format_spec(spec: &str) -> Result<String, String> {
+pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> {
     if spec.is_empty() {
-        return Ok(String::new());
+        return Ok(SpecLowering::Inline(String::new()));
     }
     let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;
@@ -218,21 +241,35 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<String, String> {
         return Err(format!("Invalid format specifier {:?}", spec));
     }
 
-    // Map the presentation type. Rust reproduces d/s/f/x/X/o/b exactly;
-    // e/E/g/n/% differ in exponent/grouping conventions and are rejected.
-    let mut rust_type = String::new();
+    // Map the presentation type. Rust reproduces d/s and (with the f64
+    // coercion) f/F exactly; radix types go through the runtime formatter
+    // (Python renders negatives as sign+magnitude, Rust as two's
+    // complement); e/E/g/n/% differ in exponent/grouping conventions and
+    // are rejected.
+    let mut cast_f64 = false;
     match ty {
         None | Some('d') | Some('s') => {}
         Some('f') | Some('F') => {
+            cast_f64 = true;
             // Python's default 'f' precision is 6; Rust's is shortest.
             if precision.is_empty() {
                 precision = "6".to_string();
             }
         }
-        Some('x') => rust_type.push('x'),
-        Some('X') => rust_type.push('X'),
-        Some('o') => rust_type.push('o'),
-        Some('b') => rust_type.push('b'),
+        Some(radix @ ('x' | 'X' | 'o' | 'b')) => {
+            if !precision.is_empty() {
+                return Err("precision not allowed in integer format specifier".into());
+            }
+            return Ok(SpecLowering::IntRadix {
+                fill: fill.unwrap_or(' '),
+                align: align.unwrap_or('\0'),
+                plus: sign == Some('+'),
+                alternate,
+                zero,
+                width: width.parse().unwrap_or(0),
+                radix,
+            });
+        }
         Some(other) => {
             return Err(format!(
                 "the {:?} presentation type is not supported yet (Rust's formatter \
@@ -265,8 +302,11 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<String, String> {
         out.push('.');
         out.push_str(&precision);
     }
-    out.push_str(&rust_type);
-    Ok(out)
+    if cast_f64 {
+        Ok(SpecLowering::CastF64(out))
+    } else {
+        Ok(SpecLowering::Inline(out))
+    }
 }
 
 #[cfg(test)]
@@ -275,15 +315,19 @@ mod tests {
 
     #[test]
     fn specs_translate() {
-        assert_eq!(translate_format_spec(".2f").unwrap(), ".2");
-        assert_eq!(translate_format_spec("f").unwrap(), ".6");
-        assert_eq!(translate_format_spec(">6").unwrap(), ">6");
-        assert_eq!(translate_format_spec("*^7").unwrap(), "*^7");
-        assert_eq!(translate_format_spec("05d").unwrap(), "05");
-        assert_eq!(translate_format_spec("+d").unwrap(), "+");
-        assert_eq!(translate_format_spec("#x").unwrap(), "#x");
-        assert_eq!(translate_format_spec("8.3f").unwrap(), "8.3");
-        assert_eq!(translate_format_spec(".3").unwrap(), ".3");
+        use SpecLowering::*;
+        assert_eq!(translate_format_spec(".2f").unwrap(), CastF64(".2".into()));
+        assert_eq!(translate_format_spec("f").unwrap(), CastF64(".6".into()));
+        assert_eq!(translate_format_spec(">6").unwrap(), Inline(">6".into()));
+        assert_eq!(translate_format_spec("*^7").unwrap(), Inline("*^7".into()));
+        assert_eq!(translate_format_spec("05d").unwrap(), Inline("05".into()));
+        assert_eq!(translate_format_spec("+d").unwrap(), Inline("+".into()));
+        assert_eq!(
+            translate_format_spec("#x").unwrap(),
+            IntRadix { fill: ' ', align: '\0', plus: false, alternate: true, zero: false, width: 0, radix: 'x' }
+        );
+        assert_eq!(translate_format_spec("8.3f").unwrap(), CastF64("8.3".into()));
+        assert_eq!(translate_format_spec(".3").unwrap(), Inline(".3".into()));
         assert!(translate_format_spec(",").is_err());
         assert!(translate_format_spec("e").is_err());
         assert!(translate_format_spec("=10").is_err());

@@ -574,6 +574,7 @@ fn lower_str_format(
     let mut auto_next = 0usize;
     let mut saw_auto = false;
     let mut saw_manual = false;
+    let mut field_bindings: Vec<TokenStream> = Vec::new();
     for piece in &pieces {
         match piece {
             Piece::Literal(text) => {
@@ -633,15 +634,52 @@ fn lower_str_format(
                             .into(),
                     );
                 }
-                let rust_spec = if matches!(conversion, Some('r') | Some('a')) {
-                    "?".to_string()
+                let lowering = if matches!(conversion, Some('r') | Some('a')) {
+                    crate::pyformat::SpecLowering::Inline("?".to_string())
                 } else {
                     translate_format_spec(spec).map_err(|e| format!("str.format: {}", e))?
                 };
-                if rust_spec.is_empty() {
-                    fmt.push_str(&format!("{{{}}}", index_name));
-                } else {
-                    fmt.push_str(&format!("{{{}:{}}}", index_name, rust_spec));
+                match lowering {
+                    crate::pyformat::SpecLowering::Inline(suffix) => {
+                        if suffix.is_empty() {
+                            fmt.push_str(&format!("{{{}}}", index_name));
+                        } else {
+                            fmt.push_str(&format!("{{{}:{}}}", index_name, suffix));
+                        }
+                    }
+                    // The operand coerces or converts per-field (one
+                    // argument may be reused with different specs), via a
+                    // field-local binding referencing the argument's.
+                    crate::pyformat::SpecLowering::CastF64(suffix) => {
+                        let fld = format!("__rython_fld{}", field_bindings.len());
+                        let src = crate::safe_ident(&index_name);
+                        let ident = crate::safe_ident(&fld);
+                        field_bindings.push(quote!(let #ident = (#src) as f64;));
+                        if suffix.is_empty() {
+                            fmt.push_str(&format!("{{{}}}", fld));
+                        } else {
+                            fmt.push_str(&format!("{{{}:{}}}", fld, suffix));
+                        }
+                    }
+                    crate::pyformat::SpecLowering::IntRadix {
+                        fill,
+                        align,
+                        plus,
+                        alternate,
+                        zero,
+                        width,
+                        radix,
+                    } => {
+                        let fld = format!("__rython_fld{}", field_bindings.len());
+                        let src = crate::safe_ident(&index_name);
+                        let ident = crate::safe_ident(&fld);
+                        field_bindings.push(quote!(
+                            let #ident = py_int_radix_format(
+                                #src, #fill, #align, #plus, #alternate, #zero, #width, #radix,
+                            );
+                        ));
+                        fmt.push_str(&format!("{{{}}}", fld));
+                    }
                 }
             }
         }
@@ -670,6 +708,10 @@ fn lower_str_format(
         } else {
             bindings.extend(quote!(let _ = #value;));
         }
+    }
+
+    for fb in field_bindings {
+        bindings.extend(fb);
     }
 
     Ok(quote!({

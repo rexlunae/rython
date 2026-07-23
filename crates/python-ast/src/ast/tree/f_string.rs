@@ -134,8 +134,10 @@ impl CodeGen for JoinedStr {
                     fmt.push_str(&escape_format_braces(&constant_text(&c)));
                 }
                 ExprType::FormattedValue(fv) => {
-                    let placeholder = fv.rust_placeholder()?;
-                    let expr = (*fv.value).to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let expr = (*fv.value)
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let (placeholder, expr) = fv.rust_placeholder(expr)?;
                     fmt.push_str(&placeholder);
                     args.push(expr);
                 }
@@ -171,19 +173,24 @@ fn escape_format_braces(s: &str) -> String {
 }
 
 impl FormattedValue {
-    /// The Rust format placeholder for this interpolation: `!r`/`!a`
-    /// conversions map to `{:?}`, and format specs translate through the
-    /// shared Python-spec translator. Specs Rust cannot reproduce exactly
-    /// (or that interpolate other values) are LOUD conversion errors —
-    /// falling back to `{}` would silently change the output.
-    fn rust_placeholder(&self) -> Result<String, Box<dyn std::error::Error>> {
+    /// The Rust format placeholder for this interpolation, plus a wrapper
+    /// applied to the value expression when the spec demands it (f64
+    /// coercion for `f` types, the runtime radix formatter for x/X/o/b —
+    /// Rust would print negative values as two's complement). `!r`/`!a`
+    /// conversions map to `{:?}`. Specs Rust cannot reproduce exactly (or
+    /// that interpolate other values) are LOUD conversion errors — falling
+    /// back to `{}` would silently change the output.
+    fn rust_placeholder(
+        &self,
+        value: TokenStream,
+    ) -> Result<(String, TokenStream), Box<dyn std::error::Error>> {
         // Python conversion codes are the ASCII values of 's', 'r', 'a'.
         if matches!(self.conversion, Some(114) | Some(97)) {
-            return Ok("{:?}".to_string());
+            return Ok(("{:?}".to_string(), value));
         }
 
         match &self.format_spec {
-            None => Ok("{}".to_string()),
+            None => Ok(("{}".to_string(), value)),
             Some(spec) => match static_spec_text(spec) {
                 None => Err(
                     "f-string format specs that interpolate other values (e.g. \
@@ -192,12 +199,41 @@ impl FormattedValue {
                         .into(),
                 ),
                 Some(spec_text) => {
-                    let rust_spec = crate::pyformat::translate_format_spec(spec_text.trim())
-                        .map_err(|e| format!("f-string: {}", e))?;
-                    if rust_spec.is_empty() {
-                        Ok("{}".to_string())
-                    } else {
-                        Ok(format!("{{:{}}}", rust_spec))
+                    use crate::pyformat::SpecLowering;
+                    match crate::pyformat::translate_format_spec(spec_text.trim())
+                        .map_err(|e| format!("f-string: {}", e))?
+                    {
+                        SpecLowering::Inline(suffix) => Ok((
+                            if suffix.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                format!("{{:{}}}", suffix)
+                            },
+                            value,
+                        )),
+                        SpecLowering::CastF64(suffix) => Ok((
+                            if suffix.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                format!("{{:{}}}", suffix)
+                            },
+                            quote!(((#value) as f64)),
+                        )),
+                        SpecLowering::IntRadix {
+                            fill,
+                            align,
+                            plus,
+                            alternate,
+                            zero,
+                            width,
+                            radix,
+                        } => Ok((
+                            "{}".to_string(),
+                            quote!(py_int_radix_format(
+                                #value, #fill, #align, #plus, #alternate, #zero, #width,
+                                #radix,
+                            )),
+                        )),
                     }
                 }
             },
@@ -244,8 +280,8 @@ impl CodeGen for FormattedValue {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let placeholder = self.rust_placeholder()?;
-        let value_tokens = (*self.value).to_rust(ctx, options, symbols)?;
+        let value_tokens = (*self.value).clone().to_rust(ctx, options, symbols)?;
+        let (placeholder, value_tokens) = self.rust_placeholder(value_tokens)?;
         Ok(quote! {
             format!(#placeholder, #value_tokens)
         })

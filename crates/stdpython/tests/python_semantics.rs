@@ -833,3 +833,19 @@ fn whitespace_maxsplit_matches_python() {
         vec!["a", "b", "c"]
     );
 }
+
+#[test]
+fn int_radix_format_matches_python_sign_magnitude() {
+    // Values verified against python3: format(-255, 'x') == "-ff" — sign
+    // and magnitude, never the two's-complement bit pattern.
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, false, false, 0, 'x'), "-ff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, true, false, 0, 'x'), "-0xff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, true, true, 6, 'x'), "-0x0ff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, false, true, 6, 'x'), "-000ff");
+    assert_eq!(py_int_radix_format(255, ' ', '>', false, false, false, 6, 'x'), "    ff");
+    assert_eq!(py_int_radix_format(255, '*', '^', false, false, false, 8, 'x'), "***ff***");
+    assert_eq!(py_int_radix_format(-5, ' ', '\0', false, false, false, 0, 'b'), "-101");
+    assert_eq!(py_int_radix_format(-8, ' ', '\0', false, false, false, 0, 'o'), "-10");
+    assert_eq!(py_int_radix_format(255, ' ', '\0', false, false, true, 8, 'X'), "000000FF");
+    assert_eq!(py_int_radix_format(5, ' ', '\0', true, false, false, 0, 'x'), "+5");
+}

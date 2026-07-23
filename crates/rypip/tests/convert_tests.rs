@@ -746,6 +746,10 @@ fn str_format_matches_python_at_runtime() {
             "    print(\"{0} {0}\".format(\"dup\"))\n",
             "    n = 42\n",
             "    print(f\"{3.14159:.2f} {n:05d} {'hi':>6}|\")\n",
+            "    m = -255\n",
+            "    print(\"{:x} {:#x} {:#06x}\".format(m, m, m))\n",
+            "    print(\"{:.2f} {:f}\".format(5, 2))\n",
+            "    print(f\"{m:#x} {5:.1f}\")\n",
             "    return 0\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -780,7 +784,10 @@ fn str_format_matches_python_at_runtime() {
             "x=3",
             "0xff 101",
             "dup dup",
-            "3.14 00042     hi|"
+            "3.14 00042     hi|",
+            "-ff -0xff -0x0ff",
+            "5.00 2.000000",
+            "-0xff 5.0"
         ],
         "format semantics diverged from CPython"
     );
