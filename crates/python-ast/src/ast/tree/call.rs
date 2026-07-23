@@ -608,6 +608,138 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // functools/heapq/copy/textwrap functions: their runtime shapes
+        // borrow (or mutably borrow) arguments, and reduce() splits by
+        // arity. Handled for both `from X import f; f(...)` and
+        // `import X; X.f(...)` spellings.
+        {
+            let target: Option<(String, Option<&'static str>)> = match self.func.as_ref() {
+                ExprType::Name(n) => match symbols.get(&n.id) {
+                    Some(SymbolTableNode::ImportFrom(import))
+                        if matches!(
+                            import.module.as_str(),
+                            "functools" | "heapq" | "copy" | "textwrap"
+                        ) =>
+                    {
+                        Some((n.id.clone(), None))
+                    }
+                    _ => None,
+                },
+                ExprType::Attribute(attr) => match attr.value.as_ref() {
+                    ExprType::Name(m)
+                        if matches!(m.id.as_str(), "functools" | "heapq" | "textwrap") =>
+                    {
+                        let module: &'static str = match m.id.as_str() {
+                            "functools" => "functools",
+                            "heapq" => "heapq",
+                            _ => "textwrap",
+                        };
+                        Some((attr.attr.clone(), Some(module)))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let known = target.as_ref().is_some_and(|(f, _)| {
+                matches!(
+                    f.as_str(),
+                    "reduce"
+                        | "heappush"
+                        | "heappop"
+                        | "heapify"
+                        | "heappushpop"
+                        | "heapreplace"
+                        | "nlargest"
+                        | "nsmallest"
+                        | "copy"
+                        | "deepcopy"
+                        | "dedent"
+                        | "indent"
+                )
+            });
+            if let (Some((fname, module_prefix)), true) = (target, known) {
+                if let Some(kw) = self.keywords.first() {
+                    return Err(format!(
+                        "{}() got an unexpected keyword argument '{}'",
+                        fname,
+                        kw.arg.as_deref().unwrap_or("**kwargs")
+                    )
+                    .into());
+                }
+                let mut rendered = Vec::new();
+                for arg in &self.args {
+                    rendered.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                let qual = |name: &str| {
+                    let f = format_ident!("{}", name);
+                    match module_prefix {
+                        Some(m) => {
+                            let m = format_ident!("{}", m);
+                            quote!(#m::#f)
+                        }
+                        None => quote!(#f),
+                    }
+                };
+                let arity = |expected: &str| -> Box<dyn std::error::Error> {
+                    format!("{}() takes {} arguments", fname, expected).into()
+                };
+                return match (fname.as_str(), rendered.as_slice()) {
+                    ("reduce", [f, xs]) => {
+                        let p = qual("reduce");
+                        Ok(quote!(#p(#f, &(#xs))?))
+                    }
+                    ("reduce", [f, xs, init]) => {
+                        let p = qual("reduce_initial");
+                        Ok(quote!(#p(#f, &(#xs), #init)))
+                    }
+                    ("reduce", _) => Err(arity("2 or 3")),
+                    ("heappush", [h, x]) => {
+                        let p = qual("heappush");
+                        Ok(quote!(#p(&mut (#h), #x)))
+                    }
+                    ("heappop", [h]) => {
+                        let p = qual("heappop");
+                        Ok(quote!(#p(&mut (#h))?))
+                    }
+                    ("heapify", [h]) => {
+                        let p = qual("heapify");
+                        Ok(quote!(#p(&mut (#h))))
+                    }
+                    ("heappushpop", [h, x]) => {
+                        let p = qual("heappushpop");
+                        Ok(quote!(#p(&mut (#h), #x)))
+                    }
+                    ("heapreplace", [h, x]) => {
+                        let p = qual("heapreplace");
+                        Ok(quote!(#p(&mut (#h), #x)?))
+                    }
+                    ("nlargest" | "nsmallest", [n_arg, xs]) => {
+                        let p = qual(&fname);
+                        Ok(quote!(#p((#n_arg) as usize, &(#xs))))
+                    }
+                    ("copy" | "deepcopy", [x]) => {
+                        let p = qual(&fname);
+                        Ok(quote!(#p(&(#x))))
+                    }
+                    ("dedent", [s]) => {
+                        let p = qual("dedent");
+                        Ok(quote!(#p(&(#s))))
+                    }
+                    ("indent", [s, prefix]) => {
+                        let p = qual("indent");
+                        Ok(quote!(#p(&(#s), &(#prefix))))
+                    }
+                    ("heappush" | "heappushpop" | "heapreplace" | "indent"
+                        | "nlargest" | "nsmallest", _) => Err(arity("2")),
+                    _ => Err(arity("the documented number of")),
+                };
+            }
+        }
+
         // Constructing a class instance: `Point(args)` lowers to
         // `Point::new(args)?`, with arguments resolved against __init__'s
         // signature (minus self) so keywords and defaults follow Python
@@ -691,10 +823,24 @@ impl<'a> CodeGen for Call {
                     return Ok(quote!((#receiver).#method_name(#(#mapped),*)?));
                 }
             }
-            let receiver = attr
-                .value
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // A mutating method on a subscripted receiver must go through
+            // the PLACE lowering: `xs[0].append(v)` has to mutate the real
+            // element, where the Load lowering (py_index) yields a clone
+            // and the write silently vanishes.
+            let receiver = if matches!(attr.value.as_ref(), ExprType::Subscript(_))
+                && crate::ast::tree::scope::MUTATING_METHODS.contains(&attr.attr.as_str())
+            {
+                crate::ast::tree::subscript::subscript_receiver_place(
+                    attr.value.as_ref(),
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?
+            } else {
+                attr.value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            };
 
             // str.split / str.rsplit take sep and maxsplit by position or
             // keyword, with sep=None (or absent) meaning whitespace mode.

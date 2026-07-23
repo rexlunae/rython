@@ -66,3 +66,15 @@ pub mod tempfile;
 #[cfg(feature = "std")]
 pub mod glob;
 
+/// Python functools module - higher-order functions (reduce)
+pub mod functools;
+
+/// Python heapq module - heap queue algorithm on plain lists
+pub mod heapq;
+
+/// Python copy module - shallow and deep copies
+pub mod copy;
+
+/// Python textwrap module - text dedent/indent helpers
+pub mod textwrap;
+

@@ -3130,6 +3130,10 @@ pub use stdlib::string;
 pub use stdlib::json;
 pub use stdlib::collections;
 pub use stdlib::itertools;
+pub use stdlib::functools;
+pub use stdlib::heapq;
+pub use stdlib::copy;
+pub use stdlib::textwrap;
 #[cfg(feature = "std")]
 pub use stdlib::pathlib;
 #[cfg(feature = "std")]

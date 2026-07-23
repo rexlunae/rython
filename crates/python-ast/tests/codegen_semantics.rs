@@ -2038,3 +2038,59 @@ fn itertools_keyword_spellings_lower_to_variants() {
     let err = compile_err(&format!("{}g = groupby([1], foo=1)\n", base), "i9.py");
     assert!(err.contains("unexpected"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// functools/heapq/copy/textwrap lowering, and mutating methods on
+// subscripted receivers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pure_module_calls_lower_with_borrows_and_arity_variants() {
+    let out = compile(
+        "from functools import reduce\nr = reduce(lambda a, b: a + b, [1, 2])\n",
+        "f1.py",
+    );
+    assert!(out.contains("reduce ("), "generated: {}", out);
+    assert!(out.contains(") ?"), "generated: {}", out);
+    let out = compile(
+        "from functools import reduce\nr = reduce(lambda a, b: a + b, [1, 2], 10)\n",
+        "f2.py",
+    );
+    assert!(out.contains("reduce_initial ("), "generated: {}", out);
+
+    // heapq mutates its first argument: &mut lowering and a mut binding.
+    let out = compile(
+        "from heapq import heappush, heappop\nh = [3, 1]\nheappush(h, 2)\nx = heappop(h)\n",
+        "h1.py",
+    );
+    assert!(out.contains("heappush (& mut (h) , 2)"), "generated: {}", out);
+    assert!(out.contains("heappop (& mut (h)) ?"), "generated: {}", out);
+    assert!(out.contains("let mut h"), "heap binding must be mut: {}", out);
+
+    // Module-attribute spelling lowers to the same shapes.
+    let out = compile("import heapq\nh = [2, 1]\nheapq.heapify(h)\n", "h2.py");
+    assert!(out.contains("heapq :: heapify (& mut (h))"), "generated: {}", out);
+
+    let out = compile("from copy import deepcopy\nc = deepcopy([1])\n", "c1.py");
+    assert!(out.contains("deepcopy (& ("), "generated: {}", out);
+    let out = compile(
+        "from textwrap import indent\ns = indent(\"a\", \"> \")\n",
+        "t1.py",
+    );
+    assert!(out.contains("indent (& (\"a\") , & (\"> \"))"), "generated: {}", out);
+}
+
+#[test]
+fn mutating_methods_on_subscripted_receivers_use_the_place_lowering() {
+    // xs[0].append(v) must mutate the real element: the Load lowering
+    // (py_index) yields a clone and the write would silently vanish.
+    let out = compile("xs = [[1], [2]]\nxs[0].append(9)\n", "sub1.py");
+    assert!(
+        out.contains("py_index_mut (0) ?) . push (9)"),
+        "generated: {}",
+        out
+    );
+    // Read-only methods keep the Load lowering.
+    let out = compile("xs = [[1]]\nn = xs[0].count(1)\n", "sub2.py");
+    assert!(!out.contains("py_index_mut"), "generated: {}", out);
+}

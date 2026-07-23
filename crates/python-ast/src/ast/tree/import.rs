@@ -20,6 +20,10 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "time"
             | "collections"
             | "itertools"
+            | "functools"
+            | "heapq"
+            | "copy"
+            | "textwrap"
             | "glob"
             | "pathlib"
             | "tempfile"
@@ -254,26 +258,23 @@ impl CodeGen for ImportFrom {
             // Python. Names without variants keep the plain import, so a
             // genuinely unused `from itertools import pairwise` still
             // surfaces as the source weakness it is.
-            let variants: &[&str] = if self.module == "itertools" {
-                match alias.name.as_str() {
-                    "accumulate" => &[
-                        "accumulate_sum",
-                        "accumulate_func",
-                        "accumulate_sum_initial",
-                        "accumulate_func_initial",
-                    ],
-                    "product" => &[
-                        "product2",
-                        "product3",
-                        "product_repeat2",
-                        "product_repeat3",
-                    ],
-                    "zip_longest" => &["zip_longest_fill"],
-                    "groupby" => &["groupby_key"],
-                    _ => &[],
-                }
-            } else {
-                &[]
+            let variants: &[&str] = match (self.module.as_str(), alias.name.as_str()) {
+                ("itertools", "accumulate") => &[
+                    "accumulate_sum",
+                    "accumulate_func",
+                    "accumulate_sum_initial",
+                    "accumulate_func_initial",
+                ],
+                ("itertools", "product") => &[
+                    "product2",
+                    "product3",
+                    "product_repeat2",
+                    "product_repeat3",
+                ],
+                ("itertools", "zip_longest") => &["zip_longest_fill"],
+                ("itertools", "groupby") => &["groupby_key"],
+                ("functools", "reduce") => &["reduce_initial"],
+                _ => &[],
             };
 
             let name = crate::safe_ident(&alias.name);

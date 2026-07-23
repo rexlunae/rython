@@ -1437,3 +1437,105 @@ mod itertools_gaps {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// functools.reduce, heapq, copy, textwrap (issue #19)
+// All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod heapq_module {
+    use stdpython::heapq::*;
+
+    #[test]
+    fn heap_operations_produce_cpythons_exact_list_layouts() {
+        // The heap is an observable Python list, so the LAYOUT after each
+        // operation is pinned, not just the pop order.
+        let mut h = vec![5i64, 1, 9, 3, 7, 2];
+        heapify(&mut h);
+        assert_eq!(h, vec![1, 3, 2, 5, 7, 9]);
+        heappush(&mut h, 0);
+        assert_eq!(h, vec![0, 3, 1, 5, 7, 9, 2]);
+        assert_eq!(heappop(&mut h).unwrap(), 0);
+        assert_eq!(h, vec![1, 3, 2, 5, 7, 9]);
+        assert_eq!(heappushpop(&mut h, 4), 1);
+        assert_eq!(h, vec![2, 3, 4, 5, 7, 9]);
+        assert_eq!(heapreplace(&mut h, 6).unwrap(), 2);
+        assert_eq!(h, vec![3, 5, 4, 6, 7, 9]);
+    }
+
+    #[test]
+    fn empty_heaps_raise_index_error_with_pythons_message() {
+        let e = heappop(&mut Vec::<i64>::new()).unwrap_err();
+        assert_eq!(format!("{}", e), "IndexError: index out of range");
+        let e = heapreplace(&mut Vec::<i64>::new(), 1).unwrap_err();
+        assert_eq!(format!("{}", e), "IndexError: index out of range");
+        // heappushpop on an empty heap returns the item, as in Python.
+        assert_eq!(heappushpop(&mut Vec::<i64>::new(), 5), 5);
+    }
+
+    #[test]
+    fn nlargest_nsmallest_match_python() {
+        assert_eq!(nlargest(3, &[5i64, 1, 9, 3, 7]), vec![9, 7, 5]);
+        assert_eq!(nsmallest(2, &[5i64, 1, 9, 3, 7]), vec![1, 3]);
+        assert_eq!(nlargest(10, &[1i64, 2]), vec![2, 1]);
+        assert_eq!(nsmallest(0, &[1i64]), Vec::<i64>::new());
+    }
+}
+
+mod functools_module {
+    use stdpython::functools::*;
+
+    #[test]
+    fn reduce_matches_python_including_the_empty_type_error() {
+        assert_eq!(reduce(|a, b| a * b, &[1i64, 2, 3, 4]).unwrap(), 24);
+        assert_eq!(reduce_initial(|a, b| a + b, &[1i64, 2], 100), 103);
+        assert_eq!(reduce_initial(|a: i64, b: i64| a + b, &[], 42), 42);
+        // The accumulator type may differ from the element type.
+        assert_eq!(
+            reduce_initial(|acc: String, n: i64| format!("{}{}", acc, n), &[1, 2, 3], String::new()),
+            "123"
+        );
+        let e = reduce(|a: i64, b: i64| a + b, &[]).unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "TypeError: reduce() of empty iterable with no initial value"
+        );
+    }
+}
+
+mod copy_module {
+    #[test]
+    fn copies_are_independent() {
+        let original = vec![vec![1i64, 2], vec![3]];
+        let mut copied = stdpython::copy::deepcopy(&original);
+        copied[0].push(9);
+        assert_eq!(original[0], vec![1, 2]);
+        assert_eq!(stdpython::copy::copy(&42i64), 42);
+    }
+}
+
+mod textwrap_module {
+    use stdpython::textwrap::{dedent, indent};
+
+    #[test]
+    fn dedent_matches_python() {
+        assert_eq!(dedent("    a\n      b\n    c\n"), "a\n  b\nc\n");
+        assert_eq!(dedent("\tx\n\t\ty\n"), "x\n\ty\n");
+        // Blank lines are ignored for the margin; whitespace-only lines
+        // normalize to empty, as in Python.
+        assert_eq!(dedent("  a\n\n  b\n"), "a\n\nb\n");
+        assert_eq!(dedent("  a\n \n  b\n"), "a\n\nb\n");
+        // Mixed margins keep the common prefix only.
+        assert_eq!(dedent("    a\n  b\n      c\n"), "  a\nb\n    c\n");
+        assert_eq!(dedent("a\n  b\n"), "a\n  b\n");
+        assert_eq!(dedent(""), "");
+    }
+
+    #[test]
+    fn indent_matches_python() {
+        assert_eq!(indent("a\nb\n\nc\n", "> "), "> a\n> b\n\n> c\n");
+        // Whitespace-only lines are not prefixed by the default predicate.
+        assert_eq!(indent("a\n \nb", ">>"), ">>a\n \n>>b");
+        assert_eq!(indent("", "> "), "");
+    }
+}
