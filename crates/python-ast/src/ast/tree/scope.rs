@@ -182,13 +182,193 @@ fn record_target(target: &ExprType, a: &mut Analysis, multi: bool) {
 
 /// The name at the base of a subscript/attribute chain (`grid` in
 /// `grid[i][j]` or `obj.rows[i]`), if the chain bottoms out in one.
-fn chain_base_name(expr: &ExprType) -> Option<&str> {
+pub(crate) fn chain_base_name(expr: &ExprType) -> Option<&str> {
     match expr {
         ExprType::Name(name) => Some(&name.id),
         ExprType::Subscript(sub) => chain_base_name(&sub.value),
         ExprType::Attribute(attr) => chain_base_name(&attr.value),
         _ => None,
     }
+}
+
+/// Invoke `f` on every Call expression in a body, recursing through
+/// control flow and nested expressions. Used for analyses that need to
+/// resolve calls against the symbol table (which the pure syntactic scope
+/// analysis here cannot).
+pub(crate) fn for_each_call(body: &[Statement], f: &mut impl FnMut(&crate::Call)) {
+    fn expr(e: &ExprType, f: &mut impl FnMut(&crate::Call)) {
+        if let ExprType::Call(call) = e {
+            f(call);
+            expr(&call.func, f);
+            for a in &call.args {
+                expr(a, f);
+            }
+            for k in &call.keywords {
+                expr(&k.value, f);
+            }
+            return;
+        }
+        match e {
+            ExprType::BinOp(op) => {
+                expr(&op.left, f);
+                expr(&op.right, f);
+            }
+            ExprType::BoolOp(op) => {
+                for v in &op.values {
+                    expr(v, f);
+                }
+            }
+            ExprType::UnaryOp(op) => expr(&op.operand, f),
+            ExprType::Compare(cmp) => {
+                expr(&cmp.left, f);
+                for c in &cmp.comparators {
+                    expr(c, f);
+                }
+            }
+            ExprType::IfExp(i) => {
+                expr(&i.test, f);
+                expr(&i.body, f);
+                expr(&i.orelse, f);
+            }
+            ExprType::Attribute(attr) => expr(&attr.value, f),
+            ExprType::Subscript(sub) => {
+                expr(&sub.value, f);
+                match &sub.kind {
+                    crate::SubscriptKind::Index(i) => expr(i, f),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        for b in [lower, upper, step].into_iter().flatten() {
+                            expr(b, f);
+                        }
+                    }
+                }
+            }
+            ExprType::List(elts) => {
+                for e in elts {
+                    expr(e, f);
+                }
+            }
+            ExprType::Tuple(t) => {
+                for e in &t.elts {
+                    expr(e, f);
+                }
+            }
+            ExprType::Dict(d) => {
+                for k in d.keys.iter().flatten() {
+                    expr(k, f);
+                }
+                for v in &d.values {
+                    expr(v, f);
+                }
+            }
+            ExprType::Set(s) => {
+                for e in &s.elts {
+                    expr(e, f);
+                }
+            }
+            ExprType::JoinedStr(j) => {
+                for v in &j.values {
+                    expr(v, f);
+                }
+            }
+            ExprType::FormattedValue(v) => expr(&v.value, f),
+            ExprType::Starred(s) => expr(&s.value, f),
+            ExprType::Await(a) => expr(&a.value, f),
+            ExprType::NamedExpr(n) => {
+                expr(&n.left, f);
+                expr(&n.right, f);
+            }
+            _ => {}
+        }
+    }
+    fn stmt(s: &Statement, f: &mut impl FnMut(&crate::Call)) {
+        match &s.statement {
+            StatementType::Assign(a) => expr(&a.value, f),
+            StatementType::AugAssign(a) => expr(&a.value, f),
+            StatementType::Expr(e) => expr(&e.value, f),
+            StatementType::Call(c) => f(c),
+            StatementType::Return(Some(e)) => expr(&e.value, f),
+            StatementType::Assert { test, msg } => {
+                expr(test, f);
+                if let Some(m) = msg {
+                    expr(m, f);
+                }
+            }
+            StatementType::Raise(r) => {
+                if let Some(e) = &r.exc {
+                    expr(e, f);
+                }
+                if let Some(c) = &r.cause {
+                    expr(c, f);
+                }
+            }
+            StatementType::If(i) => {
+                expr(&i.test, f);
+                for st in i.body.iter().chain(i.orelse.iter()) {
+                    stmt(st, f);
+                }
+            }
+            StatementType::While(w) => {
+                expr(&w.test, f);
+                for st in w.body.iter().chain(w.orelse.iter()) {
+                    stmt(st, f);
+                }
+            }
+            StatementType::For(l) => {
+                expr(&l.iter, f);
+                for st in l.body.iter().chain(l.orelse.iter()) {
+                    stmt(st, f);
+                }
+            }
+            StatementType::Try(t) => {
+                for st in t
+                    .body
+                    .iter()
+                    .chain(t.handlers.iter().flat_map(|h| h.body.iter()))
+                    .chain(t.orelse.iter())
+                    .chain(t.finalbody.iter())
+                {
+                    stmt(st, f);
+                }
+            }
+            StatementType::With(w) => {
+                for item in &w.items {
+                    expr(&item.context_expr, f);
+                }
+                for st in &w.body {
+                    stmt(st, f);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in body {
+        stmt(s, f);
+    }
+}
+
+/// Add class-aware mutation facts the syntactic analysis can't see:
+/// calling a `&mut self` method of a known class mutates the receiver
+/// chain's base binding (`c.bump()` needs `c` mutable; `self.inner.bump()`
+/// needs `&mut self`).
+pub(crate) fn add_class_mut_facts(
+    body: &[Statement],
+    ctx: &crate::CodeGenContext,
+    symbols: &crate::SymbolTableScopes,
+    needs_mut: &mut HashSet<String>,
+) {
+    for_each_call(body, &mut |call| {
+        if let ExprType::Attribute(attr) = call.func.as_ref() {
+            if let Some(class) = crate::receiver_class(&attr.value, ctx, symbols) {
+                if class.methods().any(|m| m.name == attr.attr)
+                    && class.method_needs_mut_self(&attr.attr, symbols)
+                {
+                    if let Some(base) = chain_base_name(&attr.value) {
+                        needs_mut.insert(base.to_string());
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn walk_stmts(body: &[Statement], a: &mut Analysis, multi: bool) {
@@ -311,9 +491,12 @@ fn walk_loop(
 
 fn walk_call(call: &crate::Call, a: &mut Analysis) {
     if let ExprType::Attribute(attr) = call.func.as_ref() {
-        if let ExprType::Name(name) = attr.value.as_ref() {
-            if MUTATING_METHODS.contains(&attr.attr.as_str()) {
-                a.record_mutation(&name.id);
+        // A mutating method mutates the base binding of the whole receiver
+        // chain: `self.items.append(x)` mutates `self`, `rows[i].push(x)`
+        // mutates `rows`.
+        if MUTATING_METHODS.contains(&attr.attr.as_str()) {
+            if let Some(name) = chain_base_name(&attr.value) {
+                a.record_mutation(name);
             }
         }
         walk_expr(&attr.value, a);

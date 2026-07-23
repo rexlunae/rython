@@ -61,11 +61,89 @@ impl<'a> CodeGen for Call {
             _ => false,
         };
 
+        // Constructing a class instance: `Point(args)` lowers to
+        // `Point::new(args)?`, with arguments resolved against __init__'s
+        // signature (minus self) so keywords and defaults follow Python
+        // call semantics.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            if let Some(SymbolTableNode::ClassDef(c)) = symbols.get(&n.id) {
+                let cname = crate::safe_ident(&n.id);
+                match c.init_method() {
+                    Some(init) => {
+                        if init.args.vararg.is_some() || init.args.kwarg.is_some() {
+                            return Err(format!(
+                                "`{}.__init__` takes *args/**kwargs, which is not \
+                                 supported yet",
+                                n.id
+                            )
+                            .into());
+                        }
+                        let mut sig = init.clone();
+                        crate::strip_self(&mut sig.args);
+                        let mapped = map_call_arguments(
+                            &sig,
+                            &self.args,
+                            &self.keywords,
+                            &ctx,
+                            &options,
+                            &symbols,
+                        )?;
+                        return Ok(quote!(#cname::new(#(#mapped),*)?));
+                    }
+                    None => {
+                        if !self.args.is_empty() || !self.keywords.is_empty() {
+                            return Err(format!(
+                                "{}() takes no arguments: the class defines no __init__",
+                                n.id
+                            )
+                            .into());
+                        }
+                        return Ok(quote!(#cname::new()?));
+                    }
+                }
+            }
+        }
+
         // Python methods whose Rust inherent namesakes have DIFFERENT
         // semantics (or the wrong shape) are rewritten here; methods with no
         // Rust conflict resolve through the stdpython PyListOps/PyStrOps
         // traits without any rewriting.
         if let ExprType::Attribute(attr) = self.func.as_ref() {
+            // A method call on a receiver whose class is known — `self`
+            // inside a method, or a name assigned a construction — resolves
+            // against the class's own methods FIRST, so a user-defined
+            // method named like a builtin (`get`, `pop`, ...) is not
+            // rewritten out from under the class. Calls propagate
+            // exceptions (`?`) and map keywords/defaults like any user
+            // function call.
+            if let Some(class) = receiver_class(&attr.value, &ctx, &symbols) {
+                if let Some(method) = class.methods().find(|m| m.name == attr.attr).cloned() {
+                    if method.args.vararg.is_some() || method.args.kwarg.is_some() {
+                        return Err(format!(
+                            "`{}.{}` takes *args/**kwargs, which is not supported yet",
+                            class.name, method.name
+                        )
+                        .into());
+                    }
+                    let mut sig = method;
+                    crate::strip_self(&mut sig.args);
+                    let mapped = map_call_arguments(
+                        &sig,
+                        &self.args,
+                        &self.keywords,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    )?;
+                    let receiver = attr.value.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let method_name = crate::safe_ident(&attr.attr);
+                    return Ok(quote!((#receiver).#method_name(#(#mapped),*)?));
+                }
+            }
             let receiver = attr
                 .value
                 .clone()
@@ -312,6 +390,42 @@ impl<'a> CodeGen for Call {
         // any call whose name started with "a" in async contexts, which broke
         // calls like abs(x).
         Ok(final_call)
+    }
+}
+
+/// The class of a method-call receiver, when it is statically known:
+/// `self` inside a class's method body, or a local/module name whose
+/// (symbol-table-recorded) assignment constructs a known class. Unknown
+/// receivers return None and fall through to the generic lowering — where
+/// a genuine user-method call fails to compile (loud), never silently
+/// drops exception propagation.
+pub(crate) fn receiver_class(
+    recv: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+) -> Option<crate::ClassDef> {
+    let class_name = match recv {
+        ExprType::Name(n) if n.id == "self" => ctx.enclosing_class_name()?.to_string(),
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::Assign { value: ExprType::Call(call), .. }) => {
+                match call.func.as_ref() {
+                    ExprType::Name(cn) => cn.id.clone(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
+        // Composition: `self.field.method()` resolves through the owner
+        // class's field types.
+        ExprType::Attribute(attr) => {
+            let owner = receiver_class(&attr.value, ctx, symbols)?;
+            owner.field_class(&attr.attr, symbols)?
+        }
+        _ => return None,
+    };
+    match symbols.get(&class_name) {
+        Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+        _ => None,
     }
 }
 

@@ -224,11 +224,11 @@ impl CodeGen for Module {
 
         // Hoist assigned names to declarations at the top of each generated
         // scope (assignments themselves lower to plain stores).
-        let init_decls = hoisted_declarations(&module_init_raw);
+        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols);
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
-        let main_decls = hoisted_declarations(&main_body_raw);
+        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols);
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -408,8 +408,19 @@ impl CodeGen for Module {
 /// Declarations for every name assigned in a statement list, so
 /// nested-block assignments store into scope-level variables instead of
 /// creating shadowing bindings. Scope analysis decides which need `mut`.
-fn hoisted_declarations(body: &[crate::Statement]) -> TokenStream {
-    let scope = crate::analyze_scope(body, &[]);
+fn hoisted_declarations(
+    body: &[crate::Statement],
+    ctx: &crate::CodeGenContext,
+    symbols: &crate::SymbolTableScopes,
+) -> TokenStream {
+    let mut scope = crate::analyze_scope(body, &[]);
+    // Class-aware mutation facts need the block's own assignments in the
+    // symbol table (`c = Counter(...)` then `c.bump()` needs `c` mutable).
+    let mut symbols = symbols.clone();
+    for s in body {
+        symbols = s.clone().find_symbols(symbols);
+    }
+    crate::add_class_mut_facts(body, ctx, &symbols, &mut scope.needs_mut);
     let mut out = TokenStream::new();
     for name in &scope.assigned {
         let ident = crate::safe_ident(name);

@@ -654,6 +654,111 @@ fn optional_from_dict_get_matches_python_at_runtime() {
 }
 
 #[test]
+fn classes_match_python_at_runtime() {
+    // Struct-based classes: field inference, defaults, keyword method
+    // calls, transitive &mut receivers, exceptions raised from methods and
+    // caught by callers, and composition with mutation through field
+    // chains.
+    let scratch = Scratch::new("classes");
+    let file = scratch.path().join("classes.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self, label: str, start: int = 0):\n",
+            "        self.label = label\n",
+            "        self.count = start\n",
+            "\n",
+            "    def bump(self, amount: int) -> int:\n",
+            "        self.count += amount\n",
+            "        return self.count\n",
+            "\n",
+            "    def reset(self):\n",
+            "        self.count = 0\n",
+            "\n",
+            "    def double_bump(self, amount: int) -> int:\n",
+            "        self.bump(amount)\n",
+            "        self.bump(amount)\n",
+            "        return self.count\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return f\"{self.label}={self.count}\"\n",
+            "\n",
+            "class Guard:\n",
+            "    def __init__(self, limit: int):\n",
+            "        self.limit = limit\n",
+            "\n",
+            "    def check(self, n: int) -> int:\n",
+            "        if n > self.limit:\n",
+            "            raise ValueError(\"over limit\")\n",
+            "        return n\n",
+            "\n",
+            "class Point:\n",
+            "    def __init__(self, x: int, y: int):\n",
+            "        self.x = x\n",
+            "        self.y = y\n",
+            "\n",
+            "    def dist2(self) -> int:\n",
+            "        return self.x * self.x + self.y * self.y\n",
+            "\n",
+            "    def shift(self, dx: int):\n",
+            "        self.x += dx\n",
+            "\n",
+            "class Segment:\n",
+            "    def __init__(self, a: Point, b: Point):\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "    def total(self) -> int:\n",
+            "        return self.a.dist2() + self.b.dist2()\n",
+            "\n",
+            "    def nudge(self):\n",
+            "        self.a.shift(1)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    c = Counter(\"hits\", 10)\n",
+            "    print(c.bump(5))\n",
+            "    print(c.bump(amount=2))\n",
+            "    print(c.double_bump(3))\n",
+            "    c.reset()\n",
+            "    print(c.describe())\n",
+            "    d = Counter(\"fresh\")\n",
+            "    print(d.bump(1))\n",
+            "    g = Guard(10)\n",
+            "    try:\n",
+            "        g.check(11)\n",
+            "    except ValueError:\n",
+            "        print(\"caught\")\n",
+            "    print(g.check(7))\n",
+            "    s = Segment(Point(1, 2), Point(3, 4))\n",
+            "    print(s.total())\n",
+            "    s.nudge()\n",
+            "    print(s.total())\n",
+            "    print(s.a.x)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/classes"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["15", "17", "23", "hits=0", "1", "caught", "7", "30", "33", "2"],
+        "class semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn keyword_arguments_and_defaults_match_python_at_runtime() {
     let scratch = Scratch::new("kwargs");
     let file = scratch.path().join("kw.py");

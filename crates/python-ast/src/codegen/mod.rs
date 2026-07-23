@@ -12,7 +12,10 @@ pub use to_tokenstream::CodeGen;
 #[derive(Clone, Debug)]
 pub enum CodeGenContext {
     Module(String),
-    Class,
+    /// Inside a class body; the payload is the class name, so method
+    /// lowering can resolve `self` (receiver typing, `self.method()` calls)
+    /// against the class's definition in the symbol table.
+    Class(String),
     Function,
     Async(Box<CodeGenContext>),
     /// Directly inside a loop body. `has_else` is true when the loop carries
@@ -65,6 +68,19 @@ impl CodeGenContext {
             CodeGenContext::TryBlock { parent }
             | CodeGenContext::ExceptHandler { parent } => parent.strip_exception_scopes(),
             other => other,
+        }
+    }
+
+    /// The name of the class whose method body this context sits inside, if
+    /// any — the class `self` refers to.
+    pub fn enclosing_class_name(&self) -> Option<&str> {
+        match self {
+            CodeGenContext::Class(name) => Some(name),
+            CodeGenContext::Async(inner) => inner.enclosing_class_name(),
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.enclosing_class_name(),
+            _ => None,
         }
     }
 }

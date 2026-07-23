@@ -93,8 +93,40 @@ impl CodeGen for FunctionDef {
             _ => quote!(),
         };
 
-        let parameters = self
-            .args
+        // Local assignments participate in name resolution for the body:
+        // `p = Point(...)` makes `p`'s class known to method-call lowering.
+        let mut symbols = symbols;
+        for s in &self.body {
+            symbols = s.clone().find_symbols(symbols);
+        }
+
+        // A `def` in a class body whose first parameter is `self` is a
+        // method: `self` becomes the Rust receiver instead of a parameter —
+        // `&mut self` when the method stores through `self`, directly or by
+        // calling another method of the class that does.
+        let is_method = matches!(&ctx, CodeGenContext::Class(_))
+            && self
+                .args
+                .posonlyargs
+                .first()
+                .or(self.args.args.first())
+                .is_some_and(|p| p.arg == "self");
+        let mut render_args = self.args.clone();
+        let method_mutates_self = is_method
+            && match &ctx {
+                CodeGenContext::Class(class_name) => match symbols.get(class_name) {
+                    Some(crate::SymbolTableNode::ClassDef(c)) => {
+                        c.method_needs_mut_self(&self.name, &symbols)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+        if is_method {
+            crate::strip_self(&mut render_args);
+        }
+
+        let parameters = render_args
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
@@ -106,17 +138,35 @@ impl CodeGen for FunctionDef {
         // neither unused_mut warnings nor missing-mut errors), and which
         // parameters must be rebound as mutable locals (Rust parameters are
         // immutable; Python's are ordinary variables).
-        let param_names: Vec<String> = self
-            .args
+        let mut param_names: Vec<String> = render_args
             .args
             .iter()
-            .chain(self.args.posonlyargs.iter())
-            .chain(self.args.kwonlyargs.iter())
+            .chain(render_args.posonlyargs.iter())
+            .chain(render_args.kwonlyargs.iter())
             .map(|p| p.arg.clone())
-            .chain(self.args.vararg.iter().map(|p| p.arg.clone()))
-            .chain(self.args.kwarg.iter().map(|p| p.arg.clone()))
+            .chain(render_args.vararg.iter().map(|p| p.arg.clone()))
+            .chain(render_args.kwarg.iter().map(|p| p.arg.clone()))
             .collect();
-        let scope = crate::analyze_scope(&self.body, &param_names);
+        if is_method {
+            // The receiver is initialized like a parameter, but it is never
+            // rebound (`let mut self = self` is not legal Rust); its
+            // mutations select `&mut self` above instead.
+            param_names.push("self".to_string());
+        }
+        let mut scope = crate::analyze_scope(&self.body, &param_names);
+        if is_method {
+            param_names.pop();
+        }
+        crate::add_class_mut_facts(&self.body, &ctx, &symbols, &mut scope.needs_mut);
+        let receiver = if is_method {
+            if method_mutates_self || scope.needs_mut.contains("self") {
+                quote!(&mut self,)
+            } else {
+                quote!(&self,)
+            }
+        } else {
+            quote!()
+        };
         // Optional names (assigned None on some path, or parameters with an
         // Optional annotation) are visible to every assignment in the body:
         // their non-None stores wrap in Some.
@@ -239,14 +289,14 @@ impl CodeGen for FunctionDef {
             quote! {
                 #(#doc_lines)*
                 #lossy_warning
-                #visibility #is_async fn #fn_name(#parameters) #return_type {
+                #visibility #is_async fn #fn_name(#receiver #parameters) #return_type {
                     #streams
                 }
             }
         } else {
             quote! {
                 #lossy_warning
-                #visibility #is_async fn #fn_name(#parameters) #return_type {
+                #visibility #is_async fn #fn_name(#receiver #parameters) #return_type {
                     #streams
                 }
             }
@@ -297,7 +347,7 @@ fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>
 }
 
 /// Map an expression to an obviously-inferable Rust type, if any.
-fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
+pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
     match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
@@ -314,7 +364,7 @@ fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
 
 /// Collect `name = <simply-typed constant>` assignments (recursing into
 /// control-flow bodies) so returns of those names can be inferred too.
-fn collect_local_types(
+pub(crate) fn collect_local_types(
     body: &[Statement],
     out: &mut std::collections::HashMap<String, TokenStream>,
 ) {
