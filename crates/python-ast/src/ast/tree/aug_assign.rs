@@ -103,11 +103,15 @@ impl CodeGen for AugAssign {
             let value = self.value.to_rust(ctx, options, symbols)?;
             let elem = quote!(__rython_elem);
             let combined = combine_op(&self.op, &elem, &value)?;
+            // The receiver place is bound once so a nested chain
+            // (`grid[i][j] += 1`) evaluates its intermediate lookups — and
+            // any side effects in their indices — exactly once.
             return Ok(quote! {
                 {
+                    let __rython_recv = &mut (#receiver);
                     let __rython_idx = #index;
-                    let __rython_elem = (#receiver).py_index(__rython_idx.clone())?;
-                    (#receiver).py_set_index(__rython_idx, #combined)?;
+                    let __rython_elem = (__rython_recv).py_index(__rython_idx.clone())?;
+                    (__rython_recv).py_set_index(__rython_idx, #combined)?;
                 }
             });
         }
