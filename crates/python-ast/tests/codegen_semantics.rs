@@ -1927,3 +1927,70 @@ fn by_reference_builtins_borrow_their_argument() {
     );
     assert!(out.contains("len (v)"), "generated: {}", out);
 }
+
+// ---------------------------------------------------------------------------
+// datetime constructors, strptime, and runtime-module imports
+// ---------------------------------------------------------------------------
+
+#[test]
+fn datetime_constructors_map_keywords_onto_new() {
+    let out = compile(
+        "from datetime import timedelta\ntd = timedelta(days=1, hours=2)\n",
+        "td.py",
+    );
+    assert!(
+        out.contains("timedelta :: new (Some (1) , None , None , None , None , Some (2) , None)"),
+        "generated: {}",
+        out
+    );
+    let out = compile(
+        "from datetime import date\nd = date(2024, 3, 1)\n",
+        "d.py",
+    );
+    assert!(out.contains("date :: new (2024 , 3 , 1) ?"), "generated: {}", out);
+    let out = compile(
+        "from datetime import datetime\ndt = datetime(2024, 3, 1, hour=10)\n",
+        "dt.py",
+    );
+    assert!(
+        out.contains("datetime :: new (2024 , 3 , 1 , Some (10) , None , None , None) ?"),
+        "generated: {}",
+        out
+    );
+
+    // Unknown keywords and missing required arguments stay loud.
+    let err = compile_err(
+        "from datetime import timedelta\ntd = timedelta(fortnights=1)\n",
+        "tde.py",
+    );
+    assert!(err.contains("unexpected keyword"), "error: {}", err);
+    let err = compile_err("from datetime import date\nd = date(2024)\n", "de.py");
+    assert!(err.contains("missing required argument"), "error: {}", err);
+}
+
+#[test]
+fn strptime_and_module_attribute_calls_lower_to_paths() {
+    let out = compile(
+        "from datetime import datetime\ndt = datetime.strptime(\"x\", \"%Y\")\n",
+        "sp.py",
+    );
+    assert!(
+        out.contains("datetime :: strptime (\"x\" , \"%Y\") ?"),
+        "generated: {}",
+        out
+    );
+    let out = compile("import time\nt = time.monotonic()\n", "tm.py");
+    assert!(out.contains("time :: monotonic ()"), "generated: {}", out);
+}
+
+#[test]
+fn runtime_module_imports_lower_to_nothing_and_aliases_stay_loud() {
+    // The modules are already in scope via `use stdpython::*`; a bare
+    // `use math;` would not even resolve.
+    let out = compile("import math\nimport random\n", "imp.py");
+    assert!(!out.contains("use math"), "generated: {}", out);
+    assert!(!out.contains("use random"), "generated: {}", out);
+
+    let err = compile_err("import time as t\n", "alias.py");
+    assert!(err.contains("aliasing"), "error: {}", err);
+}

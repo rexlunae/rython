@@ -316,6 +316,103 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // datetime constructors imported via `from datetime import ...`:
+        // date/datetime/timedelta calls resolve their positional and
+        // keyword arguments against the Python signatures and lower to the
+        // runtime ::new constructors (Option-typed for the defaulted
+        // parameters). date/datetime validate and propagate with `?`.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            let from_datetime = matches!(
+                symbols.get(&n.id),
+                Some(SymbolTableNode::ImportFrom(import))
+                    if import.module == "datetime"
+            );
+            if from_datetime && matches!(n.id.as_str(), "date" | "datetime" | "timedelta") {
+                let (params, required): (&[&str], usize) = match n.id.as_str() {
+                    "date" => (&["year", "month", "day"], 3),
+                    "datetime" => (
+                        &["year", "month", "day", "hour", "minute", "second", "microsecond"],
+                        3,
+                    ),
+                    _ => (
+                        &[
+                            "days",
+                            "seconds",
+                            "microseconds",
+                            "milliseconds",
+                            "minutes",
+                            "hours",
+                            "weeks",
+                        ],
+                        0,
+                    ),
+                };
+                if self.args.len() > params.len() {
+                    return Err(format!(
+                        "{}() takes at most {} arguments ({} given)",
+                        n.id,
+                        params.len(),
+                        self.args.len()
+                    )
+                    .into());
+                }
+                let mut slots: Vec<Option<crate::ExprType>> = vec![None; params.len()];
+                for (i, arg) in self.args.iter().enumerate() {
+                    slots[i] = Some(arg.clone());
+                }
+                for kw in &self.keywords {
+                    let idx = kw
+                        .arg
+                        .as_deref()
+                        .and_then(|k| params.iter().position(|p| *p == k));
+                    match idx {
+                        Some(i) if slots[i].is_none() => slots[i] = Some(kw.value.clone()),
+                        Some(i) => {
+                            return Err(format!(
+                                "{}() got multiple values for argument '{}'",
+                                n.id, params[i]
+                            )
+                            .into());
+                        }
+                        None => {
+                            return Err(format!(
+                                "{}() got an unexpected keyword argument '{}'",
+                                n.id,
+                                kw.arg.as_deref().unwrap_or("**kwargs")
+                            )
+                            .into());
+                        }
+                    }
+                }
+                let mut rendered = Vec::new();
+                for (i, slot) in slots.iter().enumerate() {
+                    let tok = match slot {
+                        Some(e) => {
+                            let v = e.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            if i < required { v } else { quote!(Some(#v)) }
+                        }
+                        None if i < required => {
+                            return Err(format!(
+                                "{}() missing required argument: '{}'",
+                                n.id, params[i]
+                            )
+                            .into());
+                        }
+                        None => quote!(None),
+                    };
+                    rendered.push(tok);
+                }
+                let ty = crate::safe_ident(&n.id);
+                let call = quote!(#ty::new(#(#rendered),*));
+                // timedelta::new is infallible; date/datetime validate.
+                return Ok(if n.id == "timedelta" { call } else { quote!(#call?) });
+            }
+        }
+
         // Constructing a class instance: `Point(args)` lowers to
         // `Point::new(args)?`, with arguments resolved against __init__'s
         // signature (minus self) so keywords and defaults follow Python
@@ -742,6 +839,12 @@ impl<'a> CodeGen for Call {
         
         // Check if this function returns a Result that should be unwrapped
         let name_str = format!("{}", name);
+
+        // datetime.strptime parses and validates, so it raises ValueError
+        // like Python; propagate rather than hand back a bare Result.
+        if name_str.ends_with(":: strptime") {
+            return Ok(quote!(#call_expr?));
+        }
         let needs_unwrap = matches!(name_str.as_str(), 
             "subprocess :: run" | "subprocess :: run_with_env" | "subprocess :: check_call" | 
             "subprocess :: check_output" | "os :: getcwd" | "os :: chdir" | "os :: execv" |
