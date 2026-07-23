@@ -2067,9 +2067,12 @@ fn pure_module_calls_lower_with_borrows_and_arity_variants() {
     assert!(out.contains("heappop (& mut (h)) ?"), "generated: {}", out);
     assert!(out.contains("let mut h"), "heap binding must be mut: {}", out);
 
-    // Module-attribute spelling lowers to the same shapes.
+    // Module-attribute spelling lowers to the same shapes AND marks the
+    // heap binding mutable (Devin review on #53: only the bare-function
+    // spelling used to).
     let out = compile("import heapq\nh = [2, 1]\nheapq.heapify(h)\n", "h2.py");
     assert!(out.contains("heapq :: heapify (& mut (h))"), "generated: {}", out);
+    assert!(out.contains("let mut h"), "heap binding must be mut: {}", out);
 
     let out = compile("from copy import deepcopy\nc = deepcopy([1])\n", "c1.py");
     assert!(out.contains("deepcopy (& ("), "generated: {}", out);
