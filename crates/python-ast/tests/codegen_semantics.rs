@@ -869,6 +869,56 @@ fn container_annotations_map_to_rust_types() {
 }
 
 #[test]
+fn augmented_assignment_to_subscript_reads_and_stores() {
+    // counts[k] += 1 is read-modify-write through py_index/py_set_index —
+    // the Load lowering yields a temporary, not a place.
+    let out = compile(
+        "def f():\n    counts = {\"a\": 1}\n    counts[\"a\"] += 5\n",
+        "augsub.py",
+    );
+    assert!(
+        out.contains("py_index (__rython_idx . clone ()) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("py_set_index (__rython_idx , (__rython_elem) . py_add (& (5))) ?"),
+        "generated: {}",
+        out
+    );
+
+    // Other operators combine with the read value too.
+    let out = compile(
+        "def f():\n    nums = [1, 2]\n    nums[-1] *= 2\n",
+        "augsub2.py",
+    );
+    assert!(
+        out.contains("py_set_index (__rython_idx , __rython_elem * 2) ?"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn bare_numeric_literals_are_anchored_in_addition() {
+    // `1 + 2` with no type anchor: the PyAdd receiver must have a concrete
+    // type, or trait resolution fails before integer-literal fallback.
+    let out = compile("y = 1 + 2", "anchor.py");
+    assert!(
+        out.contains("((1) as i64) . py_add (& ((2) as i64))"),
+        "generated: {}",
+        out
+    );
+
+    let out = compile("y = 1.5 + 2.5", "anchor2.py");
+    assert!(
+        out.contains("((1.5) as f64) . py_add"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn addition_lowers_through_py_add() {
     // Python + covers String + String and list concat, which Rust's Add
     // doesn't; operands are borrowed so variables stay usable.
