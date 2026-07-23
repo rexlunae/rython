@@ -148,6 +148,94 @@ impl<'a> CodeGen for Call {
                 .value
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+            // str.split / str.rsplit take sep and maxsplit by position or
+            // keyword, with sep=None (or absent) meaning whitespace mode.
+            // Normalized here so every spelling maps to the right runtime
+            // variant; unknown or duplicate keywords are loud errors, as
+            // Python raises TypeError for them.
+            if matches!(attr.attr.as_str(), "split" | "rsplit") {
+                if self.args.len() > 2 {
+                    return Err(format!(
+                        "{}() takes at most 2 arguments ({} given)",
+                        attr.attr,
+                        self.args.len()
+                    )
+                    .into());
+                }
+                let mut sep = self.args.first().cloned();
+                let mut maxsplit = self.args.get(1).cloned();
+                for kw in &self.keywords {
+                    match kw.arg.as_deref() {
+                        Some("sep") => {
+                            if sep.is_some() {
+                                return Err(format!(
+                                    "{}() got multiple values for argument 'sep'",
+                                    attr.attr
+                                )
+                                .into());
+                            }
+                            sep = Some(kw.value.clone());
+                        }
+                        Some("maxsplit") => {
+                            if maxsplit.is_some() {
+                                return Err(format!(
+                                    "{}() got multiple values for argument 'maxsplit'",
+                                    attr.attr
+                                )
+                                .into());
+                            }
+                            maxsplit = Some(kw.value.clone());
+                        }
+                        other => {
+                            return Err(format!(
+                                "{}() got an unexpected keyword argument '{}'",
+                                attr.attr,
+                                other.unwrap_or("**kwargs")
+                            )
+                            .into());
+                        }
+                    }
+                }
+                let is_rsplit = attr.attr == "rsplit";
+                let sep = sep.filter(|s| !crate::is_none_expr(s));
+                return Ok(match (sep, maxsplit) {
+                    (None, None) => quote!((#receiver).py_split_whitespace()),
+                    (None, Some(m)) => {
+                        let m = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        if is_rsplit {
+                            quote!((#receiver).py_rsplit_whitespace_maxsplit(#m))
+                        } else {
+                            quote!((#receiver).py_split_whitespace_maxsplit(#m))
+                        }
+                    }
+                    (Some(s), None) => {
+                        let s = s.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        if is_rsplit {
+                            quote!((#receiver).py_rsplit(&(#s))?)
+                        } else {
+                            quote!((#receiver).py_split(&(#s))?)
+                        }
+                    }
+                    (Some(s), Some(m)) => {
+                        let s = s.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        let m = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        if is_rsplit {
+                            quote!((#receiver).py_rsplit_maxsplit(&(#s), #m)?)
+                        } else {
+                            quote!((#receiver).py_split_maxsplit(&(#s), #m)?)
+                        }
+                    }
+                });
+            }
+
+            // The remaining builtin methods are positional-only in Python;
+            // a keyword here would be silently dropped by the positional
+            // pattern match below, so fall through to the generic path,
+            // which rejects keywords without a resolvable signature.
+            if !self.keywords.is_empty() {
+                // fall through
+            } else {
             let mut rendered_args = Vec::new();
             for arg in &self.args {
                 rendered_args.push(arg.clone().to_rust(
@@ -230,20 +318,45 @@ impl<'a> CodeGen for Call {
                 ("insert", [idx, value]) => {
                     return Ok(quote!((#receiver).py_insert(#idx, #value)));
                 }
-                // str.split() with no argument splits on whitespace runs;
-                // str::split (inherent) returns an iterator, so both forms
-                // map to the PyStrOps versions returning Vec<String>.
-                ("split", []) => {
-                    return Ok(quote!((#receiver).py_split_whitespace()));
+                // partition/rpartition raise ValueError on an empty
+                // separator, so the calls take `?`.
+                ("partition", [sep]) => {
+                    return Ok(quote!((#receiver).partition(&(#sep))?));
                 }
-                ("split", [sep]) => {
-                    return Ok(quote!((#receiver).py_split(&(#sep))));
+                ("rpartition", [sep]) => {
+                    return Ok(quote!((#receiver).rpartition(&(#sep))?));
+                }
+                // strip family with a chars argument (the no-arg forms
+                // resolve through PyStrOps directly).
+                ("strip", [chars]) => {
+                    return Ok(quote!((#receiver).py_strip_chars(&(#chars))));
+                }
+                ("lstrip", [chars]) => {
+                    return Ok(quote!((#receiver).py_lstrip_chars(&(#chars))));
+                }
+                ("rstrip", [chars]) => {
+                    return Ok(quote!((#receiver).py_rstrip_chars(&(#chars))));
+                }
+                // ljust/rjust: the optional fillchar selects the py_ form
+                // (space by default).
+                ("ljust", [width]) => {
+                    return Ok(quote!((#receiver).py_ljust(#width, " ")?));
+                }
+                ("ljust", [width, fill]) => {
+                    return Ok(quote!((#receiver).py_ljust(#width, &(#fill))?));
+                }
+                ("rjust", [width]) => {
+                    return Ok(quote!((#receiver).py_rjust(#width, " ")?));
+                }
+                ("rjust", [width, fill]) => {
+                    return Ok(quote!((#receiver).py_rjust(#width, &(#fill))?));
                 }
                 // str.find returns -1 when absent; str::find an Option.
                 ("find", [needle]) => {
                     return Ok(quote!((#receiver).py_find(&(#needle))));
                 }
                 _ => {}
+            }
             }
         }
 

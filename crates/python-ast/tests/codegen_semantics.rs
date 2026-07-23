@@ -790,7 +790,7 @@ fn python_str_methods_map_through_pystrops() {
     );
     let out = compile(src, "strops.py");
     assert!(out.contains("py_split_whitespace ()"), "generated: {}", out);
-    assert!(out.contains("py_split (& (\",\"))"), "generated: {}", out);
+    assert!(out.contains("py_split (& (\",\")) ?"), "generated: {}", out);
     assert!(out.contains("py_find (& (\"x\"))"), "generated: {}", out);
     assert!(out.contains(". join (parts)"), "generated: {}", out);
 }
@@ -1518,4 +1518,41 @@ fn mutations_inside_keyword_arguments_are_detected() {
         "keyword-nested mutation must mark `c` mutable: {}",
         out
     );
+}
+
+#[test]
+fn split_keyword_arguments_map_or_error_loudly() {
+    // maxsplit by keyword maps to the right runtime variant...
+    let out = compile(
+        "def f(s: str):\n    return s.split(\",\", maxsplit=1)\n",
+        "kwsplit.py",
+    );
+    assert!(
+        out.contains("py_split_maxsplit (& (\",\") , 1) ?"),
+        "generated: {}",
+        out
+    );
+    // ...including whitespace mode with a keyword-only maxsplit.
+    let out = compile(
+        "def f(s: str):\n    return s.rsplit(maxsplit=2)\n",
+        "kwrsplit.py",
+    );
+    assert!(
+        out.contains("py_rsplit_whitespace_maxsplit (2)"),
+        "generated: {}",
+        out
+    );
+    // Unknown keywords are loud conversion errors, not silent drops.
+    let err = compile_err(
+        "def f(s: str):\n    return s.split(\",\", bogus=1)\n",
+        "kwbad.py",
+    );
+    assert!(err.contains("unexpected keyword"), "error: {}", err);
+    // Keywords on positional-only builtin methods fall through to the
+    // loud no-signature error instead of being dropped.
+    let err = compile_err(
+        "def f(s: str):\n    return s.ljust(5, fillchar=\".\")\n",
+        "kwljust.py",
+    );
+    assert!(err.contains("signature"), "error: {}", err);
 }
