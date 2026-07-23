@@ -119,12 +119,12 @@ fn test_random_functions() -> i32 {
     let mut success = 0;
     
     // Set deterministic seed for testing
-    seed_wrapper(Some(42));
+    seed(Some(42i64));
     success += 1;
     
-    if random_wrapper() >= 0.0 && random_wrapper() <= 1.0 { success += 1; }
-    if uniform_wrapper(0.0, 10.0) >= 0.0 { success += 1; }
-    if triangular_wrapper(0.0, 10.0, Some(5.0)) >= 0.0 { success += 1; }
+    if random() >= 0.0 && random() <= 1.0 { success += 1; }
+    if uniform(0.0, 10.0) >= 0.0 { success += 1; }
+    if triangular(0.0, 10.0, Some(5.0)) >= 0.0 { success += 1; }
     
     println!("   ✅ Random functions: {}/4 working", success);
     success

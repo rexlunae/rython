@@ -2245,18 +2245,9 @@ pub use math::{
     remainder_py, remainder_wrapper,
 };
 
-// Re-export random module wrapper functions
+// Re-export random module functions
 #[cfg(feature = "std")]
-pub use random::{
-    // Random number generation
-    seed_py, seed_wrapper,
-    getstate_py, getstate_wrapper,
-    random_py, random_wrapper,
-    
-    // Distribution functions
-    uniform_py, uniform_wrapper,
-    triangular_py, triangular_wrapper,
-};
+pub use random::{getstate, random, seed, triangular, uniform};
 
 // Re-export JSON module wrapper functions
 #[cfg(feature = "std")]

@@ -158,8 +158,19 @@ fn counter_keeps_zero_and_negative_counts() {
     assert_eq!(c.most_common(None).len(), 1);
 }
 
+
+/// The random tests share one global generator; parallel test threads
+/// would interleave draws and break seeded sequences, so every test that
+/// touches the RNG serializes on this lock.
+static RNG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn rng_lock() -> std::sync::MutexGuard<'static, ()> {
+    RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn randrange_reaches_last_step_value() {
+    let _rng = rng_lock();
     // randrange(0, 10, 3) draws from {0, 3, 6, 9}; make sure 9 is reachable
     // and out-of-range values are not produced.
     let mut seen_max = 0;
@@ -173,6 +184,7 @@ fn randrange_reaches_last_step_value() {
 
 #[test]
 fn expovariate_is_finite() {
+    let _rng = rng_lock();
     for _ in 0..1000 {
         let v = stdpython::random::expovariate(1.5).unwrap();
         assert!(v.is_finite() && v >= 0.0, "expovariate produced {}", v);
@@ -486,4 +498,135 @@ fn option_add_matches_python_runtime_semantics() {
 fn none_add_raises_type_error_like_python() {
     // Python: None + 1 -> TypeError at runtime
     let _ = Option::<i64>::None.py_add(&1i64);
+}
+
+// ---- Seeded random: MT19937 matching CPython ----
+
+#[test]
+fn seeded_random_matches_cpython_bit_for_bit() {
+    let _rng = rng_lock();
+    use stdpython::random;
+    // Values from python3.11: random.seed(42); [random.random() for _ in range(3)]
+    random::seed(Some(42i64));
+    assert_eq!(random::random(), 0.6394267984578837);
+    assert_eq!(random::random(), 0.025010755222666936);
+    assert_eq!(random::random(), 0.27502931836911926);
+
+    // random.seed(0) exercises the zero-key path.
+    random::seed(Some(0i64));
+    assert_eq!(random::random(), 0.8444218515250481);
+
+    // A seed wider than 32 bits exercises the multi-word key split.
+    random::seed(Some((1i64 << 40) + 123));
+    assert_eq!(random::random(), 0.9437888222210947);
+}
+
+#[test]
+fn seeded_integer_functions_match_cpython() {
+    let _rng = rng_lock();
+    use stdpython::random;
+    // random.seed(42); [random.randint(1, 100) for _ in range(5)]
+    random::seed(Some(42i64));
+    let got: Vec<i64> = (0..5).map(|_| random::randint(1, 100).unwrap()).collect();
+    assert_eq!(got, vec![82, 15, 4, 95, 36]);
+
+    // random.seed(7); l = list(range(10)); random.shuffle(l)
+    random::seed(Some(7i64));
+    let mut l: Vec<i64> = (0..10).collect();
+    random::shuffle(&mut l);
+    assert_eq!(l, vec![8, 3, 1, 4, 7, 0, 9, 6, 2, 5]);
+
+    // random.seed(7); [random.choice(['a','b','c','d']) for _ in range(4)]
+    random::seed(Some(7i64));
+    let pool = ["a", "b", "c", "d"];
+    let got: Vec<&str> = (0..4).map(|_| *random::choice(&pool).unwrap()).collect();
+    assert_eq!(got, vec!["c", "b", "d", "a"]);
+
+    // random.seed(5); random.sample(range(20), 5)
+    random::seed(Some(5i64));
+    let population: Vec<i64> = (0..20).collect();
+    assert_eq!(
+        random::sample(&population, 5).unwrap(),
+        vec![19, 8, 11, 16, 0]
+    );
+
+    // random.seed(11); [random.randrange(0, 10, 3) for _ in range(6)]
+    random::seed(Some(11i64));
+    let got: Vec<i64> = (0..6)
+        .map(|_| random::randrange(0, Some(10), Some(3)).unwrap())
+        .collect();
+    assert_eq!(got, vec![9, 9, 9, 3, 3, 9]);
+
+    // random.seed(9); random.uniform(1, 10); getrandbits(16); getrandbits(64)
+    random::seed(Some(9i64));
+    assert_eq!(random::uniform(1.0, 10.0), 5.167066220335193);
+    assert_eq!(random::getrandbits(16).unwrap(), 24465);
+    assert_eq!(random::getrandbits(64).unwrap(), 2555601105289669628);
+
+    // random.seed(9); random.choices(['a','b','c'], weights=[1,2,7], k=5)
+    random::seed(Some(9i64));
+    let got = random::choices(&["a", "b", "c"], Some(&[1.0, 2.0, 7.0]), None, 5).unwrap();
+    assert_eq!(got, vec!["c", "c", "b", "c", "a"]);
+}
+
+#[test]
+fn seeded_distributions_match_cpython_arithmetic() {
+    let _rng = rng_lock();
+    use stdpython::random;
+    // Same algorithms as CPython; transcendental libm calls may differ in
+    // the last ulp, so compare with a tight relative tolerance.
+    fn close(a: f64, b: f64) {
+        assert!(
+            ((a - b) / b).abs() < 1e-12,
+            "expected {}, got {}",
+            b,
+            a
+        );
+    }
+    random::seed(Some(1i64));
+    close(random::normalvariate(0.0, 1.0), 0.6074558576437062);
+
+    // gauss consumes and caches deviates through the generator state.
+    random::seed(Some(1i64));
+    close(random::gauss(0.0, 1.0), 1.2881847531554629);
+    close(random::gauss(0.0, 1.0), 1.449445608699771);
+    close(random::gauss(0.0, 1.0), 0.06633580893826191);
+
+    random::seed(Some(3i64));
+    close(random::gammavariate(2.5, 1.0).unwrap(), 1.3970393710961815);
+    random::seed(Some(3i64));
+    close(random::gammavariate(0.5, 2.0).unwrap(), 0.15875009282498548);
+    random::seed(Some(4i64));
+    close(random::betavariate(2.0, 3.0).unwrap(), 0.29010822651603796);
+    random::seed(Some(9i64));
+    close(random::expovariate(1.5).unwrap(), 0.4145139241807281);
+    random::seed(Some(9i64));
+    close(random::triangular(0.0, 10.0, Some(2.0)), 3.44565706002514);
+    random::seed(Some(9i64));
+    close(random::vonmisesvariate(0.0, 4.0), 5.846117145872649);
+    random::seed(Some(9i64));
+    close(random::weibullvariate(1.0, 1.5).unwrap(), 0.7284843985495473);
+}
+
+#[test]
+fn random_state_round_trips_and_seed_resets_gauss() {
+    let _rng = rng_lock();
+    use stdpython::random;
+    random::seed(Some(123i64));
+    let _ = random::gauss(0.0, 1.0); // leaves a cached second deviate
+    let state = random::getstate();
+    let a = random::gauss(0.0, 1.0);
+    let b = random::random();
+    random::setstate(&state).unwrap();
+    assert_eq!(random::gauss(0.0, 1.0), a, "state must include the gauss cache");
+    assert_eq!(random::random(), b);
+
+    // Reseeding clears the cached deviate (CPython behavior): two fresh
+    // seeds give identical first gauss values.
+    random::seed(Some(55i64));
+    let _ = random::gauss(0.0, 1.0);
+    random::seed(Some(55i64));
+    let first = random::gauss(0.0, 1.0);
+    random::seed(Some(55i64));
+    assert_eq!(random::gauss(0.0, 1.0), first);
 }
