@@ -280,6 +280,18 @@ impl CodeGen for ClassDef {
             }
         }
 
+        // The synthesized constructor occupies `new` in the inherent impl;
+        // a user method with that name would be a confusing duplicate-item
+        // compile error instead of a conversion-time one.
+        if self.methods().any(|m| m.name == "new") {
+            return Err(format!(
+                "class `{}` defines a method named `new`, which collides with the \
+                 constructor synthesized for `{}(...)` call sites; rename the method",
+                self.name, self.name
+            )
+            .into());
+        }
+
         // ---- Field inference from __init__ ----
         let mut fields: Vec<(String, TokenStream)> = Vec::new();
         if let Some(init) = self.init_method() {

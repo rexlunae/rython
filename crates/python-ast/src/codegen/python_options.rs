@@ -101,6 +101,12 @@ pub struct PythonOptions {
     /// some path, or annotated Optional): non-None stores into them wrap
     /// in Some. Set per scope by the function/module generators.
     pub optional_names: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Whether the CURRENT function's return annotation is `str`: returning
+    /// an attribute chain then clones the String field out of the shared
+    /// receiver. Python strings are immutable, so the clone reproduces
+    /// Python's aliasing semantics exactly. Set per function.
+    pub clone_str_attribute_returns: bool,
 }
 
 impl Default for PythonOptions {
@@ -121,6 +127,7 @@ impl Default for PythonOptions {
             async_runtime: AsyncRuntime::default(),
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            clone_str_attribute_returns: false,
         }
     }
 }

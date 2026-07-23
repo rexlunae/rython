@@ -684,6 +684,9 @@ fn classes_match_python_at_runtime() {
             "    def describe(self) -> str:\n",
             "        return f\"{self.label}={self.count}\"\n",
             "\n",
+            "    def label_of(self) -> str:\n",
+            "        return self.label\n",
+            "\n",
             "class Guard:\n",
             "    def __init__(self, limit: int):\n",
             "        self.limit = limit\n",
@@ -722,6 +725,7 @@ fn classes_match_python_at_runtime() {
             "    print(c.double_bump(3))\n",
             "    c.reset()\n",
             "    print(c.describe())\n",
+            "    print(c.label_of())\n",
             "    d = Counter(\"fresh\")\n",
             "    print(d.bump(1))\n",
             "    g = Guard(10)\n",
@@ -753,7 +757,7 @@ fn classes_match_python_at_runtime() {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        vec!["15", "17", "23", "hits=0", "1", "caught", "7", "30", "33", "2"],
+        vec!["15", "17", "23", "hits=0", "hits", "1", "caught", "7", "30", "33", "2"],
         "class semantics diverged from CPython"
     );
 }

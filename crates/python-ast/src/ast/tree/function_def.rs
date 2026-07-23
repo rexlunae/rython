@@ -187,6 +187,8 @@ impl CodeGen for FunctionDef {
                 }
             }
             options.optional_names = std::rc::Rc::new(optional);
+            options.clone_str_attribute_returns =
+                matches!(self.returns.as_deref(), Some(ExprType::Name(n)) if n.id == "str");
         }
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.

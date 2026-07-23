@@ -1434,3 +1434,34 @@ fn unsupported_class_constructs_error_loudly() {
     );
     assert!(err.contains("cannot infer a type"), "error: {}", err);
 }
+
+#[test]
+fn str_getters_clone_the_field_out_of_the_shared_receiver() {
+    // `def name(self) -> str: return self.name` reads a String field
+    // through &self: the return clones it — semantically exact, since
+    // Python strings are immutable.
+    let src = concat!(
+        "class Tag:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def get_name(self) -> str:\n",
+        "        return self.name\n",
+    );
+    let out = compile(src, "getter.py");
+    assert!(
+        out.contains("Ok ((self . name) . clone ())"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn class_method_named_new_errors_loudly() {
+    let err = compile_err(
+        "class C:\n    def new(self) -> int:\n        return 1\n",
+        "newclash.py",
+    );
+    assert!(err.contains("`new`"), "error: {}", err);
+    assert!(err.contains("constructor"), "error: {}", err);
+}
