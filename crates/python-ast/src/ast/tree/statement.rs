@@ -385,6 +385,9 @@ impl CodeGen for StatementType {
             StatementType::AugAssign(a) => a.find_symbols(symbols),
             StatementType::ClassDef(c) => c.find_symbols(symbols),
             StatementType::FunctionDef(f) => f.find_symbols(symbols),
+            // Async functions register like ordinary ones, so call sites
+            // know they return Result and append `?` (before `.await`).
+            StatementType::AsyncFunctionDef(f) => f.find_symbols(symbols),
             StatementType::Import(i) => i.find_symbols(symbols),
             StatementType::ImportFrom(i) => i.find_symbols(symbols),
             StatementType::Expr(e) => e.find_symbols(symbols),
