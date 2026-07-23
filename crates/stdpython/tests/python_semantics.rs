@@ -227,6 +227,11 @@ fn py_contains_matches_python_in_operator() {
     // Vec of Strings with a String probe
     let names = vec![String::from("ada"), String::from("bo")];
     assert!(names.py_contains(&String::from("bo")));
+
+    // Python: 2 in {1, 2, 3} — set literals lower to a std HashSet
+    let s = std::collections::HashSet::from([1i64, 2, 3]);
+    assert!(s.py_contains(&2));
+    assert!(!s.py_contains(&9));
 }
 
 #[test]

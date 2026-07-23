@@ -1339,6 +1339,7 @@ impl<T: Eq + Hash> PyContains<T> for PySet<T> {
     }
 }
 
+// Set literals lower to a std HashSet, so `x in {1, 2, 3}` needs this.
 impl<T: Eq + Hash> PyContains<T> for HashSet<T> {
     fn py_contains(&self, item: &T) -> bool {
         self.contains(item)
