@@ -1491,3 +1491,31 @@ fn read_only_methods_with_mutator_names_do_not_force_mut() {
         out
     );
 }
+
+#[test]
+fn mutations_inside_keyword_arguments_are_detected() {
+    // `use_it(n=c.bump(2))` mutates `c` through a keyword-argument value;
+    // the binding must be mutable.
+    let src = concat!(
+        "class Counter:\n",
+        "    def __init__(self, start: int):\n",
+        "        self.count = start\n",
+        "\n",
+        "    def bump(self, amount: int) -> int:\n",
+        "        self.count += amount\n",
+        "        return self.count\n",
+        "\n",
+        "def use_it(n: int) -> int:\n",
+        "    return n\n",
+        "\n",
+        "def run() -> int:\n",
+        "    c = Counter(1)\n",
+        "    return use_it(n=c.bump(2))\n",
+    );
+    let out = compile(src, "kwmut.py");
+    assert!(
+        out.contains("let mut c ;"),
+        "keyword-nested mutation must mark `c` mutable: {}",
+        out
+    );
+}

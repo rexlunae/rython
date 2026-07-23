@@ -372,6 +372,11 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
     for arg in &call.args {
         walk_expr(arg, a);
     }
+    // Keyword-argument values carry mutations too: `foo(x=c.bump())`
+    // mutates `c` just as surely as a positional argument would.
+    for kw in &call.keywords {
+        walk_expr(&kw.value, a);
+    }
 }
 
 fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis<'_>) {
