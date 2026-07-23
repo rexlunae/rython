@@ -803,8 +803,13 @@ fn strip_title_zfill_just_match_python() {
     assert_eq!("-42".zfill(6), "-00042");
     assert_eq!("7".zfill(3), "007");
     assert_eq!("abcd".zfill(2), "abcd");
-    assert_eq!("hi".py_ljust(5, "."), "hi...");
-    assert_eq!("hi".py_rjust(5, " "), "   hi");
+    assert_eq!("hi".py_ljust(5, ".").unwrap(), "hi...");
+    assert_eq!("hi".py_rjust(5, " ").unwrap(), "   hi");
     // Widths count characters, not bytes.
-    assert_eq!("héllo".py_ljust(7, "*"), "héllo**");
+    assert_eq!("héllo".py_ljust(7, "*").unwrap(), "héllo**");
+    // Python: "hi".ljust(5, "ab") raises TypeError (fill must be exactly
+    // one character); truncating silently would diverge.
+    let err = "hi".py_ljust(5, "ab").unwrap_err();
+    assert!(err.to_string().contains("TypeError"), "got: {}", err);
+    assert!("hi".py_rjust(5, "").is_err());
 }

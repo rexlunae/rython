@@ -278,16 +278,16 @@ impl<'a> CodeGen for Call {
                 // ljust/rjust: the optional fillchar selects the py_ form
                 // (space by default).
                 ("ljust", [width]) => {
-                    return Ok(quote!((#receiver).py_ljust(#width, " ")));
+                    return Ok(quote!((#receiver).py_ljust(#width, " ")?));
                 }
                 ("ljust", [width, fill]) => {
-                    return Ok(quote!((#receiver).py_ljust(#width, &(#fill))));
+                    return Ok(quote!((#receiver).py_ljust(#width, &(#fill))?));
                 }
                 ("rjust", [width]) => {
-                    return Ok(quote!((#receiver).py_rjust(#width, " ")));
+                    return Ok(quote!((#receiver).py_rjust(#width, " ")?));
                 }
                 ("rjust", [width, fill]) => {
-                    return Ok(quote!((#receiver).py_rjust(#width, &(#fill))));
+                    return Ok(quote!((#receiver).py_rjust(#width, &(#fill))?));
                 }
                 // str.find returns -1 when absent; str::find an Option.
                 ("find", [needle]) => {

@@ -1441,6 +1441,19 @@ impl<T> PyListOps<T> for Vec<T> {
 /// Python str methods. Named exactly as in Python where no inherent Rust
 /// method conflicts; where one does (split, find), codegen maps the call to
 /// the py_-prefixed name here.
+/// Python requires ljust/rjust fill arguments to be exactly one
+/// character: "hi".ljust(5, "ab") raises TypeError.
+fn single_fill_char(fill: &str) -> Result<char, PyException> {
+    let mut chars = fill.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(c),
+        _ => Err(PyException::new(
+            "TypeError",
+            "The fill character must be exactly one character long",
+        )),
+    }
+}
+
 pub trait PyStrOps {
     fn upper(&self) -> String;
     fn lower(&self) -> String;
@@ -1482,8 +1495,10 @@ pub trait PyStrOps {
     /// str.zfill(width): zero-pad to width CHARACTERS, after any sign.
     fn zfill(&self, width: i64) -> String;
     /// str.ljust / str.rjust with a fill character, width in CHARACTERS.
-    fn py_ljust(&self, width: i64, fill: &str) -> String;
-    fn py_rjust(&self, width: i64, fill: &str) -> String;
+    /// The fill must be exactly one character; Python raises TypeError
+    /// otherwise (silently using a prefix would diverge).
+    fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException>;
+    fn py_rjust(&self, width: i64, fill: &str) -> Result<String, PyException>;
     fn splitlines(&self) -> Vec<String>;
     /// sep.join(iterable)
     fn join<I, S>(&self, parts: I) -> String
@@ -1642,23 +1657,23 @@ impl PyStrOps for str {
             format!("{}{}", zeros, self)
         }
     }
-    fn py_ljust(&self, width: i64, fill: &str) -> String {
+    fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
+        let fill_char = single_fill_char(fill)?;
         let width = width.max(0) as usize;
         let count = self.chars().count();
         if count >= width {
-            return self.to_string();
+            return Ok(self.to_string());
         }
-        let fill_char = fill.chars().next().unwrap_or(' ');
-        format!("{}{}", self, fill_char.to_string().repeat(width - count))
+        Ok(format!("{}{}", self, fill_char.to_string().repeat(width - count)))
     }
-    fn py_rjust(&self, width: i64, fill: &str) -> String {
+    fn py_rjust(&self, width: i64, fill: &str) -> Result<String, PyException> {
+        let fill_char = single_fill_char(fill)?;
         let width = width.max(0) as usize;
         let count = self.chars().count();
         if count >= width {
-            return self.to_string();
+            return Ok(self.to_string());
         }
-        let fill_char = fill.chars().next().unwrap_or(' ');
-        format!("{}{}", fill_char.to_string().repeat(width - count), self)
+        Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self))
     }
     fn splitlines(&self) -> Vec<String> {
         self.lines().map(str::to_string).collect()
