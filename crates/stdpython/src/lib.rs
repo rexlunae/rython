@@ -1339,6 +1339,12 @@ impl<T: Eq + Hash> PyContains<T> for PySet<T> {
     }
 }
 
+impl<T: Eq + Hash> PyContains<T> for HashSet<T> {
+    fn py_contains(&self, item: &T) -> bool {
+        self.contains(item)
+    }
+}
+
 impl PyContains<str> for str {
     fn py_contains(&self, item: &str) -> bool {
         self.contains(item)
