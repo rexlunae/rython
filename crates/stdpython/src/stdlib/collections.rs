@@ -13,7 +13,7 @@ pub struct Counter<T>
 where 
     T: Hash + Eq + Clone + std::fmt::Debug,
 {
-    counts: HashMap<T, i64>,
+    counts: indexmap::IndexMap<T, i64>,
 }
 
 impl<T> Counter<T> 
@@ -23,7 +23,7 @@ where
     /// Create a new Counter
     pub fn new() -> Self {
         Self {
-            counts: HashMap::new(),
+            counts: indexmap::IndexMap::new(),
         }
     }
     
@@ -66,7 +66,9 @@ where
         let mut items: Vec<(T, i64)> = self.counts.iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0))));
+        // Stable sort by count only: Python breaks ties by FIRST-INSERTION
+        // order (the old Debug-string comparison invented an ordering).
+        items.sort_by(|a, b| b.1.cmp(&a.1));
         
         match n {
             Some(limit) => items.into_iter().take(limit).collect(),

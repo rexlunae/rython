@@ -239,7 +239,7 @@ static PYTHON_FUNCTION_REGISTRY: std::sync::LazyLock<Mutex<PythonFunctionRegistr
 
 /// Get the global Python function registry
 pub fn get_registry() -> std::sync::MutexGuard<'static, PythonFunctionRegistry> {
-    PYTHON_FUNCTION_REGISTRY.lock().unwrap()
+    PYTHON_FUNCTION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Convenience macro to register a module's Python functions
