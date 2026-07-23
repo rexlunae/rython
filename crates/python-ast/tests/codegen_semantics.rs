@@ -585,6 +585,40 @@ fn finally_runs_before_handler_and_else_returns() {
 }
 
 #[test]
+fn awaited_async_calls_propagate_exceptions() {
+    // Async functions register in the symbol table like ordinary ones, so
+    // calls to them get `?` — reordered after `.await` so it unwraps the
+    // awaited Result, not the future.
+    let src = concat!(
+        "async def helper() -> int:\n",
+        "    return 1\n",
+        "\n",
+        "async def caller() -> int:\n",
+        "    return await helper()\n",
+    );
+    let out = compile(src, "async_prop.py");
+    assert!(
+        out.contains("helper () . await ?"),
+        "awaited user call must unwrap the Result: {}",
+        out
+    );
+}
+
+#[test]
+fn bare_trailing_return_gets_no_unreachable_tail() {
+    // A bare `return` fully exits the function (it extracts as returning
+    // None), so no Ok(()) tail may follow it — that would be unreachable
+    // code, tripping deny-warnings builds.
+    let out = compile("def f():\n    work()\n    return\n", "bareret.py");
+    assert!(out.contains("return Ok (())"), "generated: {}", out);
+    assert!(
+        !out.contains("return Ok (()) ; Ok (())"),
+        "no unreachable tail after a trailing bare return: {}",
+        out
+    );
+}
+
+#[test]
 fn raise_returns_err_from_the_function() {
     // Functions return Result<T, PyException>, so raising anywhere is
     // returning Err — callers propagate it with `?`, as Python propagates
