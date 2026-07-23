@@ -588,12 +588,20 @@ impl Iterator for PyRange {
 }
 
 impl PyRange {
-    /// Python len(range(...)): the number of elements remaining.
+    /// Python len(range(...)): the number of elements remaining. Computed
+    /// in i128 so extreme endpoints and steps (spans near i64::MAX,
+    /// step == i64::MIN) can never overflow.
     pub fn py_len(&self) -> usize {
         let (span, step) = if self.step > 0 {
-            (self.stop.saturating_sub(self.next), self.step)
+            (
+                self.stop as i128 - self.next as i128,
+                self.step as i128,
+            )
         } else {
-            (self.next.saturating_sub(self.stop), -self.step)
+            (
+                self.next as i128 - self.stop as i128,
+                -(self.step as i128),
+            )
         };
         if span <= 0 {
             0
@@ -602,7 +610,8 @@ impl PyRange {
         }
     }
 
-    /// Python `x in range(...)`: O(1) membership.
+    /// Python `x in range(...)`: O(1) membership (i128 keeps the
+    /// difference overflow-free for extreme endpoints).
     pub fn py_contains(&self, value: &i64) -> bool {
         let v = *value;
         let in_span = if self.step > 0 {
@@ -610,7 +619,7 @@ impl PyRange {
         } else {
             v <= self.next && v > self.stop
         };
-        in_span && (v - self.next) % self.step == 0
+        in_span && (v as i128 - self.next as i128) % (self.step as i128) == 0
     }
 }
 

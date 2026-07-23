@@ -936,3 +936,17 @@ fn abs_of_i64_min_fails_loudly_not_silently() {
     let result = std::panic::catch_unwind(|| abs(i64::MIN));
     assert!(result.is_err(), "abs(i64::MIN) must be a defined, loud failure");
 }
+
+#[test]
+fn range_len_survives_extreme_endpoints() {
+    // Values verified against python3: no overflow near the i64 limits.
+    assert_eq!(
+        range_start_stop_step(0, i64::MAX, 2).unwrap().py_len(),
+        4_611_686_018_427_387_904
+    );
+    assert_eq!(range_start_stop_step(0, 100, i64::MAX).unwrap().py_len(), 1);
+    assert_eq!(range_start_stop_step(100, 0, i64::MIN).unwrap().py_len(), 1);
+    assert!(range_start_stop_step(i64::MIN, i64::MAX, 1)
+        .unwrap()
+        .py_contains(&i64::MAX.wrapping_sub(1)));
+}
