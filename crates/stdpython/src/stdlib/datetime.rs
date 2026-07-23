@@ -298,7 +298,20 @@ impl datetime {
         tm.tm_isdst = -1; // let mktime resolve DST, like Python
         let t = unsafe { libc::mktime(&mut tm) };
         if t == -1 {
-            // mktime cannot represent it; fall back to the UTC computation
+            // -1 is ambiguous: mktime's error value, but ALSO the valid
+            // epoch-seconds for the local wall clock one second before
+            // 1970. Disambiguate portably (errno's location differs per
+            // platform) by decomposing -1 back and comparing fields.
+            if let Ok(at_minus_one) = Self::from_unix_local(-1, 0) {
+                if at_minus_one.date == self.date
+                    && at_minus_one.time.hour == self.time.hour
+                    && at_minus_one.time.minute == self.time.minute
+                    && at_minus_one.time.second == self.time.second
+                {
+                    return -1;
+                }
+            }
+            // A real mktime failure: fall back to the UTC computation
             // (signed, so pre-1970 stays negative instead of wrapping).
             return self.unix_seconds_utc();
         }

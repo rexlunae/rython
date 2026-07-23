@@ -950,3 +950,14 @@ fn range_len_survives_extreme_endpoints() {
         .unwrap()
         .py_contains(&i64::MAX.wrapping_sub(1)));
 }
+
+#[test]
+fn timestamp_one_second_before_epoch_is_minus_one() {
+    use stdpython::datetime::datetime;
+    // mktime returns -1 BOTH as its error value and as the valid result
+    // for this exact moment; the disambiguation must return -1.0 here
+    // (python3: datetime(1969, 12, 31, 23, 59, 59).timestamp() == -1.0
+    // on a UTC host).
+    let d = datetime::new(1969, 12, 31, Some(23), Some(59), Some(59), None).unwrap();
+    assert_eq!(d.timestamp(), -1.0);
+}
