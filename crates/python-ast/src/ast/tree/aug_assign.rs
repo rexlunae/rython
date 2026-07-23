@@ -75,12 +75,55 @@ impl CodeGen for AugAssign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // Compound assignment to a subscript (`counts[k] += 1`) is a
+        // read-modify-write: the Load lowering of the target is a cloned
+        // temporary (py_index), not a place, so read via py_index, combine,
+        // and store back via py_set_index. The index is evaluated once.
+        if let ExprType::Subscript(sub) = &self.target {
+            // The receiver must be a place (see subscript_receiver_place);
+            // a cloned receiver would silently drop the write-back.
+            let receiver = crate::subscript_receiver_place(
+                &sub.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
+            let index = match &sub.kind {
+                crate::SubscriptKind::Index(index) => index
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                crate::SubscriptKind::Slice { .. } => {
+                    return Err(
+                        "augmented assignment to a slice (`x[a:b] += ...`) is not supported"
+                            .to_string()
+                            .into(),
+                    )
+                }
+            };
+            let value = self.value.to_rust(ctx, options, symbols)?;
+            let elem = quote!(__rython_elem);
+            let combined = combine_op(&self.op, &elem, &value)?;
+            // The receiver place is bound once so a nested chain
+            // (`grid[i][j] += 1`) evaluates its intermediate lookups — and
+            // any side effects in their indices — exactly once.
+            return Ok(quote! {
+                {
+                    let __rython_recv = &mut (#receiver);
+                    let __rython_idx = #index;
+                    let __rython_elem = (__rython_recv).py_index(__rython_idx.clone())?;
+                    (__rython_recv).py_set_index(__rython_idx, #combined)?;
+                }
+            });
+        }
+
         let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let value = self.value.to_rust(ctx, options, symbols)?;
-        
+
         // Generate the appropriate augmented assignment operator
         match self.op {
-            BinOps::Add => Ok(quote!(#target += #value)),
+            // `+=` mirrors Python's `+` (string concat, list concat,
+            // numeric promotion) via PyAdd.
+            BinOps::Add => Ok(quote!(#target = (#target).py_add(&(#value)))),
             BinOps::Sub => Ok(quote!(#target -= #value)),
             BinOps::Mult => Ok(quote!(#target *= #value)),
             BinOps::Div => Ok(quote!(#target /= #value)),
@@ -108,6 +151,36 @@ impl CodeGen for AugAssign {
             },
         }
     }
+}
+
+/// The read-modify-write combination for a compound assignment: how the
+/// current element and the operand produce the stored value.
+fn combine_op(
+    op: &BinOps,
+    elem: &TokenStream,
+    value: &TokenStream,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    Ok(match op {
+        BinOps::Add => quote!((#elem).py_add(&(#value))),
+        BinOps::Sub => quote!(#elem - #value),
+        BinOps::Mult => quote!(#elem * #value),
+        BinOps::Div => quote!(#elem / #value),
+        BinOps::FloorDiv => quote!(py_floordiv(#elem, #value)),
+        BinOps::Mod => quote!(py_mod(#elem, #value)),
+        BinOps::Pow => quote!(py_pow(#elem, #value)),
+        BinOps::BitAnd => quote!(#elem & #value),
+        BinOps::BitOr => quote!(#elem | #value),
+        BinOps::BitXor => quote!(#elem ^ #value),
+        BinOps::LShift => quote!(#elem << #value),
+        BinOps::RShift => quote!(#elem >> #value),
+        other => {
+            return Err(format!(
+                "augmented assignment operator {:?} not supported on subscripts",
+                other
+            )
+            .into())
+        }
+    })
 }
 
 #[cfg(test)]

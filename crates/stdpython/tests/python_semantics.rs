@@ -333,3 +333,95 @@ fn py_insert_matches_python_index_rules() {
     v.py_insert(1, 2);
     assert_eq!(v, vec![1, 2, 3]);
 }
+
+#[test]
+fn py_index_matches_python_subscripts() {
+    let items = vec![10i64, 20, 30];
+    // items[0], items[-1]
+    assert_eq!(items.py_index(0).unwrap(), 10);
+    assert_eq!(items.py_index(-1).unwrap(), 30);
+    assert_eq!(items.py_index(-3).unwrap(), 10);
+    // IndexError out of range, both directions
+    assert_eq!(items.py_index(3).unwrap_err().exception_type, "IndexError");
+    assert_eq!(items.py_index(-4).unwrap_err().exception_type, "IndexError");
+
+    // Strings index by character, yielding a 1-char string: "café"[-1] == "é"
+    assert_eq!("café".py_index(-1).unwrap(), "é");
+    assert_eq!("café".py_index(3).unwrap(), "é");
+    assert_eq!("café".py_index(4).unwrap_err().exception_type, "IndexError");
+
+    // Dicts raise KeyError on a missing key
+    let d = std::collections::HashMap::from([("a", 1i64)]);
+    assert_eq!(d.py_index("a").unwrap(), 1);
+    assert_eq!(d.py_index("z").unwrap_err().exception_type, "KeyError");
+}
+
+#[test]
+fn py_set_index_matches_python_stores() {
+    let mut items = vec![1i64, 2, 3];
+    items.py_set_index(0, 10).unwrap();
+    items.py_set_index(-1, 30).unwrap();
+    assert_eq!(items, vec![10, 2, 30]);
+    assert_eq!(
+        items.py_set_index(5, 9).unwrap_err().exception_type,
+        "IndexError"
+    );
+
+    let mut d = std::collections::HashMap::new();
+    d.py_set_index("k", 1i64).unwrap();
+    d.py_set_index("k", 2i64).unwrap();
+    assert_eq!(d["k"], 2);
+}
+
+#[test]
+fn py_slice_matches_python_slices() {
+    let items = vec![1i64, 2, 3, 4, 5];
+    // items[1:3], items[::-1], items[-2:]
+    assert_eq!(items.py_slice(Some(1), Some(3), None), vec![2, 3]);
+    assert_eq!(items.py_slice(None, None, Some(-1)), vec![5, 4, 3, 2, 1]);
+    assert_eq!(items.py_slice(Some(-2), None, None), vec![4, 5]);
+    // Strings slice by character: "héllo"[1:3] == "él", [::-1] reverses
+    assert_eq!("héllo".py_slice(Some(1), Some(3), None), "él");
+    assert_eq!("hello".py_slice(None, None, Some(-1)), "olleh");
+    // Out-of-range clamps, never raises: "ab"[1:100] == "b"
+    assert_eq!("ab".py_slice(Some(1), Some(100), None), "b");
+}
+
+#[test]
+fn py_add_matches_python_plus() {
+    // Numbers, with int/float promotion
+    assert_eq!(2i64.py_add(&3i64), 5);
+    assert_eq!(2i64.py_add(&0.5f64), 2.5);
+    assert_eq!(0.5f64.py_add(&2i64), 2.5);
+    // Strings concatenate without consuming operands
+    let a = String::from("ab");
+    let b = String::from("cd");
+    assert_eq!(a.py_add(&b), "abcd");
+    assert_eq!(a, "ab"); // still usable
+    assert_eq!("x".py_add(&b), "xcd");
+    // Lists concatenate: [1] + [2] == [1, 2]
+    assert_eq!(vec![1i64].py_add(&vec![2i64]), vec![1, 2]);
+}
+
+#[test]
+fn py_index_mut_writes_land_in_place() {
+    // grid[0][1] = 9 must mutate the real nested list.
+    let mut grid = vec![vec![1i64, 2], vec![3, 4]];
+    *grid.py_index_mut(0).unwrap().py_index_mut(1).unwrap() = 9;
+    assert_eq!(grid, vec![vec![1, 9], vec![3, 4]]);
+    // Negative indices and IndexError, as with reads.
+    *grid.py_index_mut(-1).unwrap().py_index_mut(0).unwrap() = 30;
+    assert_eq!(grid[1][0], 30);
+    assert_eq!(
+        grid.py_index_mut(5).unwrap_err().exception_type,
+        "IndexError"
+    );
+    // Dicts: KeyError on missing key, mutation in place otherwise.
+    let mut table = std::collections::HashMap::from([("row", vec![5i64, 6])]);
+    table.py_index_mut("row").unwrap().py_set_index(1, 7).unwrap();
+    assert_eq!(table["row"][1], 7);
+    assert_eq!(
+        table.py_index_mut("nope").unwrap_err().exception_type,
+        "KeyError"
+    );
+}

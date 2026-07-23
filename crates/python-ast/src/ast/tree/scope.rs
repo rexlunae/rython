@@ -157,19 +157,31 @@ fn record_target(target: &ExprType, a: &mut Analysis, multi: bool) {
                 }
             }
         }
-        // Stores through the base name: `x[i] = v`, `x.f = v`.
+        // Stores through the base name: `x[i] = v`, `x.f = v`, and nested
+        // chains like `grid[i][j] = v` all mutate the chain's base binding.
         ExprType::Subscript(sub) => {
-            if let ExprType::Name(name) = sub.value.as_ref() {
-                a.record_mutation(&name.id);
+            if let Some(name) = chain_base_name(&sub.value) {
+                a.record_mutation(name);
             }
-            walk_expr(&sub.slice, a);
+            walk_subscript_kind(&sub.kind, a);
         }
         ExprType::Attribute(attr) => {
-            if let ExprType::Name(name) = attr.value.as_ref() {
-                a.record_mutation(&name.id);
+            if let Some(name) = chain_base_name(&attr.value) {
+                a.record_mutation(name);
             }
         }
         _ => {}
+    }
+}
+
+/// The name at the base of a subscript/attribute chain (`grid` in
+/// `grid[i][j]` or `obj.rows[i]`), if the chain bottoms out in one.
+fn chain_base_name(expr: &ExprType) -> Option<&str> {
+    match expr {
+        ExprType::Name(name) => Some(&name.id),
+        ExprType::Subscript(sub) => chain_base_name(&sub.value),
+        ExprType::Attribute(attr) => chain_base_name(&attr.value),
+        _ => None,
     }
 }
 
@@ -301,6 +313,17 @@ fn walk_call(call: &crate::Call, a: &mut Analysis) {
     }
 }
 
+fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis) {
+    match kind {
+        crate::SubscriptKind::Index(i) => walk_expr(i, a),
+        crate::SubscriptKind::Slice { lower, upper, step } => {
+            for bound in [lower, upper, step].into_iter().flatten() {
+                walk_expr(bound, a);
+            }
+        }
+    }
+}
+
 fn walk_expr(expr: &ExprType, a: &mut Analysis) {
     match expr {
         ExprType::Call(call) => walk_call(call, a),
@@ -355,7 +378,7 @@ fn walk_expr(expr: &ExprType, a: &mut Analysis) {
         ExprType::Attribute(attr) => walk_expr(&attr.value, a),
         ExprType::Subscript(sub) => {
             walk_expr(&sub.value, a);
-            walk_expr(&sub.slice, a);
+            walk_subscript_kind(&sub.kind, a);
         }
         ExprType::Starred(s) => walk_expr(&s.value, a),
         ExprType::Await(e) => walk_expr(&e.value, a),

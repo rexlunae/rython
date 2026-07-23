@@ -156,10 +156,36 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
             "bytes" => Some(quote!(Vec<u8>)),
             _ => None,
         },
-        ExprType::Subscript(_) => {
-            // Subscripted generics (list[int], dict[str, int], ...) aren't
-            // modeled richly enough yet to map reliably.
-            None
+        // Subscripted generics over known element types: list[int] and
+        // friends map to the concrete Rust containers codegen produces for
+        // the corresponding literals.
+        ExprType::Subscript(sub) => {
+            let container = match sub.value.as_ref() {
+                ExprType::Name(n) => n.id.as_str(),
+                _ => return None,
+            };
+            match (&sub.kind, container) {
+                (crate::SubscriptKind::Index(elt), "list") => {
+                    let inner = python_annotation_to_rust_type(elt)?;
+                    Some(quote!(Vec<#inner>))
+                }
+                (crate::SubscriptKind::Index(elt), "set" | "frozenset") => {
+                    let inner = python_annotation_to_rust_type(elt)?;
+                    Some(quote!(std::collections::HashSet<#inner>))
+                }
+                (crate::SubscriptKind::Index(kv), "dict") => {
+                    // dict[K, V] parses as a subscript with a tuple index.
+                    if let ExprType::Tuple(t) = kv.as_ref() {
+                        if let [k, v] = t.elts.as_slice() {
+                            let k = python_annotation_to_rust_type(k)?;
+                            let v = python_annotation_to_rust_type(v)?;
+                            return Some(quote!(std::collections::HashMap<#k, #v>));
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
         }
         _ => None,
     }

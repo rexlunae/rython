@@ -193,28 +193,44 @@ impl CodeGen for BinOp {
             }
         }
 
-        // Special handling for list addition (concatenation)
+        // Python `+` covers cases Rust's Add doesn't (String + String,
+        // int/float promotion, list concatenation): lower through the
+        // stdpython PyAdd trait, which borrows both operands. Bare numeric
+        // literals get an explicit type: trait-method resolution on an
+        // unanchored `{integer}` receiver fails before literal fallback
+        // (e.g. `1 + 2` in an unannotated position).
         if matches!(self.op, BinOps::Add) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let right = self.right.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            let left_str = left.to_string();
-            let right_str = right.to_string();
-            
-            // Check if we're adding vectors or lists together
-            if left_str.contains("vec !") || right_str.contains("iter ()") || right_str.contains("sys :: argv") {
-                // This is vector concatenation - use Vec::extend pattern
-                return Ok(quote! {
-                    {
-                        let mut vec = #left;
-                        vec.extend(#right);
-                        vec
-                    }
-                });
-            }
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = anchor_numeric_literal(&self.left, left);
+            let right = anchor_numeric_literal(&self.right, right);
+            return Ok(quote!((#left).py_add(&(#right))));
         }
-        
+
         // Use the generic binary operation implementation for everything else
         self.generate_rust_code(ctx, options, symbols)
+    }
+}
+
+/// Give a bare numeric literal (possibly under unary +/-) a concrete type
+/// so PyAdd's trait-method resolution has an anchored receiver: int
+/// literals become i64, float literals f64. Anything else is left to its
+/// own type.
+fn anchor_numeric_literal(expr: &ExprType, tokens: TokenStream) -> TokenStream {
+    fn literal_type(expr: &ExprType) -> Option<TokenStream> {
+        match expr {
+            ExprType::Constant(c) => match &c.0 {
+                Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+                Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
+                _ => None,
+            },
+            ExprType::UnaryOp(u) => literal_type(&u.operand),
+            _ => None,
+        }
+    }
+    match literal_type(expr) {
+        Some(ty) => quote!((#tokens) as #ty),
+        None => tokens,
     }
 }
 
