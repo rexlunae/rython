@@ -321,7 +321,10 @@ impl<'a> CodeGen for ExprType {
                 }
             }
             ExprType::Name(name) => name.to_rust(ctx, options, symbols),
-            ExprType::NoneType(c) => c.to_rust(ctx, options, symbols),
+            // Python's None is Rust's Option::None: `x = None` initializes
+            // an Option, `f(None)` passes one, `d.get(k)` results compare
+            // against it.
+            ExprType::NoneType(_) => Ok(quote!(None)),
             ExprType::UnaryOp(operand) => operand.to_rust(ctx, options, symbols),
 
             _ => {

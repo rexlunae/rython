@@ -117,6 +117,27 @@ impl CodeGen for FunctionDef {
             .chain(self.args.kwarg.iter().map(|p| p.arg.clone()))
             .collect();
         let scope = crate::analyze_scope(&self.body, &param_names);
+        // Optional names (assigned None on some path, or parameters with an
+        // Optional annotation) are visible to every assignment in the body:
+        // their non-None stores wrap in Some.
+        let mut options = options;
+        {
+            let mut optional = scope.optional.clone();
+            for p in self
+                .args
+                .posonlyargs
+                .iter()
+                .chain(self.args.args.iter())
+                .chain(self.args.kwonlyargs.iter())
+            {
+                if let Some(ann) = p.annotation.as_deref() {
+                    if crate::is_optional_annotation(ann) {
+                        optional.insert(p.arg.clone());
+                    }
+                }
+            }
+            options.optional_names = std::rc::Rc::new(optional);
+        }
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self

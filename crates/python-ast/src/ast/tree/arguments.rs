@@ -142,11 +142,42 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
     }
 }
 
+/// Whether an annotation means "optional": `Optional[T]` or a union with
+/// None (`T | None`). Optional-annotated names hold an Option, and stores
+/// into them wrap in Some.
+pub(crate) fn is_optional_annotation(ann: &ExprType) -> bool {
+    match ann {
+        ExprType::Subscript(sub) => {
+            matches!(sub.value.as_ref(), ExprType::Name(n) if n.id == "Optional")
+        }
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            crate::is_none_expr(&op.left) || crate::is_none_expr(&op.right)
+        }
+        _ => false,
+    }
+}
+
 /// Map a Python type annotation to a Rust type, when the mapping is known.
 /// `int`/`float`/`str`/`bool`/`bytes` map to concrete Rust types, and
 /// `list[T]`/`dict[K, V]`/`set[T]` map to the corresponding std containers
-/// when their element annotations map too.
+/// when their element annotations map too. `Optional[T]` / `T | None` map
+/// to `Option<T>`.
 pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
+    match annotation {
+        // T | None (and None | T) is Option<T>.
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            let inner = if crate::is_none_expr(&op.left) {
+                op.right.as_ref()
+            } else if crate::is_none_expr(&op.right) {
+                op.left.as_ref()
+            } else {
+                return None;
+            };
+            let inner = python_annotation_to_rust_type(inner)?;
+            return Some(quote!(Option<#inner>));
+        }
+        _ => {}
+    }
     match annotation {
         ExprType::Name(name) => match name.id.as_str() {
             "int" => Some(quote!(i64)),
@@ -165,6 +196,10 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 _ => return None,
             };
             match (&sub.kind, container) {
+                (crate::SubscriptKind::Index(elt), "Optional") => {
+                    let inner = python_annotation_to_rust_type(elt)?;
+                    Some(quote!(Option<#inner>))
+                }
                 (crate::SubscriptKind::Index(elt), "list") => {
                     let inner = python_annotation_to_rust_type(elt)?;
                     Some(quote!(Vec<#inner>))

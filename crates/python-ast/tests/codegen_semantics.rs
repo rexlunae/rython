@@ -1034,6 +1034,57 @@ fn dict_comprehensions_build_ordered_pydicts() {
 }
 
 #[test]
+fn none_lowers_to_option() {
+    // x = None initializes an Option; later non-None stores wrap in Some
+    // so both arms unify to Option<T>.
+    let src = concat!(
+        "def f(items: list[int]) -> int:\n",
+        "    found = None\n",
+        "    for x in items:\n",
+        "        found = x\n",
+        "    if found is None:\n",
+        "        return -1\n",
+        "    return 0\n",
+    );
+    let out = compile(src, "opt.py");
+    assert!(out.contains("found = None"), "generated: {}", out);
+    assert!(out.contains("found = Some (x)"), "generated: {}", out);
+    assert!(out.contains("(found) . py_is_none ()"), "generated: {}", out);
+}
+
+#[test]
+fn optional_annotations_map_to_option() {
+    let out = compile(
+        "def f(tag: Optional[int], n: int | None) -> int:\n    return 0\n",
+        "optann.py",
+    );
+    assert!(out.contains("tag : Option < i64 >"), "generated: {}", out);
+    assert!(out.contains("n : Option < i64 >"), "generated: {}", out);
+}
+
+#[test]
+fn optional_parameters_wrap_arguments_at_call_sites() {
+    let src = concat!(
+        "def label(tag: Optional[int]) -> int:\n",
+        "    return 0\n",
+        "\n",
+        "def f() -> int:\n",
+        "    a = label(7)\n",
+        "    b = label(None)\n",
+        "    return a + b\n",
+    );
+    let out = compile(src, "optcall.py");
+    assert!(out.contains("label (Some (7)) ?"), "generated: {}", out);
+    assert!(out.contains("label (None) ?"), "generated: {}", out);
+}
+
+#[test]
+fn typing_imports_lower_to_nothing() {
+    let out = compile("from typing import Optional\nx = 1\n", "typing.py");
+    assert!(!out.contains("typing"), "generated: {}", out);
+}
+
+#[test]
 fn membership_uses_py_contains() {
     let out = compile("found = x in items", "in.py");
     assert!(out.contains("py_contains"), "generated: {}", out);

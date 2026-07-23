@@ -473,3 +473,17 @@ fn py_pop_on_lists_uses_index_semantics() {
     assert_eq!(v.py_pop(-1).unwrap(), 30);
     assert_eq!(v.py_pop(5).unwrap_err().exception_type, "IndexError");
 }
+
+#[test]
+fn option_add_matches_python_runtime_semantics() {
+    // Some(v) + n proceeds like v + n
+    assert_eq!(Some(5i64).py_add(&2i64), 7);
+    assert_eq!(Some(String::from("a")).py_add(&String::from("b")), "ab");
+}
+
+#[test]
+#[should_panic(expected = "TypeError")]
+fn none_add_raises_type_error_like_python() {
+    // Python: None + 1 -> TypeError at runtime
+    let _ = Option::<i64>::None.py_add(&1i64);
+}
