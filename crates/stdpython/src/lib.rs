@@ -1489,7 +1489,12 @@ impl PyStrOps for str {
         self.ends_with(suffix)
     }
     fn py_find(&self, needle: &str) -> i64 {
-        self.find(needle).map(|i| i as i64).unwrap_or(-1)
+        // Python returns a character (code point) index; str::find returns
+        // a byte offset — they diverge on any non-ASCII prefix.
+        match self.find(needle) {
+            Some(byte_idx) => self[..byte_idx].chars().count() as i64,
+            None => -1,
+        }
     }
     fn py_split(&self, sep: &str) -> Vec<String> {
         self.split(sep).map(str::to_string).collect()
