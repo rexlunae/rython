@@ -385,8 +385,47 @@ pub(crate) fn expr_yields_option(
             },
             _ => false,
         },
+        // A conditional yields an Option when either arm does (None counts):
+        // the arms unify to one type, so an Option arm makes the whole
+        // expression an Option. A plain-vs-Option mix fails to compile —
+        // loud, never silent.
+        ExprType::IfExp(e) => {
+            let arm = |x: &ExprType| {
+                crate::is_none_expr(x) || expr_yields_option(x, options, symbols)
+            };
+            arm(&e.body) || arm(&e.orelse)
+        }
         _ => false,
     }
+}
+
+/// Lower an expression destined for an Option slot (a store into an
+/// optional-tracked name, or an Optional-annotated parameter): values that
+/// already yield an Option (and None itself) pass through, plain values
+/// wrap in `Some`, and conditionals wrap each arm independently — so
+/// `x if c else None` becomes `if c { Some(x) } else { None }` instead of
+/// burying the None arm inside `Some(...)`.
+pub(crate) fn lower_optional_value(
+    expr: &ExprType,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // Conditionals recurse per arm FIRST: even when one arm makes the whole
+    // expression Option-typed (e.g. an `else None`), the other arm may be a
+    // plain value that still needs its Some wrap.
+    if let ExprType::IfExp(e) = expr {
+        let test =
+            crate::condition_to_rust(&e.test, ctx.clone(), options.clone(), symbols.clone())?;
+        let body = lower_optional_value(&e.body, ctx.clone(), options.clone(), symbols.clone())?;
+        let orelse = lower_optional_value(&e.orelse, ctx, options, symbols)?;
+        return Ok(quote!(if #test { #body } else { #orelse }));
+    }
+    if is_none_expr(expr) || expr_yields_option(expr, &options, &symbols) {
+        return expr.clone().to_rust(ctx, options, symbols);
+    }
+    let tokens = expr.clone().to_rust(ctx, options, symbols)?;
+    Ok(quote!(Some(#tokens)))
 }
 
 /// Best-effort Python-source rendering of an annotation expression, for

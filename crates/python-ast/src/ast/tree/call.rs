@@ -328,25 +328,23 @@ fn map_call_arguments(
     symbols: &SymbolTableScopes,
 ) -> Result<Vec<TokenStream>, Box<dyn std::error::Error>> {
     let fname = &func.name;
-    // Optional-annotated parameters take Option values: non-None arguments
-    // wrap in Some, while None and already-Option values (dict.get, another
-    // optional name, an Optional-returning call) pass through unwrapped.
+    // Optional-annotated parameters take Option values: the Option-slot
+    // lowering wraps plain arguments in Some, passes None and
+    // already-Option values (dict.get, another optional name, an
+    // Optional-returning call) through unwrapped, and handles conditional
+    // arms independently.
     let fill = |param: &crate::Parameter,
                 expr: &ExprType|
      -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let tokens = expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let optional = param
             .annotation
             .as_deref()
             .is_some_and(crate::is_optional_annotation);
-        Ok(if optional
-            && !crate::is_none_expr(expr)
-            && !crate::expr_yields_option(expr, options, symbols)
-        {
-            quote!(Some(#tokens))
+        if optional {
+            crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())
         } else {
-            tokens
-        })
+            expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+        }
     };
 
     let pos_params: Vec<&crate::Parameter> = func

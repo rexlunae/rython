@@ -69,6 +69,7 @@ impl<'a> CodeGen for Assign {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let value_is_none_early = crate::is_none_expr(&self.value);
         let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
+        let value_expr = self.value.clone();
         let value = self
             .value
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -152,6 +153,26 @@ impl<'a> CodeGen for Assign {
         };
 
         if self.targets.len() == 1 {
+            // A store into an optional-tracked name goes through the
+            // Option-slot lowering, which passes Option values through,
+            // wraps plain values in Some, and handles conditional arms
+            // independently (`x if c else None`).
+            if let ExprType::Name(name) = &self.targets[0] {
+                if !in_class && options.optional_names.contains(&name.id) {
+                    let target_code = self.targets[0].clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let value = crate::lower_optional_value(
+                        &value_expr,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    return Ok(quote!(#target_code = #value;));
+                }
+            }
             render(&self.targets[0], &value)
         } else {
             // Chained assignment (`a = b = expr`): Python evaluates the value

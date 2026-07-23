@@ -1114,6 +1114,79 @@ fn optional_stores_from_option_values_do_not_double_wrap() {
 }
 
 #[test]
+fn conditional_stores_into_optional_names_wrap_per_arm() {
+    // `x if c else None` into a None-seeded name wraps each arm
+    // independently: Some(x) / None. Wrapping the whole conditional would
+    // bury the None arm as Some(None) and flip a later `is None` check.
+    let src = concat!(
+        "def f(n: int) -> int:\n",
+        "    tag = None\n",
+        "    tag = n if n > 0 else None\n",
+        "    if tag is None:\n",
+        "        return 0\n",
+        "    return 1\n",
+    );
+    let out = compile(src, "optifexp.py");
+    assert!(
+        out.contains("tag = if") && out.contains("Some (n)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some (if"),
+        "wrapped the whole conditional, generated: {}",
+        out
+    );
+}
+
+#[test]
+fn conditional_with_option_arms_stores_without_rewrap() {
+    // Both arms already yield an Option (dict.get / None): the conditional
+    // is an Option and stores through unchanged.
+    let src = concat!(
+        "def f(d: dict[int, int], n: int) -> int:\n",
+        "    choice = None\n",
+        "    choice = d.get(n) if n > 0 else None\n",
+        "    if choice is None:\n",
+        "        return -1\n",
+        "    return 0\n",
+    );
+    let out = compile(src, "optifexp2.py");
+    assert!(
+        out.contains("choice = if"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some (if") && !out.contains("Some ((d) . py_get"),
+        "double-wrapped a conditional Option, generated: {}",
+        out
+    );
+}
+
+#[test]
+fn conditional_arguments_to_optional_parameters_wrap_per_arm() {
+    let src = concat!(
+        "def label(tag: Optional[int]) -> int:\n",
+        "    return 0\n",
+        "\n",
+        "def f(n: int) -> int:\n",
+        "    return label(n if n > 0 else None)\n",
+    );
+    let out = compile(src, "optifexp3.py");
+    assert!(
+        out.contains("label (if") && out.contains("Some (n)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some (if"),
+        "wrapped the whole conditional argument, generated: {}",
+        out
+    );
+}
+
+#[test]
 fn optional_returning_calls_store_and_pass_without_rewrap() {
     // find() generates Result<Option<i64>, PyException>; the call site's `?`
     // leaves an Option, which must flow into optional names and Optional
