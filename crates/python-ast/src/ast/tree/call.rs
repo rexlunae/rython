@@ -229,6 +229,41 @@ impl<'a> CodeGen for Call {
                 });
             }
 
+            // str.format on a LITERAL template translates to format! at
+            // conversion time: auto-numbering, {0} positions, {name}
+            // keywords, {{ escaping, and format specs all map — and any
+            // spec Rust cannot reproduce exactly is a loud conversion
+            // error, never approximated output.
+            if attr.attr == "format" {
+                let template = match attr.value.as_ref() {
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                    {
+                        match &c.0 {
+                            Some(litrs::Literal::String(s)) => s.value().to_string(),
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "str.format on a non-literal template is not supported yet: \
+                             the template must be a string literal so the fields can be \
+                             checked at conversion time"
+                                .to_string()
+                                .into(),
+                        );
+                    }
+                };
+                return lower_str_format(
+                    &template,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                );
+            }
+
             // The remaining builtin methods are positional-only in Python;
             // a keyword here would be silently dropped by the positional
             // pattern match below, so fall through to the generic path,
@@ -504,6 +539,143 @@ impl<'a> CodeGen for Call {
         // calls like abs(x).
         Ok(final_call)
     }
+}
+
+/// Lower a literal `template.format(args...)` call to a Rust `format!`.
+///
+/// Every argument (used or not) is evaluated exactly once, in Python's
+/// order, into a local binding — Python evaluates unused arguments too.
+/// Used bindings are referenced from the format string by name; unused
+/// ones bind to `_` so no warning fires. Errors mirror Python's:
+/// mixing auto and manual numbering, out-of-range indices, and missing
+/// keywords are conversion-time failures.
+fn lower_str_format(
+    template: &str,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    use crate::pyformat::{parse_template, translate_format_spec, FieldRef, Piece};
+
+    let pieces = parse_template(template).map_err(|e| format!("str.format: {}", e))?;
+
+    for kw in keywords {
+        if kw.arg.is_none() {
+            return Err("str.format with **kwargs is not supported yet".to_string().into());
+        }
+    }
+
+    // Resolve each field to an argument slot and build the format string.
+    let mut fmt = String::new();
+    let mut used_positions: std::collections::HashSet<usize> = Default::default();
+    let mut used_names: std::collections::HashSet<String> = Default::default();
+    let mut auto_next = 0usize;
+    let mut saw_auto = false;
+    let mut saw_manual = false;
+    for piece in &pieces {
+        match piece {
+            Piece::Literal(text) => {
+                fmt.push_str(&text.replace('{', "{{").replace('}', "}}"));
+            }
+            Piece::Field { arg, conversion, spec } => {
+                let index_name = match arg {
+                    FieldRef::Auto => {
+                        saw_auto = true;
+                        let i = auto_next;
+                        auto_next += 1;
+                        if i >= args.len() {
+                            return Err(format!(
+                                "str.format: not enough positional arguments (field {} of \
+                                 template {:?})",
+                                i, template
+                            )
+                            .into());
+                        }
+                        used_positions.insert(i);
+                        format!("__rython_fmt{}", i)
+                    }
+                    FieldRef::Index(i) => {
+                        saw_manual = true;
+                        if *i >= args.len() {
+                            return Err(format!(
+                                "str.format: replacement index {} out of range for \
+                                 template {:?}",
+                                i, template
+                            )
+                            .into());
+                        }
+                        used_positions.insert(*i);
+                        format!("__rython_fmt{}", i)
+                    }
+                    FieldRef::Name(name) => {
+                        if !keywords
+                            .iter()
+                            .any(|k| k.arg.as_deref() == Some(name.as_str()))
+                        {
+                            return Err(format!(
+                                "str.format: template {:?} refers to {:?}, which is not \
+                                 among the keyword arguments",
+                                template, name
+                            )
+                            .into());
+                        }
+                        used_names.insert(name.clone());
+                        format!("__rython_fmt_{}", name)
+                    }
+                };
+                if saw_auto && saw_manual {
+                    return Err(
+                        "str.format: cannot switch between automatic field numbering \
+                         and manual field specification"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                let rust_spec = if matches!(conversion, Some('r') | Some('a')) {
+                    "?".to_string()
+                } else {
+                    translate_format_spec(spec).map_err(|e| format!("str.format: {}", e))?
+                };
+                if rust_spec.is_empty() {
+                    fmt.push_str(&format!("{{{}}}", index_name));
+                } else {
+                    fmt.push_str(&format!("{{{}:{}}}", index_name, rust_spec));
+                }
+            }
+        }
+    }
+
+    // Bindings: every argument evaluates exactly once, in order.
+    let mut bindings = TokenStream::new();
+    for (i, arg) in args.iter().enumerate() {
+        let value = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        if used_positions.contains(&i) {
+            let ident = crate::safe_ident(&format!("__rython_fmt{}", i));
+            bindings.extend(quote!(let #ident = #value;));
+        } else {
+            bindings.extend(quote!(let _ = #value;));
+        }
+    }
+    for kw in keywords {
+        let name = kw.arg.as_deref().unwrap_or_default();
+        let value = kw
+            .value
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        if used_names.contains(name) {
+            let ident = crate::safe_ident(&format!("__rython_fmt_{}", name));
+            bindings.extend(quote!(let #ident = #value;));
+        } else {
+            bindings.extend(quote!(let _ = #value;));
+        }
+    }
+
+    Ok(quote!({
+        #bindings
+        format!(#fmt)
+    }))
 }
 
 /// The class of a method-call receiver, when it is statically known:

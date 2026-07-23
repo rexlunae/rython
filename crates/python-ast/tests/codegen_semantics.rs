@@ -1556,3 +1556,71 @@ fn split_keyword_arguments_map_or_error_loudly() {
     );
     assert!(err.contains("signature"), "error: {}", err);
 }
+
+// ---- str.format ----
+
+#[test]
+fn str_format_lowers_to_format_macro() {
+    let out = compile(
+        "def f(a: int, b: str) -> str:\n    return \"{} and {}\".format(a, b)\n",
+        "fmt1.py",
+    );
+    assert!(out.contains("format !"), "generated: {}", out);
+    assert!(out.contains("__rython_fmt0"), "generated: {}", out);
+
+    // Positional reuse, keywords, and specs translate.
+    let out = compile(
+        "def f(x: float) -> str:\n    return \"{0} {0} {v:.2f}\".format(x, v=x)\n",
+        "fmt2.py",
+    );
+    assert!(out.contains("__rython_fmt_v"), "generated: {}", out);
+}
+
+#[test]
+fn str_format_errors_are_loud() {
+    // Mixing auto and manual numbering is Python's ValueError.
+    let err = compile_err(
+        "def f(a: int, b: int) -> str:\n    return \"{} {1}\".format(a, b)\n",
+        "fmtmix.py",
+    );
+    assert!(err.contains("automatic field numbering"), "error: {}", err);
+
+    // A template name with no matching keyword.
+    let err = compile_err(
+        "def f() -> str:\n    return \"{missing}\".format(present=1)\n",
+        "fmtname.py",
+    );
+    assert!(err.contains("missing"), "error: {}", err);
+
+    // Specs Rust renders differently are rejected, not approximated.
+    let err = compile_err(
+        "def f(x: int) -> str:\n    return \"{:,}\".format(x)\n",
+        "fmtgroup.py",
+    );
+    assert!(err.contains("thousands separator"), "error: {}", err);
+
+    // Non-literal templates can't be checked at conversion time.
+    let err = compile_err(
+        "def f(t: str, x: int) -> str:\n    return t.format(x)\n",
+        "fmtdyn.py",
+    );
+    assert!(err.contains("non-literal template"), "error: {}", err);
+}
+
+#[test]
+fn fstring_specs_translate_or_error_loudly() {
+    let out = compile(
+        "def f(n: int) -> str:\n    return f\"{n:05d}|{n:>4}\"\n",
+        "fspec.py",
+    );
+    assert!(out.contains("{:05}"), "generated: {}", out);
+    assert!(out.contains("{:>4}"), "generated: {}", out);
+
+    // The old behavior silently fell back to {} for unsupported specs;
+    // now they fail at conversion time.
+    let err = compile_err(
+        "def f(x: float) -> str:\n    return f\"{x:e}\"\n",
+        "fspecbad.py",
+    );
+    assert!(err.contains("presentation type"), "error: {}", err);
+}

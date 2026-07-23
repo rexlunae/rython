@@ -134,7 +134,7 @@ impl CodeGen for JoinedStr {
                     fmt.push_str(&escape_format_braces(&constant_text(&c)));
                 }
                 ExprType::FormattedValue(fv) => {
-                    let placeholder = fv.rust_placeholder();
+                    let placeholder = fv.rust_placeholder()?;
                     let expr = (*fv.value).to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     fmt.push_str(&placeholder);
                     args.push(expr);
@@ -171,32 +171,37 @@ fn escape_format_braces(s: &str) -> String {
 }
 
 impl FormattedValue {
-    /// Choose a Rust format placeholder for this interpolation: `!r`/`!a`
-    /// conversions map to `{:?}`, and a constant `.N f` format spec maps to
-    /// `{:.N}`. Anything else falls back to plain `{}` (lossy, but valid).
-    fn rust_placeholder(&self) -> String {
+    /// The Rust format placeholder for this interpolation: `!r`/`!a`
+    /// conversions map to `{:?}`, and format specs translate through the
+    /// shared Python-spec translator. Specs Rust cannot reproduce exactly
+    /// (or that interpolate other values) are LOUD conversion errors —
+    /// falling back to `{}` would silently change the output.
+    fn rust_placeholder(&self) -> Result<String, Box<dyn std::error::Error>> {
         // Python conversion codes are the ASCII values of 's', 'r', 'a'.
         if matches!(self.conversion, Some(114) | Some(97)) {
-            return "{:?}".to_string();
+            return Ok("{:?}".to_string());
         }
 
-        if let Some(spec) = &self.format_spec {
-            if let Some(spec_text) = static_spec_text(spec) {
-                // Recognize [.precision][f] with an optional leading width we
-                // don't support; anything unrecognized falls back to {}.
-                let spec_text = spec_text.trim();
-                if let Some(rest) = spec_text.strip_prefix('.') {
-                    let digits: String =
-                        rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-                    let tail = &rest[digits.len()..];
-                    if !digits.is_empty() && (tail.is_empty() || tail == "f") {
-                        return format!("{{:.{}}}", digits);
+        match &self.format_spec {
+            None => Ok("{}".to_string()),
+            Some(spec) => match static_spec_text(spec) {
+                None => Err(
+                    "f-string format specs that interpolate other values (e.g. \
+                     f\"{x:{width}}\") are not supported yet"
+                        .to_string()
+                        .into(),
+                ),
+                Some(spec_text) => {
+                    let rust_spec = crate::pyformat::translate_format_spec(spec_text.trim())
+                        .map_err(|e| format!("f-string: {}", e))?;
+                    if rust_spec.is_empty() {
+                        Ok("{}".to_string())
+                    } else {
+                        Ok(format!("{{:{}}}", rust_spec))
                     }
                 }
-            }
+            },
         }
-
-        "{}".to_string()
     }
 }
 
@@ -239,21 +244,11 @@ impl CodeGen for FormattedValue {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value_tokens = (*self.value).to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        
-        if let Some(format_spec) = self.format_spec {
-            let _spec_tokens = (*format_spec).to_rust(ctx, options, symbols)?;
-            // For now, generate a simple format with the format specifier
-            // TODO: Properly handle format specifications
-            Ok(quote! {
-                format!("{}", #value_tokens)
-            })
-        } else {
-            // Simple case - just format with default formatting
-            Ok(quote! {
-                format!("{}", #value_tokens)
-            })
-        }
+        let placeholder = self.rust_placeholder()?;
+        let value_tokens = (*self.value).to_rust(ctx, options, symbols)?;
+        Ok(quote! {
+            format!(#placeholder, #value_tokens)
+        })
     }
 }
 
