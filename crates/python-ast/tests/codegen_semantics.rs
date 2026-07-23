@@ -1647,3 +1647,20 @@ fn repr_conversion_keeps_its_format_spec() {
     );
     assert!(err.contains("cannot combine"), "error: {}", err);
 }
+
+#[test]
+fn bare_precision_without_type_errors_loudly() {
+    // Python's "{:.3}" on a float is GENERAL format (significant figures,
+    // possibly scientific); Rust's is fixed decimals. Unknowable operand
+    // type means loud rejection, pointing at .Ns / .Nf.
+    let err = compile_err(
+        "def f(x: float) -> str:\n    return \"{:.3}\".format(x)\n",
+        "barep.py",
+    );
+    assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+    let err = compile_err(
+        "def f(x: float) -> str:\n    return f\"{x:.3}\"\n",
+        "barepf.py",
+    );
+    assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+}

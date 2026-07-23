@@ -262,6 +262,16 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
     // (Python renders negatives as sign+magnitude, Rust as two's
     // complement); e/E/g/n/% differ in exponent/grouping conventions and
     // are rejected.
+    if ty.is_none() && !precision.is_empty() {
+        return Err(
+            "a precision with no presentation type is ambiguous: Python renders \
+             floats in 'general' format there (significant figures, possibly \
+             scientific notation), which Rust cannot reproduce — use .Ns for \
+             string truncation or .Nf for fixed-point"
+                .into(),
+        );
+    }
+
     let mut cast_f64 = false;
     match ty {
         None | Some('d') | Some('s') => {}
@@ -343,7 +353,10 @@ mod tests {
             IntRadix { fill: ' ', align: '\0', plus: false, alternate: true, zero: false, width: 0, radix: 'x' }
         );
         assert_eq!(translate_format_spec("8.3f").unwrap(), CastF64("8.3".into()));
-        assert_eq!(translate_format_spec(".3").unwrap(), Inline(".3".into()));
+        assert_eq!(translate_format_spec(".3s").unwrap(), Inline(".3".into()));
+        // Bare precision is Python's general float format — ambiguous
+        // without the operand type, so it is loud.
+        assert!(translate_format_spec(".3").is_err());
         assert!(translate_format_spec(",").is_err());
         assert!(translate_format_spec("e").is_err());
         assert!(translate_format_spec("=10").is_err());
