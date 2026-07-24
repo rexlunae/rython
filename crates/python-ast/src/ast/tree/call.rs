@@ -1115,7 +1115,7 @@ impl<'a> CodeGen for Call {
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
-                        Ok(quote!(#p(&(#lines))))
+                        Ok(quote!(#p(&(#lines))?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(&format!("{}_new", fname));

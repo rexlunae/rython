@@ -1928,7 +1928,7 @@ mod csv_module {
     use stdpython::csv::reader;
 
     fn rows(lines: &[&str]) -> Vec<Vec<String>> {
-        reader(lines)
+        reader(lines).unwrap()
     }
 
     #[test]
@@ -1968,5 +1968,29 @@ mod csv_module {
         // Unterminated quotes close at end of input, as in Python.
         assert_eq!(rows(&["a,\"unterminated"]), vec![vec!["a", "unterminated"]]);
         assert_eq!(rows(&["\"\",x"]), vec![vec!["", "x"]]);
+    }
+
+    #[test]
+    fn readlines_style_newlines_terminate_records_like_python() {
+        // readlines() keeps the line terminators; they end the record.
+        assert_eq!(
+            rows(&["a,b\n", "\n", "c\r\n", "d\r"]),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                Vec::<String>::new(),
+                vec!["c".to_string()],
+                vec!["d".to_string()]
+            ]
+        );
+        // Inside quotes a newline is DATA — a quoted field spanning
+        // readlines elements keeps it: python3 gives 'x\ny'.
+        assert_eq!(rows(&["a,\"x\n", "y\"\n"]), vec![vec!["a", "x\ny"]]);
+        // An unquoted newline with data after it is csv.Error.
+        let e = reader(&["a\nb,c"]).unwrap_err();
+        assert!(
+            format!("{}", e).contains("new-line character seen in unquoted field"),
+            "err: {}",
+            e
+        );
     }
 }
