@@ -2118,7 +2118,7 @@ fn mutating_methods_on_subscripted_receivers_use_the_place_lowering() {
 fn re_calls_lower_to_borrowing_fallible_paths() {
     let out = compile("import re\nm = re.search(r\"\\d\", \"a1\")\n", "r1.py");
     assert!(
-        out.contains("re :: search (& (\"\\\\d\") , & (\"a1\")) ?"),
+        out.contains("re :: search (& (\"\\\\d\") , & (\"a1\") , \"\") ?"),
         "generated: {}",
         out
     );
@@ -2144,9 +2144,44 @@ fn re_calls_lower_to_borrowing_fallible_paths() {
     );
     assert!(out.contains("findall (& ("), "generated: {}", out);
     assert!(out.contains("r#match (& ("), "generated: {}", out);
-    // Keywords are loud (Python's flags/count aren't supported yet).
-    let err = compile_err("import re\nm = re.search(r\"a\", \"a\", flags=1)\n", "r6.py");
-    assert!(err.contains("unexpected keyword"), "error: {}", err);
+    // Flags lower to inline flag letters; unknown flags are loud.
+    let out = compile(
+        "import re\nxs = re.findall(r\"a\", \"A\", re.IGNORECASE)\n",
+        "r6.py",
+    );
+    assert!(out.contains("\"i\") ?"), "generated: {}", out);
+    let out = compile(
+        "import re\nxs = re.findall(r\"a\", \"A\", flags=re.IGNORECASE | re.MULTILINE)\n",
+        "r7.py",
+    );
+    assert!(out.contains("\"im\") ?"), "generated: {}", out);
+    let out = compile(
+        "import re\ns = re.sub(r\"a\", \"b\", \"aa\", count=1)\n",
+        "r8.py",
+    );
+    assert!(out.contains(", 1 , \"\") ?"), "generated: {}", out);
+    let err = compile_err(
+        "import re\nxs = re.findall(r\"a\", \"A\", re.VERBOSE)\n",
+        "r9.py",
+    );
+    assert!(err.contains("unsupported re flag"), "error: {}", err);
+    // split's THIRD positional is maxsplit (not flags, unlike the rest).
+    let out = compile(
+        "import re\nxs = re.split(r\"a\", \"b\", 1)\n",
+        "r10.py",
+    );
+    assert!(out.contains("re :: split (& (\"a\") , & (\"b\") , 1 , \"\") ?"), "generated: {}", out);
+    let out = compile(
+        "import re\nxs = re.split(r\"a\", \"b\", maxsplit=2, flags=re.IGNORECASE)\n",
+        "r11.py",
+    );
+    assert!(out.contains(", 2 , \"i\") ?"), "generated: {}", out);
+    // Surplus positionals are loud, not silently dropped.
+    let err = compile_err(
+        "import re\nm = re.search(r\"a\", \"b\", re.IGNORECASE, 5)\n",
+        "r12.py",
+    );
+    assert!(err.contains("at most 3"), "error: {}", err);
 }
 
 // ---------------------------------------------------------------------------
