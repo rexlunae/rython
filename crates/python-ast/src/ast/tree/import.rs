@@ -25,6 +25,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "heapq"
             | "copy"
             | "textwrap"
+            | "hashlib"
             | "glob"
             | "pathlib"
             | "tempfile"
@@ -276,6 +277,10 @@ impl CodeGen for ImportFrom {
                 ("itertools", "zip_longest") => &["zip_longest_fill"],
                 ("itertools", "groupby") => &["groupby_key"],
                 ("functools", "reduce") => &["reduce_initial"],
+                ("hashlib", "md5") => &["md5_new"],
+                ("hashlib", "sha1") => &["sha1_new"],
+                ("hashlib", "sha256") => &["sha256_new"],
+                ("hashlib", "sha512") => &["sha512_new"],
                 _ => &[],
             };
 

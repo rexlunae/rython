@@ -2178,3 +2178,26 @@ fn map_filter_dispatch_on_the_function_arguments_shape() {
     let err = compile_err("ys = list()\n", "mf5.py");
     assert!(err.contains("iterable argument"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// hashlib lowering and str.encode()
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hashlib_and_encode_lower_correctly() {
+    let out = compile(
+        "import hashlib\nh = hashlib.sha256(\"x\".encode())\n",
+        "hl1.py",
+    );
+    assert!(
+        out.contains("hashlib :: sha256 (& ((\"x\") . as_bytes () . to_vec ()))"),
+        "generated: {}",
+        out
+    );
+    // Zero-arg constructors map to the _new variants for the update idiom.
+    let out = compile("from hashlib import sha256\nh = sha256()\n", "hl2.py");
+    assert!(out.contains("sha256_new ()"), "generated: {}", out);
+    // Only utf-8 encodings are supported — anything else is loud.
+    let err = compile_err("s = \"x\".encode(\"latin-1\")\n", "hl3.py");
+    assert!(err.contains("utf-8"), "error: {}", err);
+}

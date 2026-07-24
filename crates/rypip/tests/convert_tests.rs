@@ -1706,3 +1706,57 @@ fn map_filter_list_match_python_at_runtime() {
         "map/filter/list semantics diverged from CPython"
     );
 }
+
+#[test]
+fn hashlib_matches_python_at_runtime() {
+    // md5/sha1/sha256 with .encode() data, the empty+update() idiom, and
+    // UTF-8 hashing, through generated code (both import spellings).
+    let scratch = Scratch::new("hashes");
+    let file = scratch.path().join("hash_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import hashlib\n",
+            "from hashlib import sha256\n",
+            "\n",
+            "def main() -> int:\n",
+            "    print(f\"md5={hashlib.md5('hello'.encode()).hexdigest()}\")\n",
+            "    print(f\"sha1={hashlib.sha1('hello'.encode()).hexdigest()}\")\n",
+            "    print(f\"sha256={sha256('hello'.encode()).hexdigest()}\")\n",
+            "    h = sha256()\n",
+            "    h.update(\"hel\".encode())\n",
+            "    h.update(\"lo\".encode())\n",
+            "    print(f\"inc={h.hexdigest()}\")\n",
+            "    print(f\"utf8={hashlib.md5('café'.encode('utf-8')).hexdigest()}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/hash_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "md5=5d41402abc4b2a76b9719d911017c592",
+            "sha1=aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+            "sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "inc=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "utf8=07117fe4a1ebd544965dc19573183da2",
+        ],
+        "hashlib semantics diverged from CPython"
+    );
+}
