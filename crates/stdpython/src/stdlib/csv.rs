@@ -31,7 +31,7 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
     let newline_error = || {
         PyException::new(
             "csv.Error",
-            "new-line character seen in unquoted field - do you need to open              the file with newline=''?",
+            "new-line character seen in unquoted field - do you need to open the file with newline=''?",
         )
     };
 

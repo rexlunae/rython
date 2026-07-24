@@ -1987,10 +1987,10 @@ mod csv_module {
         assert_eq!(rows(&["a,\"x\n", "y\"\n"]), vec![vec!["a", "x\ny"]]);
         // An unquoted newline with data after it is csv.Error.
         let e = reader(&["a\nb,c"]).unwrap_err();
-        assert!(
-            format!("{}", e).contains("new-line character seen in unquoted field"),
-            "err: {}",
-            e
+        assert_eq!(
+            format!("{}", e),
+            "csv.Error: new-line character seen in unquoted field - do you \
+             need to open the file with newline=''?"
         );
     }
 }
