@@ -1569,3 +1569,73 @@ fn pure_modules_match_python_at_runtime() {
         "pure-module semantics diverged from CPython"
     );
 }
+
+#[test]
+fn re_module_matches_python_at_runtime() {
+    // search/match/fullmatch through the Option-based Match model
+    // (`if m:` + m.group()), findall, sub with backreference translation,
+    // and split, through generated code.
+    let scratch = Scratch::new("regex");
+    let file = scratch.path().join("re_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import re\n",
+            "\n",
+            "def main() -> int:\n",
+            "    m = re.search(r\"(\\d+)-(\\d+)\", \"order 12-34 shipped\")\n",
+            "    if m:\n",
+            "        print(f\"whole={m.group(0)} a={m.group(1)} b={m.group(2)}\")\n",
+            "        print(f\"span={m.start()},{m.end()}\")\n",
+            "    ok = re.match(r\"\\d+\", \"12ab\")\n",
+            "    if ok:\n",
+            "        print(f\"anchored={ok.group()}\")\n",
+            "    miss = re.match(r\"\\d+\", \"ab12\")\n",
+            "    if miss:\n",
+            "        print(\"unexpected\")\n",
+            "    else:\n",
+            "        print(\"no match at start\")\n",
+            "    nums = re.findall(r\"\\d+\", \"a1 b22 c333\")\n",
+            "    print(f\"nums={repr(nums)}\")\n",
+            "    tagged = re.sub(r\"(\\d+)\", r\"<\\1>\", \"a1 b22\")\n",
+            "    print(f\"tagged={tagged}\")\n",
+            "    parts = re.split(r\"[,;]\\s*\", \"a, b;c\")\n",
+            "    print(f\"parts={repr(parts)}\")\n",
+            "    whole = re.fullmatch(r\"\\w+\", \"hello\")\n",
+            "    if whole:\n",
+            "        print(f\"full={whole.group()}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/re_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "whole=12-34 a=12 b=34",
+            "span=6,11",
+            "anchored=12",
+            "no match at start",
+            "nums=['1', '22', '333']",
+            "tagged=a<1> b<22>",
+            "parts=['a', 'b', 'c']",
+            "full=hello",
+        ],
+        "re semantics diverged from CPython"
+    );
+}

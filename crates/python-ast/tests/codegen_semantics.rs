@@ -2109,3 +2109,42 @@ fn mutating_methods_on_subscripted_receivers_use_the_place_lowering() {
         out
     );
 }
+
+// ---------------------------------------------------------------------------
+// re module lowering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn re_calls_lower_to_borrowing_fallible_paths() {
+    let out = compile("import re\nm = re.search(r\"\\d\", \"a1\")\n", "r1.py");
+    assert!(
+        out.contains("re :: search (& (\"\\\\d\") , & (\"a1\")) ?"),
+        "generated: {}",
+        out
+    );
+    // `match` is a Rust keyword: the runtime function is r#match.
+    let out = compile("import re\nm = re.match(r\"\\d\", \"1\")\n", "r2.py");
+    assert!(out.contains("re :: r#match ("), "generated: {}", out);
+    let out = compile(
+        "import re\ns = re.sub(r\"a\", \"b\", \"aa\")\n",
+        "r3.py",
+    );
+    assert!(out.contains("re :: sub ("), "generated: {}", out);
+    assert!(out.contains(") ?"), "generated: {}", out);
+    // m.group() lowers to group(0).
+    let out = compile(
+        "import re\nm = re.search(r\"a\", \"a\")\ng = m.group()\n",
+        "r4.py",
+    );
+    assert!(out.contains(". group (0)"), "generated: {}", out);
+    // from-import spelling, including the keyword-name function.
+    let out = compile(
+        "from re import findall, match\nxs = findall(r\"a\", \"aa\")\nm = match(r\"a\", \"ab\")\n",
+        "r5.py",
+    );
+    assert!(out.contains("findall (& ("), "generated: {}", out);
+    assert!(out.contains("r#match (& ("), "generated: {}", out);
+    // Keywords are loud (Python's flags/count aren't supported yet).
+    let err = compile_err("import re\nm = re.search(r\"a\", \"a\", flags=1)\n", "r6.py");
+    assert!(err.contains("unexpected keyword"), "error: {}", err);
+}

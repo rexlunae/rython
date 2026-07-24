@@ -52,7 +52,7 @@ impl<'a> CodeGen for Attribute {
         // Module names are typically lowercase and match Python stdlib modules
         let is_module_access = matches!(value_str.as_str(),
             "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
-            "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" |
+            "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re" |
             // `datetime` covers both the runtime module and the datetime
             // TYPE from `from datetime import datetime` — either way the
             // attribute is a path item (datetime::strptime, datetime::now),

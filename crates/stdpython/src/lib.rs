@@ -3126,6 +3126,12 @@ pub use stdlib::random;
 pub use stdlib::datetime;
 #[cfg(feature = "std")]
 pub use stdlib::time;
+#[cfg(feature = "std")]
+pub use stdlib::re;
+// The Match-method trait must be in scope for m.group()/m.span() to
+// resolve through the Option layer in generated code.
+#[cfg(feature = "std")]
+pub use stdlib::re::PyMatchOps;
 pub use stdlib::string;
 pub use stdlib::json;
 pub use stdlib::collections;

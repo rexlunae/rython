@@ -13,6 +13,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
     matches!(
         name,
         "os" | "sys"
+            | "re"
             | "json"
             | "math"
             | "random"
@@ -42,6 +43,7 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
     matches!(
         name,
         "os" | "sys"
+            | "re"
             | "math"
             | "random"
             | "datetime"

@@ -609,17 +609,18 @@ impl<'a> CodeGen for Call {
             }
         }
 
-        // functools/heapq/copy/textwrap functions: their runtime shapes
-        // borrow (or mutably borrow) arguments, and reduce() splits by
-        // arity. Handled for both `from X import f; f(...)` and
-        // `import X; X.f(...)` spellings.
+        // functools/heapq/copy/textwrap/re functions: their runtime shapes
+        // borrow (or mutably borrow) arguments, reduce() splits by arity,
+        // and the re functions validate patterns at runtime (hence `?`).
+        // Handled for both `from X import f; f(...)` and `import X;
+        // X.f(...)` spellings.
         {
             let target: Option<(String, Option<&'static str>)> = match self.func.as_ref() {
                 ExprType::Name(n) => match symbols.get(&n.id) {
                     Some(SymbolTableNode::ImportFrom(import))
                         if matches!(
                             import.module.as_str(),
-                            "functools" | "heapq" | "copy" | "textwrap"
+                            "functools" | "heapq" | "copy" | "textwrap" | "re"
                         ) =>
                     {
                         Some((n.id.clone(), None))
@@ -628,11 +629,15 @@ impl<'a> CodeGen for Call {
                 },
                 ExprType::Attribute(attr) => match attr.value.as_ref() {
                     ExprType::Name(m)
-                        if matches!(m.id.as_str(), "functools" | "heapq" | "textwrap") =>
+                        if matches!(
+                            m.id.as_str(),
+                            "functools" | "heapq" | "textwrap" | "re"
+                        ) =>
                     {
                         let module: &'static str = match m.id.as_str() {
                             "functools" => "functools",
                             "heapq" => "heapq",
+                            "re" => "re",
                             _ => "textwrap",
                         };
                         Some((attr.attr.clone(), Some(module)))
@@ -656,6 +661,12 @@ impl<'a> CodeGen for Call {
                         | "deepcopy"
                         | "dedent"
                         | "indent"
+                        | "search"
+                        | "match"
+                        | "fullmatch"
+                        | "findall"
+                        | "sub"
+                        | "split"
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
@@ -703,7 +714,7 @@ impl<'a> CodeGen for Call {
                     }
                 }
                 let qual = |name: &str| {
-                    let f = format_ident!("{}", name);
+                    let f = crate::safe_ident(name);
                     match module_prefix {
                         Some(m) => {
                             let m = format_ident!("{}", m);
@@ -756,6 +767,14 @@ impl<'a> CodeGen for Call {
                     ("dedent", [s]) => {
                         let p = qual("dedent");
                         Ok(quote!(#p(&(#s))))
+                    }
+                    ("search" | "match" | "fullmatch" | "findall" | "split", [pat, text]) => {
+                        let p = qual(&fname);
+                        Ok(quote!(#p(&(#pat), &(#text))?))
+                    }
+                    ("sub", [pat, repl, text]) => {
+                        let p = qual("sub");
+                        Ok(quote!(#p(&(#pat), &(#repl), &(#text))?))
                     }
                     ("indent", [s, prefix]) => {
                         let p = qual("indent");
@@ -1009,6 +1028,10 @@ impl<'a> CodeGen for Call {
                 // list.count(x): the PyListOps method takes a reference.
                 ("count", [value]) => {
                     return Ok(quote!((#receiver).count(&(#value))));
+                }
+                // re Match: m.group() is m.group(0); Rust can't overload.
+                ("group", []) => {
+                    return Ok(quote!((#receiver).group(0)));
                 }
                 // list.pop() returns the last element or raises IndexError
                 // (Vec::pop returns an Option).

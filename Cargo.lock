@@ -582,6 +582,7 @@ dependencies = [
  "libm",
  "paste",
  "pyo3",
+ "regex",
 ]
 
 [[package]]
