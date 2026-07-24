@@ -2201,3 +2201,29 @@ fn hashlib_and_encode_lower_correctly() {
     let err = compile_err("s = \"x\".encode(\"latin-1\")\n", "hl3.py");
     assert!(err.contains("utf-8"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// textwrap.wrap/fill lowering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wrap_and_fill_lower_with_width_defaults() {
+    let out = compile("from textwrap import wrap\nxs = wrap(\"a b\")\n", "w1.py");
+    assert!(out.contains("wrap (& (\"a b\") , 70) ?"), "generated: {}", out);
+    let out = compile(
+        "from textwrap import fill\ns = fill(\"a b\", width=9)\n",
+        "w2.py",
+    );
+    assert!(out.contains("fill (& (\"a b\") , 9) ?"), "generated: {}", out);
+    let out = compile(
+        "import textwrap\nxs = textwrap.wrap(\"a b\", 12)\n",
+        "w3.py",
+    );
+    assert!(out.contains("textwrap :: wrap (& (\"a b\") , 12) ?"), "generated: {}", out);
+    // Unsupported options stay loud.
+    let err = compile_err(
+        "from textwrap import wrap\nxs = wrap(\"a\", initial_indent=\"> \")\n",
+        "w4.py",
+    );
+    assert!(err.contains("unexpected keyword"), "error: {}", err);
+}

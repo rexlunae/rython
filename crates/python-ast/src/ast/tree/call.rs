@@ -740,16 +740,28 @@ impl<'a> CodeGen for Call {
                         | "sha1"
                         | "sha256"
                         | "sha512"
+                        | "wrap"
+                        | "fill"
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
-                if let Some(kw) = self.keywords.first() {
-                    return Err(format!(
-                        "{}() got an unexpected keyword argument '{}'",
-                        fname,
-                        kw.arg.as_deref().unwrap_or("**kwargs")
-                    )
-                    .into());
+                // wrap/fill accept width= (only); everything else takes
+                // no keywords.
+                let mut width_kw: Option<crate::ExprType> = None;
+                for kw in &self.keywords {
+                    let allowed = matches!(fname.as_str(), "wrap" | "fill")
+                        && kw.arg.as_deref() == Some("width")
+                        && width_kw.is_none();
+                    if allowed {
+                        width_kw = Some(kw.value.clone());
+                    } else {
+                        return Err(format!(
+                            "{}() got an unexpected keyword argument '{}'",
+                            fname,
+                            kw.arg.as_deref().unwrap_or("**kwargs")
+                        )
+                        .into());
+                    }
                 }
                 let mut rendered = Vec::new();
                 for arg in &self.args {
@@ -840,6 +852,31 @@ impl<'a> CodeGen for Call {
                     ("dedent", [s]) => {
                         let p = qual("dedent");
                         Ok(quote!(#p(&(#s))))
+                    }
+                    // wrap/fill: width by position, keyword, or Python's
+                    // default of 70. They validate width, hence `?`.
+                    ("wrap" | "fill", [t]) | ("wrap" | "fill", [t, _]) => {
+                        let p = qual(&fname);
+                        let width = match (rendered.get(1), width_kw) {
+                            (Some(_), Some(_)) => {
+                                return Err(format!(
+                                    "{}() got multiple values for argument 'width'",
+                                    fname
+                                )
+                                .into());
+                            }
+                            (Some(w), None) => quote!(#w),
+                            (None, Some(w)) => {
+                                let w = w.to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                quote!(#w)
+                            }
+                            (None, None) => quote!(70),
+                        };
+                        Ok(quote!(#p(&(#t), #width)?))
                     }
                     ("search" | "match" | "fullmatch" | "findall" | "split", [pat, text]) => {
                         let p = qual(&fname);

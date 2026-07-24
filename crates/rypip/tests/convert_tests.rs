@@ -1760,3 +1760,65 @@ fn hashlib_matches_python_at_runtime() {
         "hashlib semantics diverged from CPython"
     );
 }
+
+#[test]
+fn textwrap_wrap_matches_python_at_runtime() {
+    // wrap (positional and width= keyword), fill, and the catchable
+    // invalid-width ValueError, through generated code.
+    let scratch = Scratch::new("wraps");
+    let file = scratch.path().join("wrap_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from textwrap import wrap, fill\n",
+            "\n",
+            "def main() -> int:\n",
+            "    for line in wrap(\"The quick brown fox jumps over the lazy dog\", 10):\n",
+            "        print(f\"w={line}\")\n",
+            "    for line in wrap(\"a self-referential well-known example\", width=12):\n",
+            "        print(f\"h={line}\")\n",
+            "    print(fill(\"one two three four\", 9))\n",
+            "    try:\n",
+            "        print(fill(\"x\", 0))\n",
+            "    except ValueError:\n",
+            "        print(\"width caught\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/wrap_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "w=The quick",
+            "w=brown fox",
+            "w=jumps over",
+            "w=the lazy",
+            "w=dog",
+            "h=a self-",
+            "h=referential",
+            "h=well-known",
+            "h=example",
+            "one two",
+            "three",
+            "four",
+            "width caught",
+        ],
+        "textwrap semantics diverged from CPython"
+    );
+}
