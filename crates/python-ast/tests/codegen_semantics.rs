@@ -2227,3 +2227,51 @@ fn wrap_and_fill_lower_with_width_defaults() {
     );
     assert!(err.contains("unexpected keyword"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// isinstance (static constant) and hash lowering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn isinstance_lowers_to_a_static_constant_or_a_loud_error() {
+    // Annotated parameters decide at conversion time.
+    let out = compile(
+        "def f(n: int) -> bool:\n    return isinstance(n, int)\n",
+        "is1.py",
+    );
+    assert!(out.contains("return Ok (true)") || out.contains("true"), "generated: {}", out);
+    let out = compile(
+        "def f(n: int) -> bool:\n    return isinstance(n, str)\n",
+        "is2.py",
+    );
+    assert!(out.contains("false"), "generated: {}", out);
+    // Literal-assigned locals count; bool is a subclass of int.
+    let out = compile(
+        "def f() -> bool:\n    x = 1.5\n    return isinstance(x, float)\n",
+        "is3.py",
+    );
+    assert!(out.contains("true"), "generated: {}", out);
+    let out = compile(
+        "def f(b: bool) -> bool:\n    return isinstance(b, int)\n",
+        "is4.py",
+    );
+    assert!(out.contains("true"), "generated: {}", out);
+    let out = compile(
+        "def f(n: int) -> bool:\n    return isinstance(n, bool)\n",
+        "is5.py",
+    );
+    assert!(out.contains("false"), "generated: {}", out);
+
+    // Unknown types are loud, not guessed.
+    let err = compile_err(
+        "def f(v):\n    return isinstance(v, int)\n",
+        "is6.py",
+    );
+    assert!(err.contains("statically"), "error: {}", err);
+}
+
+#[test]
+fn hash_lowers_by_reference() {
+    let out = compile("h = hash(\"a\")\n", "hs1.py");
+    assert!(out.contains("hash (& (\"a\"))"), "generated: {}", out);
+}

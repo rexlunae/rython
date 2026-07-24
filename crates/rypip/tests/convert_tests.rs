@@ -1822,3 +1822,62 @@ fn textwrap_wrap_matches_python_at_runtime() {
         "textwrap semantics diverged from CPython"
     );
 }
+
+#[test]
+fn isinstance_and_hash_match_python_at_runtime() {
+    // isinstance decided at conversion time (annotations, literal locals,
+    // bool-is-int) and hash() with PYTHONHASHSEED=0 semantics, through
+    // generated code.
+    let scratch = Scratch::new("ishash");
+    let file = scratch.path().join("is_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "def kind(n: int) -> str:\n",
+            "    if isinstance(n, int):\n",
+            "        return \"int\"\n",
+            "    return \"other\"\n",
+            "\n",
+            "def main() -> int:\n",
+            "    print(kind(5))\n",
+            "    x = 1.5\n",
+            "    print(\"float\" if isinstance(x, float) else \"not\")\n",
+            "    print(\"boolint\" if isinstance(True, int) else \"no\")\n",
+            "    print(f\"h1={hash('hello')}\")\n",
+            "    print(f\"h2={hash(42)}\")\n",
+            "    print(f\"h3={hash(-1)}\")\n",
+            "    print(f\"h4={hash(1.5)}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/is_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against PYTHONHASHSEED=0 python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "int",
+            "float",
+            "boolint",
+            "h1=-2096571579003691106",
+            "h2=42",
+            "h3=-2",
+            "h4=1152921504606846977",
+        ],
+        "isinstance/hash semantics diverged from CPython"
+    );
+}

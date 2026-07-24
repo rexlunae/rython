@@ -122,6 +122,7 @@ impl<'a> CodeGen for Call {
                 bname,
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
                     | "reversed" | "frozenset" | "map" | "filter" | "list"
+                    | "isinstance" | "hash"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -281,9 +282,65 @@ impl<'a> CodeGen for Call {
                             _ => Err("pow() takes 2 or 3 arguments".to_string().into()),
                         };
                     }
+                    // isinstance is statically decidable in a typed
+                    // lowering: it becomes the constant true/false when the
+                    // argument's type is known (annotation or literal), and
+                    // a loud error when it is not.
+                    "isinstance" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if self.args.len() != 2 {
+                            return Err("isinstance() takes exactly 2 arguments"
+                                .to_string()
+                                .into());
+                        }
+                        let target = match &self.args[1] {
+                            ExprType::Name(t)
+                                if matches!(
+                                    t.id.as_str(),
+                                    "int" | "float" | "str" | "bool"
+                                ) =>
+                            {
+                                t.id.clone()
+                            }
+                            other => {
+                                return Err(format!(
+                                    "isinstance() second argument must be int, float, \
+                                     str, or bool (got `{:?}`); tuples of types are not \
+                                     supported yet",
+                                    other
+                                )
+                                .into());
+                            }
+                        };
+                        let actual: Option<String> = match &self.args[0] {
+                            ExprType::Name(n) => options.local_types.get(&n.id).cloned(),
+                            lit => crate::ast::tree::function_def::simple_expr_type(lit)
+                                .map(|ty| match ty.to_string().as_str() {
+                                    "i64" => "int".to_string(),
+                                    "f64" => "float".to_string(),
+                                    "bool" => "bool".to_string(),
+                                    _ => "str".to_string(),
+                                }),
+                        };
+                        let Some(actual) = actual else {
+                            return Err(format!(
+                                "isinstance(): the type of `{:?}` is not statically \
+                                 known; annotate it (or assign it a literal) so the \
+                                 check can be decided at conversion time",
+                                self.args[0]
+                            )
+                            .into());
+                        };
+                        // bool is a subclass of int in Python.
+                        let result = actual == target
+                            || (actual == "bool" && target == "int");
+                        return Ok(if result { quote!(true) } else { quote!(false) });
+                    }
                     // The by-reference builtins: their runtime functions
                     // borrow, and Python's calls never consume the value.
-                    "len" | "repr" | "reversed" => {
+                    "len" | "repr" | "reversed" | "hash" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
