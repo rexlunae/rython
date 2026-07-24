@@ -574,22 +574,28 @@ where
     Compress::new(data, selectors).collect()
 }
 
-/// combinations - generate combinations of length r
-pub fn combinations<T>(iterable: &[T], r: usize) -> Vec<Vec<T>> 
+/// combinations - generate combinations of length r. r is an i64 because
+/// Python's is an int: a negative r raises ValueError (a usize cast would
+/// wrap instead).
+pub fn combinations<T>(iterable: &[T], r: i64) -> Result<Vec<Vec<T>>, crate::PyException>
 where
     T: Clone,
 {
+    if r < 0 {
+        return Err(crate::value_error("r must be non-negative"));
+    }
+    let r = r as usize;
     if r == 0 {
-        return vec![vec![]];
+        return Ok(vec![vec![]]);
     }
     
     if r > iterable.len() {
-        return vec![];
+        return Ok(vec![]);
     }
     
     let mut result = Vec::new();
     combinations_helper(iterable, r, 0, &mut vec![], &mut result);
-    result
+    Ok(result)
 }
 
 fn combinations_helper<T>(
@@ -613,25 +619,29 @@ fn combinations_helper<T>(
     }
 }
 
-/// permutations - generate permutations of length r
-pub fn permutations<T>(iterable: &[T], r: Option<usize>) -> Vec<Vec<T>> 
+/// permutations - generate permutations of length r; a negative r raises
+/// ValueError like Python.
+pub fn permutations<T>(iterable: &[T], r: Option<i64>) -> Result<Vec<Vec<T>>, crate::PyException>
 where
     T: Clone,
 {
-    let r = r.unwrap_or(iterable.len());
+    if r.is_some_and(|r| r < 0) {
+        return Err(crate::value_error("r must be non-negative"));
+    }
+    let r = r.map_or(iterable.len(), |r| r as usize);
     
     if r == 0 {
-        return vec![vec![]];
+        return Ok(vec![vec![]]);
     }
     
     if r > iterable.len() {
-        return vec![];
+        return Ok(vec![]);
     }
     
     let mut result = Vec::new();
     let mut used = vec![false; iterable.len()];
     permutations_helper(iterable, r, &mut vec![], &mut used, &mut result);
-    result
+    Ok(result)
 }
 
 fn permutations_helper<T>(
@@ -811,15 +821,22 @@ pub fn product_repeat3<T: Clone>(iterable: &[T]) -> Vec<(T, T, T)> {
 
 /// combinations_with_replacement(iterable, r) — same Vec-of-Vec shape as
 /// combinations(), in the same lexicographic-by-index order as Python.
-pub fn combinations_with_replacement<T: Clone>(iterable: &[T], r: usize) -> Vec<Vec<T>> {
+pub fn combinations_with_replacement<T: Clone>(
+    iterable: &[T],
+    r: i64,
+) -> Result<Vec<Vec<T>>, crate::PyException> {
+    if r < 0 {
+        return Err(crate::value_error("r must be non-negative"));
+    }
+    let r = r as usize;
     let n = iterable.len();
     let mut result = Vec::new();
     if r == 0 {
         result.push(Vec::new());
-        return result;
+        return Ok(result);
     }
     if n == 0 {
-        return result;
+        return Ok(result);
     }
     // indices are non-decreasing; advance like CPython's implementation.
     let mut indices = vec![0usize; r];
@@ -829,7 +846,7 @@ pub fn combinations_with_replacement<T: Clone>(iterable: &[T], r: usize) -> Vec<
         let mut i = r;
         loop {
             if i == 0 {
-                return result;
+                return Ok(result);
             }
             i -= 1;
             if indices[i] != n - 1 {
@@ -954,7 +971,7 @@ mod tests {
     
     #[test]
     fn test_combinations() {
-        let result = combinations(&[1, 2, 3, 4], 2);
+        let result = combinations(&[1, 2, 3, 4], 2).unwrap();
         assert_eq!(result, vec![
             vec![1, 2], vec![1, 3], vec![1, 4],
             vec![2, 3], vec![2, 4], vec![3, 4]
@@ -963,7 +980,7 @@ mod tests {
     
     #[test]
     fn test_permutations() {
-        let result = permutations(&[1, 2], None);
+        let result = permutations(&[1, 2], None).unwrap();
         assert_eq!(result.len(), 2);
         assert!(result.contains(&vec![1, 2]));
         assert!(result.contains(&vec![2, 1]));
