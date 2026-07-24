@@ -746,6 +746,7 @@ impl<'a> CodeGen for Call {
                         if matches!(
                             import.module.as_str(),
                             "functools" | "heapq" | "copy" | "textwrap" | "re" | "hashlib"
+                                | "csv"
                         ) =>
                     {
                         Some((n.id.clone(), None))
@@ -756,7 +757,7 @@ impl<'a> CodeGen for Call {
                     ExprType::Name(m)
                         if matches!(
                             m.id.as_str(),
-                            "functools" | "heapq" | "textwrap" | "re" | "hashlib"
+                            "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv"
                         ) =>
                     {
                         let module: &'static str = match m.id.as_str() {
@@ -764,6 +765,7 @@ impl<'a> CodeGen for Call {
                             "heapq" => "heapq",
                             "re" => "re",
                             "hashlib" => "hashlib",
+                            "csv" => "csv",
                             _ => "textwrap",
                         };
                         Some((attr.attr.clone(), Some(module)))
@@ -800,6 +802,7 @@ impl<'a> CodeGen for Call {
                         | "sha512"
                         | "wrap"
                         | "fill"
+                        | "reader"
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
@@ -1109,6 +1112,10 @@ impl<'a> CodeGen for Call {
                     ("md5" | "sha1" | "sha256" | "sha512", [data]) => {
                         let p = qual(&fname);
                         Ok(quote!(#p(&(#data))))
+                    }
+                    ("reader", [lines]) => {
+                        let p = qual("reader");
+                        Ok(quote!(#p(&(#lines))?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(&format!("{}_new", fname));

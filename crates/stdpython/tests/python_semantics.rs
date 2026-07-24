@@ -1919,3 +1919,78 @@ mod hash_builtin {
         let _ = hash(&f64::NAN);
     }
 }
+
+// ---------------------------------------------------------------------------
+// csv.reader (issue #19). All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod csv_module {
+    use stdpython::csv::reader;
+
+    fn rows(lines: &[&str]) -> Vec<Vec<String>> {
+        reader(lines).unwrap()
+    }
+
+    #[test]
+    fn excel_dialect_parsing_matches_python() {
+        assert_eq!(
+            rows(&["a,b,c", "1,2,3"]),
+            vec![vec!["a", "b", "c"], vec!["1", "2", "3"]]
+        );
+        // Quoted fields keep delimiters; "" escapes a quote.
+        assert_eq!(rows(&["a,\"b,c\",d"]), vec![vec!["a", "b,c", "d"]]);
+        assert_eq!(
+            rows(&["a,\"say \"\"hi\"\"\",z"]),
+            vec![vec!["a", "say \"hi\"", "z"]]
+        );
+        // Whitespace is data.
+        assert_eq!(rows(&[" a , b "]), vec![vec![" a ", " b "]]);
+        // Mid-field quotes are literal; data after a closing quote joins.
+        assert_eq!(rows(&["a\"b,c"]), vec![vec!["a\"b", "c"]]);
+        assert_eq!(rows(&["\"a\"b,c"]), vec![vec!["ab", "c"]]);
+        assert_eq!(rows(&["\"a\"\"b\""]), vec![vec!["a\"b"]]);
+    }
+
+    #[test]
+    fn empty_fields_lines_and_continuations_match_python() {
+        // Empty fields, a bare comma, and an EMPTY line (an empty record).
+        assert_eq!(
+            rows(&["a,,c", ",", ""]),
+            vec![
+                vec!["a".to_string(), "".to_string(), "c".to_string()],
+                vec!["".to_string(), "".to_string()],
+                Vec::<String>::new()
+            ]
+        );
+        // A quoted field spanning list elements joins them directly
+        // (list elements carry no newline of their own).
+        assert_eq!(rows(&["a,\"x", "y\",b"]), vec![vec!["a", "xy", "b"]]);
+        // Unterminated quotes close at end of input, as in Python.
+        assert_eq!(rows(&["a,\"unterminated"]), vec![vec!["a", "unterminated"]]);
+        assert_eq!(rows(&["\"\",x"]), vec![vec!["", "x"]]);
+    }
+
+    #[test]
+    fn readlines_style_newlines_terminate_records_like_python() {
+        // readlines() keeps the line terminators; they end the record.
+        assert_eq!(
+            rows(&["a,b\n", "\n", "c\r\n", "d\r"]),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                Vec::<String>::new(),
+                vec!["c".to_string()],
+                vec!["d".to_string()]
+            ]
+        );
+        // Inside quotes a newline is DATA — a quoted field spanning
+        // readlines elements keeps it: python3 gives 'x\ny'.
+        assert_eq!(rows(&["a,\"x\n", "y\"\n"]), vec![vec!["a", "x\ny"]]);
+        // An unquoted newline with data after it is csv.Error.
+        let e = reader(&["a\nb,c"]).unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "csv.Error: new-line character seen in unquoted field - do you \
+             need to open the file with newline=''?"
+        );
+    }
+}

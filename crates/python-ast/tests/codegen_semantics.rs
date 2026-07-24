@@ -2310,3 +2310,21 @@ fn hash_lowers_by_reference() {
     let out = compile("h = hash(\"a\")\n", "hs1.py");
     assert!(out.contains("hash (& (\"a\"))"), "generated: {}", out);
 }
+
+// ---------------------------------------------------------------------------
+// csv lowering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn csv_reader_lowers_by_reference() {
+    let out = compile(
+        "import csv\nrows = csv.reader([\"a,b\"])\n",
+        "cv1.py",
+    );
+    assert!(out.contains("csv :: reader (& ("), "generated: {}", out);
+    let out = compile(
+        "from csv import reader\nrows = reader([\"a,b\"])\n",
+        "cv2.py",
+    );
+    assert!(out.contains("reader (& ("), "generated: {}", out);
+}
