@@ -2165,3 +2165,67 @@ mod re_named_groups {
         );
     }
 }
+
+mod datetime_fields_and_directives {
+    use stdpython::datetime::datetime;
+
+    #[test]
+    fn datetime_fields_are_flat_like_python() {
+        let d = datetime::new(2024, 2, 29, Some(13), Some(5), Some(7), Some(123456)).unwrap();
+        assert_eq!(
+            (d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond),
+            (2024, 2, 29, 13, 5, 7, 123456)
+        );
+        // dt.date() / dt.time() are methods, as in Python.
+        assert_eq!(format!("{}", d.date()), "2024-02-29");
+        assert_eq!(format!("{}", d.time()), "13:05:07.123456");
+    }
+
+    #[test]
+    fn strptime_julian_day_matches_python() {
+        // python3: strptime("2024-060", "%Y-%j") == 2024-02-29
+        let d = datetime::strptime("2024-060", "%Y-%j").unwrap();
+        assert_eq!((d.year, d.month, d.day), (2024, 2, 29));
+        // Day 366 of a 365-day year rolls into the next year (ordinal
+        // arithmetic, as CPython).
+        let d = datetime::strptime("2023-366", "%Y-%j").unwrap();
+        assert_eq!((d.year, d.month, d.day), (2024, 1, 1));
+        // Without a year, 1900: python3 gives 1900-03-01 for day 60.
+        let d = datetime::strptime("060", "%j").unwrap();
+        assert_eq!((d.year, d.month, d.day), (1900, 3, 1));
+        // CPython's %j matches the LONGEST in-range digit prefix: "367"
+        // consumes "36" and the trailing "7" is unconverted data.
+        let e = datetime::strptime("2023-367", "%Y-%j").unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: unconverted data remains: 7");
+        // 000 matches nothing.
+        let e = datetime::strptime("2023-000", "%Y-%j").unwrap_err();
+        assert!(format!("{}", e).contains("does not match format"), "{}", e);
+    }
+
+    #[test]
+    fn strptime_weekday_names_parse_and_are_ignored() {
+        // 2024-01-02 is a Tuesday; CPython does NOT validate the parsed
+        // weekday against the date.
+        let d = datetime::strptime("Mon 2024-01-02", "%a %Y-%m-%d").unwrap();
+        assert_eq!((d.year, d.month, d.day), (2024, 1, 2));
+        // Full names via %A, case-insensitively.
+        let d = datetime::strptime("friday 2024-03-01", "%A %Y-%m-%d").unwrap();
+        assert_eq!((d.year, d.month, d.day), (2024, 3, 1));
+        // Combined with %j.
+        let d = datetime::strptime("Tue 2024-060", "%a %Y-%j").unwrap();
+        assert_eq!((d.year, d.month, d.day), (2024, 2, 29));
+        // A non-weekday is Python's mismatch ValueError.
+        let e = datetime::strptime("Xyz 2024-01-02", "%a %Y-%m-%d").unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "ValueError: time data 'Xyz 2024-01-02' does not match format '%a %Y-%m-%d'"
+        );
+        // %a takes only abbreviated names: "Monday" consumes "Mon" and
+        // the leftover "day" breaks the format, as in CPython.
+        let e = datetime::strptime("Monday 2024-01-02", "%a %Y-%m-%d").unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "ValueError: time data 'Monday 2024-01-02' does not match format '%a %Y-%m-%d'"
+        );
+    }
+}
