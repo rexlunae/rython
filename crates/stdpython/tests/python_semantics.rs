@@ -1550,3 +1550,93 @@ mod textwrap_module {
         assert_eq!(indent("", "> "), "");
     }
 }
+
+// ---------------------------------------------------------------------------
+// re module (issue #19). All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod re_module {
+    use stdpython::re::{self, PyMatchOps};
+
+    #[test]
+    fn search_match_fullmatch_follow_pythons_anchoring() {
+        let m = re::search(r"(\d+)-(\d+)", "order 12-34 shipped").unwrap();
+        assert_eq!(m.group(0), "12-34");
+        assert_eq!(m.group(1), "12");
+        assert_eq!(m.group(2), "34");
+        assert_eq!(m.groups(), vec!["12", "34"]);
+        assert_eq!((m.start(), m.end()), (6, 11));
+        assert_eq!(m.span(), (6, 11));
+
+        // match anchors at the start; fullmatch also at the end.
+        assert!(re::r#match(r"\d+", "12ab").unwrap().is_some());
+        assert!(re::r#match(r"\d+", "ab12").unwrap().is_none());
+        assert!(re::fullmatch(r"\d+", "123").unwrap().is_some());
+        assert!(re::fullmatch(r"\d+", "123a").unwrap().is_none());
+    }
+
+    #[test]
+    fn offsets_are_character_offsets_like_python() {
+        // python3: re.search(r"héllo", "say héllo").span() == (4, 9) —
+        // characters, not the regex crate's bytes.
+        let m = re::search("héllo", "say héllo").unwrap();
+        assert_eq!(m.span(), (4, 9));
+    }
+
+    #[test]
+    fn findall_sub_split_match_python() {
+        assert_eq!(
+            re::findall(r"\d+", "a1 b22 c333").unwrap(),
+            vec!["1", "22", "333"]
+        );
+        // One capture group: findall yields the group.
+        assert_eq!(re::findall(r"(\w)\d", "a1 b2").unwrap(), vec!["a", "b"]);
+        assert_eq!(re::findall("x", "abc").unwrap(), Vec::<String>::new());
+        // Two-plus groups yield tuples in Python: loud, not wrong-shaped.
+        assert!(re::findall(r"(a)(b)", "ab").is_err());
+
+        assert_eq!(re::sub(r"(\d+)", r"<\1>", "a1 b22").unwrap(), "a<1> b<22>");
+        assert_eq!(re::sub("cat", "dog", "cat cat").unwrap(), "dog dog");
+
+        assert_eq!(
+            re::split(r"[,;]\s*", "a, b;c ,d").unwrap(),
+            vec!["a", "b", "c ", "d"]
+        );
+        assert_eq!(re::split(r"\d", "abc").unwrap(), vec!["abc"]);
+    }
+
+    #[test]
+    fn errors_are_loud() {
+        // Unsupported-by-the-engine patterns (Python allows lookbehind)
+        // and bad patterns both fail as re.error.
+        let e = re::search(r"(?<=a)b(", "x").unwrap_err();
+        assert!(format!("{}", e).starts_with("re.error:"), "err: {}", e);
+
+        // A missed match behaves like Python's None.group(): loud
+        // AttributeError with Python's message.
+        let miss = re::search(r"\d", "abc").unwrap();
+        assert!(miss.is_none());
+        let result = std::panic::catch_unwind(|| miss.group(0));
+        let msg = *result.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(
+            msg,
+            "AttributeError: 'NoneType' object has no attribute 'group'"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no such group")]
+    fn out_of_range_groups_raise_index_error() {
+        let m = re::search("a", "a").unwrap();
+        let _ = m.group(3);
+    }
+
+    #[test]
+    #[should_panic(expected = "did not participate")]
+    fn non_participating_groups_fail_loudly() {
+        // python3 returns None for group(2) of r"(a)(b)?" on "a"; a typed
+        // String cannot, so this is loud instead of invented.
+        let m = re::search(r"(a)(b)?", "a").unwrap();
+        let _ = m.group(2);
+    }
+}

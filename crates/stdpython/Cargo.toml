@@ -13,7 +13,7 @@ description = "Python standard library runtime for the Rython compiler ecosystem
 # A strictly-core tier (no alloc) is not implemented yet and fails loudly.
 [features]
 default = ["std"]
-std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "indexmap/std"]
+std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "dep:regex", "indexmap/std"]
 alloc = ["dep:hashbrown", "dep:libm"]
 
 [dependencies]
@@ -23,6 +23,7 @@ indexmap = { version = "2", default-features = false }
 getrandom = { version = "0.3", optional = true }
 hashbrown = { version = "0.15", optional = true }
 libm = { version = "0.2", optional = true }
+regex = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
 
 [[bin]]

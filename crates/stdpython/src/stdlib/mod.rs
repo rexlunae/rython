@@ -78,3 +78,7 @@ pub mod copy;
 /// Python textwrap module - text dedent/indent helpers
 pub mod textwrap;
 
+/// Python re module - regular expressions (regex-crate backed)
+#[cfg(feature = "std")]
+pub mod re;
+
