@@ -1744,3 +1744,73 @@ mod hashlib_module {
         assert_eq!(h.hexdigest(), sha256("hello!").hexdigest());
     }
 }
+
+// ---------------------------------------------------------------------------
+// textwrap.wrap/fill (issue #19). All expected values pinned against
+// python3 with the default settings.
+// ---------------------------------------------------------------------------
+
+mod textwrap_wrap {
+    use stdpython::textwrap::{fill, wrap};
+
+    #[test]
+    fn wrapping_matches_python() {
+        assert_eq!(
+            wrap("The quick brown fox jumps over the lazy dog", 10).unwrap(),
+            vec!["The quick", "brown fox", "jumps over", "the lazy", "dog"]
+        );
+        // Hyphenated words break after acceptable hyphens.
+        assert_eq!(
+            wrap("a self-referential well-known example", 12).unwrap(),
+            vec!["a self-", "referential", "well-known", "example"]
+        );
+        // Em-dashes between words are their own chunks.
+        assert_eq!(
+            wrap("hello--world and then--some", 8).unwrap(),
+            vec!["hello--", "world", "and then", "--some"]
+        );
+        assert_eq!(
+            wrap("word wrap-ping is--neat", 6).unwrap(),
+            vec!["word", "wrap-", "ping", "is--", "neat"]
+        );
+        assert_eq!(fill("one two three four", 9).unwrap(), "one two\nthree\nfour");
+    }
+
+    #[test]
+    fn long_words_break_like_python() {
+        assert_eq!(
+            wrap("supercalifragilisticexpialidocious", 10).unwrap(),
+            vec!["supercalif", "ragilistic", "expialidoc", "ious"]
+        );
+        // The long-word chopper prefers a hyphen inside the window — but
+        // here none lands in the first window, matching python3 exactly.
+        assert_eq!(
+            wrap("a supercalifragilistic-expialidocious word", 12).unwrap(),
+            vec!["a supercalif", "ragilistic-e", "xpialidociou", "s word"]
+        );
+        assert_eq!(wrap("xxxxx", 70).unwrap(), vec!["xxxxx"]);
+    }
+
+    #[test]
+    fn whitespace_munging_matches_python() {
+        // Tabs expand column-aware (tabsize 8); newlines become spaces.
+        assert_eq!(
+            wrap("tabs\there\tand\nnewlines", 12).unwrap(),
+            vec!["tabs    here", "and newlines"]
+        );
+        // The FIRST line keeps leading whitespace; later lines drop it.
+        assert_eq!(
+            wrap("  leading and   multiple   spaces  ", 10).unwrap(),
+            vec!["  leading", "and", "multiple", "spaces"]
+        );
+        assert_eq!(wrap("", 10).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn invalid_width_raises_pythons_value_error() {
+        let e = wrap("x", 0).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: invalid width 0 (must be > 0)");
+        let e = fill("x", -3).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: invalid width -3 (must be > 0)");
+    }
+}
