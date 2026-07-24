@@ -1919,3 +1919,54 @@ mod hash_builtin {
         let _ = hash(&f64::NAN);
     }
 }
+
+// ---------------------------------------------------------------------------
+// csv.reader (issue #19). All expected values pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod csv_module {
+    use stdpython::csv::reader;
+
+    fn rows(lines: &[&str]) -> Vec<Vec<String>> {
+        reader(lines)
+    }
+
+    #[test]
+    fn excel_dialect_parsing_matches_python() {
+        assert_eq!(
+            rows(&["a,b,c", "1,2,3"]),
+            vec![vec!["a", "b", "c"], vec!["1", "2", "3"]]
+        );
+        // Quoted fields keep delimiters; "" escapes a quote.
+        assert_eq!(rows(&["a,\"b,c\",d"]), vec![vec!["a", "b,c", "d"]]);
+        assert_eq!(
+            rows(&["a,\"say \"\"hi\"\"\",z"]),
+            vec![vec!["a", "say \"hi\"", "z"]]
+        );
+        // Whitespace is data.
+        assert_eq!(rows(&[" a , b "]), vec![vec![" a ", " b "]]);
+        // Mid-field quotes are literal; data after a closing quote joins.
+        assert_eq!(rows(&["a\"b,c"]), vec![vec!["a\"b", "c"]]);
+        assert_eq!(rows(&["\"a\"b,c"]), vec![vec!["ab", "c"]]);
+        assert_eq!(rows(&["\"a\"\"b\""]), vec![vec!["a\"b"]]);
+    }
+
+    #[test]
+    fn empty_fields_lines_and_continuations_match_python() {
+        // Empty fields, a bare comma, and an EMPTY line (an empty record).
+        assert_eq!(
+            rows(&["a,,c", ",", ""]),
+            vec![
+                vec!["a".to_string(), "".to_string(), "c".to_string()],
+                vec!["".to_string(), "".to_string()],
+                Vec::<String>::new()
+            ]
+        );
+        // A quoted field spanning list elements joins them directly
+        // (list elements carry no newline of their own).
+        assert_eq!(rows(&["a,\"x", "y\",b"]), vec![vec!["a", "xy", "b"]]);
+        // Unterminated quotes close at end of input, as in Python.
+        assert_eq!(rows(&["a,\"unterminated"]), vec![vec!["a", "unterminated"]]);
+        assert_eq!(rows(&["\"\",x"]), vec![vec!["", "x"]]);
+    }
+}

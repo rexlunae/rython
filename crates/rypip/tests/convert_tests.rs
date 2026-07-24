@@ -1894,3 +1894,56 @@ fn isinstance_and_hash_match_python_at_runtime() {
         "isinstance/hash semantics diverged from CPython"
     );
 }
+
+#[test]
+fn csv_reader_matches_python_at_runtime() {
+    // The excel dialect over a list of lines: quoted delimiters, ""
+    // escapes, empty records, and int() over parsed fields, through
+    // generated code.
+    let scratch = Scratch::new("csvs");
+    let file = scratch.path().join("csv_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import csv\n",
+            "\n",
+            "def main() -> int:\n",
+            "    lines = [\"name,qty,note\", \"apple,3,\\\"sweet, crisp\\\"\", \"pear,7,\\\"say \\\"\\\"hi\\\"\\\"\\\"\", \"\"]\n",
+            "    for row in csv.reader(lines):\n",
+            "        print(f\"row={repr(row)}\")\n",
+            "    total = 0\n",
+            "    for row in csv.reader([\"1,2\", \"3,4\"]):\n",
+            "        total += int(row[0]) + int(row[1])\n",
+            "    print(f\"total={total}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/csv_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "row=['name', 'qty', 'note']",
+            "row=['apple', '3', 'sweet, crisp']",
+            "row=['pear', '7', 'say \"hi\"']",
+            "row=[]",
+            "total=10",
+        ],
+        "csv semantics diverged from CPython"
+    );
+}

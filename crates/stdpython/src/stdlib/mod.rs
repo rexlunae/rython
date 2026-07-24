@@ -85,3 +85,6 @@ pub mod re;
 /// Python hashlib module - message digests
 pub mod hashlib;
 
+/// Python csv module - CSV reading over line lists
+pub mod csv;
+

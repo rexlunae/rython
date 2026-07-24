@@ -26,6 +26,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "copy"
             | "textwrap"
             | "hashlib"
+            | "csv"
             | "glob"
             | "pathlib"
             | "tempfile"
