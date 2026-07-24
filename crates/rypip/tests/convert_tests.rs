@@ -1492,3 +1492,80 @@ fn itertools_gaps_match_python_at_runtime() {
         "deny-mode generated crate failed to compile (orphaned imports?)"
     );
 }
+
+#[test]
+fn pure_modules_match_python_at_runtime() {
+    // heapq (exact CPython list layouts, module-attribute and from-import
+    // spellings), functools.reduce (both arities), copy.deepcopy
+    // independence, and textwrap.dedent, through generated code.
+    let scratch = Scratch::new("puremods");
+    let file = scratch.path().join("pure_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from functools import reduce\n",
+            "from heapq import heappush, heappop, heapify, nlargest\n",
+            "from copy import deepcopy\n",
+            "from textwrap import dedent\n",
+            "import heapq\n",
+            "\n",
+            "def main() -> int:\n",
+            "    h = [5, 1, 9, 3, 7, 2]\n",
+            "    heapify(h)\n",
+            "    print(f\"heap={repr(h)}\")\n",
+            "    heappush(h, 0)\n",
+            "    print(f\"pushed={repr(h)}\")\n",
+            "    print(f\"pop={heappop(h)}\")\n",
+            "    print(f\"pushpop={heapq.heappushpop(h, 4)}\")\n",
+            "    print(f\"big={repr(nlargest(3, [5, 1, 9, 3, 7]))}\")\n",
+            "    print(f\"prod={reduce(lambda a, b: a * b, [1, 2, 3, 4])}\")\n",
+            "    print(f\"sum={reduce(lambda a, b: a + b, [1, 2], 100)}\")\n",
+            "    nested = [[1, 2], [3]]\n",
+            "    cloned = deepcopy(nested)\n",
+            "    cloned[0].append(9)\n",
+            "    print(f\"orig={repr(nested)} clone={repr(cloned)}\")\n",
+            "    rows = [[3, 1], [9]]\n",
+            "    heapify(rows[0])\n",
+            "    heappush(rows[1], 4)\n",
+            "    print(f\"rows={repr(rows)}\")\n",
+            "    text = \"    a\\n      b\\n    c\"\n",
+            "    print(dedent(text))\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/pure_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "heap=[1, 3, 2, 5, 7, 9]",
+            "pushed=[0, 3, 1, 5, 7, 9, 2]",
+            "pop=0",
+            "pushpop=1",
+            "big=[9, 7, 5]",
+            "prod=24",
+            "sum=103",
+            "orig=[[1, 2], [3]] clone=[[1, 2, 9], [3]]",
+            "rows=[[1, 3], [4, 9]]",
+            "a",
+            "  b",
+            "c",
+        ],
+        "pure-module semantics diverged from CPython"
+    );
+}

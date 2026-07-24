@@ -43,7 +43,7 @@ enum Init {
 /// Python methods that mutate their receiver; calling one on a name means
 /// the binding must be mutable. An unlisted mutating method surfaces as a
 /// missing-`mut` compile error in the generated code (loud, not silent).
-const MUTATING_METHODS: &[&str] = &[
+pub(crate) const MUTATING_METHODS: &[&str] = &[
     "append",
     "extend",
     "insert",
@@ -348,8 +348,31 @@ fn walk_loop(
     walk_stmts(orelse, a, outer_multi);
 }
 
+/// Free functions that mutate their first argument in place: the heapq
+/// surface treats a plain list as a heap, so `heappush(h, x)` mutates `h`
+/// like a method call would.
+const FIRST_ARG_MUTATORS: &[&str] = &[
+    "heappush",
+    "heappop",
+    "heapify",
+    "heappushpop",
+    "heapreplace",
+];
+
 fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
     if let ExprType::Attribute(attr) = call.func.as_ref() {
+        // The module-prefixed spelling mutates its first ARGUMENT, not the
+        // receiver: `heapq.heappush(h, x)` needs `h` mutable, mirroring
+        // the bare-function branch below.
+        if let ExprType::Name(m) = attr.value.as_ref() {
+            if m.id == "heapq" && FIRST_ARG_MUTATORS.contains(&attr.attr.as_str()) {
+                if let Some(first) = call.args.first() {
+                    if let Some(name) = chain_base_name(first) {
+                        a.record_mutation(name);
+                    }
+                }
+            }
+        }
         // A mutating method mutates the base binding of the whole receiver
         // chain: `self.items.append(x)` mutates `self`, `rows[i].push(x)`
         // mutates `rows`. When the receiver's class is statically known,
@@ -367,6 +390,17 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         }
         walk_expr(&attr.value, a);
     } else {
+        // Free functions that mutate their first argument in place; see
+        // FIRST_ARG_MUTATORS.
+        if let ExprType::Name(n) = call.func.as_ref() {
+            if FIRST_ARG_MUTATORS.contains(&n.id.as_str()) {
+                if let Some(first) = call.args.first() {
+                    if let Some(name) = chain_base_name(first) {
+                        a.record_mutation(name);
+                    }
+                }
+            }
+        }
         walk_expr(&call.func, a);
     }
     for arg in &call.args {
