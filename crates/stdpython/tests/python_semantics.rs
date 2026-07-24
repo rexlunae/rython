@@ -1657,6 +1657,10 @@ mod re_module {
         assert_eq!(re::sub("a", "-", "aaaa", 2, "").unwrap(), "--aa");
         assert_eq!(re::sub("a", "-", "aaaa", 0, "").unwrap(), "----");
         assert_eq!(re::sub("a", "-", "aaaa", -1, "").unwrap(), "aaaa");
+        // A bad pattern raises even when the negative count/maxsplit
+        // means no work would happen, as in Python.
+        assert!(re::sub("(", "-", "aaaa", -1, "").is_err());
+        assert!(re::split("(", "aaaa", -1, "").is_err());
 
         // split maxsplit: 0 unlimited, positive limits, negative none.
         assert_eq!(

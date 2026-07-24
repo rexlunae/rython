@@ -250,10 +250,12 @@ pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     flags: &str,
 ) -> Result<Vec<String>, PyException> {
     let text = string.as_ref();
+    // Compile FIRST: Python validates the pattern before consulting
+    // maxsplit, so a bad pattern raises even when no split would occur.
+    let re = compile(pattern.as_ref(), flags)?;
     if maxsplit < 0 {
         return Ok(alloc::vec![text.to_string()]);
     }
-    let re = compile(pattern.as_ref(), flags)?;
     let mut out = Vec::new();
     let mut last = 0usize;
     let mut splits = 0i64;
@@ -300,13 +302,14 @@ where
     R: AsRef<str> + ?Sized,
     S: AsRef<str> + ?Sized,
 {
-    // Python: count 0 (or omitted) replaces everything; a NEGATIVE count
-    // replaces nothing.
+    // Compile and translate FIRST — Python validates both before
+    // consulting count. count 0 (or omitted) replaces everything; a
+    // NEGATIVE count replaces nothing.
+    let re = compile(pattern.as_ref(), flags)?;
+    let repl = translate_replacement(repl.as_ref())?;
     if count < 0 {
         return Ok(string.as_ref().to_string());
     }
-    let re = compile(pattern.as_ref(), flags)?;
-    let repl = translate_replacement(repl.as_ref())?;
     Ok(re
         .replacen(string.as_ref(), count as usize, repl.as_str())
         .into_owned())
