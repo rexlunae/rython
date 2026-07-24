@@ -121,7 +121,7 @@ impl<'a> CodeGen for Call {
             if matches!(
                 bname,
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
-                    | "reversed" | "frozenset"
+                    | "reversed" | "frozenset" | "map" | "filter" | "list"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -310,6 +310,74 @@ impl<'a> CodeGen for Call {
                         }
                         let a = &rendered[0];
                         return Ok(quote!(frozenset(#a)));
+                    }
+                    // map/filter dispatch on the FUNCTION argument's shape:
+                    // lambdas are plain closures, while user-defined
+                    // functions return Result and route through the
+                    // fallible variants so their exceptions propagate.
+                    "map" | "filter" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        let fallible = matches!(self.args.first(), Some(ExprType::Name(f))
+                            if matches!(symbols.get(&f.id), Some(SymbolTableNode::FunctionDef(_))));
+                        if bname == "filter" {
+                            if rendered.len() != 2 {
+                                return Err("filter() takes a function and an iterable"
+                                    .to_string()
+                                    .into());
+                            }
+                            let (f, xs) = (&rendered[0], &rendered[1]);
+                            // filter(None, xs) keeps the truthy elements.
+                            if self
+                                .args
+                                .first()
+                                .is_some_and(crate::is_none_expr)
+                            {
+                                return Ok(quote!(filter_truthy(#xs)));
+                            }
+                            return Ok(if fallible {
+                                quote!(filter_fallible(#f, #xs)?)
+                            } else {
+                                quote!(filter(#f, #xs))
+                            });
+                        }
+                        return match rendered.as_slice() {
+                            [f, xs] => Ok(if fallible {
+                                quote!(map_fallible(#f, #xs)?)
+                            } else {
+                                quote!(map(#f, #xs))
+                            }),
+                            [f, a, b] => {
+                                if fallible {
+                                    return Err(
+                                        "map() over two iterables with a user-defined \
+                                         function is not supported yet; use a lambda"
+                                            .to_string()
+                                            .into(),
+                                    );
+                                }
+                                Ok(quote!(map2(#f, #a, #b)))
+                            }
+                            _ => Err("map() takes a function and 1-2 iterables"
+                                .to_string()
+                                .into()),
+                        };
+                    }
+                    "list" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err(
+                                "list() requires an iterable argument in rython (an \
+                                 empty list has no inferable element type; use [])"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                        let a = &rendered[0];
+                        return Ok(quote!(list(#a)));
                     }
                     _ => unreachable!(),
                 }

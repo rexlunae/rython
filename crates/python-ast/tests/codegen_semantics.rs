@@ -2148,3 +2148,33 @@ fn re_calls_lower_to_borrowing_fallible_paths() {
     let err = compile_err("import re\nm = re.search(r\"a\", \"a\", flags=1)\n", "r6.py");
     assert!(err.contains("unexpected keyword"), "error: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// map/filter/list lowering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn map_filter_dispatch_on_the_function_arguments_shape() {
+    // Lambdas are plain closures.
+    let out = compile("ys = list(map(lambda x: x * 2, [1, 2]))\n", "mf1.py");
+    assert!(out.contains("list (map (| x |"), "generated: {}", out);
+    assert!(!out.contains("map_fallible"), "generated: {}", out);
+
+    // User-defined functions return Result: the fallible variant + `?`.
+    let out = compile(
+        "def double(n: int) -> int:\n    return n * 2\n\nys = list(map(double, [1, 2]))\n",
+        "mf2.py",
+    );
+    assert!(out.contains("map_fallible (double ,"), "generated: {}", out);
+    assert!(out.contains(") ?"), "generated: {}", out);
+
+    let out = compile("ys = filter(lambda x: x > 1, [1, 2, 3])\n", "mf3.py");
+    assert!(out.contains("filter (| x |"), "generated: {}", out);
+    // filter(None, xs) keeps truthy elements.
+    let out = compile("ys = filter(None, [0, 1, 2])\n", "mf4.py");
+    assert!(out.contains("filter_truthy ("), "generated: {}", out);
+
+    // list() with no argument has no inferable type: loud.
+    let err = compile_err("ys = list()\n", "mf5.py");
+    assert!(err.contains("iterable argument"), "error: {}", err);
+}
