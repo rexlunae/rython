@@ -40,6 +40,10 @@ name = "python_semantics"
 required-features = ["std"]
 
 [[test]]
+name = "timestamp_tz"
+required-features = ["std"]
+
+[[test]]
 name = "integration_manual"
 required-features = ["std"]
 
