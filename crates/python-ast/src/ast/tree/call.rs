@@ -1003,6 +1003,13 @@ impl<'a> CodeGen for Call {
                         "search" | "match" | "fullmatch" | "findall" | "finditer",
                         [pat, text, ..],
                     ) => {
+                        if rendered.len() > 3 {
+                            return Err(format!(
+                                "{}() takes at most 3 positional arguments",
+                                fname
+                            )
+                            .into());
+                        }
                         if rendered.len() > 2 && flags_kw.is_some() {
                             return Err(format!(
                                 "{}() got multiple values for argument 'flags'",

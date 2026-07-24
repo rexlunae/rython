@@ -2176,6 +2176,12 @@ fn re_calls_lower_to_borrowing_fallible_paths() {
         "r11.py",
     );
     assert!(out.contains(", 2 , \"i\") ?"), "generated: {}", out);
+    // Surplus positionals are loud, not silently dropped.
+    let err = compile_err(
+        "import re\nm = re.search(r\"a\", \"b\", re.IGNORECASE, 5)\n",
+        "r12.py",
+    );
+    assert!(err.contains("at most 3"), "error: {}", err);
 }
 
 // ---------------------------------------------------------------------------
