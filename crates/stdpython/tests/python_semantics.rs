@@ -1370,7 +1370,7 @@ mod itertools_gaps {
     #[test]
     fn combinations_with_replacement_matches_python() {
         assert_eq!(
-            combinations_with_replacement(&[1i64, 2, 3], 2),
+            combinations_with_replacement(&[1i64, 2, 3], 2).unwrap(),
             vec![
                 vec![1, 1],
                 vec![1, 2],
@@ -1380,11 +1380,18 @@ mod itertools_gaps {
                 vec![3, 3]
             ]
         );
-        assert_eq!(combinations_with_replacement(&[1i64], 0), vec![Vec::<i64>::new()]);
+        assert_eq!(combinations_with_replacement(&[1i64], 0).unwrap(), vec![Vec::<i64>::new()]);
         assert_eq!(
-            combinations_with_replacement(&Vec::<i64>::new(), 2),
+            combinations_with_replacement(&Vec::<i64>::new(), 2).unwrap(),
             Vec::<Vec<i64>>::new()
         );
+        // python3: negative r raises ValueError("r must be non-negative").
+        let e = combinations_with_replacement(&[1i64], -1).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: r must be non-negative");
+        let e = combinations(&[1i64], -1).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: r must be non-negative");
+        let e = permutations(&[1i64], Some(-1)).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: r must be non-negative");
     }
 
     #[test]
@@ -1479,6 +1486,10 @@ mod heapq_module {
         assert_eq!(nsmallest(2, &[5i64, 1, 9, 3, 7]), vec![1, 3]);
         assert_eq!(nlargest(10, &[1i64, 2]), vec![2, 1]);
         assert_eq!(nsmallest(0, &[1i64]), Vec::<i64>::new());
+        // python3: a negative count returns [] — a usize cast would wrap
+        // and return everything (Devin review on #53).
+        assert_eq!(nlargest(-1, &[3i64, 1, 2]), Vec::<i64>::new());
+        assert_eq!(nsmallest(-5, &[3i64, 1, 2]), Vec::<i64>::new());
     }
 }
 

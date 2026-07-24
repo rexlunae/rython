@@ -581,13 +581,14 @@ impl<'a> CodeGen for Call {
                         }
                         let f = format_ident!("{}", name);
                         let (xs, r) = (&rendered[0], &rendered[1]);
-                        return Ok(quote!(#f(&(#xs), (#r) as usize)));
+                        // Negative r raises ValueError, hence the `?`.
+                        return Ok(quote!(#f(&(#xs), #r)?));
                     }
                     "permutations" => {
                         kw_of(&[])?;
                         return match rendered.as_slice() {
-                            [xs] => Ok(quote!(permutations(&(#xs), None))),
-                            [xs, r] => Ok(quote!(permutations(&(#xs), Some((#r) as usize)))),
+                            [xs] => Ok(quote!(permutations(&(#xs), None)?)),
+                            [xs, r] => Ok(quote!(permutations(&(#xs), Some(#r))?)),
                             _ => Err("permutations() takes an iterable and optional r"
                                 .to_string()
                                 .into()),
@@ -746,7 +747,7 @@ impl<'a> CodeGen for Call {
                     }
                     ("nlargest" | "nsmallest", [n_arg, xs]) => {
                         let p = qual(&fname);
-                        Ok(quote!(#p((#n_arg) as usize, &(#xs))))
+                        Ok(quote!(#p(#n_arg, &(#xs))))
                     }
                     ("copy" | "deepcopy", [x]) => {
                         let p = qual(&fname);

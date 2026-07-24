@@ -98,16 +98,18 @@ pub fn heapreplace<T: PartialOrd + Clone>(heap: &mut Vec<T>, item: T) -> Result<
 }
 
 /// heapq.nlargest(n, iterable): equivalent to sorted(iterable,
-/// reverse=True)[:n], which is exactly how it's documented.
-pub fn nlargest<T: PartialOrd + Clone>(n: usize, iterable: &[T]) -> Vec<T> {
+/// reverse=True)[:n], which is exactly how it's documented. The count is
+/// an i64 because Python's is an int: a negative n returns [], where a
+/// usize cast would wrap and return everything.
+pub fn nlargest<T: PartialOrd + Clone>(n: i64, iterable: &[T]) -> Vec<T> {
     let mut sorted = crate::sorted_reverse(iterable, true);
-    sorted.truncate(n);
+    sorted.truncate(n.max(0) as usize);
     sorted
 }
 
 /// heapq.nsmallest(n, iterable): equivalent to sorted(iterable)[:n].
-pub fn nsmallest<T: PartialOrd + Clone>(n: usize, iterable: &[T]) -> Vec<T> {
+pub fn nsmallest<T: PartialOrd + Clone>(n: i64, iterable: &[T]) -> Vec<T> {
     let mut sorted = crate::sorted(iterable);
-    sorted.truncate(n);
+    sorted.truncate(n.max(0) as usize);
     sorted
 }
