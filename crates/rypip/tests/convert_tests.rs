@@ -1639,3 +1639,70 @@ fn re_module_matches_python_at_runtime() {
         "re semantics diverged from CPython"
     );
 }
+
+#[test]
+fn map_filter_list_match_python_at_runtime() {
+    // map (lambda, two-iterable, and user-function forms), filter
+    // (predicate and None), and the list() builtin over lists, strings,
+    // and ranges, through generated code.
+    let scratch = Scratch::new("mapfilter");
+    let file = scratch.path().join("mf_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "def double(n: int) -> int:\n",
+            "    return n * 2\n",
+            "\n",
+            "def main() -> int:\n",
+            "    doubled = list(map(lambda x: x * 2, [1, 2, 3]))\n",
+            "    print(f\"doubled={repr(doubled)}\")\n",
+            "    summed = list(map(lambda a, b: a + b, [1, 2], [10, 20, 30]))\n",
+            "    print(f\"summed={repr(summed)}\")\n",
+            "    via_def = list(map(double, [4, 5]))\n",
+            "    print(f\"via_def={repr(via_def)}\")\n",
+            "    big = list(filter(lambda x: x > 1, [1, 2, 3]))\n",
+            "    print(f\"big={repr(big)}\")\n",
+            "    truthy = list(filter(None, [0, 3, 0, 5]))\n",
+            "    print(f\"truthy={repr(truthy)}\")\n",
+            "    chars = list(\"abc\")\n",
+            "    print(f\"chars={repr(chars)}\")\n",
+            "    nums = list(range(4))\n",
+            "    print(f\"nums={repr(nums)}\")\n",
+            "    for v in map(lambda x: x + 100, [7, 8]):\n",
+            "        print(f\"v={v}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/mf_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "doubled=[2, 4, 6]",
+            "summed=[11, 22]",
+            "via_def=[8, 10]",
+            "big=[2, 3]",
+            "truthy=[3, 5]",
+            "chars=['a', 'b', 'c']",
+            "nums=[0, 1, 2, 3]",
+            "v=107",
+            "v=108",
+        ],
+        "map/filter/list semantics diverged from CPython"
+    );
+}

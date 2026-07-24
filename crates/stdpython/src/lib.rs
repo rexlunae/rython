@@ -862,6 +862,96 @@ pub fn enumerate_start<T>(iterable: Vec<T>, start: i64) -> Vec<(i64, T)> {
         .collect()
 }
 
+/// Python map(f, iterable), materialized. This form takes an infallible
+/// function (a lambda); calls through user-defined functions — which
+/// return Result — lower to map_fallible.
+pub fn map<T, U, F: FnMut(T) -> U>(f: F, iterable: Vec<T>) -> Vec<U> {
+    iterable.into_iter().map(f).collect()
+}
+
+/// map(f, iterable) where f can raise: the first exception propagates,
+/// exactly like Python's lazy map surfacing the error at iteration.
+pub fn map_fallible<T, U, F: FnMut(T) -> Result<U, PyException>>(
+    f: F,
+    iterable: Vec<T>,
+) -> Result<Vec<U>, PyException> {
+    iterable.into_iter().map(f).collect()
+}
+
+/// Python map(f, a, b): pairs up to the shortest, like zip.
+pub fn map2<A, B, U, F: FnMut(A, B) -> U>(mut f: F, a: Vec<A>, b: Vec<B>) -> Vec<U> {
+    a.into_iter()
+        .zip(b)
+        .map(|(x, y)| f(x, y))
+        .collect()
+}
+
+/// Python filter(f, iterable), materialized. The predicate receives each
+/// element by value (cloned), so lambda bodies compare naturally.
+pub fn filter<T: Clone, F: FnMut(T) -> bool>(mut f: F, iterable: Vec<T>) -> Vec<T> {
+    iterable.into_iter().filter(|x| f(x.clone())).collect()
+}
+
+/// filter(f, iterable) where the predicate can raise.
+pub fn filter_fallible<T: Clone, F: FnMut(T) -> Result<bool, PyException>>(
+    mut f: F,
+    iterable: Vec<T>,
+) -> Result<Vec<T>, PyException> {
+    let mut out = Vec::new();
+    for x in iterable {
+        if f(x.clone())? {
+            out.push(x);
+        }
+    }
+    Ok(out)
+}
+
+/// Python filter(None, iterable): keep the truthy elements.
+pub fn filter_truthy<T: Truthy>(iterable: Vec<T>) -> Vec<T> {
+    iterable.into_iter().filter(Truthy::is_truthy).collect()
+}
+
+/// What Python's list() builtin accepts: already-material sequences pass
+/// through, strings explode into their characters (as one-char strings,
+/// like Python), ranges materialize.
+pub trait PyListFrom {
+    type Item;
+    fn py_list(self) -> Vec<Self::Item>;
+}
+
+impl<T> PyListFrom for Vec<T> {
+    type Item = T;
+    fn py_list(self) -> Vec<T> {
+        self
+    }
+}
+
+impl PyListFrom for &str {
+    type Item = String;
+    fn py_list(self) -> Vec<String> {
+        self.chars().map(|c| c.to_string()).collect()
+    }
+}
+
+impl PyListFrom for String {
+    type Item = String;
+    fn py_list(self) -> Vec<String> {
+        self.as_str().py_list()
+    }
+}
+
+impl PyListFrom for PyRange {
+    type Item = i64;
+    fn py_list(self) -> Vec<i64> {
+        self.collect()
+    }
+}
+
+/// Python list() builtin.
+pub fn list<L: PyListFrom>(x: L) -> Vec<L::Item> {
+    x.py_list()
+}
+
 /// Python zip() function - combines multiple iterables
 pub fn zip<T, U>(iter1: Vec<T>, iter2: Vec<U>) -> Vec<(T, U)> {
     iter1.into_iter().zip(iter2.into_iter()).collect()

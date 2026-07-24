@@ -1655,3 +1655,50 @@ mod re_module {
         let _ = m.group(2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// map/filter/list builtins (issue #19). Pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod map_filter_list {
+    use stdpython::*;
+
+    #[test]
+    fn map_and_filter_match_python() {
+        assert_eq!(map(|x: i64| x * 2, vec![1, 2, 3]), vec![2, 4, 6]);
+        // Two iterables pair up to the shortest, like zip.
+        assert_eq!(
+            map2(|a: i64, b: i64| a + b, vec![1, 2], vec![10, 20, 30]),
+            vec![11, 22]
+        );
+        assert_eq!(filter(|x: i64| x > 1, vec![1, 2, 3]), vec![2, 3]);
+        assert_eq!(filter_truthy(vec![0i64, 3, 0, 5]), vec![3, 5]);
+
+        // The fallible forms propagate the first exception.
+        let ok = map_fallible(|x: i64| Ok(x + 1), vec![1, 2]).unwrap();
+        assert_eq!(ok, vec![2, 3]);
+        let err = map_fallible(
+            |x: i64| {
+                if x == 2 {
+                    Err(value_error("bad"))
+                } else {
+                    Ok(x)
+                }
+            },
+            vec![1, 2, 3],
+        )
+        .unwrap_err();
+        assert_eq!(format!("{}", err), "ValueError: bad");
+        let kept =
+            filter_fallible(|x: i64| Ok(x % 2 == 0), vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(kept, vec![2, 4]);
+    }
+
+    #[test]
+    fn list_builtin_follows_pythons_shapes() {
+        assert_eq!(list(vec![1i64, 2]), vec![1, 2]);
+        // list("ab") explodes into one-character strings.
+        assert_eq!(list("ab"), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(list(range(3)), vec![0i64, 1, 2]);
+    }
+}
