@@ -197,6 +197,39 @@ impl CodeGen for FunctionDef {
             options.clone_str_attribute_returns =
                 matches!(self.returns.as_deref(), Some(ExprType::Name(n)) if n.id == "str");
         }
+        // Statically-known local types for isinstance(): parameter
+        // annotations plus literal assignments, as Python type names.
+        {
+            let mut known: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for param in self
+                .args
+                .args
+                .iter()
+                .chain(self.args.posonlyargs.iter())
+                .chain(self.args.kwonlyargs.iter())
+            {
+                if let Some(ExprType::Name(ann)) = param.annotation.as_deref() {
+                    if matches!(ann.id.as_str(), "int" | "float" | "str" | "bool") {
+                        known.insert(param.arg.clone(), ann.id.clone());
+                    }
+                }
+            }
+            let mut literal_types = std::collections::HashMap::new();
+            collect_local_types(&self.body, &mut literal_types);
+            for (name, ty) in literal_types {
+                let py = match ty.to_string().as_str() {
+                    "i64" => "int",
+                    "f64" => "float",
+                    "bool" => "bool",
+                    s if s.contains("str") || s.contains("String") => "str",
+                    _ => continue,
+                };
+                // A literal assignment overrides nothing: annotations win.
+                known.entry(name).or_insert_with(|| py.to_string());
+            }
+            options.local_types = std::rc::Rc::new(known);
+        }
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self

@@ -1369,6 +1369,187 @@ pub fn repr<T: PyRepr + ?Sized>(x: &T) -> String {
     x.py_repr()
 }
 
+// ============================================================================
+// hash(): CPython's algorithms with PYTHONHASHSEED=0
+// ============================================================================
+
+/// The modulus for numeric hashes: 2^61 - 1 (sys.hash_info.modulus).
+const PY_HASH_MODULUS: u64 = (1 << 61) - 1;
+
+/// Python's hash() with hash randomization DISABLED (PYTHONHASHSEED=0):
+/// deterministic and verifiable against `PYTHONHASHSEED=0 python3`. A
+/// randomized CPython session produces different string hashes — that is
+/// the documented divergence of choosing determinism.
+pub trait PyHash {
+    fn py_hash(&self) -> i64;
+}
+
+fn fixup_minus_one(h: i64) -> i64 {
+    // -1 is CPython's internal error marker, so no object hashes to it.
+    if h == -1 { -2 } else { h }
+}
+
+impl PyHash for i64 {
+    fn py_hash(&self) -> i64 {
+        let n = *self;
+        let m = PY_HASH_MODULUS as i128;
+        let r = (n as i128).rem_euclid(m);
+        let h = if n < 0 && r != 0 { r - m } else { r } as i64;
+        fixup_minus_one(h)
+    }
+}
+
+impl PyHash for bool {
+    fn py_hash(&self) -> i64 {
+        if *self { 1 } else { 0 }
+    }
+}
+
+impl PyHash for f64 {
+    /// CPython's _Py_HashDouble: 28 bits at a time, modular in 2^61-1.
+    fn py_hash(&self) -> i64 {
+        let v = *self;
+        if v.is_nan() {
+            // Python 3.10+ hashes NaN by object identity — inherently
+            // nondeterministic, so it fails loudly here.
+            panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    "hash(nan) is identity-based in Python and cannot be \
+                     reproduced deterministically",
+                )
+            );
+        }
+        if v.is_infinite() {
+            return if v > 0.0 { 314159 } else { -314159 };
+        }
+        let sign = if v < 0.0 { -1i64 } else { 1i64 };
+        let mut m = flt::abs(v);
+        // frexp: m in [0.5, 1), v = m * 2^e.
+        let mut e = 0i32;
+        if m != 0.0 {
+            while m >= 1.0 {
+                m /= 2.0;
+                e += 1;
+            }
+            while m < 0.5 {
+                m *= 2.0;
+                e -= 1;
+            }
+        }
+        let p = PY_HASH_MODULUS;
+        let mut x: u64 = 0;
+        while m != 0.0 {
+            x = ((x << 28) & p) | (x >> (61 - 28));
+            m *= 268435456.0; // 2^28
+            e -= 28;
+            let y = m as u64;
+            m -= y as f64;
+            x += y;
+            if x >= p {
+                x -= p;
+            }
+        }
+        let e = if e >= 0 { e % 61 } else { 61 - 1 - ((-1 - e) % 61) } as u32;
+        x = ((x << e) & p) | (x >> (61 - e));
+        fixup_minus_one(x as i64 * sign)
+    }
+}
+
+/// siphash13 with a zero key — CPython's string hash under
+/// PYTHONHASHSEED=0 (sys.hash_info.algorithm == "siphash13").
+fn siphash13(data: &[u8]) -> u64 {
+    fn rotl(x: u64, b: u32) -> u64 {
+        x.rotate_left(b)
+    }
+    let (k0, k1) = (0u64, 0u64);
+    let mut v0 = 0x736f6d6570736575u64 ^ k0;
+    let mut v1 = 0x646f72616e646f6du64 ^ k1;
+    let mut v2 = 0x6c7967656e657261u64 ^ k0;
+    let mut v3 = 0x7465646279746573u64 ^ k1;
+    let b: u64 = (data.len() as u64) << 56;
+
+    let round = |v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64| {
+        *v0 = v0.wrapping_add(*v1);
+        *v1 = rotl(*v1, 13);
+        *v1 ^= *v0;
+        *v0 = rotl(*v0, 32);
+        *v2 = v2.wrapping_add(*v3);
+        *v3 = rotl(*v3, 16);
+        *v3 ^= *v2;
+        *v0 = v0.wrapping_add(*v3);
+        *v3 = rotl(*v3, 21);
+        *v3 ^= *v0;
+        *v2 = v2.wrapping_add(*v1);
+        *v1 = rotl(*v1, 17);
+        *v1 ^= *v2;
+        *v2 = rotl(*v2, 32);
+    };
+
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mi = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        v3 ^= mi;
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= mi;
+    }
+    let mut t: u64 = 0;
+    let rest = chunks.remainder();
+    for (i, byte) in rest.iter().enumerate() {
+        t |= (*byte as u64) << (8 * i);
+    }
+    let b = b | t;
+    v3 ^= b;
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= b;
+    v2 ^= 0xff;
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    (v0 ^ v1) ^ (v2 ^ v3)
+}
+
+impl PyHash for str {
+    fn py_hash(&self) -> i64 {
+        if self.is_empty() {
+            return 0;
+        }
+        // CPython hashes the string's INTERNAL representation, which is
+        // the narrowest of Latin-1 / UCS-2 / UCS-4 that fits — not UTF-8.
+        let max = self.chars().map(|c| c as u32).max().unwrap_or(0);
+        let bytes: Vec<u8> = if max < 0x100 {
+            self.chars().map(|c| c as u8).collect()
+        } else if max < 0x10000 {
+            self.chars()
+                .flat_map(|c| (c as u16).to_le_bytes())
+                .collect()
+        } else {
+            self.chars()
+                .flat_map(|c| (c as u32).to_le_bytes())
+                .collect()
+        };
+        fixup_minus_one(siphash13(&bytes) as i64)
+    }
+}
+
+impl PyHash for String {
+    fn py_hash(&self) -> i64 {
+        self.as_str().py_hash()
+    }
+}
+
+impl<T: PyHash + ?Sized> PyHash for &T {
+    fn py_hash(&self) -> i64 {
+        (**self).py_hash()
+    }
+}
+
+/// Python hash() builtin (PYTHONHASHSEED=0 semantics).
+pub fn hash<T: PyHash + ?Sized>(x: &T) -> i64 {
+    x.py_hash()
+}
+
 impl PyToString for bool {
     fn py_str(self) -> String {
         if self { "True".to_string() } else { "False".to_string() }

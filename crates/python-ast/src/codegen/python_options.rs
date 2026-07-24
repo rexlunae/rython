@@ -108,6 +108,13 @@ pub struct PythonOptions {
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
 
+    /// Statically-known types of names in the CURRENT scope (parameter
+    /// annotations and literal assignments), as canonical Python type
+    /// names ("int", "float", "str", "bool"). Set per function; consumed
+    /// by isinstance(), which lowers to a constant.
+    pub local_types:
+        std::rc::Rc<std::collections::HashMap<String, String>>,
+
     /// Target stdpython's no_std (alloc) tier. Python constructs that need
     /// the OS — print/input/open, imports of os/datetime/random/…, and
     /// `__main__` entry points — fail loudly at conversion time instead of
@@ -134,6 +141,7 @@ impl Default for PythonOptions {
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
+            local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
         }
     }

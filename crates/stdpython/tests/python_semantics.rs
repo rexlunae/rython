@@ -1814,3 +1814,52 @@ mod textwrap_wrap {
         assert_eq!(format!("{}", e), "ValueError: invalid width -3 (must be > 0)");
     }
 }
+
+// ---------------------------------------------------------------------------
+// hash() with PYTHONHASHSEED=0 semantics (issue #19). All values pinned
+// against `PYTHONHASHSEED=0 python3`.
+// ---------------------------------------------------------------------------
+
+mod hash_builtin {
+    use stdpython::*;
+
+    #[test]
+    fn int_and_bool_hashes_match_python() {
+        assert_eq!(hash(&0i64), 0);
+        assert_eq!(hash(&1i64), 1);
+        // -1 is CPython's error marker: hash(-1) is -2.
+        assert_eq!(hash(&-1i64), -2);
+        assert_eq!(hash(&-2i64), -2);
+        assert_eq!(hash(&((1i64 << 61) - 1)), 0);
+        assert_eq!(hash(&(1i64 << 61)), 1);
+        assert_eq!(hash(&true), 1);
+        assert_eq!(hash(&false), 0);
+    }
+
+    #[test]
+    fn string_hashes_match_pythons_zero_seed_siphash13() {
+        assert_eq!(hash(""), 0);
+        assert_eq!(hash("a"), 4644417185603328019);
+        assert_eq!(hash("hello"), -2096571579003691106);
+        assert_eq!(hash("café"), 137524001917817222);
+        // UCS-2 and UCS-4 internal representations.
+        assert_eq!(hash("日本"), 6243316497235261705);
+        assert_eq!(hash("𝄞clef"), 456820485802690608);
+    }
+
+    #[test]
+    fn float_hashes_match_python() {
+        assert_eq!(hash(&1.5f64), 1152921504606846977);
+        assert_eq!(hash(&0.5f64), 1152921504606846976);
+        assert_eq!(hash(&2.0f64), 2);
+        assert_eq!(hash(&-1.5f64), -1152921504606846977);
+        assert_eq!(hash(&f64::INFINITY), 314159);
+        assert_eq!(hash(&f64::NEG_INFINITY), -314159);
+    }
+
+    #[test]
+    #[should_panic(expected = "hash(nan)")]
+    fn nan_hash_fails_loudly() {
+        let _ = hash(&f64::NAN);
+    }
+}
