@@ -148,7 +148,15 @@ impl PyMatchOps for Option<PyMatch> {
     }
 }
 
-fn compile(pattern: &str) -> Result<regex::Regex, PyException> {
+/// Compile with Python flag letters ("i", "m", "s") applied as an
+/// inline group, which the regex crate shares with Python's syntax.
+fn compile(pattern: &str, flags: &str) -> Result<regex::Regex, PyException> {
+    let pattern = if flags.is_empty() {
+        alloc::borrow::Cow::Borrowed(pattern)
+    } else {
+        alloc::borrow::Cow::Owned(format!("(?{}){}", flags, pattern))
+    };
+    let pattern: &str = &pattern;
     regex::Regex::new(pattern).map_err(|e| {
         PyException::new(
             "re.error",
@@ -165,8 +173,9 @@ fn compile(pattern: &str) -> Result<regex::Regex, PyException> {
 pub fn search<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
+    flags: &str,
 ) -> Result<Option<PyMatch>, PyException> {
-    let re = compile(pattern.as_ref())?;
+    let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
     Ok(re.captures(text).map(|caps| make_match(text, &caps)))
 }
@@ -175,8 +184,9 @@ pub fn search<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 pub fn r#match<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
+    flags: &str,
 ) -> Result<Option<PyMatch>, PyException> {
-    let re = compile(&format!(r"\A(?:{})", pattern.as_ref()))?;
+    let re = compile(&format!(r"\A(?:{})", pattern.as_ref()), flags)?;
     let text = string.as_ref();
     Ok(re.captures(text).map(|caps| make_match(text, &caps)))
 }
@@ -185,8 +195,9 @@ pub fn r#match<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 pub fn fullmatch<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
+    flags: &str,
 ) -> Result<Option<PyMatch>, PyException> {
-    let re = compile(&format!(r"\A(?:{})\z", pattern.as_ref()))?;
+    let re = compile(&format!(r"\A(?:{})\z", pattern.as_ref()), flags)?;
     let text = string.as_ref();
     Ok(re.captures(text).map(|caps| make_match(text, &caps)))
 }
@@ -198,8 +209,9 @@ pub fn fullmatch<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
+    flags: &str,
 ) -> Result<Vec<String>, PyException> {
-    let re = compile(pattern.as_ref())?;
+    let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
     match re.captures_len() {
         1 => Ok(re
@@ -233,8 +245,9 @@ pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
+    flags: &str,
 ) -> Result<Vec<String>, PyException> {
-    let re = compile(pattern.as_ref())?;
+    let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
     if re.captures_len() == 1 {
         return Ok(re.split(text).map(|s| s.to_string()).collect());
@@ -268,17 +281,43 @@ pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 
 /// re.sub(pattern, repl, string), with Python backreference syntax in the
 /// replacement (\1, \g<name>) translated to the regex crate's.
-pub fn sub<P, R, S>(pattern: &P, repl: &R, string: &S) -> Result<String, PyException>
+pub fn sub<P, R, S>(
+    pattern: &P,
+    repl: &R,
+    string: &S,
+    count: i64,
+    flags: &str,
+) -> Result<String, PyException>
 where
     P: AsRef<str> + ?Sized,
     R: AsRef<str> + ?Sized,
     S: AsRef<str> + ?Sized,
 {
-    let re = compile(pattern.as_ref())?;
+    // Python: count 0 (or omitted) replaces everything; a NEGATIVE count
+    // replaces nothing.
+    if count < 0 {
+        return Ok(string.as_ref().to_string());
+    }
+    let re = compile(pattern.as_ref(), flags)?;
     let repl = translate_replacement(repl.as_ref())?;
     Ok(re
-        .replace_all(string.as_ref(), repl.as_str())
+        .replacen(string.as_ref(), count as usize, repl.as_str())
         .into_owned())
+}
+
+/// re.finditer(pattern, string), materialized: each element is a full
+/// Match object (group/groups/start/end/span).
+pub fn finditer<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
+    pattern: &P,
+    string: &S,
+    flags: &str,
+) -> Result<Vec<PyMatch>, PyException> {
+    let re = compile(pattern.as_ref(), flags)?;
+    let text = string.as_ref();
+    Ok(re
+        .captures_iter(text)
+        .map(|caps| make_match(text, &caps))
+        .collect())
 }
 
 /// Python replacement syntax -> regex crate syntax: \1 -> ${1},

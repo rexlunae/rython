@@ -791,6 +791,7 @@ impl<'a> CodeGen for Call {
                         | "match"
                         | "fullmatch"
                         | "findall"
+                        | "finditer"
                         | "sub"
                         | "split"
                         | "md5"
@@ -802,22 +803,83 @@ impl<'a> CodeGen for Call {
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
-                // wrap/fill accept width= (only); everything else takes
-                // no keywords.
+                // wrap/fill accept width=, the re functions accept
+                // flags= (and sub also count=); everything else takes no
+                // keywords.
+                let is_re_fn = matches!(
+                    fname.as_str(),
+                    "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub"
+                        | "split"
+                );
                 let mut width_kw: Option<crate::ExprType> = None;
+                let mut flags_kw: Option<crate::ExprType> = None;
+                let mut count_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
-                    let allowed = matches!(fname.as_str(), "wrap" | "fill")
-                        && kw.arg.as_deref() == Some("width")
-                        && width_kw.is_none();
-                    if allowed {
-                        width_kw = Some(kw.value.clone());
-                    } else {
+                    let slot = match kw.arg.as_deref() {
+                        Some("width")
+                            if matches!(fname.as_str(), "wrap" | "fill") =>
+                        {
+                            &mut width_kw
+                        }
+                        Some("flags") if is_re_fn => &mut flags_kw,
+                        Some("count") if fname == "sub" => &mut count_kw,
+                        _ => {
+                            return Err(format!(
+                                "{}() got an unexpected keyword argument '{}'",
+                                fname,
+                                kw.arg.as_deref().unwrap_or("**kwargs")
+                            )
+                            .into());
+                        }
+                    };
+                    if slot.is_some() {
                         return Err(format!(
-                            "{}() got an unexpected keyword argument '{}'",
-                            fname,
-                            kw.arg.as_deref().unwrap_or("**kwargs")
+                            "{}() got multiple values for a keyword argument",
+                            fname
                         )
                         .into());
+                    }
+                    *slot = Some(kw.value.clone());
+                }
+                // Python re flags lower to inline flag letters: single
+                // constants or |-combinations of re.IGNORECASE/I,
+                // re.MULTILINE/M, re.DOTALL/S. Anything else is loud.
+                fn flag_letters(
+                    e: &crate::ExprType,
+                ) -> Result<String, Box<dyn std::error::Error>> {
+                    let name_of = |id: &str| -> Result<String, Box<dyn std::error::Error>> {
+                        match id {
+                            "IGNORECASE" | "I" => Ok("i".to_string()),
+                            "MULTILINE" | "M" => Ok("m".to_string()),
+                            "DOTALL" | "S" => Ok("s".to_string()),
+                            other => Err(format!(
+                                "unsupported re flag `{}`; supported: IGNORECASE,                                  MULTILINE, DOTALL (and | combinations)",
+                                other
+                            )
+                            .into()),
+                        }
+                    };
+                    match e {
+                        ExprType::Attribute(a)
+                            if matches!(a.value.as_ref(), ExprType::Name(m) if m.id == "re") =>
+                        {
+                            name_of(&a.attr)
+                        }
+                        ExprType::Name(n) => name_of(&n.id),
+                        ExprType::BinOp(b)
+                            if matches!(b.op, crate::ast::tree::bin_ops::BinOps::BitOr) =>
+                        {
+                            Ok(format!(
+                                "{}{}",
+                                flag_letters(&b.left)?,
+                                flag_letters(&b.right)?
+                            ))
+                        }
+                        other => Err(format!(
+                            "unsupported re flags expression `{:?}`; use re.IGNORECASE,                              re.MULTILINE, re.DOTALL, or | combinations of them",
+                            other
+                        )
+                        .into()),
                     }
                 }
                 let mut rendered = Vec::new();
@@ -935,13 +997,59 @@ impl<'a> CodeGen for Call {
                         };
                         Ok(quote!(#p(&(#t), #width)?))
                     }
-                    ("search" | "match" | "fullmatch" | "findall" | "split", [pat, text]) => {
+                    (
+                        "search" | "match" | "fullmatch" | "findall" | "finditer"
+                            | "split",
+                        [pat, text, ..],
+                    ) => {
+                        if rendered.len() > 2 && flags_kw.is_some() {
+                            return Err(format!(
+                                "{}() got multiple values for argument 'flags'",
+                                fname
+                            )
+                            .into());
+                        }
+                        let flags = match (self.args.get(2), flags_kw) {
+                            (Some(e), None) => flag_letters(e)?,
+                            (None, Some(e)) => flag_letters(&e)?,
+                            (None, None) => String::new(),
+                            _ => unreachable!(),
+                        };
                         let p = qual(&fname);
-                        Ok(quote!(#p(&(#pat), &(#text))?))
+                        Ok(quote!(#p(&(#pat), &(#text), #flags)?))
                     }
-                    ("sub", [pat, repl, text]) => {
+                    ("sub", [pat, repl, text, ..]) => {
+                        if rendered.len() > 4 {
+                            return Err("sub() takes at most 4 positional arguments"
+                                .to_string()
+                                .into());
+                        }
+                        if rendered.len() > 3 && count_kw.is_some() {
+                            return Err(
+                                "sub() got multiple values for argument 'count'"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                        let count = match (rendered.get(3), count_kw) {
+                            (Some(c), None) => quote!(#c),
+                            (None, Some(c)) => {
+                                let c = c.to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                quote!(#c)
+                            }
+                            (None, None) => quote!(0),
+                            _ => unreachable!(),
+                        };
+                        let flags = match flags_kw {
+                            Some(e) => flag_letters(&e)?,
+                            None => String::new(),
+                        };
                         let p = qual("sub");
-                        Ok(quote!(#p(&(#pat), &(#repl), &(#text))?))
+                        Ok(quote!(#p(&(#pat), &(#repl), &(#text), #count, #flags)?))
                     }
                     // hashlib constructors: with initial data, or the
                     // empty + update() idiom.
