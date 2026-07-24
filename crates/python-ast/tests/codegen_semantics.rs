@@ -2096,4 +2096,16 @@ fn mutating_methods_on_subscripted_receivers_use_the_place_lowering() {
     // Read-only methods keep the Load lowering.
     let out = compile("xs = [[1]]\nn = xs[0].count(1)\n", "sub2.py");
     assert!(!out.contains("py_index_mut"), "generated: {}", out);
+
+    // The heapq mutators' heap argument is a place too: heappush(rows[i], v)
+    // through the Load path would push into a clone.
+    let out = compile(
+        "from heapq import heappush\nrows = [[1], [2]]\nheappush(rows[0], 5)\n",
+        "sub3.py",
+    );
+    assert!(
+        out.contains("heappush ((rows) . py_index_mut (0) ? , 5)"),
+        "generated: {}",
+        out
+    );
 }

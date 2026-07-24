@@ -674,6 +674,33 @@ impl<'a> CodeGen for Call {
                         symbols.clone(),
                     )?);
                 }
+                // The heap mutators take their first argument by &mut, so
+                // it must be lowered as a PLACE: `heappush(rows[i], v)`
+                // through the Load path would clone the element and the
+                // push would silently vanish (the same clone-mutation bug
+                // fixed for mutating methods on subscripted receivers).
+                // rendered[0] becomes the full mutable-borrow expression:
+                // py_index_mut already yields &mut for subscripts, names
+                // take a fresh &mut.
+                let heap_mutator = matches!(
+                    fname.as_str(),
+                    "heappush" | "heappop" | "heapify" | "heappushpop" | "heapreplace"
+                );
+                if heap_mutator {
+                    if let Some(first) = self.args.first() {
+                        rendered[0] = if matches!(first, ExprType::Subscript(_)) {
+                            crate::ast::tree::subscript::subscript_receiver_place(
+                                first,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?
+                        } else {
+                            let v = &rendered[0];
+                            quote!(&mut (#v))
+                        };
+                    }
+                }
                 let qual = |name: &str| {
                     let f = format_ident!("{}", name);
                     match module_prefix {
@@ -699,23 +726,23 @@ impl<'a> CodeGen for Call {
                     ("reduce", _) => Err(arity("2 or 3")),
                     ("heappush", [h, x]) => {
                         let p = qual("heappush");
-                        Ok(quote!(#p(&mut (#h), #x)))
+                        Ok(quote!(#p(#h, #x)))
                     }
                     ("heappop", [h]) => {
                         let p = qual("heappop");
-                        Ok(quote!(#p(&mut (#h))?))
+                        Ok(quote!(#p(#h)?))
                     }
                     ("heapify", [h]) => {
                         let p = qual("heapify");
-                        Ok(quote!(#p(&mut (#h))))
+                        Ok(quote!(#p(#h)))
                     }
                     ("heappushpop", [h, x]) => {
                         let p = qual("heappushpop");
-                        Ok(quote!(#p(&mut (#h), #x)))
+                        Ok(quote!(#p(#h, #x)))
                     }
                     ("heapreplace", [h, x]) => {
                         let p = qual("heapreplace");
-                        Ok(quote!(#p(&mut (#h), #x)?))
+                        Ok(quote!(#p(#h, #x)?))
                     }
                     ("nlargest" | "nsmallest", [n_arg, xs]) => {
                         let p = qual(&fname);
