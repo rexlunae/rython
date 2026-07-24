@@ -82,15 +82,20 @@ a message saying exactly what isn't supported. Nothing silently diverges.
 What works today (all CPython-verified): functions with type annotations,
 classes (struct-based), control flow including `try`/`except`/`finally` and
 loop `else`, comprehensions, f-strings and `str.format` on literal
-templates, keyword arguments and defaults for user functions, the core
-builtins (`print`, `len`, `range`, `sorted`, `min`/`max`, `enumerate`,
+templates, keyword arguments and defaults for user functions (plus
+keyword `replace()` on the datetime family), the core builtins (`print`,
+`len`, `range`, `open`, `sorted`, `min`/`max`, `enumerate`,
 `map`/`filter`, `zip`, `sum`, `pow`, `repr`, `hash`, `isinstance` on
-annotated locals, …), string/list/dict/set methods, and a growing stdlib:
-`math`, `random`, `os`, `sys`, `json`, `re` (incl. flags, named groups,
-findall tuples), `datetime`/`time` (incl. `strptime`), `itertools`,
-`functools.reduce`, `heapq`, `copy`, `textwrap`, `hashlib`,
-`csv.reader`, `collections`, `pathlib`, `glob`, `subprocess`,
-`tempfile`, and more.
+annotated locals, …), string/list/dict/set methods, file objects (disk
+handles and `io.StringIO` behind one surface, including `with open(...)
+as f:`), `functools.partial` over statically-known functions,
+`@functools.lru_cache`/`@cache` with CPython's exact LRU discipline,
+conversion-time `argparse` (typed namespace, byte-identical help and
+error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
+`json`, `re` (incl. flags, named groups, findall tuples),
+`datetime`/`time` (incl. `strptime`), `itertools`, `functools.reduce`,
+`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
+`collections`, `pathlib`, `glob`, `subprocess`, `tempfile`, and more.
 
 Known gaps:
 
@@ -98,18 +103,23 @@ Known gaps:
   supported; overflow panics rather than growing.
 - **Dynamic typing**: variables keep one type; heterogeneous lists and
   reassigning a name to a different type don't convert.
-- **Language features**: decorators, generators/`yield`, `async`/`await`,
+- **Language features**: generators/`yield`, `async`/`await`,
   `eval`/`exec`, `*args`/`**kwargs`, multiple inheritance and dunder
-  protocols are not supported yet.
-- **File objects**: `open()` covers direct forms only; there is no shared
-  file-object model yet, so `io`, `csv.writer`, and file-based `json`
-  calls are pending it ([#65](https://github.com/rexlunae/rython/issues/65),
-  [#66](https://github.com/rexlunae/rython/issues/66)).
-- **Keyword arguments on runtime-type methods** (e.g.
-  `dt.replace(hour=1)`) need signature knowledge in the converter
-  ([#69](https://github.com/rexlunae/rython/issues/69)); common cases like
-  `sort(key=…)`, `split(maxsplit=…)`, and the `re` functions are
-  special-cased already.
+  protocols are not supported yet. Decorators other than
+  `functools.lru_cache`/`cache` are a loud conversion error (never
+  silently ignored).
+- **`lru_cache` keys** must be `int`/`bool`/`str`-annotated parameters
+  — floats are not hashable in Rust, so Python's float-key caching is
+  refused rather than approximated.
+- **File objects** cover text modes (`r`/`w`/`a`) and `io.StringIO`;
+  binary modes, `BytesIO`, `seek`/`tell`, and file-based `json`
+  (`dump`/`load`) are not supported yet.
+- **`argparse`** supports literal specs only (the parser is evaluated at
+  conversion time): `str`/`int`/`float` positionals, `--long` options
+  with `default=`, `store_true`, `help=`, `prog=`, `description=`.
+  `nargs`, `choices`, subcommands, and short options are loud errors.
+- **`csv.writer`** implements the default excel dialect; other dialects
+  and `QUOTE_ALL`-style options are not supported yet.
 - **`re`** is backed by the `regex` crate: backreferences and lookarounds
   are a loud `re.error`; `findall` supports up to 3 capture groups.
 - **Typed-lowering edges**: places where Python produces `None` inside a
@@ -119,21 +129,17 @@ Known gaps:
 
 ## Roadmap
 
-Near term (tracked issues):
+The previously tracked stdlib/feature backlog ([#19](https://github.com/rexlunae/rython/issues/19),
+[#65](https://github.com/rexlunae/rython/issues/65)–[#69](https://github.com/rexlunae/rython/issues/69))
+is complete. What's ahead:
 
-- `csv.writer` file-object surface — [#65](https://github.com/rexlunae/rython/issues/65)
-- Minimal file-object model (`io.StringIO`, shared `open()` handles) — [#66](https://github.com/rexlunae/rython/issues/66)
-- `argparse` — [#67](https://github.com/rexlunae/rython/issues/67)
-- `functools.partial` (statically-known functions) and `lru_cache` — [#68](https://github.com/rexlunae/rython/issues/68)
-- Signature-aware keyword arguments for runtime-type methods — [#69](https://github.com/rexlunae/rython/issues/69)
-
-Further out:
-
-- Decorator support in the compiler (unblocks `lru_cache`, `dataclasses`)
+- Generalized decorator support (unblocks `dataclasses`, `property`,
+  user-defined wrappers)
 - Generators and `yield` (likely as iterator-struct lowering)
 - Richer class model: inheritance, common dunder protocols
 - An arbitrary-precision integer strategy (opt-in bigint tier)
 - Broader `isinstance`/type-narrowing via real type inference
+- Binary file modes and `io.BytesIO`; file-based `json`
 - Continued stdlib expansion, always CPython-pinned with loud boundaries
 
 ## Publishing
