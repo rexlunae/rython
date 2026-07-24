@@ -912,10 +912,28 @@ fn counter_most_common_breaks_ties_by_insertion_order() {
     );
 }
 
+/// Naive datetime timestamps use LOCAL time in Python, so these
+/// assertions are timezone-dependent: pin the process to UTC (both
+/// TZ-sensitive tests set the SAME value, so parallel execution is
+/// benign). python3 under TZ=UTC produces exactly these constants.
+fn pin_utc() {
+    // POSIX tzset(), so localtime_r/mktime re-read TZ; the libc crate
+    // does not bind it.
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn tzset();
+    }
+    unsafe {
+        std::env::set_var("TZ", "UTC");
+        #[cfg(unix)]
+        tzset();
+    }
+}
+
 #[test]
 fn datetime_timestamps_round_trip_and_handle_pre_epoch() {
     use stdpython::datetime::datetime;
-    // This host runs UTC, so local == UTC and values match python3 exactly.
+    pin_utc();
     // fromtimestamp(-1) is 1969-12-31 23:59:59 — the old code wrapped
     // negatives into a panic via Duration::from_secs_f64.
     let d = datetime::fromtimestamp(-1.0).unwrap();
@@ -954,10 +972,11 @@ fn range_len_survives_extreme_endpoints() {
 #[test]
 fn timestamp_one_second_before_epoch_is_minus_one() {
     use stdpython::datetime::datetime;
+    pin_utc();
     // mktime returns -1 BOTH as its error value and as the valid result
     // for this exact moment; the disambiguation must return -1.0 here
-    // (python3: datetime(1969, 12, 31, 23, 59, 59).timestamp() == -1.0
-    // on a UTC host).
+    // (python3 under TZ=UTC: datetime(1969, 12, 31, 23, 59, 59)
+    // .timestamp() == -1.0).
     let d = datetime::new(1969, 12, 31, Some(23), Some(59), Some(59), None).unwrap();
     assert_eq!(d.timestamp(), -1.0);
 }
