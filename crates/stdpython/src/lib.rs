@@ -216,44 +216,137 @@ where
 // PYTHON BUILT-IN FUNCTIONS
 // ============================================================================
 
-/// Python print() function - outputs objects to stdout with optional separator and ending
-/// 
-/// # Arguments
-/// * `objects` - Values to print (anything implementing Display)
-/// * `sep` - String inserted between values (default: " ")
-/// * `end` - String appended after the last value (default: "\n")
-/// * `flush` - Whether to forcibly flush the stream (default: false)
-/// 
-/// Note: Only available with `std` feature - requires OS I/O capabilities
-#[cfg(feature = "std")]
-pub fn print<T: Display>(object: T) {
-    println!("{}", object);
+/// Python's str()-conversion as used by print: identical to repr except
+/// that strings render unquoted and an absent Option renders as None.
+/// This is NOT Rust's Display — Display prints `true` and
+/// `10000000000000000` where Python prints `True` and `1e+16`, so print
+/// must never fall back to it.
+pub trait PyDisplay {
+    fn py_display(&self) -> String;
 }
 
-/// Python print() function with multiple arguments
+// Every integer primitive renders like a Python int. Covering them all
+// (not just i64) matters twice over: len() yields usize, and an integer
+// LITERAL among several candidate impls falls back to i32 — which must
+// then have an impl, or inference fails.
+macro_rules! py_display_int {
+    ($($t:ty),*) => {$(
+        impl PyDisplay for $t {
+            fn py_display(&self) -> String {
+                self.to_string()
+            }
+        }
+    )*};
+}
+py_display_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+
+impl PyDisplay for f64 {
+    fn py_display(&self) -> String {
+        // Python 3's str(float) IS repr(float).
+        py_float_repr(*self)
+    }
+}
+
+impl PyDisplay for bool {
+    fn py_display(&self) -> String {
+        if *self { "True" } else { "False" }.to_string()
+    }
+}
+
+impl PyDisplay for str {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl PyDisplay for String {
+    fn py_display(&self) -> String {
+        self.clone()
+    }
+}
+
+impl<T: PyDisplay + ?Sized> PyDisplay for &T {
+    fn py_display(&self) -> String {
+        (**self).py_display()
+    }
+}
+
+/// Containers stringify their ELEMENTS with repr, as Python does:
+/// str(['a']) is "['a']", quotes and all.
+impl<T: PyRepr> PyDisplay for Vec<T> {
+    fn py_display(&self) -> String {
+        self.py_repr()
+    }
+}
+
+/// In the Option-based None model, str(None) is "None" and a present
+/// value stringifies as itself (unquoted when it is a string).
+impl<T: PyDisplay> PyDisplay for Option<T> {
+    fn py_display(&self) -> String {
+        match self {
+            Some(x) => x.py_display(),
+            None => "None".to_string(),
+        }
+    }
+}
+
+/// Free-function form of PyDisplay, used by generated multi-argument
+/// print calls to pre-render each argument.
+pub fn py_display<T: PyDisplay + ?Sized>(x: &T) -> String {
+    x.py_display()
+}
+
+/// Python print() with a single argument and default sep/end.
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn print_args<T: Display, S: AsRef<str>, E: AsRef<str>>(objects: &[T], sep: S, end: E) {
-    let output = objects.iter()
-        .map(|obj| format!("{}", obj))
+pub fn print<T: PyDisplay>(object: T) {
+    println!("{}", object.py_display());
+}
+
+/// Python print() with multiple arguments and/or explicit sep=/end=:
+/// the arguments arrive pre-rendered through py_display.
+/// Note: Only available with `std` feature - requires OS I/O capabilities
+#[cfg(feature = "std")]
+pub fn print_parts<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(parts: &[S], sep: Sep, end: E) {
+    let output = parts
+        .iter()
+        .map(|p| p.as_ref())
         .collect::<Vec<_>>()
         .join(sep.as_ref());
     print!("{}{}", output, end.as_ref());
 }
 
+/// print(..., flush=True): as print_parts, then flush stdout when asked.
+/// Note: Only available with `std` feature - requires OS I/O capabilities
+#[cfg(feature = "std")]
+pub fn print_parts_flush<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
+    parts: &[S],
+    sep: Sep,
+    end: E,
+    flush: bool,
+) {
+    print_parts(parts, sep, end);
+    if flush {
+        use std::io::Write;
+        std::io::stdout()
+            .flush()
+            .expect("print(flush=True): I/O error flushing stdout");
+    }
+}
+
 /// No-std version of print - stores output in a string instead of printing
-/// 
+///
 /// This version is available in nostd environments but doesn't perform actual I/O
 #[cfg(not(feature = "std"))]
-pub fn print_to_string<T: Display>(object: T) -> String {
-    format!("{}", object)
+pub fn print_to_string<T: PyDisplay>(object: T) -> String {
+    object.py_display()
 }
 
 /// No-std version of print with multiple arguments
 #[cfg(not(feature = "std"))]
-pub fn print_args_to_string<T: Display, S: AsRef<str>, E: AsRef<str>>(objects: &[T], sep: S, end: E) -> String {
+pub fn print_args_to_string<T: PyDisplay, S: AsRef<str>, E: AsRef<str>>(objects: &[T], sep: S, end: E) -> String {
     let output = objects.iter()
-        .map(|obj| format!("{}", obj))
+        .map(|obj| obj.py_display())
         .collect::<Vec<_>>()
         .join(sep.as_ref());
     format!("{}{}", output, end.as_ref())
@@ -505,6 +598,73 @@ pub fn sorted_key_reverse<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
         decorated.sort_by(|a, b| py_sort_cmp(&a.0, &b.0));
     }
     decorated.into_iter().map(|(_, x)| x).collect()
+}
+
+/// Python list.sort(): in-place, stable, with the key=/reverse= keyword
+/// shapes. Distinct from Vec's inherent sort, which demands a total
+/// order (rejecting floats); these share sorted()'s comparator, which
+/// sorts floats and panics loudly on NaN. The key function runs exactly
+/// once per element (decorate-sort-undecorate), as in Python.
+pub trait PySort {
+    type Item;
+    fn py_sort(&mut self)
+    where
+        Self::Item: PartialOrd;
+    fn py_sort_reverse(&mut self, reverse: bool)
+    where
+        Self::Item: PartialOrd;
+    fn py_sort_key<K: PartialOrd, F: FnMut(&Self::Item) -> K>(&mut self, key: F);
+    fn py_sort_key_reverse<K: PartialOrd, F: FnMut(&Self::Item) -> K>(
+        &mut self,
+        key: F,
+        reverse: bool,
+    );
+}
+
+impl<T> PySort for Vec<T> {
+    type Item = T;
+
+    fn py_sort(&mut self)
+    where
+        T: PartialOrd,
+    {
+        self.sort_by(py_sort_cmp);
+    }
+
+    // Stable descending, so equal elements keep their original order —
+    // NOT a sort-then-reverse, which would flip ties.
+    fn py_sort_reverse(&mut self, reverse: bool)
+    where
+        T: PartialOrd,
+    {
+        if reverse {
+            self.sort_by(|a, b| py_sort_cmp(b, a));
+        } else {
+            self.sort_by(py_sort_cmp);
+        }
+    }
+
+    fn py_sort_key<K: PartialOrd, F: FnMut(&T) -> K>(&mut self, mut key: F) {
+        let mut decorated: Vec<(K, T)> = core::mem::take(self)
+            .into_iter()
+            .map(|x| (key(&x), x))
+            .collect();
+        decorated.sort_by(|a, b| py_sort_cmp(&a.0, &b.0));
+        *self = decorated.into_iter().map(|(_, x)| x).collect();
+    }
+
+    fn py_sort_key_reverse<K: PartialOrd, F: FnMut(&T) -> K>(&mut self, mut key: F, reverse: bool) {
+        let mut decorated: Vec<(K, T)> = core::mem::take(self)
+            .into_iter()
+            .map(|x| (key(&x), x))
+            .collect();
+        if reverse {
+            decorated.sort_by(|a, b| py_sort_cmp(&b.0, &a.0));
+        } else {
+            decorated.sort_by(|a, b| py_sort_cmp(&a.0, &b.0));
+        }
+        *self = decorated.into_iter().map(|(_, x)| x).collect();
+    }
 }
 
 /// Python reversed(sequence), materialized.
@@ -1680,6 +1840,12 @@ impl PyStr {
 impl Display for PyStr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.inner)
+    }
+}
+
+impl PyDisplay for PyStr {
+    fn py_display(&self) -> String {
+        self.inner.clone()
     }
 }
 

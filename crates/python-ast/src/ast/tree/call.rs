@@ -122,7 +122,7 @@ impl<'a> CodeGen for Call {
                 bname,
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
                     | "reversed" | "frozenset" | "map" | "filter" | "list"
-                    | "isinstance" | "hash"
+                    | "isinstance" | "hash" | "print"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -340,6 +340,65 @@ impl<'a> CodeGen for Call {
                     }
                     // The by-reference builtins: their runtime functions
                     // borrow, and Python's calls never consume the value.
+                    "print" => {
+                        // print builds on py_display (Python's str
+                        // semantics: True, 1e+16, unquoted strings) — the
+                        // Display fallback would silently diverge.
+                        let mut sep = None;
+                        let mut end = None;
+                        let mut flush = None;
+                        for kw in &self.keywords {
+                            match kw.arg.as_deref() {
+                                Some("sep") if sep.is_none() => sep = Some(kw.value.clone()),
+                                Some("end") if end.is_none() => end = Some(kw.value.clone()),
+                                Some("flush") if flush.is_none() => {
+                                    flush = Some(kw.value.clone())
+                                }
+                                Some("file") => {
+                                    return Err("print(file=...) is not supported: \
+                                                generated code writes to stdout only"
+                                        .to_string()
+                                        .into());
+                                }
+                                other => return Err(unexpected(other)),
+                            }
+                        }
+                        // sep=None / end=None mean the defaults in Python.
+                        let sep = sep.filter(|s| !crate::is_none_expr(s));
+                        let end = end.filter(|e| !crate::is_none_expr(e));
+                        let render = |e: crate::ExprType| {
+                            e.to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        };
+                        if sep.is_none() && end.is_none() && flush.is_none() {
+                            match rendered.as_slice() {
+                                [] => return Ok(quote!(println!())),
+                                [a] => return Ok(quote!(print(&(#a)))),
+                                _ => {}
+                            }
+                        }
+                        let sep = match sep {
+                            Some(s) => render(s)?,
+                            None => quote!(" "),
+                        };
+                        let end = match end {
+                            Some(e) => render(e)?,
+                            None => quote!("\n"),
+                        };
+                        // print(end="") with no arguments still needs an
+                        // element type for the empty parts slice.
+                        let parts = if rendered.is_empty() {
+                            quote!(&[] as &[&str])
+                        } else {
+                            quote!(&[#(py_display(&(#rendered))),*])
+                        };
+                        return Ok(match flush {
+                            None => quote!(print_parts(#parts, #sep, #end)),
+                            Some(f) => {
+                                let f = render(f)?;
+                                quote!(print_parts_flush(#parts, #sep, #end, #f))
+                            }
+                        });
+                    }
                     "len" | "repr" | "reversed" | "hash" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
@@ -1233,6 +1292,54 @@ impl<'a> CodeGen for Call {
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?
             };
+
+            // list.sort(): in-place, stable, with Python's keyword-only
+            // key=/reverse=. Vec's inherent sort demands a total order
+            // (rejecting floats), so every shape routes through the
+            // PySort variants, which share sorted()'s NaN-loud comparator
+            // and run key exactly once per element.
+            if attr.attr == "sort" {
+                if !self.args.is_empty() {
+                    return Err("sort() takes no positional arguments".to_string().into());
+                }
+                let mut key = None;
+                let mut reverse = None;
+                for kw in &self.keywords {
+                    match kw.arg.as_deref() {
+                        Some("key") if key.is_none() => key = Some(kw.value.clone()),
+                        Some("reverse") if reverse.is_none() => {
+                            reverse = Some(kw.value.clone())
+                        }
+                        other => {
+                            return Err(format!(
+                                "sort() got an unexpected or duplicate keyword \
+                                 argument '{}'",
+                                other.unwrap_or("**kwargs")
+                            )
+                            .into());
+                        }
+                    }
+                }
+                let render = |e: crate::ExprType| {
+                    e.to_rust(ctx.clone(), options.clone(), symbols.clone())
+                };
+                return Ok(match (key, reverse) {
+                    (None, None) => quote!((#receiver).py_sort()),
+                    (None, Some(r)) => {
+                        let r = render(r)?;
+                        quote!((#receiver).py_sort_reverse(#r))
+                    }
+                    (Some(k), None) => {
+                        let k = render(k)?;
+                        quote!((#receiver).py_sort_key(#k))
+                    }
+                    (Some(k), Some(r)) => {
+                        let k = render(k)?;
+                        let r = render(r)?;
+                        quote!((#receiver).py_sort_key_reverse(#k, #r))
+                    }
+                });
+            }
 
             // str.split / str.rsplit take sep and maxsplit by position or
             // keyword, with sep=None (or absent) meaning whitespace mode.

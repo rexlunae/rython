@@ -549,3 +549,15 @@ mod tests {
         assert!(!match_glob("file.py", "*.txt"));
     }
 }
+// str(path) is the path string (the Display form), as in Python.
+impl crate::PyDisplay for PurePath {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl crate::PyDisplay for Path {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
