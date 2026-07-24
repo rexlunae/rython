@@ -82,6 +82,10 @@ pub mod textwrap;
 #[cfg(feature = "std")]
 pub mod re;
 
+/// Python io module (StringIO); PyFile itself lives at the crate root.
+#[cfg(feature = "std")]
+pub mod io;
+
 /// Python hashlib module - message digests
 pub mod hashlib;
 

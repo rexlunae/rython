@@ -124,3 +124,51 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
     }
     Ok(rows)
 }
+
+/// csv.writer(f) with CPython's default "excel" dialect: comma
+/// delimiter, QUOTE_MINIMAL (a field is quoted only when it contains
+/// the delimiter, a quote, or a newline), "" quote doubling, and \r\n
+/// as the row terminator. Rows stringify their elements through
+/// PyDisplay — Python's writer calls str() — so ints, floats, and
+/// bools render exactly as Python prints them (True, 2.5, 1e+16).
+/// Only available with the std feature: it writes through PyFile.
+#[cfg(feature = "std")]
+pub struct Writer<'a> {
+    file: &'a mut crate::PyFile,
+}
+
+#[cfg(feature = "std")]
+pub fn writer(file: &mut crate::PyFile) -> Writer<'_> {
+    Writer { file }
+}
+
+#[cfg(feature = "std")]
+impl Writer<'_> {
+    pub fn writerow<T: crate::PyDisplay>(&mut self, row: &[T]) -> Result<(), PyException> {
+        let mut out = String::new();
+        for (i, field) in row.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let text = field.py_display();
+            if text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r')
+            {
+                out.push('"');
+                out.push_str(&text.replace('"', "\"\""));
+                out.push('"');
+            } else {
+                out.push_str(&text);
+            }
+        }
+        out.push_str("\r\n");
+        self.file.write(out)?;
+        Ok(())
+    }
+
+    pub fn writerows<T: crate::PyDisplay>(&mut self, rows: &[Vec<T>]) -> Result<(), PyException> {
+        for row in rows {
+            self.writerow(row)?;
+        }
+        Ok(())
+    }
+}

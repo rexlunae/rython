@@ -14,6 +14,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
         name,
         "os" | "sys"
             | "re"
+            | "io"
             | "json"
             | "math"
             | "random"
@@ -46,6 +47,7 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
         name,
         "os" | "sys"
             | "re"
+            | "io"
             | "math"
             | "random"
             | "datetime"
@@ -286,6 +288,7 @@ impl CodeGen for ImportFrom {
                 ("itertools", "groupby") => &["groupby_key"],
                 ("functools", "reduce") => &["reduce_initial"],
                 ("re", "findall") => &["findall2", "findall3"],
+                ("io", "StringIO") => &["StringIO_seeded"],
                 ("hashlib", "md5") => &["md5_new"],
                 ("hashlib", "sha1") => &["sha1_new"],
                 ("hashlib", "sha256") => &["sha256_new"],

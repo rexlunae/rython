@@ -2284,3 +2284,76 @@ mod replace_keywords {
             .is_err());
     }
 }
+
+mod file_objects {
+    use stdpython::{csv, io};
+
+    #[test]
+    fn stringio_cursor_semantics_match_python() {
+        // python3: StringIO("seeded").write("!") OVERWRITES at the
+        // cursor: buffer becomes "!eeded", cursor 1, read() -> "eeded".
+        let mut b = io::StringIO_seeded("seeded");
+        assert_eq!(b.write("!").unwrap(), 1);
+        assert_eq!(b.getvalue().unwrap(), "!eeded");
+        assert_eq!(b.read().unwrap(), "eeded");
+        // At the end, write appends; write returns the CHAR count.
+        assert_eq!(b.write("après").unwrap(), 5);
+        assert_eq!(b.getvalue().unwrap(), "!eededaprès");
+
+        // readline/readlines keep terminators, as Python.
+        let mut two = io::StringIO_seeded("x\ny\nz");
+        assert_eq!(two.readline().unwrap(), "x\n");
+        assert_eq!(two.readlines().unwrap(), vec!["y\n", "z"]);
+        // Exhausted: empty line, empty list.
+        assert_eq!(two.readline().unwrap(), "");
+    }
+
+    #[test]
+    fn closed_files_raise_pythons_value_error() {
+        let mut b = io::StringIO();
+        b.close().unwrap();
+        let e = b.read().unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
+        // getvalue on a closed buffer is closed too.
+        assert!(b.getvalue().is_err());
+    }
+
+    #[test]
+    fn csv_writer_quoting_matches_python() {
+        // python3 (excel dialect):
+        // 'a,"b,c","say ""hi""",\r\n1,2,3\r\n\r\n"line\nbreak",tab\there\r\n'
+        let mut buf = io::StringIO();
+        {
+            let mut w = csv::writer(&mut buf);
+            w.writerow(&["a", "b,c", "say \"hi\"", ""]).unwrap();
+            w.writerow(&[1i64, 2, 3]).unwrap();
+            w.writerow(&[] as &[&str]).unwrap();
+            w.writerow(&["line\nbreak", "tab\there"]).unwrap();
+        }
+        assert_eq!(
+            buf.getvalue().unwrap(),
+            "a,\"b,c\",\"say \"\"hi\"\"\",\r\n1,2,3\r\n\r\n\"line\nbreak\",tab\there\r\n"
+        );
+
+        // Elements stringify through PyDisplay (Python's str()): bools
+        // and floats render as Python prints them.
+        let mut buf = io::StringIO();
+        {
+            let mut w = csv::writer(&mut buf);
+            w.writerow(&[stdpython::py_display(&true), stdpython::py_display(&2.5f64)])
+                .unwrap();
+            w.writerows(&[vec!["x", "y"], vec!["z", "w"]]).unwrap();
+        }
+        assert_eq!(buf.getvalue().unwrap(), "True,2.5\r\nx,y\r\nz,w\r\n");
+
+        // writer output round-trips through the reader.
+        let mut buf = io::StringIO();
+        {
+            let mut w = csv::writer(&mut buf);
+            w.writerow(&["a", "b,c", "say \"hi\""]).unwrap();
+        }
+        let text = buf.getvalue().unwrap();
+        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>()).unwrap();
+        assert_eq!(rows[0], vec!["a", "b,c", "say \"hi\""]);
+    }
+}

@@ -2672,3 +2672,58 @@ fn partial_rejects_unknown_functions_keywords_and_overbinding() {
     );
     assert!(err.contains("takes 2 argument(s), but 3 were bound"), "error: {}", err);
 }
+
+// ---- file objects, io.StringIO, csv.writer ----
+
+#[test]
+fn open_arity_splits_onto_the_option_mode() {
+    let out = compile("def f():\n    g = open(\"x.txt\")\n    return g.read()\n", "op1.py");
+    assert!(out.contains("open (& (\"x.txt\") , None :: < & str >) ?"), "generated: {}", out);
+    assert!(out.contains(". read () ?"), "generated: {}", out);
+
+    let out = compile("def f():\n    g = open(\"x.txt\", \"w\")\n    g.write(\"hi\")\n", "op2.py");
+    assert!(
+        out.contains("open (& (\"x.txt\") , Some (\"w\")) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains(". write (& (\"hi\")) ?"), "generated: {}", out);
+    // The file binding is mutable: write takes &mut self.
+    assert!(out.contains("let mut g"), "generated: {}", out);
+}
+
+#[test]
+fn stringio_and_csv_writer_lower_with_mut_borrows() {
+    let src = concat!(
+        "import csv\n",
+        "import io\n",
+        "\n",
+        "def f() -> str:\n",
+        "    buf = io.StringIO()\n",
+        "    w = csv.writer(buf)\n",
+        "    w.writerow([\"a\", \"b\"])\n",
+        "    w.writerow([])\n",
+        "    return buf.getvalue()\n",
+    );
+    let out = compile(src, "csw1.py");
+    assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
+    assert!(out.contains("csv :: writer (& mut (buf))"), "generated: {}", out);
+    assert!(out.contains("let mut buf"), "generated: {}", out);
+    assert!(out.contains("let mut w"), "generated: {}", out);
+    assert!(out.contains(". writerow (& (vec ! [\"a\" . to_string () , \"b\" . to_string ()])) ?")
+        || out.contains(". writerow ("), "generated: {}", out);
+    // The empty record gets a typed slice.
+    assert!(out.contains("writerow (& [] as & [& str]) ?"), "generated: {}", out);
+    assert!(out.contains(". getvalue () ?"), "generated: {}", out);
+
+    // The seeded StringIO variant.
+    let out = compile(
+        "import io\n\ndef f() -> str:\n    b = io.StringIO(\"seed\")\n    return b.read()\n",
+        "csw2.py",
+    );
+    assert!(
+        out.contains("io :: StringIO_seeded (& (\"seed\"))"),
+        "generated: {}",
+        out
+    );
+}

@@ -3621,6 +3621,8 @@ pub use stdlib::datetime::{PyReplace, ReplaceArgs};
 pub use stdlib::time;
 #[cfg(feature = "std")]
 pub use stdlib::re;
+#[cfg(feature = "std")]
+pub use stdlib::io;
 // The Match-method trait must be in scope for m.group()/m.span() to
 // resolve through the Option layer in generated code.
 #[cfg(feature = "std")]
@@ -3845,101 +3847,177 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
     Ok(file)
 }
 
-/// Python file object
-/// 
+/// Python file object: one type over every backend — disk handles from
+/// open() and in-memory buffers from io.StringIO() — so file-consuming
+/// code (csv.writer among others) works against either, exactly as
+/// Python's file protocol does.
+///
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
 pub struct PyFile {
-    reader: Option<std::io::BufReader<std::fs::File>>,
-    writer: Option<std::io::BufWriter<std::fs::File>>,
+    backend: PyFileBackend,
+}
+
+#[cfg(feature = "std")]
+enum PyFileBackend {
+    DiskRead(std::io::BufReader<std::fs::File>),
+    DiskWrite(std::io::BufWriter<std::fs::File>),
+    /// io.StringIO: contents plus a cursor in CHARACTERS (Python
+    /// counts positions in code points). write() OVERWRITES at the
+    /// cursor, as in Python — StringIO("seeded").write("!") yields
+    /// "!eeded", not "seeded!".
+    Buffer { data: String, pos: usize },
+    Closed,
+}
+
+#[cfg(feature = "std")]
+fn closed_file_error() -> PyException {
+    // CPython: ValueError: I/O operation on closed file.
+    value_error("I/O operation on closed file.")
 }
 
 #[cfg(feature = "std")]
 impl PyFile {
     fn new_read(reader: std::io::BufReader<std::fs::File>) -> Self {
         Self {
-            reader: Some(reader),
-            writer: None,
+            backend: PyFileBackend::DiskRead(reader),
         }
     }
-    
+
     fn new_write(writer: std::io::BufWriter<std::fs::File>) -> Self {
         Self {
-            reader: None,
-            writer: Some(writer),
+            backend: PyFileBackend::DiskWrite(writer),
         }
     }
-    
+
+    /// io.StringIO backing constructor.
+    pub(crate) fn new_buffer(initial: &str) -> Self {
+        Self {
+            backend: PyFileBackend::Buffer {
+                data: initial.to_string(),
+                pos: 0,
+            },
+        }
+    }
+
     /// Python file.read() method
     pub fn read(&mut self) -> Result<String, PyException> {
         use std::io::Read;
-        
-        if let Some(reader) = &mut self.reader {
-            let mut contents = String::new();
-            reader.read_to_string(&mut contents)
-                .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
-            Ok(contents)
-        } else {
-            Err(runtime_error("File not opened for reading"))
+        match &mut self.backend {
+            PyFileBackend::DiskRead(reader) => {
+                let mut contents = String::new();
+                reader.read_to_string(&mut contents)
+                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                Ok(contents)
+            }
+            PyFileBackend::Buffer { data, pos } => {
+                let out: String = data.chars().skip(*pos).collect();
+                *pos = data.chars().count();
+                Ok(out)
+            }
+            PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
+            PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
-    
-    /// Python file.readline() method
+
+    /// Python file.readline() method: the line INCLUDES its
+    /// terminator, as in Python; empty means end of file.
     pub fn readline(&mut self) -> Result<String, PyException> {
         use std::io::BufRead;
-        
-        if let Some(reader) = &mut self.reader {
-            let mut line = String::new();
-            reader.read_line(&mut line)
-                .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
-            Ok(line)
-        } else {
-            Err(runtime_error("File not opened for reading"))
+        match &mut self.backend {
+            PyFileBackend::DiskRead(reader) => {
+                let mut line = String::new();
+                reader.read_line(&mut line)
+                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                Ok(line)
+            }
+            PyFileBackend::Buffer { data, pos } => {
+                let mut line = String::new();
+                for c in data.chars().skip(*pos) {
+                    line.push(c);
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                *pos += line.chars().count();
+                Ok(line)
+            }
+            PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
+            PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
-    
-    /// Python file.readlines() method
+
+    /// Python file.readlines() method. Lines KEEP their terminators
+    /// ("x\n", "y\n"), exactly as Python's readlines does — stripping
+    /// them silently diverges (and breaks csv.reader's newline
+    /// handling).
     pub fn readlines(&mut self) -> Result<Vec<String>, PyException> {
-        use std::io::BufRead;
-        
-        if let Some(reader) = &mut self.reader {
-            let lines: Result<Vec<_>, _> = reader.lines().collect();
-            lines.map_err(|e| runtime_error(&format!("Read error: {}", e)))
-        } else {
-            Err(runtime_error("File not opened for reading"))
+        let mut lines = Vec::new();
+        loop {
+            let line = self.readline()?;
+            if line.is_empty() {
+                return Ok(lines);
+            }
+            lines.push(line);
         }
     }
-    
-    /// Python file.write() method
-    pub fn write<D: AsRef<str>>(&mut self, data: D) -> Result<usize, PyException> {
+
+    /// Python file.write() method: returns the number of CHARACTERS
+    /// written, as Python does. On a StringIO buffer this overwrites at
+    /// the cursor (Python semantics), not appends.
+    pub fn write<D: AsRef<str>>(&mut self, data: D) -> Result<i64, PyException> {
         use std::io::Write;
-        
-        if let Some(writer) = &mut self.writer {
-            writer.write(data.as_ref().as_bytes())
-                .map_err(|e| runtime_error(&format!("Write error: {}", e)))
-        } else {
-            Err(runtime_error("File not opened for writing"))
+        let text = data.as_ref();
+        match &mut self.backend {
+            PyFileBackend::DiskWrite(writer) => {
+                writer.write_all(text.as_bytes())
+                    .map_err(|e| runtime_error(&format!("Write error: {}", e)))?;
+                Ok(text.chars().count() as i64)
+            }
+            PyFileBackend::Buffer { data, pos } => {
+                let written = text.chars().count();
+                let prefix: String = data.chars().take(*pos).collect();
+                let suffix: String = data.chars().skip(*pos + written).collect();
+                *data = format!("{}{}{}", prefix, text, suffix);
+                *pos += written;
+                Ok(written as i64)
+            }
+            PyFileBackend::DiskRead(_) => Err(runtime_error("File not opened for writing")),
+            PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
-    
+
     /// Python file.writelines() method
     pub fn writelines<S: AsRef<str>>(&mut self, lines: &[S]) -> Result<(), PyException> {
         for line in lines {
-            self.write(line)?;
+            self.write(line.as_ref())?;
         }
         Ok(())
     }
-    
+
+    /// io.StringIO.getvalue(): the whole buffer regardless of cursor.
+    /// A disk file has no getvalue — Python raises AttributeError, and
+    /// the typed lowering cannot know the backend at conversion time,
+    /// so this fails loudly at runtime instead.
+    pub fn getvalue(&self) -> Result<String, PyException> {
+        match &self.backend {
+            PyFileBackend::Buffer { data, .. } => Ok(data.clone()),
+            PyFileBackend::Closed => Err(closed_file_error()),
+            _ => Err(PyException::new(
+                "AttributeError",
+                "'_io.TextIOWrapper' object has no attribute 'getvalue'",
+            )),
+        }
+    }
+
     /// Python file.close() method
     pub fn close(&mut self) -> Result<(), PyException> {
         use std::io::Write;
-        
-        if let Some(mut writer) = self.writer.take() {
+        let old = std::mem::replace(&mut self.backend, PyFileBackend::Closed);
+        if let PyFileBackend::DiskWrite(mut writer) = old {
             writer.flush()
                 .map_err(|e| runtime_error(&format!("Flush error: {}", e)))?;
         }
-        
-        self.reader = None;
         Ok(())
     }
 }

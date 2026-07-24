@@ -1896,6 +1896,86 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn file_objects_and_csv_writer_match_python_at_runtime() {
+    // The PyFile surface end to end: io.StringIO (cursor-overwrite
+    // write, getvalue, readlines with terminators), csv.writer quoting
+    // through both writerow and writerows, disk files via open() in
+    // write and read modes, with-blocks, and reader round-trip.
+    let scratch = Scratch::new("pyfiles");
+    let file = scratch.path().join("file_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import csv\n",
+            "import io\n",
+            "\n",
+            "def main() -> None:\n",
+            "    buf = io.StringIO()\n",
+            "    w = csv.writer(buf)\n",
+            "    w.writerow([\"a\", \"b,c\", \"say \\\"hi\\\"\", \"\"])\n",
+            "    w.writerow([1, 2, 3])\n",
+            "    w.writerow([])\n",
+            "    w.writerows([[\"x\", \"y\"], [\"z\", \"w\"]])\n",
+            "    print(repr(buf.getvalue()))\n",
+            "    seeded = io.StringIO(\"seeded\")\n",
+            "    seeded.write(\"!\")\n",
+            "    print(seeded.getvalue())\n",
+            "    print(repr(seeded.read()))\n",
+            "    two = io.StringIO(\"x\\ny\\n\")\n",
+            "    print(two.readlines())\n",
+            "    path = \"pyfile_demo_scratch.txt\"\n",
+            "    f = open(path, \"w\")\n",
+            "    f.write(\"alpha\\n\")\n",
+            "    f.writelines([\"beta\\n\", \"gamma\\n\"])\n",
+            "    f.close()\n",
+            "    g = open(path)\n",
+            "    print(repr(g.readline()))\n",
+            "    print(g.readlines())\n",
+            "    g.close()\n",
+            "    with open(path) as h:\n",
+            "        print(len(h.read()))\n",
+            "    for row in csv.reader(open(path).readlines()):\n",
+            "        print(row)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    // Run in a scratch cwd so the relative-path file lands there.
+    let output = Command::new(krate.root.join("target/debug/file_demo"))
+        .current_dir(scratch.path())
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "'a,\"b,c\",\"say \"\"hi\"\"\",\\r\\n1,2,3\\r\\n\\r\\nx,y\\r\\nz,w\\r\\n'",
+            "!eeded",
+            "'eeded'",
+            "['x\\n', 'y\\n']",
+            "'alpha\\n'",
+            "['beta\\n', 'gamma\\n']",
+            "17",
+            "['alpha']",
+            "['beta']",
+            "['gamma']",
+        ],
+        "file-object semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn functools_partial_matches_python_at_runtime() {
     // partial over statically-known functions: leading-argument binding,
     // full binding (zero-arg closure), multi-parameter tails, and

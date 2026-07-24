@@ -149,7 +149,7 @@ impl<'a> CodeGen for Call {
                 bname,
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
                     | "reversed" | "frozenset" | "map" | "filter" | "list"
-                    | "isinstance" | "hash" | "print"
+                    | "isinstance" | "hash" | "print" | "open"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -423,6 +423,25 @@ impl<'a> CodeGen for Call {
                             Some(f) => {
                                 let f = render(f)?;
                                 quote!(print_parts_flush(#parts, #sep, #end, #f))
+                            }
+                        });
+                    }
+                    "open" => {
+                        // The runtime signature takes mode as an Option;
+                        // the arity split wraps it here. Text modes only —
+                        // encoding/newline/binary spellings are loud.
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        return Ok(match rendered.as_slice() {
+                            [p] => quote!(open(&(#p), None::<&str>)?),
+                            [p, m] => quote!(open(&(#p), Some(#m))?),
+                            _ => {
+                                return Err(
+                                    "open() takes 1 or 2 arguments (path and mode)"
+                                        .to_string()
+                                        .into(),
+                                )
                             }
                         });
                     }
@@ -888,7 +907,7 @@ impl<'a> CodeGen for Call {
                         if matches!(
                             import.module.as_str(),
                             "functools" | "heapq" | "copy" | "textwrap" | "re" | "hashlib"
-                                | "csv"
+                                | "csv" | "io"
                         ) =>
                     {
                         Some((n.id.clone(), None))
@@ -900,6 +919,7 @@ impl<'a> CodeGen for Call {
                         if matches!(
                             m.id.as_str(),
                             "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv"
+                                | "io"
                         ) =>
                     {
                         let module: &'static str = match m.id.as_str() {
@@ -908,6 +928,7 @@ impl<'a> CodeGen for Call {
                             "re" => "re",
                             "hashlib" => "hashlib",
                             "csv" => "csv",
+                            "io" => "io",
                             _ => "textwrap",
                         };
                         Some((attr.attr.clone(), Some(module)))
@@ -945,6 +966,8 @@ impl<'a> CodeGen for Call {
                         | "wrap"
                         | "fill"
                         | "reader"
+                        | "writer"
+                        | "StringIO"
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
@@ -1291,6 +1314,22 @@ impl<'a> CodeGen for Call {
                     ("md5" | "sha1" | "sha256" | "sha512", [data]) => {
                         let p = qual(&fname);
                         Ok(quote!(#p(&(#data))))
+                    }
+                    // io.StringIO: arity split — the seeded form starts
+                    // with the cursor at 0, as in Python.
+                    ("StringIO", []) => {
+                        let p = qual("StringIO");
+                        Ok(quote!(#p()))
+                    }
+                    ("StringIO", [initial]) => {
+                        let p = qual("StringIO_seeded");
+                        Ok(quote!(#p(&(#initial))))
+                    }
+                    // csv.writer(f) borrows the file mutably for the
+                    // writer's lifetime (scope analysis marks f mut).
+                    ("writer", [f]) => {
+                        let p = qual("writer");
+                        Ok(quote!(#p(&mut (#f))))
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
@@ -1667,6 +1706,30 @@ impl<'a> CodeGen for Call {
                 // list.count(x): the PyListOps method takes a reference.
                 ("count", [value]) => {
                     return Ok(quote!((#receiver).count(&(#value))));
+                }
+                // File-object and csv.Writer methods return Result (I/O
+                // can fail; Python raises): thread `?`.
+                ("read", []) | ("readline", []) | ("readlines", []) | ("close", [])
+                | ("getvalue", []) => {
+                    let m = crate::safe_ident(&attr.attr);
+                    return Ok(quote!((#receiver).#m()?));
+                }
+                ("write", [d]) => {
+                    return Ok(quote!((#receiver).write(&(#d))?));
+                }
+                ("writelines", [l]) => {
+                    return Ok(quote!((#receiver).writelines(&(#l))?));
+                }
+                ("writerow", [r]) => {
+                    // writerow([]) (an empty record) still needs an
+                    // element type for the slice.
+                    if r.to_string() == "vec ! []" {
+                        return Ok(quote!((#receiver).writerow(&[] as &[&str])?));
+                    }
+                    return Ok(quote!((#receiver).writerow(&(#r))?));
+                }
+                ("writerows", [r]) => {
+                    return Ok(quote!((#receiver).writerows(&(#r))?));
                 }
                 // re Match: m.group() is m.group(0); Rust can't overload.
                 ("group", []) => {
