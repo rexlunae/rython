@@ -1603,6 +1603,21 @@ mod re_module {
             vec!["a", "b", "c ", "d"]
         );
         assert_eq!(re::split(r"\d", "abc").unwrap(), vec!["abc"]);
+        // Capturing groups interleave the delimiters, as in Python:
+        // re.split(r"(\d)", "a1b") == ['a', '1', 'b'].
+        assert_eq!(re::split(r"(\d)", "a1b").unwrap(), vec!["a", "1", "b"]);
+        assert_eq!(re::split(r"(\d)", "1").unwrap(), vec!["", "1", ""]);
+        assert_eq!(
+            re::split(r"([,;])\s*", "a, b;c").unwrap(),
+            vec!["a", ",", "b", ";", "c"]
+        );
+        // A non-participating group becomes None in Python — loud here.
+        let e = re::split(r"(x)|(\d)", "a1b").unwrap_err();
+        assert!(
+            format!("{}", e).contains("did not participate"),
+            "err: {}",
+            e
+        );
     }
 
     #[test]

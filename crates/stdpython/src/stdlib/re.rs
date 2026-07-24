@@ -225,16 +225,45 @@ pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     }
 }
 
-/// re.split(pattern, string).
+/// re.split(pattern, string). Like Python, capturing groups in the
+/// pattern interleave the captured delimiter text into the result:
+/// split(r"(\d)", "a1b") is ['a', '1', 'b']. A group that does NOT
+/// participate in a delimiter match becomes None in Python, which a typed
+/// list cannot hold — that case is a loud error.
 pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
 ) -> Result<Vec<String>, PyException> {
     let re = compile(pattern.as_ref())?;
-    Ok(re
-        .split(string.as_ref())
-        .map(|s| s.to_string())
-        .collect())
+    let text = string.as_ref();
+    if re.captures_len() == 1 {
+        return Ok(re.split(text).map(|s| s.to_string()).collect());
+    }
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0).expect("group 0 always participates");
+        out.push(text[last..whole.start()].to_string());
+        for i in 1..caps.len() {
+            match caps.get(i) {
+                Some(g) => out.push(g.as_str().to_string()),
+                None => {
+                    return Err(PyException::new(
+                        "ValueError",
+                        format!(
+                            "re.split(): group {} did not participate in a delimiter \
+                             match; Python inserts None there, which rython's typed \
+                             list cannot represent",
+                            i
+                        ),
+                    ));
+                }
+            }
+        }
+        last = whole.end();
+    }
+    out.push(text[last..].to_string());
+    Ok(out)
 }
 
 /// re.sub(pattern, repl, string), with Python backreference syntax in the
