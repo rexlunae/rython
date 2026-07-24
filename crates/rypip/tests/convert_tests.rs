@@ -1896,6 +1896,88 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn lru_cache_matches_python_at_runtime() {
+    // Memoization through recursion (fib), unbounded caches skipping
+    // recomputation (print side effects fire once per distinct
+    // argument), and CPython's exact LRU touch/eviction order for a
+    // bounded cache.
+    let scratch = Scratch::new("lrus");
+    let file = scratch.path().join("lru_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from functools import lru_cache\n",
+            "\n",
+            "@lru_cache\n",
+            "def fib(n: int) -> int:\n",
+            "    if n < 2:\n",
+            "        return n\n",
+            "    return fib(n - 1) + fib(n - 2)\n",
+            "\n",
+            "@lru_cache(maxsize=None)\n",
+            "def slow_double(x: int) -> int:\n",
+            "    print(\"computing\", x)\n",
+            "    return x * 2\n",
+            "\n",
+            "@lru_cache(maxsize=2)\n",
+            "def tag(s: str) -> str:\n",
+            "    print(\"tagging\", s)\n",
+            "    return \"<\" + s + \">\"\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(fib(30))\n",
+            "    print(slow_double(4))\n",
+            "    print(slow_double(4))\n",
+            "    print(slow_double(5))\n",
+            "    print(tag(\"a\"), tag(\"b\"))\n",
+            "    print(tag(\"a\"))\n",
+            "    print(tag(\"c\"))\n",
+            "    print(tag(\"b\"))\n",
+            "    print(tag(\"a\"))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/lru_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "832040",
+            "computing 4",
+            "8",
+            "8",
+            "computing 5",
+            "10",
+            "tagging a",
+            "tagging b",
+            "<a> <b>",
+            "<a>",
+            "tagging c",
+            "<c>",
+            "tagging b",
+            "<b>",
+            "tagging a",
+            "<a>",
+        ],
+        "lru_cache semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn file_objects_and_csv_writer_match_python_at_runtime() {
     // The PyFile surface end to end: io.StringIO (cursor-overwrite
     // write, getvalue, readlines with terminators), csv.writer quoting

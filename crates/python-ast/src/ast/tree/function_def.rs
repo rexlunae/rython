@@ -49,6 +49,86 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
 impl PyStatementTrait for FunctionDef {
 }
 
+/// The cache discipline a functools cache decorator asks for: None
+/// means uncached; Some(None) is unbounded (functools.cache or
+/// lru_cache(maxsize=None)); Some(Some(n)) is a bounded LRU (Python's
+/// bare @lru_cache default is 128). ANY other decorator is a loud
+/// error: silently ignoring a decorator converts a program into a
+/// different one.
+fn parse_cache_decorator(
+    decorators: &[ExprType],
+) -> Result<Option<Option<i64>>, Box<dyn std::error::Error>> {
+    let unsupported = |what: &str| -> Box<dyn std::error::Error> {
+        format!(
+            "decorator `{}` is not supported yet (only functools.lru_cache and \
+             functools.cache are); rython refuses to silently ignore it",
+            what
+        )
+        .into()
+    };
+    let name_of = |e: &ExprType| -> Option<String> {
+        match e {
+            ExprType::Name(n) => Some(n.id.clone()),
+            ExprType::Attribute(a) => match a.value.as_ref() {
+                ExprType::Name(m) if m.id == "functools" => Some(a.attr.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    match decorators {
+        [] => Ok(None),
+        [single] => {
+            let (base, call) = match single {
+                ExprType::Call(c) => (name_of(c.func.as_ref()), Some(c)),
+                other => (name_of(other), None),
+            };
+            match (base.as_deref(), call) {
+                (Some("cache"), None) => Ok(Some(None)),
+                (Some("cache"), Some(c)) if c.args.is_empty() && c.keywords.is_empty() => {
+                    Ok(Some(None))
+                }
+                (Some("lru_cache"), None) => Ok(Some(Some(128))),
+                (Some("lru_cache"), Some(c)) => {
+                    let maxsize = match (c.args.as_slice(), c.keywords.as_slice()) {
+                        ([], []) => return Ok(Some(Some(128))),
+                        ([e], []) => e.clone(),
+                        ([], [kw]) if kw.arg.as_deref() == Some("maxsize") => {
+                            kw.value.clone()
+                        }
+                        _ => {
+                            return Err(
+                                "lru_cache() takes at most a single maxsize argument"
+                                    .to_string()
+                                    .into(),
+                            )
+                        }
+                    };
+                    if crate::is_none_expr(&maxsize) {
+                        return Ok(Some(None));
+                    }
+                    match &maxsize {
+                        ExprType::Constant(c) => match &c.0 {
+                            Some(litrs::Literal::Integer(i)) => {
+                                let n: i64 = i.value().ok_or("maxsize out of range")?;
+                                Ok(Some(Some(n)))
+                            }
+                            _ => Err("lru_cache maxsize must be an integer literal or None"
+                                .to_string()
+                                .into()),
+                        },
+                        _ => Err("lru_cache maxsize must be an integer literal or None"
+                            .to_string()
+                            .into()),
+                    }
+                }
+                _ => Err(unsupported(&format!("{:?}", single))),
+            }
+        }
+        many => Err(unsupported(&format!("{:?}", many[0]))),
+    }
+}
+
 impl CodeGen for FunctionDef {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -71,6 +151,18 @@ impl CodeGen for FunctionDef {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
+
+        // functools cache decorators rewrite the whole definition below;
+        // any OTHER decorator is a loud error (see parse_cache_decorator).
+        let cache_spec = parse_cache_decorator(&self.decorator_list)?;
+        if cache_spec.is_some() && options.no_std {
+            return Err(format!(
+                "@lru_cache on `{}` needs a global Mutex, which the no_std \
+                 profile does not provide",
+                self.name
+            )
+            .into());
+        }
 
         // The Python convention is that functions that begin with a single underscore,
         // it's private. Otherwise, it's public. We formalize that by default.
@@ -129,6 +221,53 @@ impl CodeGen for FunctionDef {
         let parameters = render_args
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+        // A cached function's arguments form the cache KEY, so every
+        // parameter needs a hashable, nameable type: int, bool, or str
+        // (floats are not hashable in Rust — Python would cache them,
+        // which rython cannot reproduce, so it refuses loudly).
+        let cache_key: Option<Vec<(proc_macro2::Ident, TokenStream)>> = match cache_spec {
+            None => None,
+            Some(_) => {
+                if is_method {
+                    return Err(format!(
+                        "@lru_cache on method `{}` is not supported yet",
+                        self.name
+                    )
+                    .into());
+                }
+                if !self.args.posonlyargs.is_empty()
+                    || !self.args.kwonlyargs.is_empty()
+                    || self.args.vararg.is_some()
+                    || self.args.kwarg.is_some()
+                {
+                    return Err(format!(
+                        "@lru_cache on `{}`: only plain positional parameters are \
+                         supported",
+                        self.name
+                    )
+                    .into());
+                }
+                let mut key = Vec::new();
+                for p in &self.args.args {
+                    let ty = match p.annotation.as_deref() {
+                        Some(ExprType::Name(n)) if n.id == "int" => quote!(i64),
+                        Some(ExprType::Name(n)) if n.id == "bool" => quote!(bool),
+                        Some(ExprType::Name(n)) if n.id == "str" => quote!(String),
+                        _ => {
+                            return Err(format!(
+                                "@lru_cache on `{}`: parameter `{}` must be annotated \
+                                 int, bool, or str (the arguments form the cache key)",
+                                self.name, p.arg
+                            )
+                            .into());
+                        }
+                    };
+                    key.push((crate::safe_ident(&p.arg), ty));
+                }
+                Some(key)
+            }
+        };
 
         // Python variables are function-scoped: hoist every assigned name to
         // a declaration here so assignments inside nested blocks (if/loop/
@@ -296,6 +435,60 @@ impl CodeGen for FunctionDef {
         if !guarantees_return(&self.body) {
             streams.extend(quote!(Ok(())));
         }
+
+        // A cached function wraps its ORIGINAL body in an inner fn: the
+        // outer fn consults a static LRU keyed on the argument tuple,
+        // computes through the inner fn on a miss, and stores the clone.
+        // Recursive calls in the body resolve to the OUTER item, so
+        // recursion hits the cache, exactly like Python's wrapper.
+        let streams = if let (Some(maxsize), Some(key)) = (cache_spec, cache_key.as_ref()) {
+            let maxsize_tokens = match maxsize {
+                None => quote!(None),
+                Some(n) => quote!(Some(#n as usize)),
+            };
+            let key_types: Vec<&TokenStream> = key.iter().map(|(_, t)| t).collect();
+            let key_names: Vec<&proc_macro2::Ident> = key.iter().map(|(n, _)| n).collect();
+            let ret = match self.resolved_return_type() {
+                Some(ty) => quote!(#ty),
+                None => quote!(()),
+            };
+            // str parameters arrive as impl Into<String>; normalize them
+            // before building the key (the inner fn takes concrete String).
+            let mut outer_rebinds = TokenStream::new();
+            for (p, (name, _)) in self.args.args.iter().zip(key.iter()) {
+                if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "str")
+                {
+                    outer_rebinds.extend(quote!(let #name: String = #name.into();));
+                }
+            }
+            quote! {
+                #outer_rebinds
+                static __LRU_CACHE: std::sync::LazyLock<
+                    std::sync::Mutex<PyLruCache<(#(#key_types,)*), #ret>>,
+                > = std::sync::LazyLock::new(|| {
+                    std::sync::Mutex::new(PyLruCache::new(#maxsize_tokens))
+                });
+                if let Some(__hit) = __LRU_CACHE
+                    .lock()
+                    .expect("lru_cache mutex poisoned")
+                    .get(&(#((#key_names).clone(),)*))
+                {
+                    return Ok(__hit);
+                }
+                #[allow(non_snake_case)]
+                fn __lru_uncached(#(#key_names: #key_types),*) -> Result<#ret, PyException> {
+                    #streams
+                }
+                let __lru_value = __lru_uncached(#((#key_names).clone()),*)?;
+                __LRU_CACHE
+                    .lock()
+                    .expect("lru_cache mutex poisoned")
+                    .put((#((#key_names).clone(),)*), __lru_value.clone());
+                Ok(__lru_value)
+            }
+        } else {
+            streams
+        };
 
         // Lossy conversions are silent semantic changes callers may not want
         // — surface them as a compiler warning at every call site outside the

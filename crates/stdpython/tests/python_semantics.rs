@@ -2357,3 +2357,31 @@ mod file_objects {
         assert_eq!(rows[0], vec!["a", "b,c", "say \"hi\""]);
     }
 }
+
+mod lru_cache_store {
+    use stdpython::PyLruCache;
+
+    #[test]
+    fn hits_touch_and_eviction_drops_least_recent() {
+        let mut c: PyLruCache<(i64,), i64> = PyLruCache::new(Some(2));
+        c.put((1,), 10);
+        c.put((2,), 20);
+        // Touch 1 so 2 becomes least-recently-used...
+        assert_eq!(c.get(&(1,)), Some(10));
+        // ...then inserting 3 evicts 2, not 1 (CPython's discipline).
+        c.put((3,), 30);
+        assert_eq!(c.get(&(2,)), None);
+        assert_eq!(c.get(&(1,)), Some(10));
+        assert_eq!(c.get(&(3,)), Some(30));
+    }
+
+    #[test]
+    fn unbounded_cache_never_evicts() {
+        let mut c: PyLruCache<(i64,), i64> = PyLruCache::new(None);
+        for i in 0..1000 {
+            c.put((i,), i * 2);
+        }
+        assert_eq!(c.get(&(0,)), Some(0));
+        assert_eq!(c.get(&(999,)), Some(1998));
+    }
+}

@@ -2727,3 +2727,72 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
         out
     );
 }
+
+// ---- functools.lru_cache / cache decorators ----
+
+#[test]
+fn lru_cache_wraps_the_body_with_a_static_cache() {
+    let src = concat!(
+        "from functools import lru_cache\n",
+        "\n",
+        "@lru_cache\n",
+        "def fib(n: int) -> int:\n",
+        "    if n < 2:\n",
+        "        return n\n",
+        "    return fib(n - 1) + fib(n - 2)\n",
+    );
+    let out = compile(src, "lru1.py");
+    // Python's bare @lru_cache default is maxsize=128.
+    assert!(out.contains("PyLruCache :: new (Some (128"), "generated: {}", out);
+    assert!(out.contains("__lru_uncached"), "generated: {}", out);
+    assert!(out.contains("static __LRU_CACHE"), "generated: {}", out);
+
+    // maxsize=None and functools.cache are unbounded.
+    let src = concat!(
+        "from functools import lru_cache\n",
+        "\n",
+        "@lru_cache(maxsize=None)\n",
+        "def f(n: int) -> int:\n",
+        "    return n\n",
+    );
+    let out = compile(src, "lru2.py");
+    assert!(out.contains("PyLruCache :: new (None)"), "generated: {}", out);
+
+    let src = concat!(
+        "import functools\n",
+        "\n",
+        "@functools.cache\n",
+        "def f(s: str) -> str:\n",
+        "    return s\n",
+    );
+    let out = compile(src, "lru3.py");
+    assert!(out.contains("PyLruCache :: new (None)"), "generated: {}", out);
+    // str parameters key as concrete String.
+    assert!(out.contains("(String ,)"), "generated: {}", out);
+}
+
+#[test]
+fn unknown_decorators_and_unhashable_keys_are_loud() {
+    // Silently ignoring a decorator converts the program into a
+    // different one; refuse.
+    let err = compile_err(
+        "@mystery\ndef f(n: int) -> int:\n    return n\n",
+        "lru4.py",
+    );
+    assert!(err.contains("not supported yet"), "error: {}", err);
+    assert!(err.contains("refuses to silently ignore"), "error: {}", err);
+
+    // Floats are not hashable cache keys in Rust; Python would cache
+    // them, which cannot be reproduced — loud.
+    let err = compile_err(
+        concat!(
+            "from functools import lru_cache\n",
+            "\n",
+            "@lru_cache\n",
+            "def f(x: float) -> float:\n",
+            "    return x\n",
+        ),
+        "lru5.py",
+    );
+    assert!(err.contains("must be annotated int, bool, or str"), "error: {}", err);
+}

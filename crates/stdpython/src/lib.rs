@@ -3632,6 +3632,8 @@ pub use stdlib::json;
 pub use stdlib::collections;
 pub use stdlib::itertools;
 pub use stdlib::functools;
+// The lru_cache backing store must be nameable in generated statics.
+pub use stdlib::functools::PyLruCache;
 pub use stdlib::heapq;
 pub use stdlib::copy;
 pub use stdlib::textwrap;

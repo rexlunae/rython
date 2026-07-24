@@ -250,11 +250,14 @@ impl CodeGen for ImportFrom {
 
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
-            // functools.partial has no runtime symbol: every call site
-            // lowers to a closure at conversion time, so the import
-            // itself emits nothing (an uncalled bare reference is then a
-            // loud unresolved-name error).
-            if self.module == "functools" && alias.name == "partial" {
+            // functools.partial/lru_cache/cache have no runtime symbols:
+            // partial lowers to a closure at each call site, and the
+            // cache decorators rewrite the function definition itself,
+            // so the imports emit nothing (an uncalled bare reference is
+            // then a loud unresolved-name error).
+            if self.module == "functools"
+                && matches!(alias.name.as_str(), "partial" | "lru_cache" | "cache")
+            {
                 continue;
             }
             if alias.name == "*" {
