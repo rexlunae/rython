@@ -278,6 +278,7 @@ impl CodeGen for ImportFrom {
                 ("itertools", "zip_longest") => &["zip_longest_fill"],
                 ("itertools", "groupby") => &["groupby_key"],
                 ("functools", "reduce") => &["reduce_initial"],
+                ("re", "findall") => &["findall2", "findall3"],
                 ("hashlib", "md5") => &["md5_new"],
                 ("hashlib", "sha1") => &["sha1_new"],
                 ("hashlib", "sha256") => &["sha256_new"],

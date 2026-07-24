@@ -2092,3 +2092,76 @@ mod list_sort {
         assert!(msg.contains("NaN"), "panic message: {}", msg);
     }
 }
+
+mod re_named_groups {
+    use stdpython::re;
+    use stdpython::{PyMatchOps, PyRepr};
+
+    #[test]
+    fn group_name_and_groupdict_match_python() {
+        let m = re::search(r"(?P<user>\w+)@(?P<host>[\w.]+)", "bob@example.com", "").unwrap();
+        assert_eq!(m.group_name("user"), "bob");
+        assert_eq!(m.group_name("host"), "example.com");
+        // Numeric access still works alongside names.
+        assert_eq!(m.group(1), "bob");
+        let d = m.groupdict();
+        assert_eq!(d.get("user").map(String::as_str), Some("bob"));
+        assert_eq!(d.get("host").map(String::as_str), Some("example.com"));
+        // Insertion follows group-index order, like Python's dict.
+        let keys: Vec<&String> = d.keys().collect();
+        assert_eq!(keys, ["user", "host"]);
+    }
+
+    #[test]
+    fn unknown_group_name_is_index_error() {
+        let m = re::search(r"(?P<x>a)", "a", "").unwrap();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m.group_name("nope");
+        }))
+        .unwrap_err();
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        // Python: IndexError: no such group
+        assert!(msg.contains("IndexError"), "panic message: {}", msg);
+        assert!(msg.contains("no such group"), "panic message: {}", msg);
+    }
+
+    #[test]
+    fn findall_tuple_variants_match_python() {
+        // python3: re.findall(r"(\w+)=(\d+)", "a=1 b=22") == [('a','1'),('b','22')]
+        assert_eq!(
+            re::findall2(r"(\w+)=(\d+)", "a=1 b=22", "").unwrap(),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "22".to_string())
+            ]
+        );
+        // A non-participating group contributes '' in findall, as Python.
+        assert_eq!(
+            re::findall2(r"(a)|(b)", "ab", "").unwrap(),
+            vec![
+                ("a".to_string(), "".to_string()),
+                ("".to_string(), "b".to_string())
+            ]
+        );
+        assert_eq!(
+            re::findall3(r"(\d+)-(\d+)-(\d+)", "2024-01-05", "").unwrap(),
+            vec![("2024".to_string(), "01".to_string(), "05".to_string())]
+        );
+        // The tuple arity is part of the TYPE: a mismatched pattern is a
+        // loud error, never a mis-shaped result.
+        let err = re::findall2(r"(\d+)", "1", "").unwrap_err();
+        assert!(format!("{}", err).contains("capture groups"), "{}", err);
+    }
+
+    #[test]
+    fn tuples_repr_like_python() {
+        // python3: repr(('a', '1')) == "('a', '1')"
+        assert_eq!(("a".to_string(), "1".to_string()).py_repr(), "('a', '1')");
+        assert_eq!((1i64, 2i64, 3i64).py_repr(), "(1, 2, 3)");
+        // Through Vec: [('a', '1')]
+        assert_eq!(
+            vec![("a".to_string(), "1".to_string())].py_repr(),
+            "[('a', '1')]"
+        );
+    }
+}

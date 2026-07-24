@@ -1085,7 +1085,44 @@ impl<'a> CodeGen for Call {
                             (None, None) => String::new(),
                             _ => unreachable!(),
                         };
-                        let p = qual(&fname);
+                        // findall's result SHAPE depends on the pattern's
+                        // capture-group count (strings for 0-1 groups,
+                        // tuples beyond), so a literal pattern is compiled
+                        // here at conversion time to pick the variant —
+                        // which also surfaces bad patterns before the
+                        // program ever runs. Non-literal patterns keep the
+                        // string shape; 2+ groups there stay a loud
+                        // runtime error.
+                        let mut target = fname.clone();
+                        if fname == "findall" {
+                            if let ExprType::Constant(c) = &self.args[0] {
+                                if let Some(litrs::Literal::String(slit)) = &c.0 {
+                                    let pattern = slit.value();
+                                    let re = regex::Regex::new(&pattern).map_err(|e| {
+                                        format!(
+                                            "re.findall(): cannot compile pattern {:?}: {} \
+                                             (the regex engine does not support Python's \
+                                             backreferences or lookarounds)",
+                                            pattern, e
+                                        )
+                                    })?;
+                                    match re.captures_len() - 1 {
+                                        0 | 1 => {}
+                                        2 => target = "findall2".to_string(),
+                                        3 => target = "findall3".to_string(),
+                                        n => {
+                                            return Err(format!(
+                                                "re.findall() with {} capture groups is \
+                                                 not supported yet (at most 3)",
+                                                n
+                                            )
+                                            .into());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let p = qual(&target);
                         Ok(quote!(#p(&(#pat), &(#text), #flags)?))
                     }
                     // re.split(pattern, string, maxsplit=0, flags=0):
@@ -1484,6 +1521,13 @@ impl<'a> CodeGen for Call {
                 // re Match: m.group() is m.group(0); Rust can't overload.
                 ("group", []) => {
                     return Ok(quote!((#receiver).group(0)));
+                }
+                // m.group("name") for (?P<name>...) groups: Rust can't
+                // overload on the argument type, so the string spelling
+                // routes to group_name. Numeric group(i) falls through to
+                // the plain method call.
+                ("group", [g]) if g.to_string().starts_with('"') => {
+                    return Ok(quote!((#receiver).group_name(#g)));
                 }
                 // str.encode() / encode("utf-8"): UTF-8 bytes, which is
                 // exactly what Rust strings hold.
