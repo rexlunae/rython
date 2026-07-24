@@ -1896,6 +1896,72 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn re_named_groups_and_findall_tuples_match_python_at_runtime() {
+    // (?P<name>...) access by name and groupdict, findall returning
+    // 2- and 3-tuples (chosen from the literal pattern at conversion
+    // time), tuple unpacking over the result, and tuple printing.
+    let scratch = Scratch::new("renamed");
+    let file = scratch.path().join("renamed_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import re\n",
+            "\n",
+            "def main() -> None:\n",
+            "    m = re.search(r\"(?P<user>\\w+)@(?P<host>[\\w.]+)\", \"mail bob@example.com now\")\n",
+            "    if m:\n",
+            "        print(m.group(\"user\"), m.group(\"host\"))\n",
+            "        print(m.group(0))\n",
+            "        d = m.groupdict()\n",
+            "        print(d[\"user\"], d[\"host\"])\n",
+            "        print(m.span())\n",
+            "    pairs = re.findall(r\"(\\w+)=(\\d+)\", \"a=1 b=22 c=333\")\n",
+            "    print(pairs)\n",
+            "    for k, v in pairs:\n",
+            "        print(k, v)\n",
+            "    trios = re.findall(r\"(\\d+)-(\\d+)-(\\d+)\", \"2024-01-05 and 1999-12-31\")\n",
+            "    print(trios)\n",
+            "    print(re.findall(r\"(a)|(b)\", \"ab\"))\n",
+            "    print(re.findall(r\"(?P<k>\\w+):(?P<v>\\d+)\", \"x:1 y:2\", re.IGNORECASE))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/renamed_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "bob example.com",
+            "bob@example.com",
+            "bob example.com",
+            "(5, 20)",
+            "[('a', '1'), ('b', '22'), ('c', '333')]",
+            "a 1",
+            "b 22",
+            "c 333",
+            "[('2024', '01', '05'), ('1999', '12', '31')]",
+            "[('a', ''), ('', 'b')]",
+            "[('x', '1'), ('y', '2')]",
+        ],
+        "re named-group semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn print_and_list_sort_match_python_at_runtime() {
     // Multi-argument print (sep=/end=/flush=, mixed types, Python str
     // semantics for bools/floats/lists) and in-place list.sort in every

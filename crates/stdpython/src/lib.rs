@@ -1476,6 +1476,38 @@ impl<T: PyRepr> PyRepr for Vec<T> {
     }
 }
 
+// Python tuples: ('a', 1). Rust tuples back m.span() and the
+// findall2/findall3 result shapes; str(tuple) is repr(tuple), elements
+// included, so PyDisplay defers to PyRepr.
+impl<A: PyRepr, B: PyRepr> PyRepr for (A, B) {
+    fn py_repr(&self) -> String {
+        format!("({}, {})", self.0.py_repr(), self.1.py_repr())
+    }
+}
+
+impl<A: PyRepr, B: PyRepr, C: PyRepr> PyRepr for (A, B, C) {
+    fn py_repr(&self) -> String {
+        format!(
+            "({}, {}, {})",
+            self.0.py_repr(),
+            self.1.py_repr(),
+            self.2.py_repr()
+        )
+    }
+}
+
+impl<A: PyRepr, B: PyRepr> PyDisplay for (A, B) {
+    fn py_display(&self) -> String {
+        self.py_repr()
+    }
+}
+
+impl<A: PyRepr, B: PyRepr, C: PyRepr> PyDisplay for (A, B, C) {
+    fn py_display(&self) -> String {
+        self.py_repr()
+    }
+}
+
 /// In the Option-based None model, None reprs as Python's None and a
 /// present value reprs as itself.
 impl<T: PyRepr> PyRepr for Option<T> {
@@ -3027,6 +3059,26 @@ impl<K: Eq + Hash + Debug, V> PyIndexMut<K> for PyDict<K, V> {
     fn py_index_mut(&mut self, key: K) -> Result<&mut V, PyException> {
         let msg = format!("{:?}", key);
         self.get_mut(&key)
+            .ok_or_else(|| PyException::new("KeyError", msg))
+    }
+}
+
+// A String-keyed dict (e.g. groupdict()) subscripted with a literal:
+// the literal lowers as &str, which the K-keyed impl above cannot take.
+impl<V: Clone> PyIndex<&str> for PyDict<String, V> {
+    type Output = V;
+    fn py_index(&self, key: &str) -> Result<V, PyException> {
+        self.get(key)
+            .cloned()
+            .ok_or_else(|| PyException::new("KeyError", format!("{:?}", key)))
+    }
+}
+
+impl<V> PyIndexMut<&str> for PyDict<String, V> {
+    type Output = V;
+    fn py_index_mut(&mut self, key: &str) -> Result<&mut V, PyException> {
+        let msg = format!("{:?}", key);
+        self.get_mut(key)
             .ok_or_else(|| PyException::new("KeyError", msg))
     }
 }

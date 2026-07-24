@@ -13,13 +13,15 @@ pub struct PyMatch {
     /// Per-group (0 = whole match) participation: the matched text and
     /// its (start, end) in character offsets.
     groups: Vec<Option<(String, i64, i64)>>,
+    /// Per-group name from (?P<name>...), parallel to `groups`.
+    names: Vec<Option<String>>,
 }
 
 fn char_offset(text: &str, byte: usize) -> i64 {
     text[..byte].chars().count() as i64
 }
 
-fn make_match(text: &str, caps: &regex::Captures) -> PyMatch {
+fn make_match(re: &regex::Regex, text: &str, caps: &regex::Captures) -> PyMatch {
     let groups = (0..caps.len())
         .map(|i| {
             caps.get(i).map(|m| {
@@ -31,7 +33,11 @@ fn make_match(text: &str, caps: &regex::Captures) -> PyMatch {
             })
         })
         .collect();
-    PyMatch { groups }
+    let names = re
+        .capture_names()
+        .map(|n| n.map(|n| n.to_string()))
+        .collect();
+    PyMatch { groups, names }
 }
 
 impl PyMatch {
@@ -60,6 +66,50 @@ impl PyMatch {
     /// m.group(i); m.group() lowers to m.group(0).
     pub fn group(&self, i: i64) -> String {
         self.group_entry(i).0.clone()
+    }
+
+    /// m.group("name") for (?P<name>...) groups; an unknown name is
+    /// Python's IndexError.
+    pub fn group_name(&self, name: &str) -> String {
+        let i = self
+            .names
+            .iter()
+            .position(|n| n.as_deref() == Some(name))
+            .unwrap_or_else(|| {
+                panic!("{}", PyException::new("IndexError", "no such group"));
+            });
+        self.group_entry(i as i64).0.clone()
+    }
+
+    /// m.groupdict(): named groups only, in group-index order as Python.
+    /// A named group that did not participate is None in Python, which a
+    /// typed dict of String cannot hold — loud, like group().
+    pub fn groupdict(&self) -> crate::PyDict<String, String> {
+        let mut out = crate::PyDict::default();
+        for (i, name) in self.names.iter().enumerate() {
+            if let Some(name) = name {
+                match &self.groups[i] {
+                    Some(entry) => {
+                        out.insert(name.clone(), entry.0.clone());
+                    }
+                    None => {
+                        panic!(
+                            "{}",
+                            PyException::new(
+                                "ValueError",
+                                format!(
+                                    "groupdict(): group '{}' did not participate in the \
+                                     match (Python maps it to None, which rython's typed \
+                                     dict cannot)",
+                                    name
+                                ),
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// m.groups(): every group from 1 up.
@@ -99,6 +149,8 @@ impl crate::Truthy for PyMatch {
 /// method on a missed match fails with Python's exact AttributeError.
 pub trait PyMatchOps {
     fn group(&self, i: i64) -> String;
+    fn group_name(&self, name: &str) -> String;
+    fn groupdict(&self) -> crate::PyDict<String, String>;
     fn groups(&self) -> Vec<String>;
     fn start(&self) -> i64;
     fn end(&self) -> i64;
@@ -120,6 +172,18 @@ impl PyMatchOps for Option<PyMatch> {
         match self {
             Some(m) => m.group(i),
             None => none_match_panic("group"),
+        }
+    }
+    fn group_name(&self, name: &str) -> String {
+        match self {
+            Some(m) => m.group_name(name),
+            None => none_match_panic("group"),
+        }
+    }
+    fn groupdict(&self) -> crate::PyDict<String, String> {
+        match self {
+            Some(m) => m.groupdict(),
+            None => none_match_panic("groupdict"),
         }
     }
     fn groups(&self) -> Vec<String> {
@@ -177,7 +241,7 @@ pub fn search<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 ) -> Result<Option<PyMatch>, PyException> {
     let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
-    Ok(re.captures(text).map(|caps| make_match(text, &caps)))
+    Ok(re.captures(text).map(|caps| make_match(&re, text, &caps)))
 }
 
 /// re.match(pattern, string): anchored at the START of the string.
@@ -188,7 +252,7 @@ pub fn r#match<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 ) -> Result<Option<PyMatch>, PyException> {
     let re = compile(&format!(r"\A(?:{})", pattern.as_ref()), flags)?;
     let text = string.as_ref();
-    Ok(re.captures(text).map(|caps| make_match(text, &caps)))
+    Ok(re.captures(text).map(|caps| make_match(&re, text, &caps)))
 }
 
 /// re.fullmatch(pattern, string): the whole string must match.
@@ -199,7 +263,7 @@ pub fn fullmatch<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 ) -> Result<Option<PyMatch>, PyException> {
     let re = compile(&format!(r"\A(?:{})\z", pattern.as_ref()), flags)?;
     let text = string.as_ref();
-    Ok(re.captures(text).map(|caps| make_match(text, &caps)))
+    Ok(re.captures(text).map(|caps| make_match(&re, text, &caps)))
 }
 
 /// re.findall(pattern, string). Python's per-group-count result SHAPES
@@ -235,6 +299,63 @@ pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
             ),
         )),
     }
+}
+
+/// re.findall with exactly 2 capture groups: Python's list of 2-tuples.
+/// A group that does not participate contributes '' (empty string), as
+/// findall does in Python (unlike group(), which returns None).
+pub fn findall2<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
+    pattern: &P,
+    string: &S,
+    flags: &str,
+) -> Result<Vec<(String, String)>, PyException> {
+    let re = compile(pattern.as_ref(), flags)?;
+    check_group_count(&re, 2)?;
+    Ok(re
+        .captures_iter(string.as_ref())
+        .map(|caps| (cap_or_empty(&caps, 1), cap_or_empty(&caps, 2)))
+        .collect())
+}
+
+/// re.findall with exactly 3 capture groups: a list of 3-tuples.
+pub fn findall3<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
+    pattern: &P,
+    string: &S,
+    flags: &str,
+) -> Result<Vec<(String, String, String)>, PyException> {
+    let re = compile(pattern.as_ref(), flags)?;
+    check_group_count(&re, 3)?;
+    Ok(re
+        .captures_iter(string.as_ref())
+        .map(|caps| {
+            (
+                cap_or_empty(&caps, 1),
+                cap_or_empty(&caps, 2),
+                cap_or_empty(&caps, 3),
+            )
+        })
+        .collect())
+}
+
+fn cap_or_empty(caps: &regex::Captures, i: usize) -> String {
+    caps.get(i).map(|g| g.as_str().to_string()).unwrap_or_default()
+}
+
+/// The tuple arity is part of findall2/findall3's TYPE; a pattern with a
+/// different group count would silently mis-shape the result, so it is a
+/// loud error instead.
+fn check_group_count(re: &regex::Regex, expected: usize) -> Result<(), PyException> {
+    let n = re.captures_len() - 1;
+    if n != expected {
+        return Err(PyException::new(
+            "TypeError",
+            format!(
+                "findall{}() requires a pattern with exactly {} capture groups, got {}",
+                expected, expected, n
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// re.split(pattern, string, maxsplit=0). Like Python, capturing groups
@@ -326,7 +447,7 @@ pub fn finditer<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     let text = string.as_ref();
     Ok(re
         .captures_iter(text)
-        .map(|caps| make_match(text, &caps))
+        .map(|caps| make_match(&re, text, &caps))
         .collect())
 }
 

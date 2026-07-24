@@ -2446,3 +2446,73 @@ fn list_sort_positional_arg_is_a_loud_error() {
         err
     );
 }
+
+// ---- re named groups and findall tuple shapes ----
+
+#[test]
+fn findall_picks_variant_from_literal_group_count() {
+    let src = "import re\n\ndef f(s: str):\n    return re.findall(r\"(\\w+)=(\\d+)\", s)\n";
+    let out = compile(src, "fa2.py");
+    assert!(out.contains("findall2"), "generated: {}", out);
+
+    let src = "import re\n\ndef f(s: str):\n    return re.findall(r\"(\\d+)-(\\d+)-(\\d+)\", s)\n";
+    let out = compile(src, "fa3.py");
+    assert!(out.contains("findall3"), "generated: {}", out);
+
+    // 0 or 1 group keeps the string-shaped findall.
+    let src = "import re\n\ndef f(s: str):\n    return re.findall(r\"\\d+\", s)\n";
+    let out = compile(src, "fa1.py");
+    assert!(out.contains("findall ("), "generated: {}", out);
+    assert!(!out.contains("findall2"), "generated: {}", out);
+
+    // A non-literal pattern can't be counted at conversion time; the
+    // string shape (with its loud runtime error for 2+ groups) stays.
+    let src = "import re\n\ndef f(p: str, s: str):\n    return re.findall(p, s)\n";
+    let out = compile(src, "fa_dyn.py");
+    assert!(out.contains("findall ("), "generated: {}", out);
+}
+
+#[test]
+fn findall_bad_or_wide_literal_patterns_error_at_conversion() {
+    let err = compile_err(
+        "import re\n\ndef f(s: str):\n    return re.findall(r\"(a)(b)(c)(d)\", s)\n",
+        "fa4.py",
+    );
+    assert!(err.contains("4 capture groups"), "error: {}", err);
+
+    // An invalid literal pattern surfaces at conversion time, not runtime.
+    let err = compile_err(
+        "import re\n\ndef f(s: str):\n    return re.findall(r\"(unclosed\", s)\n",
+        "fa_bad.py",
+    );
+    assert!(err.contains("cannot compile pattern"), "error: {}", err);
+}
+
+#[test]
+fn match_group_string_routes_to_group_name() {
+    let src = concat!(
+        "import re\n",
+        "\n",
+        "def f(s: str):\n",
+        "    m = re.search(r\"(?P<word>\\w+)\", s)\n",
+        "    return m.group(\"word\")\n",
+    );
+    let out = compile(src, "gn1.py");
+    assert!(
+        out.contains("group_name (\"word\")"),
+        "generated: {}",
+        out
+    );
+
+    // Numeric group access is untouched.
+    let src = concat!(
+        "import re\n",
+        "\n",
+        "def f(s: str):\n",
+        "    m = re.search(r\"(\\w+)\", s)\n",
+        "    return m.group(1)\n",
+    );
+    let out = compile(src, "gn2.py");
+    assert!(out.contains("group (1)"), "generated: {}", out);
+    assert!(!out.contains("group_name"), "generated: {}", out);
+}
