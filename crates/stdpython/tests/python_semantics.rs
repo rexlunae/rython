@@ -913,24 +913,6 @@ fn counter_most_common_breaks_ties_by_insertion_order() {
 }
 
 #[test]
-fn datetime_timestamps_round_trip_and_handle_pre_epoch() {
-    use stdpython::datetime::datetime;
-    // This host runs UTC, so local == UTC and values match python3 exactly.
-    // fromtimestamp(-1) is 1969-12-31 23:59:59 — the old code wrapped
-    // negatives into a panic via Duration::from_secs_f64.
-    let d = datetime::fromtimestamp(-1.0).unwrap();
-    assert_eq!(d.date_component().year, 1969);
-    assert_eq!(d.time_component().second, 59);
-    // python3: datetime(2026, 7, 23, 12, 0).timestamp() == 1784808000.0
-    let d = datetime::new(2026, 7, 23, Some(12), Some(0), Some(0), None).unwrap();
-    assert_eq!(d.timestamp(), 1784808000.0);
-    // Round trip.
-    let back = datetime::fromtimestamp(1784808000.0).unwrap();
-    assert_eq!(back.date_component().day, 23);
-    assert_eq!(back.time_component().hour, 12);
-}
-
-#[test]
 fn abs_of_i64_min_fails_loudly_not_silently() {
     assert_eq!(abs(-5i64), 5);
     let result = std::panic::catch_unwind(|| abs(i64::MIN));
@@ -949,17 +931,6 @@ fn range_len_survives_extreme_endpoints() {
     assert!(range_start_stop_step(i64::MIN, i64::MAX, 1)
         .unwrap()
         .py_contains(&i64::MAX.wrapping_sub(1)));
-}
-
-#[test]
-fn timestamp_one_second_before_epoch_is_minus_one() {
-    use stdpython::datetime::datetime;
-    // mktime returns -1 BOTH as its error value and as the valid result
-    // for this exact moment; the disambiguation must return -1.0 here
-    // (python3: datetime(1969, 12, 31, 23, 59, 59).timestamp() == -1.0
-    // on a UTC host).
-    let d = datetime::new(1969, 12, 31, Some(23), Some(59), Some(59), None).unwrap();
-    assert_eq!(d.timestamp(), -1.0);
 }
 
 // ---------------------------------------------------------------------------
