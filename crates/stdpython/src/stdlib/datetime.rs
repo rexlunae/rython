@@ -858,3 +858,28 @@ pub const MAXYEAR: i32 = 9999;
 pub fn utcnow() -> datetime {
     datetime::utcnow()
 }
+// str(x) of the datetime family is its isoformat-style Display, already
+// verified against CPython; print defers to it.
+impl crate::PyDisplay for date {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl crate::PyDisplay for time {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl crate::PyDisplay for datetime {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl crate::PyDisplay for timedelta {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}

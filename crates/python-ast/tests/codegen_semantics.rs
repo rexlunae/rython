@@ -652,10 +652,11 @@ fn calls_to_user_functions_propagate_with_question_mark() {
     let out = compile(src, "prop.py");
     assert!(out.contains("helper () ?"), "generated: {}", out);
 
-    // Builtins that don't raise stay plain.
+    // Builtins that don't raise stay plain (print takes its argument by
+    // reference).
     let out = compile("def f(x: int):\n    print(x)\n", "plaincall.py");
-    assert!(out.contains("print (x)"), "generated: {}", out);
-    assert!(!out.contains("print (x) ?"), "generated: {}", out);
+    assert!(out.contains("print (& (x))"), "generated: {}", out);
+    assert!(!out.contains("print (& (x)) ?"), "generated: {}", out);
 }
 
 #[test]
@@ -2327,4 +2328,121 @@ fn csv_reader_lowers_by_reference() {
         "cv2.py",
     );
     assert!(out.contains("reader (& ("), "generated: {}", out);
+}
+
+// ---- print and list.sort ----
+
+#[test]
+fn print_multi_arg_renders_through_py_display() {
+    // Multi-argument print pre-renders each argument with py_display
+    // (Python str semantics) and joins with the default sep/end.
+    let out = compile("def f(x: int, s: str):\n    print(x, s)\n", "pr1.py");
+    assert!(
+        out.contains("print_parts (& [py_display (& (x)) , py_display (& (s))] , \" \" , \"\\n\")"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn print_sep_end_flush_keywords_map() {
+    let out = compile(
+        "def f(a: int, b: int):\n    print(a, b, sep='-', end='!')\n",
+        "pr2.py",
+    );
+    assert!(
+        out.contains("print_parts (& [py_display (& (a)) , py_display (& (b))] , \"-\" , \"!\")"),
+        "generated: {}",
+        out
+    );
+
+    // flush= routes to the flushing variant; sep=None means default.
+    let out = compile(
+        "def f(a: int):\n    print(a, sep=None, flush=True)\n",
+        "pr3.py",
+    );
+    assert!(
+        out.contains("print_parts_flush (& [py_display (& (a))] , \" \" , \"\\n\" , true)"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn print_zero_and_single_arg_shapes() {
+    let out = compile("def f():\n    print()\n", "pr4.py");
+    assert!(out.contains("println ! ()"), "generated: {}", out);
+
+    // print(end="") with no arguments still needs a typed empty slice.
+    let out = compile("def f():\n    print(end='')\n", "pr5.py");
+    assert!(
+        out.contains("print_parts (& [] as & [& str] , \" \" , \"\")"),
+        "generated: {}",
+        out
+    );
+
+    let out = compile("def f(x: int):\n    print(x)\n", "pr6.py");
+    assert!(out.contains("print (& (x))"), "generated: {}", out);
+}
+
+#[test]
+fn print_file_keyword_is_a_loud_error() {
+    let err = compile_err(
+        "import sys\n\ndef f():\n    print('x', file=sys.stderr)\n",
+        "pr7.py",
+    );
+    assert!(err.contains("file"), "error: {}", err);
+}
+
+#[test]
+fn list_sort_maps_keyword_shapes_in_place() {
+    let out = compile("def f(xs: list[int]):\n    xs.sort()\n", "srt1.py");
+    assert!(out.contains("(xs) . py_sort ()"), "generated: {}", out);
+
+    let out = compile(
+        "def f(xs: list[int]):\n    xs.sort(reverse=True)\n",
+        "srt2.py",
+    );
+    assert!(
+        out.contains("(xs) . py_sort_reverse (true)"),
+        "generated: {}",
+        out
+    );
+
+    let out = compile(
+        "def f(xs: list[str]):\n    xs.sort(key=lambda w: len(w))\n",
+        "srt3.py",
+    );
+    assert!(out.contains("py_sort_key"), "generated: {}", out);
+
+    let out = compile(
+        "def f(xs: list[str]):\n    xs.sort(key=lambda w: len(w), reverse=True)\n",
+        "srt4.py",
+    );
+    assert!(out.contains("py_sort_key_reverse"), "generated: {}", out);
+}
+
+#[test]
+fn list_sort_on_subscript_uses_place_lowering() {
+    // grid[0].sort() must mutate the real element, not a py_index clone.
+    let out = compile(
+        "def f(grid: list[list[int]]):\n    grid[0].sort()\n",
+        "srt5.py",
+    );
+    assert!(out.contains("py_index_mut"), "generated: {}", out);
+    assert!(out.contains("py_sort"), "generated: {}", out);
+}
+
+#[test]
+fn list_sort_positional_arg_is_a_loud_error() {
+    // Python: TypeError: sort() takes no positional arguments.
+    let err = compile_err(
+        "def f(xs: list[int]):\n    xs.sort(True)\n",
+        "srt6.py",
+    );
+    assert!(
+        err.contains("no positional arguments"),
+        "error: {}",
+        err
+    );
 }

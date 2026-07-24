@@ -1896,6 +1896,92 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn print_and_list_sort_match_python_at_runtime() {
+    // Multi-argument print (sep=/end=/flush=, mixed types, Python str
+    // semantics for bools/floats/lists) and in-place list.sort in every
+    // keyword shape, through generated code. Compared as RAW BYTES so
+    // end="" behavior is pinned too.
+    let scratch = Scratch::new("prints");
+    let file = scratch.path().join("print_sort_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "def show(label: str, values: list[int]) -> None:\n",
+            "    print(label, values)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"alpha\", 1, 2.5, True)\n",
+            "    print(\"a\", \"b\", \"c\", sep=\"\")\n",
+            "    print(\"x\", \"y\", sep=\" | \", end=\".\\n\")\n",
+            "    print(\"no newline\", end=\"\")\n",
+            "    print()\n",
+            "    print(1, 2, 3, sep=\"-\", end=\"!\\n\")\n",
+            "    print(\"flushed\", flush=True)\n",
+            "    print(10000000000000000.0)\n",
+            "    print(False, True)\n",
+            "    print([1, 2, 3], [\"a\", \"b\"])\n",
+            "    show(\"nums:\", [3, 1, 2])\n",
+            "    xs = [3, 1, 2]\n",
+            "    xs.sort()\n",
+            "    print(xs)\n",
+            "    xs.sort(reverse=True)\n",
+            "    print(xs)\n",
+            "    ys = [2.5, -1.0, 0.5]\n",
+            "    ys.sort()\n",
+            "    print(ys)\n",
+            "    words = [\"pear\", \"fig\", \"banana\"]\n",
+            "    words.sort(key=lambda w: len(w))\n",
+            "    print(words)\n",
+            "    words.sort(key=lambda w: len(w), reverse=True)\n",
+            "    print(words)\n",
+            "    grid = [[3, 1], [2, 0]]\n",
+            "    grid[0].sort()\n",
+            "    print(grid)\n",
+            "    words.reverse()\n",
+            "    print(words)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/print_sort_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified byte-for-byte against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "alpha 1 2.5 True\n",
+            "abc\n",
+            "x | y.\n",
+            "no newline\n",
+            "1-2-3!\n",
+            "flushed\n",
+            "1e+16\n",
+            "False True\n",
+            "[1, 2, 3] ['a', 'b']\n",
+            "nums: [3, 1, 2]\n",
+            "[1, 2, 3]\n",
+            "[3, 2, 1]\n",
+            "[-1.0, 0.5, 2.5]\n",
+            "['fig', 'pear', 'banana']\n",
+            "['banana', 'pear', 'fig']\n",
+            "[[1, 3], [2, 0]]\n",
+            "['fig', 'pear', 'banana']\n",
+        ),
+        "print/sort semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn csv_reader_matches_python_at_runtime() {
     // The excel dialect over a list of lines: quoted delimiters, ""
     // escapes, empty records, and int() over parsed fields, through

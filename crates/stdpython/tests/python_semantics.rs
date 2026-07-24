@@ -1994,3 +1994,101 @@ mod csv_module {
         );
     }
 }
+
+mod print_display {
+    use stdpython::py_display;
+
+    #[test]
+    fn py_display_matches_python_str() {
+        // Python's str(): True/False, exponent-form large floats,
+        // unquoted strings — none of which Rust's Display produces.
+        assert_eq!(py_display(&true), "True");
+        assert_eq!(py_display(&false), "False");
+        assert_eq!(py_display(&42i64), "42");
+        assert_eq!(py_display(&1e16f64), "1e+16");
+        assert_eq!(py_display(&2.5f64), "2.5");
+        assert_eq!(py_display(&"plain"), "plain");
+        assert_eq!(py_display(&String::from("owned")), "owned");
+        // len() yields usize; it prints like any int.
+        assert_eq!(py_display(&3usize), "3");
+    }
+
+    #[test]
+    fn containers_use_repr_for_elements_and_none_is_none() {
+        // str(['a']) is "['a']" — element strings keep their quotes.
+        assert_eq!(py_display(&vec![1i64, 2, 3]), "[1, 2, 3]");
+        assert_eq!(
+            py_display(&vec!["a".to_string(), "b".to_string()]),
+            "['a', 'b']"
+        );
+        // Option-based None model: None prints as None, a present string
+        // prints unquoted (str, not repr).
+        assert_eq!(py_display(&Option::<i64>::None), "None");
+        assert_eq!(py_display(&Some("hi")), "hi");
+        assert_eq!(py_display(&Some(2.5f64)), "2.5");
+    }
+}
+
+mod list_sort {
+    use stdpython::PySort;
+
+    #[test]
+    fn py_sort_shapes_match_python() {
+        let mut xs = vec![3i64, 1, 2];
+        xs.py_sort();
+        assert_eq!(xs, vec![1, 2, 3]);
+        xs.py_sort_reverse(true);
+        assert_eq!(xs, vec![3, 2, 1]);
+        xs.py_sort_reverse(false);
+        assert_eq!(xs, vec![1, 2, 3]);
+
+        // Floats sort (Vec's inherent sort would reject them).
+        let mut ys = vec![2.5f64, -1.0, 0.5];
+        ys.py_sort();
+        assert_eq!(ys, vec![-1.0, 0.5, 2.5]);
+
+        // key= runs once per element; lengths fig(3) < pear(4) <
+        // banana(6) order the words.
+        let mut words = vec!["pear".to_string(), "fig".to_string(), "banana".to_string()];
+        words.py_sort_key(|w| w.chars().count() as i64);
+        assert_eq!(words, vec!["fig", "pear", "banana"]);
+        words.py_sort_key_reverse(|w| w.chars().count() as i64, true);
+        assert_eq!(words, vec!["banana", "pear", "fig"]);
+    }
+
+    #[test]
+    fn reverse_true_is_stable_not_a_reversal() {
+        // Python's reverse=True keeps EQUAL keys in source order; a
+        // sort-then-reverse would flip them. python3:
+        // sorted([(1,'a'),(2,'x'),(1,'b')], key=lambda t:t[0], reverse=True)
+        // == [(2,'x'),(1,'a'),(1,'b')]
+        let mut pairs = vec![
+            (1i64, "a".to_string()),
+            (2i64, "x".to_string()),
+            (1i64, "b".to_string()),
+        ];
+        pairs.py_sort_key_reverse(|t| t.0, true);
+        assert_eq!(
+            pairs,
+            vec![
+                (2i64, "x".to_string()),
+                (1i64, "a".to_string()),
+                (1i64, "b".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn nan_sort_panics_loudly() {
+        let mut xs = vec![1.0f64, f64::NAN];
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            xs.py_sort();
+        }))
+        .unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(msg.contains("NaN"), "panic message: {}", msg);
+    }
+}

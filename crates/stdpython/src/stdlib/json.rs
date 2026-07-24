@@ -790,3 +790,9 @@ fn escape_json_string(s: &str, ensure_ascii: bool) -> String {
     }
     result
 }
+// str(value) of a parsed JSON value is its Python-literal Display form.
+impl crate::PyDisplay for JSONValue {
+    fn py_display(&self) -> String {
+        self.to_string()
+    }
+}
