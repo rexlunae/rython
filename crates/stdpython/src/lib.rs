@@ -3623,6 +3623,8 @@ pub use stdlib::time;
 pub use stdlib::re;
 #[cfg(feature = "std")]
 pub use stdlib::io;
+#[cfg(feature = "std")]
+pub use stdlib::argparse;
 // The Match-method trait must be in scope for m.group()/m.span() to
 // resolve through the Option layer in generated code.
 #[cfg(feature = "std")]

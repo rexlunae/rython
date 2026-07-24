@@ -2796,3 +2796,80 @@ fn unknown_decorators_and_unhashable_keys_are_loud() {
     );
     assert!(err.contains("must be annotated int, bool, or str"), "error: {}", err);
 }
+
+// ---- argparse: conversion-time parsers ----
+
+#[test]
+fn argparse_parser_statements_become_a_typed_struct() {
+    let src = concat!(
+        "import argparse\n",
+        "\n",
+        "def main() -> None:\n",
+        "    p = argparse.ArgumentParser(prog=\"tool\", description=\"Demo\")\n",
+        "    p.add_argument(\"name\")\n",
+        "    p.add_argument(\"count\", type=int)\n",
+        "    p.add_argument(\"--verbose\", action=\"store_true\")\n",
+        "    p.add_argument(\"--scale\", type=float, default=1.0)\n",
+        "    args = p.parse_args()\n",
+        "    print(args.name, args.count, args.scale)\n",
+    );
+    let out = compile(src, "ap1.py");
+    // The parser-building statements vanish; a typed namespace struct
+    // and one run_parser call take their place.
+    assert!(out.contains("struct __ArgparseArgs"), "generated: {}", out);
+    assert!(out.contains("argparse :: run_parser"), "generated: {}", out);
+    assert!(out.contains("name : String"), "generated: {}", out);
+    assert!(out.contains("count : i64"), "generated: {}", out);
+    assert!(out.contains("verbose : bool"), "generated: {}", out);
+    assert!(out.contains("scale : f64"), "generated: {}", out);
+    assert!(!out.contains("ArgumentParser"), "generated: {}", out);
+    assert!(!out.contains("add_argument"), "generated: {}", out);
+    // The parser variable is gone entirely (not even a hoisted let).
+    assert!(!out.contains("let p"), "generated: {}", out);
+}
+
+#[test]
+fn argparse_dynamic_or_unsupported_specs_are_loud() {
+    // A value-taking option without default= would be None in Python,
+    // which the typed field cannot hold.
+    let err = compile_err(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(\"--scale\", type=float)\n",
+            "    args = p.parse_args()\n",
+        ),
+        "ap2.py",
+    );
+    assert!(err.contains("needs default="), "error: {}", err);
+
+    // Dynamic names cannot shape a struct at conversion time.
+    let err = compile_err(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(n: str) -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(n)\n",
+            "    args = p.parse_args()\n",
+        ),
+        "ap3.py",
+    );
+    assert!(err.contains("string literal"), "error: {}", err);
+
+    // Unsupported add_argument keywords refuse loudly.
+    let err = compile_err(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(\"xs\", nargs=\"+\")\n",
+            "    args = p.parse_args()\n",
+        ),
+        "ap4.py",
+    );
+    assert!(err.contains("'nargs' is not supported yet"), "error: {}", err);
+}

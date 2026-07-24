@@ -1896,6 +1896,113 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn argparse_matches_python_at_runtime() {
+    // The conversion-time parser end to end: help text (layout and
+    // column math), value forms (--opt V and --opt=V), prefix
+    // abbreviation, store_true, typed defaults, and the exact
+    // usage+error output with exit code 2 on missing/invalid/unknown
+    // arguments. Everything below was captured from python3 verbatim.
+    let scratch = Scratch::new("argps");
+    let file = scratch.path().join("arg_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\", description=\"Demo tool\")\n",
+            "    p.add_argument(\"name\", help=\"who to greet\")\n",
+            "    p.add_argument(\"count\", type=int)\n",
+            "    p.add_argument(\"--verbose\", action=\"store_true\", help=\"say more\")\n",
+            "    p.add_argument(\"--scale\", type=float, default=1.0)\n",
+            "    p.add_argument(\"--label\", default=\"none\")\n",
+            "    args = p.parse_args()\n",
+            "    if args.verbose:\n",
+            "        print(\"verbose mode\")\n",
+            "    print(args.name, args.count * 2, args.scale, args.label)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/arg_demo");
+
+    let usage = "usage: tool [-h] [--verbose] [--scale SCALE] [--label LABEL] name count";
+
+    // --help: python3's exact text, exit 0.
+    let output = Command::new(&bin).arg("--help").output().expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: tool [-h] [--verbose] [--scale SCALE] [--label LABEL] name count\n",
+            "\n",
+            "Demo tool\n",
+            "\n",
+            "positional arguments:\n",
+            "  name           who to greet\n",
+            "  count\n",
+            "\n",
+            "options:\n",
+            "  -h, --help     show this help message and exit\n",
+            "  --verbose      say more\n",
+            "  --scale SCALE\n",
+            "  --label LABEL\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    // Successful runs: split and = value forms, prefix abbreviation.
+    let output = Command::new(&bin)
+        .args(["bob", "3", "--scale", "2.5", "--verbose"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "verbose mode\nbob 6 2.5 none\n"
+    );
+    let output = Command::new(&bin)
+        .args(["bob", "3", "--scale=0.5", "--lab", "x"])
+        .output()
+        .expect("run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "bob 6 0.5 x\n");
+
+    // Errors: usage + message on stderr, exit 2, all python3-verbatim.
+    let cases = [
+        (
+            vec!["bob"],
+            "tool: error: the following arguments are required: count",
+        ),
+        (
+            vec!["bob", "xx"],
+            "tool: error: argument count: invalid int value: 'xx'",
+        ),
+        (
+            vec!["bob", "1", "--bogus"],
+            "tool: error: unrecognized arguments: --bogus",
+        ),
+    ];
+    for (args, want) in cases {
+        let output = Command::new(&bin).args(&args).output().expect("run");
+        assert_eq!(output.status.code(), Some(2), "args: {:?}", args);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("{}\n{}\n", usage, want),
+            "args: {:?}",
+            args
+        );
+    }
+}
+
+#[test]
 fn lru_cache_matches_python_at_runtime() {
     // Memoization through recursion (fib), unbounded caches skipping
     // recomputation (print side effects fire once per distinct

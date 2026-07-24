@@ -49,6 +49,353 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
 impl PyStatementTrait for FunctionDef {
 }
 
+/// One add_argument spec collected at conversion time.
+struct ArgparseSpec {
+    name: String,
+    kind: &'static str, // "Str" | "Int" | "Float" | "StoreTrue"
+    default: Option<ExprType>,
+    help: Option<String>,
+}
+
+/// The argparse rewrite plan for a function body: parser-building
+/// statements to drop, the parse_args assignment to replace, and the
+/// literal specs. ArgumentParser/add_argument/parse_args are evaluated
+/// HERE, at conversion time — only literal specs can shape the typed
+/// namespace struct, so anything dynamic is a loud error.
+struct ArgparseRewrite {
+    skip: std::collections::HashSet<usize>,
+    parse_index: usize,
+    args_var: String,
+    prog: Option<String>,
+    description: Option<String>,
+    specs: Vec<ArgparseSpec>,
+}
+
+fn literal_str(e: &ExprType) -> Option<String> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(s)) => Some(s.value().to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn scan_argparse(
+    body: &[Statement],
+) -> Result<Option<ArgparseRewrite>, Box<dyn std::error::Error>> {
+    // Find `<var> = argparse.ArgumentParser(...)`.
+    let mut parser: Option<(usize, String, Option<String>, Option<String>)> = None;
+    for (i, stmt) in body.iter().enumerate() {
+        let StatementType::Assign(assign) = &stmt.statement else {
+            continue;
+        };
+        let ExprType::Call(call) = &assign.value else {
+            continue;
+        };
+        let ExprType::Attribute(attr) = call.func.as_ref() else {
+            continue;
+        };
+        let is_ctor = attr.attr == "ArgumentParser"
+            && matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "argparse");
+        if !is_ctor {
+            continue;
+        }
+        let [ExprType::Name(target)] = assign.targets.as_slice() else {
+            return Err("argparse.ArgumentParser must be assigned to a plain name".into());
+        };
+        if !call.args.is_empty() {
+            return Err(
+                "argparse.ArgumentParser: pass prog=/description= by keyword".into(),
+            );
+        }
+        let mut prog = None;
+        let mut description = None;
+        for kw in &call.keywords {
+            let value = literal_str(&kw.value).ok_or_else(|| {
+                format!(
+                    "argparse.ArgumentParser: {} must be a string literal (the parser \
+                     is evaluated at conversion time)",
+                    kw.arg.as_deref().unwrap_or("argument")
+                )
+            })?;
+            match kw.arg.as_deref() {
+                Some("prog") => prog = Some(value),
+                Some("description") => description = Some(value),
+                other => {
+                    return Err(format!(
+                        "argparse.ArgumentParser keyword '{}' is not supported yet",
+                        other.unwrap_or("**kwargs")
+                    )
+                    .into())
+                }
+            }
+        }
+        parser = Some((i, target.id.clone(), prog, description));
+        break;
+    }
+    let Some((ctor_index, pvar, prog, description)) = parser else {
+        return Ok(None);
+    };
+
+    // Collect `<pvar>.add_argument(...)` statements and the final
+    // `<args> = <pvar>.parse_args()`.
+    let mut skip = std::collections::HashSet::from([ctor_index]);
+    let mut specs = Vec::new();
+    let mut parse: Option<(usize, String)> = None;
+    for (i, stmt) in body.iter().enumerate().skip(ctor_index + 1) {
+        let call_on_parser = |call: &crate::Call| -> Option<String> {
+            let ExprType::Attribute(attr) = call.func.as_ref() else {
+                return None;
+            };
+            match attr.value.as_ref() {
+                ExprType::Name(m) if m.id == pvar => Some(attr.attr.clone()),
+                _ => None,
+            }
+        };
+        // A bare call statement surfaces as Expr(Call) or Call
+        // depending on the extraction path; normalize.
+        let stmt_call: Option<&crate::Call> = match &stmt.statement {
+            StatementType::Call(c) => Some(c),
+            StatementType::Expr(e) => match &e.value {
+                ExprType::Call(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        match &stmt.statement {
+            _ if stmt_call.is_some_and(|c| call_on_parser(c) == Some("add_argument".into())) => {
+                let call = stmt_call.expect("checked");
+                if parse.is_some() {
+                    return Err("add_argument after parse_args is not supported".into());
+                }
+                let [name_expr] = call.args.as_slice() else {
+                    return Err(
+                        "add_argument takes exactly one name (short aliases are not \
+                         supported yet)"
+                            .into(),
+                    );
+                };
+                let name = literal_str(name_expr)
+                    .ok_or("add_argument: the name must be a string literal")?;
+                if name.starts_with('-') && !name.starts_with("--") {
+                    return Err(format!(
+                        "add_argument: short option '{}' is not supported yet; use the \
+                         --long form",
+                        name
+                    )
+                    .into());
+                }
+                let mut kind: Option<&'static str> = None;
+                let mut default = None;
+                let mut help = None;
+                let mut store_true = false;
+                for kw in &call.keywords {
+                    match kw.arg.as_deref() {
+                        Some("type") => {
+                            kind = Some(match &kw.value {
+                                ExprType::Name(n) if n.id == "int" => "Int",
+                                ExprType::Name(n) if n.id == "float" => "Float",
+                                ExprType::Name(n) if n.id == "str" => "Str",
+                                _ => {
+                                    return Err(format!(
+                                        "add_argument('{}'): type must be int, float, \
+                                         or str",
+                                        name
+                                    )
+                                    .into())
+                                }
+                            });
+                        }
+                        Some("default") => default = Some(kw.value.clone()),
+                        Some("help") => {
+                            help = Some(literal_str(&kw.value).ok_or_else(|| {
+                                format!(
+                                    "add_argument('{}'): help must be a string literal",
+                                    name
+                                )
+                            })?)
+                        }
+                        Some("action") => match literal_str(&kw.value).as_deref() {
+                            Some("store_true") => store_true = true,
+                            _ => {
+                                return Err(format!(
+                                    "add_argument('{}'): only action=\"store_true\" is \
+                                     supported",
+                                    name
+                                )
+                                .into())
+                            }
+                        },
+                        other => {
+                            return Err(format!(
+                                "add_argument('{}'): keyword '{}' is not supported yet",
+                                name,
+                                other.unwrap_or("**kwargs")
+                            )
+                            .into())
+                        }
+                    }
+                }
+                let kind = if store_true {
+                    if kind.is_some() || default.is_some() {
+                        return Err(format!(
+                            "add_argument('{}'): store_true takes neither type nor \
+                             default",
+                            name
+                        )
+                        .into());
+                    }
+                    "StoreTrue"
+                } else {
+                    kind.unwrap_or("Str")
+                };
+                let is_positional = !name.starts_with('-');
+                if is_positional && default.is_some() {
+                    return Err(format!(
+                        "add_argument('{}'): defaults on positionals are not supported",
+                        name
+                    )
+                    .into());
+                }
+                if !is_positional && !store_true && default.is_none() {
+                    return Err(format!(
+                        "add_argument('{}'): a value-taking option needs default= (its \
+                         Python default None cannot inhabit a typed field)",
+                        name
+                    )
+                    .into());
+                }
+                specs.push(ArgparseSpec {
+                    name,
+                    kind,
+                    default,
+                    help,
+                });
+                skip.insert(i);
+            }
+            StatementType::Assign(assign) => {
+                if let ExprType::Call(call) = &assign.value {
+                    if call_on_parser(call) == Some("parse_args".into()) {
+                        if !call.args.is_empty() || !call.keywords.is_empty() {
+                            return Err("parse_args with arguments is not supported".into());
+                        }
+                        let [ExprType::Name(t)] = assign.targets.as_slice() else {
+                            return Err("parse_args must be assigned to a plain name".into());
+                        };
+                        parse = Some((i, t.id.clone()));
+                    } else if call_on_parser(call).is_some() {
+                        return Err(format!(
+                            "argparse parser `{}`: only add_argument and parse_args \
+                             are supported",
+                            pvar
+                        )
+                        .into());
+                    }
+                }
+            }
+            _ if stmt_call.is_some_and(|c| call_on_parser(c).is_some()) => {
+                return Err(format!(
+                    "argparse parser `{}`: only add_argument and parse_args are \
+                     supported",
+                    pvar
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
+    let Some((parse_index, args_var)) = parse else {
+        return Err("argparse.ArgumentParser built but parse_args() never assigned".into());
+    };
+    Ok(Some(ArgparseRewrite {
+        skip,
+        parse_index,
+        args_var,
+        prog,
+        description,
+        specs,
+    }))
+}
+
+/// Emit the parse_args replacement: a namespace struct typed from the
+/// specs, the run_parser call, and the destructuring assignment into
+/// the (hoisted) namespace variable.
+fn lower_parse_args(
+    rw: &ArgparseRewrite,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    use quote::format_ident;
+    let mut fields = Vec::new();
+    let mut field_types = Vec::new();
+    let mut spec_tokens = Vec::new();
+    let mut accessors = Vec::new();
+    for spec in &rw.specs {
+        let dest = spec.name.trim_start_matches('-').replace('-', "_");
+        fields.push(crate::safe_ident(&dest));
+        let (fty, kind, accessor) = match spec.kind {
+            "Int" => (quote!(i64), quote!(Int), format_ident!("into_int")),
+            "Float" => (quote!(f64), quote!(Float), format_ident!("into_float")),
+            "StoreTrue" => (quote!(bool), quote!(StoreTrue), format_ident!("into_flag")),
+            _ => (quote!(String), quote!(Str), format_ident!("into_str")),
+        };
+        field_types.push(fty);
+        accessors.push(accessor);
+        let default = match &spec.default {
+            None => quote!(None),
+            Some(e) => {
+                let d = e
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                // Coerce literal defaults onto the declared type
+                // (default=1 with type=float is valid Python).
+                match spec.kind {
+                    "Int" => quote!(Some(argparse::ParsedValue::Int((#d) as i64))),
+                    "Float" => quote!(Some(argparse::ParsedValue::Float((#d) as f64))),
+                    _ => quote!(Some(argparse::ParsedValue::Str((#d).to_string()))),
+                }
+            }
+        };
+        let name = &spec.name;
+        let help = match &spec.help {
+            Some(h) => quote!(Some(#h)),
+            None => quote!(None),
+        };
+        spec_tokens.push(quote!(argparse::ArgSpec {
+            name: #name,
+            kind: argparse::ArgKind::#kind,
+            default: #default,
+            help: #help,
+        }));
+    }
+    let prog = match &rw.prog {
+        Some(p) => quote!(Some(#p)),
+        None => quote!(None),
+    };
+    let description = match &rw.description {
+        Some(d) => quote!(Some(#d)),
+        None => quote!(None),
+    };
+    let args_var = crate::safe_ident(&rw.args_var);
+    Ok(quote! {
+        #[allow(non_camel_case_types)]
+        struct __ArgparseArgs {
+            #(#fields: #field_types,)*
+        }
+        let mut __parsed = argparse::run_parser(
+            #prog,
+            #description,
+            &[#(#spec_tokens),*],
+        )?
+        .into_iter();
+        #args_var = __ArgparseArgs {
+            #(#fields: __parsed.next().expect("one value per spec").#accessors(),)*
+        }
+    })
+}
+
 /// The cache discipline a functools cache decorator asks for: None
 /// means uncached; Some(None) is unbounded (functools.cache or
 /// lru_cache(maxsize=None)); Some(Some(n)) is a bounded LRU (Python's
@@ -151,6 +498,26 @@ impl CodeGen for FunctionDef {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
+
+        // An argparse parser in the body is evaluated at conversion time:
+        // its statements vanish and parse_args becomes a typed struct.
+        let argparse_rewrite = scan_argparse(&self.body)?;
+        let effective_body: Vec<Statement> = match &argparse_rewrite {
+            None => self.body.clone(),
+            Some(rw) => self
+                .body
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !rw.skip.contains(i))
+                .map(|(_, s)| s.clone())
+                .collect(),
+        };
+        // The parse_args statement's position within the filtered body.
+        let argparse_parse_at: Option<usize> = argparse_rewrite.as_ref().map(|rw| {
+            (0..rw.parse_index)
+                .filter(|i| !rw.skip.contains(i))
+                .count()
+        });
 
         // functools cache decorators rewrite the whole definition below;
         // any OTHER decorator is a loud error (see parse_cache_decorator).
@@ -297,7 +664,7 @@ impl CodeGen for FunctionDef {
         // and a read-only user method shadowing a builtin mutator name
         // (`pop`, `update`, ...) does NOT force a spurious `mut`.
         let scope = crate::analyze_scope_with(
-            &self.body,
+            &effective_body,
             &param_names,
             &crate::class_call_resolver(&ctx, &symbols),
         );
@@ -411,7 +778,18 @@ impl CodeGen for FunctionDef {
         // A leading docstring is emitted as doc comments below; skip it here
         // so it isn't also emitted as a statement.
         let body_start = if self.get_docstring().is_some() { 1 } else { 0 };
-        for s in self.body.iter().skip(body_start) {
+        for (i, s) in effective_body.iter().enumerate().skip(body_start) {
+            if Some(i) == argparse_parse_at {
+                let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
+                streams.extend(lower_parse_args(
+                    rw,
+                    &ctx,
+                    &options,
+                    &symbols,
+                )?);
+                streams.extend(quote!(;));
+                continue;
+            }
             streams.extend(
                 s.clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?,

@@ -86,6 +86,10 @@ pub mod re;
 #[cfg(feature = "std")]
 pub mod io;
 
+/// Python argparse module: the runtime half of conversion-time parsers.
+#[cfg(feature = "std")]
+pub mod argparse;
+
 /// Python hashlib module - message digests
 pub mod hashlib;
 
