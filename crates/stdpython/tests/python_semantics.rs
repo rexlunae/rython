@@ -1599,20 +1599,20 @@ mod re_module {
         assert_eq!(re::sub("cat", "dog", "cat cat", 0, "").unwrap(), "dog dog");
 
         assert_eq!(
-            re::split(r"[,;]\s*", "a, b;c ,d", "").unwrap(),
+            re::split(r"[,;]\s*", "a, b;c ,d", 0, "").unwrap(),
             vec!["a", "b", "c ", "d"]
         );
-        assert_eq!(re::split(r"\d", "abc", "").unwrap(), vec!["abc"]);
+        assert_eq!(re::split(r"\d", "abc", 0, "").unwrap(), vec!["abc"]);
         // Capturing groups interleave the delimiters, as in Python:
         // re.split(r"(\d)", "a1b") == ['a', '1', 'b'].
-        assert_eq!(re::split(r"(\d)", "a1b", "").unwrap(), vec!["a", "1", "b"]);
-        assert_eq!(re::split(r"(\d)", "1", "").unwrap(), vec!["", "1", ""]);
+        assert_eq!(re::split(r"(\d)", "a1b", 0, "").unwrap(), vec!["a", "1", "b"]);
+        assert_eq!(re::split(r"(\d)", "1", 0, "").unwrap(), vec!["", "1", ""]);
         assert_eq!(
-            re::split(r"([,;])\s*", "a, b;c", "").unwrap(),
+            re::split(r"([,;])\s*", "a, b;c", 0, "").unwrap(),
             vec!["a", ",", "b", ";", "c"]
         );
         // A non-participating group becomes None in Python — loud here.
-        let e = re::split(r"(x)|(\d)", "a1b", "").unwrap_err();
+        let e = re::split(r"(x)|(\d)", "a1b", 0, "").unwrap_err();
         assert!(
             format!("{}", e).contains("did not participate"),
             "err: {}",
@@ -1657,6 +1657,25 @@ mod re_module {
         assert_eq!(re::sub("a", "-", "aaaa", 2, "").unwrap(), "--aa");
         assert_eq!(re::sub("a", "-", "aaaa", 0, "").unwrap(), "----");
         assert_eq!(re::sub("a", "-", "aaaa", -1, "").unwrap(), "aaaa");
+
+        // split maxsplit: 0 unlimited, positive limits, negative none.
+        assert_eq!(
+            re::split(r"\s+", "a b c d", 1, "").unwrap(),
+            vec!["a", "b c d"]
+        );
+        assert_eq!(
+            re::split(r"\s+", "a b c d", -1, "").unwrap(),
+            vec!["a b c d"]
+        );
+        // Capturing groups still interleave under a limit.
+        assert_eq!(
+            re::split(r"(\d)", "a1b2c", 1, "").unwrap(),
+            vec!["a", "1", "b2c"]
+        );
+        assert_eq!(
+            re::split("x", "AxBxC", 1, "i").unwrap(),
+            vec!["A", "BxC"]
+        );
 
         let spans: Vec<(i64, i64)> = re::finditer(r"\d+", "a1 b22", "")
             .unwrap()

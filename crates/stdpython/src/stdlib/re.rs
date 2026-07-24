@@ -237,24 +237,30 @@ pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     }
 }
 
-/// re.split(pattern, string). Like Python, capturing groups in the
-/// pattern interleave the captured delimiter text into the result:
-/// split(r"(\d)", "a1b") is ['a', '1', 'b']. A group that does NOT
-/// participate in a delimiter match becomes None in Python, which a typed
-/// list cannot hold — that case is a loud error.
+/// re.split(pattern, string, maxsplit=0). Like Python, capturing groups
+/// in the pattern interleave the captured delimiter text into the
+/// result: split(r"(\d)", "a1b") is ['a', '1', 'b']; maxsplit 0 means
+/// unlimited and a negative maxsplit means no splits at all. A group
+/// that does NOT participate in a delimiter match becomes None in
+/// Python, which a typed list cannot hold — that case is a loud error.
 pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     pattern: &P,
     string: &S,
+    maxsplit: i64,
     flags: &str,
 ) -> Result<Vec<String>, PyException> {
-    let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
-    if re.captures_len() == 1 {
-        return Ok(re.split(text).map(|s| s.to_string()).collect());
+    if maxsplit < 0 {
+        return Ok(alloc::vec![text.to_string()]);
     }
+    let re = compile(pattern.as_ref(), flags)?;
     let mut out = Vec::new();
     let mut last = 0usize;
+    let mut splits = 0i64;
     for caps in re.captures_iter(text) {
+        if maxsplit > 0 && splits == maxsplit {
+            break;
+        }
         let whole = caps.get(0).expect("group 0 always participates");
         out.push(text[last..whole.start()].to_string());
         for i in 1..caps.len() {
@@ -274,6 +280,7 @@ pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
             }
         }
         last = whole.end();
+        splits += 1;
     }
     out.push(text[last..].to_string());
     Ok(out)

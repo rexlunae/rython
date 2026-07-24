@@ -814,6 +814,7 @@ impl<'a> CodeGen for Call {
                 let mut width_kw: Option<crate::ExprType> = None;
                 let mut flags_kw: Option<crate::ExprType> = None;
                 let mut count_kw: Option<crate::ExprType> = None;
+                let mut maxsplit_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
                         Some("width")
@@ -823,6 +824,7 @@ impl<'a> CodeGen for Call {
                         }
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
+                        Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
                         _ => {
                             return Err(format!(
                                 "{}() got an unexpected keyword argument '{}'",
@@ -998,8 +1000,7 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(&(#t), #width)?))
                     }
                     (
-                        "search" | "match" | "fullmatch" | "findall" | "finditer"
-                            | "split",
+                        "search" | "match" | "fullmatch" | "findall" | "finditer",
                         [pat, text, ..],
                     ) => {
                         if rendered.len() > 2 && flags_kw.is_some() {
@@ -1017,6 +1018,51 @@ impl<'a> CodeGen for Call {
                         };
                         let p = qual(&fname);
                         Ok(quote!(#p(&(#pat), &(#text), #flags)?))
+                    }
+                    // re.split(pattern, string, maxsplit=0, flags=0):
+                    // the THIRD positional is maxsplit, unlike the other
+                    // re functions where it is flags.
+                    ("split", [pat, text, ..]) => {
+                        if rendered.len() > 4 {
+                            return Err("split() takes at most 4 positional arguments"
+                                .to_string()
+                                .into());
+                        }
+                        if rendered.len() > 2 && maxsplit_kw.is_some() {
+                            return Err(
+                                "split() got multiple values for argument 'maxsplit'"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                        if rendered.len() > 3 && flags_kw.is_some() {
+                            return Err(
+                                "split() got multiple values for argument 'flags'"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                        let maxsplit = match (rendered.get(2), maxsplit_kw) {
+                            (Some(m), None) => quote!(#m),
+                            (None, Some(m)) => {
+                                let m = m.to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                quote!(#m)
+                            }
+                            (None, None) => quote!(0),
+                            _ => unreachable!(),
+                        };
+                        let flags = match (self.args.get(3), flags_kw) {
+                            (Some(e), None) => flag_letters(e)?,
+                            (None, Some(e)) => flag_letters(&e)?,
+                            (None, None) => String::new(),
+                            _ => unreachable!(),
+                        };
+                        let p = qual("split");
+                        Ok(quote!(#p(&(#pat), &(#text), #maxsplit, #flags)?))
                     }
                     ("sub", [pat, repl, text, ..]) => {
                         if rendered.len() > 4 {

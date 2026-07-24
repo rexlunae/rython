@@ -2165,6 +2165,17 @@ fn re_calls_lower_to_borrowing_fallible_paths() {
         "r9.py",
     );
     assert!(err.contains("unsupported re flag"), "error: {}", err);
+    // split's THIRD positional is maxsplit (not flags, unlike the rest).
+    let out = compile(
+        "import re\nxs = re.split(r\"a\", \"b\", 1)\n",
+        "r10.py",
+    );
+    assert!(out.contains("re :: split (& (\"a\") , & (\"b\") , 1 , \"\") ?"), "generated: {}", out);
+    let out = compile(
+        "import re\nxs = re.split(r\"a\", \"b\", maxsplit=2, flags=re.IGNORECASE)\n",
+        "r11.py",
+    );
+    assert!(out.contains(", 2 , \"i\") ?"), "generated: {}", out);
 }
 
 // ---------------------------------------------------------------------------
