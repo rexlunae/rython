@@ -248,6 +248,13 @@ impl CodeGen for ImportFrom {
 
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
+            // functools.partial has no runtime symbol: every call site
+            // lowers to a closure at conversion time, so the import
+            // itself emits nothing (an uncalled bare reference is then a
+            // loud unresolved-name error).
+            if self.module == "functools" && alias.name == "partial" {
+                continue;
+            }
             if alias.name == "*" {
                 tokens.extend(quote! { use #root #(::#module_path)*::*; });
                 continue;

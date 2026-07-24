@@ -3613,6 +3613,10 @@ pub use stdlib::math;
 pub use stdlib::random;
 #[cfg(feature = "std")]
 pub use stdlib::datetime;
+// The keyword-replace trait and its args struct must be in scope for
+// dt.replace(hour=...) to resolve in generated code.
+#[cfg(feature = "std")]
+pub use stdlib::datetime::{PyReplace, ReplaceArgs};
 #[cfg(feature = "std")]
 pub use stdlib::time;
 #[cfg(feature = "std")]

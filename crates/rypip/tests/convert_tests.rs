@@ -1896,6 +1896,125 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn functools_partial_matches_python_at_runtime() {
+    // partial over statically-known functions: leading-argument binding,
+    // full binding (zero-arg closure), multi-parameter tails, and
+    // exception propagation through the bound name.
+    let scratch = Scratch::new("partials");
+    let file = scratch.path().join("part_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from functools import partial\n",
+            "\n",
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+            "\n",
+            "def clamp(lo: int, hi: int, x: int) -> int:\n",
+            "    if x < lo:\n",
+            "        return lo\n",
+            "    if x > hi:\n",
+            "        return hi\n",
+            "    return x\n",
+            "\n",
+            "def main() -> None:\n",
+            "    add5 = partial(add, 5)\n",
+            "    print(add5(3))\n",
+            "    print(add5(10))\n",
+            "    add_both = partial(add, 2, 3)\n",
+            "    print(add_both())\n",
+            "    unit = partial(clamp, 0, 100)\n",
+            "    print(unit(-4), unit(50), unit(300))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/part_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["8", "15", "5", "0 50 100"],
+        "functools.partial semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn replace_keywords_match_python_at_runtime() {
+    // dt.replace(field=...) through the type-dispatched PyReplace trait:
+    // datetime and date receivers, foreign-field TypeError, range
+    // ValueError, and str.replace coexisting untouched.
+    let scratch = Scratch::new("replkw");
+    let file = scratch.path().join("repl_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from datetime import datetime, date\n",
+            "\n",
+            "def main() -> None:\n",
+            "    d = datetime(2024, 2, 29, 13, 5, 7, 123456)\n",
+            "    print(d.replace(hour=14))\n",
+            "    print(d.replace(year=2023, day=28))\n",
+            "    print(d.replace(minute=0, second=0, microsecond=0))\n",
+            "    dd = date(2024, 2, 29)\n",
+            "    print(dd.replace(month=3, day=1))\n",
+            "    try:\n",
+            "        print(dd.replace(hour=1))\n",
+            "    except TypeError:\n",
+            "        print(\"date has no hour\")\n",
+            "    try:\n",
+            "        print(d.replace(month=2, day=30))\n",
+            "    except ValueError:\n",
+            "        print(\"day out of range caught\")\n",
+            "    s = \"banana\"\n",
+            "    print(s.replace(\"a\", \"o\"))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/repl_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2024-02-29 14:05:07.123456",
+            "2023-02-28 13:05:07.123456",
+            "2024-02-29 13:00:00",
+            "2024-03-01",
+            "date has no hour",
+            "day out of range caught",
+            "bonono",
+        ],
+        "replace-keyword semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn datetime_fields_and_strptime_directives_match_python_at_runtime() {
     // Flat attribute access (dt.year .. dt.microsecond), the dt.date()
     // and dt.time() methods, and the %a/%A/%j strptime directives,

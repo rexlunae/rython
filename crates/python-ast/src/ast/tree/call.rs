@@ -30,6 +30,28 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Call {
     }
 }
 
+/// Is this callee functools.partial — via `from functools import
+/// partial` (the symbol table maps the bare name to the functools
+/// import) or the `functools.partial` attribute spelling? A user
+/// function named partial shadows the import in the symbol table and
+/// does not match.
+fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match func {
+        ExprType::Name(n) => {
+            n.id == "partial"
+                && matches!(
+                    symbols.get(&n.id),
+                    Some(SymbolTableNode::ImportFrom(i)) if i.module == "functools"
+                )
+        }
+        ExprType::Attribute(attr) => {
+            attr.attr == "partial"
+                && matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "functools")
+        }
+        _ => false,
+    }
+}
+
 impl<'a> CodeGen for Call {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -54,6 +76,11 @@ impl<'a> CodeGen for Call {
                         Some(SymbolTableNode::ImportFrom(import)) => {
                             let root = import.module.split('.').next().unwrap_or("");
                             !crate::is_stdpython_module(root)
+                        }
+                        // A name bound to functools.partial(f, ...) is a
+                        // closure returning f's Result: propagate.
+                        Some(SymbolTableNode::Assign { value: ExprType::Call(c), .. }) => {
+                            is_partial_target(c.func.as_ref(), &symbols)
                         }
                         _ => false,
                     }
@@ -793,6 +820,62 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // functools.partial over a STATICALLY-KNOWN function: the
+        // signature comes from the symbol table, so the call lowers to a
+        // move closure binding the leading arguments, with the remaining
+        // parameters keeping their Python names. The closure returns the
+        // function's Result directly; calls through the bound name get
+        // `?` (see propagates_exceptions). Dynamic first arguments have
+        // no signature to consult and are a loud error.
+        if is_partial_target(self.func.as_ref(), &symbols) {
+            if !self.keywords.is_empty() {
+                return Err("functools.partial with keyword arguments is not \
+                            supported yet; bind the arguments positionally"
+                    .to_string()
+                    .into());
+            }
+            let Some(ExprType::Name(f)) = self.args.first() else {
+                return Err("functools.partial requires a function defined in this \
+                            module as its first argument"
+                    .to_string()
+                    .into());
+            };
+            let Some(SymbolTableNode::FunctionDef(fdef)) = symbols.get(&f.id) else {
+                return Err(format!(
+                    "functools.partial: `{}` is not a function defined in this \
+                     module (only statically-known functions can be bound)",
+                    f.id
+                )
+                .into());
+            };
+            let params: Vec<String> =
+                fdef.args.args.iter().map(|p| p.arg.clone()).collect();
+            let bound_n = self.args.len() - 1;
+            if bound_n > params.len() {
+                return Err(format!(
+                    "functools.partial: `{}` takes {} argument(s), but {} were bound",
+                    f.id,
+                    params.len(),
+                    bound_n
+                )
+                .into());
+            }
+            let mut bound = Vec::new();
+            for arg in &self.args[1..] {
+                bound.push(arg.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            let rest: Vec<_> = params[bound_n..]
+                .iter()
+                .map(|p| crate::safe_ident(p))
+                .collect();
+            let fident = crate::safe_ident(&f.id);
+            return Ok(quote!(move |#(#rest),*| #fident(#(#bound,)* #(#rest),*)));
+        }
+
         // functools/heapq/copy/textwrap/re functions: their runtime shapes
         // borrow (or mutably borrow) arguments, reduce() splits by arity,
         // and the re functions validate patterns at runtime (hence `?`).
@@ -1376,6 +1459,73 @@ impl<'a> CodeGen for Call {
                         quote!((#receiver).py_sort_key_reverse(#k, #r))
                     }
                 });
+            }
+
+            // replace(...) with datetime-family keywords: one lowering
+            // through the PyReplace trait, whose receiver impls
+            // (datetime/date/time) each validate their own field set and
+            // raise Python's exact TypeError for foreign fields. Only
+            // keyword spellings route here — bare/positional replace
+            // stays the plain method call (str.replace among others).
+            if attr.attr == "replace" && !self.keywords.is_empty() {
+                const FIELDS: [&str; 7] = [
+                    "year", "month", "day", "hour", "minute", "second", "microsecond",
+                ];
+                if self
+                    .keywords
+                    .iter()
+                    .all(|kw| kw.arg.as_deref().is_some_and(|a| FIELDS.contains(&a)))
+                {
+                    let mut slots: [Option<crate::ExprType>; 7] = Default::default();
+                    if self.args.len() > FIELDS.len() {
+                        return Err("replace() takes at most 7 arguments".to_string().into());
+                    }
+                    for (i, arg) in self.args.iter().enumerate() {
+                        slots[i] = Some(arg.clone());
+                    }
+                    for kw in &self.keywords {
+                        let name = kw.arg.as_deref().expect("checked above");
+                        let idx = FIELDS.iter().position(|f| *f == name).expect("checked");
+                        if slots[idx].is_some() {
+                            return Err(format!(
+                                "replace() got multiple values for argument '{}'",
+                                name
+                            )
+                            .into());
+                        }
+                        slots[idx] = Some(kw.value.clone());
+                    }
+                    let mut inits = Vec::new();
+                    for (idx, slot) in slots.into_iter().enumerate() {
+                        if let Some(e) = slot {
+                            let field = crate::safe_ident(FIELDS[idx]);
+                            let v =
+                                e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            inits.push(quote!(#field: Some(#v)));
+                        }
+                    }
+                    return Ok(quote!(
+                        (#receiver).py_replace(ReplaceArgs {
+                            #(#inits,)*
+                            ..ReplaceArgs::default()
+                        })?
+                    ));
+                }
+                // A keyword outside the field set: Python's message, at
+                // conversion time (str.replace takes no keywords here).
+                let bad = self
+                    .keywords
+                    .iter()
+                    .find(|kw| {
+                        !kw.arg.as_deref().is_some_and(|a| FIELDS.contains(&a))
+                    })
+                    .and_then(|kw| kw.arg.clone())
+                    .unwrap_or_else(|| "**kwargs".to_string());
+                return Err(format!(
+                    "'{}' is an invalid keyword argument for replace()",
+                    bad
+                )
+                .into());
             }
 
             // str.split / str.rsplit take sep and maxsplit by position or

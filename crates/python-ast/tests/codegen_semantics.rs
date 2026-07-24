@@ -2516,3 +2516,159 @@ fn match_group_string_routes_to_group_name() {
     assert!(out.contains("group (1)"), "generated: {}", out);
     assert!(!out.contains("group_name"), "generated: {}", out);
 }
+
+// ---- replace() with datetime-family keywords ----
+
+#[test]
+fn replace_keywords_lower_through_py_replace() {
+    let src = concat!(
+        "from datetime import datetime\n",
+        "\n",
+        "def f(d: datetime):\n",
+        "    return d.replace(hour=14)\n",
+    );
+    let out = compile(src, "rep1.py");
+    assert!(out.contains("py_replace"), "generated: {}", out);
+    assert!(out.contains("hour : Some (14)"), "generated: {}", out);
+    assert!(
+        out.contains(".. ReplaceArgs :: default ()"),
+        "generated: {}",
+        out
+    );
+
+    // Positional year plus keyword day both map into slots.
+    let src = concat!(
+        "from datetime import datetime\n",
+        "\n",
+        "def f(d: datetime):\n",
+        "    return d.replace(2023, day=28)\n",
+    );
+    let out = compile(src, "rep2.py");
+    assert!(out.contains("year : Some (2023)"), "generated: {}", out);
+    assert!(out.contains("day : Some (28)"), "generated: {}", out);
+}
+
+#[test]
+fn replace_bad_keywords_are_loud_with_pythons_message() {
+    let err = compile_err(
+        "from datetime import datetime\n\ndef f(d: datetime):\n    return d.replace(bogus=1)\n",
+        "rep3.py",
+    );
+    assert!(
+        err.contains("'bogus' is an invalid keyword argument for replace()"),
+        "error: {}",
+        err
+    );
+
+    let err = compile_err(
+        "from datetime import datetime\n\ndef f(d: datetime):\n    return d.replace(2023, year=1)\n",
+        "rep4.py",
+    );
+    assert!(
+        err.contains("multiple values for argument 'year'"),
+        "error: {}",
+        err
+    );
+}
+
+#[test]
+fn str_replace_positional_stays_a_plain_method_call() {
+    let out = compile(
+        "def f(s: str):\n    return s.replace(\"a\", \"o\")\n",
+        "rep5.py",
+    );
+    assert!(out.contains("replace (\"a\" , \"o\")"), "generated: {}", out);
+    assert!(!out.contains("py_replace"), "generated: {}", out);
+}
+
+// ---- functools.partial over statically-known functions ----
+
+#[test]
+fn partial_lowers_to_a_move_closure_with_remaining_params() {
+    let src = concat!(
+        "from functools import partial\n",
+        "\n",
+        "def add(a: int, b: int) -> int:\n",
+        "    return a + b\n",
+        "\n",
+        "def f() -> int:\n",
+        "    add5 = partial(add, 5)\n",
+        "    return add5(3)\n",
+    );
+    let out = compile(src, "part1.py");
+    // The closure binds 5 and keeps the remaining parameter's Python name.
+    assert!(out.contains("move | b | add (5 , b)"), "generated: {}", out);
+    // Calls through the bound name propagate the function's Result.
+    assert!(out.contains("add5 (3) ?"), "generated: {}", out);
+    // The import emits no `use` — partial has no runtime symbol.
+    assert!(!out.contains("use stdpython :: functools :: partial"), "generated: {}", out);
+
+    // Binding ALL parameters leaves a zero-argument closure.
+    let src = concat!(
+        "from functools import partial\n",
+        "\n",
+        "def add(a: int, b: int) -> int:\n",
+        "    return a + b\n",
+        "\n",
+        "def f() -> int:\n",
+        "    g = partial(add, 2, 3)\n",
+        "    return g()\n",
+    );
+    let out = compile(src, "part2.py");
+    assert!(out.contains("move | | add (2 , 3 ,)"), "generated: {}", out);
+
+    // The functools.partial attribute spelling works too.
+    let src = concat!(
+        "import functools\n",
+        "\n",
+        "def add(a: int, b: int) -> int:\n",
+        "    return a + b\n",
+        "\n",
+        "def f() -> int:\n",
+        "    add5 = functools.partial(add, 5)\n",
+        "    return add5(1)\n",
+    );
+    let out = compile(src, "part3.py");
+    assert!(out.contains("move | b | add (5 , b)"), "generated: {}", out);
+}
+
+#[test]
+fn partial_rejects_unknown_functions_keywords_and_overbinding() {
+    let err = compile_err(
+        "from functools import partial\n\ndef f():\n    g = partial(unknown_fn, 1)\n",
+        "part4.py",
+    );
+    assert!(
+        err.contains("not a function defined in this module"),
+        "error: {}",
+        err
+    );
+
+    let err = compile_err(
+        concat!(
+            "from functools import partial\n",
+            "\n",
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+            "\n",
+            "def f():\n",
+            "    g = partial(add, b=1)\n",
+        ),
+        "part5.py",
+    );
+    assert!(err.contains("keyword arguments"), "error: {}", err);
+
+    let err = compile_err(
+        concat!(
+            "from functools import partial\n",
+            "\n",
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+            "\n",
+            "def f():\n",
+            "    g = partial(add, 1, 2, 3)\n",
+        ),
+        "part6.py",
+    );
+    assert!(err.contains("takes 2 argument(s), but 3 were bound"), "error: {}", err);
+}

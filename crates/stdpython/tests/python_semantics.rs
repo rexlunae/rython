@@ -2200,3 +2200,87 @@ mod datetime_fields_and_directives {
         );
     }
 }
+
+mod replace_keywords {
+    use stdpython::datetime::{date, datetime, time, PyReplace, ReplaceArgs};
+
+    #[test]
+    fn replace_maps_fields_per_receiver_type() {
+        let d = datetime::new(2024, 2, 29, Some(13), Some(5), Some(7), Some(123456)).unwrap();
+        let r = d
+            .py_replace(ReplaceArgs {
+                hour: Some(14),
+                ..ReplaceArgs::default()
+            })
+            .unwrap();
+        assert_eq!(format!("{}", r), "2024-02-29 14:05:07.123456");
+
+        let dd = date::new(2024, 2, 29).unwrap();
+        let r = dd
+            .py_replace(ReplaceArgs {
+                month: Some(3),
+                day: Some(1),
+                ..ReplaceArgs::default()
+            })
+            .unwrap();
+        assert_eq!(format!("{}", r), "2024-03-01");
+
+        let t = time::new(13, 5, Some(7), Some(0)).unwrap();
+        let r = t
+            .py_replace(ReplaceArgs {
+                minute: Some(0),
+                ..ReplaceArgs::default()
+            })
+            .unwrap();
+        assert_eq!(format!("{}", r), "13:00:07");
+    }
+
+    #[test]
+    fn foreign_fields_raise_pythons_type_error() {
+        // CPython: TypeError: 'hour' is an invalid keyword argument for replace()
+        let dd = date::new(2024, 2, 29).unwrap();
+        let e = dd
+            .py_replace(ReplaceArgs {
+                hour: Some(1),
+                ..ReplaceArgs::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "TypeError: 'hour' is an invalid keyword argument for replace()"
+        );
+
+        let t = time::new(1, 2, None, None).unwrap();
+        let e = t
+            .py_replace(ReplaceArgs {
+                year: Some(2000),
+                ..ReplaceArgs::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "TypeError: 'year' is an invalid keyword argument for replace()"
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_raise_value_error() {
+        let d = datetime::new(2024, 1, 15, None, None, None, None).unwrap();
+        // python3: d.replace(month=2, day=30) -> ValueError: day is out of
+        // range for month
+        assert!(d
+            .py_replace(ReplaceArgs {
+                month: Some(2),
+                day: Some(30),
+                ..ReplaceArgs::default()
+            })
+            .is_err());
+        // A negative field cannot narrow to u32: ValueError, not a wrap.
+        assert!(d
+            .py_replace(ReplaceArgs {
+                hour: Some(-1),
+                ..ReplaceArgs::default()
+            })
+            .is_err());
+    }
+}
