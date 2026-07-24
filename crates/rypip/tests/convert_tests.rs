@@ -1896,6 +1896,81 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn datetime_fields_and_strptime_directives_match_python_at_runtime() {
+    // Flat attribute access (dt.year .. dt.microsecond), the dt.date()
+    // and dt.time() methods, and the %a/%A/%j strptime directives,
+    // through generated code.
+    let scratch = Scratch::new("dtfields");
+    let file = scratch.path().join("dtf_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from datetime import datetime\n",
+            "\n",
+            "def main() -> None:\n",
+            "    d = datetime(2024, 2, 29, 13, 5, 7, 123456)\n",
+            "    print(d.year, d.month, d.day)\n",
+            "    print(d.hour, d.minute, d.second, d.microsecond)\n",
+            "    print(d.date())\n",
+            "    print(d.time())\n",
+            "    print(datetime.strptime(\"2024-060\", \"%Y-%j\"))\n",
+            "    print(datetime.strptime(\"2023-366\", \"%Y-%j\"))\n",
+            "    print(datetime.strptime(\"060\", \"%j\"))\n",
+            "    print(datetime.strptime(\"Mon 2024-01-02\", \"%a %Y-%m-%d\"))\n",
+            "    print(datetime.strptime(\"friday 2024-03-01\", \"%A %Y-%m-%d\"))\n",
+            "    print(datetime.strptime(\"Tue 2024-060\", \"%a %Y-%j\"))\n",
+            "    try:\n",
+            "        print(datetime.strptime(\"Xyz 2024-01-02\", \"%a %Y-%m-%d\"))\n",
+            "    except ValueError:\n",
+            "        print(\"bad weekday caught\")\n",
+            "    try:\n",
+            "        print(datetime.strptime(\"2023-367\", \"%Y-%j\"))\n",
+            "    except ValueError:\n",
+            "        print(\"trailing digit caught\")\n",
+            "    lo = datetime(2024, 2, 29, 13, 5, 7)\n",
+            "    hi = datetime(2024, 2, 29, 14, 5, 7)\n",
+            "    print(lo < hi, hi - lo)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/dtf_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2024 2 29",
+            "13 5 7 123456",
+            "2024-02-29",
+            "13:05:07.123456",
+            "2024-02-29 00:00:00",
+            "2024-01-01 00:00:00",
+            "1900-03-01 00:00:00",
+            "2024-01-02 00:00:00",
+            "2024-03-01 00:00:00",
+            "2024-02-29 00:00:00",
+            "bad weekday caught",
+            "trailing digit caught",
+            "True 1:00:00",
+        ],
+        "datetime field/strptime semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn re_named_groups_and_findall_tuples_match_python_at_runtime() {
     // (?P<name>...) access by name and groupdict, findall returning
     // 2- and 3-tuples (chosen from the literal pattern at conversion
