@@ -3230,6 +3230,7 @@ pub use stdlib::functools;
 pub use stdlib::heapq;
 pub use stdlib::copy;
 pub use stdlib::textwrap;
+pub use stdlib::hashlib;
 #[cfg(feature = "std")]
 pub use stdlib::pathlib;
 #[cfg(feature = "std")]

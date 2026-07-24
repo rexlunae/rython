@@ -688,7 +688,7 @@ impl<'a> CodeGen for Call {
                     Some(SymbolTableNode::ImportFrom(import))
                         if matches!(
                             import.module.as_str(),
-                            "functools" | "heapq" | "copy" | "textwrap" | "re"
+                            "functools" | "heapq" | "copy" | "textwrap" | "re" | "hashlib"
                         ) =>
                     {
                         Some((n.id.clone(), None))
@@ -699,13 +699,14 @@ impl<'a> CodeGen for Call {
                     ExprType::Name(m)
                         if matches!(
                             m.id.as_str(),
-                            "functools" | "heapq" | "textwrap" | "re"
+                            "functools" | "heapq" | "textwrap" | "re" | "hashlib"
                         ) =>
                     {
                         let module: &'static str = match m.id.as_str() {
                             "functools" => "functools",
                             "heapq" => "heapq",
                             "re" => "re",
+                            "hashlib" => "hashlib",
                             _ => "textwrap",
                         };
                         Some((attr.attr.clone(), Some(module)))
@@ -735,6 +736,10 @@ impl<'a> CodeGen for Call {
                         | "findall"
                         | "sub"
                         | "split"
+                        | "md5"
+                        | "sha1"
+                        | "sha256"
+                        | "sha512"
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
@@ -843,6 +848,16 @@ impl<'a> CodeGen for Call {
                     ("sub", [pat, repl, text]) => {
                         let p = qual("sub");
                         Ok(quote!(#p(&(#pat), &(#repl), &(#text))?))
+                    }
+                    // hashlib constructors: with initial data, or the
+                    // empty + update() idiom.
+                    ("md5" | "sha1" | "sha256" | "sha512", [data]) => {
+                        let p = qual(&fname);
+                        Ok(quote!(#p(&(#data))))
+                    }
+                    ("md5" | "sha1" | "sha256" | "sha512", []) => {
+                        let p = qual(&format!("{}_new", fname));
+                        Ok(quote!(#p()))
                     }
                     ("indent", [s, prefix]) => {
                         let p = qual("indent");
@@ -1100,6 +1115,21 @@ impl<'a> CodeGen for Call {
                 // re Match: m.group() is m.group(0); Rust can't overload.
                 ("group", []) => {
                     return Ok(quote!((#receiver).group(0)));
+                }
+                // str.encode() / encode("utf-8"): UTF-8 bytes, which is
+                // exactly what Rust strings hold.
+                ("encode", []) => {
+                    return Ok(quote!((#receiver).as_bytes().to_vec()));
+                }
+                ("encode", [enc]) => {
+                    if enc.to_string().trim_matches('"') != "utf-8" {
+                        return Err(format!(
+                            "str.encode({}): only \"utf-8\" is supported",
+                            enc
+                        )
+                        .into());
+                    }
+                    return Ok(quote!((#receiver).as_bytes().to_vec()));
                 }
                 // list.pop() returns the last element or raises IndexError
                 // (Vec::pop returns an Option).

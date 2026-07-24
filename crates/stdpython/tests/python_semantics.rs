@@ -1702,3 +1702,45 @@ mod map_filter_list {
         assert_eq!(list(range(3)), vec![0i64, 1, 2]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// hashlib (issue #19). Digests pinned against python3.
+// ---------------------------------------------------------------------------
+
+mod hashlib_module {
+    use stdpython::hashlib::*;
+
+    #[test]
+    fn digests_match_cpython_exactly() {
+        assert_eq!(md5("hello").hexdigest(), "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(
+            sha1("hello").hexdigest(),
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+        );
+        assert_eq!(
+            sha256("hello").hexdigest(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert!(sha512("hello")
+            .hexdigest()
+            .starts_with("9b71d224bd62f3785d96d46ad3ea3d73"));
+        // Non-ASCII hashes its UTF-8 bytes: hashlib.md5("café".encode()).
+        assert_eq!(md5("café").hexdigest(), "07117fe4a1ebd544965dc19573183da2");
+        assert_eq!(
+            sha256("").hexdigest(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn update_accumulates_and_hexdigest_does_not_consume() {
+        let mut h = sha256_new();
+        h.update("hel");
+        h.update("lo");
+        assert_eq!(h.hexdigest(), sha256("hello").hexdigest());
+        // hexdigest() again (Python allows further updates after reading).
+        assert_eq!(h.hexdigest(), sha256("hello").hexdigest());
+        h.update("!");
+        assert_eq!(h.hexdigest(), sha256("hello!").hexdigest());
+    }
+}

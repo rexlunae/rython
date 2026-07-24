@@ -82,3 +82,6 @@ pub mod textwrap;
 #[cfg(feature = "std")]
 pub mod re;
 
+/// Python hashlib module - message digests
+pub mod hashlib;
+

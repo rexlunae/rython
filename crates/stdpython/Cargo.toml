@@ -14,7 +14,7 @@ description = "Python standard library runtime for the Rython compiler ecosystem
 [features]
 default = ["std"]
 std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "dep:regex", "indexmap/std"]
-alloc = ["dep:hashbrown", "dep:libm"]
+alloc = ["dep:hashbrown", "dep:libm", "dep:md-5", "dep:sha1", "dep:sha2"]
 
 [dependencies]
 pyo3 = {version = "0.29", features=["auto-initialize"], optional = true}
@@ -24,6 +24,9 @@ getrandom = { version = "0.3", optional = true }
 hashbrown = { version = "0.15", optional = true }
 libm = { version = "0.2", optional = true }
 regex = { version = "1", optional = true }
+md-5 = { version = "0.10", optional = true, default-features = false }
+sha1 = { version = "0.10", optional = true, default-features = false }
+sha2 = { version = "0.10", optional = true, default-features = false }
 libc = { version = "0.2", optional = true }
 
 [[bin]]
