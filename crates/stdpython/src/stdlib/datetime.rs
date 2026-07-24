@@ -986,3 +986,107 @@ impl crate::PyDisplay for timedelta {
         self.to_string()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Keyword-shaped replace()
+// ---------------------------------------------------------------------------
+
+/// Keyword arguments for replace(), as one struct so the CONVERTER can
+/// emit a single lowering without knowing whether the receiver is a
+/// datetime, date, or time — each receiver validates its own field set
+/// and raises Python's exact TypeError for fields it does not have.
+/// Fields are i64 (the converter's integer type); range errors are
+/// ValueError, as in Python.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReplaceArgs {
+    pub year: Option<i64>,
+    pub month: Option<i64>,
+    pub day: Option<i64>,
+    pub hour: Option<i64>,
+    pub minute: Option<i64>,
+    pub second: Option<i64>,
+    pub microsecond: Option<i64>,
+}
+
+/// dt.replace(field=...) for the datetime family.
+pub trait PyReplace: Sized {
+    fn py_replace(&self, args: ReplaceArgs) -> Result<Self, PyException>;
+}
+
+fn invalid_replace_keyword(field: &str) -> PyException {
+    // CPython: TypeError: 'hour' is an invalid keyword argument for replace()
+    PyException::new(
+        "TypeError",
+        format!("'{}' is an invalid keyword argument for replace()", field),
+    )
+}
+
+fn narrow_i32(v: Option<i64>, field: &str) -> Result<Option<i32>, PyException> {
+    v.map(|v| {
+        i32::try_from(v)
+            .map_err(|_| crate::value_error(format!("{} {} is out of range", field, v)))
+    })
+    .transpose()
+}
+
+fn narrow_u32(v: Option<i64>, field: &str) -> Result<Option<u32>, PyException> {
+    v.map(|v| {
+        u32::try_from(v)
+            .map_err(|_| crate::value_error(format!("{} {} is out of range", field, v)))
+    })
+    .transpose()
+}
+
+impl PyReplace for datetime {
+    fn py_replace(&self, args: ReplaceArgs) -> Result<Self, PyException> {
+        self.replace(
+            narrow_i32(args.year, "year")?,
+            narrow_u32(args.month, "month")?,
+            narrow_u32(args.day, "day")?,
+            narrow_u32(args.hour, "hour")?,
+            narrow_u32(args.minute, "minute")?,
+            narrow_u32(args.second, "second")?,
+            narrow_u32(args.microsecond, "microsecond")?,
+        )
+    }
+}
+
+impl PyReplace for date {
+    fn py_replace(&self, args: ReplaceArgs) -> Result<Self, PyException> {
+        for (field, value) in [
+            ("hour", args.hour),
+            ("minute", args.minute),
+            ("second", args.second),
+            ("microsecond", args.microsecond),
+        ] {
+            if value.is_some() {
+                return Err(invalid_replace_keyword(field));
+            }
+        }
+        self.replace(
+            narrow_i32(args.year, "year")?,
+            narrow_u32(args.month, "month")?,
+            narrow_u32(args.day, "day")?,
+        )
+    }
+}
+
+impl PyReplace for time {
+    fn py_replace(&self, args: ReplaceArgs) -> Result<Self, PyException> {
+        for (field, value) in [
+            ("year", args.year),
+            ("month", args.month),
+            ("day", args.day),
+        ] {
+            if value.is_some() {
+                return Err(invalid_replace_keyword(field));
+            }
+        }
+        self.replace(
+            narrow_u32(args.hour, "hour")?,
+            narrow_u32(args.minute, "minute")?,
+            narrow_u32(args.second, "second")?,
+            narrow_u32(args.microsecond, "microsecond")?,
+        )
+    }
+}

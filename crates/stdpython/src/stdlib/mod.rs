@@ -82,6 +82,14 @@ pub mod textwrap;
 #[cfg(feature = "std")]
 pub mod re;
 
+/// Python io module (StringIO); PyFile itself lives at the crate root.
+#[cfg(feature = "std")]
+pub mod io;
+
+/// Python argparse module: the runtime half of conversion-time parsers.
+#[cfg(feature = "std")]
+pub mod argparse;
+
 /// Python hashlib module - message digests
 pub mod hashlib;
 

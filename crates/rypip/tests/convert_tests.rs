@@ -1896,6 +1896,394 @@ fn isinstance_and_hash_match_python_at_runtime() {
 }
 
 #[test]
+fn argparse_matches_python_at_runtime() {
+    // The conversion-time parser end to end: help text (layout and
+    // column math), value forms (--opt V and --opt=V), prefix
+    // abbreviation, store_true, typed defaults, and the exact
+    // usage+error output with exit code 2 on missing/invalid/unknown
+    // arguments. Everything below was captured from python3 verbatim.
+    let scratch = Scratch::new("argps");
+    let file = scratch.path().join("arg_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\", description=\"Demo tool\")\n",
+            "    p.add_argument(\"name\", help=\"who to greet\")\n",
+            "    p.add_argument(\"count\", type=int)\n",
+            "    p.add_argument(\"--verbose\", action=\"store_true\", help=\"say more\")\n",
+            "    p.add_argument(\"--scale\", type=float, default=1.0)\n",
+            "    p.add_argument(\"--label\", default=\"none\")\n",
+            "    args = p.parse_args()\n",
+            "    if args.verbose:\n",
+            "        print(\"verbose mode\")\n",
+            "    print(args.name, args.count * 2, args.scale, args.label)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/arg_demo");
+
+    let usage = "usage: tool [-h] [--verbose] [--scale SCALE] [--label LABEL] name count";
+
+    // --help: python3's exact text, exit 0.
+    let output = Command::new(&bin).arg("--help").output().expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: tool [-h] [--verbose] [--scale SCALE] [--label LABEL] name count\n",
+            "\n",
+            "Demo tool\n",
+            "\n",
+            "positional arguments:\n",
+            "  name           who to greet\n",
+            "  count\n",
+            "\n",
+            "options:\n",
+            "  -h, --help     show this help message and exit\n",
+            "  --verbose      say more\n",
+            "  --scale SCALE\n",
+            "  --label LABEL\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    // Successful runs: split and = value forms, prefix abbreviation.
+    let output = Command::new(&bin)
+        .args(["bob", "3", "--scale", "2.5", "--verbose"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "verbose mode\nbob 6 2.5 none\n"
+    );
+    let output = Command::new(&bin)
+        .args(["bob", "3", "--scale=0.5", "--lab", "x"])
+        .output()
+        .expect("run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "bob 6 0.5 x\n");
+
+    // Errors: usage + message on stderr, exit 2, all python3-verbatim.
+    let cases = [
+        (
+            vec!["bob"],
+            "tool: error: the following arguments are required: count",
+        ),
+        (
+            vec!["bob", "xx"],
+            "tool: error: argument count: invalid int value: 'xx'",
+        ),
+        (
+            vec!["bob", "1", "--bogus"],
+            "tool: error: unrecognized arguments: --bogus",
+        ),
+    ];
+    for (args, want) in cases {
+        let output = Command::new(&bin).args(&args).output().expect("run");
+        assert_eq!(output.status.code(), Some(2), "args: {:?}", args);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("{}\n{}\n", usage, want),
+            "args: {:?}",
+            args
+        );
+    }
+}
+
+#[test]
+fn lru_cache_matches_python_at_runtime() {
+    // Memoization through recursion (fib), unbounded caches skipping
+    // recomputation (print side effects fire once per distinct
+    // argument), and CPython's exact LRU touch/eviction order for a
+    // bounded cache.
+    let scratch = Scratch::new("lrus");
+    let file = scratch.path().join("lru_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from functools import lru_cache\n",
+            "\n",
+            "@lru_cache\n",
+            "def fib(n: int) -> int:\n",
+            "    if n < 2:\n",
+            "        return n\n",
+            "    return fib(n - 1) + fib(n - 2)\n",
+            "\n",
+            "@lru_cache(maxsize=None)\n",
+            "def slow_double(x: int) -> int:\n",
+            "    print(\"computing\", x)\n",
+            "    return x * 2\n",
+            "\n",
+            "@lru_cache(maxsize=2)\n",
+            "def tag(s: str) -> str:\n",
+            "    print(\"tagging\", s)\n",
+            "    return \"<\" + s + \">\"\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(fib(30))\n",
+            "    print(slow_double(4))\n",
+            "    print(slow_double(4))\n",
+            "    print(slow_double(5))\n",
+            "    print(tag(\"a\"), tag(\"b\"))\n",
+            "    print(tag(\"a\"))\n",
+            "    print(tag(\"c\"))\n",
+            "    print(tag(\"b\"))\n",
+            "    print(tag(\"a\"))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/lru_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "832040",
+            "computing 4",
+            "8",
+            "8",
+            "computing 5",
+            "10",
+            "tagging a",
+            "tagging b",
+            "<a> <b>",
+            "<a>",
+            "tagging c",
+            "<c>",
+            "tagging b",
+            "<b>",
+            "tagging a",
+            "<a>",
+        ],
+        "lru_cache semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn file_objects_and_csv_writer_match_python_at_runtime() {
+    // The PyFile surface end to end: io.StringIO (cursor-overwrite
+    // write, getvalue, readlines with terminators), csv.writer quoting
+    // through both writerow and writerows, disk files via open() in
+    // write and read modes, with-blocks, and reader round-trip.
+    let scratch = Scratch::new("pyfiles");
+    let file = scratch.path().join("file_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import csv\n",
+            "import io\n",
+            "\n",
+            "def main() -> None:\n",
+            "    buf = io.StringIO()\n",
+            "    w = csv.writer(buf)\n",
+            "    w.writerow([\"a\", \"b,c\", \"say \\\"hi\\\"\", \"\"])\n",
+            "    w.writerow([1, 2, 3])\n",
+            "    w.writerow([])\n",
+            "    w.writerows([[\"x\", \"y\"], [\"z\", \"w\"]])\n",
+            "    print(repr(buf.getvalue()))\n",
+            "    seeded = io.StringIO(\"seeded\")\n",
+            "    seeded.write(\"!\")\n",
+            "    print(seeded.getvalue())\n",
+            "    print(repr(seeded.read()))\n",
+            "    two = io.StringIO(\"x\\ny\\n\")\n",
+            "    print(two.readlines())\n",
+            "    path = \"pyfile_demo_scratch.txt\"\n",
+            "    f = open(path, \"w\")\n",
+            "    f.write(\"alpha\\n\")\n",
+            "    f.writelines([\"beta\\n\", \"gamma\\n\"])\n",
+            "    f.close()\n",
+            "    g = open(path)\n",
+            "    print(repr(g.readline()))\n",
+            "    print(g.readlines())\n",
+            "    g.close()\n",
+            "    with open(path) as h:\n",
+            "        print(len(h.read()))\n",
+            "    for row in csv.reader(open(path).readlines()):\n",
+            "        print(row)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    // Run in a scratch cwd so the relative-path file lands there.
+    let output = Command::new(krate.root.join("target/debug/file_demo"))
+        .current_dir(scratch.path())
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "'a,\"b,c\",\"say \"\"hi\"\"\",\\r\\n1,2,3\\r\\n\\r\\nx,y\\r\\nz,w\\r\\n'",
+            "!eeded",
+            "'eeded'",
+            "['x\\n', 'y\\n']",
+            "'alpha\\n'",
+            "['beta\\n', 'gamma\\n']",
+            "17",
+            "['alpha']",
+            "['beta']",
+            "['gamma']",
+        ],
+        "file-object semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn functools_partial_matches_python_at_runtime() {
+    // partial over statically-known functions: leading-argument binding,
+    // full binding (zero-arg closure), multi-parameter tails, and
+    // exception propagation through the bound name.
+    let scratch = Scratch::new("partials");
+    let file = scratch.path().join("part_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from functools import partial\n",
+            "\n",
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+            "\n",
+            "def clamp(lo: int, hi: int, x: int) -> int:\n",
+            "    if x < lo:\n",
+            "        return lo\n",
+            "    if x > hi:\n",
+            "        return hi\n",
+            "    return x\n",
+            "\n",
+            "def main() -> None:\n",
+            "    add5 = partial(add, 5)\n",
+            "    print(add5(3))\n",
+            "    print(add5(10))\n",
+            "    add_both = partial(add, 2, 3)\n",
+            "    print(add_both())\n",
+            "    unit = partial(clamp, 0, 100)\n",
+            "    print(unit(-4), unit(50), unit(300))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/part_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["8", "15", "5", "0 50 100"],
+        "functools.partial semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn replace_keywords_match_python_at_runtime() {
+    // dt.replace(field=...) through the type-dispatched PyReplace trait:
+    // datetime and date receivers, foreign-field TypeError, range
+    // ValueError, and str.replace coexisting untouched.
+    let scratch = Scratch::new("replkw");
+    let file = scratch.path().join("repl_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "from datetime import datetime, date\n",
+            "\n",
+            "def main() -> None:\n",
+            "    d = datetime(2024, 2, 29, 13, 5, 7, 123456)\n",
+            "    print(d.replace(hour=14))\n",
+            "    print(d.replace(year=2023, day=28))\n",
+            "    print(d.replace(minute=0, second=0, microsecond=0))\n",
+            "    dd = date(2024, 2, 29)\n",
+            "    print(dd.replace(month=3, day=1))\n",
+            "    try:\n",
+            "        print(dd.replace(hour=1))\n",
+            "    except TypeError:\n",
+            "        print(\"date has no hour\")\n",
+            "    try:\n",
+            "        print(d.replace(month=2, day=30))\n",
+            "    except ValueError:\n",
+            "        print(\"day out of range caught\")\n",
+            "    s = \"banana\"\n",
+            "    print(s.replace(\"a\", \"o\"))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/repl_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2024-02-29 14:05:07.123456",
+            "2023-02-28 13:05:07.123456",
+            "2024-02-29 13:00:00",
+            "2024-03-01",
+            "date has no hour",
+            "day out of range caught",
+            "bonono",
+        ],
+        "replace-keyword semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn datetime_fields_and_strptime_directives_match_python_at_runtime() {
     // Flat attribute access (dt.year .. dt.microsecond), the dt.date()
     // and dt.time() methods, and the %a/%A/%j strptime directives,

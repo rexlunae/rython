@@ -61,6 +61,16 @@ pub(crate) const MUTATING_METHODS: &[&str] = &[
     "difference_update",
     "symmetric_difference_update",
     "push",
+    // File-object methods take &mut self (reads advance the cursor);
+    // csv.Writer's row methods write through it.
+    "read",
+    "readline",
+    "readlines",
+    "write",
+    "writelines",
+    "close",
+    "writerow",
+    "writerows",
 ];
 
 struct Analysis<'r> {
@@ -357,6 +367,8 @@ const FIRST_ARG_MUTATORS: &[&str] = &[
     "heapify",
     "heappushpop",
     "heapreplace",
+    // csv.writer(f) holds &mut f for the writer's lifetime.
+    "writer",
 ];
 
 fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
@@ -365,7 +377,9 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         // receiver: `heapq.heappush(h, x)` needs `h` mutable, mirroring
         // the bare-function branch below.
         if let ExprType::Name(m) = attr.value.as_ref() {
-            if m.id == "heapq" && FIRST_ARG_MUTATORS.contains(&attr.attr.as_str()) {
+            if matches!(m.id.as_str(), "heapq" | "csv")
+                && FIRST_ARG_MUTATORS.contains(&attr.attr.as_str())
+            {
                 if let Some(first) = call.args.first() {
                     if let Some(name) = chain_base_name(first) {
                         a.record_mutation(name);

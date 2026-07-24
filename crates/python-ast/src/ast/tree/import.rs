@@ -14,6 +14,8 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
         name,
         "os" | "sys"
             | "re"
+            | "io"
+            | "argparse"
             | "json"
             | "math"
             | "random"
@@ -46,6 +48,8 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
         name,
         "os" | "sys"
             | "re"
+            | "io"
+            | "argparse"
             | "math"
             | "random"
             | "datetime"
@@ -248,6 +252,16 @@ impl CodeGen for ImportFrom {
 
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
+            // functools.partial/lru_cache/cache have no runtime symbols:
+            // partial lowers to a closure at each call site, and the
+            // cache decorators rewrite the function definition itself,
+            // so the imports emit nothing (an uncalled bare reference is
+            // then a loud unresolved-name error).
+            if self.module == "functools"
+                && matches!(alias.name.as_str(), "partial" | "lru_cache" | "cache")
+            {
+                continue;
+            }
             if alias.name == "*" {
                 tokens.extend(quote! { use #root #(::#module_path)*::*; });
                 continue;
@@ -279,6 +293,7 @@ impl CodeGen for ImportFrom {
                 ("itertools", "groupby") => &["groupby_key"],
                 ("functools", "reduce") => &["reduce_initial"],
                 ("re", "findall") => &["findall2", "findall3"],
+                ("io", "StringIO") => &["StringIO_seeded"],
                 ("hashlib", "md5") => &["md5_new"],
                 ("hashlib", "sha1") => &["sha1_new"],
                 ("hashlib", "sha256") => &["sha256_new"],

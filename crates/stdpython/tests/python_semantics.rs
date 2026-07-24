@@ -2200,3 +2200,188 @@ mod datetime_fields_and_directives {
         );
     }
 }
+
+mod replace_keywords {
+    use stdpython::datetime::{date, datetime, time, PyReplace, ReplaceArgs};
+
+    #[test]
+    fn replace_maps_fields_per_receiver_type() {
+        let d = datetime::new(2024, 2, 29, Some(13), Some(5), Some(7), Some(123456)).unwrap();
+        let r = d
+            .py_replace(ReplaceArgs {
+                hour: Some(14),
+                ..ReplaceArgs::default()
+            })
+            .unwrap();
+        assert_eq!(format!("{}", r), "2024-02-29 14:05:07.123456");
+
+        let dd = date::new(2024, 2, 29).unwrap();
+        let r = dd
+            .py_replace(ReplaceArgs {
+                month: Some(3),
+                day: Some(1),
+                ..ReplaceArgs::default()
+            })
+            .unwrap();
+        assert_eq!(format!("{}", r), "2024-03-01");
+
+        let t = time::new(13, 5, Some(7), Some(0)).unwrap();
+        let r = t
+            .py_replace(ReplaceArgs {
+                minute: Some(0),
+                ..ReplaceArgs::default()
+            })
+            .unwrap();
+        assert_eq!(format!("{}", r), "13:00:07");
+    }
+
+    #[test]
+    fn foreign_fields_raise_pythons_type_error() {
+        // CPython: TypeError: 'hour' is an invalid keyword argument for replace()
+        let dd = date::new(2024, 2, 29).unwrap();
+        let e = dd
+            .py_replace(ReplaceArgs {
+                hour: Some(1),
+                ..ReplaceArgs::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "TypeError: 'hour' is an invalid keyword argument for replace()"
+        );
+
+        let t = time::new(1, 2, None, None).unwrap();
+        let e = t
+            .py_replace(ReplaceArgs {
+                year: Some(2000),
+                ..ReplaceArgs::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "TypeError: 'year' is an invalid keyword argument for replace()"
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_raise_value_error() {
+        let d = datetime::new(2024, 1, 15, None, None, None, None).unwrap();
+        // python3: d.replace(month=2, day=30) -> ValueError: day is out of
+        // range for month
+        assert!(d
+            .py_replace(ReplaceArgs {
+                month: Some(2),
+                day: Some(30),
+                ..ReplaceArgs::default()
+            })
+            .is_err());
+        // A negative field cannot narrow to u32: ValueError, not a wrap.
+        assert!(d
+            .py_replace(ReplaceArgs {
+                hour: Some(-1),
+                ..ReplaceArgs::default()
+            })
+            .is_err());
+    }
+}
+
+mod file_objects {
+    use stdpython::{csv, io};
+
+    #[test]
+    fn stringio_cursor_semantics_match_python() {
+        // python3: StringIO("seeded").write("!") OVERWRITES at the
+        // cursor: buffer becomes "!eeded", cursor 1, read() -> "eeded".
+        let mut b = io::StringIO_seeded("seeded");
+        assert_eq!(b.write("!").unwrap(), 1);
+        assert_eq!(b.getvalue().unwrap(), "!eeded");
+        assert_eq!(b.read().unwrap(), "eeded");
+        // At the end, write appends; write returns the CHAR count.
+        assert_eq!(b.write("après").unwrap(), 5);
+        assert_eq!(b.getvalue().unwrap(), "!eededaprès");
+
+        // readline/readlines keep terminators, as Python.
+        let mut two = io::StringIO_seeded("x\ny\nz");
+        assert_eq!(two.readline().unwrap(), "x\n");
+        assert_eq!(two.readlines().unwrap(), vec!["y\n", "z"]);
+        // Exhausted: empty line, empty list.
+        assert_eq!(two.readline().unwrap(), "");
+    }
+
+    #[test]
+    fn closed_files_raise_pythons_value_error() {
+        let mut b = io::StringIO();
+        b.close().unwrap();
+        let e = b.read().unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
+        // getvalue on a closed buffer is closed too.
+        assert!(b.getvalue().is_err());
+    }
+
+    #[test]
+    fn csv_writer_quoting_matches_python() {
+        // python3 (excel dialect):
+        // 'a,"b,c","say ""hi""",\r\n1,2,3\r\n\r\n"line\nbreak",tab\there\r\n'
+        let mut buf = io::StringIO();
+        {
+            let mut w = csv::writer(&mut buf);
+            w.writerow(&["a", "b,c", "say \"hi\"", ""]).unwrap();
+            w.writerow(&[1i64, 2, 3]).unwrap();
+            w.writerow(&[] as &[&str]).unwrap();
+            w.writerow(&["line\nbreak", "tab\there"]).unwrap();
+        }
+        assert_eq!(
+            buf.getvalue().unwrap(),
+            "a,\"b,c\",\"say \"\"hi\"\"\",\r\n1,2,3\r\n\r\n\"line\nbreak\",tab\there\r\n"
+        );
+
+        // Elements stringify through PyDisplay (Python's str()): bools
+        // and floats render as Python prints them.
+        let mut buf = io::StringIO();
+        {
+            let mut w = csv::writer(&mut buf);
+            w.writerow(&[stdpython::py_display(&true), stdpython::py_display(&2.5f64)])
+                .unwrap();
+            w.writerows(&[vec!["x", "y"], vec!["z", "w"]]).unwrap();
+        }
+        assert_eq!(buf.getvalue().unwrap(), "True,2.5\r\nx,y\r\nz,w\r\n");
+
+        // writer output round-trips through the reader.
+        let mut buf = io::StringIO();
+        {
+            let mut w = csv::writer(&mut buf);
+            w.writerow(&["a", "b,c", "say \"hi\""]).unwrap();
+        }
+        let text = buf.getvalue().unwrap();
+        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>()).unwrap();
+        assert_eq!(rows[0], vec!["a", "b,c", "say \"hi\""]);
+    }
+}
+
+mod lru_cache_store {
+    use stdpython::PyLruCache;
+
+    #[test]
+    fn hits_touch_and_eviction_drops_least_recent() {
+        let mut c: PyLruCache<(i64,), i64> = PyLruCache::new(Some(2));
+        c.put((1,), 10);
+        c.put((2,), 20);
+        // Touch 1 so 2 becomes least-recently-used...
+        assert_eq!(c.get(&(1,)), Some(10));
+        // ...then inserting 3 evicts 2, not 1 (CPython's discipline).
+        c.put((3,), 30);
+        assert_eq!(c.get(&(2,)), None);
+        assert_eq!(c.get(&(1,)), Some(10));
+        assert_eq!(c.get(&(3,)), Some(30));
+    }
+
+    #[test]
+    fn unbounded_cache_never_evicts() {
+        let mut c: PyLruCache<(i64,), i64> = PyLruCache::new(None);
+        for i in 0..1000 {
+            c.put((i,), i * 2);
+        }
+        assert_eq!(c.get(&(0,)), Some(0));
+        assert_eq!(c.get(&(999,)), Some(1998));
+    }
+}

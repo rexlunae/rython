@@ -2516,3 +2516,360 @@ fn match_group_string_routes_to_group_name() {
     assert!(out.contains("group (1)"), "generated: {}", out);
     assert!(!out.contains("group_name"), "generated: {}", out);
 }
+
+// ---- replace() with datetime-family keywords ----
+
+#[test]
+fn replace_keywords_lower_through_py_replace() {
+    let src = concat!(
+        "from datetime import datetime\n",
+        "\n",
+        "def f(d: datetime):\n",
+        "    return d.replace(hour=14)\n",
+    );
+    let out = compile(src, "rep1.py");
+    assert!(out.contains("py_replace"), "generated: {}", out);
+    assert!(out.contains("hour : Some (14)"), "generated: {}", out);
+    assert!(
+        out.contains(".. ReplaceArgs :: default ()"),
+        "generated: {}",
+        out
+    );
+
+    // Positional year plus keyword day both map into slots.
+    let src = concat!(
+        "from datetime import datetime\n",
+        "\n",
+        "def f(d: datetime):\n",
+        "    return d.replace(2023, day=28)\n",
+    );
+    let out = compile(src, "rep2.py");
+    assert!(out.contains("year : Some (2023)"), "generated: {}", out);
+    assert!(out.contains("day : Some (28)"), "generated: {}", out);
+}
+
+#[test]
+fn replace_bad_keywords_are_loud_with_pythons_message() {
+    let err = compile_err(
+        "from datetime import datetime\n\ndef f(d: datetime):\n    return d.replace(bogus=1)\n",
+        "rep3.py",
+    );
+    assert!(
+        err.contains("'bogus' is an invalid keyword argument for replace()"),
+        "error: {}",
+        err
+    );
+
+    let err = compile_err(
+        "from datetime import datetime\n\ndef f(d: datetime):\n    return d.replace(2023, year=1)\n",
+        "rep4.py",
+    );
+    assert!(
+        err.contains("multiple values for argument 'year'"),
+        "error: {}",
+        err
+    );
+}
+
+#[test]
+fn str_replace_positional_stays_a_plain_method_call() {
+    let out = compile(
+        "def f(s: str):\n    return s.replace(\"a\", \"o\")\n",
+        "rep5.py",
+    );
+    assert!(out.contains("replace (\"a\" , \"o\")"), "generated: {}", out);
+    assert!(!out.contains("py_replace"), "generated: {}", out);
+}
+
+// ---- functools.partial over statically-known functions ----
+
+#[test]
+fn partial_lowers_to_a_move_closure_with_remaining_params() {
+    let src = concat!(
+        "from functools import partial\n",
+        "\n",
+        "def add(a: int, b: int) -> int:\n",
+        "    return a + b\n",
+        "\n",
+        "def f() -> int:\n",
+        "    add5 = partial(add, 5)\n",
+        "    return add5(3)\n",
+    );
+    let out = compile(src, "part1.py");
+    // The closure binds 5 and keeps the remaining parameter's Python name.
+    assert!(out.contains("move | b | add (5 , b)"), "generated: {}", out);
+    // Calls through the bound name propagate the function's Result.
+    assert!(out.contains("add5 (3) ?"), "generated: {}", out);
+    // The import emits no `use` — partial has no runtime symbol.
+    assert!(!out.contains("use stdpython :: functools :: partial"), "generated: {}", out);
+
+    // Binding ALL parameters leaves a zero-argument closure.
+    let src = concat!(
+        "from functools import partial\n",
+        "\n",
+        "def add(a: int, b: int) -> int:\n",
+        "    return a + b\n",
+        "\n",
+        "def f() -> int:\n",
+        "    g = partial(add, 2, 3)\n",
+        "    return g()\n",
+    );
+    let out = compile(src, "part2.py");
+    assert!(out.contains("move | | add (2 , 3 ,)"), "generated: {}", out);
+
+    // The functools.partial attribute spelling works too.
+    let src = concat!(
+        "import functools\n",
+        "\n",
+        "def add(a: int, b: int) -> int:\n",
+        "    return a + b\n",
+        "\n",
+        "def f() -> int:\n",
+        "    add5 = functools.partial(add, 5)\n",
+        "    return add5(1)\n",
+    );
+    let out = compile(src, "part3.py");
+    assert!(out.contains("move | b | add (5 , b)"), "generated: {}", out);
+}
+
+#[test]
+fn partial_rejects_unknown_functions_keywords_and_overbinding() {
+    let err = compile_err(
+        "from functools import partial\n\ndef f():\n    g = partial(unknown_fn, 1)\n",
+        "part4.py",
+    );
+    assert!(
+        err.contains("not a function defined in this module"),
+        "error: {}",
+        err
+    );
+
+    let err = compile_err(
+        concat!(
+            "from functools import partial\n",
+            "\n",
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+            "\n",
+            "def f():\n",
+            "    g = partial(add, b=1)\n",
+        ),
+        "part5.py",
+    );
+    assert!(err.contains("keyword arguments"), "error: {}", err);
+
+    let err = compile_err(
+        concat!(
+            "from functools import partial\n",
+            "\n",
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+            "\n",
+            "def f():\n",
+            "    g = partial(add, 1, 2, 3)\n",
+        ),
+        "part6.py",
+    );
+    assert!(err.contains("takes 2 argument(s), but 3 were bound"), "error: {}", err);
+}
+
+// ---- file objects, io.StringIO, csv.writer ----
+
+#[test]
+fn open_arity_splits_onto_the_option_mode() {
+    let out = compile("def f():\n    g = open(\"x.txt\")\n    return g.read()\n", "op1.py");
+    assert!(out.contains("open (& (\"x.txt\") , None :: < & str >) ?"), "generated: {}", out);
+    assert!(out.contains(". read () ?"), "generated: {}", out);
+
+    let out = compile("def f():\n    g = open(\"x.txt\", \"w\")\n    g.write(\"hi\")\n", "op2.py");
+    assert!(
+        out.contains("open (& (\"x.txt\") , Some (\"w\")) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains(". write (& (\"hi\")) ?"), "generated: {}", out);
+    // The file binding is mutable: write takes &mut self.
+    assert!(out.contains("let mut g"), "generated: {}", out);
+}
+
+#[test]
+fn stringio_and_csv_writer_lower_with_mut_borrows() {
+    let src = concat!(
+        "import csv\n",
+        "import io\n",
+        "\n",
+        "def f() -> str:\n",
+        "    buf = io.StringIO()\n",
+        "    w = csv.writer(buf)\n",
+        "    w.writerow([\"a\", \"b\"])\n",
+        "    w.writerow([])\n",
+        "    return buf.getvalue()\n",
+    );
+    let out = compile(src, "csw1.py");
+    assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
+    assert!(out.contains("csv :: writer (& mut (buf))"), "generated: {}", out);
+    assert!(out.contains("let mut buf"), "generated: {}", out);
+    assert!(out.contains("let mut w"), "generated: {}", out);
+    assert!(out.contains(". writerow (& (vec ! [\"a\" . to_string () , \"b\" . to_string ()])) ?")
+        || out.contains(". writerow ("), "generated: {}", out);
+    // The empty record gets a typed slice.
+    assert!(out.contains("writerow (& [] as & [& str]) ?"), "generated: {}", out);
+    assert!(out.contains(". getvalue () ?"), "generated: {}", out);
+
+    // The seeded StringIO variant.
+    let out = compile(
+        "import io\n\ndef f() -> str:\n    b = io.StringIO(\"seed\")\n    return b.read()\n",
+        "csw2.py",
+    );
+    assert!(
+        out.contains("io :: StringIO_seeded (& (\"seed\"))"),
+        "generated: {}",
+        out
+    );
+}
+
+// ---- functools.lru_cache / cache decorators ----
+
+#[test]
+fn lru_cache_wraps_the_body_with_a_static_cache() {
+    let src = concat!(
+        "from functools import lru_cache\n",
+        "\n",
+        "@lru_cache\n",
+        "def fib(n: int) -> int:\n",
+        "    if n < 2:\n",
+        "        return n\n",
+        "    return fib(n - 1) + fib(n - 2)\n",
+    );
+    let out = compile(src, "lru1.py");
+    // Python's bare @lru_cache default is maxsize=128.
+    assert!(out.contains("PyLruCache :: new (Some (128"), "generated: {}", out);
+    assert!(out.contains("__lru_uncached"), "generated: {}", out);
+    assert!(out.contains("static __LRU_CACHE"), "generated: {}", out);
+
+    // maxsize=None and functools.cache are unbounded.
+    let src = concat!(
+        "from functools import lru_cache\n",
+        "\n",
+        "@lru_cache(maxsize=None)\n",
+        "def f(n: int) -> int:\n",
+        "    return n\n",
+    );
+    let out = compile(src, "lru2.py");
+    assert!(out.contains("PyLruCache :: new (None)"), "generated: {}", out);
+
+    let src = concat!(
+        "import functools\n",
+        "\n",
+        "@functools.cache\n",
+        "def f(s: str) -> str:\n",
+        "    return s\n",
+    );
+    let out = compile(src, "lru3.py");
+    assert!(out.contains("PyLruCache :: new (None)"), "generated: {}", out);
+    // str parameters key as concrete String.
+    assert!(out.contains("(String ,)"), "generated: {}", out);
+}
+
+#[test]
+fn unknown_decorators_and_unhashable_keys_are_loud() {
+    // Silently ignoring a decorator converts the program into a
+    // different one; refuse.
+    let err = compile_err(
+        "@mystery\ndef f(n: int) -> int:\n    return n\n",
+        "lru4.py",
+    );
+    assert!(err.contains("not supported yet"), "error: {}", err);
+    assert!(err.contains("refuses to silently ignore"), "error: {}", err);
+
+    // Floats are not hashable cache keys in Rust; Python would cache
+    // them, which cannot be reproduced — loud.
+    let err = compile_err(
+        concat!(
+            "from functools import lru_cache\n",
+            "\n",
+            "@lru_cache\n",
+            "def f(x: float) -> float:\n",
+            "    return x\n",
+        ),
+        "lru5.py",
+    );
+    assert!(err.contains("must be annotated int, bool, or str"), "error: {}", err);
+}
+
+// ---- argparse: conversion-time parsers ----
+
+#[test]
+fn argparse_parser_statements_become_a_typed_struct() {
+    let src = concat!(
+        "import argparse\n",
+        "\n",
+        "def main() -> None:\n",
+        "    p = argparse.ArgumentParser(prog=\"tool\", description=\"Demo\")\n",
+        "    p.add_argument(\"name\")\n",
+        "    p.add_argument(\"count\", type=int)\n",
+        "    p.add_argument(\"--verbose\", action=\"store_true\")\n",
+        "    p.add_argument(\"--scale\", type=float, default=1.0)\n",
+        "    args = p.parse_args()\n",
+        "    print(args.name, args.count, args.scale)\n",
+    );
+    let out = compile(src, "ap1.py");
+    // The parser-building statements vanish; a typed namespace struct
+    // and one run_parser call take their place.
+    assert!(out.contains("struct __ArgparseArgs"), "generated: {}", out);
+    assert!(out.contains("argparse :: run_parser"), "generated: {}", out);
+    assert!(out.contains("name : String"), "generated: {}", out);
+    assert!(out.contains("count : i64"), "generated: {}", out);
+    assert!(out.contains("verbose : bool"), "generated: {}", out);
+    assert!(out.contains("scale : f64"), "generated: {}", out);
+    assert!(!out.contains("ArgumentParser"), "generated: {}", out);
+    assert!(!out.contains("add_argument"), "generated: {}", out);
+    // The parser variable is gone entirely (not even a hoisted let).
+    assert!(!out.contains("let p"), "generated: {}", out);
+}
+
+#[test]
+fn argparse_dynamic_or_unsupported_specs_are_loud() {
+    // A value-taking option without default= would be None in Python,
+    // which the typed field cannot hold.
+    let err = compile_err(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(\"--scale\", type=float)\n",
+            "    args = p.parse_args()\n",
+        ),
+        "ap2.py",
+    );
+    assert!(err.contains("needs default="), "error: {}", err);
+
+    // Dynamic names cannot shape a struct at conversion time.
+    let err = compile_err(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(n: str) -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(n)\n",
+            "    args = p.parse_args()\n",
+        ),
+        "ap3.py",
+    );
+    assert!(err.contains("string literal"), "error: {}", err);
+
+    // Unsupported add_argument keywords refuse loudly.
+    let err = compile_err(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(\"xs\", nargs=\"+\")\n",
+            "    args = p.parse_args()\n",
+        ),
+        "ap4.py",
+    );
+    assert!(err.contains("'nargs' is not supported yet"), "error: {}", err);
+}
