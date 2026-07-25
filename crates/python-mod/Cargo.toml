@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A macro library for including a Python module in Rust. At this point, very incomplete."
+description = "Proc-macros that compile Python modules into Rust at build time (the Rython toolchain)"
+documentation = "https://docs.rs/python-mod"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["python", "macro", "transpiler", "compile-time"]
+categories = ["development-tools", "compilers"]
 
 [lib]
 proc-macro = true

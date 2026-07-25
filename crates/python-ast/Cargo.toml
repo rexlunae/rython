@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "A library for compiling Python to Rust"
 documentation = "https://docs.rs/python-ast"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["python", "rust", "transpiler", "compiler", "ast"]
+categories = ["compilers", "development-tools"]
 
 [dependencies]
 syn = "2.0"
@@ -15,7 +19,6 @@ pyo3 = {version = "0.29", features=["auto-initialize", "serde"]}
 num-traits = "0.2"
 num-derive = "0.4"
 tracing = "0.1"
-test-log = { version = "0.2", default-features = false, features = ["trace"] }
 litrs = "1.0"
 to_tokenstream = "0.1.3"
 serde = { version = "1.0.195", features = ["serde_derive", "derive", "rc"] }
@@ -23,3 +26,6 @@ thiserror = "2.0.12"
 regex = "1.10"
 anyhow = "1.0"
 anyhow-tracing = "0.2"
+
+[dev-dependencies]
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
