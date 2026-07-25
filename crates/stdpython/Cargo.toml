@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Python standard library runtime for the Rython compiler ecosystem"
+documentation = "https://docs.rs/stdpython"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["python", "runtime", "stdlib", "transpiler", "no-std"]
+categories = ["development-tools", "no-std"]
 
 # Feature ladder (no_std-by-absence): core ⊂ alloc ⊂ std.
 #   --no-default-features --features alloc  → #![no_std] + alloc (strings,

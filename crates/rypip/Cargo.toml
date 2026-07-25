@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A pip-like tool that builds Python packages as native Rust binaries and converts them into Rust crates, optionally with PyO3 bindings."
+documentation = "https://docs.rs/rypip"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["python", "pip", "transpiler", "packaging", "build-tool"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [dependencies]
 anyhow = "1.0"

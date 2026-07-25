@@ -13,9 +13,13 @@ version = "1.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rexlunae/rython"
+homepage = "https://github.com/rexlunae/rython"
 
+# Path dependencies carry the workspace version so `cargo publish` can
+# rewrite them into registry dependencies; without a version, publishing
+# any dependent crate fails outright.
 [workspace.dependencies]
-python-ast = { path = "crates/python-ast" }
-python-mod = { path = "crates/python-mod" }
-rythonc = { path = "crates/rythonc" }
-stdpython = { path = "crates/stdpython" }
+python-ast = { path = "crates/python-ast", version = "1.1.0" }
+python-mod = { path = "crates/python-mod", version = "1.1.0" }
+rythonc = { path = "crates/rythonc", version = "1.1.0" }
+stdpython = { path = "crates/stdpython", version = "1.1.0" }
