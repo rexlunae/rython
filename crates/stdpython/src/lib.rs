@@ -1433,11 +1433,20 @@ pub trait PyRepr {
     fn py_repr(&self) -> String;
 }
 
-impl PyRepr for i64 {
-    fn py_repr(&self) -> String {
-        self.to_string()
-    }
+// Every integer primitive reprs like a Python int, matching PyDisplay's
+// coverage: len() yields usize, and an integer literal among several
+// candidate impls falls back to i32, so a container of either must still
+// be printable.
+macro_rules! py_repr_int {
+    ($($t:ty),*) => {$(
+        impl PyRepr for $t {
+            fn py_repr(&self) -> String {
+                self.to_string()
+            }
+        }
+    )*};
 }
+py_repr_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 impl PyRepr for f64 {
     fn py_repr(&self) -> String {

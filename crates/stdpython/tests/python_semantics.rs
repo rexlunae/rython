@@ -2402,6 +2402,13 @@ mod dict_and_exception_display {
         let empty: PyDict<String, i64> = PyDict::default();
         assert_eq!(empty.py_repr(), "{}");
 
+        // len() yields usize, so a container of lengths must still
+        // render — PyRepr covers every integer width, as PyDisplay does.
+        let mut lens: PyDict<String, usize> = PyDict::default();
+        lens.insert("ab".to_string(), 2usize);
+        assert_eq!(lens.py_repr(), "{'ab': 2}");
+        assert_eq!(vec![1usize, 2].py_repr(), "[1, 2]");
+
         // Values render with repr: strings keep their quotes, floats and
         // bools use Python's spelling.
         let mut mixed: PyDict<String, String> = PyDict::default();
