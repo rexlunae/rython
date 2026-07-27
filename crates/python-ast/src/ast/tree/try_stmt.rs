@@ -153,9 +153,35 @@ impl CodeGen for Try {
         // The try body runs inside an immediately-invoked closure; `raise`
         // (and failed `assert`) inside it lower to `return Err(...)`. When
         // the body contains function-level returns, the closure's Ok value
-        // is a ControlFlow carrying the returned value out (Break) or
-        // marking normal completion (Continue).
+        // is a PyFlow carrying the returned value out (Return), a
+        // break/continue signal, or normal completion (Normal).
         let has_return = crate::body_contains_function_return(&self.body);
+        // A `break`/`continue` in the try body targets a loop OUTSIDE the
+        // body's closure, so it cannot be emitted as a Rust jump — it is
+        // threaded out as a PyFlow signal and replayed below.
+        let body_escapes = crate::body_breaks_outward(&self.body);
+        // Handler and else bodies run inline UNLESS there is a finally
+        // clause, which wraps them in their own closure; a break there
+        // would escape that closure with no signal path back. Refuse at
+        // conversion time rather than emit Rust that cannot compile.
+        if !self.finalbody.is_empty() {
+            let where_ = if self.handlers.iter().any(|h| crate::body_breaks_outward(&h.body)) {
+                Some("except handler")
+            } else if crate::body_breaks_outward(&self.orelse) {
+                Some("else clause")
+            } else {
+                None
+            };
+            if let Some(where_) = where_ {
+                return Err(format!(
+                    "`break`/`continue` in a try statement's {} is not supported when the \
+                     statement also has a `finally` clause; move the loop control out of the \
+                     handler, or drop the finally clause",
+                    where_
+                )
+                .into());
+            }
+        }
         let body_for_guarantee = self.body.clone();
         let body_ctx = CodeGenContext::TryBlock {
             parent: Box::new(ctx.clone()),
@@ -172,7 +198,7 @@ impl CodeGen for Try {
         // another Break when this try is itself inside an enclosing try's
         // closure.
         let break_return = if ctx.in_try_block() {
-            quote!(return Ok(std::ops::ControlFlow::Break(__rython_ret));)
+            quote!(return Ok(PyFlow::Return(__rython_ret));)
         } else {
             quote!(return Ok(__rython_ret);)
         };
@@ -277,23 +303,67 @@ impl CodeGen for Try {
             });
         }
 
-        if has_return {
+        if has_return || body_escapes {
+            // The Return arm carries a value, so the parameter needs a
+            // type; a body with no `return` never constructs one, so pin
+            // it to () rather than leave it uninferable.
+            let flow_type = if has_return {
+                quote!(PyFlow<_>)
+            } else {
+                quote!(PyFlow<()>)
+            };
+            let return_arm = if has_return {
+                quote! {
+                    Ok(PyFlow::Return(__rython_ret)) => {
+                        #finally_tokens
+                        #break_return
+                    }
+                }
+            } else {
+                quote! { Ok(PyFlow::Return(_)) => unreachable!("try body has no return"), }
+            };
+            // Replay a signalled break/continue at the try statement's own
+            // position, AFTER the finally clause — Python's ordering. If
+            // this try is itself inside another try's closure, the signal
+            // is re-raised outward instead of becoming a Rust loop jump.
+            let (break_arm, continue_arm) = if body_escapes {
+                let replay_break = if ctx.break_crosses_try_closure() {
+                    quote!(return Ok(PyFlow::Break);)
+                } else if ctx.break_target_has_else() {
+                    quote!({ __rython_broke = true; break; })
+                } else {
+                    quote!(break;)
+                };
+                let replay_continue = if ctx.break_crosses_try_closure() {
+                    quote!(return Ok(PyFlow::Continue);)
+                } else {
+                    quote!(continue;)
+                };
+                (
+                    quote! { Ok(PyFlow::Break) => { #finally_tokens #replay_break } },
+                    quote! { Ok(PyFlow::Continue) => { #finally_tokens #replay_continue } },
+                )
+            } else {
+                (
+                    quote! { Ok(PyFlow::Break) => unreachable!("try body has no break"), },
+                    quote! { Ok(PyFlow::Continue) => unreachable!("try body has no continue"), },
+                )
+            };
             Ok(quote! {
                 {
                     #[allow(unreachable_code)]
                     let __rython_try_result: std::result::Result<
-                        std::ops::ControlFlow<_>,
+                        #flow_type,
                         PyException,
                     > = (|| {
                         #(#try_body_tokens;)*
-                        Ok(std::ops::ControlFlow::Continue(()))
+                        Ok(PyFlow::Normal)
                     })();
                     match __rython_try_result {
-                        Ok(std::ops::ControlFlow::Break(__rython_ret)) => {
-                            #finally_tokens
-                            #break_return
-                        }
-                        Ok(std::ops::ControlFlow::Continue(())) => { #ok_arm_body }
+                        #return_arm
+                        #break_arm
+                        #continue_arm
+                        Ok(PyFlow::Normal) => { #ok_arm_body }
                         #(#arms)*
                     }
                     #finally_tokens
@@ -320,7 +390,7 @@ impl CodeGen for Try {
 
 /// Lower an except-handler or else-clause body. Without a finally clause
 /// the statements run inline. With one, the body runs in its own closure —
-/// like the try body — so a `return` (threaded out as ControlFlow::Break)
+/// like the try body — so a `return` (threaded out as PyFlow::Return)
 /// or a raise (an Err) still executes the finally body before leaving the
 /// function, as Python guarantees.
 #[allow(clippy::too_many_arguments)]
@@ -364,18 +434,23 @@ fn lower_finally_guarded_body(
         Ok(quote! {
             #[allow(unreachable_code)]
             let __rython_inner: std::result::Result<
-                std::ops::ControlFlow<_>,
+                PyFlow<_>,
                 PyException,
             > = (|| {
                 #(#tokens;)*
-                Ok(std::ops::ControlFlow::Continue(()))
+                Ok(PyFlow::Normal)
             })();
             match __rython_inner {
-                Ok(std::ops::ControlFlow::Break(__rython_ret)) => {
+                Ok(PyFlow::Return(__rython_ret)) => {
                     #finally_tokens
                     #break_return
                 }
-                Ok(std::ops::ControlFlow::Continue(())) => { #completed_arm }
+                // A break/continue in a closure-wrapped handler or else
+                // clause is rejected at conversion time, so these are
+                // structurally unreachable.
+                Ok(PyFlow::Break) => unreachable!("handler body has no break"),
+                Ok(PyFlow::Continue) => unreachable!("handler body has no continue"),
+                Ok(PyFlow::Normal) => { #completed_arm }
                 Err(__rython_reraise) => {
                     #finally_tokens
                     return Err(__rython_reraise);

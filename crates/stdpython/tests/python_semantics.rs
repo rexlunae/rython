@@ -2385,3 +2385,38 @@ mod lru_cache_store {
         assert_eq!(c.get(&(999,)), Some(1998));
     }
 }
+
+mod dict_and_exception_display {
+    use stdpython::{py_display, PyDict, PyException, PyRepr};
+
+    #[test]
+    fn dict_repr_matches_python_including_order() {
+        // python3: repr({'a': 1, 'b': 'x'}) == "{'a': 1, 'b': 'x'}" —
+        // keys AND values use repr, and insertion order is preserved.
+        let mut d: PyDict<String, i64> = PyDict::default();
+        d.insert("b".to_string(), 2);
+        d.insert("a".to_string(), 1);
+        assert_eq!(d.py_repr(), "{'b': 2, 'a': 1}");
+        assert_eq!(py_display(&d), "{'b': 2, 'a': 1}");
+
+        let empty: PyDict<String, i64> = PyDict::default();
+        assert_eq!(empty.py_repr(), "{}");
+
+        // Values render with repr: strings keep their quotes, floats and
+        // bools use Python's spelling.
+        let mut mixed: PyDict<String, String> = PyDict::default();
+        mixed.insert("k".to_string(), "v".to_string());
+        assert_eq!(mixed.py_repr(), "{'k': 'v'}");
+    }
+
+    #[test]
+    fn exception_str_is_the_message_alone() {
+        // python3: str(ValueError("boom")) == "boom" — NOT the
+        // "ValueError: boom" traceback form that Display produces.
+        let e = PyException::new("ValueError", "boom");
+        assert_eq!(py_display(&e), "boom");
+        assert_eq!(format!("{}", e), "ValueError: boom");
+        // python3: repr(ValueError("boom")) == "ValueError('boom')"
+        assert_eq!(e.py_repr(), "ValueError('boom')");
+    }
+}

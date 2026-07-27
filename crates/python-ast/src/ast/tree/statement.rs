@@ -306,11 +306,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
 }
 
 /// A Python `return` lowered for the current context: inside a try-block
-/// closure it breaks out via ControlFlow so the try lowering can run the
+/// closure it signals out via PyFlow so the try lowering can run the
 /// finally body and re-return; elsewhere it returns Ok directly.
 fn return_tokens(ctx: &CodeGenContext, value: TokenStream) -> TokenStream {
     if ctx.in_try_block() {
-        quote!(return Ok(std::ops::ControlFlow::Break(#value)))
+        quote!(return Ok(PyFlow::Return(#value)))
     } else {
         quote!(return Ok(#value))
     }
@@ -320,7 +320,35 @@ fn return_tokens(ctx: &CodeGenContext, value: TokenStream) -> TokenStream {
 /// looking through control flow (including nested trys and their handlers)
 /// but not into nested function or class definitions. The try lowering uses
 /// this to pick its closure's carrier type: bodies with returns thread the
-/// returned value out through ControlFlow.
+/// returned value out through PyFlow.
+/// Does this statement list contain a `break`/`continue` that targets a
+/// loop OUTSIDE the list? A loop nested *within* the list owns its own
+/// breaks, so its body is not searched — but its `else` clause is, since
+/// a break there targets the enclosing loop, as in Python. Nested
+/// function and class bodies are separate scopes and never searched.
+pub fn body_breaks_outward(body: &[Statement]) -> bool {
+    body.iter().any(|stmt| match &stmt.statement {
+        StatementType::Break | StatementType::Continue => true,
+        StatementType::If(s) => {
+            body_breaks_outward(&s.body) || body_breaks_outward(&s.orelse)
+        }
+        // A loop captures breaks in its BODY; only its else clause can
+        // break outward.
+        StatementType::For(s) => body_breaks_outward(&s.orelse),
+        StatementType::While(s) => body_breaks_outward(&s.orelse),
+        StatementType::AsyncFor(s) => body_breaks_outward(&s.orelse),
+        StatementType::Try(s) => {
+            body_breaks_outward(&s.body)
+                || s.handlers.iter().any(|h| body_breaks_outward(&h.body))
+                || body_breaks_outward(&s.orelse)
+                || body_breaks_outward(&s.finalbody)
+        }
+        StatementType::With(s) => body_breaks_outward(&s.body),
+        StatementType::AsyncWith(s) => body_breaks_outward(&s.body),
+        _ => false,
+    })
+}
+
 pub fn body_contains_function_return(body: &[Statement]) -> bool {
     body.iter().any(|stmt| match &stmt.statement {
         StatementType::Return(_) => true,
@@ -437,6 +465,17 @@ impl CodeGen for StatementType {
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
             StatementType::AugAssign(a) => a.to_rust(ctx, options, symbols),
             StatementType::Break => {
+                // A break whose loop lies outside an enclosing try-block
+                // closure cannot be a Rust `break` here — it would escape
+                // the closure. Signal it out instead; the try lowering
+                // replays it after the finally clause, as Python orders it.
+                if ctx.break_crosses_try_closure() {
+                    return Ok(if ctx.break_target_has_else() {
+                        quote! {{ __rython_broke = true; return Ok(PyFlow::Break); }}
+                    } else {
+                        quote! {return Ok(PyFlow::Break);}
+                    });
+                }
                 // Inside a loop that has an `else` clause, breaking must also
                 // record that the loop did not complete normally.
                 if matches!(ctx, Self::Context::Loop { has_else: true, .. }) {
@@ -447,7 +486,13 @@ impl CodeGen for StatementType {
             }
             StatementType::Call(c) => c.to_rust(ctx, options, symbols),
             StatementType::ClassDef(c) => c.to_rust(ctx, options, symbols),
-            StatementType::Continue => Ok(quote! {continue;}),
+            StatementType::Continue => {
+                if ctx.break_crosses_try_closure() {
+                    Ok(quote! {return Ok(PyFlow::Continue);})
+                } else {
+                    Ok(quote! {continue;})
+                }
+            }
             StatementType::Pass => Ok(quote! {}),
             StatementType::FunctionDef(s) => s.to_rust(ctx, options, symbols),
             StatementType::Import(s) => s.to_rust(ctx, options, symbols),
@@ -456,7 +501,7 @@ impl CodeGen for StatementType {
             // Functions return Result<T, PyException>; a Python return wraps
             // its value in Ok (bare return / return None yield Ok(())).
             // Inside a try block's closure, a return must first break out of
-            // the closure: it becomes Ok(ControlFlow::Break(value)), which
+            // the closure: it becomes Ok(PyFlow::Return(value)), which
             // the try lowering turns back into a function return — after
             // running the finally body, as Python requires.
             StatementType::Return(None) => Ok(return_tokens(&ctx, quote!(()))),

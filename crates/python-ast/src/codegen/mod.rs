@@ -48,6 +48,33 @@ impl CodeGenContext {
         }
     }
 
+    /// Whether a `break`/`continue` generated here would have to cross a
+    /// try-block closure boundary to reach its loop. Walking outward, the
+    /// first `Loop` means the statement binds to a real Rust loop; hitting
+    /// `TryBlock` first means the loop is outside the closure, so the
+    /// statement must be threaded out as a `PyFlow` signal instead.
+    pub fn break_crosses_try_closure(&self) -> bool {
+        match self {
+            CodeGenContext::Loop { .. } => false,
+            CodeGenContext::TryBlock { .. } => true,
+            CodeGenContext::ExceptHandler { parent } => parent.break_crosses_try_closure(),
+            CodeGenContext::Async(inner) => inner.break_crosses_try_closure(),
+            _ => false,
+        }
+    }
+
+    /// Whether the loop a `break` here targets carries a Python `else`
+    /// clause, so the break must also set the loop's `__rython_broke` flag.
+    pub fn break_target_has_else(&self) -> bool {
+        match self {
+            CodeGenContext::Loop { has_else, .. } => *has_else,
+            CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.break_target_has_else(),
+            CodeGenContext::Async(inner) => inner.break_target_has_else(),
+            _ => false,
+        }
+    }
+
     /// Whether code generated here runs inside an except handler, i.e. the
     /// caught exception is in scope as `__rython_exc` (for bare `raise`).
     pub fn in_except_handler(&self) -> bool {

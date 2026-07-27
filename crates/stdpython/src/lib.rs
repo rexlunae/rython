@@ -1496,6 +1496,30 @@ impl<A: PyRepr, B: PyRepr, C: PyRepr> PyRepr for (A, B, C) {
     }
 }
 
+/// Python dict repr: `{'a': 1, 'b': 2}` — keys AND values both render
+/// with repr, and insertion order is preserved (IndexMap matches
+/// Python's dict ordering guarantee, so the rendering is faithful, not
+/// merely plausible). An empty dict is `{}`.
+///
+/// Sets deliberately have no repr: their iteration order is arbitrary
+/// in both languages and cannot be made to agree, so printing one would
+/// silently diverge from CPython. It stays a loud compile error instead.
+impl<K: PyRepr, V: PyRepr> PyRepr for PyDict<K, V> {
+    fn py_repr(&self) -> String {
+        let items: Vec<String> = self
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k.py_repr(), v.py_repr()))
+            .collect();
+        format!("{{{}}}", items.join(", "))
+    }
+}
+
+impl<K: PyRepr, V: PyRepr> PyDisplay for PyDict<K, V> {
+    fn py_display(&self) -> String {
+        self.py_repr()
+    }
+}
+
 impl<A: PyRepr, B: PyRepr> PyDisplay for (A, B) {
     fn py_display(&self) -> String {
         self.py_repr()
@@ -3527,6 +3551,40 @@ impl From<PyException> for pyo3::PyErr {
 impl Display for PyException {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}: {}", self.exception_type, self.message)
+    }
+}
+
+/// How a `try` body finished, for the try lowering's closure. A Python
+/// `try` body runs inside a closure so `raise` can `return Err(...)`;
+/// that closure also swallows `return`, `break`, and `continue`, which
+/// must instead be carried out to the try statement's own position and
+/// replayed AFTER the finally clause runs, exactly as Python orders
+/// them.
+pub enum PyFlow<T> {
+    /// Fell off the end of the body.
+    Normal,
+    /// `return value`
+    Return(T),
+    /// `break` targeting a loop outside the try.
+    Break,
+    /// `continue` targeting a loop outside the try.
+    Continue,
+}
+
+/// Python's `str(exception)` is the MESSAGE alone — `str(ValueError("boom"))`
+/// is "boom", not "ValueError: boom" (that form is the traceback
+/// rendering, which this type's Display produces). So
+/// `except ValueError as e: print(e)` prints exactly what Python prints.
+impl PyDisplay for PyException {
+    fn py_display(&self) -> String {
+        self.message.clone()
+    }
+}
+
+/// Python's `repr(exception)` is `ValueError('boom')`.
+impl PyRepr for PyException {
+    fn py_repr(&self) -> String {
+        format!("{}({})", self.exception_type, py_str_repr(&self.message))
     }
 }
 
