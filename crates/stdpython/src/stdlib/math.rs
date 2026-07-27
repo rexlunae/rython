@@ -14,6 +14,37 @@ pub const tau: f64 = consts::TAU;
 pub const inf: f64 = f64::INFINITY;
 pub const nan: f64 = f64::NAN;
 
+/// Convert an already-rounded float to an int the way Python does:
+/// NaN and infinity raise instead of silently becoming 0 or i64::MAX,
+/// and a magnitude beyond i64 is an overflow rather than a saturation.
+fn to_py_int(value: f64, func: &str) -> i64 {
+    if value.is_nan() {
+        panic!(
+            "{}",
+            crate::PyException::new("ValueError", "cannot convert float NaN to integer")
+        );
+    }
+    if value.is_infinite() {
+        panic!(
+            "{}",
+            crate::PyException::new(
+                "OverflowError",
+                "cannot convert float infinity to integer",
+            )
+        );
+    }
+    if value < (i64::MIN as f64) || value > (i64::MAX as f64) {
+        panic!(
+            "{}",
+            crate::PyException::new(
+                "OverflowError",
+                format!("math.{}() result too large to convert to int", func),
+            )
+        );
+    }
+    value as i64
+}
+
 python_function! {
     /// math.ceil - ceiling function
     pub fn ceil<T>(x: T) -> i64
@@ -21,7 +52,7 @@ python_function! {
     [signature: (x)]
     [concrete_types: (f64) -> i64]
     {
-        x.into().ceil() as i64
+        to_py_int(x.into().ceil(), "ceil")
     }
 }
 
@@ -32,7 +63,7 @@ python_function! {
     [signature: (x)]
     [concrete_types: (f64) -> i64]
     {
-        x.into().floor() as i64
+        to_py_int(x.into().floor(), "floor")
     }
 }
 
@@ -43,7 +74,7 @@ python_function! {
     [signature: (x)]
     [concrete_types: (f64) -> i64]
     {
-        x.into().trunc() as i64
+        to_py_int(x.into().trunc(), "trunc")
     }
 }
 

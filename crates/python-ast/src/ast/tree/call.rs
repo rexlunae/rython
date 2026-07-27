@@ -2108,12 +2108,31 @@ fn lower_str_format(
                             .into(),
                     );
                 }
-                let lowering = if matches!(conversion, Some('r') | Some('a')) {
-                    crate::pyformat::conversion_lowering(spec)
-                        .map_err(|e| format!("str.format: {}", e))?
-                } else {
-                    translate_format_spec(spec).map_err(|e| format!("str.format: {}", e))?
-                };
+                let is_repr = matches!(conversion, Some('r') | Some('a'));
+                let lowering =
+                    translate_format_spec(spec).map_err(|e| format!("str.format: {}", e))?;
+                if is_repr {
+                    // Python's !r renders the repr STRING and applies the
+                    // spec to it; Rust's `{:?}` would print its own Debug
+                    // form ("ab" with double quotes) and diverge.
+                    let crate::pyformat::SpecLowering::Inline(suffix) = lowering else {
+                        return Err("str.format: numeric presentation types cannot combine \
+                                    with !r/!a (Python applies the spec to the repr string \
+                                    and raises)"
+                            .to_string()
+                            .into());
+                    };
+                    let fld = format!("__rython_fld{}", field_bindings.len());
+                    let src = crate::safe_ident(&index_name);
+                    let ident = crate::safe_ident(&fld);
+                    field_bindings.push(quote!(let #ident = repr(&(#src));));
+                    if suffix.is_empty() {
+                        fmt.push_str(&format!("{{{}}}", fld));
+                    } else {
+                        fmt.push_str(&format!("{{{}:{}}}", fld, suffix));
+                    }
+                    continue;
+                }
                 match lowering {
                     crate::pyformat::SpecLowering::Inline(suffix) => {
                         if suffix.is_empty() {

@@ -2221,6 +2221,79 @@ fn functools_partial_matches_python_at_runtime() {
 }
 
 #[test]
+fn chained_comparisons_dicts_and_try_flow_match_python_at_runtime() {
+    // Three correctness fixes at once: a chained comparison evaluating
+    // its middle operand exactly once (and short-circuiting the rest),
+    // dict and exception rendering, and `break` leaving a loop from
+    // inside a try body with a finally clause.
+    let scratch = Scratch::new("mixedfix");
+    let file = scratch.path().join("d7_all.py");
+    fs::write(
+        &file,
+        concat!(
+            "def probe(n: int) -> int:\n",
+            "    print(\"eval\", n)\n",
+            "    return n\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(1 < probe(5) < 10)\n",
+            "    print(1 < probe(0) < probe(9))\n",
+            "    d = {\"b\": 2, \"a\": 1}\n",
+            "    print(d)\n",
+            "    print(repr(d))\n",
+            "    try:\n",
+            "        raise ValueError(\"boom\")\n",
+            "    except ValueError as err:\n",
+            "        print(err)\n",
+            "        print(\"msg:\", err)\n",
+            "    for i in range(4):\n",
+            "        try:\n",
+            "            if i == 2:\n",
+            "                break\n",
+            "        finally:\n",
+            "            print(\"fin\", i)\n",
+            "    print(\"done\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/d7_all"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3. "eval 5" and "eval 0" appear ONCE each:
+    // the middle operand is not re-evaluated, and probe(9) never runs.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "eval 5",
+            "True",
+            "eval 0",
+            "False",
+            "{'b': 2, 'a': 1}",
+            "{'b': 2, 'a': 1}",
+            "boom",
+            "msg: boom",
+            "fin 0",
+            "fin 1",
+            "fin 2",
+            "done",
+        ],
+        "chained-comparison / dict / try-flow semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn replace_keywords_match_python_at_runtime() {
     // dt.replace(field=...) through the type-dispatched PyReplace trait:
     // datetime and date receivers, foreign-field TypeError, range

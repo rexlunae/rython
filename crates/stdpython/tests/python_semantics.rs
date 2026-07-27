@@ -2385,3 +2385,108 @@ mod lru_cache_store {
         assert_eq!(c.get(&(999,)), Some(1998));
     }
 }
+
+mod dict_and_exception_display {
+    use stdpython::{py_display, PyDict, PyException, PyRepr};
+
+    #[test]
+    fn dict_repr_matches_python_including_order() {
+        // python3: repr({'a': 1, 'b': 'x'}) == "{'a': 1, 'b': 'x'}" —
+        // keys AND values use repr, and insertion order is preserved.
+        let mut d: PyDict<String, i64> = PyDict::default();
+        d.insert("b".to_string(), 2);
+        d.insert("a".to_string(), 1);
+        assert_eq!(d.py_repr(), "{'b': 2, 'a': 1}");
+        assert_eq!(py_display(&d), "{'b': 2, 'a': 1}");
+
+        let empty: PyDict<String, i64> = PyDict::default();
+        assert_eq!(empty.py_repr(), "{}");
+
+        // len() yields usize, so a container of lengths must still
+        // render — PyRepr covers every integer width, as PyDisplay does.
+        let mut lens: PyDict<String, usize> = PyDict::default();
+        lens.insert("ab".to_string(), 2usize);
+        assert_eq!(lens.py_repr(), "{'ab': 2}");
+        assert_eq!(vec![1usize, 2].py_repr(), "[1, 2]");
+
+        // Values render with repr: strings keep their quotes, floats and
+        // bools use Python's spelling.
+        let mut mixed: PyDict<String, String> = PyDict::default();
+        mixed.insert("k".to_string(), "v".to_string());
+        assert_eq!(mixed.py_repr(), "{'k': 'v'}");
+    }
+
+    #[test]
+    fn exception_str_is_the_message_alone() {
+        // python3: str(ValueError("boom")) == "boom" — NOT the
+        // "ValueError: boom" traceback form that Display produces.
+        let e = PyException::new("ValueError", "boom");
+        assert_eq!(py_display(&e), "boom");
+        assert_eq!(format!("{}", e), "ValueError: boom");
+        // python3: repr(ValueError("boom")) == "ValueError('boom')"
+        assert_eq!(e.py_repr(), "ValueError('boom')");
+    }
+}
+
+mod cpython_numeric_and_stdlib_fixes {
+    use stdpython::{datetime::date, py_pow, PyInt};
+
+    #[test]
+    fn float_power_uses_libm_pow_not_repeated_squaring() {
+        // python3: 0.1 ** 4 == 0.00010000000000000002 (powi's repeated
+        // squaring gives ...05), and 1.05 ** 10 == 1.628894626777442.
+        assert_eq!(py_pow(0.1f64, 4i64), 0.1f64.powf(4.0));
+        assert_eq!(format!("{:?}", py_pow(0.1f64, 4i64)), "0.00010000000000000002");
+        assert_eq!(format!("{:?}", py_pow(1.05f64, 10i64)), "1.628894626777442");
+    }
+
+    #[test]
+    fn int_conversions_match_python() {
+        // Python strips surrounding whitespace and allows _ separators,
+        // so int(line) over file lines works.
+        assert_eq!("42\n".py_int().unwrap(), 42);
+        assert_eq!(" 7 ".py_int().unwrap(), 7);
+        assert_eq!("1_000".py_int().unwrap(), 1000);
+        // NaN and infinity raise instead of silently becoming 0/i64::MAX.
+        let e = f64::NAN.py_int().unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: cannot convert float NaN to integer");
+        let e = f64::INFINITY.py_int().unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "OverflowError: cannot convert float infinity to integer"
+        );
+    }
+
+    #[test]
+    fn isocalendar_follows_iso_week_rules() {
+        // python3: these dates belong to the NEIGHBOURING ISO year.
+        assert_eq!(date::new(2023, 1, 1).unwrap().isocalendar(), (2022, 52, 7));
+        assert_eq!(date::new(2024, 12, 31).unwrap().isocalendar(), (2025, 1, 2));
+        assert_eq!(date::new(2024, 12, 30).unwrap().isocalendar(), (2025, 1, 1));
+        // And an ordinary mid-year date.
+        assert_eq!(date::new(2000, 3, 1).unwrap().isocalendar(), (2000, 9, 3));
+        assert_eq!(date::new(2026, 7, 27).unwrap().isocalendar(), (2026, 31, 1));
+    }
+
+    #[test]
+    fn deque_maxlen_discards_from_the_opposite_end() {
+        use stdpython::collections::deque;
+        // python3: deque([1,2,3], maxlen=3).appendleft(0) -> deque([0,1,2])
+        // — always popping the front discarded the element just added.
+        let mut d: deque<i64> = deque::with_maxlen(3);
+        d.extend(vec![1, 2, 3]);
+        d.appendleft(0);
+        assert_eq!(
+            (0..3).map(|i| *d.get(i).unwrap()).collect::<Vec<i64>>(),
+            vec![0, 1, 2]
+        );
+        // Growing at the back still evicts the front.
+        let mut d: deque<i64> = deque::with_maxlen(3);
+        d.extend(vec![1, 2, 3]);
+        d.append(4);
+        assert_eq!(
+            (0..3).map(|i| *d.get(i).unwrap()).collect::<Vec<i64>>(),
+            vec![2, 3, 4]
+        );
+    }
+}

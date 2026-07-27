@@ -144,7 +144,7 @@ impl CodeGen for JoinedStr {
                 other => {
                     let expr = other.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     fmt.push_str("{}");
-                    args.push(expr);
+                    args.push(quote!(py_display(&(#expr))));
                 }
             }
         }
@@ -203,24 +203,35 @@ impl FormattedValue {
         };
 
         use crate::pyformat::SpecLowering;
-        let lowering = if is_repr {
-            // The spec applies to the debug rendering, so f"{x!r:>10}"
-            // pads the repr like Python.
-            crate::pyformat::conversion_lowering(&spec_text)
-                .map_err(|e| format!("f-string: {}", e))?
-        } else {
-            crate::pyformat::translate_format_spec(&spec_text)
-                .map_err(|e| format!("f-string: {}", e))?
-        };
+        // `!r` renders the repr STRING first and lets the spec pad or
+        // align that string, exactly as Python does — Rust's `{:?}`
+        // would print its own Debug form ("abc" with double quotes,
+        // `true` for a bool) and silently diverge.
+        if is_repr {
+            let lowering = crate::pyformat::translate_format_spec(&spec_text)
+                .map_err(|e| format!("f-string: {}", e))?;
+            let SpecLowering::Inline(suffix) = lowering else {
+                return Err("numeric presentation types cannot combine with !r/!a (Python \
+                            applies the spec to the repr string and raises)"
+                    .to_string()
+                    .into());
+            };
+            let placeholder = if suffix.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{:{}}}", suffix)
+            };
+            return Ok((placeholder, quote!(repr(&(#value)))));
+        }
+        let lowering = crate::pyformat::translate_format_spec(&spec_text)
+            .map_err(|e| format!("f-string: {}", e))?;
         match lowering {
-            SpecLowering::Inline(suffix) => Ok((
-                if suffix.is_empty() {
-                    "{}".to_string()
-                } else {
-                    format!("{{:{}}}", suffix)
-                },
-                value,
-            )),
+            // A bare `{x}` is Python's str(), which is NOT Rust's
+            // Display: Display prints `1` for 1.0 and `true` for True.
+            SpecLowering::Inline(suffix) if suffix.is_empty() => {
+                Ok(("{}".to_string(), quote!(py_display(&(#value)))))
+            }
+            SpecLowering::Inline(suffix) => Ok((format!("{{:{}}}", suffix), value)),
             SpecLowering::CastF64(suffix) => Ok((
                 if suffix.is_empty() {
                     "{}".to_string()

@@ -237,9 +237,12 @@ fn fstring_maps_precision_spec() {
 }
 
 #[test]
-fn fstring_repr_conversion_uses_debug() {
+fn fstring_repr_conversion_uses_pythons_repr() {
+    // Python's !r is repr(), not Rust's Debug: repr("ab") is 'ab' with
+    // SINGLE quotes, where {:?} would render "ab".
     let out = compile("s = f\"{val!r}\"", "fstr3.py");
-    assert!(out.contains("{:?}"), "generated: {}", out);
+    assert!(out.contains("repr (& (val))"), "generated: {}", out);
+    assert!(!out.contains("{:?}"), "generated: {}", out);
 }
 
 #[test]
@@ -550,9 +553,9 @@ fn finally_runs_before_handler_and_else_returns() {
     );
     let out = compile(src, "finally_handler.py");
     // Both the handler return and the else return thread out through a
-    // ControlFlow closure whose Break arm runs cleanup() first.
+    // PyFlow closure whose Return arm runs cleanup() first.
     assert_eq!(
-        out.matches("Ok (std :: ops :: ControlFlow :: Break (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }")
+        out.matches("Ok (PyFlow :: Return (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }")
             .count(),
         2,
         "handler and else returns must run the finally first: {}",
@@ -674,12 +677,12 @@ fn return_inside_try_threads_through_controlflow() {
     );
     let out = compile(src, "trystmt_ret.py");
     assert!(
-        out.contains("ControlFlow :: Break (n)"),
+        out.contains("PyFlow :: Return (n)"),
         "generated: {}",
         out
     );
     assert!(
-        out.contains("Ok (std :: ops :: ControlFlow :: Break (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }"),
+        out.contains("Ok (PyFlow :: Return (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }"),
         "finally must run before the returned value leaves: {}",
         out
     );
@@ -1634,13 +1637,15 @@ fn repr_conversion_keeps_its_format_spec() {
         "def f(n: int) -> str:\n    return \"{0!r:>10}\".format(n)\n",
         "reprspec.py",
     );
-    assert!(out.contains(":>10?}"), "generated: {}", out);
+    assert!(out.contains(":>10}"), "generated: {}", out);
+    assert!(out.contains("repr ("), "generated: {}", out);
 
     let out = compile(
         "def f(n: int) -> str:\n    return f\"{n!r:>10}\"\n",
         "freprspec.py",
     );
-    assert!(out.contains(":>10?}"), "generated: {}", out);
+    assert!(out.contains(":>10}"), "generated: {}", out);
+    assert!(out.contains("repr ("), "generated: {}", out);
 
     // Numeric presentation types on a repr are Python errors; loud here.
     let err = compile_err(
@@ -2872,4 +2877,143 @@ fn argparse_dynamic_or_unsupported_specs_are_loud() {
         "ap4.py",
     );
     assert!(err.contains("'nargs' is not supported yet"), "error: {}", err);
+}
+
+// ---- chained comparisons and loop control through try ----
+
+#[test]
+fn chained_comparison_evaluates_each_operand_once() {
+    // `a < f() < b` must NOT expand to `a < f() && f() < b`: Python
+    // evaluates the middle operand exactly once, so a side-effecting or
+    // non-deterministic operand would otherwise diverge.
+    let out = compile(
+        "def f(n: int) -> int:\n    return n\n\ndef g() -> bool:\n    return 1 < f(5) < 10\n",
+        "chain1.py",
+    );
+    assert_eq!(
+        out.matches("f (5)").count(),
+        1,
+        "middle operand must be evaluated once: {}",
+        out
+    );
+    assert!(out.contains("__rython_cmp"), "generated: {}", out);
+
+    // The later operand stays inside the `&&` so a false prefix leaves
+    // it unevaluated, as Python short-circuits.
+    let out = compile(
+        "def f(n: int) -> int:\n    return n\n\ndef g() -> bool:\n    return 1 < f(2) < f(3)\n",
+        "chain2.py",
+    );
+    assert!(out.contains("&& {"), "later operand must stay guarded: {}", out);
+
+    // A plain (unchained) comparison keeps the simple lowering.
+    let out = compile("def g(a: int, b: int) -> bool:\n    return a < b\n", "chain3.py");
+    assert!(!out.contains("__rython_cmp"), "generated: {}", out);
+    assert!(out.contains("(a) < (b)"), "generated: {}", out);
+}
+
+#[test]
+fn break_and_continue_thread_out_of_a_try_body() {
+    // A break inside a try body targets the enclosing loop, which lies
+    // outside the body's closure — it must be signalled out and replayed
+    // after the finally clause, not emitted as a `break` in the closure.
+    let src = concat!(
+        "def f() -> None:\n",
+        "    for i in range(3):\n",
+        "        try:\n",
+        "            if i == 1:\n",
+        "                break\n",
+        "        finally:\n",
+        "            cleanup()\n",
+    );
+    let out = compile(src, "tryflow1.py");
+    assert!(out.contains("return Ok (PyFlow :: Break)"), "generated: {}", out);
+    assert!(
+        out.contains("Ok (PyFlow :: Break) => { cleanup () ; break ; }"),
+        "the finally must run before the break resumes: {}",
+        out
+    );
+
+    // A break belonging to a loop INSIDE the try body stays a plain break.
+    let src = concat!(
+        "def f() -> None:\n",
+        "    try:\n",
+        "        for i in range(3):\n",
+        "            break\n",
+        "    finally:\n",
+        "        cleanup()\n",
+    );
+    let out = compile(src, "tryflow2.py");
+    assert!(!out.contains("PyFlow :: Break"), "generated: {}", out);
+}
+
+#[test]
+fn loop_control_in_a_finally_guarded_handler_is_loud() {
+    // The handler body is closure-wrapped when a finally clause exists,
+    // so a break there has no signal path out; refuse at conversion time
+    // rather than emit Rust that cannot compile.
+    let src = concat!(
+        "def f() -> None:\n",
+        "    for i in range(3):\n",
+        "        try:\n",
+        "            risky()\n",
+        "        except ValueError:\n",
+        "            break\n",
+        "        finally:\n",
+        "            cleanup()\n",
+    );
+    let err = compile_err(src, "tryflow3.py");
+    assert!(err.contains("except handler"), "error: {}", err);
+    assert!(err.contains("finally"), "error: {}", err);
+}
+
+// ---- f-strings, true division, `not`, `or None` ----
+
+#[test]
+fn f_strings_render_through_py_display_not_rust_display() {
+    // Rust's Display prints `1` for 1.0 and `true` for True; Python's
+    // str() prints `1.0` and `True`.
+    let out = compile("def f(x: float):\n    return f\"v={x}\"\n", "fs1.py");
+    assert!(out.contains("py_display (& (x))"), "generated: {}", out);
+
+    // A format spec still uses Rust's translated formatting.
+    let out = compile("def f(x: float):\n    return f\"v={x:.2f}\"\n", "fs2.py");
+    assert!(out.contains("{:.2}"), "generated: {}", out);
+    assert!(!out.contains("py_display"), "generated: {}", out);
+
+    // !r renders the repr STRING, so the spec pads the repr like Python;
+    // Rust's `{:?}` would print its own Debug form instead.
+    let out = compile("def f(s: str):\n    return f\"{s!r}\"\n", "fs3.py");
+    assert!(out.contains("repr (& (s))"), "generated: {}", out);
+    assert!(!out.contains("{:?}"), "generated: {}", out);
+}
+
+#[test]
+fn augmented_division_is_true_division() {
+    // Python's `/=` yields a float; Rust's `/=` on an integer truncates.
+    let out = compile("def f(y: float):\n    y /= 2\n    return y\n", "td1.py");
+    assert!(out.contains("as f64 / (2) as f64"), "generated: {}", out);
+    assert!(!out.contains("y /= 2"), "generated: {}", out);
+}
+
+#[test]
+fn not_is_a_truthiness_test_not_bitwise_complement() {
+    // `not 5` is False; `!5i64` is -6.
+    let out = compile("def f(n: int):\n    return not n\n", "not1.py");
+    assert!(out.contains("! (n) . is_truthy ()"), "generated: {}", out);
+
+    // `~n` stays a bitwise complement.
+    let out = compile("def f(n: int):\n    return ~n\n", "not2.py");
+    assert!(out.contains("! n"), "generated: {}", out);
+    assert!(!out.contains("is_truthy"), "generated: {}", out);
+}
+
+#[test]
+fn or_none_yields_none_instead_of_dropping_it() {
+    // `count or None` must be None when count is falsy — the None was
+    // previously dropped, silently returning the falsy value.
+    let out = compile("def f(count: int):\n    return count or None\n", "orn.py");
+    assert!(out.contains("is_truthy ()"), "generated: {}", out);
+    assert!(out.contains("Some (__rython_or)"), "generated: {}", out);
+    assert!(out.contains("None"), "generated: {}", out);
 }

@@ -112,6 +112,19 @@ impl CodeGen for Compare {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A CHAINED comparison (`a < b < c`) must evaluate every operand
+        // exactly once — the naive `a < b && b < c` expansion evaluates
+        // `b` twice, running its side effects twice and, for a
+        // non-deterministic operand, even yielding a different answer
+        // than Python. Bind each operand to a temporary at the point
+        // Python evaluates it, and nest the remaining tests inside the
+        // `&&` so a false prefix leaves later operands unevaluated, as
+        // Python's short circuit does. The temporaries bind by
+        // REFERENCE so an operand that is a live variable is not moved
+        // out of the enclosing scope.
+        if self.ops.len() > 1 {
+            return self.to_rust_chained(ctx, options, symbols);
+        }
         let mut outer_ts = TokenStream::new();
         // Python chains comparisons pairwise: `a < b < c` means
         // `a < b && b < c`, so each comparator becomes the left operand of
@@ -192,6 +205,99 @@ impl CodeGen for Compare {
             }
         }
         Ok(outer_ts)
+    }
+}
+
+impl Compare {
+    /// Lower `a OP b OP c ...` with each operand evaluated exactly once
+    /// and Python's short-circuit order preserved:
+    ///
+    /// ```text
+    /// { let t0 = &a; let t1 = &b; t0 OP t1 && { let t2 = &c; t1 OP t2 } }
+    /// ```
+    fn to_rust_chained(
+        self,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let mut operands: Vec<&ExprType> = Vec::with_capacity(self.comparators.len() + 1);
+        operands.push(self.left.as_ref());
+        operands.extend(self.comparators.iter());
+
+        let mut rendered = Vec::with_capacity(operands.len());
+        for operand in &operands {
+            rendered.push((*operand).clone().to_rust(
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?);
+        }
+        let names: Vec<proc_macro2::Ident> = (0..operands.len())
+            .map(|i| quote::format_ident!("__rython_cmp{}", i))
+            .collect();
+
+        // A None literal is side-effect free and has no nameable type of
+        // its own, so it is never bound to a temporary; `is None` tests
+        // consume only the other side.
+        let is_none: Vec<bool> = operands.iter().map(|e| crate::is_none_expr(e)).collect();
+        let bind = |i: usize| -> TokenStream {
+            if is_none[i] {
+                return quote!();
+            }
+            let name = &names[i];
+            let value = &rendered[i];
+            quote!(let #name = &(#value);)
+        };
+
+        // The comparison for one link of the chain, over the temporaries.
+        let compare_pair = |i: usize| -> Result<TokenStream, Box<dyn std::error::Error>> {
+            let op = &self.ops[i];
+            let (l, r) = (&names[i], &names[i + 1]);
+            if matches!(op, Compares::Is | Compares::IsNot) {
+                let operand = if is_none[i + 1] {
+                    Some(l)
+                } else if is_none[i] {
+                    Some(r)
+                } else {
+                    None
+                };
+                if let Some(operand) = operand {
+                    return Ok(match op {
+                        Compares::Is => quote!((#operand).py_is_none()),
+                        _ => quote!(!(#operand).py_is_none()),
+                    });
+                }
+            }
+            Ok(match op {
+                Compares::Eq => quote!((#l) == (#r)),
+                Compares::NotEq => quote!((#l) != (#r)),
+                Compares::Lt => quote!((#l) < (#r)),
+                Compares::LtE => quote!((#l) <= (#r)),
+                Compares::Gt => quote!((#l) > (#r)),
+                Compares::GtE => quote!((#l) >= (#r)),
+                Compares::Is => quote!((#l) == (#r)),
+                Compares::IsNot => quote!((#l) != (#r)),
+                Compares::In => quote!((#r).py_contains(#l)),
+                Compares::NotIn => quote!(!(#r).py_contains(#l)),
+                _ => return Err(err_from(CompareNotYetImplemented(self.clone())).into()),
+            })
+        };
+
+        // Build inside out so each operand is bound immediately before
+        // the test that first needs it.
+        let mut acc: Option<TokenStream> = None;
+        for i in (0..self.ops.len()).rev() {
+            let rhs_bind = bind(i + 1);
+            let test = compare_pair(i)?;
+            acc = Some(match acc {
+                None => quote!({ #rhs_bind #test }),
+                Some(rest) => quote!({ #rhs_bind #test && #rest }),
+            });
+        }
+        let first_bind = bind(0);
+        let body = acc.expect("a chained comparison has at least one operator");
+        Ok(quote!({ #first_bind #body }))
     }
 }
 
