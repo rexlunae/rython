@@ -82,7 +82,10 @@ impl CodeGen for UnaryOp {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let operand = self.operand.clone().to_rust(ctx, options, symbols)?;
         match self.op {
-            Ops::Invert | Ops::Not => Ok(quote!(!#operand)),
+            // `~x` is Rust's bitwise complement, but `not x` is a
+            // TRUTHINESS test: `not 5` is False, where `!5i64` is -6.
+            Ops::Invert => Ok(quote!(!#operand)),
+            Ops::Not => Ok(quote!(!(#operand).is_truthy())),
             // Rust has no unary plus; Python's `+x` is the identity for
             // numbers, so emit the operand alone (parenthesized).
             Ops::UAdd => Ok(quote!((#operand))),

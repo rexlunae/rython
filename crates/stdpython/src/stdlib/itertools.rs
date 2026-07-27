@@ -229,7 +229,19 @@ where
         Self {
             items: iterable.into_iter().collect(),
             stop,
-            step: step.max(1), // Ensure step is at least 1
+            step: if step == 0 {
+                // Python raises; silently treating 0 as 1 would yield a
+                // full slice where Python refuses.
+                panic!(
+                    "{}",
+                    crate::PyException::new(
+                        "ValueError",
+                        "Step for islice() must be a positive integer or None.",
+                    )
+                )
+            } else {
+                step
+            },
             current: start,
         }
     }

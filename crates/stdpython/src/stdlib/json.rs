@@ -755,7 +755,10 @@ fn format_json_float(n: f64) -> String {
     } else if crate::flt::fract(n) == 0.0 && crate::flt::abs(n) < 1e16 {
         format!("{:.1}", n)
     } else {
-        format!("{}", n)
+        // Python's json uses float.__repr__, which switches to exponent
+        // form outside [1e-4, 1e16); Rust's Display never does, turning
+        // 1e300 into a 301-digit literal.
+        crate::py_float_repr(n)
     }
 }
 

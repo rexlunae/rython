@@ -237,9 +237,12 @@ fn fstring_maps_precision_spec() {
 }
 
 #[test]
-fn fstring_repr_conversion_uses_debug() {
+fn fstring_repr_conversion_uses_pythons_repr() {
+    // Python's !r is repr(), not Rust's Debug: repr("ab") is 'ab' with
+    // SINGLE quotes, where {:?} would render "ab".
     let out = compile("s = f\"{val!r}\"", "fstr3.py");
-    assert!(out.contains("{:?}"), "generated: {}", out);
+    assert!(out.contains("repr (& (val))"), "generated: {}", out);
+    assert!(!out.contains("{:?}"), "generated: {}", out);
 }
 
 #[test]
@@ -1634,13 +1637,15 @@ fn repr_conversion_keeps_its_format_spec() {
         "def f(n: int) -> str:\n    return \"{0!r:>10}\".format(n)\n",
         "reprspec.py",
     );
-    assert!(out.contains(":>10?}"), "generated: {}", out);
+    assert!(out.contains(":>10}"), "generated: {}", out);
+    assert!(out.contains("repr ("), "generated: {}", out);
 
     let out = compile(
         "def f(n: int) -> str:\n    return f\"{n!r:>10}\"\n",
         "freprspec.py",
     );
-    assert!(out.contains(":>10?}"), "generated: {}", out);
+    assert!(out.contains(":>10}"), "generated: {}", out);
+    assert!(out.contains("repr ("), "generated: {}", out);
 
     // Numeric presentation types on a repr are Python errors; loud here.
     let err = compile_err(
@@ -2960,4 +2965,55 @@ fn loop_control_in_a_finally_guarded_handler_is_loud() {
     let err = compile_err(src, "tryflow3.py");
     assert!(err.contains("except handler"), "error: {}", err);
     assert!(err.contains("finally"), "error: {}", err);
+}
+
+// ---- f-strings, true division, `not`, `or None` ----
+
+#[test]
+fn f_strings_render_through_py_display_not_rust_display() {
+    // Rust's Display prints `1` for 1.0 and `true` for True; Python's
+    // str() prints `1.0` and `True`.
+    let out = compile("def f(x: float):\n    return f\"v={x}\"\n", "fs1.py");
+    assert!(out.contains("py_display (& (x))"), "generated: {}", out);
+
+    // A format spec still uses Rust's translated formatting.
+    let out = compile("def f(x: float):\n    return f\"v={x:.2f}\"\n", "fs2.py");
+    assert!(out.contains("{:.2}"), "generated: {}", out);
+    assert!(!out.contains("py_display"), "generated: {}", out);
+
+    // !r renders the repr STRING, so the spec pads the repr like Python;
+    // Rust's `{:?}` would print its own Debug form instead.
+    let out = compile("def f(s: str):\n    return f\"{s!r}\"\n", "fs3.py");
+    assert!(out.contains("repr (& (s))"), "generated: {}", out);
+    assert!(!out.contains("{:?}"), "generated: {}", out);
+}
+
+#[test]
+fn augmented_division_is_true_division() {
+    // Python's `/=` yields a float; Rust's `/=` on an integer truncates.
+    let out = compile("def f(y: float):\n    y /= 2\n    return y\n", "td1.py");
+    assert!(out.contains("as f64 / (2) as f64"), "generated: {}", out);
+    assert!(!out.contains("y /= 2"), "generated: {}", out);
+}
+
+#[test]
+fn not_is_a_truthiness_test_not_bitwise_complement() {
+    // `not 5` is False; `!5i64` is -6.
+    let out = compile("def f(n: int):\n    return not n\n", "not1.py");
+    assert!(out.contains("! (n) . is_truthy ()"), "generated: {}", out);
+
+    // `~n` stays a bitwise complement.
+    let out = compile("def f(n: int):\n    return ~n\n", "not2.py");
+    assert!(out.contains("! n"), "generated: {}", out);
+    assert!(!out.contains("is_truthy"), "generated: {}", out);
+}
+
+#[test]
+fn or_none_yields_none_instead_of_dropping_it() {
+    // `count or None` must be None when count is falsy — the None was
+    // previously dropped, silently returning the falsy value.
+    let out = compile("def f(count: int):\n    return count or None\n", "orn.py");
+    assert!(out.contains("is_truthy ()"), "generated: {}", out);
+    assert!(out.contains("Some (__rython_or)"), "generated: {}", out);
+    assert!(out.contains("None"), "generated: {}", out);
 }

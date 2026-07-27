@@ -200,7 +200,7 @@ impl<T> deque<T> {
     /// Add element to left end
     pub fn appendleft(&mut self, item: T) {
         self.inner.push_front(item);
-        self.check_maxlen();
+        self.check_maxlen_front();
     }
     
     /// Remove and return element from right end
@@ -332,10 +332,24 @@ impl<T> deque<T> {
         self.maxlen
     }
     
+    /// Trim to maxlen after growing at the BACK: CPython discards from
+    /// the opposite end, i.e. the front.
     fn check_maxlen(&mut self) {
         if let Some(max_len) = self.maxlen {
             while self.inner.len() > max_len {
                 self.inner.pop_front();
+            }
+        }
+    }
+
+    /// Trim after growing at the FRONT. Always popping the front would
+    /// discard the element just added — `deque([1,2,3], maxlen=3)
+    /// .appendleft(0)` is `deque([0,1,2])` in Python, not an unchanged
+    /// deque.
+    fn check_maxlen_front(&mut self) {
+        if let Some(max_len) = self.maxlen {
+            while self.inner.len() > max_len {
+                self.inner.pop_back();
             }
         }
     }

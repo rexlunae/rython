@@ -181,7 +181,7 @@ fn convert(
             Err(_) => exit_error(
                 prog,
                 specs,
-                &format!("argument {}: invalid int value: '{}'", spec.dest(), raw),
+                &format!("argument {}: invalid int value: '{}'", spec.name, raw),
             ),
         },
         ArgKind::Float => match raw.parse::<f64>() {
@@ -189,7 +189,7 @@ fn convert(
             Err(_) => exit_error(
                 prog,
                 specs,
-                &format!("argument {}: invalid float value: '{}'", spec.dest(), raw),
+                &format!("argument {}: invalid float value: '{}'", spec.name, raw),
             ),
         },
         ArgKind::StoreTrue => ParsedValue::Flag(true),

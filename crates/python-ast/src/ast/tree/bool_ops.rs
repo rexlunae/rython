@@ -100,12 +100,16 @@ impl<'a> CodeGen for BoolOp {
 
         match self.op {
             BoolOps::Or => {
-                // Special case for a trailing `or None`: drop it to avoid the
-                // type mismatch with `|| None`.
+                // `a or None` yields the Option-model None when `a` is
+                // falsy — dropping the None silently returned the falsy
+                // value instead (`0 or None` must be None, not 0).
                 if let Some(last) = rendered.last() {
                     if last.to_string().trim() == "None" && rendered.len() == 2 {
                         let first = &rendered[0];
-                        return Ok(quote!(#first));
+                        return Ok(quote!({
+                            let __rython_or = #first;
+                            if (__rython_or).is_truthy() { Some(__rython_or) } else { None }
+                        }));
                     }
                 }
                 Ok(quote!(#((#rendered))||*))

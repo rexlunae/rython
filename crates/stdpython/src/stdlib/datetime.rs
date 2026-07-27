@@ -66,15 +66,25 @@ impl date {
         self.weekday() + 1
     }
     
-    /// Get ISO calendar (year, week, weekday)
+    /// Get ISO calendar (year, week, weekday). ISO weeks start on a
+    /// Monday and week 1 is the one containing the first Thursday, so
+    /// early-January and late-December dates can belong to the
+    /// neighbouring ISO YEAR: 2023-01-01 is (2022, 52, 7) and 2024-12-30
+    /// is (2025, 1, 1).
     pub fn isocalendar(&self) -> (i32, u32, u32) {
-        let year = self.year;
+        // The Monday of this date's ISO week.
         let ordinal = self.toordinal();
-        let jan1_ordinal = date::new(year, 1, 1).unwrap().toordinal();
-        let jan1_weekday = (jan1_ordinal % 7) as u32;
-        
-        let week = ((ordinal - jan1_ordinal + jan1_weekday as i64 + 7) / 7) as u32;
-        (year, week.max(1), self.isoweekday())
+        let weekday = self.weekday() as i64; // 0 = Monday
+        let week_monday = ordinal - weekday;
+        // The ISO year is the calendar year of that week's Thursday.
+        let thursday = week_monday + 3;
+        let iso_year = days_to_date(thursday).year;
+        // Week 1 is the week whose Thursday falls in the ISO year, i.e.
+        // it starts on the Monday on or before that year's January 4th.
+        let jan4 = date::new(iso_year, 1, 4).expect("January 4th is always valid");
+        let week1_monday = jan4.toordinal() - jan4.weekday() as i64;
+        let week = ((week_monday - week1_monday) / 7 + 1) as u32;
+        (iso_year, week, self.isoweekday())
     }
     
     /// Format as ISO string

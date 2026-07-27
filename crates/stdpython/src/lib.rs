@@ -94,6 +94,11 @@ pub(crate) mod flt {
     pub(crate) fn powi(x: f64, n: i32) -> f64 { x.powi(n) }
     #[cfg(not(feature = "std"))]
     pub(crate) fn powi(x: f64, n: i32) -> f64 { libm::pow(x, n as f64) }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn copysign(x: f64, y: f64) -> f64 { x.copysign(y) }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn copysign(x: f64, y: f64) -> f64 { libm::copysign(x, y) }
 }
 
 // PyO3 only available with std
@@ -689,6 +694,14 @@ pub trait PyDivMod: Copy {
 
 impl PyDivMod for i64 {
     fn py_floordiv(self, rhs: Self) -> Self {
+        if rhs == 0 {
+            // Rust's `/` panics with its own message, which no
+            // `except ZeroDivisionError` can match.
+            panic!(
+                "{}",
+                PyException::new("ZeroDivisionError", "integer division or modulo by zero")
+            );
+        }
         let q = self / rhs;
         if self % rhs != 0 && (self < 0) != (rhs < 0) {
             q - 1
@@ -697,6 +710,12 @@ impl PyDivMod for i64 {
         }
     }
     fn py_mod(self, rhs: Self) -> Self {
+        if rhs == 0 {
+            panic!(
+                "{}",
+                PyException::new("ZeroDivisionError", "integer division or modulo by zero")
+            );
+        }
         let r = self % rhs;
         if r != 0 && (r < 0) != (rhs < 0) {
             r + rhs
@@ -708,12 +727,26 @@ impl PyDivMod for i64 {
 
 impl PyDivMod for f64 {
     fn py_floordiv(self, rhs: Self) -> Self {
+        if rhs == 0.0 {
+            // Python raises here; returning inf would diverge silently.
+            panic!(
+                "{}",
+                PyException::new("ZeroDivisionError", "float floor division by zero")
+            );
+        }
         flt::floor(self / rhs)
     }
     fn py_mod(self, rhs: Self) -> Self {
+        if rhs == 0.0 {
+            panic!("{}", PyException::new("ZeroDivisionError", "float modulo"));
+        }
         let r = self % rhs;
         if r != 0.0 && (r < 0.0) != (rhs < 0.0) {
             r + rhs
+        } else if r == 0.0 {
+            // CPython gives a zero remainder the sign of the DIVISOR:
+            // -4.0 % 2.0 is 0.0, and 4.0 % -2.0 is -0.0.
+            flt::copysign(0.0, rhs)
         } else {
             r
         }
@@ -758,7 +791,11 @@ impl PyPow for i64 {
 impl PyPow<i64> for f64 {
     type Output = f64;
     fn py_pow(self, rhs: i64) -> f64 {
-        flt::powi(self, rhs as i32)
+        // CPython converts the exponent to a double and calls libm pow.
+        // powi's repeated squaring differs in the last ULPs — 0.1 ** 4 is
+        // 0.00010000000000000002 in Python but ...05 via powi — and
+        // `rhs as i32` would silently truncate a large exponent.
+        flt::powf(self, rhs as f64)
     }
 }
 
@@ -1306,7 +1343,13 @@ impl PyBool for &PyStr {
 // PyInt implementations
 impl PyInt for &str {
     fn py_int(self) -> Result<i64, PyException> {
-        self.parse().map_err(|_| value_error(&format!("invalid literal for int(): '{}'", self)))
+        // Python strips surrounding whitespace and accepts `_` digit
+        // separators, so int(line) over a file's lines works; Rust's
+        // parse() rejects both.
+        let cleaned = self.trim().replace('_', "");
+        cleaned
+            .parse()
+            .map_err(|_| value_error(&format!("invalid literal for int(): '{}'", self)))
     }
 }
 
@@ -1318,6 +1361,16 @@ impl PyInt for String {
 
 impl PyInt for f64 {
     fn py_int(self) -> Result<i64, PyException> {
+        // `as` saturates and turns NaN into 0; Python raises for both.
+        if self.is_nan() {
+            return Err(value_error("cannot convert float NaN to integer"));
+        }
+        if self.is_infinite() {
+            return Err(PyException::new(
+                "OverflowError",
+                "cannot convert float infinity to integer",
+            ));
+        }
         Ok(self as i64)
     }
 }
@@ -1337,7 +1390,10 @@ impl PyInt for i64 {
 // PyFloat implementations
 impl PyFloat for &str {
     fn py_float(self) -> Result<f64, PyException> {
-        self.parse().map_err(|_| value_error(&format!("could not convert string to float: '{}'", self)))
+        let cleaned = self.trim().replace('_', "");
+        cleaned
+            .parse()
+            .map_err(|_| value_error(&format!("could not convert string to float: '{}'", self)))
     }
 }
 
@@ -3883,6 +3939,23 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
     Ok(input)
 }
 
+/// Map an I/O failure to the exception type Python raises, so
+/// `except FileNotFoundError:` actually catches a missing file — a flat
+/// RuntimeError would never match, and the error would escape the try.
+#[cfg(feature = "std")]
+fn os_error(e: &std::io::Error, path: &str) -> PyException {
+    use std::io::ErrorKind;
+    let kind = match e.kind() {
+        ErrorKind::NotFound => "FileNotFoundError",
+        ErrorKind::PermissionDenied => "PermissionError",
+        ErrorKind::AlreadyExists => "FileExistsError",
+        ErrorKind::IsADirectory => "IsADirectoryError",
+        ErrorKind::NotADirectory => "NotADirectoryError",
+        _ => "OSError",
+    };
+    PyException::new(kind, format!("{}: '{}'", e, path))
+}
+
 /// Python open() function - opens a file
 /// 
 /// Note: Only available with `std` feature - requires OS I/O capabilities
@@ -3896,12 +3969,12 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
     let file = match mode {
         "r" => {
             let f = File::open(filename.as_ref())
-                .map_err(|e| runtime_error(format!("Could not open file '{}': {}", filename.as_ref(), e)))?;
+                .map_err(|e| os_error(&e, filename.as_ref()))?;
             PyFile::new_read(BufReader::new(f))
         },
         "w" => {
             let f = File::create(filename.as_ref())
-                .map_err(|e| runtime_error(format!("Could not create file '{}': {}", filename.as_ref(), e)))?;
+                .map_err(|e| os_error(&e, filename.as_ref()))?;
             PyFile::new_write(BufWriter::new(f))
         },
         "a" => {
@@ -3909,7 +3982,7 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
                 .create(true)
                 .append(true)
                 .open(filename.as_ref())
-                .map_err(|e| runtime_error(format!("Could not open file '{}' for append: {}", filename.as_ref(), e)))?;
+                .map_err(|e| os_error(&e, filename.as_ref()))?;
             PyFile::new_write(BufWriter::new(f))
         },
         _ => return Err(value_error(&format!("Invalid file mode: '{}'", mode))),
