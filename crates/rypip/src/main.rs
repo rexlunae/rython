@@ -46,6 +46,11 @@ enum Cmd {
         /// imports, __main__ blocks — fail the conversion loudly.
         #[arg(long)]
         no_std: bool,
+        /// Generate a Linux kernel module crate. Implies no_std. Produces
+        /// a cdylib with panic=abort, module_init/module_exit entry points,
+        /// and printk lowering. No stdpython dependency.
+        #[arg(long, conflicts_with = "no_std")]
+        kernel_module: bool,
     },
     /// Convert and compile a Python package (release profile).
     Build {
@@ -86,6 +91,7 @@ fn main() -> Result<()> {
             stdpython,
             warnings,
             no_std,
+            kernel_module,
         } => {
             let pkg = rypip::discover(&package)?;
             let krate = rypip::convert(
@@ -96,6 +102,7 @@ fn main() -> Result<()> {
                     stdpython_path: stdpython,
                     warnings,
                     no_std,
+                    kernel_module,
                 },
             )?;
             report_warnings(&krate);
@@ -126,6 +133,7 @@ fn main() -> Result<()> {
                     stdpython_path: stdpython,
                     warnings,
                     no_std: false,
+                    kernel_module: false,
                 },
             )?;
             report_warnings(&krate);
@@ -148,6 +156,7 @@ fn main() -> Result<()> {
                     stdpython_path: stdpython,
                     warnings,
                     no_std: false,
+                    kernel_module: false,
                 },
             )?;
             report_warnings(&krate);
