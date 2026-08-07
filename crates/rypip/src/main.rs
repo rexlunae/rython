@@ -51,6 +51,11 @@ enum Cmd {
         /// and printk lowering. No stdpython dependency.
         #[arg(long, conflicts_with = "no_std")]
         kernel_module: bool,
+        /// Generate a rust-for-linux kernel module (requires --kernel-module):
+        /// a module!-macro crate implementing kernel::Module for the
+        /// rust-for-linux toolchain, instead of raw-FFI entry points.
+        #[arg(long, requires = "kernel_module")]
+        rust_for_linux: bool,
     },
     /// Convert and compile a Python package (release profile).
     Build {
@@ -92,6 +97,7 @@ fn main() -> Result<()> {
             warnings,
             no_std,
             kernel_module,
+            rust_for_linux,
         } => {
             let pkg = rypip::discover(&package)?;
             let krate = rypip::convert(
@@ -103,6 +109,7 @@ fn main() -> Result<()> {
                     warnings,
                     no_std,
                     kernel_module,
+                    rust_for_linux,
                 },
             )?;
             report_warnings(&krate);
@@ -134,6 +141,7 @@ fn main() -> Result<()> {
                     warnings,
                     no_std: false,
                     kernel_module: false,
+                    rust_for_linux: false,
                 },
             )?;
             report_warnings(&krate);
@@ -157,6 +165,7 @@ fn main() -> Result<()> {
                     warnings,
                     no_std: false,
                     kernel_module: false,
+                    rust_for_linux: false,
                 },
             )?;
             report_warnings(&krate);

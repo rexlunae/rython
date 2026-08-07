@@ -87,6 +87,11 @@ pub struct ConvertOptions {
     /// (module_init/module_exit), and printk lowering. The stdpython
     /// dependency is dropped entirely — only core Rust is available.
     pub kernel_module: bool,
+    /// Generate a rust-for-linux kernel module (issue #88): a `module!`-
+    /// macro crate implementing `kernel::Module`, built with the
+    /// rust-for-linux toolchain inside a rust-for-linux kernel tree.
+    /// Requires `kernel_module`; overrides the raw-FFI output.
+    pub rust_for_linux: bool,
 }
 
 /// A converted crate on disk.
@@ -102,18 +107,35 @@ pub struct ConvertedCrate {
     pub warnings: Vec<String>,
 }
 
+/// Which kernel module backend to generate (issue #88).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KernelTarget {
+    /// Raw C FFI: a `#![no_std]` staticlib with `#[no_mangle] extern "C"`
+    /// init_module/cleanup_module, a kmalloc-backed global allocator, and
+    /// `.modinfo` ELF sections. Builds on any kernel with headers installed
+    /// (no CONFIG_RUST needed).
+    #[default]
+    RawFfi,
+    /// The rust-for-linux `kernel` crate: a `module!`-macro module
+    /// implementing `kernel::Module`, built with the rust-for-linux
+    /// toolchain inside a rust-for-linux kernel tree.
+    RustForLinux,
+}
+
 /// Generate a kernel module lib.rs from Python source. This bypasses the
-/// full transpiler in favour of a minimal lowering that produces raw `no_std`
-/// Rust with kernel entry points, printk FFI, and module metadata.
-fn generate_kernel_lib_rs(source: &str) -> Result<String> {
+/// full transpiler in favour of a minimal lowering that produces kernel
+/// entry points, printk lowering, and module metadata — either raw `no_std`
+/// Rust (RawFfi) or a rust-for-linux `module!` crate (RustForLinux).
+fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str) -> Result<String> {
     use python_ast::parse_enhanced;
     use python_ast::ast::tree::StatementType;
 
     let ast = parse_enhanced(source, "<kernel>".to_string())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // The kernel runs with the FPU in a lazy-save state: reject floating-point
-    // usage loudly instead of emitting code that can corrupt userspace state.
+    // The kernel runs with the FPU in a lazy-save state: reject
+    // floating-point usage loudly instead of emitting code that can corrupt
+    // userspace state (issue #87).
     check_kernel_no_floats(&ast)?;
 
     let mut init_body = String::new();
@@ -151,12 +173,18 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
                 }
                 if !kernel_args_empty(&func.args) {
                     return Err(anyhow::anyhow!(
-                        "kernel target: `{}` must take no parameters — the kernel ABI calls \
-                         init_module()/cleanup_module() with none",
+                        "kernel target: `{}` must take no parameters — the kernel calls \
+                         module entry points with none",
                         func.name
                     ));
                 }
-                let body = lower_kernel_body(&func.body, &mut has_printk)?;
+                let body = lower_kernel_body(
+                    &func.body,
+                    &mut has_printk,
+                    target,
+                    is_init,
+                    &func.name,
+                )?;
                 if is_init {
                     init_body = body;
                 } else {
@@ -167,13 +195,32 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
         }
     }
 
-    // Warn if no entry point found.
+    // Error if no entry point found.
     if init_body.is_empty() && exit_body.is_empty() {
         return Err(anyhow::anyhow!(
             "kernel module requires at least one of `module_init()` or `module_exit()`"
         ));
     }
 
+    match target {
+        KernelTarget::RawFfi => {
+            generate_kernel_raw_ffi(&init_body, &exit_body, &modinfo, has_printk)
+        }
+        KernelTarget::RustForLinux => {
+            generate_kernel_rust_for_linux(&init_body, &exit_body, &modinfo, package_name)
+        }
+    }
+}
+
+/// The raw-FFI kernel module: `#![no_std]` staticlib with
+/// `#[no_mangle] extern "C"` entry points, kmalloc-backed allocator,
+/// `.modinfo` sections, and a panic handler.
+fn generate_kernel_raw_ffi(
+    init_body: &str,
+    exit_body: &str,
+    modinfo: &std::collections::BTreeMap<String, String>,
+    has_printk: bool,
+) -> Result<String> {
     let printk_decl = if has_printk {
         "extern \"C\" {\n    fn printk(fmt: *const core::ffi::c_char, ...);\n}\n\n"
     } else {
@@ -208,9 +255,7 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
         let entry = format!("{key}={value}");
         let len = entry.len();
         let padded = (len + 7) & !7; // align to 8 bytes
-        out.push_str(&format!(
-            "#[no_mangle]\n#[link_section = \".modinfo\"]\n"
-        ));
+        out.push_str("#[no_mangle]\n#[link_section = \".modinfo\"]\n");
         out.push_str(&format!(
             "static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"
         ));
@@ -249,15 +294,6 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
     Ok(out)
 }
 
-<<<<<<< HEAD
-/// Does an entry-function parameter list declare any parameters?
-fn kernel_args_empty(args: &python_ast::ParameterList) -> bool {
-    args.posonlyargs.is_empty()
-        && args.args.is_empty()
-        && args.vararg.is_none()
-        && args.kwonlyargs.is_empty()
-        && args.kwarg.is_none()
-=======
 /// Stdlib modules whose public surface uses floating-point arithmetic.
 /// Importing them in kernel context is a loud conversion error (issue #87):
 /// the kernel runs with the FPU in a lazy-save state, and executing FP
@@ -642,7 +678,115 @@ fn check_kernel_comprehension_gen_no_floats(
         check_kernel_expr_no_floats(c, line)?;
     }
     Ok(())
->>>>>>> origin/main
+}
+
+/// Does an entry-function parameter list declare any parameters?
+fn kernel_args_empty(args: &python_ast::ParameterList) -> bool {
+    args.posonlyargs.is_empty()
+        && args.args.is_empty()
+        && args.vararg.is_none()
+        && args.kwonlyargs.is_empty()
+        && args.kwarg.is_none()
+}
+
+/// The rust-for-linux kernel module: a `module!`-macro crate implementing
+/// `kernel::Module`. The module! macro emits the .modinfo metadata, so no
+/// manual sections are needed; printk lowers to pr_info!, and module_init /
+/// module_exit map to `init` / `Drop`.
+fn generate_kernel_rust_for_linux(
+    init_body: &str,
+    exit_body: &str,
+    modinfo: &std::collections::BTreeMap<String, String>,
+    package_name: &str,
+) -> Result<String> {
+    let license = modinfo
+        .get("license")
+        .cloned()
+        .unwrap_or_else(|| "GPL".to_string());
+    let author = modinfo.get("author").cloned().unwrap_or_default();
+    let description = modinfo.get("description").cloned().unwrap_or_default();
+    let ko_name = package_name;
+    let type_name = kernel_type_name(package_name);
+
+    // The module! macro requires type/name/license; author/description are
+    // optional but nice to have. module! emits .modinfo itself.
+    let mut meta = format!("module! {{\n    type: {type_name},\n    name: \"{ko_name}\",\n");
+    if !author.is_empty() {
+        meta.push_str(&format!("    author: \"{author}\",\n"));
+    }
+    if !description.is_empty() {
+        meta.push_str(&format!("    description: \"{description}\",\n"));
+    }
+    meta.push_str(&format!("    license: \"{license}\",\n}}\n"));
+
+    let indent = |body: &str| -> String {
+        // lower_kernel_body emits 4-space-indented lines; nest them one
+        // more level inside fn init / fn drop.
+        body.lines().map(|l| format!("    {l}\n")).collect()
+    };
+
+    let mut out = format!(
+        "// Generated by rypip --kernel-module --rust-for-linux. Edit freely.\n\
+         //\n\
+         // Build with the rust-for-linux toolchain inside a rust-for-linux\n\
+         // kernel tree (CONFIG_RUST=y): copy this crate into the tree, add\n\
+         // `rust-obj-m += {ko_name}.o` to the Kbuild Makefile, and build the\n\
+         // kernel. The `kernel` crate (path dep in Cargo.toml) provides the\n\
+         // module! macro and kernel::prelude.\n\
+         #![no_std]\n\
+         #![no_main]\n\n\
+         use kernel::prelude::*;\n\n\
+         {meta}\n\
+         struct {type_name};\n\n"
+    );
+
+    if !init_body.is_empty() {
+        out.push_str(&format!(
+            "impl kernel::Module for {type_name} {{\n\
+             \x20   fn init(_module: &'static ThisModule) -> Result<Self> {{\n\
+             {}\x20   \x20   Ok({type_name})\n\
+             \x20   }}\n\
+             }}\n\n",
+            indent(init_body)
+        ));
+    }
+
+    if !exit_body.is_empty() {
+        out.push_str(&format!(
+            "impl Drop for {type_name} {{\n\
+             \x20   fn drop(&mut self) {{\n\
+             {}\x20   }}\n\
+             }}\n",
+            indent(exit_body)
+        ));
+    }
+
+    Ok(out)
+}
+
+/// CamelCase a crate name into a Rust type name: `hello_kernel` ->
+/// `HelloKernel`. Falls back to `K`-prefixed names for identifiers that
+/// would not be valid Rust type names.
+fn kernel_type_name(package_name: &str) -> String {
+    let mut out = String::new();
+    let mut upper = true;
+    for ch in package_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if upper {
+                out.extend(ch.to_uppercase());
+                upper = false;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            upper = true;
+        }
+    }
+    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
+        format!("K{out}")
+    } else {
+        out
+    }
 }
 
 /// Try to extract a string literal from an expression.
@@ -671,6 +815,9 @@ fn _expr_int_literal(expr: &python_ast::ExprType) -> Option<i64> {
 fn lower_kernel_body(
     body: &[python_ast::ast::tree::Statement],
     has_printk: &mut bool,
+    target: KernelTarget,
+    is_init: bool,
+    func_name: &str,
 ) -> Result<String> {
     let mut out = String::new();
     for stmt in body {
@@ -699,15 +846,27 @@ fn lower_kernel_body(
                     ));
                 }
                 *has_printk = true;
-                let (fmt, values) = lower_printk_args(&call.args, line)?;
-                out.push_str("    unsafe {\n        printk(");
-                out.push_str(&format!(
-                    "b\"{fmt}\\0\".as_ptr() as *const core::ffi::c_char"
-                ));
-                if !values.is_empty() {
-                    out.push_str(&format!(", {}", values.join(", ")));
+                let style = printk_style(target);
+                let (fmt, values) = lower_printk_args(&call.args, line, style)?;
+                match target {
+                    KernelTarget::RawFfi => {
+                        out.push_str("    unsafe {\n        printk(");
+                        out.push_str(&format!(
+                            "b\"{fmt}\\0\".as_ptr() as *const core::ffi::c_char"
+                        ));
+                        if !values.is_empty() {
+                            out.push_str(&format!(", {}", values.join(", ")));
+                        }
+                        out.push_str(");\n    }\n");
+                    }
+                    KernelTarget::RustForLinux => {
+                        out.push_str(&format!("    pr_info!(\"{fmt}\""));
+                        if !values.is_empty() {
+                            out.push_str(&format!(", {}", values.join(", ")));
+                        }
+                        out.push_str(");\n");
+                    }
                 }
-                out.push_str(");\n    }\n");
             }
             python_ast::StatementType::Assign(assign) => {
                 // Integer-literal local binding, e.g. `addr = 0x1fff0000`.
@@ -739,13 +898,53 @@ fn lower_kernel_body(
                 ));
             }
             python_ast::StatementType::Return(Some(val)) => {
-                out.push_str(&format!(
-                    "    return {};\n",
-                    lower_kernel_expr(&val.value, line)?
-                ));
+                match target {
+                    // Raw init returns an errno to the kernel; any literal
+                    // works, though 0 (success) is the normal case.
+                    KernelTarget::RawFfi if is_init => out.push_str(&format!(
+                        "    return {};\n",
+                        lower_kernel_expr(&val.value, line)?
+                    )),
+                    // rust-for-linux init maps the Python `return 0` to
+                    // `Ok(ModuleType)`; other return values have no honest
+                    // mapping to kernel::error::Error yet.
+                    KernelTarget::RustForLinux if is_init => {
+                        let is_zero = matches!(
+                            &val.value,
+                            python_ast::ExprType::Constant(c)
+                                if matches!(
+                                    &c.0,
+                                    Some(litrs::Literal::Integer(ilit))
+                                        if ilit.value::<i64>() == Some(0)
+                                )
+                        );
+                        if !is_zero {
+                            return Err(kernel_body_err(
+                                "rust-for-linux module_init can only `return 0` (success); \
+                                 error numbers have no mapping to kernel::error::Error yet",
+                                line,
+                            ));
+                        }
+                        // Success: nothing here; `Ok(<Type>)` is emitted by
+                        // the module skeleton.
+                    }
+                    _ => {
+                        return Err(kernel_body_err(
+                            &format!(
+                                "`{func_name}` cannot return a value — the kernel ABI gives \
+                                 cleanup_module()/Drop::drop a void return"
+                            ),
+                            line,
+                        ));
+                    }
+                }
             }
             python_ast::StatementType::Return(None) => {
-                out.push_str("    return;\n");
+                if target == KernelTarget::RawFfi {
+                    out.push_str("    return;\n");
+                }
+                // rust-for-linux: bare `return` is a no-op in init (Ok is
+                // emitted by the skeleton) and in Drop.
             }
             python_ast::StatementType::Pass => {}
             _ => {
@@ -766,14 +965,33 @@ fn kernel_body_err(what: &str, line: Option<usize>) -> anyhow::Error {
     anyhow::anyhow!("kernel target{at}: {what}")
 }
 
-/// Lower the arguments of a printk call to a C format string (percent-
-/// escaped, to be embedded in a byte-string literal) and the list of value
-/// expressions. printk's only argument must be a string literal or an
-/// f-string; each f-string interpolation lowers to a `%ld` conversion with
-/// the interpolated value as a vararg.
+/// Which format-string dialect printk lowers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintkStyle {
+    /// The kernel's C format parser (raw FFI): `%ld` conversions, `%`
+    /// doubled for literal percent signs.
+    C,
+    /// Rust's `format!` parser (pr_info!): `{}` conversions, braces doubled.
+    RustFmt,
+}
+
+fn printk_style(target: KernelTarget) -> PrintkStyle {
+    match target {
+        KernelTarget::RawFfi => PrintkStyle::C,
+        KernelTarget::RustForLinux => PrintkStyle::RustFmt,
+    }
+}
+
+/// Lower the arguments of a printk call to a format string (dialect chosen
+/// by the target: percent-escaped C for the raw printk FFI, brace-escaped
+/// Rust for pr_info!) and the list of value expressions. printk's only
+/// argument must be a string literal or an f-string; each f-string
+/// interpolation lowers to a conversion with the interpolated value passed
+/// alongside.
 fn lower_printk_args(
     args: &[python_ast::ExprType],
     line: Option<usize>,
+    style: PrintkStyle,
 ) -> Result<(String, Vec<String>)> {
     if args.len() != 1 {
         return Err(kernel_body_err(
@@ -786,7 +1004,7 @@ fn lower_printk_args(
     match &args[0] {
         python_ast::ExprType::Constant(c) => {
             if let Some(litrs::Literal::String(slit)) = &c.0 {
-                fmt.push_str(&escape_c_format(slit.value()));
+                fmt.push_str(&escape_kernel_fmt(slit.value(), style));
             } else {
                 return Err(kernel_body_err(
                     "printk format must be a string literal or f-string",
@@ -799,7 +1017,7 @@ fn lower_printk_args(
                 match part {
                     python_ast::ExprType::Constant(c) => {
                         if let Some(litrs::Literal::String(slit)) = &c.0 {
-                            fmt.push_str(&escape_c_format(slit.value()));
+                            fmt.push_str(&escape_kernel_fmt(slit.value(), style));
                         } else {
                             return Err(kernel_body_err(
                                 "printk f-string parts must be strings or interpolations",
@@ -815,7 +1033,10 @@ fn lower_printk_args(
                                 line,
                             ));
                         }
-                        fmt.push_str("%ld");
+                        match style {
+                            PrintkStyle::C => fmt.push_str("%ld"),
+                            PrintkStyle::RustFmt => fmt.push_str("{}"),
+                        }
                         values.push(lower_kernel_value(&fv.value, line)?);
                     }
                     _ => {
@@ -837,10 +1058,11 @@ fn lower_printk_args(
     Ok((fmt, values))
 }
 
-/// Escape a Python string for use inside a C printf/printk format literal:
-/// control characters become escapes and `%` is doubled so the kernel's
-/// format parser treats it as literal text.
-fn escape_c_format(s: &str) -> String {
+/// Escape a Python string for use inside a kernel format literal: control
+/// characters become escapes, then the dialect-specific literal delimiters
+/// are doubled — `%` for the C format parser (printk), `{`/`}` for Rust's
+/// format! parser (pr_info!).
+fn escape_kernel_fmt(s: &str, style: PrintkStyle) -> String {
     let mut escaped = String::new();
     for ch in s.chars() {
         match ch {
@@ -850,11 +1072,19 @@ fn escape_c_format(s: &str) -> String {
             '\t' => escaped.push_str("\\t"),
             '\r' => escaped.push_str("\\r"),
             '\0' => escaped.push_str("\\0"),
-            '%' => escaped.push_str("%%"),
+            '%' if style == PrintkStyle::C => escaped.push_str("%%"),
+            '{' if style == PrintkStyle::RustFmt => escaped.push_str("{{"),
+            '}' if style == PrintkStyle::RustFmt => escaped.push_str("}}"),
             other => escaped.push(other),
         }
     }
     escaped
+}
+
+/// Escape a Python string for a C byte-string literal (used for string
+/// return values in raw-FFI entry bodies).
+fn escape_c_format(s: &str) -> String {
+    escape_kernel_fmt(s, PrintkStyle::C)
 }
 
 /// A simplified call representation for kernel lowering.
@@ -946,6 +1176,12 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
     fs::create_dir_all(&src_dir)
         .with_context(|| format!("creating {}", src_dir.display()))?;
 
+    if opts.rust_for_linux && !opts.kernel_module {
+        bail!(
+            "rust_for_linux requires kernel_module (pass --kernel-module with --rust-for-linux)"
+        );
+    }
+
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
     // Kernel modules use a dedicated lowering path: no stdpython, no alloc,
@@ -963,12 +1199,21 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         } else {
             bail!("kernel module requires at least one Python source file");
         };
-        let kernel_code = generate_kernel_lib_rs(&source)?;
+        let target = if opts.rust_for_linux {
+            KernelTarget::RustForLinux
+        } else {
+            KernelTarget::RawFfi
+        };
+        let kernel_code = generate_kernel_lib_rs(&source, target, &package.name)?;
         fs::write(src_dir.join("lib.rs"), &kernel_code)?;
         let has_binary = false;
         let warnings = Vec::new();
         write_cargo_toml(package, out_dir, opts, has_binary)?;
-        write_kernel_makefile(package, out_dir)?;
+        if !opts.rust_for_linux {
+            // rust-for-linux modules are registered in the kernel tree's
+            // Kbuild Makefile (rust-obj-m += <name>.o), not a standalone one.
+            write_kernel_makefile(package, out_dir)?;
+        }
         return Ok(ConvertedCrate {
             root: out_dir.to_path_buf(),
             name: package.name.clone(),
@@ -1408,7 +1653,15 @@ fn write_cargo_toml(
     // global allocator — String, Vec, dicts, and the full stdlib work.
     // The no_std profile pins stdpython to its alloc tier: no OS, no libc,
     // suitable for embedded/wasm targets.
-    let stdpython_dep = if opts.kernel_module {
+    // rust-for-linux modules link against the kernel crate from the
+    // rust-for-linux kernel tree; stdpython has no kernel support, so the
+    // dependency is a commented-out path the user points at their tree.
+    let stdpython_dep = if opts.rust_for_linux {
+        "# kernel = { path = \"/path/to/linux/rust/kernel\" }\n\
+         # The kernel crate provides the module! macro and pr_info!; point\n\
+         # the path at your rust-for-linux tree's rust/kernel directory."
+            .to_string()
+    } else if opts.kernel_module {
         match &stdpython_source {
             StdpythonSource::Path(path) => format!(
                 "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
