@@ -149,6 +149,13 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
                 if !is_init && !is_exit {
                     continue;
                 }
+                if !kernel_args_empty(&func.args) {
+                    return Err(anyhow::anyhow!(
+                        "kernel target: `{}` must take no parameters — the kernel ABI calls \
+                         init_module()/cleanup_module() with none",
+                        func.name
+                    ));
+                }
                 let body = lower_kernel_body(&func.body, &mut has_printk)?;
                 if is_init {
                     init_body = body;
@@ -242,6 +249,15 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
     Ok(out)
 }
 
+<<<<<<< HEAD
+/// Does an entry-function parameter list declare any parameters?
+fn kernel_args_empty(args: &python_ast::ParameterList) -> bool {
+    args.posonlyargs.is_empty()
+        && args.args.is_empty()
+        && args.vararg.is_none()
+        && args.kwonlyargs.is_empty()
+        && args.kwarg.is_none()
+=======
 /// Stdlib modules whose public surface uses floating-point arithmetic.
 /// Importing them in kernel context is a loud conversion error (issue #87):
 /// the kernel runs with the FPU in a lazy-save state, and executing FP
@@ -626,6 +642,7 @@ fn check_kernel_comprehension_gen_no_floats(
         check_kernel_expr_no_floats(c, line)?;
     }
     Ok(())
+>>>>>>> origin/main
 }
 
 /// Try to extract a string literal from an expression.
@@ -648,45 +665,203 @@ fn _expr_int_literal(expr: &python_ast::ExprType) -> Option<i64> {
     None
 }
 
-/// Lower a kernel-function body: printk calls and return statements.
+/// Lower a kernel-function body: printk calls, integer-literal local
+/// bindings, and return statements. Anything the kernel ABI cannot express
+/// is a loud conversion error — never silently dropped (issue #84).
 fn lower_kernel_body(
     body: &[python_ast::ast::tree::Statement],
     has_printk: &mut bool,
 ) -> Result<String> {
     let mut out = String::new();
     for stmt in body {
+        let line = stmt.lineno;
         match &stmt.statement {
             python_ast::StatementType::Expr(expr) => {
-                if let Some(call) = extract_kernel_call(expr) {
-                    if call.name == "printk" {
-                        *has_printk = true;
-                        out.push_str("    unsafe {\n        printk(");
-                        for (i, arg) in call.args.iter().enumerate() {
-                            if i > 0 {
-                                out.push_str(", ");
+                let Some(call) = extract_kernel_call(expr) else {
+                    return Err(kernel_body_err(
+                        "unsupported expression statement (only printk(...) calls are supported)",
+                        line,
+                    ));
+                };
+                if call.name != "printk" {
+                    return Err(kernel_body_err(
+                        &format!(
+                            "unsupported call `{}()` (only printk is available in kernel modules)",
+                            call.name
+                        ),
+                        line,
+                    ));
+                }
+                if !call.keywords.is_empty() {
+                    return Err(kernel_body_err(
+                        "printk takes positional arguments only",
+                        line,
+                    ));
+                }
+                *has_printk = true;
+                let (fmt, values) = lower_printk_args(&call.args, line)?;
+                out.push_str("    unsafe {\n        printk(");
+                out.push_str(&format!(
+                    "b\"{fmt}\\0\".as_ptr() as *const core::ffi::c_char"
+                ));
+                if !values.is_empty() {
+                    out.push_str(&format!(", {}", values.join(", ")));
+                }
+                out.push_str(");\n    }\n");
+            }
+            python_ast::StatementType::Assign(assign) => {
+                // Integer-literal local binding, e.g. `addr = 0x1fff0000`.
+                // These are the only locals the kernel ABI supports; they
+                // exist so f-string printk interpolations have values to
+                // reference.
+                let target_is_name = matches!(
+                    assign.targets.first(),
+                    Some(python_ast::ExprType::Name(_))
+                );
+                if assign.targets.len() == 1 && target_is_name {
+                    if let python_ast::ExprType::Constant(c) = &assign.value {
+                        if let Some(litrs::Literal::Integer(ilit)) = &c.0 {
+                            if let Some(val) = ilit.value::<i64>() {
+                                if let python_ast::ExprType::Name(name) = &assign.targets[0] {
+                                    out.push_str(&format!(
+                                        "    let {}: i64 = {val};\n",
+                                        safe_ident(&name.id)
+                                    ));
+                                    continue;
+                                }
                             }
-                            out.push_str(&lower_kernel_expr(arg));
                         }
-                        out.push_str(");\n    }\n");
                     }
                 }
+                return Err(kernel_body_err(
+                    "unsupported assignment (only `name = <integer literal>` is supported)",
+                    line,
+                ));
             }
             python_ast::StatementType::Return(Some(val)) => {
-                out.push_str(&format!("    return {};\n", lower_kernel_expr(&val.value)));
+                out.push_str(&format!(
+                    "    return {};\n",
+                    lower_kernel_expr(&val.value, line)?
+                ));
             }
             python_ast::StatementType::Return(None) => {
                 out.push_str("    return;\n");
             }
-            _ => {}
+            python_ast::StatementType::Pass => {}
+            _ => {
+                return Err(kernel_body_err(
+                    "unsupported statement (only printk calls, integer-literal \
+                     assignments, pass, and return are supported)",
+                    line,
+                ));
+            }
         }
     }
     Ok(out)
+}
+
+/// Build a kernel-body lowering error with the source line when known.
+fn kernel_body_err(what: &str, line: Option<usize>) -> anyhow::Error {
+    let at = line.map(|l| format!(" (line {l})")).unwrap_or_default();
+    anyhow::anyhow!("kernel target{at}: {what}")
+}
+
+/// Lower the arguments of a printk call to a C format string (percent-
+/// escaped, to be embedded in a byte-string literal) and the list of value
+/// expressions. printk's only argument must be a string literal or an
+/// f-string; each f-string interpolation lowers to a `%ld` conversion with
+/// the interpolated value as a vararg.
+fn lower_printk_args(
+    args: &[python_ast::ExprType],
+    line: Option<usize>,
+) -> Result<(String, Vec<String>)> {
+    if args.len() != 1 {
+        return Err(kernel_body_err(
+            "printk takes exactly one argument: a format string literal or f-string",
+            line,
+        ));
+    }
+    let mut fmt = String::new();
+    let mut values: Vec<String> = Vec::new();
+    match &args[0] {
+        python_ast::ExprType::Constant(c) => {
+            if let Some(litrs::Literal::String(slit)) = &c.0 {
+                fmt.push_str(&escape_c_format(slit.value()));
+            } else {
+                return Err(kernel_body_err(
+                    "printk format must be a string literal or f-string",
+                    line,
+                ));
+            }
+        }
+        python_ast::ExprType::JoinedStr(js) => {
+            for part in &js.values {
+                match part {
+                    python_ast::ExprType::Constant(c) => {
+                        if let Some(litrs::Literal::String(slit)) = &c.0 {
+                            fmt.push_str(&escape_c_format(slit.value()));
+                        } else {
+                            return Err(kernel_body_err(
+                                "printk f-string parts must be strings or interpolations",
+                                line,
+                            ));
+                        }
+                    }
+                    python_ast::ExprType::FormattedValue(fv) => {
+                        if fv.conversion.is_some() || fv.format_spec.is_some() {
+                            return Err(kernel_body_err(
+                                "printk f-string conversions (!s/!r) and format specs are not \
+                                 supported; interpolate plain integer values",
+                                line,
+                            ));
+                        }
+                        fmt.push_str("%ld");
+                        values.push(lower_kernel_value(&fv.value, line)?);
+                    }
+                    _ => {
+                        return Err(kernel_body_err(
+                            "printk f-string parts must be strings or interpolations",
+                            line,
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(kernel_body_err(
+                "printk format must be a string literal or f-string",
+                line,
+            ));
+        }
+    }
+    Ok((fmt, values))
+}
+
+/// Escape a Python string for use inside a C printf/printk format literal:
+/// control characters become escapes and `%` is doubled so the kernel's
+/// format parser treats it as literal text.
+fn escape_c_format(s: &str) -> String {
+    let mut escaped = String::new();
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\t' => escaped.push_str("\\t"),
+            '\r' => escaped.push_str("\\r"),
+            '\0' => escaped.push_str("\\0"),
+            '%' => escaped.push_str("%%"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// A simplified call representation for kernel lowering.
 struct KernelCall<'a> {
     name: String,
     args: &'a [python_ast::ExprType],
+    keywords: &'a [python_ast::Keyword],
 }
 
 /// Try to extract a named call from an expression.
@@ -696,36 +871,66 @@ fn extract_kernel_call(expr: &python_ast::Expr) -> Option<KernelCall<'_>> {
             return Some(KernelCall {
                 name: name.id.clone(),
                 args: &call.args,
+                keywords: &call.keywords,
             });
         }
     }
     None
 }
 
-/// Lower a kernel-mode expression to a Rust token string.
-fn lower_kernel_expr(expr: &python_ast::ExprType) -> String {
+/// Lower a kernel-mode expression that must stand on its own (a return
+/// value): string literals lower to C-string pointers, integer literals to
+/// i64. Anything else is a loud error.
+fn lower_kernel_expr(expr: &python_ast::ExprType, line: Option<usize>) -> Result<String> {
     match expr {
         python_ast::ExprType::Constant(c) => {
             match &c.0 {
                 Some(litrs::Literal::String(slit)) => {
-                    let s = slit.value();
-                    let escaped = s
-                        .replace('\\', "\\\\")
-                        .replace('\"', "\\\"")
-                        .replace('\n', "\\n")
-                        .replace('\t', "\\t");
-                    format!(
-                        "b\"{}\\0\".as_ptr() as *const core::ffi::c_char",
-                        escaped
-                    )
+                    let escaped = escape_c_format(slit.value());
+                    Ok(format!(
+                        "b\"{escaped}\\0\".as_ptr() as *const core::ffi::c_char"
+                    ))
                 }
-                Some(litrs::Literal::Integer(ilit)) => {
-                    format!("{}", ilit.value::<i64>().unwrap_or(0))
-                }
-                _ => c.to_string(),
+                Some(litrs::Literal::Integer(ilit)) => ilit
+                    .value::<i64>()
+                    .map(|v| v.to_string())
+                    .ok_or_else(|| kernel_body_err("integer literal is too large", line)),
+                _ => Err(kernel_body_err(
+                    "unsupported literal in module entry body (only string and integer literals)",
+                    line,
+                )),
             }
         }
-        _ => format!("/* TODO: lower {:?} */", expr),
+        _ => Err(kernel_body_err(
+            "unsupported expression in module entry body (only string and integer literals)",
+            line,
+        )),
+    }
+}
+
+/// Lower an f-string interpolation value to a Rust expression. The kernel
+/// ABI has no heap strings in argument position, so only names (resolved to
+/// the i64 locals introduced by the body lowering) and integer literals are
+/// valid interpolation values.
+fn lower_kernel_value(expr: &python_ast::ExprType, line: Option<usize>) -> Result<String> {
+    match expr {
+        python_ast::ExprType::Name(name) => Ok(safe_ident(&name.id).to_string()),
+        python_ast::ExprType::Constant(c) => {
+            if let Some(litrs::Literal::Integer(ilit)) = &c.0 {
+                ilit.value::<i64>()
+                    .map(|v| v.to_string())
+                    .ok_or_else(|| kernel_body_err("integer literal is too large", line))
+            } else {
+                Err(kernel_body_err(
+                    "printk interpolations support integer values only",
+                    line,
+                ))
+            }
+        }
+        _ => Err(kernel_body_err(
+            "printk interpolations support integer values only",
+            line,
+        )),
     }
 }
 
