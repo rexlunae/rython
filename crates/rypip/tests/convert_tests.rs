@@ -1241,6 +1241,133 @@ fn no_std_profile_rejects_std_constructs_loudly() {
 }
 
 #[test]
+fn kernel_module_lowers_printk_fstrings_and_locals() {
+    // Issue #84: printk takes a format string; f-string interpolations lower
+    // to %ld conversions with the interpolated value as a vararg, and
+    // integer-literal locals give interpolations something to reference.
+    let scratch = Scratch::new("kernel-printk");
+    let file = scratch.path().join("hello.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    addr = 0x1fff0000\n",
+            "    printk(f\"Module loaded at {addr}\\n\")\n",
+            "    printk(\"100% ready\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "def module_exit():\n",
+            "    printk(\"Goodbye, kernel!\\n\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("f-string printk module converts");
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    // 0x1fff0000 == 536805376
+    assert!(
+        lib.contains("let addr: i64 = 536805376;"),
+        "integer-literal local: {}",
+        lib
+    );
+    assert!(
+        lib.contains("b\"Module loaded at %ld\\n\\0\""),
+        "f-string to %ld: {}",
+        lib
+    );
+    assert!(lib.contains(", addr"), "vararg passes the local: {}", lib);
+    assert!(
+        lib.contains("b\"100%% ready\\n\\0\""),
+        "literal % escaped for the C format parser: {}",
+        lib
+    );
+
+    // The generated crate is genuine no_std Rust: it must cargo-check.
+    let status = check_generated(&out);
+    assert!(status.success(), "generated kernel crate failed to compile");
+}
+
+#[test]
+fn kernel_module_printk_rejects_unsupported_forms_loudly() {
+    let scratch = Scratch::new("kernel-printk-bad");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "non_string.py",
+            "def module_init() -> int:\n    printk(42)\n    return 0\n",
+            "format must be a string literal",
+        ),
+        (
+            "two_args.py",
+            "def module_init() -> int:\n    printk(\"a\", \"b\")\n    return 0\n",
+            "exactly one argument",
+        ),
+        (
+            "repr_conv.py",
+            "def module_init() -> int:\n    printk(f\"{x!r}\")\n    return 0\n",
+            "conversions (!s/!r)",
+        ),
+        (
+            "format_spec.py",
+            "def module_init() -> int:\n    printk(f\"{x:04}\")\n    return 0\n",
+            "format specs",
+        ),
+        (
+            "helper_call.py",
+            "def module_init() -> int:\n    helper()\n    return 0\n",
+            "unsupported call",
+        ),
+        (
+            "return_name.py",
+            "def module_init() -> int:\n    return foo\n",
+            "unsupported expression",
+        ),
+        (
+            "float_assign.py",
+            "def module_init() -> int:\n    x = 3.5\n    return 0\n",
+            "unsupported assignment",
+        ),
+        (
+            "expr_interp.py",
+            "def module_init() -> int:\n    printk(f\"{1 + 2}\")\n    return 0\n",
+            "interpolations support integer values",
+        ),
+        (
+            "params.py",
+            "def module_init(n: int) -> int:\n    return 0\n",
+            "must take no parameters",
+        ),
+    ];
+    for (name, src, needle) in cases {
+        let file = scratch.path().join(name);
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join(format!("crate-{}", name.replace('.', "-")));
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                kernel_module: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("unsupported kernel-body construct must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(needle), "{}: {}", name, msg);
+    }
+}
+
+#[test]
 fn builtins_match_python_at_runtime() {
     // min/max (n-ary, default=, key=), sorted (reverse=, key=, stability),
     // reversed, enumerate(start=), 2/3-arg pow, and repr (including
