@@ -1241,6 +1241,7 @@ fn no_std_profile_rejects_std_constructs_loudly() {
 }
 
 #[test]
+<<<<<<< HEAD
 fn kernel_module_lowers_printk_fstrings_and_locals() {
     // Issue #84: printk takes a format string; f-string interpolations lower
     // to %ld conversions with the interpolated value as a vararg, and
@@ -1346,6 +1347,63 @@ fn kernel_module_printk_rejects_unsupported_forms_loudly() {
             "params.py",
             "def module_init(n: int) -> int:\n    return 0\n",
             "must take no parameters",
+=======
+fn kernel_module_rejects_floating_point_loudly() {
+    // Issue #87: the kernel runs with the FPU in a lazy-save state, so
+    // floating-point code must be a loud conversion error, never silently
+    // dropped or mis-lowered.
+    let scratch = Scratch::new("kernel-fp");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "float_return.py",
+            "def module_init() -> int:\n    printk(\"x\\n\")\n    return 1.5\n",
+            "floating-point",
+        ),
+        (
+            "float_assign.py",
+            "def module_init() -> int:\n    ratio = 1.5\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_param.py",
+            "def module_init(scale: float) -> int:\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_return_ann.py",
+            "def module_init() -> float:\n    return 1\n",
+            "floating-point",
+        ),
+        (
+            "float_list_ann.py",
+            "def module_init() -> list[float]:\n    return [1, 2]\n",
+            "floating-point",
+        ),
+        (
+            "float_call.py",
+            "def module_init() -> int:\n    x = float(\"1.5\")\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "import_math.py",
+            "import math\n\ndef module_init() -> int:\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "from_random.py",
+            "from random import randint\n\ndef module_init() -> int:\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_nested.py",
+            "def module_init() -> int:\n    vals = [1.0, 2.0]\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_if.py",
+            "def module_init() -> int:\n    if 1.5 > 1:\n        return 0\n    return 1\n",
+            "floating-point",
+>>>>>>> origin/main
         ),
     ];
     for (name, src, needle) in cases {
@@ -1361,13 +1419,65 @@ fn kernel_module_printk_rejects_unsupported_forms_loudly() {
                 ..Default::default()
             },
         )
+<<<<<<< HEAD
         .expect_err("unsupported kernel-body construct must fail the conversion");
         let msg = format!("{:#}", err);
         assert!(msg.contains(needle), "{}: {}", name, msg);
+=======
+        .expect_err("floating-point kernel code must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(needle), "{}: {}", name, msg);
+        assert!(
+            msg.contains("kernel_fpu_begin"),
+            "{}: error must mention the FPU guard workaround: {}",
+            name,
+            msg
+        );
+>>>>>>> origin/main
     }
 }
 
 #[test]
+<<<<<<< HEAD
+=======
+fn kernel_module_accepts_float_free_module() {
+    // Positive control: integer/string-only kernel code converts cleanly.
+    let scratch = Scratch::new("kernel-ok");
+    let file = scratch.path().join("hello.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    printk(\"Hello, kernel!\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "def module_exit():\n",
+            "    printk(\"Goodbye, kernel!\\n\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("float-free kernel module converts");
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("init_module"), "lib.rs: {}", lib);
+    assert!(lib.contains("cleanup_module"), "lib.rs: {}", lib);
+    assert!(!lib.contains("f64"), "no floating point in lib.rs: {}", lib);
+    assert!(!krate.has_binary, "kernel output is a library");
+}
+
+#[test]
+>>>>>>> origin/main
 fn builtins_match_python_at_runtime() {
     // min/max (n-ary, default=, key=), sorted (reverse=, key=, stability),
     // reversed, enumerate(start=), 2/3-arg pow, and repr (including

@@ -112,6 +112,10 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
     let ast = parse_enhanced(source, "<kernel>".to_string())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // The kernel runs with the FPU in a lazy-save state: reject floating-point
+    // usage loudly instead of emitting code that can corrupt userspace state.
+    check_kernel_no_floats(&ast)?;
+
     let mut init_body = String::new();
     let mut exit_body = String::new();
     let mut has_printk = false;
@@ -245,6 +249,7 @@ fn generate_kernel_lib_rs(source: &str) -> Result<String> {
     Ok(out)
 }
 
+<<<<<<< HEAD
 /// Does an entry-function parameter list declare any parameters?
 fn kernel_args_empty(args: &python_ast::ParameterList) -> bool {
     args.posonlyargs.is_empty()
@@ -252,6 +257,392 @@ fn kernel_args_empty(args: &python_ast::ParameterList) -> bool {
         && args.vararg.is_none()
         && args.kwonlyargs.is_empty()
         && args.kwarg.is_none()
+=======
+/// Stdlib modules whose public surface uses floating-point arithmetic.
+/// Importing them in kernel context is a loud conversion error (issue #87):
+/// the kernel runs with the FPU in a lazy-save state, and executing FP
+/// instructions without `kernel_fpu_begin()`/`kernel_fpu_end()` guards can
+/// corrupt userspace FPU state and cause silent data corruption.
+const KERNEL_FP_STDLIB: &[&str] = &[
+    "cmath",
+    "datetime",
+    "decimal",
+    "fractions",
+    "math",
+    "random",
+    "statistics",
+];
+
+/// Build the loud conversion error for floating-point usage in kernel code.
+fn kernel_fp_err(what: &str, line: Option<usize>) -> anyhow::Error {
+    let at = line.map(|l| format!(" (line {l})")).unwrap_or_default();
+    anyhow::anyhow!(
+        "kernel target forbids floating-point{at}: {what}. The kernel runs with the \
+         FPU in a lazy-save state; use integer or fixed-point math, or guard genuine \
+         FP work with kernel_fpu_begin()/kernel_fpu_end()"
+    )
+}
+
+/// Scan the whole module for floating-point usage and reject it loudly
+/// (issue #87). Covers float literals in any expression, `float` type
+/// annotations, `float()` calls, and imports of float-using stdlib modules —
+/// including inside statements the kernel lowering does not otherwise touch,
+/// so nothing is silently dropped.
+fn check_kernel_no_floats(ast: &python_ast::Module) -> Result<()> {
+    for stmt in &ast.raw.body {
+        check_kernel_stmt_no_floats(stmt)?;
+    }
+    Ok(())
+}
+
+fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
+    use python_ast::ast::tree::StatementType as S;
+    let line = stmt.lineno;
+    match &stmt.statement {
+        S::Import(imp) => {
+            for alias in &imp.names {
+                let root = alias.name.split('.').next().unwrap_or("");
+                if KERNEL_FP_STDLIB.contains(&root) {
+                    return Err(kernel_fp_err(
+                        &format!("import of `{}` (a floating-point stdlib module)", alias.name),
+                        line,
+                    ));
+                }
+            }
+            Ok(())
+        }
+        S::ImportFrom(imp) => {
+            let root = imp.module.split('.').next().unwrap_or("");
+            if KERNEL_FP_STDLIB.contains(&root) {
+                return Err(kernel_fp_err(
+                    &format!("import of `{}` (a floating-point stdlib module)", imp.module),
+                    line,
+                ));
+            }
+            Ok(())
+        }
+        S::FunctionDef(func) | S::AsyncFunctionDef(func) => {
+            check_kernel_funcdef_no_floats(func, line)
+        }
+        S::ClassDef(class) => {
+            for s in &class.body {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::Assign(assign) => {
+            check_kernel_expr_no_floats(&assign.value, line)?;
+            for target in &assign.targets {
+                check_kernel_expr_no_floats(target, line)?;
+            }
+            Ok(())
+        }
+        S::AugAssign(aug) => {
+            check_kernel_expr_no_floats(&aug.target, line)?;
+            check_kernel_expr_no_floats(&aug.value, line)
+        }
+        S::Call(call) => check_kernel_call_no_floats(call, line),
+        S::Expr(expr) => check_kernel_expr_no_floats(&expr.value, line),
+        S::Return(Some(val)) => check_kernel_expr_no_floats(&val.value, line),
+        S::Return(None) | S::Pass | S::Break | S::Continue => Ok(()),
+        S::Raise(r) => {
+            if let Some(exc) = &r.exc {
+                check_kernel_expr_no_floats(exc, line)?;
+            }
+            if let Some(cause) = &r.cause {
+                check_kernel_expr_no_floats(cause, line)?;
+            }
+            Ok(())
+        }
+        S::Assert { test, msg } => {
+            check_kernel_expr_no_floats(test, line)?;
+            if let Some(m) = msg {
+                check_kernel_expr_no_floats(m, line)?;
+            }
+            Ok(())
+        }
+        S::If(i) => {
+            check_kernel_expr_no_floats(&i.test, line)?;
+            for s in i.body.iter().chain(&i.orelse) {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::For(f) => {
+            check_kernel_expr_no_floats(&f.target, line)?;
+            check_kernel_expr_no_floats(&f.iter, line)?;
+            for s in f.body.iter().chain(&f.orelse) {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::While(w) => {
+            check_kernel_expr_no_floats(&w.test, line)?;
+            for s in w.body.iter().chain(&w.orelse) {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::AsyncFor(f) => {
+            check_kernel_expr_no_floats(&f.target, line)?;
+            check_kernel_expr_no_floats(&f.iter, line)?;
+            for s in f.body.iter().chain(&f.orelse) {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::Try(t) => {
+            for s in t.body.iter().chain(&t.orelse).chain(&t.finalbody) {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            for handler in &t.handlers {
+                if let Some(et) = &handler.exception_type {
+                    check_kernel_expr_no_floats(et, line)?;
+                }
+                for s in &handler.body {
+                    check_kernel_stmt_no_floats(s)?;
+                }
+            }
+            Ok(())
+        }
+        S::With(w) => {
+            check_kernel_with_items_no_floats(&w.items, line)?;
+            for s in &w.body {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::AsyncWith(w) => {
+            check_kernel_with_items_no_floats(&w.items, line)?;
+            for s in &w.body {
+                check_kernel_stmt_no_floats(s)?;
+            }
+            Ok(())
+        }
+        S::Unimplemented(_) => Ok(()),
+    }
+}
+
+fn check_kernel_with_items_no_floats(items: &[python_ast::WithItem], line: Option<usize>) -> Result<()> {
+    for item in items {
+        check_kernel_expr_no_floats(&item.context_expr, line)?;
+        if let Some(vars) = &item.optional_vars {
+            check_kernel_expr_no_floats(vars, line)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_kernel_funcdef_no_floats(func: &python_ast::FunctionDef, line: Option<usize>) -> Result<()> {
+    check_kernel_args_no_floats(&func.args, line)?;
+    if let Some(returns) = &func.returns {
+        if annotation_mentions_float(returns) {
+            return Err(kernel_fp_err("`float` return annotation", line));
+        }
+    }
+    for dec in &func.decorator_list {
+        check_kernel_expr_no_floats(dec, line)?;
+    }
+    for s in &func.body {
+        check_kernel_stmt_no_floats(s)?;
+    }
+    Ok(())
+}
+
+fn check_kernel_args_no_floats(args: &python_ast::ParameterList, line: Option<usize>) -> Result<()> {
+    for p in args.posonlyargs.iter().chain(&args.args).chain(&args.kwonlyargs) {
+        if let Some(ann) = &p.annotation {
+            if annotation_mentions_float(ann) {
+                return Err(kernel_fp_err(
+                    &format!("`float` annotation on parameter `{}`", p.arg),
+                    line,
+                ));
+            }
+        }
+    }
+    for p in [&args.vararg, &args.kwarg].into_iter().flatten() {
+        if let Some(ann) = &p.annotation {
+            if annotation_mentions_float(ann) {
+                return Err(kernel_fp_err(
+                    &format!("`float` annotation on parameter `{}`", p.arg),
+                    line,
+                ));
+            }
+        }
+    }
+    for d in args.defaults.iter() {
+        check_kernel_expr_no_floats(d, line)?;
+    }
+    for d in args.kw_defaults.iter().flatten() {
+        check_kernel_expr_no_floats(d, line)?;
+    }
+    Ok(())
+}
+
+/// Does this annotation expression mention the `float` type — bare, or
+/// nested in a subscript such as `list[float]`?
+fn annotation_mentions_float(expr: &python_ast::ExprType) -> bool {
+    match expr {
+        python_ast::ExprType::Name(n) => n.id == "float",
+        python_ast::ExprType::Subscript(s) => {
+            annotation_mentions_float(&s.value)
+                || match &s.kind {
+                    python_ast::SubscriptKind::Index(index) => annotation_mentions_float(index),
+                    python_ast::SubscriptKind::Slice { lower, upper, step } => {
+                        lower.as_deref().is_some_and(annotation_mentions_float)
+                            || upper.as_deref().is_some_and(annotation_mentions_float)
+                            || step.as_deref().is_some_and(annotation_mentions_float)
+                    }
+                }
+        }
+        python_ast::ExprType::Attribute(a) => annotation_mentions_float(&a.value),
+        _ => false,
+    }
+}
+
+/// Walk an expression for float literals and `float()` calls.
+fn check_kernel_expr_no_floats(expr: &python_ast::ExprType, line: Option<usize>) -> Result<()> {
+    use python_ast::ExprType as E;
+    match expr {
+        E::Constant(c) => {
+            if matches!(c.0, Some(litrs::Literal::Float(_))) {
+                return Err(kernel_fp_err(
+                    &format!("float literal `{}`", c.to_string()),
+                    line,
+                ));
+            }
+            Ok(())
+        }
+        E::BoolOp(b) => b
+            .values
+            .iter()
+            .try_for_each(|v| check_kernel_expr_no_floats(v, line)),
+        E::NamedExpr(n) => {
+            check_kernel_expr_no_floats(&n.left, line)?;
+            check_kernel_expr_no_floats(&n.right, line)
+        }
+        E::BinOp(b) => {
+            check_kernel_expr_no_floats(&b.left, line)?;
+            check_kernel_expr_no_floats(&b.right, line)
+        }
+        E::UnaryOp(u) => check_kernel_expr_no_floats(&u.operand, line),
+        E::Lambda(l) => {
+            check_kernel_args_no_floats(&l.args, line)?;
+            check_kernel_expr_no_floats(&l.body, line)
+        }
+        E::IfExp(i) => {
+            check_kernel_expr_no_floats(&i.test, line)?;
+            check_kernel_expr_no_floats(&i.body, line)?;
+            check_kernel_expr_no_floats(&i.orelse, line)
+        }
+        E::Dict(d) => {
+            for k in d.keys.iter().flatten() {
+                check_kernel_expr_no_floats(k, line)?;
+            }
+            for v in &d.values {
+                check_kernel_expr_no_floats(v, line)?;
+            }
+            Ok(())
+        }
+        E::Set(s) => s
+            .elts
+            .iter()
+            .try_for_each(|e| check_kernel_expr_no_floats(e, line)),
+        E::ListComp(lc) => check_kernel_comprehension_no_floats(&lc.elt, &lc.generators, line),
+        E::SetComp(sc) => check_kernel_comprehension_no_floats(&sc.elt, &sc.generators, line),
+        E::GeneratorExp(ge) => check_kernel_comprehension_no_floats(&ge.elt, &ge.generators, line),
+        E::DictComp(dc) => {
+            check_kernel_expr_no_floats(&dc.key, line)?;
+            check_kernel_expr_no_floats(&dc.value, line)?;
+            for g in &dc.generators {
+                check_kernel_comprehension_gen_no_floats(g, line)?;
+            }
+            Ok(())
+        }
+        E::Await(a) => check_kernel_expr_no_floats(&a.value, line),
+        E::Yield(y) => {
+            if let Some(v) = &y.value {
+                check_kernel_expr_no_floats(v, line)?;
+            }
+            Ok(())
+        }
+        E::YieldFrom(y) => check_kernel_expr_no_floats(&y.value, line),
+        E::Compare(c) => {
+            check_kernel_expr_no_floats(&c.left, line)?;
+            c.comparators
+                .iter()
+                .try_for_each(|v| check_kernel_expr_no_floats(v, line))
+        }
+        E::Call(call) => check_kernel_call_no_floats(call, line),
+        E::FormattedValue(fv) => check_kernel_expr_no_floats(&fv.value, line),
+        E::JoinedStr(js) => js
+            .values
+            .iter()
+            .try_for_each(|v| check_kernel_expr_no_floats(v, line)),
+        E::Attribute(a) => check_kernel_expr_no_floats(&a.value, line),
+        E::Subscript(s) => {
+            check_kernel_expr_no_floats(&s.value, line)?;
+            match &s.kind {
+                python_ast::SubscriptKind::Index(index) => check_kernel_expr_no_floats(index, line),
+                python_ast::SubscriptKind::Slice { lower, upper, step } => {
+                    for part in [lower, upper, step].into_iter().flatten() {
+                        check_kernel_expr_no_floats(part, line)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+        E::Starred(s) => check_kernel_expr_no_floats(&s.value, line),
+        E::List(items) => items
+            .iter()
+            .try_for_each(|e| check_kernel_expr_no_floats(e, line)),
+        E::Tuple(t) => t
+            .elts
+            .iter()
+            .try_for_each(|e| check_kernel_expr_no_floats(e, line)),
+        E::Name(_) | E::NoneType(_) | E::Unimplemented(_) | E::Unknown => Ok(()),
+    }
+}
+
+fn check_kernel_call_no_floats(call: &python_ast::Call, line: Option<usize>) -> Result<()> {
+    if let python_ast::ExprType::Name(n) = call.func.as_ref() {
+        if n.id == "float" {
+            return Err(kernel_fp_err("call to `float()`", line));
+        }
+    }
+    check_kernel_expr_no_floats(&call.func, line)?;
+    for arg in &call.args {
+        check_kernel_expr_no_floats(arg, line)?;
+    }
+    for kw in &call.keywords {
+        check_kernel_expr_no_floats(&kw.value, line)?;
+    }
+    Ok(())
+}
+
+fn check_kernel_comprehension_no_floats(
+    elt: &python_ast::ExprType,
+    generators: &[python_ast::Comprehension],
+    line: Option<usize>,
+) -> Result<()> {
+    check_kernel_expr_no_floats(elt, line)?;
+    for g in generators {
+        check_kernel_comprehension_gen_no_floats(g, line)?;
+    }
+    Ok(())
+}
+
+fn check_kernel_comprehension_gen_no_floats(
+    g: &python_ast::Comprehension,
+    line: Option<usize>,
+) -> Result<()> {
+    check_kernel_expr_no_floats(&g.target, line)?;
+    check_kernel_expr_no_floats(&g.iter, line)?;
+    for c in &g.ifs {
+        check_kernel_expr_no_floats(c, line)?;
+    }
+    Ok(())
+>>>>>>> origin/main
 }
 
 /// Try to extract a string literal from an expression.
