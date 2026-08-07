@@ -1241,7 +1241,89 @@ fn no_std_profile_rejects_std_constructs_loudly() {
 }
 
 #[test]
-<<<<<<< HEAD
+fn kernel_module_rejects_floating_point_loudly() {
+    // Issue #87: the kernel runs with the FPU in a lazy-save state, so
+    // floating-point code must be a loud conversion error, never silently
+    // dropped or mis-lowered.
+    let scratch = Scratch::new("kernel-fp");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "float_return.py",
+            "def module_init() -> int:\n    printk(\"x\\n\")\n    return 1.5\n",
+            "floating-point",
+        ),
+        (
+            "float_assign.py",
+            "def module_init() -> int:\n    ratio = 1.5\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_param.py",
+            "def module_init(scale: float) -> int:\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_return_ann.py",
+            "def module_init() -> float:\n    return 1\n",
+            "floating-point",
+        ),
+        (
+            "float_list_ann.py",
+            "def module_init() -> list[float]:\n    return [1, 2]\n",
+            "floating-point",
+        ),
+        (
+            "float_call.py",
+            "def module_init() -> int:\n    x = float(\"1.5\")\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "import_math.py",
+            "import math\n\ndef module_init() -> int:\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "from_random.py",
+            "from random import randint\n\ndef module_init() -> int:\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_nested.py",
+            "def module_init() -> int:\n    vals = [1.0, 2.0]\n    return 0\n",
+            "floating-point",
+        ),
+        (
+            "float_if.py",
+            "def module_init() -> int:\n    if 1.5 > 1:\n        return 0\n    return 1\n",
+            "floating-point",
+        ),
+    ];
+    for (name, src, needle) in cases {
+        let file = scratch.path().join(name);
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join(format!("crate-{}", name.replace('.', "-")));
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                kernel_module: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("floating-point kernel code must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(needle), "{}: {}", name, msg);
+        assert!(
+            msg.contains("kernel_fpu_begin"),
+            "{}: error must mention the FPU guard workaround: {}",
+            name,
+            msg
+        );
+    }
+}
+
+#[test]
 fn kernel_module_lowers_printk_fstrings_and_locals() {
     // Issue #84: printk takes a format string; f-string interpolations lower
     // to %ld conversions with the interpolated value as a vararg, and
@@ -1334,11 +1416,6 @@ fn kernel_module_printk_rejects_unsupported_forms_loudly() {
             "unsupported expression",
         ),
         (
-            "float_assign.py",
-            "def module_init() -> int:\n    x = 3.5\n    return 0\n",
-            "unsupported assignment",
-        ),
-        (
             "expr_interp.py",
             "def module_init() -> int:\n    printk(f\"{1 + 2}\")\n    return 0\n",
             "interpolations support integer values",
@@ -1347,63 +1424,6 @@ fn kernel_module_printk_rejects_unsupported_forms_loudly() {
             "params.py",
             "def module_init(n: int) -> int:\n    return 0\n",
             "must take no parameters",
-=======
-fn kernel_module_rejects_floating_point_loudly() {
-    // Issue #87: the kernel runs with the FPU in a lazy-save state, so
-    // floating-point code must be a loud conversion error, never silently
-    // dropped or mis-lowered.
-    let scratch = Scratch::new("kernel-fp");
-    let cases: &[(&str, &str, &str)] = &[
-        (
-            "float_return.py",
-            "def module_init() -> int:\n    printk(\"x\\n\")\n    return 1.5\n",
-            "floating-point",
-        ),
-        (
-            "float_assign.py",
-            "def module_init() -> int:\n    ratio = 1.5\n    return 0\n",
-            "floating-point",
-        ),
-        (
-            "float_param.py",
-            "def module_init(scale: float) -> int:\n    return 0\n",
-            "floating-point",
-        ),
-        (
-            "float_return_ann.py",
-            "def module_init() -> float:\n    return 1\n",
-            "floating-point",
-        ),
-        (
-            "float_list_ann.py",
-            "def module_init() -> list[float]:\n    return [1, 2]\n",
-            "floating-point",
-        ),
-        (
-            "float_call.py",
-            "def module_init() -> int:\n    x = float(\"1.5\")\n    return 0\n",
-            "floating-point",
-        ),
-        (
-            "import_math.py",
-            "import math\n\ndef module_init() -> int:\n    return 0\n",
-            "floating-point",
-        ),
-        (
-            "from_random.py",
-            "from random import randint\n\ndef module_init() -> int:\n    return 0\n",
-            "floating-point",
-        ),
-        (
-            "float_nested.py",
-            "def module_init() -> int:\n    vals = [1.0, 2.0]\n    return 0\n",
-            "floating-point",
-        ),
-        (
-            "float_if.py",
-            "def module_init() -> int:\n    if 1.5 > 1:\n        return 0\n    return 1\n",
-            "floating-point",
->>>>>>> origin/main
         ),
     ];
     for (name, src, needle) in cases {
@@ -1419,27 +1439,13 @@ fn kernel_module_rejects_floating_point_loudly() {
                 ..Default::default()
             },
         )
-<<<<<<< HEAD
         .expect_err("unsupported kernel-body construct must fail the conversion");
         let msg = format!("{:#}", err);
         assert!(msg.contains(needle), "{}: {}", name, msg);
-=======
-        .expect_err("floating-point kernel code must fail the conversion");
-        let msg = format!("{:#}", err);
-        assert!(msg.contains(needle), "{}: {}", name, msg);
-        assert!(
-            msg.contains("kernel_fpu_begin"),
-            "{}: error must mention the FPU guard workaround: {}",
-            name,
-            msg
-        );
->>>>>>> origin/main
     }
 }
 
 #[test]
-<<<<<<< HEAD
-=======
 fn kernel_module_accepts_float_free_module() {
     // Positive control: integer/string-only kernel code converts cleanly.
     let scratch = Scratch::new("kernel-ok");
@@ -1477,7 +1483,186 @@ fn kernel_module_accepts_float_free_module() {
 }
 
 #[test]
->>>>>>> origin/main
+fn kernel_module_rust_for_linux_generates_module_macro() {
+    // Issue #88: --kernel-module --rust-for-linux must emit a rust-for-linux
+    // crate: a module! macro, kernel::Module impl with init(), a Drop impl
+    // for module_exit, pr_info! printk lowering with Rust format strings
+    // ({}-placeholders, doubled braces, literal %), and no raw-FFI machinery.
+    let scratch = Scratch::new("kernel-rfl");
+    let file = scratch.path().join("hello.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "__module_author__ = \"Erica\"\n",
+            "__module_description__ = \"A hello-world kernel module\"\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    addr = 0x1fff0000\n",
+            "    printk(f\"Module loaded at {addr}\\n\")\n",
+            "    printk(\"100% ready\\n\")\n",
+            "    printk(\"set {x} literal\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "def module_exit():\n",
+            "    printk(\"Goodbye, kernel!\\n\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            rust_for_linux: true,
+            ..Default::default()
+        },
+    )
+    .expect("rust-for-linux module converts");
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+
+    // Skeleton: no_std/no_main, kernel prelude, module! macro with metadata.
+    assert!(lib.contains("#![no_std]"), "lib.rs: {}", lib);
+    assert!(lib.contains("#![no_main]"), "lib.rs: {}", lib);
+    assert!(
+        lib.contains("use kernel::prelude::*;"),
+        "prelude: {}",
+        lib
+    );
+    assert!(lib.contains("module! {"), "module!: {}", lib);
+    assert!(lib.contains("type: Hello,"), "module type: {}", lib);
+    assert!(lib.contains("name: \"hello\","), "module name: {}", lib);
+    assert!(lib.contains("author: \"Erica\","), "author: {}", lib);
+    assert!(
+        lib.contains("description: \"A hello-world kernel module\","),
+        "description: {}",
+        lib
+    );
+    assert!(lib.contains("license: \"GPL\","), "license: {}", lib);
+
+    // init -> kernel::Module::init returning Ok(Hello).
+    assert!(
+        lib.contains("impl kernel::Module for Hello {"),
+        "Module impl: {}",
+        lib
+    );
+    assert!(
+        lib.contains("fn init(_module: &'static ThisModule) -> Result<Self>"),
+        "init signature: {}",
+        lib
+    );
+    assert!(lib.contains("Ok(Hello)"), "Ok return: {}", lib);
+
+    // exit -> Drop.
+    assert!(lib.contains("impl Drop for Hello {"), "Drop: {}", lib);
+    assert!(lib.contains("fn drop(&mut self)"), "drop: {}", lib);
+
+    // printk -> pr_info! with Rust format dialect: {}-placeholder, doubled
+    // braces for literal braces, % left alone, \n escaped.
+    assert!(lib.contains("let addr: i64 = 536805376;"), "local: {}", lib);
+    assert!(
+        lib.contains("pr_info!(\"Module loaded at {}\\n\", addr);"),
+        "f-string to pr_info!: {}",
+        lib
+    );
+    assert!(
+        lib.contains("pr_info!(\"100% ready\\n\");"),
+        "% is literal in Rust format: {}",
+        lib
+    );
+    assert!(
+        lib.contains("pr_info!(\"set {{x}} literal\\n\");"),
+        "braces doubled for the Rust format parser: {}",
+        lib
+    );
+    assert!(
+        lib.contains("pr_info!(\"Goodbye, kernel!\\n\");"),
+        "exit printk: {}",
+        lib
+    );
+
+    // No raw-FFI machinery.
+    assert!(!lib.contains("printk("), "no raw printk FFI: {}", lib);
+    assert!(!lib.contains("kmalloc"), "no kmalloc allocator: {}", lib);
+    assert!(!lib.contains("init_module"), "no extern init_module: {}", lib);
+    assert!(!lib.contains("cleanup_module"), "no extern cleanup_module: {}", lib);
+    assert!(!lib.contains(".modinfo"), "no manual .modinfo: {}", lib);
+    assert!(!lib.contains("panic_handler"), "kernel crate has its own: {}", lib);
+
+    // Cargo.toml: commented kernel path dep, staticlib, panic=abort, and no
+    // stdpython dependency; no standalone Kbuild Makefile (modules are
+    // registered in the kernel tree instead).
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("kernel = { path ="), "kernel dep: {}", toml);
+    assert!(!toml.contains("stdpython"), "no stdpython: {}", toml);
+    assert!(toml.contains("staticlib"), "staticlib: {}", toml);
+    assert!(toml.contains("panic = \"abort\""), "abort: {}", toml);
+    assert!(!out.join("Makefile").exists(), "no standalone Makefile");
+    assert!(!krate.has_binary, "rust-for-linux output is a library");
+}
+
+#[test]
+fn kernel_module_rust_for_linux_rejects_unmappable_forms() {
+    let scratch = Scratch::new("kernel-rfl-bad");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "nonzero_init.py",
+            "def module_init() -> int:\n    return 1\n",
+            "can only `return 0`",
+        ),
+        (
+            "string_init.py",
+            "def module_init() -> int:\n    return \"ok\"\n",
+            "can only `return 0`",
+        ),
+        (
+            "exit_returns.py",
+            "def module_exit():\n    return 0\n",
+            "cannot return a value",
+        ),
+    ];
+    for (name, src, needle) in cases {
+        let file = scratch.path().join(name);
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join(format!("crate-{}", name.replace('.', "-")));
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                kernel_module: true,
+                rust_for_linux: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("rust-for-linux unmappable forms must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(needle), "{}: {}", name, msg);
+    }
+
+    // --rust-for-linux without --kernel-module is a configuration error.
+    let file = scratch.path().join("plain.py");
+    fs::write(&file, "x = 1\n").unwrap();
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &scratch.path().join("crate-plain"),
+        &ConvertOptions {
+            rust_for_linux: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("rust_for_linux without kernel_module must fail");
+    assert!(
+        format!("{:#}", err).contains("requires kernel_module"),
+        "err: {:#}",
+        err
+    );
+}
+
+#[test]
 fn builtins_match_python_at_runtime() {
     // min/max (n-ary, default=, key=), sorted (reverse=, key=, stability),
     // reversed, enumerate(start=), 2/3-arg pow, and repr (including
