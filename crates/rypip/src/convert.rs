@@ -136,18 +136,84 @@ pub struct GeneratedKernel {
     pub code: String,
     pub has_init: bool,
     pub has_exit: bool,
+    /// The generated misc device (`src/device.rs`) when the Python declares
+    /// a device manifest — `None` for plain kernel modules.
+    pub device: Option<String>,
+}
+
+/// Scan top-level assignments for module metadata (`__module_license__`,
+/// `__module_author__`, `__module_description__`, `__module_version__`).
+/// The license defaults to GPL — the kernel's modpost requires one.
+fn scan_modinfo(ast: &python_ast::Module) -> std::collections::BTreeMap<String, String> {
+    use python_ast::ast::tree::StatementType;
+    let mut modinfo: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::from([("license".into(), "GPL".into())]);
+    for stmt in &ast.raw.body {
+        if let StatementType::Assign(assign) = &stmt.statement {
+            if let (Some(target), Some(val_str)) =
+                (assign.targets.first(), expr_str_literal(&assign.value))
+            {
+                if let python_ast::ExprType::Name(name) = target {
+                    let key = match name.id.as_str() {
+                        "__module_license__" => Some("license"),
+                        "__module_author__" => Some("author"),
+                        "__module_description__" => Some("description"),
+                        "__module_version__" => Some("version"),
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        modinfo.insert(k.into(), val_str);
+                    }
+                }
+            }
+        }
+    }
+    modinfo
+}
+
+/// Emit a `.modinfo` section entry for each metadata key-value pair.
+/// Entries are null-terminated `key=value\0` strings in an ELF .modinfo
+/// section; each gets its own static with a generated symbol name.
+/// `#[used]` keeps the entries alive across `ld -r --gc-sections` (the
+/// C-free module link step): nothing references them from the entry
+/// points, so without it the license would be GC'd out of the module.
+fn modinfo_statics(modinfo: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (idx, (key, value)) in modinfo.iter().enumerate() {
+        let entry = format!("{key}={value}");
+        let len = entry.len();
+        let padded = (len + 7) & !7; // align to 8 bytes
+        out.push_str("#[used]\n#[no_mangle]\n#[link_section = \".modinfo\"]\n");
+        out.push_str(&format!("static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"));
+        for _ in len..padded {
+            out.push_str("\\0");
+        }
+        out.push_str("\";\n\n");
+    }
+    out
 }
 
 /// Generate a kernel module lib.rs from Python source. This bypasses the
 /// full transpiler in favour of a minimal lowering that produces kernel
 /// entry points, printk lowering, and module metadata — either raw `no_std`
-/// Rust (RawFfi) or a rust-for-linux `module!` crate (RustForLinux).
-fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str) -> Result<GeneratedKernel> {
+/// Rust (RawFfi) or a rust-for-linux `module!` crate (RustForLinux). When
+/// the Python declares a device manifest, the module becomes a generated
+/// misc device (device.rs + entry points that register it).
+fn generate_kernel_lib_rs(
+    source: &str,
+    target: KernelTarget,
+    package_name: &str,
+    manifest: &DeviceManifest,
+) -> Result<GeneratedKernel> {
     use python_ast::parse_enhanced;
     use python_ast::ast::tree::StatementType;
 
     let ast = parse_enhanced(source, "<kernel>".to_string())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    if manifest.has_device {
+        return generate_kernel_device(&ast, manifest, target, package_name);
+    }
 
     // The kernel runs with the FPU in a lazy-save state: reject
     // floating-point usage loudly instead of emitting code that can corrupt
@@ -157,30 +223,11 @@ fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str
     let mut init_body = String::new();
     let mut exit_body = String::new();
     let mut has_printk = false;
-    // Module metadata: key -> value (e.g. "license" -> "GPL").
-    let mut modinfo: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::from([("license".into(), "GPL".into())]);
+    let modinfo = scan_modinfo(&ast);
 
-    // Scan top-level statements for module metadata and entry points.
+    // Scan top-level statements for entry points.
     for stmt in &ast.raw.body {
         match &stmt.statement {
-            StatementType::Assign(assign) => {
-                if let (Some(target), Some(val_str)) =
-                    (assign.targets.first(), expr_str_literal(&assign.value))
-                {
-                    if let python_ast::ExprType::Name(name) = target {
-                        let key = match name.id.as_str() {
-                            "__module_license__" => Some("license"),
-                            "__module_author__" => Some("author"),
-                            "__module_description__" => Some("description"),
-                            _ => None,
-                        };
-                        if let Some(k) = key {
-                            modinfo.insert(k.into(), val_str);
-                        }
-                    }
-                }
-            }
             StatementType::FunctionDef(func) => {
                 let is_init = func.name == "module_init";
                 let is_exit = func.name == "module_exit";
@@ -224,6 +271,7 @@ fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str
                 code,
                 has_init: !init_body.is_empty(),
                 has_exit: !exit_body.is_empty(),
+                device: None,
             }),
         KernelTarget::RustForLinux => {
             generate_kernel_rust_for_linux(&init_body, &exit_body, &modinfo, package_name)
@@ -231,9 +279,67 @@ fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str
                     code,
                     has_init: !init_body.is_empty(),
                     has_exit: !exit_body.is_empty(),
+                    device: None,
                 })
         }
     }
+}
+
+/// Generate a kernel module for a device-manifest Python: `src/device.rs`
+/// (a misc byte-ring device parameterized by the manifest) and `src/lib.rs`
+/// (modinfo + entry points that register/deregister it). The Python is
+/// declarative here — only the manifest constants and modinfo metadata are
+/// consumed; the driver logic stays in user space (UIO/vfio pattern).
+fn generate_kernel_device(
+    ast: &python_ast::Module,
+    manifest: &DeviceManifest,
+    target: KernelTarget,
+    module_name: &str,
+) -> Result<GeneratedKernel> {
+    use python_ast::ast::tree::StatementType;
+
+    if let KernelTarget::RustForLinux = target {
+        bail!(
+            "kernel device generation (from __device_name__ etc.) is not supported \
+             with --rust-for-linux — device generation targets the raw-FFI pipeline"
+        );
+    }
+
+    // The generated device owns the module entry points; a Python
+    // module_init/module_exit would be silently dropped.
+    for stmt in &ast.raw.body {
+        if let StatementType::FunctionDef(func) = &stmt.statement {
+            if func.name == "module_init" || func.name == "module_exit" {
+                bail!(
+                    "kernel device generation: `{}` conflicts with the generated device \
+                     entry points — the misc device owns init/exit; remove it or drop \
+                     __device_name__",
+                    func.name
+                );
+            }
+        }
+    }
+
+    let modinfo = scan_modinfo(ast);
+
+    let lib = kernel_device_lib_template()
+        .replace("@@MODINFO@@", &modinfo_statics(&modinfo))
+        .replace("@@MODULE@@", module_name)
+        .replace("@@DEVICE_NAME@@", &manifest.device_name);
+    let device = kernel_device_template()
+        .replace("@@DEVICE_NAME@@", &manifest.device_name)
+        .replace("@@BUFSZ@@", &manifest.bufsz.to_string())
+        .replace("@@MAGIC@@", &format!("{:X}", manifest.magic))
+        .replace("@@IOC_RESET@@", &format!("{:x}", manifest.ioc_reset))
+        .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats))
+        .replace("@@DEVICE_MODE@@", &format!("{:o}", manifest.device_mode));
+
+    Ok(GeneratedKernel {
+        code: lib,
+        has_init: true,
+        has_exit: true,
+        device: Some(device),
+    })
 }
 
 /// The raw-FFI kernel module: `#![no_std]` staticlib with
@@ -277,25 +383,9 @@ fn generate_kernel_raw_ffi(
          static ALLOCATOR: KernelAllocator = KernelAllocator;\n\n",
     );
 
-    // Emit a .modinfo section entry for each metadata key-value pair.
-    // Entries are null-terminated key=value\0 strings in an ELF .modinfo
-    // section; each gets its own static with a generated symbol name.
-    // #[used] keeps the entries alive across `ld -r --gc-sections` (the
-    // C-free module link step): nothing references them from the entry
-    // points, so without it the license would be GC'd out of the module.
-    for (idx, (key, value)) in modinfo.iter().enumerate() {
-        let entry = format!("{key}={value}");
-        let len = entry.len();
-        let padded = (len + 7) & !7; // align to 8 bytes
-        out.push_str("#[used]\n#[no_mangle]\n#[link_section = \".modinfo\"]\n");
-        out.push_str(&format!(
-            "static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"
-        ));
-        for _ in len..padded {
-            out.push_str("\\0");
-        }
-        out.push_str("\";\n\n");
-    }
+    // Emit a .modinfo section entry for each metadata key-value pair
+    // (see `modinfo_statics`).
+    out.push_str(&modinfo_statics(modinfo));
 
     // Kernel panic handler.
     out.push_str(
@@ -796,6 +886,326 @@ fn generate_kernel_rust_for_linux(
     Ok(out)
 }
 
+/// The module skeleton for a generated device: modinfo statics, the
+/// `mod device;` declaration, and entry points that register/deregister
+/// the misc device. `@@MODINFO@@` is replaced with `modinfo_statics`
+/// output, `@@MODULE@@` with the module name, `@@DEVICE_NAME@@` with the
+/// misc device name.
+fn kernel_device_lib_template() -> &'static str {
+    r#"// Generated by rypip --kernel-module (device manifest). Edit the Python,
+// not this file: the device constants come from __device_name__,
+// __bufsz__, __magic__, __device_mode__, __ioc_reset__, __ioc_stats__ and
+// the modinfo entries from __module_license__ etc. in the driver Python.
+#![no_std]
+
+mod device;
+
+use core::ffi::c_int;
+
+use rykernel_shim::printk;
+
+@@MODINFO@@
+// ---------------------------------------------------------------------------
+// module entry points — owned by the generated device
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn init_module() -> c_int {
+    match device::register() {
+        Ok(()) => {
+            printk!(
+                "@@MODULE@@: loaded — /dev/@@DEVICE_NAME@@ ready (magic 0x%lx)\n",
+                device::MAGIC as u64
+            );
+            0
+        }
+        Err(err) => {
+            printk!("@@MODULE@@: misc_register failed: %ld\n", err as i64);
+            err
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cleanup_module() {
+    device::deregister();
+    printk!("@@MODULE@@: unloaded\n");
+}
+"#
+}
+
+/// The generated misc device — a byte ring with transaction counters and a
+/// reset ioctl, parameterized by the device manifest. Deliberately
+/// contains NO driver logic: it is a dumb byte pipe, an emulated MMIO
+/// region with no hardware behind it. All semantics live in the driver
+/// Python, compiled to Rust and run in user space against this device
+/// (the UIO/vfio pattern).
+fn kernel_device_template() -> &'static str {
+    r#"//! The kernel-side "device" — generated by rypip --kernel-module from the
+//! device manifest in the driver Python (__device_name__, __bufsz__,
+//! __magic__, __device_mode__, __ioc_reset__, __ioc_stats__). Edit those,
+//! not this file.
+//!
+//! A byte ring with transaction counters and a reset ioctl, exposed as the
+//! misc device /dev/@@DEVICE_NAME@@.
+//!
+//! This device deliberately contains NO driver logic: it is a dumb byte
+//! pipe with counters, an emulated MMIO region with no hardware behind it.
+//! All semantics live in the driver Python, which rython compiles to Rust
+//! and runs in user space against this device.
+//!
+//! The fops/ioctl numbers below are the ABI the user-space driver speaks
+//! (rypip --driver emits the syscall glue from the same manifest):
+//!   - write(2) — append up to @@BUFSZ@@ bytes to the ring, dropping the
+//!     oldest bytes when full
+//!   - read(2)  — drain bytes from the ring
+//!   - ioctl 0x@@IOC_RESET@@ (RYTHON_IOC_RESET) — clear ring, keep byte
+//!     counters, bump the reset counter
+//!   - ioctl 0x@@IOC_STATS@@ (RYTHON_IOC_STATS) — return `Stats`
+//!
+//! Locking: a spinlock serialises ring access. `copy_to_user` /
+//! `copy_from_user` are always called with the lock released — they can
+//! page-fault, and sleeping while holding a spinlock is a kernel bug.
+
+use core::ffi::{c_int, c_long, c_uint, c_ulong, c_void};
+use core::mem::size_of;
+use core::cell::UnsafeCell;
+
+use rykernel_shim::device::{
+    copy_from_user, copy_to_user, File, FileOperations, MiscDevice,
+};
+use rykernel_shim::ffi::{EFAULT, ENOTTY};
+use rykernel_shim::sync::SpinLock;
+
+/// Ring capacity — must match the user-space driver's expectations.
+pub const BUFSZ: usize = @@BUFSZ@@;
+/// Device magic (e.g. "RYHT"), echoed in the load message.
+pub const MAGIC: u32 = 0x@@MAGIC@@;
+
+/// `_IO(RYTHON_IOC_MAGIC, 1)` — clear the ring.
+const IOC_RESET: c_uint = 0x@@IOC_RESET@@;
+/// `_IOR(RYTHON_IOC_MAGIC, 2, struct rython_stats)` — fetch counters.
+const IOC_STATS: c_uint = 0x@@IOC_STATS@@;
+
+/// ioctl stats record, `struct rython_stats` (40 bytes).
+#[repr(C)]
+struct Stats {
+    wr_bytes: u64,
+    rd_bytes: u64,
+    wr_calls: u64,
+    rd_calls: u64,
+    resets: u64,
+}
+
+/// Device state: the emulated "device memory" plus transaction counters.
+struct Dev {
+    buf: [u8; BUFSZ],
+    head: usize,
+    tail: usize,
+    wr_bytes: u64,
+    rd_bytes: u64,
+    wr_calls: u64,
+    rd_calls: u64,
+    resets: u64,
+}
+
+const fn dev_init() -> Dev {
+    Dev {
+        buf: [0; BUFSZ],
+        head: 0,
+        tail: 0,
+        wr_bytes: 0,
+        rd_bytes: 0,
+        wr_calls: 0,
+        rd_calls: 0,
+        resets: 0,
+    }
+}
+
+/// `&mut Dev` access is exclusive under `LOCK`; the cell makes that
+/// discipline explicit instead of relying on `static mut`.
+struct SyncDev(UnsafeCell<Dev>);
+unsafe impl Sync for SyncDev {}
+
+static LOCK: SpinLock = SpinLock::new();
+static DEV: SyncDev = SyncDev(UnsafeCell::new(dev_init()));
+
+/// Run `f` with the device state locked.
+fn with_dev<R>(f: impl FnOnce(&mut Dev) -> R) -> R {
+    let _guard = LOCK.lock();
+    f(unsafe { &mut *DEV.0.get() })
+}
+
+// ---------------------------------------------------------------------------
+// file operations
+// ---------------------------------------------------------------------------
+
+/// Zero `len` bytes with volatile stores.
+///
+/// Deliberately volatile: a plain `*b = 0` loop (or an array literal) is
+/// recognised by LLVM and emitted as a `memset` libcall, and references to
+/// the interposable `memset` symbol are GOTPCREL relocations that the kernel
+/// module loader rejects. Volatile stores are not fused, so no libcall is
+/// emitted.
+unsafe fn zero_volatile(p: *mut u8, len: usize) {
+    for i in 0..len {
+        unsafe { core::ptr::write_volatile(p.add(i), 0u8) };
+    }
+}
+
+unsafe extern "C" fn dev_read(
+    _file: *mut File,
+    ubuf: *mut c_void,
+    count: usize,
+    _ppos: *mut i64,
+) -> isize {
+    // Drain the ring into the staging area (the ring buffer itself) under
+    // the lock, then copy out with the lock released.
+    let n = with_dev(|dev| {
+        let mut n = 0usize;
+        while n < count && dev.tail != dev.head {
+            // SAFETY: `n < BUFSZ` — the ring holds at most BUFSZ-1 bytes, so
+            // the drain loop runs at most BUFSZ times; `dev.tail < BUFSZ` is
+            // maintained by the modulo below. No panics may reachable code
+            // (panic formatting pulls GOTPCREL relocations the module loader
+            // rejects), so these are unchecked on purpose.
+            unsafe {
+                *dev.buf.get_unchecked_mut(n) = *dev.buf.get_unchecked(dev.tail);
+            }
+            n += 1;
+            dev.tail = (dev.tail + 1) % BUFSZ;
+        }
+        dev.rd_bytes += n as u64;
+        if n > 0 {
+            dev.rd_calls += 1;
+        }
+        n
+    });
+    if n > 0 {
+        if let Err(e) = unsafe { copy_to_user(ubuf, dev_buf_ptr(), n) } {
+            return e as isize;
+        }
+    }
+    n as isize
+}
+
+fn dev_buf_ptr() -> *const u8 {
+    // Read-only peek at the staging bytes just written; called after the
+    // lock is released, exactly like the C shim's post-unlock copy.
+    unsafe { &(*DEV.0.get()).buf as *const [u8; BUFSZ] as *const u8 }
+}
+
+unsafe extern "C" fn dev_write(
+    _file: *mut File,
+    ubuf: *const c_void,
+    count: usize,
+    _ppos: *mut i64,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    let count = count.min(BUFSZ);
+    // Copy the user bytes into a stack staging buffer first — copy_from_user
+    // may fault, so it must not run under the spinlock. (MaybeUninit + an
+    // explicit volatile zero: the `[0u8; N]` literal would lower to a memset
+    // libcall, whose GOTPCREL relocation the module loader rejects.)
+    let mut kbuf = core::mem::MaybeUninit::<[u8; BUFSZ]>::uninit();
+    let kbuf_ptr = kbuf.as_mut_ptr() as *mut u8;
+    unsafe { zero_volatile(kbuf_ptr, BUFSZ) };
+    if let Err(e) = unsafe { copy_from_user(kbuf_ptr, ubuf, count) } {
+        return e as isize;
+    }
+    with_dev(|dev| {
+        for i in 0..count {
+            // SAFETY: `i < count <= BUFSZ` (count was clamped above);
+            // `dev.head < BUFSZ` is maintained by the modulo below. Unchecked
+            // on purpose — see the note in dev_read.
+            unsafe {
+                *dev.buf.get_unchecked_mut(dev.head) = *kbuf_ptr.add(i);
+            }
+            dev.head = (dev.head + 1) % BUFSZ;
+            if dev.head == dev.tail {
+                // Full: drop the oldest byte.
+                dev.tail = (dev.tail + 1) % BUFSZ;
+            }
+        }
+        dev.wr_bytes += count as u64;
+        dev.wr_calls += 1;
+    });
+    count as isize
+}
+
+unsafe extern "C" fn dev_ioctl(
+    _file: *mut File,
+    cmd: c_uint,
+    arg: c_ulong,
+) -> c_long {
+    match cmd {
+        IOC_RESET => {
+            with_dev(|dev| {
+                unsafe { zero_volatile(dev.buf.as_mut_ptr(), BUFSZ) };
+                dev.head = 0;
+                dev.tail = 0;
+                dev.resets += 1;
+            });
+            0
+        }
+        IOC_STATS => {
+            let st = with_dev(|dev| Stats {
+                wr_bytes: dev.wr_bytes,
+                rd_bytes: dev.rd_bytes,
+                wr_calls: dev.wr_calls,
+                rd_calls: dev.rd_calls,
+                resets: dev.resets,
+            });
+            let ret = unsafe { copy_to_user(arg as *mut c_void, &st as *const Stats as *const u8, size_of::<Stats>()) };
+            if ret.is_err() {
+                EFAULT as c_long
+            } else {
+                0
+            }
+        }
+        _ => ENOTTY as c_long,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// registration
+// ---------------------------------------------------------------------------
+
+static FOPS: FileOperations = FileOperations {
+    owner: unsafe { &rykernel_shim::__this_module },
+    read: Some(dev_read),
+    write: Some(dev_write),
+    unlocked_ioctl: Some(dev_ioctl),
+    ..FileOperations::empty()
+};
+
+/// The registered device record. `mode 0600`: root-only, like the C shim;
+/// install the udev rule to open it unprivileged.
+///
+/// Wrapped in `UnsafeCell`: `misc_register` initialises the embedded
+/// `list_head` (`INIT_LIST_HEAD(&misc->list)`), so the record must live in
+/// writable memory — a plain `static` would be placed in read-only
+/// `.data.rel.ro` and fault on that write.
+struct SyncDevice(UnsafeCell<MiscDevice>);
+unsafe impl Sync for SyncDevice {}
+
+static DEVICE: SyncDevice =
+    SyncDevice(UnsafeCell::new(MiscDevice::new(b"@@DEVICE_NAME@@\0", &FOPS, 0o@@DEVICE_MODE@@)));
+
+pub fn register() -> Result<(), c_int> {
+    let dev: &'static MiscDevice = unsafe { &*DEVICE.0.get() };
+    dev.register()
+}
+
+pub fn deregister() {
+    let dev: &'static MiscDevice = unsafe { &*DEVICE.0.get() };
+    dev.deregister();
+}
+"#
+}
+
 /// CamelCase a crate name into a Rust type name: `hello_kernel` ->
 /// `HelloKernel`. Falls back to `K`-prefixed names for identifiers that
 /// would not be valid Rust type names.
@@ -1239,19 +1649,27 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         } else {
             KernelTarget::RawFfi
         };
-        let kernel = generate_kernel_lib_rs(&source, target, &package.name)?;
+        let manifest = parse_device_manifest(&source)?;
+        let crate_name = manifest
+            .module_name
+            .clone()
+            .unwrap_or_else(|| package.name.clone());
+        let kernel = generate_kernel_lib_rs(&source, target, &crate_name, &manifest)?;
         fs::write(src_dir.join("lib.rs"), &kernel.code)?;
+        if let Some(device) = &kernel.device {
+            fs::write(src_dir.join("device.rs"), device)?;
+        }
         let has_binary = false;
         let warnings = Vec::new();
-        write_cargo_toml(package, out_dir, opts, has_binary)?;
+        write_cargo_toml(package, out_dir, opts, has_binary, &manifest)?;
         if !opts.rust_for_linux {
             // rust-for-linux modules are registered in the kernel tree's
             // Kbuild Makefile (rust-obj-m += <name>.o), not a standalone one.
-            write_kernel_makefile(package, out_dir, kernel.has_init, kernel.has_exit)?;
+            write_kernel_makefile(&crate_name, out_dir, kernel.has_init, kernel.has_exit)?;
         }
         return Ok(ConvertedCrate {
             root: out_dir.to_path_buf(),
-            name: package.name.clone(),
+            name: crate_name,
             has_binary,
             warnings,
         });
@@ -1394,7 +1812,7 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         has_binary = true;
     }
 
-    write_cargo_toml(package, out_dir, opts, has_binary)?;
+    write_cargo_toml(package, out_dir, opts, has_binary, &DeviceManifest::default())?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -1408,59 +1826,145 @@ fn is_dunder_main(module: &PyModule) -> bool {
     module.path.last().map(String::as_str) == Some("__main__")
 }
 
-/// Device-manifest constants a driver Python may declare; consumed by
-/// `--driver` to parameterize the generated syscall glue.
-struct DriverManifest {
+/// Device manifest a driver Python may declare; consumed by `--driver`
+/// (user-space syscall glue) and `--kernel-module` (kernel misc device) to
+/// parameterize the generated code. Absent constants keep the documented
+/// defaults, so a driver Python can stay pure logic and still get working
+/// glue. Declaring a device field (`__device_name__`, `__bufsz__`,
+/// `__magic__`, `__device_mode__`) switches `--kernel-module` into
+/// device-generation mode: rypip emits the misc device too.
+struct DeviceManifest {
+    /// `__module_name__` — kernel module name (→ `{name}.ko`). Defaults to
+    /// the package name when absent.
+    module_name: Option<String>,
+    /// `__device_path__` — device node the user-space glue opens.
     device_path: String,
+    /// `__device_name__` — misc device name (the `/dev/` node suffix).
+    device_name: String,
+    /// `__bufsz__` — byte-ring capacity in the kernel device.
+    bufsz: usize,
+    /// `__magic__` — device magic, echoed in the load message.
+    magic: u32,
+    /// `__device_mode__` — device node permission bits.
+    device_mode: u32,
+    /// `__ioc_reset__` / `__ioc_stats__` — ioctl numbers (shared ABI).
     ioc_reset: i64,
     ioc_stats: i64,
+    /// True when the Python declared any device-generation field.
+    has_device: bool,
 }
 
-impl Default for DriverManifest {
+impl Default for DeviceManifest {
     fn default() -> Self {
-        DriverManifest {
+        DeviceManifest {
+            module_name: None,
             device_path: "/dev/rython0".to_string(),
+            device_name: "rython0".to_string(),
+            bufsz: 4096,
+            magic: 0x52594854,
+            device_mode: 0o600,
             ioc_reset: 0x5201,
             ioc_stats: 0x8028_5202,
+            has_device: false,
         }
     }
 }
 
-/// Read the driver manifest out of a Python module: module-level constants
-/// `__device_path__` (string) and `__ioc_reset__` / `__ioc_stats__`
-/// (integers). Absent constants keep the documented defaults, so a driver
-/// Python can stay pure driver logic and still get working glue.
-fn parse_driver_manifest(source: &str) -> Result<DriverManifest> {
+/// Read the device manifest out of a Python module: module-level constants
+/// `__device_path__` (string), `__device_name__` / `__module_name__`
+/// (strings), `__bufsz__` / `__magic__` / `__device_mode__` /
+/// `__ioc_reset__` / `__ioc_stats__` (integers). Absent constants keep the
+/// documented defaults. Malformed values are loud conversion errors — never
+/// silently ignored.
+fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
     let ast = parse_enhanced(source, "<driver>".to_string())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let mut manifest = DriverManifest::default();
+    let mut manifest = DeviceManifest::default();
     for stmt in &ast.raw.body {
         if let python_ast::ast::tree::StatementType::Assign(assign) = &stmt.statement {
             if let (Some(target), value) = (assign.targets.first(), &assign.value) {
                 if let python_ast::ExprType::Name(name) = target {
                     let key = name.id.as_str();
-                    if key == "__device_path__" {
-                        if let Some(s) = expr_str_literal(value) {
-                            manifest.device_path = s;
-                        } else {
-                            bail!("--driver: __device_path__ must be a string literal");
+                    match key {
+                        "__module_name__" => {
+                            if let Some(s) = expr_str_literal(value) {
+                                manifest.module_name = Some(s);
+                            } else {
+                                bail!("--driver/--kernel-module: __module_name__ must be a string literal");
+                            }
                         }
-                    } else if key == "__ioc_reset__" {
-                        if let Some(v) = expr_int_literal(value) {
-                            manifest.ioc_reset = v;
-                        } else {
-                            bail!("--driver: __ioc_reset__ must be an integer literal");
+                        "__device_path__" => {
+                            if let Some(s) = expr_str_literal(value) {
+                                manifest.device_path = s;
+                            } else {
+                                bail!("--driver/--kernel-module: __device_path__ must be a string literal");
+                            }
                         }
-                    } else if key == "__ioc_stats__" {
-                        if let Some(v) = expr_int_literal(value) {
-                            manifest.ioc_stats = v;
-                        } else {
-                            bail!("--driver: __ioc_stats__ must be an integer literal");
+                        "__device_name__" => {
+                            if let Some(s) = expr_str_literal(value) {
+                                manifest.has_device = true;
+                                manifest.device_name = s;
+                            } else {
+                                bail!("--driver/--kernel-module: __device_name__ must be a string literal");
+                            }
                         }
+                        "__bufsz__" => {
+                            if let Some(v) = expr_int_literal(value) {
+                                manifest.has_device = true;
+                                manifest.bufsz = v as usize;
+                            } else {
+                                bail!("--driver/--kernel-module: __bufsz__ must be an integer literal");
+                            }
+                        }
+                        "__magic__" => {
+                            if let Some(v) = expr_int_literal(value) {
+                                manifest.has_device = true;
+                                manifest.magic = v as u32;
+                            } else {
+                                bail!("--driver/--kernel-module: __magic__ must be an integer literal");
+                            }
+                        }
+                        "__device_mode__" => {
+                            if let Some(v) = expr_int_literal(value) {
+                                manifest.has_device = true;
+                                manifest.device_mode = v as u32;
+                            } else {
+                                bail!("--driver/--kernel-module: __device_mode__ must be an integer literal");
+                            }
+                        }
+                        "__ioc_reset__" => {
+                            if let Some(v) = expr_int_literal(value) {
+                                manifest.ioc_reset = v;
+                            } else {
+                                bail!("--driver/--kernel-module: __ioc_reset__ must be an integer literal");
+                            }
+                        }
+                        "__ioc_stats__" => {
+                            if let Some(v) = expr_int_literal(value) {
+                                manifest.ioc_stats = v;
+                            } else {
+                                bail!("--driver/--kernel-module: __ioc_stats__ must be an integer literal");
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+    }
+    // The device name is embedded in a Rust byte-string literal; keep it
+    // to a safe charset so a weird Python string cannot break the output.
+    if manifest.has_device
+        && !manifest
+            .device_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "--driver/--kernel-module: __device_name__ must be alphanumeric, '_' or '-' \
+             (got {:?})",
+            manifest.device_name
+        );
     }
     Ok(manifest)
 }
@@ -1503,7 +2007,7 @@ fn convert_driver(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) ->
     fs::write(src_dir.join("lib.rs"), format_rust(&lib))?;
 
     // main.rs: the generated syscall glue, parameterized by the manifest.
-    let manifest = parse_driver_manifest(&module.source)?;
+    let manifest = parse_device_manifest(&module.source)?;
     let main = driver_glue_template()
         .replace("@@CRATE@@", &package.name)
         .replace("@@DEVICE_PATH@@", &manifest.device_path)
@@ -1511,7 +2015,7 @@ fn convert_driver(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) ->
         .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats));
     fs::write(src_dir.join("main.rs"), format_rust(&main))?;
 
-    write_cargo_toml(package, out_dir, opts, true)?;
+    write_cargo_toml(package, out_dir, opts, true, &manifest)?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -2133,22 +2637,47 @@ fn bindable_signature(
     Some((params, names, ret))
 }
 
-/// Write the generated crate's Cargo.toml.
+/// Write the generated crate's Cargo.toml. `manifest` carries the device
+/// manifest: kernel device generation swaps the stdpython dependency for
+/// the rykernel-shim crate (the device code links it directly) and takes
+/// its crate name from `__module_name__` when declared.
 fn write_cargo_toml(
     package: &PyPackage,
     out_dir: &Path,
     opts: &ConvertOptions,
     _has_binary: bool,
+    manifest: &DeviceManifest,
 ) -> Result<()> {
+    let crate_name = if opts.kernel_module {
+        // Kernel modules take their name from the kernel manifest; the
+        // userspace driver keeps the package name (the glue and the
+        // integration tests reference it).
+        manifest
+            .module_name
+            .clone()
+            .unwrap_or_else(|| package.name.clone())
+    } else {
+        package.name.clone()
+    };
+    let kernel_device = opts.kernel_module && manifest.has_device;
     let stdpython_source = resolve_stdpython_source(opts)?;
-    // Kernel modules use stdpython's alloc tier, backed by a kmalloc
-    // global allocator — String, Vec, dicts, and the full stdlib work.
-    // The no_std profile pins stdpython to its alloc tier: no OS, no libc,
-    // suitable for embedded/wasm targets.
-    // rust-for-linux modules link against the kernel crate from the
-    // rust-for-linux kernel tree; stdpython has no kernel support, so the
-    // dependency is a commented-out path the user points at their tree.
-    let stdpython_dep = if opts.rust_for_linux {
+    let stdpython_dep = if kernel_device {
+        // The generated device links the rython kernel shim crate. It is
+        // not published: resolve a checkout next to this tool, an explicit
+        // override, or fail loudly.
+        let shim = resolve_rykernel_shim_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--kernel-module device generation needs the rykernel-shim crate \
+                 (the generated device links it): set RYPIP_RYKERNEL_SHIM_PATH to \
+                 its checkout, or run rypip from the rython workspace \
+                 (crates/rykernel-shim)"
+            )
+        })?;
+        format!(
+            "rykernel-shim = {{ path = \"{}\" }}",
+            shim.display().to_string().replace('\\', "/")
+        )
+    } else if opts.rust_for_linux {
         "# kernel = { path = \"/path/to/linux/rust/kernel\" }\n\
          # The kernel crate provides the module! macro and pr_info!; point\n\
          # the path at your rust-for-linux tree's rust/kernel directory."
@@ -2191,7 +2720,7 @@ fn write_cargo_toml(
          edition = \"2021\"\n\n\
          [dependencies]\n\
          {stdpython_dep}\n",
-        name = package.name,
+        name = crate_name,
         version = package.version,
     );
     // Userspace drivers link libc for their generated syscall glue.
@@ -2266,6 +2795,22 @@ fn resolve_stdpython_source(opts: &ConvertOptions) -> Result<StdpythonSource> {
     ))
 }
 
+/// Locate the rykernel-shim crate that generated device modules link: an
+/// explicit `RYPIP_RYKERNEL_SHIM_PATH`, or the checkout that ships
+/// alongside this tool's own source tree (crates/rykernel-shim). The crate
+/// is not published, so an installed rypip without a rython checkout has
+/// no shim to point at — generation fails loudly in that case.
+fn resolve_rykernel_shim_path() -> Option<PathBuf> {
+    if let Ok(env_path) = std::env::var("RYPIP_RYKERNEL_SHIM_PATH") {
+        let p = PathBuf::from(env_path);
+        if p.join("Cargo.toml").is_file() {
+            return Some(p);
+        }
+    }
+    let built_in = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rykernel-shim");
+    built_in.canonicalize().ok()
+}
+
 /// Generate a C-free Kbuild Makefile and a pahole wrapper that build the
 /// kernel module purely from Rust: no `{name}_shim.c`, no C anywhere.
 ///
@@ -2282,12 +2827,11 @@ fn resolve_stdpython_source(opts: &ConvertOptions) -> Result<StdpythonSource> {
 ///      works around pahole emitting no types (and therefore no `.BTF.1`)
 ///      for pure-Rust objects when the kernel passes `--lang_exclude=rust`.
 fn write_kernel_makefile(
-    package: &PyPackage,
+    name: &str,
     out_dir: &Path,
     has_init: bool,
     has_exit: bool,
 ) -> Result<()> {
-    let name = &package.name;
     let entry_flags = {
         let mut flags = Vec::new();
         if has_init {
@@ -2355,12 +2899,15 @@ link:
 # 3. Kbuild: modpost, BTF, and the final module. PAHOLE is passed on the
 #    command line (command-line variables override the kbuild Makefile's
 #    `PAHOLE = pahole`) and points at the wrapper that works around pahole
-#    emitting no BTF for pure-Rust objects.
+#    emitting no BTF for pure-Rust objects. CURDIR (make's own working
+#    directory — this directory, even when driven from a parent make) is
+#    used for M=, not PWD: a top-level `make module` exports PWD as the
+#    parent directory, which would point kbuild at the wrong tree.
 kbuild:
-	$(MAKE) -C $(KDIR) LLVM=1 M=$(PWD) PAHOLE=$(PWD)/pahole-wrapper modules
+	$(MAKE) -C $(KDIR) LLVM=1 M=$(CURDIR) PAHOLE=$(CURDIR)/pahole-wrapper modules
 
 clean:
-	$(MAKE) -C $(KDIR) LLVM=1 M=$(PWD) clean
+	$(MAKE) -C $(KDIR) LLVM=1 M=$(CURDIR) clean
 	$(CARGO) clean
 
 .PHONY: all rust link kbuild clean

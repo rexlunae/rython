@@ -48,7 +48,11 @@ enum Cmd {
         no_std: bool,
         /// Generate a Linux kernel module crate. Implies no_std. Produces
         /// a cdylib with panic=abort, module_init/module_exit entry points,
-        /// and printk lowering. No stdpython dependency.
+        /// and printk lowering. No stdpython dependency. When the Python
+        /// declares a device manifest (__device_name__, __bufsz__, __magic__,
+        /// __device_mode__, __ioc_reset__, __ioc_stats__), also generates
+        /// src/device.rs — a misc byte-ring device — and entry points that
+        /// register it.
         #[arg(long, conflicts_with = "no_std")]
         kernel_module: bool,
         /// Generate a userspace driver crate for a rython byte-ring misc
