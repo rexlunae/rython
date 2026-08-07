@@ -1480,6 +1480,16 @@ fn kernel_module_accepts_float_free_module() {
     assert!(lib.contains("cleanup_module"), "lib.rs: {}", lib);
     assert!(!lib.contains("f64"), "no floating point in lib.rs: {}", lib);
     assert!(!krate.has_binary, "kernel output is a library");
+
+    // The C-free kernel build needs the allocator to bind to the kernel's
+    // exported symbol (__kmalloc_noprof on 7.x kernels), .modinfo metadata
+    // kept alive with #[used], and a fmt-free panic handler (the fmt
+    // machinery pulls core code with GOTPCREL relocations the module loader
+    // rejects).
+    assert!(lib.contains("__kmalloc_noprof"), "7.x allocator export: {}", lib);
+    assert!(lib.contains("#[used]"), "modinfo survives --gc-sections: {}", lib);
+    assert!(lib.contains("#[panic_handler]"), "panic handler: {}", lib);
+    assert!(lib.contains("fn panic"), "panic handler: {}", lib);
 }
 
 #[test]

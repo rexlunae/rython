@@ -122,11 +122,20 @@ pub enum KernelTarget {
     RustForLinux,
 }
 
+/// Result of lowering a Python module to a kernel module: the generated
+/// `lib.rs` plus which module entry points exist (the build recipe needs to
+/// know, so the linker keeps exactly the entry points that are defined).
+pub struct GeneratedKernel {
+    pub code: String,
+    pub has_init: bool,
+    pub has_exit: bool,
+}
+
 /// Generate a kernel module lib.rs from Python source. This bypasses the
 /// full transpiler in favour of a minimal lowering that produces kernel
 /// entry points, printk lowering, and module metadata — either raw `no_std`
 /// Rust (RawFfi) or a rust-for-linux `module!` crate (RustForLinux).
-fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str) -> Result<String> {
+fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str) -> Result<GeneratedKernel> {
     use python_ast::parse_enhanced;
     use python_ast::ast::tree::StatementType;
 
@@ -203,11 +212,19 @@ fn generate_kernel_lib_rs(source: &str, target: KernelTarget, package_name: &str
     }
 
     match target {
-        KernelTarget::RawFfi => {
-            generate_kernel_raw_ffi(&init_body, &exit_body, &modinfo, has_printk)
-        }
+        KernelTarget::RawFfi => generate_kernel_raw_ffi(&init_body, &exit_body, &modinfo, has_printk)
+            .map(|code| GeneratedKernel {
+                code,
+                has_init: !init_body.is_empty(),
+                has_exit: !exit_body.is_empty(),
+            }),
         KernelTarget::RustForLinux => {
             generate_kernel_rust_for_linux(&init_body, &exit_body, &modinfo, package_name)
+                .map(|code| GeneratedKernel {
+                    code,
+                    has_init: !init_body.is_empty(),
+                    has_exit: !exit_body.is_empty(),
+                })
         }
     }
 }
@@ -222,7 +239,9 @@ fn generate_kernel_raw_ffi(
     has_printk: bool,
 ) -> Result<String> {
     let printk_decl = if has_printk {
-        "extern \"C\" {\n    fn printk(fmt: *const core::ffi::c_char, ...);\n}\n\n"
+        // The kernel exports `_printk`, not `printk` — `printk` is a C macro
+        // around it. Modules must call the symbol directly.
+        "extern \"C\" {\n    fn _printk(fmt: *const core::ffi::c_char, ...);\n}\n\n"
     } else {
         ""
     };
@@ -237,13 +256,16 @@ fn generate_kernel_raw_ffi(
 
     // kmalloc-backed global allocator: allows String, Vec, HashMap, and the
     // full stdpython alloc tier to work in kernel context. Same pattern as
-    // rust-for-linux's Kmalloc allocator.
+    // rust-for-linux's Kmalloc allocator. The exported symbol is
+    // `__kmalloc_noprof` on kernels >= 7.0 (the kmalloc() inline in slab.h
+    // lowers to it; the _noprof suffix comes from the allocation-profiling
+    // rework). On 6.x kernels this was `kmalloc` — adjust if needed.
     out.push_str(
         "use core::alloc::{GlobalAlloc, Layout};\n\n\
-         extern \"C\" {\n    fn kmalloc(size: usize, flags: core::ffi::c_uint) -> *mut u8;\n    fn kfree(ptr: *mut u8);\n}\n\n\
+         extern \"C\" {\n    fn __kmalloc_noprof(size: usize, flags: core::ffi::c_uint) -> *mut u8;\n    fn kfree(ptr: *mut u8);\n}\n\n\
          const GFP_KERNEL: core::ffi::c_uint = 0xCC0;\n\n\
          struct KernelAllocator;\n\n\
-         unsafe impl GlobalAlloc for KernelAllocator {\n    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {\n        unsafe { kmalloc(layout.size(), GFP_KERNEL) }\n    }\n    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {\n        unsafe { kfree(ptr) }\n    }\n}\n\n\
+         unsafe impl GlobalAlloc for KernelAllocator {\n    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {\n        unsafe { __kmalloc_noprof(layout.size(), GFP_KERNEL) }\n    }\n    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {\n        unsafe { kfree(ptr) }\n    }\n}\n\n\
          #[global_allocator]\n\
          static ALLOCATOR: KernelAllocator = KernelAllocator;\n\n",
     );
@@ -251,11 +273,14 @@ fn generate_kernel_raw_ffi(
     // Emit a .modinfo section entry for each metadata key-value pair.
     // Entries are null-terminated key=value\0 strings in an ELF .modinfo
     // section; each gets its own static with a generated symbol name.
+    // #[used] keeps the entries alive across `ld -r --gc-sections` (the
+    // C-free module link step): nothing references them from the entry
+    // points, so without it the license would be GC'd out of the module.
     for (idx, (key, value)) in modinfo.iter().enumerate() {
         let entry = format!("{key}={value}");
         let len = entry.len();
         let padded = (len + 7) & !7; // align to 8 bytes
-        out.push_str("#[no_mangle]\n#[link_section = \".modinfo\"]\n");
+        out.push_str("#[used]\n#[no_mangle]\n#[link_section = \".modinfo\"]\n");
         out.push_str(&format!(
             "static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"
         ));
@@ -850,7 +875,7 @@ fn lower_kernel_body(
                 let (fmt, values) = lower_printk_args(&call.args, line, style)?;
                 match target {
                     KernelTarget::RawFfi => {
-                        out.push_str("    unsafe {\n        printk(");
+                        out.push_str("    unsafe {\n        _printk(");
                         out.push_str(&format!(
                             "b\"{fmt}\\0\".as_ptr() as *const core::ffi::c_char"
                         ));
@@ -1204,15 +1229,15 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         } else {
             KernelTarget::RawFfi
         };
-        let kernel_code = generate_kernel_lib_rs(&source, target, &package.name)?;
-        fs::write(src_dir.join("lib.rs"), &kernel_code)?;
+        let kernel = generate_kernel_lib_rs(&source, target, &package.name)?;
+        fs::write(src_dir.join("lib.rs"), &kernel.code)?;
         let has_binary = false;
         let warnings = Vec::new();
         write_cargo_toml(package, out_dir, opts, has_binary)?;
         if !opts.rust_for_linux {
             // rust-for-linux modules are registered in the kernel tree's
             // Kbuild Makefile (rust-obj-m += <name>.o), not a standalone one.
-            write_kernel_makefile(package, out_dir)?;
+            write_kernel_makefile(package, out_dir, kernel.has_init, kernel.has_exit)?;
         }
         return Ok(ConvertedCrate {
             root: out_dir.to_path_buf(),
@@ -1770,15 +1795,52 @@ fn resolve_stdpython_source(opts: &ConvertOptions) -> Result<StdpythonSource> {
     ))
 }
 
-/// Generate a Kbuild Makefile and C shim that builds the kernel module
-/// from the Rust cdylib. The shim bridges the kernel module loader
-/// with our Rust-compiled init_module/cleanup_module symbols.
-fn write_kernel_makefile(package: &PyPackage, out_dir: &Path) -> Result<()> {
+/// Generate a C-free Kbuild Makefile and a pahole wrapper that build the
+/// kernel module purely from Rust: no `{name}_shim.c`, no C anywhere.
+///
+/// Pipeline:
+///   1. `cargo build --release --target x86_64-unknown-none` — the generated
+///      crate is a `#![no_std]` staticlib (kmalloc allocator, `.modinfo`
+///      sections, `extern "C"` entry points).
+///   2. `ld -r --gc-sections -u init_module ...` — merge the staticlib into a
+///      single relocatable object the module loader accepts. `--gc-sections`
+///      prunes everything unreachable from the entry points; that is what
+///      drops the PIC/GOTPCREL relocations (R_X86_64_GOTPCREL is rejected by
+///      the kernel loader) that rust-std's precompiled objects carry.
+///   3. Kbuild does modpost, BTF, and the final link. The `pahole-wrapper`
+///      works around pahole emitting no types (and therefore no `.BTF.1`)
+///      for pure-Rust objects when the kernel passes `--lang_exclude=rust`.
+fn write_kernel_makefile(
+    package: &PyPackage,
+    out_dir: &Path,
+    has_init: bool,
+    has_exit: bool,
+) -> Result<()> {
     let name = &package.name;
+    let entry_flags = {
+        let mut flags = Vec::new();
+        if has_init {
+            flags.push("-u init_module");
+        }
+        if has_exit {
+            flags.push("-u cleanup_module");
+        }
+        flags.join(" ")
+    };
     let makefile = format!(
         r#"# Kbuild Makefile for {name}.ko — generated by rypip --kernel-module.
 #
-# Prerequisites: linux-headers, build-essential, Rust toolchain
+# Pure-Rust module: no C shim. The module is a Rust staticlib linked into a
+# single relocatable object that Kbuild can consume.
+#
+# Prerequisites:
+#   - linux-headers for the running kernel
+#   - nightly Rust (for -Zbuild-std; stable cannot rebuild core/alloc, whose
+#     precompiled objects carry GOTPCREL relocations the module loader
+#     rejects) plus the freestanding target:
+#         rustup toolchain install nightly --profile minimal
+#         rustup +nightly target add x86_64-unknown-none
+#   - GNU ld >= 2.36 (--gc-sections in relocatable links)
 #
 # Build:  make
 # Load:   sudo insmod {name}.ko
@@ -1786,40 +1848,95 @@ fn write_kernel_makefile(package: &PyPackage, out_dir: &Path) -> Result<()> {
 # Logs:   sudo dmesg | tail -5
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
+CARGO ?= cargo
+RUST_TARGET ?= x86_64-unknown-none
+KOBJ := target/$(RUST_TARGET)/release/lib{name}.a
+# Kernel modules must not use PIC addressing: the module loader rejects
+# R_X86_64_GOTPCREL ("Unknown rela relocation: 9"). The static model makes
+# every reference direct. code-model=kernel matches the kernel's own model;
+# embed-bitcode=no keeps the .llvmbc sections out of the staticlib.
+# -Zbuild-std rebuilds core/alloc/compiler_builtins with these flags — the
+# precompiled ones from rustup are built PIC and keep their GOTPCRELs in
+# reachable code (stdpython pulls alloc + the panic-message machinery).
+RUSTFLAGS := -C relocation-model=static -C code-model=kernel -C embed-bitcode=no
+BUILD_STD := -Zbuild-std=core,alloc,compiler_builtins
 
 obj-m += {name}.o
-{name}-objs := {name}_shim.o target/release/lib{name}.a
 
-all: rust
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+all: rust link kbuild
 
+# 1. Compile the module to a freestanding staticlib (no libc, no std),
+#    rebuilding core/alloc/compiler_builtins under the static model.
 rust:
-	cargo build --release
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) +nightly build $(BUILD_STD) --release --target $(RUST_TARGET)
+
+# 2. Link the staticlib into a single relocatable object. --gc-sections
+#    prunes everything unreachable from the module entry points (this is what
+#    removes the PIC/GOTPCREL relocations the module loader rejects), and -u
+#    keeps exactly the entry points the generated module defines. The
+#    generated Rust emits .modinfo entries, so the module keeps its
+#    license/author/description without any C.
+link:
+	ld -r --gc-sections {entry_flags} --whole-archive $(KOBJ) -o {name}.o
+	objcopy --remove-section .llvmbc --remove-section .llvmcmd --strip-debug {name}.o
+	@touch .{name}.o.cmd
+
+# 3. Kbuild: modpost, BTF, and the final module. PAHOLE is passed on the
+#    command line (command-line variables override the kbuild Makefile's
+#    `PAHOLE = pahole`) and points at the wrapper that works around pahole
+#    emitting no BTF for pure-Rust objects.
+kbuild:
+	$(MAKE) -C $(KDIR) LLVM=1 M=$(PWD) PAHOLE=$(PWD)/pahole-wrapper modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	cargo clean
+	$(MAKE) -C $(KDIR) LLVM=1 M=$(PWD) clean
+	$(CARGO) clean
 
-.PHONY: all rust clean
+.PHONY: all rust link kbuild clean
 "#
     );
 
-    let shim = format!(
-        r#"// {name}_shim.c — generated by rypip. Bridges Kbuild and Rust.
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-
-// Declared by the Rust lib.rs with #[no_mangle] pub extern "C".
-extern int init_module(void);
-extern void cleanup_module(void);
-
-MODULE_LICENSE("GPL");
-"#
-    );
+    let wrapper = r#"#!/bin/sh
+# pahole-wrapper — generated by rypip --kernel-module.
+#
+# Workaround for pahole + pure-Rust modules on kernels built with BTF support
+# (CONFIG_DEBUG_INFO_BTF_MODULES=y): the kernel's BTF Makefile passes
+# --lang_exclude=rust, and pahole then emits NO types for an object whose only
+# debug info is Rust. The kbuild BTF step fails with
+#   "FAILED: load BTF from ... .BTF.1: No such file or directory"
+#
+# This wrapper runs the real pahole; if it produced nothing, it fabricates a
+# valid empty BTF header so resolve_btfids/objcopy can proceed. Modules with
+# no BTF types are valid; they simply carry no type info.
+#
+# The empty header is the 24-byte struct btf_header:
+#   magic 0xeb9f, version 1, flags 0, hdr_len 24, type_off/len 0, str_off/len 0
+# (little-endian; printf octal escapes — \ddd is at most 3 digits, so
+# \237 = 0x9f and \353 = 0xeb).
+PAHOLE_REAL="${PAHOLE_REAL:-pahole}"
+out=""
+for arg in "$@"; do
+    case "$arg" in
+        --btf_encode_detached=*) out="${arg#--btf_encode_detached=}" ;;
+    esac
+done
+"$PAHOLE_REAL" "$@" || exit $?
+if [ -n "$out" ] && [ ! -s "$out" ]; then
+    printf '\237\353\001\000\030\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000' > "$out"
+fi
+"#;
 
     fs::write(out_dir.join("Makefile"), &makefile)?;
-    fs::write(out_dir.join(format!("{name}_shim.c")), &shim)?;
+    fs::write(out_dir.join("pahole-wrapper"), wrapper)?;
+    // Make sure the wrapper is executable in the generated tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::metadata(out_dir.join("pahole-wrapper"))?.permissions();
+        let mut new_perms = perms.clone();
+        new_perms.set_mode(perms.mode() | 0o755);
+        fs::set_permissions(out_dir.join("pahole-wrapper"), new_perms)?;
+    }
     Ok(())
 }
 

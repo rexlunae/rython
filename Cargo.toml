@@ -5,6 +5,7 @@ members = [
     "crates/python-mod",
     "crates/rypip",
     "crates/rythonc",
+    "crates/rykernel-shim",
     "crates/stdpython",
 ]
 
