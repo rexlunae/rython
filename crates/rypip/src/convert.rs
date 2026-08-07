@@ -87,6 +87,13 @@ pub struct ConvertOptions {
     /// (module_init/module_exit), and printk lowering. The stdpython
     /// dependency is dropped entirely — only core Rust is available.
     pub kernel_module: bool,
+    /// Generate a userspace driver crate for a rython byte-ring misc device
+    /// (UIO style): the Python driver logic is compiled to a library, and a
+    /// syscall-glue binary (open/read/write/ioctl) is generated around it —
+    /// the only Rust in the driver is this generated boilerplate. The
+    /// Python declares the device manifest: `__device_path__`,
+    /// `__ioc_reset__`, and `__ioc_stats__` module-level constants.
+    pub driver: bool,
     /// Generate a rust-for-linux kernel module (issue #88): a `module!`-
     /// macro crate implementing `kernel::Module`, built with the
     /// rust-for-linux toolchain inside a rust-for-linux kernel tree.
@@ -825,7 +832,7 @@ fn expr_str_literal(expr: &python_ast::ExprType) -> Option<String> {
 }
 
 /// Try to extract an integer literal from an expression.
-fn _expr_int_literal(expr: &python_ast::ExprType) -> Option<i64> {
+fn expr_int_literal(expr: &python_ast::ExprType) -> Option<i64> {
     if let python_ast::ExprType::Constant(c) = expr {
         if let Some(litrs::Literal::Integer(ilit)) = &c.0 {
             return ilit.value::<i64>();
@@ -1206,6 +1213,9 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
             "rust_for_linux requires kernel_module (pass --kernel-module with --rust-for-linux)"
         );
     }
+    if opts.driver && (opts.kernel_module || opts.pyo3 || opts.no_std) {
+        bail!("--driver cannot be combined with --kernel-module, --pyo3, or --no-std");
+    }
 
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
@@ -1245,6 +1255,13 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
             has_binary,
             warnings,
         });
+    }
+
+    // Userspace drivers use the full stdpython transpile for the logic and
+    // wrap it in generated syscall glue — the only Rust shipped is the
+    // template below; everything else comes from the Python.
+    if opts.driver {
+        return convert_driver(package, out_dir, opts);
     }
 
     // Transpile every module, collecting lossy-conversion warnings.
@@ -1389,6 +1406,456 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
 
 fn is_dunder_main(module: &PyModule) -> bool {
     module.path.last().map(String::as_str) == Some("__main__")
+}
+
+/// Device-manifest constants a driver Python may declare; consumed by
+/// `--driver` to parameterize the generated syscall glue.
+struct DriverManifest {
+    device_path: String,
+    ioc_reset: i64,
+    ioc_stats: i64,
+}
+
+impl Default for DriverManifest {
+    fn default() -> Self {
+        DriverManifest {
+            device_path: "/dev/rython0".to_string(),
+            ioc_reset: 0x5201,
+            ioc_stats: 0x8028_5202,
+        }
+    }
+}
+
+/// Read the driver manifest out of a Python module: module-level constants
+/// `__device_path__` (string) and `__ioc_reset__` / `__ioc_stats__`
+/// (integers). Absent constants keep the documented defaults, so a driver
+/// Python can stay pure driver logic and still get working glue.
+fn parse_driver_manifest(source: &str) -> Result<DriverManifest> {
+    let ast = parse_enhanced(source, "<driver>".to_string())
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut manifest = DriverManifest::default();
+    for stmt in &ast.raw.body {
+        if let python_ast::ast::tree::StatementType::Assign(assign) = &stmt.statement {
+            if let (Some(target), value) = (assign.targets.first(), &assign.value) {
+                if let python_ast::ExprType::Name(name) = target {
+                    let key = name.id.as_str();
+                    if key == "__device_path__" {
+                        if let Some(s) = expr_str_literal(value) {
+                            manifest.device_path = s;
+                        } else {
+                            bail!("--driver: __device_path__ must be a string literal");
+                        }
+                    } else if key == "__ioc_reset__" {
+                        if let Some(v) = expr_int_literal(value) {
+                            manifest.ioc_reset = v;
+                        } else {
+                            bail!("--driver: __ioc_reset__ must be an integer literal");
+                        }
+                    } else if key == "__ioc_stats__" {
+                        if let Some(v) = expr_int_literal(value) {
+                            manifest.ioc_stats = v;
+                        } else {
+                            bail!("--driver: __ioc_stats__ must be an integer literal");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+/// Generate a userspace driver crate for a rython byte-ring misc device:
+/// the Python driver logic transpiles to `src/lib.rs` (full stdpython), and
+/// `src/main.rs` is generated syscall glue — open/read/write/ioctl around
+/// the device manifest. The only Rust in the output is this template.
+fn convert_driver(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Result<ConvertedCrate> {
+    let src_dir = out_dir.join("src");
+    fs::create_dir_all(&src_dir)
+        .with_context(|| format!("creating {}", src_dir.display()))?;
+
+    let module = match package.entry_module() {
+        Some(entry) => package
+            .modules
+            .iter()
+            .find(|m| m.file == entry.file)
+            .or_else(|| package.modules.first())
+            .context("driver requires at least one Python source file")?,
+        None => package
+            .modules
+            .first()
+            .context("driver requires at least one Python source file")?,
+    };
+
+    let mut warnings = Vec::new();
+    let code = transpile(module, &mut warnings, opts)?;
+    match opts.warnings {
+        WarningMode::Deny if !warnings.is_empty() => bail!(
+            "lossy conversion (warnings denied):\n  {}",
+            warnings.join("\n  ")
+        ),
+        WarningMode::Allow => warnings.clear(),
+        _ => {}
+    }
+
+    // lib.rs: the driver logic, compiled from Python.
+    let lib = format!("{}\n{}", generated_lint_attrs(opts.warnings), code);
+    fs::write(src_dir.join("lib.rs"), format_rust(&lib))?;
+
+    // main.rs: the generated syscall glue, parameterized by the manifest.
+    let manifest = parse_driver_manifest(&module.source)?;
+    let main = driver_glue_template()
+        .replace("@@CRATE@@", &package.name)
+        .replace("@@DEVICE_PATH@@", &manifest.device_path)
+        .replace("@@IOC_RESET@@", &format!("{:x}", manifest.ioc_reset))
+        .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats));
+    fs::write(src_dir.join("main.rs"), format_rust(&main))?;
+
+    write_cargo_toml(package, out_dir, opts, true)?;
+
+    Ok(ConvertedCrate {
+        root: out_dir.to_path_buf(),
+        name: package.name.clone(),
+        has_binary: true,
+        warnings,
+    })
+}
+
+/// The syscall glue template for a rython byte-ring misc device. Placeholder
+/// tokens: `@@CRATE@@` (crate name), `@@DEVICE_PATH@@`, `@@IOC_RESET@@`,
+/// `@@IOC_STATS@@` (hex, no 0x). Everything else is the standard driver
+/// shell: open/read/write/ioctl, one command round-trip with CRC-8
+/// verification, CLI/interactive modes, and unit tests for the generated
+/// driver logic.
+fn driver_glue_template() -> &'static str {
+    r#"//! Generated by `rypip convert --driver` — the syscall glue for a rython
+//! byte-ring misc device (UIO style). The driver logic lives in the
+//! compiled Python module; this file only does open/read/write/ioctl.
+//! Edit the Python (`driver.py`), not this file.
+
+use std::ffi::CString;
+use std::io::{self, BufRead, IsTerminal};
+use std::os::fd::RawFd;
+
+use @@CRATE@@::{crc8, parse_hex, Device};
+use stdpython::PyDict;
+
+/// ioctl numbers, declared in the driver Python as `__ioc_reset__` and
+/// `__ioc_stats__` (they mirror the kernel side):
+///   RYTHON_IOC_RESET = _IO(0x52, 1)              -> 0x5201
+///   RYTHON_IOC_STATS = _IOR(0x52, 2, stats(40))  -> 0x80285202
+const RYTHON_IOC_RESET: libc::c_ulong = 0x@@IOC_RESET@@;
+const RYTHON_IOC_STATS: libc::c_ulong = 0x@@IOC_STATS@@;
+
+const DEVICE_PATH: &str = "@@DEVICE_PATH@@";
+
+/// Kernel-side device counters (40-byte _IOR struct, 5 x u64).
+#[repr(C)]
+struct DeviceStats {
+    wr_bytes: u64,
+    rd_bytes: u64,
+    wr_calls: u64,
+    rd_calls: u64,
+    resets: u64,
+}
+
+/* ------------------------------------------------------------------ */
+/* syscall plumbing                                                   */
+/* ------------------------------------------------------------------ */
+
+fn open_device(path: &str) -> RawFd {
+    let cpath = CString::new(path).expect("device path contains NUL");
+    // SAFETY: standard libc open on a caller-supplied path.
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        eprintln!(
+            "{}: cannot open {}: {} (is the module loaded? try `make load`)",
+            env!("CARGO_PKG_NAME"),
+            path,
+            err
+        );
+        std::process::exit(1);
+    }
+    fd
+}
+
+/// Program the device: write the raw command bytes into the ring.
+fn device_write(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    // SAFETY: fd is a valid open descriptor, bytes is a readable slice.
+    let n = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Read the device's echo back out of the ring.
+fn device_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: fd is a valid open descriptor, buf is a writable slice.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+fn device_reset(fd: RawFd) -> io::Result<()> {
+    // SAFETY: ioctl with a command that takes no argument.
+    let rc = unsafe { libc::ioctl(fd, RYTHON_IOC_RESET) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn device_stats(fd: RawFd) -> io::Result<DeviceStats> {
+    let mut st = DeviceStats {
+        wr_bytes: 0,
+        rd_bytes: 0,
+        wr_calls: 0,
+        rd_calls: 0,
+        resets: 0,
+    };
+    // SAFETY: st is a valid, correctly sized struct for the _IOR command.
+    let rc = unsafe { libc::ioctl(fd, RYTHON_IOC_STATS, &mut st as *mut DeviceStats) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(st)
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* one command round-trip                                             */
+/* ------------------------------------------------------------------ */
+
+/// Run one driver command: Python logic -> device -> echo -> CRC-8.
+fn run_command(dev: &mut Device, fd: RawFd, line: &str) {
+    // 1. Driver logic (compiled from the driver Python): parse, validate, update state.
+    let resp = match dev.handle(line) {
+        Ok(r) => r,
+        Err(e) => format!("ERR exception: {}", e),
+    };
+
+    // 2. Program the kernel device with the raw command bytes.
+    let mut wire = line.as_bytes().to_vec();
+    wire.push(b'\n');
+    if let Err(e) = device_write(fd, &wire) {
+        eprintln!("{}: write failed: {}", env!("CARGO_PKG_NAME"), e);
+        std::process::exit(1);
+    }
+
+    // 3. Read the device echo.
+    let mut echo = [0u8; 512];
+    let n = match device_read(fd, &mut echo) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{}: read failed: {}", env!("CARGO_PKG_NAME"), e);
+            std::process::exit(1);
+        }
+    };
+
+    // 4. Checksum the device bytes with the generated CRC-8.
+    let crc = crc8(echo[..n].iter().map(|&b| b as i64).collect()).unwrap_or(-1);
+
+    println!("{}   [dev-echo {}B crc=0x{:02x}]", resp, n, crc);
+}
+
+fn print_usage() {
+    println!(
+        "usage: rython-driver [--device PATH] [--reset] [--stats] [COMMAND...]\n\
+         \n\
+         Opens the rython kernel device and drives it with the driver logic\n\
+         compiled from the driver Python by rypip.\n\
+         \n\
+         options:\n\
+         \x20 --device PATH   device node (default /dev/rython0)\n\
+         \x20 --reset         reset the kernel device (ioctl, clears ring/counters)\n\
+         \x20 --stats         print kernel device counters (ioctl)\n\
+         \n\
+         With COMMAND arguments each is run once; without them, an\n\
+         interactive session is started. Commands are the driver protocol:\n\
+         \n\
+         \x20 READ <hex> | WRITE <hex> <hex> | DUMP | STATS | RESET | HELP"
+    );
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let mut path = DEVICE_PATH.to_string();
+    let mut do_reset = false;
+    let mut do_stats = false;
+    let mut command_line: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--device" => {
+                i += 1;
+                path = args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--device needs a path");
+                    std::process::exit(2);
+                });
+            }
+            "--reset" => do_reset = true,
+            "--stats" => do_stats = true,
+            "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+            a if a.starts_with('-') => {
+                eprintln!("unknown option: {}", a);
+                print_usage();
+                std::process::exit(2);
+            }
+            other => {
+                // Positional arguments form a single command line, so
+                // `rython-driver WRITE 2 2a` runs the command "WRITE 2 2a".
+                match command_line.as_mut() {
+                    Some(cl) => {
+                        cl.push(' ');
+                        cl.push_str(other);
+                    }
+                    None => command_line = Some(other.to_string()),
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let fd = open_device(&path);
+
+    if do_reset {
+        match device_reset(fd) {
+            Ok(()) => println!("device reset (ioctl)"),
+            Err(e) => {
+                eprintln!("reset failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if do_stats {
+        match device_stats(fd) {
+            Ok(st) => println!(
+                "kernel stats: wr_bytes={} rd_bytes={} wr_calls={} rd_calls={} resets={}",
+                st.wr_bytes, st.rd_bytes, st.wr_calls, st.rd_calls, st.resets
+            ),
+            Err(e) => {
+                eprintln!("stats failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // The driver state machine, instantiated from compiled Python.
+    let mut dev = Device::new(PyDict::new(), "dev0").expect("Device::new");
+
+    match command_line {
+        Some(cmd) => run_command(&mut dev, fd, &cmd),
+        None if do_reset || do_stats => {} // flags only — nothing else to run
+        None => {
+            if io::stdin().is_terminal() {
+                println!("{}: interactive mode (Ctrl-D to quit). Try: WRITE 2 2a", env!("CARGO_PKG_NAME"));
+            }
+            let stdin = io::stdin();
+            for line in stdin.lock().lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                run_command(&mut dev, fd, line.trim());
+            }
+        }
+    }
+
+    // SAFETY: fd was opened by us and is no longer used after this.
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* unit tests for the generated (Python-derived) logic                */
+/* ------------------------------------------------------------------ */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_dev() -> Device {
+        Device::new(PyDict::new(), "test").expect("Device::new")
+    }
+
+    #[test]
+    fn generated_write_read_roundtrip() {
+        let mut d = new_dev();
+        assert_eq!(d.handle("WRITE 2 2a").unwrap(), "OK 42");
+        assert_eq!(d.handle("READ 2").unwrap(), "VAL 42");
+        assert_eq!(d.handle("READ 7").unwrap(), "VAL 0");
+    }
+
+    #[test]
+    fn generated_bounds_and_errors() {
+        let mut d = new_dev();
+        assert_eq!(d.handle("WRITE 8 1").unwrap(), "ERR bad write"); // off window
+        assert_eq!(d.handle("WRITE 2 zz").unwrap(), "ERR bad write"); // bad hex
+        assert_eq!(d.handle("NOPE").unwrap(), "ERR unknown cmd: NOPE");
+    }
+
+    #[test]
+    fn generated_dump_stats_reset() {
+        let mut d = new_dev();
+        d.handle("WRITE 1 5").unwrap();
+        d.handle("WRITE 3 6").unwrap();
+        let dump = d.handle("DUMP").unwrap();
+        assert!(dump.contains("1:5"), "dump={dump}");
+        assert!(dump.contains("3:6"), "dump={dump}");
+        assert_eq!(d.handle("STATS").unwrap(), "ops=2 reads=0");
+        assert_eq!(d.handle("RESET").unwrap(), "OK reset");
+        assert_eq!(d.handle("DUMP").unwrap(), "");
+    }
+
+    #[test]
+    fn generated_crc8_matches_reference() {
+        // Reference: CRC-8, poly 0x07, init 0, no reflection.
+        fn ref_crc8(data: &[u8]) -> u8 {
+            let mut crc = 0u8;
+            for &b in data {
+                crc ^= b;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 { (crc >> 1) ^ 0x07 } else { crc >> 1 };
+                }
+            }
+            crc
+        }
+        for data in [
+            vec![0u8],
+            vec![1, 2, 3, 4],
+            b"WRITE 2 2a\n".to_vec(),
+            vec![0xde, 0xad, 0xbe, 0xef],
+        ] {
+            let got = crc8(data.iter().map(|&b| b as i64).collect()).unwrap() as u8;
+            assert_eq!(got, ref_crc8(&data), "data={data:02x?}");
+        }
+    }
+
+    #[test]
+    fn generated_parse_hex() {
+        assert_eq!(parse_hex("0").unwrap(), 0);
+        assert_eq!(parse_hex("2a").unwrap(), 42);
+        assert_eq!(parse_hex("DEADBEEF").unwrap(), 0xDEADBEEF);
+        assert_eq!(parse_hex("nope").unwrap(), -1);
+    }
+}
+"#
 }
 
 /// A clean package-relative filename for the parser: it derives a module
@@ -1727,6 +2194,10 @@ fn write_cargo_toml(
         name = package.name,
         version = package.version,
     );
+    // Userspace drivers link libc for their generated syscall glue.
+    if opts.driver {
+        toml.push_str("libc = \"0.2\"\n");
+    }
     // no_std and kernel-module targets must not unwind — there is no
     // unwinding runtime in embedded, wasm, or kernel contexts.
     if opts.no_std || opts.kernel_module {

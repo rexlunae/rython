@@ -3067,3 +3067,128 @@ fn csv_reader_matches_python_at_runtime() {
         "csv semantics diverged from CPython"
     );
 }
+#[test]
+fn driver_mode_generates_complete_driver_crate() {
+    // `--driver` must emit the whole userspace driver: the compiled Python
+    // logic (lib.rs) plus generated syscall glue (main.rs) parameterized by
+    // the Python-declared device manifest.
+    let scratch = Scratch::new("driver-mode");
+    let file = scratch.path().join("driver.py");
+    fs::write(
+        &file,
+        concat!(
+            "__device_path__ = \"/dev/rython0\"\n",
+            "__ioc_reset__ = 0x5201\n",
+            "__ioc_stats__ = 0x80285202\n",
+            "\n",
+            "class Device:\n",
+            "    def __init__(self, regs: dict[int, int], name: str):\n",
+            "        self.regs = regs\n",
+            "        self.name = name\n",
+            "        self.ops = 0\n",
+            "\n",
+            "    def handle(self, line: str) -> str:\n",
+            "        self.ops = self.ops + 1\n",
+            "        return \"OK \" + str(self.ops)\n",
+            "\n",
+            "def parse_hex(s: str) -> int:\n",
+            "    return 0\n",
+            "\n",
+            "def crc8(data: list[int]) -> int:\n",
+            "    return 0\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            driver: true,
+            ..Default::default()
+        },
+    )
+    .expect("driver crate converts");
+
+    // Manifest constants parameterize the glue.
+    let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("use driver::{crc8, parse_hex, Device};"),
+        "glue imports the compiled Python: {main}"
+    );
+    assert!(
+        main.contains("const RYTHON_IOC_RESET: libc::c_ulong = 0x5201;"),
+        "ioc_reset from manifest: {main}"
+    );
+    assert!(
+        main.contains("const RYTHON_IOC_STATS: libc::c_ulong = 0x80285202;"),
+        "ioc_stats from manifest: {main}"
+    );
+    assert!(
+        main.contains("const DEVICE_PATH: &str = \"/dev/rython0\";"),
+        "device path from manifest: {main}"
+    );
+
+    // The Python logic lands compiled in lib.rs, with public items.
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub struct Device"), "compiled logic: {lib}");
+
+    // The crate depends on libc for the glue and has a binary target.
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("libc = \"0.2\""), "libc dep: {toml}");
+    assert!(fs::metadata(out.join("src/main.rs")).is_ok());
+
+    // The whole generated crate must compile.
+    let status = check_generated(&out);
+    assert!(status.success(), "generated driver crate failed to compile");
+}
+
+#[test]
+fn driver_mode_defaults_manifest_when_absent() {
+    // A driver Python with no manifest still gets working glue, using the
+    // documented default device (byte-ring misc device, /dev/rython0).
+    let scratch = Scratch::new("driver-defaults");
+    let file = scratch.path().join("thing.py");
+    fs::write(&file, "def crc8(data: list[int]) -> int:\n    return 0\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            driver: true,
+            ..Default::default()
+        },
+    )
+    .expect("driver crate converts without a manifest");
+    let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("const DEVICE_PATH: &str = \"/dev/rython0\";"),
+        "default device path: {main}"
+    );
+    assert!(main.contains("0x5201") && main.contains("0x80285202"));
+}
+
+#[test]
+fn driver_mode_rejects_bad_manifest_types() {
+    let scratch = Scratch::new("driver-bad-manifest");
+    let file = scratch.path().join("driver.py");
+    fs::write(&file, "__ioc_reset__ = \"not an int\"\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            driver: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("non-integer __ioc_reset__ must fail loudly");
+    assert!(
+        err.to_string().contains("__ioc_reset__ must be an integer literal"),
+        "{}",
+        err
+    );
+}
