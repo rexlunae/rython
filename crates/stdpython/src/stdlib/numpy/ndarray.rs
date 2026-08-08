@@ -699,12 +699,6 @@ impl NdArray {
         };
         NdArray::new(shape, self.dtype, data)
     }
-
-    /// The flat offset of `(i, j)` within a 2-D array.
-    pub(crate) fn flat2(&self, i: usize, j: usize) -> usize {
-        debug_assert_eq!(self.ndim, 2);
-        i * self.shape[1] + j
-    }
 }
 
 /// Read `a[i]` along axis 0: a 1-D array yields a 0-d scalar, a 2-D array a

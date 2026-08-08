@@ -92,56 +92,6 @@ impl Backend {
     }
 }
 
-/// Compile-time assertion used by generated code: `--numpy-backend simd`
-/// emits `const _: () = stdpython::numpy::assert_backend_available(...)`, so
-/// a build whose stdpython features do not include the requested backend
-/// fails at compile time with this message instead of at runtime.
-pub const fn assert_backend_available(b: Backend) {
-    match b {
-        Backend::Auto | Backend::Scalar => {}
-        Backend::Rayon => {
-            #[cfg(not(feature = "numpy-rayon"))]
-            {
-                panic!(
-                    "this program requests the numpy `rayon` backend, but stdpython was \
-                     built without the `numpy-rayon` feature; rebuild stdpython with \
-                     --features numpy-rayon (or convert without --numpy-backend rayon)"
-                )
-            }
-        }
-        Backend::Simd => {
-            #[cfg(not(feature = "numpy-simd"))]
-            {
-                panic!(
-                    "this program requests the numpy `simd` backend, but stdpython was \
-                     built without the `numpy-simd` feature; rebuild stdpython with \
-                     --features numpy-simd (or convert without --numpy-backend simd)"
-                )
-            }
-        }
-        Backend::Cuda => {
-            #[cfg(not(feature = "numpy-cuda"))]
-            {
-                panic!(
-                    "this program requests the numpy `cuda` backend, but stdpython was \
-                     built without the `numpy-cuda` feature; rebuild stdpython with \
-                     --features numpy-cuda (or convert without --numpy-backend cuda)"
-                )
-            }
-        }
-        Backend::Vulkan => {
-            #[cfg(not(feature = "numpy-vulkan"))]
-            {
-                panic!(
-                    "this program requests the numpy `vulkan` backend, but stdpython was \
-                     built without the `numpy-vulkan` feature; rebuild stdpython with \
-                     --features numpy-vulkan (or convert without --numpy-backend vulkan)"
-                )
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Backend selection
 // ---------------------------------------------------------------------------
@@ -300,21 +250,6 @@ pub(crate) enum UnOp {
     LogicalNot,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ReduceOp {
-    Sum,
-    Prod,
-    Min,
-    Max,
-    /// Mean/std/var are float-typed reductions (numpy: mean of an int array
-    /// is float64).
-    Mean,
-    Std,
-    Var,
-    All,
-    Any,
-}
-
 // ---------------------------------------------------------------------------
 // Engine modules
 // ---------------------------------------------------------------------------
@@ -363,38 +298,6 @@ macro_rules! dispatch_unary {
     }};
 }
 
-macro_rules! dispatch_reduce {
-    ($f:ident, $op:expr, $a:expr) => {{
-        match active_backend() {
-            #[cfg(feature = "numpy-cuda")]
-            Backend::Cuda => cuda::$f($op, $a),
-            #[cfg(feature = "numpy-vulkan")]
-            Backend::Vulkan => vulkan::$f($op, $a),
-            #[cfg(feature = "numpy-simd")]
-            Backend::Simd => simd::$f($op, $a),
-            #[cfg(feature = "numpy-rayon")]
-            Backend::Rayon => rayon_eng::$f($op, $a),
-            _ => scalar::$f($op, $a),
-        }
-    }};
-}
-
-macro_rules! dispatch_arg {
-    ($f:ident, $a:expr) => {{
-        match active_backend() {
-            #[cfg(feature = "numpy-cuda")]
-            Backend::Cuda => cuda::$f($a),
-            #[cfg(feature = "numpy-vulkan")]
-            Backend::Vulkan => vulkan::$f($a),
-            #[cfg(feature = "numpy-simd")]
-            Backend::Simd => simd::$f($a),
-            #[cfg(feature = "numpy-rayon")]
-            Backend::Rayon => rayon_eng::$f($a),
-            _ => scalar::$f($a),
-        }
-    }};
-}
-
 pub(crate) fn binary_f64(op: BinOp, a: &[f64], b: &[f64], out: &mut [f64]) {
     dispatch_binary!(binary_f64, op, a, b, out);
 }
@@ -425,51 +328,4 @@ pub(crate) fn unary_i32(op: UnOp, a: &[i32], out: &mut [i32]) {
 }
 pub(crate) fn unary_bool(op: UnOp, a: &[bool], out: &mut [bool]) {
     dispatch_unary!(unary_bool, op, a, out);
-}
-
-pub(crate) fn reduce_f64(op: ReduceOp, a: &[f64]) -> f64 {
-    dispatch_reduce!(reduce_f64, op, a)
-}
-pub(crate) fn reduce_f32(op: ReduceOp, a: &[f32]) -> f32 {
-    dispatch_reduce!(reduce_f32, op, a)
-}
-pub(crate) fn reduce_i64(op: ReduceOp, a: &[i64]) -> i64 {
-    dispatch_reduce!(reduce_i64, op, a)
-}
-pub(crate) fn reduce_i32(op: ReduceOp, a: &[i32]) -> i32 {
-    dispatch_reduce!(reduce_i32, op, a)
-}
-pub(crate) fn reduce_bool(op: ReduceOp, a: &[bool]) -> bool {
-    dispatch_reduce!(reduce_bool, op, a)
-}
-
-pub(crate) fn argmin_f64(a: &[f64]) -> i64 {
-    dispatch_arg!(argmin_f64, a)
-}
-pub(crate) fn argmax_f64(a: &[f64]) -> i64 {
-    dispatch_arg!(argmax_f64, a)
-}
-pub(crate) fn argmin_f32(a: &[f32]) -> i64 {
-    dispatch_arg!(argmin_f32, a)
-}
-pub(crate) fn argmax_f32(a: &[f32]) -> i64 {
-    dispatch_arg!(argmax_f32, a)
-}
-pub(crate) fn argmin_i64(a: &[i64]) -> i64 {
-    dispatch_arg!(argmin_i64, a)
-}
-pub(crate) fn argmax_i64(a: &[i64]) -> i64 {
-    dispatch_arg!(argmax_i64, a)
-}
-pub(crate) fn argmin_i32(a: &[i32]) -> i64 {
-    dispatch_arg!(argmin_i32, a)
-}
-pub(crate) fn argmax_i32(a: &[i32]) -> i64 {
-    dispatch_arg!(argmax_i32, a)
-}
-pub(crate) fn argmin_bool(a: &[bool]) -> i64 {
-    dispatch_arg!(argmin_bool, a)
-}
-pub(crate) fn argmax_bool(a: &[bool]) -> i64 {
-    dispatch_arg!(argmax_bool, a)
 }
