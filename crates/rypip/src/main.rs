@@ -48,9 +48,20 @@ enum Cmd {
         no_std: bool,
         /// Generate a Linux kernel module crate. Implies no_std. Produces
         /// a cdylib with panic=abort, module_init/module_exit entry points,
-        /// and printk lowering. No stdpython dependency.
+        /// and printk lowering. No stdpython dependency. When the Python
+        /// declares a device manifest (__device_name__, __bufsz__, __magic__,
+        /// __device_mode__, __ioc_reset__, __ioc_stats__), also generates
+        /// src/device.rs — a misc byte-ring device — and entry points that
+        /// register it.
         #[arg(long, conflicts_with = "no_std")]
         kernel_module: bool,
+        /// Generate a userspace driver crate for a rython byte-ring misc
+        /// device (UIO style): the Python driver logic compiles to a
+        /// library and generated syscall glue (open/read/write/ioctl) wraps
+        /// it. The Python may declare __device_path__, __ioc_reset__, and
+        /// __ioc_stats__ to parameterize the glue.
+        #[arg(long, conflicts_with_all = ["kernel_module", "no_std", "pyo3"])]
+        driver: bool,
         /// Generate a rust-for-linux kernel module (requires --kernel-module):
         /// a module!-macro crate implementing kernel::Module for the
         /// rust-for-linux toolchain, instead of raw-FFI entry points.
@@ -97,6 +108,7 @@ fn main() -> Result<()> {
             warnings,
             no_std,
             kernel_module,
+            driver,
             rust_for_linux,
         } => {
             let pkg = rypip::discover(&package)?;
@@ -109,6 +121,7 @@ fn main() -> Result<()> {
                     warnings,
                     no_std,
                     kernel_module,
+                    driver,
                     rust_for_linux,
                 },
             )?;
@@ -141,6 +154,7 @@ fn main() -> Result<()> {
                     warnings,
                     no_std: false,
                     kernel_module: false,
+                    driver: false,
                     rust_for_linux: false,
                 },
             )?;
@@ -165,6 +179,7 @@ fn main() -> Result<()> {
                     warnings,
                     no_std: false,
                     kernel_module: false,
+                    driver: false,
                     rust_for_linux: false,
                 },
             )?;

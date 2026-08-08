@@ -50,6 +50,8 @@ impl<'a> CodeGen for Attribute {
         
         // Determine if this is a module access or a field/method access
         // Module names are typically lowercase and match Python stdlib modules
+        // `np`/`numpy` cover the numpy module (import numpy as np lowers to
+        // `use stdpython::numpy as np`, making np a real Rust path).
         let is_module_access = matches!(value_str.as_str(),
             "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
             "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re" | "hashlib" | "csv" | "io" |
@@ -58,7 +60,9 @@ impl<'a> CodeGen for Attribute {
             // attribute is a path item (datetime::strptime, datetime::now),
             // never a field on a value.
             "datetime" |
-            "os :: path" | "os::path" // for nested modules
+            "numpy" | "np" |
+            "os :: path" | "os::path" | // for nested modules
+            "numpy :: linalg" | "np :: linalg" | "numpy::linalg" | "np::linalg" // np.linalg.inv
         );
         
         if is_module_access {

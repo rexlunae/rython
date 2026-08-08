@@ -187,6 +187,23 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
             "bytes" => Some(quote!(Vec<u8>)),
             _ => None,
         },
+        // numpy scalar type annotations: np.float64 → f64, np.int32 → i32,
+        // ... (and ndarray → the numpy NdArray type).
+        ExprType::Attribute(attr) => {
+            let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "np" || n.id == "numpy");
+            if !is_np {
+                return None;
+            }
+            match attr.attr.as_str() {
+                "ndarray" => Some(quote!(numpy::NdArray)),
+                "float64" => Some(quote!(f64)),
+                "float32" => Some(quote!(f32)),
+                "int64" => Some(quote!(i64)),
+                "int32" => Some(quote!(i32)),
+                "bool_" => Some(quote!(bool)),
+                _ => None,
+            }
+        }
         // Subscripted generics over known element types: list[int] and
         // friends map to the concrete Rust containers codegen produces for
         // the corresponding literals.

@@ -1,0 +1,21 @@
+[package]
+name = "rykernel-shim"
+description = "Minimal C-free runtime for out-of-tree Linux kernel modules written in Rust (no rust-for-linux required)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# Kernel modules must not unwind — there is no unwinding runtime in kernel
+# context, and the module loader rejects the unwinding symbols. These profiles
+# apply when this crate is the build root (`--manifest-path`) or a dependency
+# of a module crate; the rython workspace root leaves profiles at their
+# defaults so stdpython's `#[should_panic]` tests keep working.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

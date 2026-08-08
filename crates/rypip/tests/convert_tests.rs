@@ -1480,6 +1480,16 @@ fn kernel_module_accepts_float_free_module() {
     assert!(lib.contains("cleanup_module"), "lib.rs: {}", lib);
     assert!(!lib.contains("f64"), "no floating point in lib.rs: {}", lib);
     assert!(!krate.has_binary, "kernel output is a library");
+
+    // The C-free kernel build needs the allocator to bind to the kernel's
+    // exported symbol (__kmalloc_noprof on 7.x kernels), .modinfo metadata
+    // kept alive with #[used], and a fmt-free panic handler (the fmt
+    // machinery pulls core code with GOTPCREL relocations the module loader
+    // rejects).
+    assert!(lib.contains("__kmalloc_noprof"), "7.x allocator export: {}", lib);
+    assert!(lib.contains("#[used]"), "modinfo survives --gc-sections: {}", lib);
+    assert!(lib.contains("#[panic_handler]"), "panic handler: {}", lib);
+    assert!(lib.contains("fn panic"), "panic handler: {}", lib);
 }
 
 #[test]
@@ -3055,5 +3065,342 @@ fn csv_reader_matches_python_at_runtime() {
             "total=10",
         ],
         "csv semantics diverged from CPython"
+    );
+}
+#[test]
+fn driver_mode_generates_complete_driver_crate() {
+    // `--driver` must emit the whole userspace driver: the compiled Python
+    // logic (lib.rs) plus generated syscall glue (main.rs) parameterized by
+    // the Python-declared device manifest.
+    let scratch = Scratch::new("driver-mode");
+    let file = scratch.path().join("driver.py");
+    fs::write(
+        &file,
+        concat!(
+            "__device_path__ = \"/dev/rython0\"\n",
+            "__ioc_reset__ = 0x5201\n",
+            "__ioc_stats__ = 0x80285202\n",
+            "\n",
+            "class Device:\n",
+            "    def __init__(self, regs: dict[int, int], name: str):\n",
+            "        self.regs = regs\n",
+            "        self.name = name\n",
+            "        self.ops = 0\n",
+            "\n",
+            "    def handle(self, line: str) -> str:\n",
+            "        self.ops = self.ops + 1\n",
+            "        return \"OK \" + str(self.ops)\n",
+            "\n",
+            "def parse_hex(s: str) -> int:\n",
+            "    return 0\n",
+            "\n",
+            "def crc8(data: list[int]) -> int:\n",
+            "    return 0\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            driver: true,
+            ..Default::default()
+        },
+    )
+    .expect("driver crate converts");
+
+    // Manifest constants parameterize the glue.
+    let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("use driver::{crc8, parse_hex, Device};"),
+        "glue imports the compiled Python: {main}"
+    );
+    assert!(
+        main.contains("const RYTHON_IOC_RESET: libc::c_ulong = 0x5201;"),
+        "ioc_reset from manifest: {main}"
+    );
+    assert!(
+        main.contains("const RYTHON_IOC_STATS: libc::c_ulong = 0x80285202;"),
+        "ioc_stats from manifest: {main}"
+    );
+    assert!(
+        main.contains("const DEVICE_PATH: &str = \"/dev/rython0\";"),
+        "device path from manifest: {main}"
+    );
+
+    // The Python logic lands compiled in lib.rs, with public items.
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub struct Device"), "compiled logic: {lib}");
+
+    // The crate depends on libc for the glue and has a binary target.
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("libc = \"0.2\""), "libc dep: {toml}");
+    assert!(fs::metadata(out.join("src/main.rs")).is_ok());
+
+    // The whole generated crate must compile.
+    let status = check_generated(&out);
+    assert!(status.success(), "generated driver crate failed to compile");
+}
+
+#[test]
+fn driver_mode_defaults_manifest_when_absent() {
+    // A driver Python with no manifest still gets working glue, using the
+    // documented default device (byte-ring misc device, /dev/rython0).
+    let scratch = Scratch::new("driver-defaults");
+    let file = scratch.path().join("thing.py");
+    fs::write(&file, "def crc8(data: list[int]) -> int:\n    return 0\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            driver: true,
+            ..Default::default()
+        },
+    )
+    .expect("driver crate converts without a manifest");
+    let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("const DEVICE_PATH: &str = \"/dev/rython0\";"),
+        "default device path: {main}"
+    );
+    assert!(main.contains("0x5201") && main.contains("0x80285202"));
+}
+
+#[test]
+fn driver_mode_rejects_bad_manifest_types() {
+    let scratch = Scratch::new("driver-bad-manifest");
+    let file = scratch.path().join("driver.py");
+    fs::write(&file, "__ioc_reset__ = \"not an int\"\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            driver: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("non-integer __ioc_reset__ must fail loudly");
+    assert!(
+        err.to_string().contains("__ioc_reset__ must be an integer literal"),
+        "{}",
+        err
+    );
+}
+
+// ---------------------------------------------------------------------------
+// kernel device generation (--kernel-module + device manifest)
+// ---------------------------------------------------------------------------
+
+/// A device-manifest Python like rython-kmod's driver.py: module metadata,
+/// the device manifest, and pure user-space driver logic (no module entry
+/// points — the generated device owns them).
+const DEVICE_DRIVER_PY: &str = concat!(
+    "__module_name__ = \"rython\"\n",
+    "__module_license__ = \"GPL\"\n",
+    "__module_author__ = \"rexlunae\"\n",
+    "__module_description__ = \"rython-kmod: pure-Rust byte-ring device driven by rython-compiled driver logic\"\n",
+    "__module_version__ = \"0.1.0\"\n",
+    "\n",
+    "__device_path__ = \"/dev/rython0\"\n",
+    "__device_name__ = \"rython0\"\n",
+    "__bufsz__ = 4096\n",
+    "__magic__ = 0x52594854\n",
+    "__device_mode__ = 0o600\n",
+    "__ioc_reset__ = 0x5201\n",
+    "__ioc_stats__ = 0x80285202\n",
+    "\n",
+    "def parse_hex(s: str) -> int:\n",
+    "    return 0\n",
+    "\n",
+    "class Device:\n",
+    "    def handle(self, line: str) -> str:\n",
+    "        return str(\"OK\")\n",
+);
+
+#[test]
+fn kernel_device_mode_generates_misc_device_crate() {
+    let scratch = Scratch::new("kernel-device");
+    let file = scratch.path().join("driver.py");
+    fs::write(&file, DEVICE_DRIVER_PY).unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("device-manifest kernel module converts");
+    assert!(!krate.has_binary, "kernel output is a library");
+
+    // lib.rs: modinfo, mod device, entry points that register the device.
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("#![no_std]"), "lib.rs: {}", lib);
+    assert!(lib.contains("mod device;"), "lib.rs: {}", lib);
+    assert!(lib.contains("device::register()"), "lib.rs: {}", lib);
+    assert!(lib.contains("device::deregister()"), "lib.rs: {}", lib);
+    assert!(lib.contains("pub extern \"C\" fn init_module()"), "lib.rs: {}", lib);
+    assert!(lib.contains("pub extern \"C\" fn cleanup_module()"), "lib.rs: {}", lib);
+    // modinfo entries from the Python metadata, kept alive for ld --gc-sections.
+    assert!(lib.contains("license=GPL"), "modinfo license: {}", lib);
+    assert!(lib.contains("author=rexlunae"), "modinfo author: {}", lib);
+    assert!(lib.contains("version=0.1.0"), "modinfo version: {}", lib);
+
+    // device.rs: the misc device parameterized by the manifest.
+    let dev = fs::read_to_string(out.join("src/device.rs")).unwrap();
+    assert!(dev.contains("pub const BUFSZ: usize = 4096;"), "device.rs: {}", dev);
+    assert!(dev.contains("pub const MAGIC: u32 = 0x52594854;"), "device.rs: {}", dev);
+    assert!(dev.contains("const IOC_RESET: c_uint = 0x5201;"), "device.rs: {}", dev);
+    assert!(dev.contains("const IOC_STATS: c_uint = 0x80285202;"), "device.rs: {}", dev);
+    assert!(
+        dev.contains("MiscDevice::new(b\"rython0\\0\", &FOPS, 0o600)"),
+        "device name/mode: {}",
+        dev
+    );
+
+    // Cargo.toml: crate name from __module_name__, rykernel-shim dep (the
+    // device code links it), no stdpython, staticlib for the kernel link.
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("name = \"rython\""), "Cargo.toml: {}", toml);
+    assert!(toml.contains("rykernel-shim"), "Cargo.toml: {}", toml);
+    assert!(!toml.contains("stdpython"), "no stdpython for a device: {}", toml);
+    assert!(toml.contains("crate-type = [\"staticlib\"]"), "Cargo.toml: {}", toml);
+
+    // The generated Makefile names the module from __module_name__.
+    let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
+    assert!(makefile.contains("obj-m += rython.o"), "Makefile: {}", makefile);
+    assert!(makefile.contains("-u init_module -u cleanup_module"), "Makefile: {}", makefile);
+
+    // The proof: the generated device crate is genuine no_std Rust and
+    // compiles (host check; the kernel link itself is exercised by the
+    // rython-kmod repository's make module).
+    let status = check_generated(&out);
+    assert!(status.success(), "generated device crate failed to compile");
+}
+
+#[test]
+fn kernel_device_mode_uses_manifest_defaults() {
+    // Declaring only __device_name__ still generates a device: every other
+    // manifest constant keeps its documented default.
+    let scratch = Scratch::new("kernel-device-defaults");
+    let file = scratch.path().join("driver.py");
+    fs::write(
+        &file,
+        concat!(
+            "__device_name__ = \"rython0\"\n",
+            "\n",
+            "def handle(line: str) -> str:\n",
+            "    return str(\"OK\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("device-name-only manifest converts");
+    let dev = fs::read_to_string(out.join("src/device.rs")).unwrap();
+    assert!(dev.contains("pub const BUFSZ: usize = 4096;"), "device.rs: {}", dev);
+    assert!(dev.contains("pub const MAGIC: u32 = 0x52594854;"), "device.rs: {}", dev);
+    assert!(dev.contains("const IOC_RESET: c_uint = 0x5201;"), "device.rs: {}", dev);
+    assert!(dev.contains("const IOC_STATS: c_uint = 0x80285202;"), "device.rs: {}", dev);
+}
+
+#[test]
+fn kernel_device_mode_rejects_module_init_conflict() {
+    // The generated device owns the entry points; a Python module_init
+    // would be silently dropped — loud error instead.
+    let scratch = Scratch::new("kernel-device-conflict");
+    let file = scratch.path().join("driver.py");
+    fs::write(
+        &file,
+        concat!(
+            "__device_name__ = \"rython0\"\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    return 0\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("module_init + device manifest must fail loudly");
+    assert!(
+        err.to_string().contains("conflicts with the generated device"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn kernel_device_mode_rejects_rust_for_linux() {
+    // Device generation targets the raw-FFI pipeline; rust-for-linux has its
+    // own module! machinery and cannot host the generated misc device.
+    let scratch = Scratch::new("kernel-device-rfl");
+    let file = scratch.path().join("driver.py");
+    fs::write(&file, "__device_name__ = \"rython0\"\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            rust_for_linux: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("device + rust-for-linux must fail loudly");
+    assert!(
+        err.to_string().contains("not supported with --rust-for-linux"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn kernel_device_mode_rejects_bad_device_name() {
+    // The device name is embedded in a Rust byte-string literal; keep it to
+    // a safe charset so a weird Python string cannot break the output.
+    let scratch = Scratch::new("kernel-device-badname");
+    let file = scratch.path().join("driver.py");
+    fs::write(&file, "__device_name__ = \"foo/bar\"\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("a device name outside the safe charset must fail loudly");
+    assert!(
+        err.to_string().contains("__device_name__ must be alphanumeric"),
+        "{}",
+        err
     );
 }
