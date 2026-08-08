@@ -113,7 +113,11 @@ fn scalar_arr_bool(v: bool) -> NdArray {
 
 /// The two operands of a binary op, normalized to a common broadcast shape.
 /// Accepts arrays and the three scalar kinds in any position.
-pub(crate) enum BinaryOperand {
+///
+/// Public because it appears in the generic bounds of the public ufunc
+/// API (`np.add`, `np.equal`, ...); treat it as an implementation detail.
+#[doc(hidden)]
+pub enum BinaryOperand {
     Array(NdArray),
     I64(i64),
     F64(f64),
