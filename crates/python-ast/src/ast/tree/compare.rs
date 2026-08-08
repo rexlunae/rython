@@ -178,13 +178,19 @@ impl CodeGen for Compare {
             let comparator = comparator_ast
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // Comparisons route through the stdpython PyEq/PyNe/PyLt/PyLe/
+            // PyGt/PyGe traits (in scope via `use stdpython::*`): scalars
+            // and containers get their existing PartialEq/PartialOrd
+            // behaviour (bool result) through blanket impls, while NdArray
+            // overrides them to broadcast elementwise and return an array —
+            // the same pattern `+` uses with PyAdd.
             let tokens = match op {
-                Compares::Eq => quote!((#left) == (#comparator)),
-                Compares::NotEq => quote!((#left) != (#comparator)),
-                Compares::Lt => quote!((#left) < (#comparator)),
-                Compares::LtE => quote!((#left) <= (#comparator)),
-                Compares::Gt => quote!((#left) > (#comparator)),
-                Compares::GtE => quote!((#left) >= (#comparator)),
+                Compares::Eq => quote!((#left).py_eq(&(#comparator))),
+                Compares::NotEq => quote!((#left).py_ne(&(#comparator))),
+                Compares::Lt => quote!((#left).py_lt(&(#comparator))),
+                Compares::LtE => quote!((#left).py_le(&(#comparator))),
+                Compares::Gt => quote!((#left).py_gt(&(#comparator))),
+                Compares::GtE => quote!((#left).py_ge(&(#comparator))),
                 Compares::Is => quote!(&#left == &#comparator),
                 Compares::IsNot => quote!(&#left != &#comparator),
                 // Python `in` dispatches on the container: substring for
@@ -270,12 +276,12 @@ impl Compare {
                 }
             }
             Ok(match op {
-                Compares::Eq => quote!((#l) == (#r)),
-                Compares::NotEq => quote!((#l) != (#r)),
-                Compares::Lt => quote!((#l) < (#r)),
-                Compares::LtE => quote!((#l) <= (#r)),
-                Compares::Gt => quote!((#l) > (#r)),
-                Compares::GtE => quote!((#l) >= (#r)),
+                Compares::Eq => quote!((#l).py_eq(#r)),
+                Compares::NotEq => quote!((#l).py_ne(#r)),
+                Compares::Lt => quote!((#l).py_lt(#r)),
+                Compares::LtE => quote!((#l).py_le(#r)),
+                Compares::Gt => quote!((#l).py_gt(#r)),
+                Compares::GtE => quote!((#l).py_ge(#r)),
                 Compares::Is => quote!((#l) == (#r)),
                 Compares::IsNot => quote!((#l) != (#r)),
                 Compares::In => quote!((#r).py_contains(#l)),

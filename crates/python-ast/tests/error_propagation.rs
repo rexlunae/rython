@@ -61,8 +61,9 @@ fn syntax_error_carries_structured_fields() {
 /// module's source file.
 #[test]
 fn codegen_error_propagates_with_filename() {
-    // `x @ y` (MatMult) parses fine but has no codegen implementation.
-    let module = parse("q = a @ b", "matmul_test.py").expect("parses");
+    // `q = a @ b` (MatMult) now lowers to py_matmul; an unknown numpy
+    // function parses fine but has no codegen implementation.
+    let module = parse("q = np.not_a_real_numpy_fn(1)", "matmul_test.py").expect("parses");
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let result = module.to_rust(
         CodeGenContext::Module("matmul_test".to_string()),

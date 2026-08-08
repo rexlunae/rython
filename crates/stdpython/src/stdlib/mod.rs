@@ -96,3 +96,10 @@ pub mod hashlib;
 /// Python csv module - CSV reading over line lists
 pub mod csv;
 
+/// Python numpy subset — dense N-dimensional arrays with broadcasting,
+/// ufuncs, reductions, and a small linalg module. Optional feature
+/// `numpy` pulls in the sequential engine; `numpy-rayon`, `numpy-simd`,
+/// `numpy-cuda`, and `numpy-vulkan` add accelerated backends.
+#[cfg(feature = "std")]
+pub mod numpy;
+

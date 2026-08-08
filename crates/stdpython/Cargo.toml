@@ -21,9 +21,19 @@ default = ["std"]
 std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "dep:regex", "indexmap/std"]
 alloc = ["dep:hashbrown", "dep:libm", "dep:md-5", "dep:sha1", "dep:sha2"]
 
+# numpy backends: "numpy" (or none) = always-on sequential engine;
+# numpy-rayon / numpy-simd / numpy-cuda / numpy-vulkan enable the
+# accelerated engines (chosen at runtime via np.set_backend or the
+# RYPY_NUMPY_BACKEND env var / --numpy-backend flag).
+numpy-rayon = ["dep:rayon"]
+numpy-simd = []
+numpy-cuda = []
+numpy-vulkan = []
+
 [dependencies]
 pyo3 = {version = "0.29", features=["auto-initialize"], optional = true}
 paste = "1.0"
+rayon = { version = "1.10", optional = true }
 indexmap = { version = "2", default-features = false }
 getrandom = { version = "0.3", optional = true }
 hashbrown = { version = "0.15", optional = true }

@@ -120,6 +120,14 @@ pub struct PythonOptions {
     /// `__main__` entry points — fail loudly at conversion time instead of
     /// surfacing as resolution errors when the generated crate builds.
     pub no_std: bool,
+
+    /// Force a numpy execution backend for the generated program
+    /// ("scalar", "rayon", "simd", "cuda", "vulkan"), overriding the
+    /// `RYPY_NUMPY_BACKEND` env var and np.set_backend defaults. The
+    /// generated crate must be built with the matching stdpython feature
+    /// (numpy-rayon, numpy-simd, ...) or the emitted set_backend call
+    /// fails loudly at startup.
+    pub numpy_backend: Option<String>,
 }
 
 impl Default for PythonOptions {
@@ -143,6 +151,7 @@ impl Default for PythonOptions {
             clone_str_attribute_returns: false,
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
+            numpy_backend: None,
         }
     }
 }

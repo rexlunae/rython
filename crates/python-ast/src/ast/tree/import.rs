@@ -36,6 +36,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "string"
             | "sysconfig"
             | "venv"
+            | "numpy"
     )
 }
 
@@ -60,6 +61,7 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
             | "subprocess"
             | "sysconfig"
             | "venv"
+            | "numpy"
     )
 }
 
@@ -123,6 +125,34 @@ impl CodeGen for Import {
             }
             // Check if this is a Python standard library module that needs special handling
             let rust_import = match alias.name.as_str() {
+                // `import numpy as np` (and `import numpy.linalg as np`) is
+                // THE canonical numpy spelling. numpy IS a path under the
+                // runtime crate (stdpython::numpy), so the alias resolves
+                // as a proper `use` — unlike the glob-provided modules
+                // below. The alias import also makes `np.linalg.inv(...)`
+                // work through the nested path.
+                "numpy" | "numpy.linalg" => {
+                    let runtime = crate::safe_ident(&options.stdpython);
+                    match &alias.asname {
+                        None => {
+                            if alias.name == "numpy" {
+                                // `import numpy` — the name comes from the
+                                // `use stdpython::*` glob re-export.
+                                quote! {}
+                            } else {
+                                quote! {
+                                    use #runtime::numpy;
+                                }
+                            }
+                        }
+                        Some(asname) => {
+                            let asname = crate::safe_ident(asname);
+                            quote! {
+                                use #runtime::numpy as #asname;
+                            }
+                        }
+                    }
+                }
                 // Runtime-provided modules are already in scope through
                 // `use stdpython::*` (each is re-exported at the crate
                 // root), so the import lowers to nothing — a bare

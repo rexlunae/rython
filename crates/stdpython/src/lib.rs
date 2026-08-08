@@ -685,16 +685,38 @@ where
     iterable.py_sum()
 }
 
-/// Trait backing Python's `//` and `%` operators, whose results follow the
-/// sign of the divisor (unlike Rust's truncating `/` and `%`).
-pub trait PyDivMod: Copy {
-    fn py_floordiv(self, rhs: Self) -> Self;
-    fn py_mod(self, rhs: Self) -> Self;
+/// Trait backing Python's `//` operator, whose result follows the sign of
+/// the divisor (unlike Rust's truncating `/`). Generic over the operand
+/// types so `NdArray` (numpy `floor_divide`) can participate alongside the
+/// numeric primitives.
+pub trait PyFloorDiv<R: ?Sized> {
+    type Output;
+    fn py_floordiv(&self, rhs: &R) -> Self::Output;
 }
 
-impl PyDivMod for i64 {
-    fn py_floordiv(self, rhs: Self) -> Self {
-        if rhs == 0 {
+/// Trait backing Python's `%` operator (result takes the divisor's sign).
+pub trait PyMod<R: ?Sized> {
+    type Output;
+    fn py_mod(&self, rhs: &R) -> Self::Output;
+}
+
+/// Trait backing Python's `/` true division (always float) — generic so
+/// `NdArray` (numpy `divide`) can participate.
+pub trait PyDiv<R: ?Sized> {
+    type Output;
+    fn py_div(&self, rhs: &R) -> Self::Output;
+}
+
+/// Trait backing Python's `@` matrix multiplication operator.
+pub trait PyMatMul<R: ?Sized> {
+    type Output;
+    fn py_matmul(&self, rhs: &R) -> Self::Output;
+}
+
+impl PyFloorDiv<i64> for i64 {
+    type Output = i64;
+    fn py_floordiv(&self, rhs: &i64) -> i64 {
+        if *rhs == 0 {
             // Rust's `/` panics with its own message, which no
             // `except ZeroDivisionError` can match.
             panic!(
@@ -702,70 +724,168 @@ impl PyDivMod for i64 {
                 PyException::new("ZeroDivisionError", "integer division or modulo by zero")
             );
         }
-        let q = self / rhs;
-        if self % rhs != 0 && (self < 0) != (rhs < 0) {
+        let q = *self / *rhs;
+        if *self % *rhs != 0 && (*self < 0) != (*rhs < 0) {
             q - 1
         } else {
             q
         }
     }
-    fn py_mod(self, rhs: Self) -> Self {
-        if rhs == 0 {
-            panic!(
-                "{}",
-                PyException::new("ZeroDivisionError", "integer division or modulo by zero")
-            );
-        }
-        let r = self % rhs;
-        if r != 0 && (r < 0) != (rhs < 0) {
-            r + rhs
-        } else {
-            r
-        }
-    }
 }
 
-impl PyDivMod for f64 {
-    fn py_floordiv(self, rhs: Self) -> Self {
-        if rhs == 0.0 {
+impl PyFloorDiv<f64> for f64 {
+    type Output = f64;
+    fn py_floordiv(&self, rhs: &f64) -> f64 {
+        if *rhs == 0.0 {
             // Python raises here; returning inf would diverge silently.
             panic!(
                 "{}",
                 PyException::new("ZeroDivisionError", "float floor division by zero")
             );
         }
-        flt::floor(self / rhs)
+        flt::floor(*self / *rhs)
     }
-    fn py_mod(self, rhs: Self) -> Self {
-        if rhs == 0.0 {
-            panic!("{}", PyException::new("ZeroDivisionError", "float modulo"));
+}
+
+impl PyFloorDiv<f64> for i64 {
+    type Output = f64;
+    fn py_floordiv(&self, rhs: &f64) -> f64 {
+        PyFloorDiv::py_floordiv(&(*self as f64), rhs)
+    }
+}
+
+impl PyFloorDiv<i64> for f64 {
+    type Output = f64;
+    fn py_floordiv(&self, rhs: &i64) -> f64 {
+        PyFloorDiv::py_floordiv(self, &(*rhs as f64))
+    }
+}
+
+impl PyMod<i64> for i64 {
+    type Output = i64;
+    fn py_mod(&self, rhs: &i64) -> i64 {
+        if *rhs == 0 {
+            panic!(
+                "{}",
+                PyException::new("ZeroDivisionError", "integer division or modulo by zero")
+            );
         }
-        let r = self % rhs;
-        if r != 0.0 && (r < 0.0) != (rhs < 0.0) {
-            r + rhs
-        } else if r == 0.0 {
-            // CPython gives a zero remainder the sign of the DIVISOR:
-            // -4.0 % 2.0 is 0.0, and 4.0 % -2.0 is -0.0.
-            flt::copysign(0.0, rhs)
+        let r = *self % *rhs;
+        if r != 0 && (r < 0) != (*rhs < 0) {
+            r + *rhs
         } else {
             r
         }
     }
 }
 
+impl PyMod<f64> for f64 {
+    type Output = f64;
+    fn py_mod(&self, rhs: &f64) -> f64 {
+        if *rhs == 0.0 {
+            panic!("{}", PyException::new("ZeroDivisionError", "float modulo"));
+        }
+        let r = *self % *rhs;
+        if r != 0.0 && (r < 0.0) != (*rhs < 0.0) {
+            r + *rhs
+        } else if r == 0.0 {
+            // CPython gives a zero remainder the sign of the DIVISOR:
+            // -4.0 % 2.0 is 0.0, and 4.0 % -2.0 is -0.0.
+            flt::copysign(0.0, *rhs)
+        } else {
+            r
+        }
+    }
+}
+
+impl PyMod<f64> for i64 {
+    type Output = f64;
+    fn py_mod(&self, rhs: &f64) -> f64 {
+        PyMod::py_mod(&(*self as f64), rhs)
+    }
+}
+
+impl PyMod<i64> for f64 {
+    type Output = f64;
+    fn py_mod(&self, rhs: &i64) -> f64 {
+        PyMod::py_mod(self, &(*rhs as f64))
+    }
+}
+
+macro_rules! numeric_div {
+    ($($l:ty, $r:ty => $out:ty),* $(,)?) => {
+        $(impl PyDiv<$r> for $l {
+            type Output = $out;
+            fn py_div(&self, rhs: &$r) -> $out {
+                (*self as f64) / (*rhs as f64)
+            }
+        })*
+    };
+}
+
+// bool operands promote through the numeric path (True → 1.0) like numpy.
+macro_rules! bool_div {
+    ($($r:ty),* $(,)?) => {
+        $(
+            impl PyDiv<$r> for bool {
+                type Output = f64;
+                fn py_div(&self, rhs: &$r) -> f64 {
+                    (if *self { 1.0 } else { 0.0 }) / (*rhs as f64)
+                }
+            }
+            impl PyDiv<bool> for $r {
+                type Output = f64;
+                fn py_div(&self, rhs: &bool) -> f64 {
+                    (*self as f64) / if *rhs { 1.0 } else { 0.0 }
+                }
+            }
+        )*
+    };
+}
+
+numeric_div!(
+    i64, i64 => f64,
+    i64, f64 => f64,
+    f64, i64 => f64,
+    f64, f64 => f64,
+);
+
+bool_div!(i64, f64);
+
+impl PyDiv<bool> for bool {
+    type Output = f64;
+    fn py_div(&self, rhs: &bool) -> f64 {
+        (if *self { 1.0 } else { 0.0 }) / if *rhs { 1.0 } else { 0.0 }
+    }
+}
+
 /// Python `//` (floor division): `-7 // 2 == -4`.
-pub fn py_floordiv<T: PyDivMod>(a: T, b: T) -> T {
-    a.py_floordiv(b)
+pub fn py_floordiv<L: PyFloorDiv<R>, R>(a: L, b: R) -> L::Output {
+    a.py_floordiv(&b)
 }
 
 /// Python `%` (modulo takes the divisor's sign): `-7 % 3 == 2`.
-pub fn py_mod<T: PyDivMod>(a: T, b: T) -> T {
-    a.py_mod(b)
+pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> L::Output {
+    a.py_mod(&b)
+}
+
+/// Python `/` (true division): `py_div(3, 2) == 1.5`.
+pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> L::Output {
+    a.py_div(&b)
+}
+
+/// Python `@` (matrix multiplication): routes to the numpy linalg backend
+/// for arrays.
+pub fn py_matmul<L: PyMatMul<R>, R>(a: L, b: R) -> L::Output {
+    a.py_matmul(&b)
 }
 
 /// Python divmod() builtin, floor-division based: `divmod(-7, 2) == (-4, 1)`.
-pub fn divmod<T: PyDivMod>(a: T, b: T) -> (T, T) {
-    (a.py_floordiv(b), a.py_mod(b))
+pub fn divmod<L: PyFloorDiv<R> + PyMod<R>, R>(
+    a: L,
+    b: R,
+) -> (<L as PyFloorDiv<R>>::Output, <L as PyMod<R>>::Output) {
+    (a.py_floordiv(&b), a.py_mod(&b))
 }
 
 /// Trait backing Python's `**` operator. Integer bases with non-negative
@@ -3215,6 +3335,166 @@ pub trait PyAdd<R: ?Sized> {
     fn py_add(&self, rhs: &R) -> Self::Output;
 }
 
+// ============================================================================
+// COMPARISONS: a == b, a < b, ...
+// ============================================================================
+// Native Rust `==`/`<` can't model numpy: `arr > 2` must return an ARRAY,
+// not a bool. The Py*Cmp traits give every Rust type the Python behaviour
+// it already has via PartialEq/PartialOrd (blanket impls, bool result),
+// while NdArray overrides them to broadcast elementwise and return an
+// NdArray — the same pattern PyAdd/PySub use for + and -.
+
+/// Python `==` — bool for scalars/containers, elementwise NdArray for arrays.
+pub trait PyEq<R: ?Sized> {
+    type Output;
+    fn py_eq(&self, rhs: &R) -> Self::Output;
+}
+/// Python `!=`.
+pub trait PyNe<R: ?Sized> {
+    type Output;
+    fn py_ne(&self, rhs: &R) -> Self::Output;
+}
+/// Python `<`.
+pub trait PyLt<R: ?Sized> {
+    type Output;
+    fn py_lt(&self, rhs: &R) -> Self::Output;
+}
+/// Python `<=`.
+pub trait PyLe<R: ?Sized> {
+    type Output;
+    fn py_le(&self, rhs: &R) -> Self::Output;
+}
+/// Python `>`.
+pub trait PyGt<R: ?Sized> {
+    type Output;
+    fn py_gt(&self, rhs: &R) -> Self::Output;
+}
+/// Python `>=`.
+pub trait PyGe<R: ?Sized> {
+    type Output;
+    fn py_ge(&self, rhs: &R) -> Self::Output;
+}
+
+impl<L: PartialEq<R>, R: ?Sized> PyEq<R> for L {
+    type Output = bool;
+    fn py_eq(&self, rhs: &R) -> bool {
+        self == rhs
+    }
+}
+impl<L: PartialEq<R>, R: ?Sized> PyNe<R> for L {
+    type Output = bool;
+    fn py_ne(&self, rhs: &R) -> bool {
+        self != rhs
+    }
+}
+impl<L: PartialOrd<R>, R: ?Sized> PyLt<R> for L {
+    type Output = bool;
+    fn py_lt(&self, rhs: &R) -> bool {
+        self < rhs
+    }
+}
+impl<L: PartialOrd<R>, R: ?Sized> PyLe<R> for L {
+    type Output = bool;
+    fn py_le(&self, rhs: &R) -> bool {
+        self <= rhs
+    }
+}
+impl<L: PartialOrd<R>, R: ?Sized> PyGt<R> for L {
+    type Output = bool;
+    fn py_gt(&self, rhs: &R) -> bool {
+        self > rhs
+    }
+}
+impl<L: PartialOrd<R>, R: ?Sized> PyGe<R> for L {
+    type Output = bool;
+    fn py_ge(&self, rhs: &R) -> bool {
+        self >= rhs
+    }
+}
+
+// ============================================================================
+// `-` and `*` (PySub / PyMul)
+// ============================================================================
+// These mirror PyAdd: codegen routes `a - b` / `a * b` through them so
+// operands are BORROWED (Python value semantics — variables stay usable),
+// with numeric promotion, while NdArray overrides them to broadcast
+// elementwise.
+
+/// Python's `-`, with int/float promotion.
+pub trait PySub<R: ?Sized> {
+    type Output;
+    fn py_sub(&self, rhs: &R) -> Self::Output;
+}
+/// Python's `*`, with int/float promotion (string repetition is handled
+/// separately in codegen).
+pub trait PyMul<R: ?Sized> {
+    type Output;
+    fn py_mul(&self, rhs: &R) -> Self::Output;
+}
+
+macro_rules! numeric_sub_mul {
+    ($trait:ident, $method:ident, $op:tt; $($l:ty, $r:ty => $out:ty),* $(,)?) => {
+        $(impl $trait<$r> for $l {
+            type Output = $out;
+            fn $method(&self, rhs: &$r) -> $out {
+                (*self as $out) $op (*rhs as $out)
+            }
+        })*
+    };
+}
+
+numeric_sub_mul!(
+    PySub, py_sub, -;
+    i64, i64 => i64,
+    f64, f64 => f64,
+    i64, f64 => f64,
+    f64, i64 => f64,
+);
+numeric_sub_mul!(
+    PyMul, py_mul, *;
+    i64, i64 => i64,
+    f64, f64 => f64,
+    i64, f64 => f64,
+    f64, i64 => f64,
+);
+
+impl<L, R: ?Sized> PySub<R> for Option<L>
+where
+    L: PySub<R>,
+{
+    type Output = L::Output;
+    fn py_sub(&self, rhs: &R) -> L::Output {
+        match self {
+            Some(l) => l.py_sub(rhs),
+            None => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    "unsupported operand type(s) for -: 'NoneType'"
+                )
+            ),
+        }
+    }
+}
+impl<L, R: ?Sized> PyMul<R> for Option<L>
+where
+    L: PyMul<R>,
+{
+    type Output = L::Output;
+    fn py_mul(&self, rhs: &R) -> L::Output {
+        match self {
+            Some(l) => l.py_mul(rhs),
+            None => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    "unsupported operand type(s) for *: 'NoneType'"
+                )
+            ),
+        }
+    }
+}
+
 macro_rules! numeric_add {
     ($($l:ty, $r:ty => $out:ty),* $(,)?) => {
         $(impl PyAdd<$r> for $l {
@@ -3770,6 +4050,8 @@ pub use stdlib::pathlib;
 pub use stdlib::tempfile;
 #[cfg(feature = "std")]
 pub use stdlib::glob;
+#[cfg(feature = "std")]
+pub use stdlib::numpy;
 
 // Re-export custom macro-generated wrapper functions for generated code
 #[cfg(feature = "std")]

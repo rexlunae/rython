@@ -651,6 +651,39 @@ impl crate::PyAdd<timedelta> for timedelta {
     }
 }
 
+// Python `-` lowers through PySub (borrowed operands), so the date types
+// implement it too, delegating to the native `-` operators above.
+impl crate::PySub<date> for date {
+    type Output = timedelta;
+    fn py_sub(&self, rhs: &date) -> timedelta {
+        *self - *rhs
+    }
+}
+impl crate::PySub<timedelta> for date {
+    type Output = date;
+    fn py_sub(&self, rhs: &timedelta) -> date {
+        *self - *rhs
+    }
+}
+impl crate::PySub<datetime> for datetime {
+    type Output = timedelta;
+    fn py_sub(&self, rhs: &datetime) -> timedelta {
+        *self - *rhs
+    }
+}
+impl crate::PySub<timedelta> for datetime {
+    type Output = datetime;
+    fn py_sub(&self, rhs: &timedelta) -> datetime {
+        *self - *rhs
+    }
+}
+impl crate::PySub<timedelta> for timedelta {
+    type Output = timedelta;
+    fn py_sub(&self, rhs: &timedelta) -> timedelta {
+        *self - *rhs
+    }
+}
+
 // ---------------------------------------------------------------------------
 // strptime
 // ---------------------------------------------------------------------------

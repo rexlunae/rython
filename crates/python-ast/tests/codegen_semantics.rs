@@ -691,7 +691,8 @@ fn return_inside_try_threads_through_controlflow() {
 #[test]
 fn assert_lowers_to_assertion_error() {
     let out = compile("def f(n):\n    assert n > 0, \"need positive\"\n", "assert.py");
-    assert!(out.contains("if ! ((n) > (0))"), "generated: {}", out);
+    // Comparisons lower through the PyGt trait (borrowed operands).
+    assert!(out.contains("if ! ((n) . py_gt (& (0)))"), "generated: {}", out);
     assert!(
         out.contains("PyException :: new (\"AssertionError\""),
         "generated: {}",
@@ -2909,7 +2910,8 @@ fn chained_comparison_evaluates_each_operand_once() {
     // A plain (unchained) comparison keeps the simple lowering.
     let out = compile("def g(a: int, b: int) -> bool:\n    return a < b\n", "chain3.py");
     assert!(!out.contains("__rython_cmp"), "generated: {}", out);
-    assert!(out.contains("(a) < (b)"), "generated: {}", out);
+    // Comparisons lower through the PyLt trait (borrowed operands).
+    assert!(out.contains("(a) . py_lt (& (b))"), "generated: {}", out);
 }
 
 #[test]
@@ -2990,9 +2992,10 @@ fn f_strings_render_through_py_display_not_rust_display() {
 
 #[test]
 fn augmented_division_is_true_division() {
-    // Python's `/=` yields a float; Rust's `/=` on an integer truncates.
+    // Python's `/=` yields a float; Rust's `/=` on an integer truncates,
+    // so the aug-assign lowers to a py_div rebinding (true division).
     let out = compile("def f(y: float):\n    y /= 2\n    return y\n", "td1.py");
-    assert!(out.contains("as f64 / (2) as f64"), "generated: {}", out);
+    assert!(out.contains("y = py_div (y , 2)"), "generated: {}", out);
     assert!(!out.contains("y /= 2"), "generated: {}", out);
 }
 

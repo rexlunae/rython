@@ -151,11 +151,23 @@ impl CodeGen for BinOp {
             return Ok(quote!(py_pow(#left, #right)));
         }
         
-        // For Div, we need to cast to f64
+        // For Div, Python semantics are elementwise/numeric true division.
+        // Route through the stdpython py_div helper: numeric operands
+        // divide to f64, and NdArray operands (numpy) divide elementwise.
         if matches!(self.op, BinOps::Div) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
-            return Ok(quote!((#left) as f64 / (#right) as f64));
+            return Ok(quote!(py_div(#left, #right)));
+        }
+
+        // Python's `@` is matrix multiplication (numpy semantics for
+        // arrays); route through the stdpython py_matmul helper. Non-array
+        // operands fail loudly at compile time (no impl), like CPython's
+        // TypeError for unsupported types.
+        if matches!(self.op, BinOps::MatMult) {
+            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            return Ok(quote!(py_matmul(#left, #right)));
         }
 
         // Python's // floors toward negative infinity and % takes the
@@ -205,6 +217,28 @@ impl CodeGen for BinOp {
             let left = anchor_numeric_literal(&self.left, left);
             let right = anchor_numeric_literal(&self.right, right);
             return Ok(quote!((#left).py_add(&(#right))));
+        }
+
+        // `-` mirrors `+`: PySub borrows its operands (numeric promotion
+        // for scalars, elementwise for NdArray), so `x - y` never moves
+        // the variables.
+        if matches!(self.op, BinOps::Sub) {
+            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = anchor_numeric_literal(&self.left, left);
+            let right = anchor_numeric_literal(&self.right, right);
+            return Ok(quote!((#left).py_sub(&(#right))));
+        }
+
+        // `*` mirrors `+`/`-` for everything except the literal-string
+        // repetition handled above: PyMul borrows both operands, so
+        // `x * 2` never moves `x`.
+        if matches!(self.op, BinOps::Mult) {
+            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = anchor_numeric_literal(&self.left, left);
+            let right = anchor_numeric_literal(&self.right, right);
+            return Ok(quote!((#left).py_mul(&(#right))));
         }
 
         // Use the generic binary operation implementation for everything else

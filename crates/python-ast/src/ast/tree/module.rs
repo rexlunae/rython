@@ -217,8 +217,11 @@ impl CodeGen for Module {
                 let test_str = format!("{:?}", if_stmt.test);
                 if test_str.contains("__name__") && test_str.contains("__main__") {
                     // Check if this is a simple main() call pattern
+                    // (disabled when --numpy-backend forces startup code: the
+                    // wrapper main below must run __module_init__ first).
                     let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body)
-                        && !user_main_returns_value;
+                        && !user_main_returns_value
+                        && options.numpy_backend.is_none();
                     
                     if is_simple_main_call {
                         // For simple main() calls, we'll use the user's main function directly
@@ -294,6 +297,24 @@ impl CodeGen for Module {
         let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols);
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
+        }
+
+        // A forced numpy backend (--numpy-backend) runs as the first
+        // statement of __module_init__, so the choice lives in the program,
+        // not just in an env var: a wrong spelling or a backend the crate
+        // wasn't built with (missing numpy-rayon / numpy-simd / ... cargo
+        // feature) fails loudly when the program starts, not silently.
+        if let Some(backend) = &options.numpy_backend {
+            has_module_init_code = true;
+            module_init_stmts.insert(
+                0,
+                quote! {
+                    match stdpython::numpy::set_backend_by_name(#backend) {
+                        Ok(()) => (),
+                        Err(e) => panic!("--numpy-backend {}: {}", #backend, e),
+                    }
+                },
+            );
         }
 
         // Generate module initialization function if needed. Like all

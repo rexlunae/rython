@@ -35,8 +35,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Call {
 /// import) or the `functools.partial` attribute spelling? A user
 /// function named partial shadows the import in the symbol table and
 /// does not match.
-fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
-    match func {
+fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {    match func {
         ExprType::Name(n) => {
             n.id == "partial"
                 && matches!(
@@ -49,6 +48,648 @@ fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
                 && matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "functools")
         }
         _ => false,
+    }
+}
+
+/// Resolve a call target to a numpy function name, when the call is on the
+/// numpy module (`np.foo(...)`, `numpy.foo(...)`, `np.linalg.inv(...)`) or
+/// on a name imported from it (`from numpy import array; array(...)`).
+/// Returns the Python-side function name (`"linalg.inv"` for the nested
+/// form). A user definition shadowing the import wins in the symbol table,
+/// like the other module dispatches in this file.
+fn numpy_target(func: &ExprType, symbols: &SymbolTableScopes) -> Option<String> {
+    match func {
+        ExprType::Attribute(attr) => match attr.value.as_ref() {
+            ExprType::Attribute(inner) => {
+                if let ExprType::Name(m) = inner.value.as_ref() {
+                    if (m.id == "numpy" || m.id == "np") && inner.attr == "linalg" {
+                        return Some(format!("linalg.{}", attr.attr));
+                    }
+                }
+                None
+            }
+            ExprType::Name(m) if m.id == "numpy" || m.id == "np" => Some(attr.attr.clone()),
+            _ => None,
+        },
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::ImportFrom(import))
+                if import.module == "numpy" || import.module == "numpy.linalg" =>
+            {
+                let name = n.id.clone();
+                Some(if import.module == "numpy.linalg" {
+                    format!("linalg.{name}")
+                } else {
+                    name
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// numpy call lowering
+// ---------------------------------------------------------------------------
+
+/// Render one positional argument.
+type NpCtx = (CodeGenContext, PythonOptions, SymbolTableScopes);
+
+fn np_render(expr: &ExprType, ctx: &NpCtx) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let tokens = expr
+        .clone()
+        .to_rust(ctx.0.clone(), ctx.1.clone(), ctx.2.clone())?;
+    // The numpy runtime functions take their array/scalar arguments BY
+    // VALUE (no borrows, unlike the Python-operator traits), while Python
+    // value semantics let a variable be re-used freely after the call.
+    // Clone every argument so `a = np.sum(x); b = np.mean(x)` still
+    // compiles. Every generated value type (NdArray, i64, f64, bool,
+    // String, Vec, Option, tuples) is Clone, so this is always safe.
+    Ok(quote!((#tokens).clone()))
+}
+
+fn np_kw<'a>(keywords: &'a [Keyword], name: &str) -> Option<&'a ExprType> {
+    keywords.iter().find(|k| k.arg.as_deref() == Some(name)).map(|k| &k.value)
+}
+
+fn np_has_kw(keywords: &[Keyword], name: &str) -> bool {
+    keywords.iter().any(|k| k.arg.as_deref() == Some(name))
+}
+
+/// Reject any keyword argument (other than the named ones, if any).
+fn np_no_extra_kw(
+    fname: &str,
+    keywords: &[Keyword],
+    allowed: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for k in keywords {
+        if let Some(arg) = k.arg.as_deref() {
+            if !allowed.contains(&arg) {
+                return Err(format!(
+                    "np.{fname}() got an unexpected keyword argument '{arg}' (rython's \
+                     numpy subset supports: {})",
+                    allowed.join(", ")
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Is this expression a float literal (possibly under unary +/-)?
+fn np_is_float_literal(expr: &ExprType) -> bool {
+    match expr {
+        ExprType::Constant(c) => matches!(c.0, Some(litrs::Literal::Float(_))),
+        ExprType::UnaryOp(u) => np_is_float_literal(&u.operand),
+        _ => false,
+    }
+}
+
+/// Is this expression an int literal (possibly under unary +/-)?
+fn np_is_int_literal(expr: &ExprType) -> bool {
+    match expr {
+        ExprType::Constant(c) => matches!(c.0, Some(litrs::Literal::Integer(_))),
+        ExprType::UnaryOp(u) => np_is_int_literal(&u.operand),
+        _ => false,
+    }
+}
+
+/// Is this expression the None literal?
+fn np_is_none(expr: &ExprType) -> bool {
+    matches!(expr, ExprType::Constant(c) if c.0.is_none())
+}
+
+/// Is this expression a bool literal?
+fn np_is_bool_literal(expr: &ExprType) -> bool {
+    matches!(expr, ExprType::Constant(c) if matches!(c.0, Some(litrs::Literal::Bool(_))))
+}
+
+/// Map a `dtype=` keyword value (`np.int64`, `"float32"`, ...) to the
+/// `numpy::Dtype` path token.
+fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let name = match expr {
+        ExprType::Attribute(attr) => {
+            if !matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "np" || m.id == "numpy") {
+                return Err(format!(
+                    "dtype= must be one of np.float64/np.float32/np.int64/np.int32/np.bool_ \
+                     or a string like \"float64\" (got an unsupported expression)"
+                )
+                .into());
+            }
+            attr.attr.clone()
+        }
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(s)) => s.value().to_string(),
+            _ => {
+                return Err(
+                    "dtype= must be one of np.float64/np.float32/np.int64/np.int32/np.bool_ \
+                     or a string like \"float64\""
+                        .to_string()
+                        .into(),
+                )
+            }
+        },
+        _ => {
+            return Err(
+                "dtype= must be one of np.float64/np.float32/np.int64/np.int32/np.bool_ \
+                 or a string like \"float64\""
+                    .to_string()
+                    .into(),
+            )
+        }
+    };
+    let variant = match name.as_str() {
+        "float64" => "Float64",
+        "float32" => "Float32",
+        "int64" => "Int64",
+        "int32" => "Int32",
+        "bool_" | "bool" => "Bool",
+        _ => {
+            return Err(format!(
+                "unsupported numpy dtype '{name}' (rython's numpy subset supports \
+                 float64, float32, int64, int32, bool_)"
+            )
+            .into())
+        }
+    };
+    Ok(quote!(numpy::Dtype::#variant))
+}
+
+/// The `numpy::` path prefix for a given numpy function name (handles the
+/// `linalg.*` nested functions).
+fn np_path(name: &str) -> (String, TokenStream) {
+    if let Some(linalg_fn) = name.strip_prefix("linalg.") {
+        let ident = crate::safe_ident(linalg_fn);
+        (linalg_fn.to_string(), quote!(numpy::linalg::#ident))
+    } else {
+        let ident = crate::safe_ident(name);
+        (name.to_string(), quote!(numpy::#ident))
+    }
+}
+
+/// Lower `np.<fname>(args, kwargs)` onto the stdpython numpy module.
+#[allow(clippy::too_many_lines)]
+fn lower_numpy_call(
+    fname: &str,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let npc = (ctx, options, symbols);
+    let fname = fname.to_string();
+    let (plain_name, path) = np_path(&fname);
+
+    // np.float64(x) / np.int64(x) / np.float32(x) / np.int32(x) / np.bool_(x)
+    // are dtype CASTS (numpy's scalar types).
+    let cast: Option<&str> = match plain_name.as_str() {
+        "float64" => Some("f64"),
+        "float32" => Some("f32"),
+        "int64" => Some("i64"),
+        "int32" => Some("i32"),
+        _ => None,
+    };
+    if let Some(ty) = cast {
+        np_no_extra_kw(&plain_name, keywords, &[])?;
+        if args.len() != 1 {
+            return Err(format!(
+                "np.{}() takes exactly 1 argument ({} given)",
+                plain_name,
+                args.len()
+            )
+            .into());
+        }
+        let a = np_render(&args[0], &npc)?;
+        // `#ty` is a &str; parse it into an actual Rust type token so the
+        // cast emits `as f64`, not `as "f64"`.
+        let ty_tokens: proc_macro2::TokenStream = ty
+            .parse()
+            .unwrap_or_else(|_| panic!("numpy cast type '{ty}' is not valid Rust"));
+        return Ok(quote!((#a) as #ty_tokens));
+    }
+    if plain_name == "bool_" {
+        np_no_extra_kw(&plain_name, keywords, &[])?;
+        if args.len() != 1 {
+            return Err(format!(
+                "np.bool_() takes exactly 1 argument ({} given)",
+                args.len()
+            )
+            .into());
+        }
+        let a = np_render(&args[0], &npc)?;
+        return Ok(quote!((#a).py_bool()));
+    }
+
+    // Construction helpers with shape arguments: shape tuples (2, 3) render
+    // as Rust tuples and convert via IntoShape; `dtype=` maps to Dtype.
+    let shape_fns: &[&str] = &["zeros", "ones", "empty", "full"];
+    if shape_fns.contains(&plain_name.as_str()) {
+        np_no_extra_kw(&plain_name, keywords, &["dtype"])?;
+        let ndtype = np_kw(keywords, "dtype").map(np_dtype_tokens).transpose()?;
+        match plain_name.as_str() {
+            "zeros" | "ones" | "empty" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "np.{}() takes exactly 1 positional argument (shape), got {}",
+                        plain_name,
+                        args.len()
+                    )
+                    .into());
+                }
+                let shape = np_render(&args[0], &npc)?;
+                let dtype = ndtype.unwrap_or(quote!(numpy::Dtype::Float64));
+                return Ok(quote!(#path(#shape, #dtype)));
+            }
+            _ => {
+                // full: fill value picks the Rust function (int → full_i,
+                // float → full, bool → full_bool); dtype= is not supported
+                // yet (it would fight the fill type, like numpy's promotion).
+                if ndtype.is_some() {
+                    return Err(
+                        "np.full(..., dtype=...) is not supported in rython's numpy subset \
+                         (the dtype follows the fill value)"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                if args.len() != 2 {
+                    return Err(format!(
+                        "np.full() takes exactly 2 arguments (shape, fill_value), got {}",
+                        args.len()
+                    )
+                    .into());
+                }
+                let shape = np_render(&args[0], &npc)?;
+                let fill = np_render(&args[1], &npc)?;
+                return if np_is_bool_literal(&args[1]) {
+                    Ok(quote!(numpy::full_bool(#shape, #fill)))
+                } else if np_is_int_literal(&args[1]) {
+                    Ok(quote!(numpy::full_i(#shape, #fill)))
+                } else {
+                    Ok(quote!(numpy::full(#shape, (#fill) as f64)))
+                };
+            }
+        }
+    }
+
+    // Dispatch on the FULL name (fname) so the `linalg.*` arms fire; the
+    // plain arms use `plain_name`, which equals fname for non-linalg calls.
+    match fname.as_str() {
+        "arange" => {
+            np_no_extra_kw("arange", keywords, &[])?;
+            let n = args.len();
+            if !(1..=3).contains(&n) {
+                return Err(format!(
+                    "np.arange() takes 1 to 3 arguments ({} given)",
+                    n
+                )
+                .into());
+            }
+            let any_float = args.iter().any(np_is_float_literal);
+            let any_int = args.iter().any(np_is_int_literal);
+            if any_float && any_int {
+                return Err(
+                    "np.arange() mixing int and float bounds is not supported in rython's \
+                     numpy subset; use all-int or all-float literals"
+                        .to_string()
+                        .into(),
+                );
+            }
+            let rendered: Vec<TokenStream> = args
+                .iter()
+                .map(|a| np_render(a, &npc))
+                .collect::<Result<_, _>>()?;
+            if any_float {
+                let (a, b, c) = (
+                    rendered
+                        .first()
+                        .map(|t| quote!((#t) as f64))
+                        .unwrap_or(quote!(0.0)),
+                    rendered
+                        .get(1)
+                        .map(|t| quote!((#t) as f64))
+                        .unwrap_or(quote!(0.0)),
+                    rendered
+                        .get(2)
+                        .map(|t| quote!((#t) as f64))
+                        .unwrap_or(quote!(1.0)),
+                );
+                return Ok(if n == 1 {
+                    quote!(numpy::arange_f(#a))
+                } else {
+                    quote!(numpy::arange_f3(#a, #b, #c))
+                });
+            }
+            let (a, b, c) = (
+                rendered
+                    .first()
+                    .map(|t| quote!((#t) as i64))
+                    .unwrap_or(quote!(0i64)),
+                rendered
+                    .get(1)
+                    .map(|t| quote!((#t) as i64))
+                    .unwrap_or(quote!(1i64)),
+                rendered
+                    .get(2)
+                    .map(|t| quote!((#t) as i64))
+                    .unwrap_or(quote!(1i64)),
+            );
+            Ok(if n == 1 {
+                quote!(numpy::arange(#a))
+            } else {
+                quote!(numpy::arange3(#a, #b, #c))
+            })
+        }
+
+        "linspace" => {
+            np_no_extra_kw("linspace", keywords, &["num", "endpoint"])?;
+            if let Some(endpoint) = np_kw(keywords, "endpoint") {
+                if !matches!(endpoint, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Bool(litrs::BoolLit::True)))) {
+                    return Err(
+                        "np.linspace(..., endpoint=False) is not supported in rython's \
+                         numpy subset (endpoint defaults to True)"
+                            .to_string()
+                            .into(),
+                    );
+                }
+            }
+            if !(2..=3).contains(&args.len()) {
+                return Err(format!(
+                    "np.linspace() takes 2 or 3 arguments ({} given)",
+                    args.len()
+                )
+                .into());
+            }
+            let start = np_render(&args[0], &npc)?;
+            let stop = np_render(&args[1], &npc)?;
+            let num = match np_kw(keywords, "num") {
+                Some(n) => Some(np_render(n, &npc)?),
+                None if args.len() == 3 => Some(np_render(&args[2], &npc)?),
+                None => None,
+            };
+            let num = match num {
+                Some(t) => quote!((#t) as i64),
+                None => quote!(50i64),
+            };
+            Ok(quote!(numpy::linspace((#start) as f64, (#stop) as f64, #num)))
+        }
+
+        "eye" | "identity" => {
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.{}() takes exactly 1 argument ({} given)",
+                    plain_name,
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(#path((#a) as i64)))
+        }
+
+        "dtype" => {
+            np_no_extra_kw("dtype", keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.dtype() takes exactly 1 argument ({} given)",
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(numpy::dtype(#a)))
+        }
+
+        "set_backend" => {
+            np_no_extra_kw("set_backend", keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.set_backend() takes exactly 1 argument ({} given)",
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(numpy::set_backend_by_name(#a)?))
+        }
+
+        "sum" | "prod" | "mean" | "max" | "min" | "all" | "any" | "argmax" | "argmin" => {
+            if np_has_kw(keywords, "axis") {
+                return Err(format!(
+                    "np.{}(a, axis=...) is not supported in rython's numpy subset \
+                     (full reductions only)",
+                    plain_name
+                )
+                .into());
+            }
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.{}() takes exactly 1 argument ({} given)",
+                    plain_name,
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(#path(#a)))
+        }
+
+        "std" | "var" => {
+            np_no_extra_kw(&plain_name, keywords, &["ddof"])?;
+            if !(1..=2).contains(&args.len()) {
+                return Err(format!(
+                    "np.{}() takes 1 or 2 arguments ({} given)",
+                    plain_name,
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            let ddof = match np_kw(keywords, "ddof") {
+                Some(d) => Some(np_render(d, &npc)?),
+                None if args.len() == 2 => Some(np_render(&args[1], &npc)?),
+                None => None,
+            };
+            let ddof = match ddof {
+                Some(t) => quote!((#t) as f64),
+                None => quote!(0.0),
+            };
+            Ok(quote!(#path(#a, #ddof)))
+        }
+
+        "clip" => {
+            np_no_extra_kw("clip", keywords, &["min", "max"])?;
+            let lo = np_kw(keywords, "min").or_else(|| args.get(1));
+            let hi = np_kw(keywords, "max").or_else(|| args.get(2));
+            if args.is_empty() || lo.is_none() || hi.is_none() {
+                return Err(
+                    "np.clip() needs an array plus min and max bounds (either both \
+                     positional or min=/max= keywords); None means unbounded"
+                        .to_string()
+                        .into(),
+                );
+            }
+            let a = np_render(&args[0], &npc)?;
+            let lo = match lo {
+                Some(e) if np_is_none(e) => quote!(None),
+                Some(e) => {
+                    let t = np_render(e, &npc)?;
+                    quote!(Some((#t) as f64))
+                }
+                None => quote!(None),
+            };
+            let hi = match hi {
+                Some(e) if np_is_none(e) => quote!(None),
+                Some(e) => {
+                    let t = np_render(e, &npc)?;
+                    quote!(Some((#t) as f64))
+                }
+                None => quote!(None),
+            };
+            Ok(quote!(numpy::clip(#a, #lo, #hi)))
+        }
+
+        "where" => {
+            np_no_extra_kw("where", keywords, &[])?;
+            if args.len() != 3 {
+                return Err(
+                    "np.where(cond, a, b) needs exactly 3 arguments in rython's numpy \
+                     subset (the single-argument index form is not supported)"
+                        .to_string()
+                        .into(),
+                );
+            }
+            let (c, a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?, np_render(&args[2], &npc)?);
+            Ok(quote!(numpy::where_(#c, #a, #b)))
+        }
+
+        "concatenate" => {
+            np_no_extra_kw("concatenate", keywords, &["axis"])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.concatenate() takes exactly 1 positional argument ({} given)",
+                    args.len()
+                )
+                .into());
+            }
+            let arrays = np_render(&args[0], &npc)?;
+            let axis = match np_kw(keywords, "axis") {
+                Some(a) => np_render(a, &npc)?,
+                None => quote!(0i64),
+            };
+            Ok(quote!(numpy::concatenate(#arrays, (#axis) as i64)))
+        }
+
+        // Plain 1-arg pass-throughs.
+        "array" | "asarray" | "ravel" | "transpose" | "sort" | "argsort" | "negative"
+        | "abs" | "square" | "sign" | "isfinite" | "isinf" | "isnan" | "logical_not"
+        | "sqrt" | "exp" | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "arcsin"
+        | "arccos" | "arctan" | "sinh" | "cosh" | "tanh" | "floor" | "ceil" | "reciprocal"
+        | "expm1" | "log1p" => {
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.{}() takes exactly 1 argument ({} given)",
+                    plain_name,
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(#path(#a)))
+        }
+
+        // np.reshape(a, shape) — the shape tuple converts via IntoShape.
+        "reshape" => {
+            np_no_extra_kw("reshape", keywords, &[])?;
+            if args.len() != 2 {
+                return Err(format!(
+                    "np.reshape() takes exactly 2 arguments ({} given)",
+                    args.len()
+                )
+                .into());
+            }
+            let (a, s) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?);
+            Ok(quote!(numpy::reshape(#a, #s)))
+        }
+
+        // Plain 2-arg pass-throughs.
+        "add" | "subtract" | "multiply" | "divide" | "floor_divide" | "mod" | "remainder"
+        | "power" | "maximum" | "minimum" | "equal" | "not_equal" | "less" | "less_equal"
+        | "greater" | "greater_equal" | "bitwise_and" | "bitwise_or" | "bitwise_xor"
+        | "logical_and" | "logical_or" | "logical_xor" | "matmul" | "dot" | "vdot" => {
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 2 {
+                return Err(format!(
+                    "np.{}() takes exactly 2 arguments ({} given)",
+                    plain_name,
+                    args.len()
+                )
+                .into());
+            }
+            let (a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?);
+            let name = if plain_name == "mod" { "mod_" } else { plain_name.as_str() };
+            let path = crate::safe_ident(name);
+            Ok(quote!(numpy::#path(#a, #b)))
+        }
+
+        "vstack" | "hstack" => {
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.{}() takes exactly 1 argument ({} given)",
+                    plain_name,
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(#path(#a)))
+        }
+
+        // linalg.inv / linalg.det / linalg.solve
+        "linalg.inv" | "linalg.det" => {
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 1 {
+                return Err(format!(
+                    "np.linalg.{}() takes exactly 1 argument ({} given)",
+                    plain_name.trim_start_matches("linalg."),
+                    args.len()
+                )
+                .into());
+            }
+            let a = np_render(&args[0], &npc)?;
+            Ok(quote!(#path(#a)))
+        }
+        "linalg.solve" => {
+            np_no_extra_kw(&plain_name, keywords, &[])?;
+            if args.len() != 2 {
+                return Err(format!(
+                    "np.linalg.solve() takes exactly 2 arguments ({} given)",
+                    args.len()
+                )
+                .into());
+            }
+            let (a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?);
+            Ok(quote!(#path(#a, #b)))
+        }
+
+        other => Err(format!(
+            "np.{other}() is not supported by rython's numpy subset. Supported: \
+             array, zeros, ones, full, empty, arange, linspace, eye, identity, dtype, \
+             reshape, ravel, transpose, concatenate, vstack, hstack, clip, where, sort, \
+             argsort, sum, prod, mean, max, min, std, var, all, any, argmax, argmin, \
+             dot, matmul, vdot, set_backend, the ufuncs (add, subtract, multiply, \
+             divide, floor_divide, mod, power, sqrt, exp, log, sin, cos, ...), the \
+             comparisons (equal, not_equal, less, greater, ...), the dtype casts \
+             (np.float64, np.int64, np.bool_, ...), and np.linalg.{{inv,det,solve}}. \
+             See the numpy README for details."
+        )
+        .into()),
     }
 }
 
@@ -106,6 +747,24 @@ impl<'a> CodeGen for Call {
                     .into());
                 }
             }
+        }
+
+        // numpy subset calls (`np.foo(...)`, `numpy.foo(...)`, and
+        // `from numpy import ...` names) map onto the stdpython numpy
+        // module at compile time: the runtime has one Rust function per
+        // arity/type combination (no overloading, no default arguments),
+        // shape tuples need converting, and dtype= keywords need mapping.
+        // Anything unsupported fails HERE with a clear message instead of
+        // as a cryptic error in the generated crate.
+        if let Some(numpy_fn) = numpy_target(self.func.as_ref(), &symbols) {
+            return lower_numpy_call(
+                &numpy_fn,
+                &self.args,
+                &self.keywords,
+                ctx,
+                options,
+                symbols,
+            );
         }
 
         // Multi-argument range() maps to the arity-specific runtime

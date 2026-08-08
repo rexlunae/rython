@@ -71,6 +71,17 @@ struct Args {
 
     #[clap(long, short, action, help = "Compile without stdpython.")]
     nostd: bool,
+
+    #[clap(
+        long,
+        action,
+        value_name = "BACKEND",
+        help = "Force a numpy execution backend for the generated program: scalar, \
+                rayon, simd, cuda, or vulkan. Emits a startup numpy::set_backend call \
+                (overrides RYPY_NUMPY_BACKEND and np.set_backend); build the generated \
+                crate with the matching stdpython feature (numpy-rayon, numpy-simd, ...)."
+    )]
+    numpy_backend: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -78,6 +89,7 @@ fn main() -> Result<()> {
     setup_logger(args.log_level, args.log_file)?;
     let options = PythonOptions {
         with_std_python: !args.nostd,
+        numpy_backend: args.numpy_backend.clone(),
         ..Default::default()
     };
 

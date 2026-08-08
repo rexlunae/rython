@@ -127,10 +127,11 @@ impl CodeGen for AugAssign {
             BinOps::Sub => Ok(quote!(#target -= #value)),
             BinOps::Mult => Ok(quote!(#target *= #value)),
             // Python's `/` is TRUE division: `x /= 2` on an int yields a
-            // float. Rust's `/=` on an integer truncates silently, so
-            // mirror the BinOp lowering instead (an int target then fails
-            // to compile, which is loud rather than quietly wrong).
-            BinOps::Div => Ok(quote!(#target = (#target) as f64 / (#value) as f64)),
+            // float. Route through py_div (numeric → f64, numpy arrays →
+            // elementwise) instead of Rust's truncating `/=` or an `as f64`
+            // cast (an int target then fails to compile, which is loud
+            // rather than quietly wrong).
+            BinOps::Div => Ok(quote!(#target = py_div(#target, #value))),
             // Python // and % floor toward negative infinity / take the
             // divisor's sign; use the stdpython helpers instead of Rust's
             // truncating operators.
@@ -168,7 +169,7 @@ fn combine_op(
         BinOps::Add => quote!((#elem).py_add(&(#value))),
         BinOps::Sub => quote!(#elem - #value),
         BinOps::Mult => quote!(#elem * #value),
-        BinOps::Div => quote!((#elem) as f64 / (#value) as f64),
+        BinOps::Div => quote!(py_div(#elem, #value)),
         BinOps::FloorDiv => quote!(py_floordiv(#elem, #value)),
         BinOps::Mod => quote!(py_mod(#elem, #value)),
         BinOps::Pow => quote!(py_pow(#elem, #value)),
