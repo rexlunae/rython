@@ -2594,6 +2594,20 @@ impl<T> Len for Vec<T> {
     }
 }
 
+impl Len for [u8] {
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<const N: usize> Len for [u8; N] {
+    fn len(&self) -> usize {
+        // as_slice() lands on the inherent slice len; a bare self.len()
+        // would resolve to this trait method and recurse.
+        self.as_slice().len()
+    }
+}
+
 // ============================================================================
 // TRUTHINESS OF STD TYPES (conditions lower through Truthy)
 // ============================================================================

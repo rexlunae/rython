@@ -6,7 +6,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableScopes};
+use crate::{CodeGen, CodeGenContext, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -634,6 +634,12 @@ fn hoisted_declarations(
         crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
     let mut out = TokenStream::new();
     for name in &scope.assigned {
+        // rust.bind names are compile-time symbols: the declaration
+        // assignment lowers to nothing, so there is no runtime binding to
+        // hoist — declaring one would be a dead variable.
+        if matches!(symbols.get(name), Some(SymbolTableNode::RustBinding(_))) {
+            continue;
+        }
         let ident = crate::safe_ident(name);
         if scope.needs_mut.contains(name) {
             out.extend(quote!(let mut #ident;));

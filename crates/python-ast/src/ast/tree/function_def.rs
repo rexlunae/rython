@@ -778,6 +778,15 @@ impl CodeGen for FunctionDef {
         // A leading docstring is emitted as doc comments below; skip it here
         // so it isn't also emitted as a statement.
         let body_start = if self.get_docstring().is_some() { 1 } else { 0 };
+        // Body statements render in a Function context. rython's
+        // module-level-only constructs (rust.bind declarations) are rejected
+        // inside functions; nothing in the lowerings inspects the outer
+        // context (try/loop/async scopes are pushed explicitly below it),
+        // except the enclosing class name, which the Function context carries
+        // so `self` keeps resolving in method bodies.
+        let body_ctx = CodeGenContext::Function {
+            class: ctx.enclosing_class_name().map(str::to_string),
+        };
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
@@ -792,7 +801,7 @@ impl CodeGen for FunctionDef {
             }
             streams.extend(
                 s.clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                    .to_rust(body_ctx.clone(), options.clone(), symbols.clone())?,
             );
             streams.extend(quote!(;));
         }
