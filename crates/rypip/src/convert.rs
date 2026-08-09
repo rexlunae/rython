@@ -2734,6 +2734,18 @@ fn write_cargo_toml(
             "\n[profile.dev]\npanic = \"abort\"\n\n[profile.release]\npanic = \"abort\"\n",
         );
     }
+    // Crates declared via `from rython import rust` bindings become
+    // dependencies of the generated crate. The declaration's `path=` /
+    // `version=` spec is copied verbatim (paths are relative to the
+    // generated crate's Cargo.toml).
+    for (name, path, version) in rust_bind_dependencies(package) {
+        let entry = match (path, version) {
+            (Some(p), _) => format!("{name} = {{ path = \"{}\" }}", p),
+            (_, Some(v)) => format!("{name} = \"{v}\""),
+            (None, None) => continue,
+        };
+        toml.push_str(&format!("{entry}\n"));
+    }
     if opts.pyo3 {
         toml.push_str(
             "pyo3 = { version = \"0.29\", features = [\"extension-module\"], optional = true }\n\n\
@@ -2755,6 +2767,25 @@ fn write_cargo_toml(
     text.push_str("\n[workspace]\n");
     fs::write(manifest, text)?;
     Ok(())
+}
+
+/// Crate dependencies declared by `from rython import rust` bindings across
+/// the package's modules, deduplicated by crate name (first declaration's
+/// spec wins). Parse failures here are ignored: the transpile pass reports
+/// them with full context.
+fn rust_bind_dependencies(package: &PyPackage) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deps = Vec::new();
+    for module in &package.modules {
+        if let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) {
+            for spec in python_ast::rust_bind_specs(&ast.raw.body) {
+                if seen.insert(spec.crate_name.clone()) {
+                    deps.push((spec.crate_name, spec.path, spec.version));
+                }
+            }
+        }
+    }
+    deps
 }
 
 /// Where the generated crate's stdpython dependency comes from.

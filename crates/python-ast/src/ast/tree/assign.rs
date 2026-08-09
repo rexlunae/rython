@@ -47,6 +47,18 @@ impl<'a> CodeGen for Assign {
         for target in self.targets {
             // Only add symbols for Name assignments, not for Attribute assignments
             if let ExprType::Name(name) = target {
+                // A rust.bind(...) / rust.c_bind(...) declaration: record the
+                // parsed binding so call sites can lower to direct calls.
+                // Parse failures surface later, in to_rust, which re-parses
+                // and reports them loudly.
+                if let ExprType::Call(call) = &self.value {
+                    if crate::is_rust_bind_call(&self.value) {
+                        if let Ok(spec) = crate::parse_rust_bind(call) {
+                            symbols.insert(name.id, SymbolTableNode::RustBinding(spec));
+                        }
+                        continue;
+                    }
+                }
                 symbols.insert(
                     name.id,
                     SymbolTableNode::Assign {
@@ -67,6 +79,27 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // rust.bind / rust.c_bind declarations are compile-time-only: the
+        // assignment emits nothing (the binding lives in the symbol table).
+        // Everything about the declaration is validated here, loudly.
+        if crate::is_rust_bind_call(&self.value) {
+            if !matches!(ctx, CodeGenContext::Module(_)) {
+                return Err("rust.bind declarations must be at module level, not inside \
+                            a function or class"
+                    .to_string()
+                    .into());
+            }
+            if self.targets.len() != 1 || !matches!(self.targets[0], ExprType::Name(_)) {
+                return Err("rust.bind must be assigned to exactly one name"
+                    .to_string()
+                    .into());
+            }
+            if let ExprType::Call(call) = &self.value {
+                crate::parse_rust_bind(call)?;
+            }
+            return Ok(TokenStream::new());
+        }
+
         let value_is_none_early = crate::is_none_expr(&self.value);
         let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
         let value_expr = self.value.clone();

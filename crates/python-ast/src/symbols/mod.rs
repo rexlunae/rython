@@ -10,6 +10,7 @@ use crate::tree::{ClassDef, FunctionDef, Import, ImportFrom};
 
 //use crate::codegen::{CodeGen, PythonOptions, CodeGenContext};
 use crate::tree::ExprType;
+use crate::RustBindSpec;
 
 /// A stack of symbol tables of different scopes. Topmost is the current scope.
 #[derive(Clone, Debug)]
@@ -68,6 +69,10 @@ pub enum SymbolTableNode {
     Import(Import),
     ImportFrom(ImportFrom),
     Alias(String),
+    /// A name bound to a `rust.bind(...)` / `rust.c_bind(...)` declaration:
+    /// a compile-time symbol. Call sites lower to direct calls into the
+    /// bound crate; the name never exists as a runtime value.
+    RustBinding(RustBindSpec),
 }
 
 #[derive(Clone, Debug)]

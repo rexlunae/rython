@@ -729,6 +729,34 @@ impl<'a> CodeGen for Call {
             _ => false,
         };
 
+        // rust.bind / rust.c_bind names: calls lower to direct calls into
+        // the bound crate, with type-directed conversions. This comes before
+        // every builtin handler — a binding shadows the builtin of the same
+        // name exactly as a user function would.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            if let Some(SymbolTableNode::RustBinding(spec)) = symbols.get(&n.id) {
+                return lower_rust_binding_call(
+                    spec,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                );
+            }
+        }
+        // A rust.bind declaration used as a bare expression (not assigned) is
+        // a loud error: bindings must be module-level assignments.
+        if let ExprType::Attribute(attr) = self.func.as_ref() {
+            if matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "rust")
+                && matches!(attr.attr.as_str(), "bind" | "c_bind")
+            {
+                return Err("rust.bind(...) must be assigned to a name at module level"
+                    .to_string()
+                    .into());
+            }
+        }
+
         // The I/O builtins have no no_std lowering (stdpython gates them
         // behind std): fail at conversion time with the reason, rather than
         // let the generated crate fail with a bare unresolved-name error. A
@@ -2672,6 +2700,110 @@ impl<'a> CodeGen for Call {
         // calls like abs(x).
         Ok(final_call)
     }
+}
+
+/// Lower a call to a `rust.bind`/`rust.c_bind` name: a direct call into the
+/// bound crate, with type-directed conversions between rython's Python types
+/// and the declared Rust signature.
+fn lower_rust_binding_call(
+    spec: &crate::RustBindSpec,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if !keywords.is_empty() {
+        return Err(format!(
+            "keyword arguments in a call to bound function `{}::{}` are not \
+             supported yet; pass the arguments positionally",
+            spec.crate_name, spec.fn_name
+        )
+        .into());
+    }
+    if args.len() != spec.args.len() {
+        return Err(format!(
+            "bound function `{}::{}` takes {} argument(s), but {} were given",
+            spec.crate_name,
+            spec.fn_name,
+            spec.args.len(),
+            args.len()
+        )
+        .into());
+    }
+
+    let mut converted = Vec::new();
+    for ((_, ty), arg) in spec.args.iter().zip(args.iter()) {
+        let rendered = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        converted.push(convert_rust_bind_arg(rendered, ty)?);
+    }
+
+    let crate_ident = format_ident!("{}", spec.crate_name.replace('-', "_"));
+    let fn_ident = format_ident!("{}", spec.fn_name);
+    let call = quote!(#crate_ident::#fn_ident(#(#converted),*));
+    let call = if spec.c_abi {
+        quote!(unsafe { #call })
+    } else {
+        call
+    };
+    convert_rust_bind_ret(call, spec.returns.as_deref())
+}
+
+/// Convert a Python-side argument to the declared Rust parameter type.
+/// rython's Python types are fixed: int is i64, float is f64, str is String,
+/// bytes is Vec<u8>, bool is bool — so every conversion is deterministic.
+fn convert_rust_bind_arg(
+    tokens: TokenStream,
+    ty: &str,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let converted = match ty {
+        "i64" | "i32" | "u64" | "u32" | "i16" | "u16" | "i8" | "u8" | "isize" | "usize" => {
+            let t: TokenStream = ty.parse().expect("validated rust type");
+            quote!(#tokens as #t)
+        }
+        "f64" => tokens,
+        "f32" => quote!(#tokens as f32),
+        "bool" => tokens,
+        // AsRef bridges both spellings: String and &'static str (literals and
+        // module constants) both produce &str.
+        "&str" => quote!(#tokens.as_ref()),
+        // From is an identity impl for String and a conversion for &str.
+        "String" => quote!(String::from(#tokens)),
+        "&[u8]" => quote!(#tokens.as_ref()),
+        // From is identity for Vec<u8> and converts from byte literals.
+        "Vec<u8>" => quote!(Vec::from(#tokens)),
+        "*const u8" => quote!(#tokens.as_ptr()),
+        "*mut u8" => quote!(#tokens.as_mut_ptr()),
+        other => {
+            return Err(format!("rust.bind: unsupported parameter type `{}`", other).into())
+        }
+    };
+    Ok(converted)
+}
+
+/// Convert a bound call's result to the Python-side type. `()`/`void`/absent
+/// returns stay bare so statement-position calls keep a plain `fn();` shape.
+fn convert_rust_bind_ret(
+    call: TokenStream,
+    ret: Option<&str>,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let converted = match ret {
+        None | Some("()") | Some("void") => call,
+        Some("i64") | Some("i32") | Some("u64") | Some("u32") | Some("i16") | Some("u16")
+        | Some("i8") | Some("u8") | Some("isize") | Some("usize") => {
+            quote!(#call as i64)
+        }
+        Some("f64") => call,
+        Some("f32") => quote!(#call as f64),
+        Some("bool") => call,
+        Some("String") => call,
+        Some("&str") => quote!(#call.to_string()),
+        Some("Vec<u8>") => call,
+        Some(other) => {
+            return Err(format!("rust.bind: unsupported return type `{}`", other).into())
+        }
+    };
+    Ok(converted)
 }
 
 /// Lower a literal `template.format(args...)` call to a Rust `format!`.

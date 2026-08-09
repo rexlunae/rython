@@ -117,6 +117,15 @@ impl CodeGen for Import {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
+            // `import rython` is not a runtime module: rust.bind declarations
+            // are compile-time-only. The from-import spelling is required so
+            // the declaration syntax stays explicit.
+            if alias.name == "rython" || alias.name.starts_with("rython.") {
+                return Err("`import rython` is not supported; use \
+                            `from rython import rust` for compile-time Rust bindings"
+                    .to_string()
+                    .into());
+            }
             if options.no_std {
                 let root = alias.name.split('.').next().unwrap_or(&alias.name);
                 if is_std_only_module(root) {
@@ -252,6 +261,25 @@ impl CodeGen for ImportFrom {
         // lowers to nothing.
         if self.module.split('.').next() == Some("typing") {
             return Ok(TokenStream::new());
+        }
+
+        // `from rython import rust` is compile-time-only: rust.bind
+        // declarations lower to nothing and the module never exists at
+        // runtime. Only `rust` is importable — anything else is a mistake
+        // worth a loud error, not a silent no-op.
+        if self.module == "rython" {
+            if self.names.len() == 1
+                && self.names[0].name == "rust"
+                && self.names[0].asname.is_none()
+            {
+                return Ok(TokenStream::new());
+            }
+            return Err(
+                "only `from rython import rust` is supported (compile-time Rust \
+                 bindings); aliasing or importing other names does not exist"
+                    .to_string()
+                    .into(),
+            );
         }
 
         if _options.no_std {

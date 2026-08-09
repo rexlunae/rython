@@ -16,7 +16,12 @@ pub enum CodeGenContext {
     /// lowering can resolve `self` (receiver typing, `self.method()` calls)
     /// against the class's definition in the symbol table.
     Class(String),
-    Function,
+    /// Inside a function body. Carries the enclosing class name (if any) so
+    /// `self` still resolves in method bodies — the codegen context otherwise
+    /// loses the Class marker at the function boundary, and function bodies
+    /// must not be confused with module scope (module-level-only constructs
+    /// like rust.bind declarations are rejected there).
+    Function { class: Option<String> },
     Async(Box<CodeGenContext>),
     /// Directly inside a loop body. `has_else` is true when the loop carries
     /// a Python `else` clause, in which case `break` statements must also set
@@ -103,6 +108,7 @@ impl CodeGenContext {
     pub fn enclosing_class_name(&self) -> Option<&str> {
         match self {
             CodeGenContext::Class(name) => Some(name),
+            CodeGenContext::Function { class } => class.as_deref(),
             CodeGenContext::Async(inner) => inner.enclosing_class_name(),
             CodeGenContext::Loop { parent, .. }
             | CodeGenContext::TryBlock { parent }
