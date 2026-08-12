@@ -770,11 +770,36 @@ impl CodeGen for FunctionDef {
                             "bytes" => {
                                 info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bytes);
                             }
+                            // A bare `list`/`dict`/... annotation has no
+                            // element/key type: the generated Rust would be
+                            // `xs: list` — invalid — so fail loudly at
+                            // conversion time instead of at rustc.
+                            "list" | "List" | "dict" | "Dict" | "tuple" | "Tuple" | "set"
+                            | "Set" | "Optional" => {
+                                return Err(format!(
+                                    "parameter `{}` is annotated `{}`, which has no element/\
+                                     key type; use a subscripted annotation like \
+                                     `list[float]` or `dict[str, int]`",
+                                    p.arg, n.id
+                                )
+                                .into());
+                            }
                             _ => {}
                         },
                         other => {
                             if let Some(t) = crate::annotation_type_info(other) {
                                 info.name_types.insert(p.arg.clone(), t);
+                            } else if crate::python_annotation_to_rust_type(other).is_none() {
+                                // The annotation is genuinely unsupported
+                                // (e.g. a custom type): fail loudly at
+                                // conversion time instead of emitting
+                                // invalid Rust that rustc rejects.
+                                return Err(format!(
+                                    "parameter `{}` has an unsupported annotation `{}`",
+                                    p.arg,
+                                    crate::annotation_display(other)
+                                )
+                                .into());
                             }
                         }
                     }
@@ -874,6 +899,23 @@ impl CodeGen for FunctionDef {
         // do: call sites append `?`, and an uncaught exception surfaces at
         // the entry point. T is the resolved Python return type (unit when
         // there is none).
+        // A bare `-> list` / `-> dict` return annotation would silently
+        // resolve to unit and then fail at rustc on the body's real value:
+        // fail loudly at conversion time instead.
+        if let Some(ann) = self.returns.as_deref()
+            && let ExprType::Name(n) = ann
+            && matches!(
+                n.id.as_str(),
+                "list" | "List" | "dict" | "Dict" | "tuple" | "Tuple" | "set" | "Set"
+            )
+        {
+            return Err(format!(
+                "return annotation `{}` has no element/key type; use a subscripted \
+                 annotation like `list[float]` or `dict[str, int]`",
+                n.id
+            )
+            .into());
+        }
         let return_type = match self.resolved_return_type() {
             Some(ty) => quote!(-> Result<#ty, PyException>),
             None => quote!(-> Result<(), PyException>),
@@ -1165,7 +1207,7 @@ pub(crate) fn lower_optional_value(
 
 /// Best-effort Python-source rendering of an annotation expression, for
 /// warning messages.
-fn annotation_display(ann: &ExprType) -> String {
+pub(crate) fn annotation_display(ann: &ExprType) -> String {
     match ann {
         ExprType::Name(name) => name.id.clone(),
         ExprType::Constant(c) => c.to_string(),

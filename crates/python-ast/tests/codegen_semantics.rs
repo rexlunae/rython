@@ -225,6 +225,37 @@ fn unpinned_empty_container_is_a_loud_error() {
 }
 
 #[test]
+fn bare_container_annotation_is_a_loud_error() {
+    // Issue #76 companion: `def f(xs: list)` would emit `xs: list` —
+    // invalid Rust — so it is a loud conversion-time error directing the
+    // user to subscripted annotations, not a rustc failure.
+    let err = compile_err("def f(xs: list) -> int:\n    return len(xs)\n", "bareann.py");
+    assert!(
+        err.contains("no element/key type") && err.contains("list[float]"),
+        "expected loud bare-annotation error, got: {}",
+        err
+    );
+    let err = compile_err("def f(xs: dict) -> int:\n    return len(xs)\n", "bareann2.py");
+    assert!(
+        err.contains("no element/key type") && err.contains("dict[str, int]"),
+        "expected loud bare-annotation error, got: {}",
+        err
+    );
+    let err = compile_err("def f() -> list:\n    return [1]\n", "bareret.py");
+    assert!(
+        err.contains("return annotation") && err.contains("no element/key type"),
+        "expected loud bare return-annotation error, got: {}",
+        err
+    );
+    // ... but subscripted generics, including set[T], still work.
+    let out = compile(
+        "def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n",
+        "generics2.py",
+    );
+    assert!(out.contains("c : std :: collections :: HashSet < i64 >"), "generated: {}", out);
+}
+
+#[test]
 fn rust_keywords_are_escaped() {
     let out = compile("type = 5", "kw.py");
     assert!(out.contains("r#type"), "generated: {}", out);
