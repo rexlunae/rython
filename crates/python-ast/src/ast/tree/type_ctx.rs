@@ -588,7 +588,16 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
         StatementType::Assign(assign) => {
             // Record `name = <inferable expr>` (syntactic only).
             if let [ExprType::Name(name)] = assign.targets.as_slice() {
-                let t = syntactic_type(&assign.value);
+                let mut t = syntactic_type(&assign.value);
+                // Dict keys normalize to String (matches literal lowering
+                // and `dict[str, V]` annotations); empty dicts and lists
+                // are remembered for pinning from later use.
+                t = match t {
+                    TypeInfo::Dict(k, v) if matches!(*k, TypeInfo::StrRef) => {
+                        TypeInfo::Dict(Box::new(TypeInfo::String), v)
+                    }
+                    other => other,
+                };
                 if !matches!(t, TypeInfo::PyObject) {
                     info.name_types.insert(name.id.clone(), t.clone());
                     // Empty container: remember it to pin from later use.
@@ -778,7 +787,12 @@ fn collect_use_suggestions(
                 {
                     let v = resolve_type(&assign.value, info);
                     if let crate::SubscriptKind::Index(idx) = &sub.kind {
-                        let k = resolve_type(idx, info);
+                        // Keys normalize to String, matching dict literals
+                        // and `dict[str, V]` annotations.
+                        let k = match resolve_type(idx, info) {
+                            TypeInfo::StrRef => TypeInfo::String,
+                            other => other,
+                        };
                         let ty = TypeInfo::Dict(Box::new(k), Box::new(v));
                         out.entry(recv.id.clone())
                             .and_modify(|e| *e = unify(e.clone(), ty.clone()))
@@ -797,7 +811,10 @@ fn collect_use_suggestions(
                     // d.get(k) read pins the key type.
                     "get" => {
                         if let Some(arg) = call.args.first() {
-                            let k = resolve_type(arg, info);
+                            let k = match resolve_type(arg, info) {
+                                TypeInfo::StrRef => TypeInfo::String,
+                                other => other,
+                            };
                             let t = TypeInfo::Dict(
                                 Box::new(k),
                                 Box::new(TypeInfo::PyObject),
@@ -812,17 +829,32 @@ fn collect_use_suggestions(
                     "append" | "push" => {
                         if let Some(arg) = call.args.first() {
                             let t = resolve_type(arg, info);
+                            let suggestion = TypeInfo::Vec(Box::new(t));
                             out.entry(recv.id.clone())
-                                .and_modify(|e| *e = unify(e.clone(), t.clone()))
-                                .or_insert(TypeInfo::Vec(Box::new(t)));
+                                .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
+                                .or_insert(suggestion);
+                        }
+                    }
+                    // `xs.extend(ys)` pins xs's element type to ys's.
+                    "extend" => {
+                        if let Some(arg) = call.args.first() {
+                            let t = match resolve_type(arg, info) {
+                                TypeInfo::Vec(e) => *e,
+                                other => other,
+                            };
+                            let suggestion = TypeInfo::Vec(Box::new(t));
+                            out.entry(recv.id.clone())
+                                .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
+                                .or_insert(suggestion);
                         }
                     }
                     "insert" => {
                         if let Some(arg) = call.args.get(1) {
                             let t = resolve_type(arg, info);
+                            let suggestion = TypeInfo::Vec(Box::new(t));
                             out.entry(recv.id.clone())
-                                .and_modify(|e| *e = unify(e.clone(), t.clone()))
-                                .or_insert(TypeInfo::Vec(Box::new(t)));
+                                .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
+                                .or_insert(suggestion);
                         }
                     }
                     _ => {}

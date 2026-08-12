@@ -108,33 +108,45 @@ impl<'a> CodeGen for Assign {
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         // `x = []` / `x = {}` with a pinned element type (from a later
-        // append/insert/indexed-store/use): render the empty literal with
-        // explicit types so the store does not poison the binding with an
-        // unconstrained Vec<_>/PyDict<_, _> that rustc then rejects at the
-        // first use.
+        // append/insert/indexed-store/use, or a later typed assignment):
+        // render the empty literal with explicit types so the store does
+        // not poison the binding with an unconstrained Vec<_>/PyDict<_, _>
+        // that rustc then rejects at the first use. An empty literal that
+        // was never pinned is a loud conversion-time error (issue #77)
+        // rather than a cryptic rustc mismatch inside generated code.
         if let [ExprType::Name(name)] = self.targets.as_slice() {
-            let pinned = options.empty_pinned.get(&name.id).cloned();
-            if let Some(pinned) = pinned {
-                let empty_literal = match &value_expr {
-                    ExprType::List(l) if l.is_empty() => true,
-                    ExprType::Dict(d) if d.keys.is_empty() => true,
-                    _ => false,
-                };
-                if empty_literal {
-                    // The turbofish names the ELEMENT type, not the whole
-                    // container: Vec<f64> is `Vec::<f64>::new()`, PyDict
-                    // takes its key/value types directly.
-                    match &pinned {
-                        crate::TypeInfo::Vec(inner) => {
-                            let t = inner.to_rust_type();
-                            value = quote!(Vec::<#t>::new());
-                        }
-                        crate::TypeInfo::Dict(k, v) => {
-                            let k = k.to_rust_type();
-                            let v = v.to_rust_type();
-                            value = quote!(PyDict::<#k, #v>::from([]));
-                        }
-                        _ => {}
+            let empty_literal = match &value_expr {
+                ExprType::List(l) if l.is_empty() => true,
+                ExprType::Dict(d) if d.keys.is_empty() => true,
+                _ => false,
+            };
+            if empty_literal {
+                // name_types carries the FINAL per-name type: later typed
+                // assignments and pinning uses both refine it, so an empty
+                // store is rendered against the binding's final type.
+                let pinned = options.name_types.get(&name.id).cloned();
+                match pinned {
+                    Some(crate::TypeInfo::Vec(inner)) if !matches!(*inner, crate::TypeInfo::PyObject) => {
+                        let t = inner.to_rust_type();
+                        value = quote!(Vec::<#t>::new());
+                    }
+                    Some(crate::TypeInfo::Dict(k, v))
+                        if !matches!(*k, crate::TypeInfo::PyObject)
+                            && !matches!(*v, crate::TypeInfo::PyObject) =>
+                    {
+                        let k = k.to_rust_type();
+                        let v = v.to_rust_type();
+                        value = quote!(PyDict::<#k, #v>::from([]));
+                    }
+                    Some(_) | None => {
+                        return Err(format!(
+                            "empty container literal has no inferable element type; \
+                             annotate the variable (e.g. `{}: list[float] = []` or \
+                             `{}: dict[str, int] = {{}}`) or add a use that pins \
+                             the type (`{}.append(...)`, `{}[k] = v`)",
+                            name.id, name.id, name.id, name.id
+                        )
+                        .into());
                     }
                 }
             }
@@ -203,9 +215,31 @@ impl<'a> CodeGen for Assign {
             )?;
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
-                    let index = index
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    // String-keyed dicts store `&str` indexes through
+                    // py_set_index(String, V), so a &str literal index is
+                    // owned at the store site.
+                    let string_keyed = matches!(
+                        sub.value.as_ref(),
+                        ExprType::Name(n)
+                            if matches!(
+                                options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Dict(k, _))
+                                    if matches!(**k, crate::TypeInfo::String)
+                            )
+                    );
+                    let index = if string_keyed {
+                        crate::render_typed(
+                            index,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?
+                    } else {
+                        index
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    };
                     Ok(quote!((#receiver).py_set_index(#index, #value)?;))
                 }
                 crate::SubscriptKind::Slice { .. } => Err(
@@ -230,21 +264,21 @@ impl<'a> CodeGen for Assign {
             // Option-slot lowering, which passes Option values through,
             // wraps plain values in Some, and handles conditional arms
             // independently (`x if c else None`).
-            if let ExprType::Name(name) = &self.targets[0] {
-                if options.optional_names.contains(&name.id) {
-                    let target_code = self.targets[0].clone().to_rust(
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?;
-                    let value = crate::lower_optional_value(
-                        &value_expr,
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?;
-                    return Ok(quote!(#target_code = #value;));
-                }
+            if let ExprType::Name(name) = &self.targets[0]
+                && options.optional_names.contains(&name.id)
+            {
+                let target_code = self.targets[0].clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                let value = crate::lower_optional_value(
+                    &value_expr,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                return Ok(quote!(#target_code = #value;));
             }
             render(&self.targets[0], &value)
         } else {

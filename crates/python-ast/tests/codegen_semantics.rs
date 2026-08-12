@@ -126,6 +126,105 @@ fn single_use_name_is_not_cloned() {
 }
 
 #[test]
+fn unused_loop_index_lowers_to_underscore() {
+    // Issue #101: an index that is never read in the body must not emit a
+    // Rust binding rustc warns about.
+    let out = compile(
+        "def f() -> int:\n\
+         \x20   total = 0\n\
+         \x20   for i in range(3):\n\
+         \x20       total += 1\n\
+         \x20   return total\n",
+        "issue101.py",
+    );
+    assert!(
+        out.contains("for _ in range"),
+        "unused index must lower to `_`: {}",
+        out
+    );
+    // ...while a used index keeps its name.
+    let out = compile(
+        "def f(x: list[int]) -> int:\n\
+         \x20   total = 0\n\
+         \x20   for i in range(len(x)):\n\
+         \x20       total += x[i]\n\
+         \x20   return total\n",
+        "issue101b.py",
+    );
+    assert!(
+        out.contains("for i in range"),
+        "used index keeps its name: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_list_pinned_by_append_is_typed() {
+    // Issue #77 companion: `xs = []` + `xs.append(v)` pins the element
+    // type from the append, so the empty literal is rendered typed.
+    let out = compile(
+        "def f() -> list[int]:\n\
+         \x20   xs = []\n\
+         \x20   xs.append(1)\n\
+         \x20   return xs\n",
+        "emptyappend.py",
+    );
+    assert!(
+        out.contains("Vec :: < i64 > :: new ()"),
+        "empty list must be pinned from append: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_list_pinned_by_extend_is_typed() {
+    // `xs = []` + `xs.extend(ys)` pins the element type from the extended
+    // container — including when append and extend both contribute.
+    let out = compile(
+        "def f(rows: list[list[int]]) -> list[int]:\n\
+         \x20   out = []\n\
+         \x20   out.append(1)\n\
+         \x20   out.extend(rows[0])\n\
+         \x20   return out\n",
+        "emptyextend.py",
+    );
+    assert!(
+        out.contains("Vec :: < i64 > :: new ()"),
+        "empty list must be pinned from extend: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_dict_pinned_by_subscript_store_is_typed() {
+    let out = compile(
+        "def f() -> dict[str, int]:\n\
+         \x20   d = {}\n\
+         \x20   d[\"k\"] = 1\n\
+         \x20   return d\n",
+        "emptydict.py",
+    );
+    assert!(
+        out.contains("PyDict :: < String , i64 > :: from"),
+        "empty dict must be pinned from subscript store: {}",
+        out
+    );
+}
+
+#[test]
+fn unpinned_empty_container_is_a_loud_error() {
+    // Issue #77: `x = []` with no use that could pin the element type is
+    // a conversion-time error with a helpful message, not a cryptic rustc
+    // "type annotations needed" inside generated code.
+    let err = compile_err("def f():\n    x = []\n    return x\n", "issue77.py");
+    assert!(
+        err.contains("no inferable element type"),
+        "expected loud empty-container error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn rust_keywords_are_escaped() {
     let out = compile("type = 5", "kw.py");
     assert!(out.contains("r#type"), "generated: {}", out);
@@ -923,8 +1022,14 @@ fn subscripts_lower_through_py_index() {
     assert!(!out.contains("py_index (0) ? ="), "generated: {}", out);
 
     // Dict stores insert; catchable KeyError on reads comes from PyIndex.
+    // String-keyed dicts own the key at the store site (py_set_index
+    // takes String for PyDict<String, V>); reads take &str.
     let out = compile("def f():\n    d = {\"a\": 1}\n    d[\"b\"] = 2\n    return d[\"a\"]\n", "dictsub.py");
-    assert!(out.contains("py_set_index (\"b\" , 2) ?"), "generated: {}", out);
+    assert!(
+        out.contains("py_set_index ((\"b\") . to_string () , 2) ?"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("py_index (\"a\") ?"), "generated: {}", out);
 }
 
@@ -1043,17 +1148,18 @@ fn dict_literals_and_methods_lower_through_pydict() {
         "    return x + y + z\n",
     );
     let out = compile(src, "dictops.py");
-    assert!(out.contains("py_get_default (& (\"a\") , 0)"), "generated: {}", out);
-    assert!(out.contains("py_pop (\"a\") ?"), "generated: {}", out);
-    assert!(out.contains("py_pop_default (\"gone\" , 9)"), "generated: {}", out);
-    assert!(out.contains("py_setdefault (\"b\" , 2)"), "generated: {}", out);
+    assert!(out.contains("py_get_default (& ((\"a\") . to_string ()) , 0)"), "generated: {}", out);
+    assert!(out.contains("py_pop ((\"a\") . to_string ()) ?"), "generated: {}", out);
+    assert!(out.contains("py_pop_default ((\"gone\") . to_string () , 9)"), "generated: {}", out);
+    assert!(out.contains("py_setdefault ((\"b\") . to_string () , 2)"), "generated: {}", out);
     assert!(out.contains("py_keys ()"), "generated: {}", out);
     assert!(out.contains("py_values ()"), "generated: {}", out);
     assert!(out.contains("py_items ()"), "generated: {}", out);
 
-    // get with one argument returns an Option (value-or-None).
+    // get with one argument returns an Option (value-or-None). Dict keys
+    // are String (literal or annotation), so literal keys are owned.
     let out = compile("def g(d: dict[str, int]):\n    v = d.get(\"k\")\n", "dictget.py");
-    assert!(out.contains("py_get (& (\"k\"))"), "generated: {}", out);
+    assert!(out.contains("py_get (& ((\"k\") . to_string ()))"), "generated: {}", out);
 }
 
 #[test]

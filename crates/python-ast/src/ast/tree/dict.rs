@@ -101,7 +101,15 @@ impl CodeGen for Dict {
         let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {
             None
         } else {
-            Some(k_expected)
+            // Dict keys are String, not &'static str: literal `"a"` keys
+            // must match `dict[str, V]` annotations (IndexMap<String, V>)
+            // and survive past the literal's lifetime. PyIndex<&str> and
+            // PyIndexMut<&str> impls keep `d["a"]` reads working on
+            // String-keyed dicts.
+            Some(match k_expected {
+                crate::TypeInfo::StrRef => crate::TypeInfo::String,
+                other => other,
+            })
         };
         let v_expected = if matches!(v_expected, crate::TypeInfo::PyObject) {
             None

@@ -2152,6 +2152,20 @@ impl<'a> CodeGen for Call {
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?
             };
 
+            // String-keyed dicts (from a literal or a `dict[str, V]`
+            // annotation) take String keys in py_setdefault/py_pop and
+            // &String in py_get/py_get_default/py_contains; literal `"a"`
+            // keys are owned at the call site so the generic impls apply.
+            let string_keyed_dict = matches!(
+                attr.value.as_ref(),
+                ExprType::Name(n)
+                    if matches!(
+                        options.name_types.get(&n.id),
+                        Some(crate::TypeInfo::Dict(k, _))
+                            if matches!(**k, crate::TypeInfo::String)
+                    )
+            );
+
             // list.sort(): in-place, stable, with Python's keyword-only
             // key=/reverse=. Vec's inherent sort demands a total order
             // (rejecting floats), so every shape routes through the
@@ -2470,18 +2484,58 @@ impl<'a> CodeGen for Call {
                 // PyPop trait: list.pop(i) by index (IndexError), dict.pop(k)
                 // by key (KeyError).
                 ("pop", [arg]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_pop(#key)?));
+                    }
                     return Ok(quote!((#receiver).py_pop(#arg)?));
                 }
                 ("pop", [key, default]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_pop_default(#key, #default)));
+                    }
                     return Ok(quote!((#receiver).py_pop_default(#key, #default)));
                 }
                 // dict.get never raises: value-or-None (an Option), or the
                 // provided default. IndexMap's inherent get returns a
                 // borrowed Option, so both forms map to py_ versions.
                 ("get", [key]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_get(&(#key))));
+                    }
                     return Ok(quote!((#receiver).py_get(&(#key))));
                 }
                 ("get", [key, default]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
+                    }
                     return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
                 }
                 // Views materialize as Vecs in insertion order.
@@ -2495,6 +2549,16 @@ impl<'a> CodeGen for Call {
                     return Ok(quote!((#receiver).py_items()));
                 }
                 ("setdefault", [key, default]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_setdefault(#key, #default)));
+                    }
                     return Ok(quote!((#receiver).py_setdefault(#key, #default)));
                 }
                 // list.remove(x) removes by VALUE and raises ValueError;

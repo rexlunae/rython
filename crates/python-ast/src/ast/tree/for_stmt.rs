@@ -71,7 +71,21 @@ impl CodeGen for For {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // An index name that is never read in the body (or else clause)
+        // lowers to `_` so rustc does not warn about the unused binding
+        // (issue #101). The reference check runs before the body is
+        // consumed below.
+        let unused_index = matches!(
+            &self.target,
+            ExprType::Name(n)
+                if !crate::name_referenced_in(&self.body, &n.id)
+                    && !crate::name_referenced_in(&self.orelse, &n.id)
+        );
+        let target = if unused_index {
+            quote!(_)
+        } else {
+            self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+        };
         let iter = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let has_else = !self.orelse.is_empty();

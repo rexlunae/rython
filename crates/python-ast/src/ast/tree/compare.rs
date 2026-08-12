@@ -196,8 +196,52 @@ impl CodeGen for Compare {
                 // Python `in` dispatches on the container: substring for
                 // strings, key lookup for dicts, element lookup for
                 // sequences. The stdpython PyContains trait models that.
-                Compares::In => quote!((#comparator).py_contains(&(#left))),
-                Compares::NotIn => quote!(!(#comparator).py_contains(&(#left))),
+                // String-keyed dicts take &String; literal `"a"` keys are
+                // owned so the generic impl applies.
+                Compares::In => {
+                    if matches!(
+                        comparator_ast,
+                        ExprType::Name(n)
+                            if matches!(
+                                options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Dict(k, _))
+                                    if matches!(**k, crate::TypeInfo::String)
+                            )
+                    ) {
+                        let left = crate::render_typed(
+                            left_ast,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        quote!((#comparator).py_contains(&(#left)))
+                    } else {
+                        quote!((#comparator).py_contains(&(#left)))
+                    }
+                }
+                Compares::NotIn => {
+                    if matches!(
+                        comparator_ast,
+                        ExprType::Name(n)
+                            if matches!(
+                                options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Dict(k, _))
+                                    if matches!(**k, crate::TypeInfo::String)
+                            )
+                    ) {
+                        let left = crate::render_typed(
+                            left_ast,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        quote!(!(#comparator).py_contains(&(#left)))
+                    } else {
+                        quote!(!(#comparator).py_contains(&(#left)))
+                    }
+                }
 
                 _ => return Err(err_from(CompareNotYetImplemented(self)).into()),
             };
