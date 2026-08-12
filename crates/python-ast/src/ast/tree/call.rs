@@ -803,22 +803,32 @@ impl<'a> CodeGen for Call {
             if n.id == "range"
                 && symbols.get("range").is_none()
                 && self.keywords.is_empty()
-                && matches!(self.args.len(), 2 | 3)
+                && matches!(self.args.len(), 1 | 2 | 3)
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {
-                    rendered.push(arg.clone().to_rust(
+                    // Every range argument is an index/step: `range(len(x))`
+                    // passes usize, so coerce to i64 here rather than rely on
+                    // the runtime generic (which fails to resolve for
+                    // expression arguments of unknown type).
+                    rendered.push(crate::render_typed(
+                        arg,
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
+                        Some(crate::TypeInfo::Int),
                     )?);
                 }
-                return Ok(if rendered.len() == 2 {
-                    let (a, b) = (&rendered[0], &rendered[1]);
-                    quote!(range_start_stop(#a, #b))
-                } else {
-                    let (a, b, c) = (&rendered[0], &rendered[1], &rendered[2]);
-                    quote!(range_start_stop_step(#a, #b, #c)?)
+                return Ok(match rendered.len() {
+                    1 => quote!(range(#(#rendered),*)),
+                    2 => {
+                        let (a, b) = (&rendered[0], &rendered[1]);
+                        quote!(range_start_stop(#a, #b))
+                    }
+                    _ => {
+                        let (a, b, c) = (&rendered[0], &rendered[1], &rendered[2]);
+                        quote!(range_start_stop_step(#a, #b, #c)?)
+                    }
                 });
             }
         }
@@ -841,6 +851,9 @@ impl<'a> CodeGen for Call {
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {
+                    // Builtin args are borrowed or copied by the runtime;
+                    // render them plain — clone-on-reuse is only inserted
+                    // for user-function calls, whose params are owned.
                     rendered.push(arg.clone().to_rust(
                         ctx.clone(),
                         options.clone(),
@@ -2625,9 +2638,38 @@ impl<'a> CodeGen for Call {
 
         let mut all_args = Vec::new();
 
+        // When the callee is a user function defined in this module, the
+        // direct-call path (simple signature, matching arity, no mapping)
+        // still needs param-aware lowering: coerce to the parameter's
+        // annotated type and clone non-Copy names that are reused later
+        // (`f(x); g(x)` — Python shares by reference, Rust moves).
+        let pos_params: Vec<&crate::Parameter> = match &callee {
+            Some(f) => f
+                .args
+                .posonlyargs
+                .iter()
+                .chain(f.args.args.iter())
+                .collect(),
+            None => Vec::new(),
+        };
+
         // Add positional arguments
-        for arg in self.args {
-            let rust_arg = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        for (i, arg) in self.args.into_iter().enumerate() {
+            let rust_arg = if let Some(param) = pos_params.get(i) {
+                let expected = param
+                    .annotation
+                    .as_deref()
+                    .and_then(crate::call_arg_expected_type);
+                crate::render_typed_reused(
+                    &arg,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    expected,
+                )?
+            } else {
+                arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            };
             all_args.push(rust_arg);
         }
         
@@ -3069,7 +3111,21 @@ fn map_call_arguments(
         if optional {
             crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())
         } else {
-            expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+            // Type-aware lowering: coerce the argument to the parameter's
+            // annotated type (usize → i64, i64 → f64) and clone non-Copy
+            // names that are reused later (Python shares by reference;
+            // Rust moves).
+            let expected = param
+                .annotation
+                .as_deref()
+                .and_then(crate::call_arg_expected_type);
+            crate::render_typed_reused(
+                expr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                expected,
+            )
         }
     };
 

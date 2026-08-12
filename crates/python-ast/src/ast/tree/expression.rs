@@ -248,17 +248,67 @@ impl<'a> CodeGen for ExprType {
             ExprType::JoinedStr(js) => js.to_rust(ctx, options, symbols),
             ExprType::FormattedValue(fv) => fv.to_rust(ctx, options, symbols),
             ExprType::List(l) => {
-                let mut elements = Vec::new();
+                // Type-aware list lowering: infer the element type across
+                // the literal, then coerce each element to it —
+                // `[1, 2.0]` → `Vec<f64>` with `1 as f64`, `["a", s]` →
+                // `Vec<String>` with `"a".to_string()`. Incompatible kinds
+                // ([1, "a"]) are a loud conversion-time error rather than
+                // a cryptic rustc mismatch inside generated code.
                 let mut has_starred = false;
-                
-                for li in l {
-                    let code = li
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    
-                    // Check if this is a starred expression
+                let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
+                for li in &l {
                     if matches!(li, ExprType::Starred(_)) {
                         has_starred = true;
+                    }
+                    let t = crate::infer_type(&li, &options, &symbols);
+                    if !matches!(t, crate::TypeInfo::PyObject) {
+                        elt_types.push(t);
+                    }
+                }
+                let mut expected = crate::TypeInfo::PyObject;
+                let mut distinct: Vec<crate::TypeInfo> = Vec::new();
+                for t in &elt_types {
+                    if !distinct.contains(t) {
+                        distinct.push(t.clone());
+                    }
+                    expected = crate::unify(expected, t.clone());
+                }
+                if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {
+                    let kinds = distinct
+                        .iter()
+                        .map(|d| d.display())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "list literal mixes incompatible element types ({kinds}); \
+                         elements must share a common type (or annotate the \
+                         variable, e.g. `xs: list[float] = [...]`)"
+                    )
+                    .into());
+                }
+                let expected_elt = if matches!(expected, crate::TypeInfo::PyObject) {
+                    None
+                } else {
+                    Some(expected)
+                };
+
+                let mut elements = Vec::new();
+                for li in l {
+                    let code = if matches!(li, ExprType::Starred(_)) {
+                        li.clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    } else {
+                        crate::render_typed(
+                            &li,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            expected_elt.clone(),
+                        )?
+                    };
+
+                    // Check if this is a starred expression
+                    if matches!(li, ExprType::Starred(_)) {
                         let code_str = code.to_string();
                         // Special handling for sys::argv unpacking
                         if code_str.contains("sys :: argv") {

@@ -140,7 +140,16 @@ impl CodeGen for Subscript {
             // Python index rules via PyIndex: negatives from the end, a
             // catchable IndexError/KeyError instead of a Rust panic.
             SubscriptKind::Index(index) => {
-                let index = index.to_rust(ctx, options, symbols)?;
+                // Context-aware: indices are i64. `len(x)` yields usize and
+                // `xs[len(xs) - 1]` yields i64, so coerce usize → i64 here
+                // rather than depend on the runtime generic.
+                let index = crate::render_typed(
+                    &index,
+                    ctx,
+                    options,
+                    symbols,
+                    Some(crate::TypeInfo::Int),
+                )?;
                 Ok(quote! { (#value).py_index(#index)? })
             }
             // Slices clamp and never raise.

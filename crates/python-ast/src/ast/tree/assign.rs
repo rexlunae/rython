@@ -103,9 +103,42 @@ impl<'a> CodeGen for Assign {
         let value_is_none_early = crate::is_none_expr(&self.value);
         let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
         let value_expr = self.value.clone();
-        let value = self
+        let mut value = self
             .value
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
+        // `x = []` / `x = {}` with a pinned element type (from a later
+        // append/insert/indexed-store/use): render the empty literal with
+        // explicit types so the store does not poison the binding with an
+        // unconstrained Vec<_>/PyDict<_, _> that rustc then rejects at the
+        // first use.
+        if let [ExprType::Name(name)] = self.targets.as_slice() {
+            let pinned = options.empty_pinned.get(&name.id).cloned();
+            if let Some(pinned) = pinned {
+                let empty_literal = match &value_expr {
+                    ExprType::List(l) if l.is_empty() => true,
+                    ExprType::Dict(d) if d.keys.is_empty() => true,
+                    _ => false,
+                };
+                if empty_literal {
+                    // The turbofish names the ELEMENT type, not the whole
+                    // container: Vec<f64> is `Vec::<f64>::new()`, PyDict
+                    // takes its key/value types directly.
+                    match &pinned {
+                        crate::TypeInfo::Vec(inner) => {
+                            let t = inner.to_rust_type();
+                            value = quote!(Vec::<#t>::new());
+                        }
+                        crate::TypeInfo::Dict(k, v) => {
+                            let k = k.to_rust_type();
+                            let v = v.to_rust_type();
+                            value = quote!(PyDict::<#k, #v>::from([]));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // Render one assignment for a single target. Python variables are
         // function-scoped, so name targets are declared once (hoisted to a

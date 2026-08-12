@@ -39,6 +39,93 @@ fn list_literals_keep_element_types() {
 }
 
 #[test]
+fn range_over_len_coerces_usize_to_i64() {
+    // Issue #100: len() yields usize but range() wants i64; the generated
+    // code must convert, not rely on a generic that fails to resolve for
+    // expression arguments.
+    let out = compile(
+        "def forward(x: list[float]) -> list[float]:\n\
+         \x20   result: list[float] = []\n\
+         \x20   for j in range(len(x)):\n\
+         \x20       result.append(x[j])\n\
+         \x20   return result\n",
+        "issue100.py",
+    );
+    assert!(
+        out.contains("try_into () . unwrap ()"),
+        "len() must convert usize → i64: {}",
+        out
+    );
+    assert!(
+        out.contains("Vec :: < f64 > :: new ()"),
+        "empty list must be pinned from the append: {}",
+        out
+    );
+}
+
+#[test]
+fn mixed_numeric_list_unifies_to_float() {
+    // [1, 2.0] is Vec<f64> in Rust; the int literal must be coerced.
+    let out = compile("xs = [1, 2.0, 3]", "mixed.py");
+    assert!(
+        out.contains("as f64"),
+        "int element must coerce to f64: {}",
+        out
+    );
+}
+
+#[test]
+fn incompatible_list_elements_are_a_loud_error() {
+    let err = compile_err("[1, 'a']", "badlist.py");
+    assert!(
+        err.contains("mixes incompatible element types"),
+        "expected loud conversion error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn reused_name_argument_is_cloned() {
+    // Issue #102: parameters lower to owned values, so a name passed to a
+    // user function twice must be cloned on each call (Python shares by
+    // reference; Rust moves).
+    let out = compile(
+        "def forward(x: list[float]) -> list[float]:\n\
+         \x20   return x\n\n\
+         def test() -> list[float]:\n\
+         \x20   x: list[float] = [1.0, 2.0]\n\
+         \x20   out1: list[float] = forward(x)\n\
+         \x20   out2: list[float] = forward(x)\n\
+         \x20   return out2\n",
+        "issue102.py",
+    );
+    let clones = out.matches("clone ()").count();
+    assert!(
+        clones >= 2,
+        "reused owned name must be cloned per call, got {} clones: {}",
+        clones,
+        out
+    );
+}
+
+#[test]
+fn single_use_name_is_not_cloned() {
+    let out = compile(
+        "def forward(x: list[float]) -> list[float]:\n\
+         \x20   return x\n\n\
+         def test() -> list[float]:\n\
+         \x20   x: list[float] = [1.0, 2.0]\n\
+         \x20   return forward(x)\n",
+        "singleuse.py",
+    );
+    assert!(
+        !out.contains("clone ()"),
+        "single-use name must not be cloned: {}",
+        out
+    );
+}
+
+#[test]
 fn rust_keywords_are_escaped() {
     let out = compile("type = 5", "kw.py");
     assert!(out.contains("r#type"), "generated: {}", out);

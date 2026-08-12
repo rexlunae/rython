@@ -49,12 +49,83 @@ impl CodeGen for Dict {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut pairs = Vec::new();
-        
+        // Type-aware dict lowering: infer the key/value types across the
+        // literal and coerce each pair to them, so `{1: 'a', 2: b}`
+        // becomes PyDict<i64, String> with the string literal owned.
+        let mut k_expected = crate::TypeInfo::PyObject;
+        let mut v_expected = crate::TypeInfo::PyObject;
+        let mut k_distinct: Vec<crate::TypeInfo> = Vec::new();
+        let mut v_distinct: Vec<crate::TypeInfo> = Vec::new();
+        for (key, value) in self.keys.iter().zip(self.values.iter()) {
+            if let Some(k) = key {
+                let kt = crate::infer_type(k, &options, &symbols);
+                if !matches!(kt, crate::TypeInfo::PyObject) {
+                    if !k_distinct.contains(&kt) {
+                        k_distinct.push(kt.clone());
+                    }
+                    k_expected = crate::unify(k_expected, kt);
+                }
+            }
+            let vt = crate::infer_type(value, &options, &symbols);
+            if !matches!(vt, crate::TypeInfo::PyObject) {
+                if !v_distinct.contains(&vt) {
+                    v_distinct.push(vt.clone());
+                }
+                v_expected = crate::unify(v_expected, vt);
+            }
+        }
+        if k_distinct.len() > 1 && matches!(k_expected, crate::TypeInfo::PyObject) {
+            let kinds = k_distinct
+                .iter()
+                .map(|d| d.display())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "dict literal mixes incompatible key types ({kinds}); keys must \
+                 share a common type"
+            )
+            .into());
+        }
+        if v_distinct.len() > 1 && matches!(v_expected, crate::TypeInfo::PyObject) {
+            let kinds = v_distinct
+                .iter()
+                .map(|d| d.display())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "dict literal mixes incompatible value types ({kinds}); values \
+                 must share a common type"
+            )
+            .into());
+        }
+        let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {
+            None
+        } else {
+            Some(k_expected)
+        };
+        let v_expected = if matches!(v_expected, crate::TypeInfo::PyObject) {
+            None
+        } else {
+            Some(v_expected)
+        };
+
         for (key, value) in self.keys.iter().zip(self.values.iter()) {
             match key {
                 Some(k) => {
-                    let key_tokens = k.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    let value_tokens = value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let key_tokens = crate::render_typed(
+                        k,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        k_expected.clone(),
+                    )?;
+                    let value_tokens = crate::render_typed(
+                        value,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        v_expected.clone(),
+                    )?;
                     pairs.push(quote! { (#key_tokens, #value_tokens) });
                 }
                 None => {

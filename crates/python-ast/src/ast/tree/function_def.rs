@@ -736,6 +736,69 @@ impl CodeGen for FunctionDef {
             }
             options.local_types = std::rc::Rc::new(known);
         }
+        // Type-aware lowering context for the body: read-use counts (for
+        // clone-on-reuse), inferred name types, and empty-container types
+        // pinned by later use. Annotation-derived types win over
+        // assignment-inferred ones, matching local_types above.
+        {
+            let mut info = crate::analyze_function_types(&effective_body);
+            for p in self
+                .args
+                .args
+                .iter()
+                .chain(self.args.posonlyargs.iter())
+                .chain(self.args.kwonlyargs.iter())
+            {
+                if let Some(ann) = p.annotation.as_deref() {
+                    // Scalar annotations map directly; container
+                    // annotations (`list[float]`, `dict[str, int]`,
+                    // `Optional[str]`) arrive as Subscript expressions.
+                    match ann {
+                        ExprType::Name(n) => match n.id.as_str() {
+                            "int" => {
+                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::Int);
+                            }
+                            "float" => {
+                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::Float);
+                            }
+                            "bool" => {
+                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bool);
+                            }
+                            "str" => {
+                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::String);
+                            }
+                            "bytes" => {
+                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bytes);
+                            }
+                            _ => {}
+                        },
+                        other => {
+                            if let Some(t) = crate::annotation_type_info(other) {
+                                info.name_types.insert(p.arg.clone(), t);
+                            }
+                        }
+                    }
+                }
+            }
+            options.use_counts = std::rc::Rc::new(info.use_counts);
+            options.name_types = std::rc::Rc::new(info.name_types);
+            options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
+        }
+        // Empty-container pinning needs the parameter annotations above,
+        // so re-run the pin pass now that name_types knows the params
+        // (`xs.append(x[0])` can resolve x's element type from its
+        // `list[float]` annotation).
+        {
+            let mut info = crate::FunctionTypeInfo {
+                use_counts: options.use_counts.as_ref().clone(),
+                name_types: options.name_types.as_ref().clone(),
+                empty_pinned: options.empty_pinned.as_ref().clone(),
+            };
+            crate::pin_empty_containers(&effective_body, &mut info);
+            options.use_counts = std::rc::Rc::new(info.use_counts);
+            options.name_types = std::rc::Rc::new(info.name_types);
+            options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
+        }
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self
