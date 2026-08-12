@@ -176,14 +176,17 @@ pub(crate) fn analyze_scope_with(
     // First pass: collect every name the body assigns, so the closure
     // boundaries in the analysis pass know the full name set (a name first
     // assigned *inside* a try body is not yet in `assigned` when the
-    // boundary runs).
+    // boundary runs). The collector uses a no-op resolver: only the
+    // `assigned` list is read back, and consulting the real resolver here
+    // would poison its cycle-guard `visited` set for the analysis pass.
+    let noop_resolve = |_: &crate::Call| -> Option<bool> { None };
     let mut collector = Analysis {
         assigned: Vec::new(),
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
         state: HashMap::new(),
-        resolve_call,
+        resolve_call: &noop_resolve,
     };
     walk_stmts(body, &mut collector, false);
 

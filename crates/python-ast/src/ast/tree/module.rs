@@ -642,7 +642,14 @@ fn hoisted_declarations(
         }
         let ident = crate::safe_ident(name);
         if scope.needs_mut.contains(name) {
-            out.extend(quote!(let mut #ident;));
+            if scope.closure_captured_uninit.contains(name) {
+                // Captured by a generated try/handler closure while possibly
+                // uninitialized: Default-initialize so rustc accepts the
+                // capture (issue #78).
+                out.extend(quote!(let mut #ident = Default::default();));
+            } else {
+                out.extend(quote!(let mut #ident;));
+            }
         } else {
             out.extend(quote!(let #ident;));
         }
