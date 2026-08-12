@@ -856,7 +856,16 @@ impl CodeGen for FunctionDef {
         for name in &scope.assigned {
             let ident = crate::safe_ident(name);
             if scope.needs_mut.contains(name) {
-                streams_prologue.extend(quote!(let mut #ident;));
+                if scope.closure_captured_uninit.contains(name) {
+                    // The name is captured by a generated closure (try body,
+                    // or finally-guarded handler/else body) while possibly
+                    // uninitialized: a bare `let mut x;` would be rejected
+                    // by rustc's E0381. Default-initialize so the capture
+                    // is legal; the real value is stored on the happy path.
+                    streams_prologue.extend(quote!(let mut #ident = Default::default();));
+                } else {
+                    streams_prologue.extend(quote!(let mut #ident;));
+                }
             } else {
                 streams_prologue.extend(quote!(let #ident;));
             }

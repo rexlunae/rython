@@ -30,6 +30,12 @@ pub struct ScopeBindings {
     /// Names assigned `None` on some path: they hold an Option, and every
     /// non-None store into them wraps in `Some`.
     pub optional: HashSet<String>,
+    /// Names that are possibly-uninitialized where a generated closure is
+    /// created (try-body, and finally-guarded handler/else bodies). rustc
+    /// rejects capturing a possibly-uninitialized variable (E0381), so the
+    /// hoisted declaration for these names gets a `Default::default()`
+    /// initializer instead of a bare `let mut x;` (issue #78).
+    pub closure_captured_uninit: HashSet<String>,
 }
 
 /// How definitely a variable holds a value at a program point.
@@ -77,6 +83,7 @@ struct Analysis<'r> {
     assigned: Vec<String>,
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
+    closure_captured_uninit: HashSet<String>,
     state: HashMap<String, Init>,
     /// Classifies a method call's effect on its receiver when the
     /// receiver's class is statically known: Some(needs_mut) resolves the
@@ -101,6 +108,18 @@ impl Analysis<'_> {
             self.needs_mut.insert(name.to_string());
         }
         self.state.insert(name.to_string(), Init::Yes);
+    }
+
+    /// A generated closure is about to run over `entry_state`: every name
+    /// that is not definitely initialized there will be captured
+    /// possibly-uninitialized, which rustc rejects (E0381). Record them so
+    /// the hoist can give them a Default initializer.
+    fn record_closure_boundary(&mut self, entry_state: &HashMap<String, Init>) {
+        for name in &self.assigned {
+            if entry_state.get(name).copied().unwrap_or(Init::No) != Init::Yes {
+                self.closure_captured_uninit.insert(name.clone());
+            }
+        }
     }
 
     /// The variable is mutated in place (aug-assign, store-through, or a
@@ -154,10 +173,25 @@ pub(crate) fn analyze_scope_with(
     initialized: &[String],
     resolve_call: &dyn Fn(&crate::Call) -> Option<bool>,
 ) -> ScopeBindings {
-    let mut a = Analysis {
+    // First pass: collect every name the body assigns, so the closure
+    // boundaries in the analysis pass know the full name set (a name first
+    // assigned *inside* a try body is not yet in `assigned` when the
+    // boundary runs).
+    let mut collector = Analysis {
         assigned: Vec::new(),
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
+        closure_captured_uninit: HashSet::new(),
+        state: HashMap::new(),
+        resolve_call,
+    };
+    walk_stmts(body, &mut collector, false);
+
+    let mut a = Analysis {
+        assigned: collector.assigned.clone(),
+        needs_mut: HashSet::new(),
+        optional: HashSet::new(),
+        closure_captured_uninit: HashSet::new(),
         state: initialized
             .iter()
             .map(|n| (n.clone(), Init::Yes))
@@ -175,6 +209,7 @@ pub(crate) fn analyze_scope_with(
         assigned,
         needs_mut: a.needs_mut,
         optional: a.optional,
+        closure_captured_uninit: a.closure_captured_uninit,
     }
 }
 
@@ -307,11 +342,20 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 // The try body runs inside a closure; stores there behave
                 // like multi-execution stores (they mutate captured state).
                 let before = a.state.clone();
+                a.record_closure_boundary(&before);
                 walk_stmts(&s.body, a, true);
                 let after_body = a.state.clone();
                 // Handlers may run with the body only partially executed.
                 let handler_entry =
                     merge_states(vec![before, after_body.clone()]);
+                // With a finally clause the handler and else bodies also run
+                // in closures (so a return/raise still executes finally):
+                // their entry state may still be uninitialized for names
+                // first assigned inside the try statement.
+                if !s.finalbody.is_empty() {
+                    a.record_closure_boundary(&handler_entry);
+                    a.record_closure_boundary(&after_body);
+                }
                 let mut exits = Vec::new();
                 for handler in &s.handlers {
                     a.state = handler_entry.clone();

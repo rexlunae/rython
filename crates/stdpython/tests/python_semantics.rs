@@ -48,23 +48,31 @@ fn float_str_keeps_decimal() {
 #[test]
 fn floordiv_and_mod_follow_divisor_sign() {
     // Python: -7 // 2 == -4, -7 % 2 == 1
-    assert_eq!(py_floordiv(-7i64, 2), -4);
-    assert_eq!(py_mod(-7i64, 2), 1);
+    assert_eq!(py_floordiv(-7i64, 2).unwrap(), -4);
+    assert_eq!(py_mod(-7i64, 2).unwrap(), 1);
     // Python: 7 // -2 == -4, 7 % -2 == -1
-    assert_eq!(py_floordiv(7i64, -2), -4);
-    assert_eq!(py_mod(7i64, -2), -1);
+    assert_eq!(py_floordiv(7i64, -2).unwrap(), -4);
+    assert_eq!(py_mod(7i64, -2).unwrap(), -1);
     // Positive operands match Rust.
-    assert_eq!(py_floordiv(7i64, 2), 3);
-    assert_eq!(py_mod(7i64, 2), 1);
+    assert_eq!(py_floordiv(7i64, 2).unwrap(), 3);
+    assert_eq!(py_mod(7i64, 2).unwrap(), 1);
     // Floats: -7.0 // 2.0 == -4.0
-    assert_eq!(py_floordiv(-7.0f64, 2.0), -4.0);
-    assert_eq!(py_mod(-7.0f64, 2.0), 1.0);
+    assert_eq!(py_floordiv(-7.0f64, 2.0).unwrap(), -4.0);
+    assert_eq!(py_mod(-7.0f64, 2.0).unwrap(), 1.0);
+    // A zero divisor raises a catchable ZeroDivisionError (issue #75) —
+    // no panic past try/except.
+    assert_eq!(
+        py_floordiv(1i64, 0).unwrap_err().exception_type,
+        "ZeroDivisionError"
+    );
+    assert_eq!(py_mod(1.0f64, 0.0).unwrap_err().exception_type, "ZeroDivisionError");
 }
 
 #[test]
 fn divmod_matches_python() {
-    assert_eq!(divmod(-7i64, 2), (-4, 1));
-    assert_eq!(divmod(7i64, 2), (3, 1));
+    assert_eq!(divmod(-7i64, 2).unwrap(), (-4, 1));
+    assert_eq!(divmod(7i64, 2).unwrap(), (3, 1));
+    assert_eq!(divmod(1i64, 0).unwrap_err().exception_type, "ZeroDivisionError");
 }
 
 #[test]

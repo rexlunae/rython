@@ -172,17 +172,18 @@ impl CodeGen for BinOp {
 
         // Python's // floors toward negative infinity and % takes the
         // divisor's sign; Rust's / and % truncate. Route through the
-        // stdpython helpers, which implement the Python semantics.
+        // stdpython helpers, which implement the Python semantics. The `?`
+        // propagates a catchable ZeroDivisionError (issue #75).
         if matches!(self.op, BinOps::FloorDiv) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
-            return Ok(quote!(py_floordiv(#left, #right)));
+            return Ok(quote!(py_floordiv(#left, #right)?));
         }
 
         if matches!(self.op, BinOps::Mod) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
-            return Ok(quote!(py_mod(#left, #right)));
+            return Ok(quote!(py_mod(#left, #right)?));
         }
         
         // Python's * repeats sequences when one operand is a string:

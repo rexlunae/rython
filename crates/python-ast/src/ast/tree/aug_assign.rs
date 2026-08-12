@@ -88,10 +88,34 @@ impl CodeGen for AugAssign {
                 options.clone(),
                 symbols.clone(),
             )?;
+            // String-keyed dicts (literal or `dict[str, V]`) store through
+            // py_set_index with an owned String key; literal `"a"` keys
+            // are coerced at the call site like plain stores (assign.rs).
+            let string_keyed_dict = matches!(
+                sub.value.as_ref(),
+                ExprType::Name(n)
+                    if matches!(
+                        options.name_types.get(&n.id),
+                        Some(crate::TypeInfo::Dict(k, _))
+                            if matches!(**k, crate::TypeInfo::String)
+                    )
+            );
             let index = match &sub.kind {
-                crate::SubscriptKind::Index(index) => index
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                crate::SubscriptKind::Index(index) => {
+                    if string_keyed_dict {
+                        crate::render_typed(
+                            index,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?
+                    } else {
+                        index
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    }
+                }
                 crate::SubscriptKind::Slice { .. } => {
                     return Err(
                         "augmented assignment to a slice (`x[a:b] += ...`) is not supported"
@@ -134,9 +158,10 @@ impl CodeGen for AugAssign {
             BinOps::Div => Ok(quote!(#target = py_div(#target, #value))),
             // Python // and % floor toward negative infinity / take the
             // divisor's sign; use the stdpython helpers instead of Rust's
-            // truncating operators.
-            BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target, #value))),
-            BinOps::Mod => Ok(quote!(#target = py_mod(#target, #value))),
+            // truncating operators. The `?` propagates a catchable
+            // ZeroDivisionError (issue #75).
+            BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target, #value)?)),
+            BinOps::Mod => Ok(quote!(#target = py_mod(#target, #value)?)),
             BinOps::BitAnd => Ok(quote!(#target &= #value)),
             BinOps::BitOr => Ok(quote!(#target |= #value)),
             BinOps::BitXor => Ok(quote!(#target ^= #value)),
@@ -170,8 +195,8 @@ fn combine_op(
         BinOps::Sub => quote!(#elem - #value),
         BinOps::Mult => quote!(#elem * #value),
         BinOps::Div => quote!(py_div(#elem, #value)),
-        BinOps::FloorDiv => quote!(py_floordiv(#elem, #value)),
-        BinOps::Mod => quote!(py_mod(#elem, #value)),
+        BinOps::FloorDiv => quote!(py_floordiv(#elem, #value)?),
+        BinOps::Mod => quote!(py_mod(#elem, #value)?),
         BinOps::Pow => quote!(py_pow(#elem, #value)),
         BinOps::BitAnd => quote!(#elem & #value),
         BinOps::BitOr => quote!(#elem | #value),

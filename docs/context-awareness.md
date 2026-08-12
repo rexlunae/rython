@@ -106,3 +106,44 @@ so overflow panics loudly rather than wrapping.
 - Callee-side borrow analysis (emit `&[T]` params for read-only params) is
   left as a future optimization; the caller-side clone is sufficient to
   make the reported programs compile.
+
+## Exception model: ZeroDivisionError and closure captures
+
+Two more roundup issues were the same shape as the rest: codegen produced
+Rust that diverged from Python *silently* (wrong value) or *loudly at the
+wrong place* (an uncatchable panic / a rustc error).
+
+### #75 — `5 // 0` panicked past `try/except`
+
+`PyFloorDiv`/`PyMod` and the free `py_floordiv`/`py_mod` fns returned bare
+values and panicked on a zero divisor; a panic is not a `PyException`, so
+`except ZeroDivisionError` could never match it. The trait methods and free
+fns now return `Result<Self::Output, PyException>`, and every codegen site
+appends `?`:
+
+- `bin_ops.rs` (`//`, `%` expressions),
+- `aug_assign.rs` plain path (`x //= v`) and the `combine_op` subscript path
+  (`d[k] %= v`).
+
+Each emitted context already returns `Result` — generated functions,
+try-body/handler/else closures, and comprehension bodies — so the `?`
+propagates the error to the nearest handler, exactly like `raise`. `divmod`
+returns `Result` too. Numpy floor-div/mod impls wrap in `Ok(...)` (ufuncs
+don't raise on zero).
+
+### #78 — hoisted variable first assigned in a `try` body
+
+Try bodies (and finally-guarded handler/else bodies) lower to closures, and
+a name whose *first* assignment is inside that closure is captured
+possibly-uninitialized — rustc rejects that with E0381 even though the try
+body always runs. `scope.rs` now records, at every closure boundary, the
+names that are not definitely initialized there (`closure_captured_uninit`),
+and the hoist in `function_def.rs` emits `let mut x = Default::default();`
+for exactly those names instead of a bare `let mut x;`. The happy path is
+unchanged; the only divergence left is the narrow
+raise-before-assign-then-catch-then-read case, which would need a full
+`UnboundLocalError` value model to distinguish.
+
+Related gap fixed on the way: `d["a"] %= 0` on a `dict[str, V]` rendered
+the literal key as `&str` where `py_set_index` needs an owned `String`
+(aug_assign now uses `render_typed(expected=String)` like plain stores).

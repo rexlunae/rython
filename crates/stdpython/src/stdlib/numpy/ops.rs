@@ -301,63 +301,63 @@ impl crate::PyDiv<NdArray> for bool {
 
 impl crate::PyFloorDiv<NdArray> for NdArray {
     type Output = NdArray;
-    fn py_floordiv(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::FloorDiv, self.clone(), rhs.clone())
+    fn py_floordiv(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::FloorDiv, self.clone(), rhs.clone()))
     }
 }
 impl crate::PyFloorDiv<i64> for NdArray {
     type Output = NdArray;
-    fn py_floordiv(&self, rhs: &i64) -> NdArray {
-        ufunc::binary(BinOp::FloorDiv, self.clone(), *rhs)
+    fn py_floordiv(&self, rhs: &i64) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::FloorDiv, self.clone(), *rhs))
     }
 }
 impl crate::PyFloorDiv<f64> for NdArray {
     type Output = NdArray;
-    fn py_floordiv(&self, rhs: &f64) -> NdArray {
-        ufunc::binary(BinOp::FloorDiv, self.clone(), *rhs)
+    fn py_floordiv(&self, rhs: &f64) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::FloorDiv, self.clone(), *rhs))
     }
 }
 impl crate::PyFloorDiv<NdArray> for i64 {
     type Output = NdArray;
-    fn py_floordiv(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::FloorDiv, *self, rhs.clone())
+    fn py_floordiv(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::FloorDiv, *self, rhs.clone()))
     }
 }
 impl crate::PyFloorDiv<NdArray> for f64 {
     type Output = NdArray;
-    fn py_floordiv(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::FloorDiv, *self, rhs.clone())
+    fn py_floordiv(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::FloorDiv, *self, rhs.clone()))
     }
 }
 
 impl crate::PyMod<NdArray> for NdArray {
     type Output = NdArray;
-    fn py_mod(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mod, self.clone(), rhs.clone())
+    fn py_mod(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Mod, self.clone(), rhs.clone()))
     }
 }
 impl crate::PyMod<i64> for NdArray {
     type Output = NdArray;
-    fn py_mod(&self, rhs: &i64) -> NdArray {
-        ufunc::binary(BinOp::Mod, self.clone(), *rhs)
+    fn py_mod(&self, rhs: &i64) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Mod, self.clone(), *rhs))
     }
 }
 impl crate::PyMod<f64> for NdArray {
     type Output = NdArray;
-    fn py_mod(&self, rhs: &f64) -> NdArray {
-        ufunc::binary(BinOp::Mod, self.clone(), *rhs)
+    fn py_mod(&self, rhs: &f64) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Mod, self.clone(), *rhs))
     }
 }
 impl crate::PyMod<NdArray> for i64 {
     type Output = NdArray;
-    fn py_mod(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mod, *self, rhs.clone())
+    fn py_mod(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Mod, *self, rhs.clone()))
     }
 }
 impl crate::PyMod<NdArray> for f64 {
     type Output = NdArray;
-    fn py_mod(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mod, *self, rhs.clone())
+    fn py_mod(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Mod, *self, rhs.clone()))
     }
 }
 

@@ -688,16 +688,17 @@ where
 /// Trait backing Python's `//` operator, whose result follows the sign of
 /// the divisor (unlike Rust's truncating `/`). Generic over the operand
 /// types so `NdArray` (numpy `floor_divide`) can participate alongside the
-/// numeric primitives.
+/// numeric primitives. Returns a Result so a zero divisor raises a
+/// catchable ZeroDivisionError instead of panicking past try/except.
 pub trait PyFloorDiv<R: ?Sized> {
     type Output;
-    fn py_floordiv(&self, rhs: &R) -> Self::Output;
+    fn py_floordiv(&self, rhs: &R) -> Result<Self::Output, PyException>;
 }
 
 /// Trait backing Python's `%` operator (result takes the divisor's sign).
 pub trait PyMod<R: ?Sized> {
     type Output;
-    fn py_mod(&self, rhs: &R) -> Self::Output;
+    fn py_mod(&self, rhs: &R) -> Result<Self::Output, PyException>;
 }
 
 /// Trait backing Python's `/` true division (always float) — generic so
@@ -715,99 +716,97 @@ pub trait PyMatMul<R: ?Sized> {
 
 impl PyFloorDiv<i64> for i64 {
     type Output = i64;
-    fn py_floordiv(&self, rhs: &i64) -> i64 {
+    fn py_floordiv(&self, rhs: &i64) -> Result<i64, PyException> {
         if *rhs == 0 {
-            // Rust's `/` panics with its own message, which no
-            // `except ZeroDivisionError` can match.
-            panic!(
-                "{}",
-                PyException::new("ZeroDivisionError", "integer division or modulo by zero")
-            );
+            return Err(PyException::new(
+                "ZeroDivisionError",
+                "integer division or modulo by zero",
+            ));
         }
         let q = *self / *rhs;
         if *self % *rhs != 0 && (*self < 0) != (*rhs < 0) {
-            q - 1
+            Ok(q - 1)
         } else {
-            q
+            Ok(q)
         }
     }
 }
 
 impl PyFloorDiv<f64> for f64 {
     type Output = f64;
-    fn py_floordiv(&self, rhs: &f64) -> f64 {
+    fn py_floordiv(&self, rhs: &f64) -> Result<f64, PyException> {
         if *rhs == 0.0 {
             // Python raises here; returning inf would diverge silently.
-            panic!(
-                "{}",
-                PyException::new("ZeroDivisionError", "float floor division by zero")
-            );
+            return Err(PyException::new(
+                "ZeroDivisionError",
+                "float floor division by zero",
+            ));
         }
-        flt::floor(*self / *rhs)
+        Ok(flt::floor(*self / *rhs))
     }
 }
 
 impl PyFloorDiv<f64> for i64 {
     type Output = f64;
-    fn py_floordiv(&self, rhs: &f64) -> f64 {
+    fn py_floordiv(&self, rhs: &f64) -> Result<f64, PyException> {
         PyFloorDiv::py_floordiv(&(*self as f64), rhs)
     }
 }
 
 impl PyFloorDiv<i64> for f64 {
     type Output = f64;
-    fn py_floordiv(&self, rhs: &i64) -> f64 {
+    fn py_floordiv(&self, rhs: &i64) -> Result<f64, PyException> {
         PyFloorDiv::py_floordiv(self, &(*rhs as f64))
     }
 }
 
 impl PyMod<i64> for i64 {
     type Output = i64;
-    fn py_mod(&self, rhs: &i64) -> i64 {
+    fn py_mod(&self, rhs: &i64) -> Result<i64, PyException> {
         if *rhs == 0 {
-            panic!(
-                "{}",
-                PyException::new("ZeroDivisionError", "integer division or modulo by zero")
-            );
+            return Err(PyException::new(
+                "ZeroDivisionError",
+                "integer division or modulo by zero",
+            ));
         }
         let r = *self % *rhs;
         if r != 0 && (r < 0) != (*rhs < 0) {
-            r + *rhs
+            Ok(r + *rhs)
         } else {
-            r
+            Ok(r)
         }
     }
 }
 
 impl PyMod<f64> for f64 {
     type Output = f64;
-    fn py_mod(&self, rhs: &f64) -> f64 {
+    fn py_mod(&self, rhs: &f64) -> Result<f64, PyException> {
         if *rhs == 0.0 {
-            panic!("{}", PyException::new("ZeroDivisionError", "float modulo"));
+            return Err(PyException::new("ZeroDivisionError", "float modulo"));
         }
         let r = *self % *rhs;
         if r != 0.0 && (r < 0.0) != (*rhs < 0.0) {
-            r + *rhs
+            Ok(r + *rhs)
         } else if r == 0.0 {
             // CPython gives a zero remainder the sign of the DIVISOR:
             // -4.0 % 2.0 is 0.0, and 4.0 % -2.0 is -0.0.
-            flt::copysign(0.0, *rhs)
+            Ok(flt::copysign(0.0, *rhs))
         } else {
-            r
+            Ok(r)
         }
     }
 }
 
 impl PyMod<f64> for i64 {
     type Output = f64;
-    fn py_mod(&self, rhs: &f64) -> f64 {
+    fn py_mod(&self, rhs: &f64) -> Result<f64, PyException> {
         PyMod::py_mod(&(*self as f64), rhs)
     }
 }
 
 impl PyMod<i64> for f64 {
     type Output = f64;
-    fn py_mod(&self, rhs: &i64) -> f64 {
+    fn py_mod(&self, rhs: &i64) -> Result<f64, PyException> {
         PyMod::py_mod(self, &(*rhs as f64))
     }
 }
@@ -859,13 +858,15 @@ impl PyDiv<bool> for bool {
     }
 }
 
-/// Python `//` (floor division): `-7 // 2 == -4`.
-pub fn py_floordiv<L: PyFloorDiv<R>, R>(a: L, b: R) -> L::Output {
+/// Python `//` (floor division): `-7 // 2 == -4`. Raises a catchable
+/// ZeroDivisionError on a zero divisor.
+pub fn py_floordiv<L: PyFloorDiv<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_floordiv(&b)
 }
 
-/// Python `%` (modulo takes the divisor's sign): `-7 % 3 == 2`.
-pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> L::Output {
+/// Python `%` (modulo takes the divisor's sign): `-7 % 3 == 2`. Raises a
+/// catchable ZeroDivisionError on a zero divisor.
+pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_mod(&b)
 }
 
@@ -884,8 +885,8 @@ pub fn py_matmul<L: PyMatMul<R>, R>(a: L, b: R) -> L::Output {
 pub fn divmod<L: PyFloorDiv<R> + PyMod<R>, R>(
     a: L,
     b: R,
-) -> (<L as PyFloorDiv<R>>::Output, <L as PyMod<R>>::Output) {
-    (a.py_floordiv(&b), a.py_mod(&b))
+) -> Result<(<L as PyFloorDiv<R>>::Output, <L as PyMod<R>>::Output), PyException> {
+    Ok((a.py_floordiv(&b)?, a.py_mod(&b)?))
 }
 
 /// Trait backing Python's `**` operator. Integer bases with non-negative

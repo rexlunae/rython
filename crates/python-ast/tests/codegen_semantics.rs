@@ -752,6 +752,73 @@ fn finally_runs_before_reraise() {
 }
 
 #[test]
+fn zero_division_raises_catchable_zero_division_error() {
+    // Issue #75: py_floordiv/py_mod used to panic on a zero divisor, so
+    // `except ZeroDivisionError` could never catch them. They now return
+    // Result and the call sites thread `?`, keeping the error inside the
+    // try-body closure where the handlers can match it.
+    for op in ["//", "%"] {
+        let src = format!(
+            "def f():\n    try:\n        print(5 {op} 0)\n    except ZeroDivisionError:\n        print(\"caught\")\n"
+        );
+        let out = compile(&src, "zero_div.py");
+        assert!(
+            out.contains("py_mod (5 , 0) ?") || out.contains("py_floordiv (5 , 0) ?"),
+            "{} must route through the Result-returning helper with `?`: {}",
+            op,
+            out
+        );
+        assert!(
+            out.contains("__rython_exc . matches (\"ZeroDivisionError\")"),
+            "the handler must match ZeroDivisionError: {}",
+            out
+        );
+    }
+    // The augmented-assignment forms lower through the same helpers.
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        x = 10\n",
+        "        x //= 0\n",
+        "    except ZeroDivisionError:\n",
+        "        print(\"caught\")\n",
+    );
+    let out = compile(src, "zero_div_aug.py");
+    assert!(
+        out.contains("x = py_floordiv (x , 0) ?"),
+        "aug //= must thread `?`: {}",
+        out
+    );
+}
+
+#[test]
+fn hoisted_variable_first_assigned_in_try_body_gets_default_init() {
+    // Issue #78: a variable first assigned inside a try body is captured by
+    // the try-body closure while possibly-uninitialized, which rustc rejects
+    // (E0381). The hoist must give it a Default initializer instead of a
+    // bare `let mut x;`.
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        x = compute()\n",
+        "    finally:\n",
+        "        cleanup()\n",
+        "    print(x)\n",
+    );
+    let out = compile(src, "try_hoist.py");
+    assert!(
+        out.contains("let mut x = Default :: default () ;"),
+        "hoisted capture needs a Default initializer: {}",
+        out
+    );
+    assert!(
+        !out.contains("let mut x ;"),
+        "no bare uninitialized hoist for a closure-captured name: {}",
+        out
+    );
+}
+
+#[test]
 fn finally_runs_before_handler_and_else_returns() {
     // Python: finally always executes before control leaves the try
     // statement — including when an except handler or else clause returns
