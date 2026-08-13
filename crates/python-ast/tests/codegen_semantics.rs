@@ -1600,9 +1600,10 @@ fn keyword_arguments_map_to_parameter_positions() {
     let out = compile(src, "kw.py");
     // Keywords land in signature order regardless of call order; the
     // arguments are bound to temps in SOURCE order first (d=2, w=3, h=4),
-    // then referenced in parameter order (issue #80).
+    // then referenced in parameter order (issue #80). The reordering block
+    // is parenthesized before `?` so it is valid in any position (F9).
     assert!(
-        out.contains("let __rython_arg_0 = 2 ; let __rython_arg_1 = 3 ; let __rython_arg_2 = 4 ; volume (__rython_arg_1 , __rython_arg_2 , __rython_arg_0) } ?"),
+        out.contains("let __rython_arg_0 = 2 ; let __rython_arg_1 = 3 ; let __rython_arg_2 = 4 ; volume (__rython_arg_1 , __rython_arg_2 , __rython_arg_0) }) ?"),
         "generated: {}",
         out
     );
@@ -1622,7 +1623,7 @@ fn omitted_defaults_fill_at_the_call_site() {
     );
     let out = compile(src, "kwdef.py");
     assert!(
-        out.contains("greet (\"world\" , false) } ?"),
+        out.contains("greet (\"world\" , false) }) ?"),
         "generated: {}",
         out
     );
@@ -1630,7 +1631,7 @@ fn omitted_defaults_fill_at_the_call_site() {
     // inlined in parameter position while the keyword is bound to a temp
     // (evaluated in source order, then referenced in parameter order).
     assert!(
-        out.contains("let __rython_arg_0 = true ; greet (\"world\" , __rython_arg_0) } ?"),
+        out.contains("let __rython_arg_0 = true ; greet (\"world\" , __rython_arg_0) }) ?"),
         "keyword for the second param leaves the first defaulted: {}",
         out
     );
@@ -1709,9 +1710,10 @@ fn optional_parameters_wrap_arguments_at_call_sites() {
     );
     let out = compile(src, "optcall.py");
     // All-positional calls emit directly (no reordering): the `?` still
-    // applies to the whole call, now wrapped in the lowering block.
-    assert!(out.contains("{ label (Some (7)) } ?"), "generated: {}", out);
-    assert!(out.contains("{ label (None) } ?"), "generated: {}", out);
+    // applies to the whole call, now wrapped in the lowering block and
+    // parenthesized so it is valid in any position (F9).
+    assert!(out.contains("({ label (Some (7)) }) ?"), "generated: {}", out);
+    assert!(out.contains("({ label (None) }) ?"), "generated: {}", out);
 }
 
 #[test]
@@ -3903,5 +3905,45 @@ fn aliased_import_reassignment_still_shadows() {
     // table, so user code still wins over the module intercept.
     let out = compile("import numpy as np\nnp = 5\nx = np\n", "shadownp.py");
     assert!(!out.contains("numpy :: zeros"), "generated: {}", out);
+}
+
+#[test]
+fn keyword_call_as_statement_keeps_propagation() {
+    // F9: `f(a=1)` on its own line emitted `{...}?` — a bare block with `?`
+    // is not a valid statement (the block's tail value mismatches `()`),
+    // so the generated Rust failed to build. The block must be
+    // parenthesized: `({...})?`, valid in both statement and expression
+    // position.
+    let out = compile(
+        "def f(a: int) -> int:\n    return a\nf(a=1)\n",
+        "kwstmt.py",
+    );
+    assert!(
+        out.contains("({ let __rython_arg_0 = 1 ; f (__rython_arg_0) }) ?"),
+        "generated: {}",
+        out
+    );
+    // The assignment form must keep the same parenthesized shape.
+    let out = compile(
+        "def f(a: int) -> int:\n    return a\ny = f(a=1)\n",
+        "kwexpr.py",
+    );
+    assert!(
+        out.contains("y = ({ let __rython_arg_0 = 1 ; f (__rython_arg_0) }) ?"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn defaulted_call_as_statement_keeps_propagation() {
+    // F9 guard: omitted defaulted parameters go through the same mapping
+    // path, so `f(1)` (with a defaulted `b`) must also build as a statement.
+    let out = compile(
+        "def f(a: int, b: int = 10) -> int:\n    return a + b\nf(1)\n",
+        "defstmt.py",
+    );
+    assert!(out.contains("? ;"), "generated: {}", out);
+    assert!(!out.contains("} ? ;"), "bare block with `?` leaked: {}", out);
 }
 

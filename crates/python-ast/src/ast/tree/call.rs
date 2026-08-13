@@ -2733,7 +2733,13 @@ impl<'a> CodeGen for Call {
                 let name = self.func.to_rust(ctx, options, symbols)?;
                 let call = quote!({ #prelude #name(#(#args),*) });
                 return Ok(if propagates_exceptions {
-                    quote!(#call?)
+                    // Parenthesize before `?`: a bare `{...}?` in statement
+                    // position is not a valid expression statement (the
+                    // block's tail value mismatches `()`), so `f(a=1)` on
+                    // its own line failed to build (Devin review on #103,
+                    // F9). `({...})?` is valid both as a statement and as
+                    // an operand in an assignment/return.
+                    quote!((#call)?)
                 } else {
                     call
                 });
