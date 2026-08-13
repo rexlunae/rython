@@ -206,6 +206,42 @@ impl CodeGen for Module {
             )
         });
 
+        // Pass 1: classify statements so the hoisted-name sets are known
+        // before any statement renders — a `for` target on a name that
+        // leaks out of the loop lowers to a store into the prologue
+        // binding, never a shadowing fresh binding (issue #80). The render
+        // pass below repeats this classification (cheap); the raw lists
+        // drive both the hoisted sets and hoisted_declarations.
+        for s in &self.raw.body {
+            if let crate::StatementType::If(if_stmt) = &s.statement {
+                let test_str = format!("{:?}", if_stmt.test);
+                if test_str.contains("__name__") && test_str.contains("__main__") {
+                    let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body)
+                        && !user_main_returns_value
+                        && options.numpy_backend.is_none();
+                    if !is_simple_main_call {
+                        main_body_raw.extend(if_stmt.body.iter().cloned());
+                    }
+                    continue;
+                }
+            }
+            // Module-level constants are static items, not runtime stores.
+            if let crate::StatementType::Assign(a) = &s.statement {
+                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
+                    if module_assign_counts.get(&n.id) == Some(&1)
+                        && const_static_type(&a.value).is_some()
+                    {
+                        continue;
+                    }
+                }
+            }
+            if !Self::is_declaration_statement(&s.statement) {
+                module_init_raw.push(s.clone());
+            }
+        }
+        let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols);
+        let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols);
+
         for s in self.raw.body {
             // Check if this statement is an async function
             if let crate::StatementType::AsyncFunctionDef(_) = &s.statement {
@@ -231,14 +267,19 @@ impl CodeGen for Module {
                         // Don't collect the main body statements - we'll use user's main directly
                     } else {
                         // This is a complex __name__ == "__main__" block - collect its body for main function
+                        let main_options = {
+                            let mut o = options.clone();
+                            o.hoisted_names = std::rc::Rc::new(main_hoisted.clone());
+                            o.leaked_loop_targets = std::rc::Rc::new(main_leaked.clone());
+                            o
+                        };
                         for body_stmt in &if_stmt.body {
                             let stmt_token = body_stmt
                                 .clone()
-                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .to_rust(ctx.clone(), main_options.clone(), symbols.clone())
                                 .map_err(|e| wrap_module_error(&module_filename, e))?;
                             if !stmt_token.to_string().trim().is_empty() {
                                 main_body_stmts.push(stmt_token);
-                                main_body_raw.push(body_stmt.clone());
                                 has_main_code = true;
                             }
                         }
@@ -270,9 +311,15 @@ impl CodeGen for Module {
             // Categorize statements into declarations vs executable code
             let is_declaration = Self::is_declaration_statement(&s.statement);
 
+            let init_options = {
+                let mut o = options.clone();
+                o.hoisted_names = std::rc::Rc::new(init_hoisted.clone());
+                o.leaked_loop_targets = std::rc::Rc::new(init_leaked.clone());
+                o
+            };
             let statement = s
                 .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                .to_rust(ctx.clone(), init_options, symbols.clone())
                 .map_err(|e| wrap_module_error(&module_filename, e))?;
             
             if statement.to_string() != "" {
@@ -282,7 +329,6 @@ impl CodeGen for Module {
                 } else {
                     // Executable statements go in module initialization function
                     module_init_stmts.push(statement);
-                    module_init_raw.push(s.clone());
                     has_module_init_code = true;
                 }
             }
@@ -619,6 +665,28 @@ fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {
 /// Declarations for every name assigned in a statement list, so
 /// nested-block assignments store into scope-level variables instead of
 /// creating shadowing bindings. Scope analysis decides which need `mut`.
+fn hoisted_name_set(
+    body: &[crate::Statement],
+    ctx: &crate::CodeGenContext,
+    symbols: &crate::SymbolTableScopes,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let mut symbols = symbols.clone();
+    for s in body {
+        symbols = s.clone().find_symbols(symbols);
+    }
+    let scope = crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
+    let hoisted = scope
+        .assigned
+        .iter()
+        .chain(scope.needs_mut.iter())
+        .cloned()
+        .collect();
+    (hoisted, scope.leaked_loop_targets)
+}
+
 fn hoisted_declarations(
     body: &[crate::Statement],
     ctx: &crate::CodeGenContext,

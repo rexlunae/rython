@@ -1126,7 +1126,7 @@ fn target_references(target: &ExprType, name: &str) -> bool {
     }
 }
 
-fn expr_references(expr: &ExprType, name: &str) -> bool {
+pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {
     match expr {
         ExprType::Name(n) => n.id == name,
         ExprType::Attribute(a) => expr_references(&a.value, name),

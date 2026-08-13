@@ -479,7 +479,7 @@ mod tests {
             options,
             symbols,
         ).unwrap().to_string();
-        assert!(rust_code.contains("func (1 , 2)"), "generated: {}", rust_code);
+        assert!(rust_code.contains("let __rython_arg_0 = 2 ; let __rython_arg_1 = 1 ; func (__rython_arg_1 , __rython_arg_0)"), "generated: {}", rust_code);
     }
 
     #[test]
@@ -494,7 +494,7 @@ mod tests {
             options,
             symbols,
         ).unwrap().to_string();
-        assert!(rust_code.contains("func (1 , 2 , 3 , 4)"), "generated: {}", rust_code);
+        assert!(rust_code.contains("let __rython_arg_0 = 1 ; let __rython_arg_1 = 2 ; let __rython_arg_2 = 4 ; let __rython_arg_3 = 3 ; func (__rython_arg_0 , __rython_arg_1 , __rython_arg_3 , __rython_arg_2)"), "generated: {}", rust_code);
     }
 
     #[test]

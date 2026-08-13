@@ -80,9 +80,16 @@ impl CodeGen for AsyncFor {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let iter_expr = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-
+        // Python's loop variable is function-scoped; a target name whose
+        // value LEAKS (a later read, unshadowed) receives a STORE into the
+        // hoisted binding, not a fresh `for` binding (same reasoning as the
+        // sync For, issue #80). Non-leaking targets keep fresh bindings.
+        let leaked = options.leaked_loop_targets.as_ref().clone();
+        let any_hoisted = {
+            let mut names = Vec::new();
+            super::for_stmt::collect_target_names(&self.target, &mut names);
+            names.iter().any(|n| leaked.contains(*n))
+        };
         let has_else = !self.orelse.is_empty();
         // Break-tracking is only needed when a break belonging to this loop
         // could skip the else clause.
@@ -100,10 +107,27 @@ impl CodeGen for AsyncFor {
         // then, iterate the expression synchronously. This preserves the
         // loop's iteration and target binding (previously the body ran once
         // and the iterator was discarded entirely).
+        let (loop_target, loop_inner): (TokenStream, TokenStream) = if any_hoisted {
+            let mut stmts = Vec::new();
+            let mut counter = 0usize;
+            super::for_stmt::lower_loop_target(
+                &self.target,
+                quote!(__rython_elt),
+                &leaked,
+                &mut stmts,
+                &mut counter,
+            );
+            (quote!(__rython_elt), quote!({ #(#stmts)* #(#body_tokens;)* }))
+        } else {
+            let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            (target, quote!(#(#body_tokens;)*))
+        };
+        let iter_expr = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
         if !has_else {
             Ok(quote! {
-                for #target in #iter_expr {
-                    #(#body_tokens;)*
+                for #loop_target in #iter_expr {
+                    #loop_inner
                 }
             })
         } else {
@@ -115,8 +139,8 @@ impl CodeGen for AsyncFor {
                 Ok(quote! {
                     {
                         let mut __rython_broke = false;
-                        for #target in #iter_expr {
-                            #(#body_tokens;)*
+                        for #loop_target in #iter_expr {
+                            #loop_inner
                         }
                         if !__rython_broke {
                             #(#else_body_tokens;)*
@@ -127,8 +151,8 @@ impl CodeGen for AsyncFor {
                 // No break can skip the else clause; run it unconditionally.
                 Ok(quote! {
                     {
-                        for #target in #iter_expr {
-                            #(#body_tokens;)*
+                        for #loop_target in #iter_expr {
+                            #loop_inner
                         }
                         #(#else_body_tokens;)*
                     }

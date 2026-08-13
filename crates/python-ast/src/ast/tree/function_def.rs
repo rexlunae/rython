@@ -684,6 +684,22 @@ impl CodeGen for FunctionDef {
         // Optional annotation) are visible to every assignment in the body:
         // their non-None stores wrap in Some.
         let mut options = options;
+        // Names managed by this function's prologue: hoisted assignments
+        // plus mutable parameters. A `for`-loop target on one of these
+        // lowers to a store into the hoisted binding, never a shadowing
+        // fresh binding (issue #80).
+        options.hoisted_names = std::rc::Rc::new(
+            scope
+                .assigned
+                .iter()
+                .chain(scope.needs_mut.iter())
+                .cloned()
+                .collect(),
+        );
+        // Only the targets whose value is observed after the loop store
+        // into the hoisted binding; the rest keep fresh per-loop bindings
+        // (issue #80).
+        options.leaked_loop_targets = std::rc::Rc::new(scope.leaked_loop_targets.clone());
         {
             let mut optional = scope.optional.clone();
             for p in self

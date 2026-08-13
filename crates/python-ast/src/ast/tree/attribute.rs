@@ -44,6 +44,11 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // If a user binding shadows the root name (e.g. a variable named
+        // `re`), the attribute is a field access on that value — never a
+        // stdlib module path. Computed before `self.value` is moved below.
+        let root_shadowed = crate::ast::tree::call::root_name(&self.value)
+            .is_some_and(|root| crate::module_name_shadowed(root, &symbols));
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
@@ -52,8 +57,10 @@ impl<'a> CodeGen for Attribute {
         // Module names are typically lowercase and match Python stdlib modules
         // `np`/`numpy` cover the numpy module (import numpy as np lowers to
         // `use stdpython::numpy as np`, making np a real Rust path).
-        let is_module_access = matches!(value_str.as_str(),
-            "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
+        let is_module_access = !root_shadowed
+            && matches!(
+                value_str.as_str(),
+                "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
             "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re" | "hashlib" | "csv" | "io" |
             // `datetime` covers both the runtime module and the datetime
             // TYPE from `from datetime import datetime` — either way the
@@ -63,8 +70,8 @@ impl<'a> CodeGen for Attribute {
             "numpy" | "np" |
             "os :: path" | "os::path" | // for nested modules
             "numpy :: linalg" | "np :: linalg" | "numpy::linalg" | "np::linalg" // np.linalg.inv
-        );
-        
+            );
+
         if is_module_access {
             // Use :: for module access (Python's sys.executable becomes sys::executable)
             // Special handling for LazyLock static variables that need

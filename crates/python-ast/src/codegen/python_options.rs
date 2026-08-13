@@ -150,6 +150,21 @@ pub struct PythonOptions {
     /// `Vec::<T>::new()` / `PyDict::<K,V>::from([])`; a name assigned an
     /// empty literal with no pinning use is a loud conversion-time error.
     pub empty_pinned: std::rc::Rc<std::collections::HashMap<String, TypeInfo>>,
+
+    /// Names whose bindings are managed by the enclosing scope's prologue
+    /// (hoisted assignments plus mutable parameters): a `for`-loop target
+    /// on one of these lowers to a plain store into that binding instead
+    /// of a fresh binding that would shadow it, so Python's function-
+    /// scoped loop-variable leak survives codegen (issue #80). Set per
+    /// scope by the function/module generators.
+    pub hoisted_names: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// `for`-target names whose post-loop value is actually observed (a
+    /// read in a later statement that no re-binding shadows). Only these
+    /// lower to stores into the hoisted binding; a target that merely
+    /// shares a name with a hoisted variable for other reasons keeps its
+    /// fresh per-loop binding (issue #80).
+    pub leaked_loop_targets: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 impl Default for PythonOptions {
@@ -177,6 +192,8 @@ impl Default for PythonOptions {
             use_counts: std::rc::Rc::new(std::collections::HashMap::new()),
             name_types: std::rc::Rc::new(std::collections::HashMap::new()),
             empty_pinned: std::rc::Rc::new(std::collections::HashMap::new()),
+            hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
         }
     }
 }

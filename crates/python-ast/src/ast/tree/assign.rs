@@ -240,7 +240,10 @@ impl<'a> CodeGen for Assign {
                             .clone()
                             .to_rust(ctx.clone(), options.clone(), symbols.clone())?
                     };
-                    Ok(quote!((#receiver).py_set_index(#index, #value)?;))
+                    Ok(quote!({
+                        let __rython_val = #value;
+                        (#receiver).py_set_index(#index, __rython_val)?;
+                    }))
                 }
                 crate::SubscriptKind::Slice { .. } => Err(
                     "slice assignment (`x[a:b] = ...`) is not yet supported"
@@ -284,6 +287,21 @@ impl<'a> CodeGen for Assign {
         } else {
             // Chained assignment (`a = b = expr`): Python evaluates the value
             // once and assigns it to each target in turn.
+            // A container literal would break the aliasing semantics: Python
+            // shares ONE object across all targets, while the lowering must
+            // clone per target — later mutations through one name would
+            // silently diverge. That is a loud conversion error, not a
+            // silent divergence (issue #80).
+            if is_container_literal(&value_expr) {
+                return Err(
+                    "chained assignment to a container literal (`a = b = [...]`) \
+                     cannot preserve Python's shared aliasing: rython would give \
+                     each target a separate copy. Assign the literal to one name \
+                     first, then copy it to the others"
+                        .to_string()
+                        .into(),
+                );
+            }
             let mut stream = quote!(let __rython_chain = #value;);
             for target in &self.targets {
                 stream.extend(render(target, &quote!(__rython_chain.clone()))?);
@@ -291,4 +309,16 @@ impl<'a> CodeGen for Assign {
             Ok(stream)
         }
     }
+}
+
+fn is_container_literal(expr: &ExprType) -> bool {
+    matches!(
+        expr,
+        ExprType::List(_)
+            | ExprType::Dict(_)
+            | ExprType::Set(_)
+            | ExprType::ListComp(_)
+            | ExprType::DictComp(_)
+            | ExprType::SetComp(_)
+    )
 }

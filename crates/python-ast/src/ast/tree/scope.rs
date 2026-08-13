@@ -36,6 +36,10 @@ pub struct ScopeBindings {
     /// hoisted declaration for these names gets a `Default::default()`
     /// initializer instead of a bare `let mut x;` (issue #78).
     pub closure_captured_uninit: HashSet<String>,
+    /// `for`-target names whose value is observed after the loop (a read in
+    /// a later statement that no re-binding shadows). These lower to stores
+    /// into the hoisted binding, never shadowing fresh bindings (issue #80).
+    pub leaked_loop_targets: HashSet<String>,
 }
 
 /// How definitely a variable holds a value at a program point.
@@ -84,6 +88,7 @@ struct Analysis<'r> {
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
     closure_captured_uninit: HashSet<String>,
+    leaked_loop_targets: HashSet<String>,
     state: HashMap<String, Init>,
     /// Classifies a method call's effect on its receiver when the
     /// receiver's class is statically known: Some(needs_mut) resolves the
@@ -185,6 +190,7 @@ pub(crate) fn analyze_scope_with(
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
+        leaked_loop_targets: HashSet::new(),
         state: HashMap::new(),
         resolve_call: &noop_resolve,
     };
@@ -195,6 +201,7 @@ pub(crate) fn analyze_scope_with(
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
+        leaked_loop_targets: HashSet::new(),
         state: initialized
             .iter()
             .map(|n| (n.clone(), Init::Yes))
@@ -213,6 +220,7 @@ pub(crate) fn analyze_scope_with(
         needs_mut: a.needs_mut,
         optional: a.optional,
         closure_captured_uninit: a.closure_captured_uninit,
+        leaked_loop_targets: a.leaked_loop_targets,
     }
 }
 
@@ -255,6 +263,143 @@ pub(crate) fn chain_base_name(expr: &ExprType) -> Option<&str> {
         ExprType::Subscript(sub) => chain_base_name(&sub.value),
         ExprType::Attribute(attr) => chain_base_name(&attr.value),
         _ => None,
+    }
+}
+
+/// Collect the names in a `for` target (`i` and `v` in `for i, v in ...`).
+fn for_target_names<'a>(target: &'a ExprType, out: &mut Vec<&'a str>) {
+    match target {
+        ExprType::Name(n) => out.push(&n.id),
+        ExprType::Tuple(t) => {
+            for elt in &t.elts {
+                for_target_names(elt, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a `for` target name can be observed after the loop: a READ in a
+/// later statement of the enclosing list that is not shadowed by a
+/// re-binding of the name. Only then must the loop store into the hoisted
+/// binding instead of using a fresh per-loop binding (issue #80).
+fn for_target_referenced_outside<'a>(
+    body: &'a [Statement],
+    this: &'a Statement,
+    name: &str,
+) -> bool {
+    let mut past = false;
+    for s in body {
+        if std::ptr::eq(s, this) {
+            past = true;
+            continue;
+        }
+        if past && statement_observes_read(s, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether executing `stmt` can READ `name` in a way that observes a value
+/// written before `stmt` ran — i.e. the read is not dominated by a `for`
+/// target binding of `name` inside `stmt`. Plain `statement_references`
+/// also counts stores and target bindings (a later `for i in ...` would
+/// look like a reference and force a spurious hoist, and a hoisted
+/// binding that is never actually read after the loop can end up
+/// uninitialized or with the wrong type); this walker only counts reads
+/// that escape.
+fn statement_observes_read(stmt: &Statement, name: &str) -> bool {
+    match &stmt.statement {
+        StatementType::Assign(a) => crate::expr_references(&a.value, name),
+        StatementType::AugAssign(a) => {
+            crate::expr_references(&a.target, name) || crate::expr_references(&a.value, name)
+        }
+        StatementType::Expr(e) => crate::expr_references(&e.value, name),
+        StatementType::Return(r) => r
+            .as_ref()
+            .map(|e| crate::expr_references(&e.value, name))
+            .unwrap_or(false),
+        StatementType::If(s) => {
+            crate::expr_references(&s.test, name)
+                || s.body.iter().any(|b| statement_observes_read(b, name))
+                || s.orelse.iter().any(|b| statement_observes_read(b, name))
+        }
+        StatementType::While(s) => {
+            crate::expr_references(&s.test, name)
+                || s.body.iter().any(|b| statement_observes_read(b, name))
+                || s.orelse.iter().any(|b| statement_observes_read(b, name))
+        }
+        StatementType::For(s) => {
+            for_statement_observes_read(&s.target, &s.iter, &s.body, &s.orelse, name)
+        }
+        StatementType::AsyncFor(s) => {
+            for_statement_observes_read(&s.target, &s.iter, &s.body, &s.orelse, name)
+        }
+        StatementType::With(s) => {
+            s.items
+                .iter()
+                .any(|i| crate::expr_references(&i.context_expr, name))
+                || s.body.iter().any(|b| statement_observes_read(b, name))
+        }
+        StatementType::Try(s) => {
+            s.body.iter().any(|b| statement_observes_read(b, name))
+                || s.handlers.iter().any(|h| {
+                    h.exception_type
+                        .as_ref()
+                        .map(|t| crate::expr_references(t, name))
+                        .unwrap_or(false)
+                        || h.body.iter().any(|b| statement_observes_read(b, name))
+                })
+                || s.orelse.iter().any(|b| statement_observes_read(b, name))
+                || s.finalbody.iter().any(|b| statement_observes_read(b, name))
+        }
+        _ => false,
+    }
+}
+
+/// A loop whose target binds `name` shadows body reads (each iteration
+/// sees the fresh value), but its iterable (evaluated before any binding)
+/// and its orelse (which can run with zero iterations, leaving the earlier
+/// value visible) still observe.
+fn for_statement_observes_read(
+    target: &ExprType,
+    iter: &ExprType,
+    body: &[Statement],
+    orelse: &[Statement],
+    name: &str,
+) -> bool {
+    let rebinds = {
+        let mut names = Vec::new();
+        for_target_names(target, &mut names);
+        names.contains(&name)
+    };
+    crate::expr_references(iter, name)
+        || orelse.iter().any(|b| statement_observes_read(b, name))
+        || (!rebinds && body.iter().any(|b| statement_observes_read(b, name)))
+}
+
+/// Record stores for the `for`-target names whose values leak out of the
+/// loop (observable reads in later statements). Loop-local names stay
+/// unrecorded so they keep their fresh per-loop binding (and the unused-
+/// index `_` lowering); only the leaked ones are hoisted, and the loop
+/// lowering is told exactly which names those are so it stores into the
+/// hoisted binding rather than a shadowing fresh one.
+fn record_leaking_for_targets(
+    target: &ExprType,
+    body: &[Statement],
+    this: &Statement,
+    a: &mut Analysis<'_>,
+) {
+    let mut names = Vec::new();
+    for_target_names(target, &mut names);
+    for name in names {
+        if for_target_referenced_outside(body, this, name) {
+            // multi=true: the store runs once per iteration (possibly zero
+            // times), so the binding always needs `mut` when hoisted.
+            a.record_store(name, true);
+            a.leaked_loop_targets.insert(name.to_string());
+        }
     }
 }
 
@@ -335,10 +480,12 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
             }
             StatementType::For(s) => {
                 walk_expr(&s.iter, a);
+                record_leaking_for_targets(&s.target, body, stmt, a);
                 walk_loop(&s.body, &s.orelse, a, multi);
             }
             StatementType::AsyncFor(s) => {
                 walk_expr(&s.iter, a);
+                record_leaking_for_targets(&s.target, body, stmt, a);
                 walk_loop(&s.body, &s.orelse, a, multi);
             }
             StatementType::Try(s) => {
