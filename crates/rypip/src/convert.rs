@@ -1266,6 +1266,12 @@ fn lower_kernel_body(
         let line = stmt.lineno;
         match &stmt.statement {
             python_ast::StatementType::Expr(expr) => {
+                // Docstrings: the canonical kernel module opens module_init
+                // with a docstring (issue #83's example). They carry no
+                // runtime meaning — drop them like CPython does.
+                if expr_str_literal(&expr.value).is_some() {
+                    continue;
+                }
                 let Some(call) = extract_kernel_call(expr) else {
                     return Err(kernel_body_err(
                         "unsupported expression statement (only printk(...) calls are supported)",

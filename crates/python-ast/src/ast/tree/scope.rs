@@ -30,6 +30,16 @@ pub struct ScopeBindings {
     /// Names assigned `None` on some path: they hold an Option, and every
     /// non-None store into them wraps in `Some`.
     pub optional: HashSet<String>,
+    /// Names that are possibly-uninitialized where a generated closure is
+    /// created (try-body, and finally-guarded handler/else bodies). rustc
+    /// rejects capturing a possibly-uninitialized variable (E0381), so the
+    /// hoisted declaration for these names gets a `Default::default()`
+    /// initializer instead of a bare `let mut x;` (issue #78).
+    pub closure_captured_uninit: HashSet<String>,
+    /// `for`-target names whose value is observed after the loop (a read in
+    /// a later statement that no re-binding shadows). These lower to stores
+    /// into the hoisted binding, never shadowing fresh bindings (issue #80).
+    pub leaked_loop_targets: HashSet<String>,
 }
 
 /// How definitely a variable holds a value at a program point.
@@ -75,8 +85,16 @@ pub(crate) const MUTATING_METHODS: &[&str] = &[
 
 struct Analysis<'r> {
     assigned: Vec<String>,
+    /// Names assigned so far in THIS walk (sequential), as opposed to
+    /// `assigned`, which is seeded with the collector's full-function list.
+    /// Closure boundaries record against the sequential list so a name first
+    /// assigned AFTER a try statement is not given a dummy initializer for a
+    /// closure it is never captured by (Devin review on #103).
+    seq_assigned: Vec<String>,
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
+    closure_captured_uninit: HashSet<String>,
+    leaked_loop_targets: HashSet<String>,
     state: HashMap<String, Init>,
     /// Classifies a method call's effect on its receiver when the
     /// receiver's class is statically known: Some(needs_mut) resolves the
@@ -97,10 +115,29 @@ impl Analysis<'_> {
         if !self.assigned.contains(&name.to_string()) {
             self.assigned.push(name.to_string());
         }
+        if !self.seq_assigned.contains(&name.to_string()) {
+            self.seq_assigned.push(name.to_string());
+        }
         if multi || self.init_of(name) != Init::No {
             self.needs_mut.insert(name.to_string());
         }
         self.state.insert(name.to_string(), Init::Yes);
+    }
+
+    /// A generated closure is about to run over `entry_state`: every name
+    /// that is not definitely initialized there will be captured
+    /// possibly-uninitialized, which rustc rejects (E0381). Record them so
+    /// the hoist can give them a Default initializer. Only names assigned
+    /// before this point in the walk (or inside the closure's own body,
+    /// which the caller has walked first) can be captured — a name first
+    /// assigned later in the function is not in `seq_assigned` and is left
+    /// alone.
+    fn record_closure_boundary(&mut self, entry_state: &HashMap<String, Init>) {
+        for name in &self.seq_assigned {
+            if entry_state.get(name).copied().unwrap_or(Init::No) != Init::Yes {
+                self.closure_captured_uninit.insert(name.clone());
+            }
+        }
     }
 
     /// The variable is mutated in place (aug-assign, store-through, or a
@@ -154,10 +191,32 @@ pub(crate) fn analyze_scope_with(
     initialized: &[String],
     resolve_call: &dyn Fn(&crate::Call) -> Option<bool>,
 ) -> ScopeBindings {
-    let mut a = Analysis {
+    // First pass: collect every name the body assigns, so the closure
+    // boundaries in the analysis pass know the full name set (a name first
+    // assigned *inside* a try body is not yet in `assigned` when the
+    // boundary runs). The collector uses a no-op resolver: only the
+    // `assigned` list is read back, and consulting the real resolver here
+    // would poison its cycle-guard `visited` set for the analysis pass.
+    let noop_resolve = |_: &crate::Call| -> Option<bool> { None };
+    let mut collector = Analysis {
         assigned: Vec::new(),
+        seq_assigned: Vec::new(),
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
+        closure_captured_uninit: HashSet::new(),
+        leaked_loop_targets: HashSet::new(),
+        state: HashMap::new(),
+        resolve_call: &noop_resolve,
+    };
+    walk_stmts(body, &mut collector, false);
+
+    let mut a = Analysis {
+        assigned: collector.assigned.clone(),
+        seq_assigned: Vec::new(),
+        needs_mut: HashSet::new(),
+        optional: HashSet::new(),
+        closure_captured_uninit: HashSet::new(),
+        leaked_loop_targets: HashSet::new(),
         state: initialized
             .iter()
             .map(|n| (n.clone(), Init::Yes))
@@ -175,6 +234,8 @@ pub(crate) fn analyze_scope_with(
         assigned,
         needs_mut: a.needs_mut,
         optional: a.optional,
+        closure_captured_uninit: a.closure_captured_uninit,
+        leaked_loop_targets: a.leaked_loop_targets,
     }
 }
 
@@ -217,6 +278,143 @@ pub(crate) fn chain_base_name(expr: &ExprType) -> Option<&str> {
         ExprType::Subscript(sub) => chain_base_name(&sub.value),
         ExprType::Attribute(attr) => chain_base_name(&attr.value),
         _ => None,
+    }
+}
+
+/// Collect the names in a `for` target (`i` and `v` in `for i, v in ...`).
+fn for_target_names<'a>(target: &'a ExprType, out: &mut Vec<&'a str>) {
+    match target {
+        ExprType::Name(n) => out.push(&n.id),
+        ExprType::Tuple(t) => {
+            for elt in &t.elts {
+                for_target_names(elt, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a `for` target name can be observed after the loop: a READ in a
+/// later statement of the enclosing list that is not shadowed by a
+/// re-binding of the name. Only then must the loop store into the hoisted
+/// binding instead of using a fresh per-loop binding (issue #80).
+fn for_target_referenced_outside<'a>(
+    body: &'a [Statement],
+    this: &'a Statement,
+    name: &str,
+) -> bool {
+    let mut past = false;
+    for s in body {
+        if std::ptr::eq(s, this) {
+            past = true;
+            continue;
+        }
+        if past && statement_observes_read(s, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether executing `stmt` can READ `name` in a way that observes a value
+/// written before `stmt` ran — i.e. the read is not dominated by a `for`
+/// target binding of `name` inside `stmt`. Plain `statement_references`
+/// also counts stores and target bindings (a later `for i in ...` would
+/// look like a reference and force a spurious hoist, and a hoisted
+/// binding that is never actually read after the loop can end up
+/// uninitialized or with the wrong type); this walker only counts reads
+/// that escape.
+fn statement_observes_read(stmt: &Statement, name: &str) -> bool {
+    match &stmt.statement {
+        StatementType::Assign(a) => crate::expr_references(&a.value, name),
+        StatementType::AugAssign(a) => {
+            crate::expr_references(&a.target, name) || crate::expr_references(&a.value, name)
+        }
+        StatementType::Expr(e) => crate::expr_references(&e.value, name),
+        StatementType::Return(r) => r
+            .as_ref()
+            .map(|e| crate::expr_references(&e.value, name))
+            .unwrap_or(false),
+        StatementType::If(s) => {
+            crate::expr_references(&s.test, name)
+                || s.body.iter().any(|b| statement_observes_read(b, name))
+                || s.orelse.iter().any(|b| statement_observes_read(b, name))
+        }
+        StatementType::While(s) => {
+            crate::expr_references(&s.test, name)
+                || s.body.iter().any(|b| statement_observes_read(b, name))
+                || s.orelse.iter().any(|b| statement_observes_read(b, name))
+        }
+        StatementType::For(s) => {
+            for_statement_observes_read(&s.target, &s.iter, &s.body, &s.orelse, name)
+        }
+        StatementType::AsyncFor(s) => {
+            for_statement_observes_read(&s.target, &s.iter, &s.body, &s.orelse, name)
+        }
+        StatementType::With(s) => {
+            s.items
+                .iter()
+                .any(|i| crate::expr_references(&i.context_expr, name))
+                || s.body.iter().any(|b| statement_observes_read(b, name))
+        }
+        StatementType::Try(s) => {
+            s.body.iter().any(|b| statement_observes_read(b, name))
+                || s.handlers.iter().any(|h| {
+                    h.exception_type
+                        .as_ref()
+                        .map(|t| crate::expr_references(t, name))
+                        .unwrap_or(false)
+                        || h.body.iter().any(|b| statement_observes_read(b, name))
+                })
+                || s.orelse.iter().any(|b| statement_observes_read(b, name))
+                || s.finalbody.iter().any(|b| statement_observes_read(b, name))
+        }
+        _ => false,
+    }
+}
+
+/// A loop whose target binds `name` shadows body reads (each iteration
+/// sees the fresh value), but its iterable (evaluated before any binding)
+/// and its orelse (which can run with zero iterations, leaving the earlier
+/// value visible) still observe.
+fn for_statement_observes_read(
+    target: &ExprType,
+    iter: &ExprType,
+    body: &[Statement],
+    orelse: &[Statement],
+    name: &str,
+) -> bool {
+    let rebinds = {
+        let mut names = Vec::new();
+        for_target_names(target, &mut names);
+        names.contains(&name)
+    };
+    crate::expr_references(iter, name)
+        || orelse.iter().any(|b| statement_observes_read(b, name))
+        || (!rebinds && body.iter().any(|b| statement_observes_read(b, name)))
+}
+
+/// Record stores for the `for`-target names whose values leak out of the
+/// loop (observable reads in later statements). Loop-local names stay
+/// unrecorded so they keep their fresh per-loop binding (and the unused-
+/// index `_` lowering); only the leaked ones are hoisted, and the loop
+/// lowering is told exactly which names those are so it stores into the
+/// hoisted binding rather than a shadowing fresh one.
+fn record_leaking_for_targets(
+    target: &ExprType,
+    body: &[Statement],
+    this: &Statement,
+    a: &mut Analysis<'_>,
+) {
+    let mut names = Vec::new();
+    for_target_names(target, &mut names);
+    for name in names {
+        if for_target_referenced_outside(body, this, name) {
+            // multi=true: the store runs once per iteration (possibly zero
+            // times), so the binding always needs `mut` when hoisted.
+            a.record_store(name, true);
+            a.leaked_loop_targets.insert(name.to_string());
+        }
     }
 }
 
@@ -297,10 +495,12 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
             }
             StatementType::For(s) => {
                 walk_expr(&s.iter, a);
+                record_leaking_for_targets(&s.target, body, stmt, a);
                 walk_loop(&s.body, &s.orelse, a, multi);
             }
             StatementType::AsyncFor(s) => {
                 walk_expr(&s.iter, a);
+                record_leaking_for_targets(&s.target, body, stmt, a);
                 walk_loop(&s.body, &s.orelse, a, multi);
             }
             StatementType::Try(s) => {
@@ -309,9 +509,24 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 let before = a.state.clone();
                 walk_stmts(&s.body, a, true);
                 let after_body = a.state.clone();
+                // Record the boundary AFTER walking the body: names first
+                // assigned inside the try body are in `seq_assigned` now
+                // (their stores capture the hoisted binding, which is
+                // possibly-uninitialized when the closure is created —
+                // E0381), while names assigned later in the function are
+                // not, so they get no dummy initializer.
+                a.record_closure_boundary(&before);
                 // Handlers may run with the body only partially executed.
                 let handler_entry =
                     merge_states(vec![before, after_body.clone()]);
+                // With a finally clause the handler and else bodies also run
+                // in closures (so a return/raise still executes finally):
+                // their entry state may still be uninitialized for names
+                // first assigned inside the try statement.
+                if !s.finalbody.is_empty() {
+                    a.record_closure_boundary(&handler_entry);
+                    a.record_closure_boundary(&after_body);
+                }
                 let mut exits = Vec::new();
                 for handler in &s.handlers {
                     a.state = handler_entry.clone();

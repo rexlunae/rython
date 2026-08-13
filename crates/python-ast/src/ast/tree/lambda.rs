@@ -1,4 +1,4 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{TokenStream, TokenTree};
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
@@ -60,12 +60,35 @@ impl CodeGen for Lambda {
             .iter()
             .map(|param| crate::safe_ident(&param.arg))
             .collect();
-        let body = self.body.to_rust(ctx, options, symbols)?;
+        let body = wrap_fallible_body(self.body.to_rust(ctx, options, symbols)?);
 
         Ok(quote! {
             |#(#params),*| #body
         })
     }
+}
+
+/// A lambda body is a plain Rust closure, but fallible expressions lower to
+/// `?` (`x // 2`, `int(s)`, a keyword call to a user function, ...), which
+/// is only legal in a function or closure returning `Result`. When the
+/// lowered body contains `?`, wrap it in an immediately-invoked
+/// Result-returning closure and unwrap: the exception becomes a loud panic
+/// at the lambda's call site (with the exception's message) instead of a
+/// rustc error. An enclosing Python `try`/`except` cannot catch it — a
+/// rython lambda is a plain closure with nowhere to route the Err, where
+/// CPython would let the caller catch — so loud-and-clear beats failing to
+/// compile (issues #75-family, Devin review on #103).
+fn wrap_fallible_body(body: TokenStream) -> TokenStream {
+    let has_question = body.clone().into_iter().any(|tt| {
+        matches!(&tt, TokenTree::Punct(p) if p.as_char() == '?')
+    });
+    if !has_question {
+        return body;
+    }
+    quote! {{
+        (|| -> Result<_, PyException> { Ok(#body) })()
+            .unwrap_or_else(|e| panic!("{}", e))
+    }}
 }
 
 #[cfg(test)]

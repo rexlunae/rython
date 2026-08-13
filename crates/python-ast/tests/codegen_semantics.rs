@@ -3,7 +3,7 @@
 //! mutability, loop else-clauses, with-statements, comprehensions, f-strings,
 //! statement separators, await handling, and from-imports.
 
-use python_ast::{parse, CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
+use python_ast::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse};
 
 fn compile(src: &str, name: &str) -> String {
     let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed for {:?}: {}", src, e));
@@ -39,6 +39,233 @@ fn list_literals_keep_element_types() {
 }
 
 #[test]
+fn range_over_len_coerces_usize_to_i64() {
+    // Issue #100: len() yields usize but range() wants i64; the generated
+    // code must convert, not rely on a generic that fails to resolve for
+    // expression arguments.
+    let out = compile(
+        "def forward(x: list[float]) -> list[float]:\n\
+         \x20   result: list[float] = []\n\
+         \x20   for j in range(len(x)):\n\
+         \x20       result.append(x[j])\n\
+         \x20   return result\n",
+        "issue100.py",
+    );
+    assert!(
+        out.contains("try_into () . unwrap ()"),
+        "len() must convert usize → i64: {}",
+        out
+    );
+    assert!(
+        out.contains("Vec :: < f64 > :: new ()"),
+        "empty list must be pinned from the append: {}",
+        out
+    );
+}
+
+#[test]
+fn mixed_numeric_list_unifies_to_float() {
+    // [1, 2.0] is Vec<f64> in Rust; the int literal must be coerced.
+    let out = compile("xs = [1, 2.0, 3]", "mixed.py");
+    assert!(
+        out.contains("as f64"),
+        "int element must coerce to f64: {}",
+        out
+    );
+}
+
+#[test]
+fn incompatible_list_elements_are_a_loud_error() {
+    let err = compile_err("[1, 'a']", "badlist.py");
+    assert!(
+        err.contains("mixes incompatible element types"),
+        "expected loud conversion error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn reused_name_argument_is_cloned() {
+    // Issue #102: parameters lower to owned values, so a name passed to a
+    // user function twice must be cloned on each call (Python shares by
+    // reference; Rust moves).
+    let out = compile(
+        "def forward(x: list[float]) -> list[float]:\n\
+         \x20   return x\n\n\
+         def test() -> list[float]:\n\
+         \x20   x: list[float] = [1.0, 2.0]\n\
+         \x20   out1: list[float] = forward(x)\n\
+         \x20   out2: list[float] = forward(x)\n\
+         \x20   return out2\n",
+        "issue102.py",
+    );
+    let clones = out.matches("clone ()").count();
+    assert!(
+        clones >= 2,
+        "reused owned name must be cloned per call, got {} clones: {}",
+        clones,
+        out
+    );
+}
+
+#[test]
+fn single_use_name_is_not_cloned() {
+    let out = compile(
+        "def forward(x: list[float]) -> list[float]:\n\
+         \x20   return x\n\n\
+         def test() -> list[float]:\n\
+         \x20   x: list[float] = [1.0, 2.0]\n\
+         \x20   return forward(x)\n",
+        "singleuse.py",
+    );
+    assert!(
+        !out.contains("clone ()"),
+        "single-use name must not be cloned: {}",
+        out
+    );
+}
+
+#[test]
+fn unused_loop_index_lowers_to_underscore() {
+    // Issue #101: an index that is never read in the body must not emit a
+    // Rust binding rustc warns about.
+    let out = compile(
+        "def f() -> int:\n\
+         \x20   total = 0\n\
+         \x20   for i in range(3):\n\
+         \x20       total += 1\n\
+         \x20   return total\n",
+        "issue101.py",
+    );
+    assert!(
+        out.contains("for _ in range"),
+        "unused index must lower to `_`: {}",
+        out
+    );
+    // ...while a used index keeps its name.
+    let out = compile(
+        "def f(x: list[int]) -> int:\n\
+         \x20   total = 0\n\
+         \x20   for i in range(len(x)):\n\
+         \x20       total += x[i]\n\
+         \x20   return total\n",
+        "issue101b.py",
+    );
+    assert!(
+        out.contains("for i in range"),
+        "used index keeps its name: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_list_pinned_by_append_is_typed() {
+    // Issue #77 companion: `xs = []` + `xs.append(v)` pins the element
+    // type from the append, so the empty literal is rendered typed.
+    let out = compile(
+        "def f() -> list[int]:\n\
+         \x20   xs = []\n\
+         \x20   xs.append(1)\n\
+         \x20   return xs\n",
+        "emptyappend.py",
+    );
+    assert!(
+        out.contains("Vec :: < i64 > :: new ()"),
+        "empty list must be pinned from append: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_list_pinned_by_extend_is_typed() {
+    // `xs = []` + `xs.extend(ys)` pins the element type from the extended
+    // container — including when append and extend both contribute.
+    let out = compile(
+        "def f(rows: list[list[int]]) -> list[int]:\n\
+         \x20   out = []\n\
+         \x20   out.append(1)\n\
+         \x20   out.extend(rows[0])\n\
+         \x20   return out\n",
+        "emptyextend.py",
+    );
+    assert!(
+        out.contains("Vec :: < i64 > :: new ()"),
+        "empty list must be pinned from extend: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_dict_pinned_by_subscript_store_is_typed() {
+    let out = compile(
+        "def f() -> dict[str, int]:\n\
+         \x20   d = {}\n\
+         \x20   d[\"k\"] = 1\n\
+         \x20   return d\n",
+        "emptydict.py",
+    );
+    assert!(
+        out.contains("PyDict :: < String , i64 > :: from"),
+        "empty dict must be pinned from subscript store: {}",
+        out
+    );
+}
+
+#[test]
+fn unpinned_empty_container_is_a_loud_error() {
+    // Issue #77: `x = []` with no use that could pin the element type is
+    // a conversion-time error with a helpful message, not a cryptic rustc
+    // "type annotations needed" inside generated code.
+    let err = compile_err("def f():\n    x = []\n    return x\n", "issue77.py");
+    assert!(
+        err.contains("no inferable element type"),
+        "expected loud empty-container error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn bare_container_annotation_is_a_loud_error() {
+    // Issue #76 companion: `def f(xs: list)` would emit `xs: list` —
+    // invalid Rust — so it is a loud conversion-time error directing the
+    // user to subscripted annotations, not a rustc failure.
+    let err = compile_err(
+        "def f(xs: list) -> int:\n    return len(xs)\n",
+        "bareann.py",
+    );
+    assert!(
+        err.contains("no element/key type") && err.contains("list[float]"),
+        "expected loud bare-annotation error, got: {}",
+        err
+    );
+    let err = compile_err(
+        "def f(xs: dict) -> int:\n    return len(xs)\n",
+        "bareann2.py",
+    );
+    assert!(
+        err.contains("no element/key type") && err.contains("dict[str, int]"),
+        "expected loud bare-annotation error, got: {}",
+        err
+    );
+    let err = compile_err("def f() -> list:\n    return [1]\n", "bareret.py");
+    assert!(
+        err.contains("return annotation") && err.contains("no element/key type"),
+        "expected loud bare return-annotation error, got: {}",
+        err
+    );
+    // ... but subscripted generics, including set[T], still work.
+    let out = compile(
+        "def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n",
+        "generics2.py",
+    );
+    assert!(
+        out.contains("c : std :: collections :: HashSet < i64 >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn rust_keywords_are_escaped() {
     let out = compile("type = 5", "kw.py");
     assert!(out.contains("r#type"), "generated: {}", out);
@@ -56,14 +283,19 @@ fn assignments_hoist_declaration_and_store() {
     // use a computed value.)
     let out = compile("x = 1 + 1", "mut.py");
     assert!(out.contains("let x"), "generated: {}", out);
-    assert!(!out.contains("let mut x"), "single store needs no mut: {}", out);
+    assert!(
+        !out.contains("let mut x"),
+        "single store needs no mut: {}",
+        out
+    );
 }
 
 #[test]
 fn mut_is_inferred_only_where_needed() {
     // Branch-exclusive initialization: no path assigns twice, so no mut —
     // rustc would warn unused_mut otherwise.
-    let src = "def f(c) -> int:\n    if c:\n        x = 1\n    else:\n        x = 2\n    return x\n";
+    let src =
+        "def f(c) -> int:\n    if c:\n        x = 1\n    else:\n        x = 2\n    return x\n";
     let out = compile(src, "branches.py");
     assert!(out.contains("let x ;"), "generated: {}", out);
     assert!(!out.contains("let mut x"), "generated: {}", out);
@@ -74,7 +306,10 @@ fn mut_is_inferred_only_where_needed() {
     assert!(out.contains("let mut total"), "generated: {}", out);
 
     // A mutating method call requires a mutable binding.
-    let out = compile("def h():\n    items = []\n    items.append(1)\n", "append.py");
+    let out = compile(
+        "def h():\n    items = []\n    items.append(1)\n",
+        "append.py",
+    );
     assert!(out.contains("let mut items"), "generated: {}", out);
 
     // A parameter that is only read is not rebound.
@@ -105,7 +340,10 @@ fn nested_block_assignment_stores_into_the_outer_variable() {
 fn assigned_parameters_are_rebound_mutably() {
     // Rust parameters are immutable; a parameter the body assigns to is
     // rebound as a mutable local first.
-    let out = compile("def f(n: int) -> int:\n    n = n + 1\n    return n\n", "param.py");
+    let out = compile(
+        "def f(n: int) -> int:\n    n = n + 1\n    return n\n",
+        "param.py",
+    );
     assert!(out.contains("let mut n = n"), "generated: {}", out);
 }
 
@@ -272,13 +510,21 @@ fn explicit_await_still_awaits() {
 #[test]
 fn from_import_brings_name_into_scope() {
     let out = compile("from os import path", "imp.py");
-    assert!(out.contains("use stdpython :: os :: path ;"), "generated: {}", out);
+    assert!(
+        out.contains("use stdpython :: os :: path ;"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn from_import_with_alias() {
     let out = compile("from os import path as p", "imp2.py");
-    assert!(out.contains("use stdpython :: os :: path as p ;"), "generated: {}", out);
+    assert!(
+        out.contains("use stdpython :: os :: path as p ;"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -291,38 +537,65 @@ fn lambda_parameters_are_bare_names() {
 #[test]
 fn return_type_inferred_from_int_constant() {
     let out = compile("def f():\n    return 42\n", "ret.py");
-    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn return_type_inferred_from_fstring() {
     let out = compile("def f():\n    return f\"x={x}\"\n", "ret2.py");
-    assert!(out.contains("-> Result < String , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn return_type_inferred_from_string_literal() {
     let out = compile("def f():\n    return \"hi\"\n", "ret3.py");
-    assert!(out.contains("-> Result < & 'static str , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < & 'static str , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn mixed_returns_get_no_annotation() {
-    let out = compile("def f(c):\n    if c:\n        return 1\n    return \"s\"\n", "ret4.py");
-    assert!(out.contains("-> Result < () , PyException >"), "generated: {}", out);
+    let out = compile(
+        "def f(c):\n    if c:\n        return 1\n    return \"s\"\n",
+        "ret4.py",
+    );
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn bare_return_gets_no_annotation() {
     let out = compile("def f():\n    return\n", "ret5.py");
-    assert!(out.contains("-> Result < () , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("return Ok (())"), "generated: {}", out);
 }
 
 #[test]
 fn return_type_inferred_through_local_variable() {
     let out = compile("def f():\n    n = 5\n    n -= 1\n    return n\n", "ret6.py");
-    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -335,7 +608,10 @@ fn partial_return_gets_no_annotation() {
 
 #[test]
 fn return_in_loop_only_gets_no_annotation() {
-    let out = compile("def f(items):\n    for x in items:\n        return 1\n", "ret8.py");
+    let out = compile(
+        "def f(items):\n    for x in items:\n        return 1\n",
+        "ret8.py",
+    );
     assert!(!out.contains("-> i64"), "generated: {}", out);
 }
 
@@ -343,12 +619,19 @@ fn return_in_loop_only_gets_no_annotation() {
 fn exhaustive_if_else_returns_get_annotation() {
     let src = "def f(c):\n    if c:\n        return 1\n    else:\n        return 2\n";
     let out = compile(src, "ret9.py");
-    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn annotated_parameters_map_to_rust_types() {
-    let out = compile("def f(a: int, b: float, c: str, d: bool):\n    pass\n", "ann_params.py");
+    let out = compile(
+        "def f(a: int, b: float, c: str, d: bool):\n    pass\n",
+        "ann_params.py",
+    );
     assert!(out.contains("a : i64"), "generated: {}", out);
     assert!(out.contains("b : f64"), "generated: {}", out);
     assert!(out.contains("c : String"), "generated: {}", out);
@@ -359,7 +642,11 @@ fn annotated_parameters_map_to_rust_types() {
 #[test]
 fn return_annotation_used_when_inference_fails() {
     let out = compile("def f(x: int) -> int:\n    return x + 1\n", "ann_ret.py");
-    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -376,13 +663,21 @@ fn string_repetition_uses_multiply_string() {
 #[test]
 fn stdlib_from_import_anchors_to_stdpython() {
     let out = compile("from os import path", "imp3.py");
-    assert!(out.contains("use stdpython :: os :: path ;"), "generated: {}", out);
+    assert!(
+        out.contains("use stdpython :: os :: path ;"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
 fn sibling_from_import_anchors_to_crate() {
     let out = compile("from helpers import util", "imp4.py");
-    assert!(out.contains("use crate :: helpers :: util ;"), "generated: {}", out);
+    assert!(
+        out.contains("use crate :: helpers :: util ;"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -409,7 +704,10 @@ fn annotation_ignored_when_body_can_fall_through() {
     // of the function without returning (the implicit tail is `()`) — but
     // ignoring it is a lossy conversion that likely marks a source bug, so
     // the generated function must carry a warning note saying so.
-    let out = compile("def f(c) -> int:\n    if c:\n        return 1\n", "ann_partial.py");
+    let out = compile(
+        "def f(c) -> int:\n    if c:\n        return 1\n",
+        "ann_partial.py",
+    );
     assert!(!out.contains("-> i64"), "generated: {}", out);
     assert!(out.contains("deprecated"), "generated: {}", out);
     assert!(
@@ -465,7 +763,11 @@ fn try_except_lowers_to_result_handling() {
         out
     );
     // `as e` binds the caught exception.
-    assert!(out.contains("let mut e = __rython_exc . clone ()"), "generated: {}", out);
+    assert!(
+        out.contains("let mut e = __rython_exc . clone ()"),
+        "generated: {}",
+        out
+    );
     // An unmatched exception re-raises as an Err out of the function.
     assert!(
         out.contains("Err (__rython_exc) => { return Err (__rython_exc) ; }"),
@@ -535,6 +837,73 @@ fn finally_runs_before_reraise() {
 }
 
 #[test]
+fn zero_division_raises_catchable_zero_division_error() {
+    // Issue #75: py_floordiv/py_mod used to panic on a zero divisor, so
+    // `except ZeroDivisionError` could never catch them. They now return
+    // Result and the call sites thread `?`, keeping the error inside the
+    // try-body closure where the handlers can match it.
+    for op in ["//", "%"] {
+        let src = format!(
+            "def f():\n    try:\n        print(5 {op} 0)\n    except ZeroDivisionError:\n        print(\"caught\")\n"
+        );
+        let out = compile(&src, "zero_div.py");
+        assert!(
+            out.contains("py_mod (5 , 0) ?") || out.contains("py_floordiv (5 , 0) ?"),
+            "{} must route through the Result-returning helper with `?`: {}",
+            op,
+            out
+        );
+        assert!(
+            out.contains("__rython_exc . matches (\"ZeroDivisionError\")"),
+            "the handler must match ZeroDivisionError: {}",
+            out
+        );
+    }
+    // The augmented-assignment forms lower through the same helpers.
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        x = 10\n",
+        "        x //= 0\n",
+        "    except ZeroDivisionError:\n",
+        "        print(\"caught\")\n",
+    );
+    let out = compile(src, "zero_div_aug.py");
+    assert!(
+        out.contains("x = py_floordiv (x , 0) ?"),
+        "aug //= must thread `?`: {}",
+        out
+    );
+}
+
+#[test]
+fn hoisted_variable_first_assigned_in_try_body_gets_default_init() {
+    // Issue #78: a variable first assigned inside a try body is captured by
+    // the try-body closure while possibly-uninitialized, which rustc rejects
+    // (E0381). The hoist must give it a Default initializer instead of a
+    // bare `let mut x;`.
+    let src = concat!(
+        "def f():\n",
+        "    try:\n",
+        "        x = compute()\n",
+        "    finally:\n",
+        "        cleanup()\n",
+        "    print(x)\n",
+    );
+    let out = compile(src, "try_hoist.py");
+    assert!(
+        out.contains("let mut x = Default :: default () ;"),
+        "hoisted capture needs a Default initializer: {}",
+        out
+    );
+    assert!(
+        !out.contains("let mut x ;"),
+        "no bare uninitialized hoist for a closure-captured name: {}",
+        out
+    );
+}
+
+#[test]
 fn finally_runs_before_handler_and_else_returns() {
     // Python: finally always executes before control leaves the try
     // statement — including when an except handler or else clause returns
@@ -555,8 +924,10 @@ fn finally_runs_before_handler_and_else_returns() {
     // Both the handler return and the else return thread out through a
     // PyFlow closure whose Return arm runs cleanup() first.
     assert_eq!(
-        out.matches("Ok (PyFlow :: Return (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }")
-            .count(),
+        out.matches(
+            "Ok (PyFlow :: Return (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }"
+        )
+        .count(),
         2,
         "handler and else returns must run the finally first: {}",
         out
@@ -631,10 +1002,7 @@ fn raise_returns_err_from_the_function() {
     // Functions return Result<T, PyException>, so raising anywhere is
     // returning Err — callers propagate it with `?`, as Python propagates
     // exceptions up the call stack.
-    let out = compile(
-        "def f():\n    raise RuntimeError(\"boom\")\n",
-        "raise.py",
-    );
+    let out = compile("def f():\n    raise RuntimeError(\"boom\")\n", "raise.py");
     assert!(
         out.contains("return Err (PyException :: new (\"RuntimeError\""),
         "generated: {}",
@@ -676,13 +1044,11 @@ fn return_inside_try_threads_through_controlflow() {
         "        cleanup()\n",
     );
     let out = compile(src, "trystmt_ret.py");
+    assert!(out.contains("PyFlow :: Return (n)"), "generated: {}", out);
     assert!(
-        out.contains("PyFlow :: Return (n)"),
-        "generated: {}",
-        out
-    );
-    assert!(
-        out.contains("Ok (PyFlow :: Return (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }"),
+        out.contains(
+            "Ok (PyFlow :: Return (__rython_ret)) => { cleanup () ; return Ok (__rython_ret) ; }"
+        ),
         "finally must run before the returned value leaves: {}",
         out
     );
@@ -690,9 +1056,16 @@ fn return_inside_try_threads_through_controlflow() {
 
 #[test]
 fn assert_lowers_to_assertion_error() {
-    let out = compile("def f(n):\n    assert n > 0, \"need positive\"\n", "assert.py");
+    let out = compile(
+        "def f(n):\n    assert n > 0, \"need positive\"\n",
+        "assert.py",
+    );
     // Comparisons lower through the PyGt trait (borrowed operands).
-    assert!(out.contains("if ! ((n) . py_gt (& (0)))"), "generated: {}", out);
+    assert!(
+        out.contains("if ! ((n) . py_gt (& (0)))"),
+        "generated: {}",
+        out
+    );
     assert!(
         out.contains("PyException :: new (\"AssertionError\""),
         "generated: {}",
@@ -727,18 +1100,38 @@ fn unary_plus_emits_no_invalid_operator() {
 fn conditions_apply_python_truthiness() {
     // Non-bool condition: wrapped in is_truthy (empty string/list and zero
     // are false, as in Python).
-    let out = compile("def f(items):\n    if items:\n        work()\n", "truthy.py");
-    assert!(out.contains("if (items) . is_truthy ()"), "generated: {}", out);
+    let out = compile(
+        "def f(items):\n    if items:\n        work()\n",
+        "truthy.py",
+    );
+    assert!(
+        out.contains("if (items) . is_truthy ()"),
+        "generated: {}",
+        out
+    );
 
-    let out = compile("def f(n):\n    while n:\n        work()\n", "truthy_while.py");
-    assert!(out.contains("while (n) . is_truthy ()"), "generated: {}", out);
+    let out = compile(
+        "def f(n):\n    while n:\n        work()\n",
+        "truthy_while.py",
+    );
+    assert!(
+        out.contains("while (n) . is_truthy ()"),
+        "generated: {}",
+        out
+    );
 
     // Comparisons already yield bool: no wrapping.
-    let out = compile("def f(n: int):\n    if n < 0:\n        work()\n", "truthy_cmp.py");
+    let out = compile(
+        "def f(n: int):\n    if n < 0:\n        work()\n",
+        "truthy_cmp.py",
+    );
     assert!(!out.contains("is_truthy"), "generated: {}", out);
 
     // Boolean operators recurse into operands; `not` negates a condition.
-    let out = compile("def f(a, b):\n    if a and not b:\n        work()\n", "truthy_bool.py");
+    let out = compile(
+        "def f(a, b):\n    if a and not b:\n        work()\n",
+        "truthy_bool.py",
+    );
     assert!(
         out.contains("((a) . is_truthy ()) && (! ((b) . is_truthy ()))"),
         "generated: {}",
@@ -748,10 +1141,16 @@ fn conditions_apply_python_truthiness() {
 
 #[test]
 fn is_none_lowers_to_py_is_none() {
-    let out = compile("def f(x):\n    if x is None:\n        work()\n", "isnone.py");
+    let out = compile(
+        "def f(x):\n    if x is None:\n        work()\n",
+        "isnone.py",
+    );
     assert!(out.contains("(x) . py_is_none ()"), "generated: {}", out);
 
-    let out = compile("def f(x):\n    if x is not None:\n        work()\n", "isnotnone.py");
+    let out = compile(
+        "def f(x):\n    if x is not None:\n        work()\n",
+        "isnotnone.py",
+    );
     assert!(out.contains("! (x) . py_is_none ()"), "generated: {}", out);
 
     // `is` between two non-None values keeps the identity approximation.
@@ -803,7 +1202,10 @@ fn python_str_methods_map_through_pystrops() {
 
 #[test]
 fn str_parameters_accept_borrowed_and_owned_strings() {
-    let out = compile("def shout(name: str) -> str:\n    return name.upper()\n", "strparam.py");
+    let out = compile(
+        "def shout(name: str) -> str:\n    return name.upper()\n",
+        "strparam.py",
+    );
     // The parameter is generic over Into<String>, converted once up front.
     assert!(
         out.contains("name : impl Into < String >"),
@@ -818,32 +1220,212 @@ fn str_parameters_accept_borrowed_and_owned_strings() {
 }
 
 #[test]
+fn for_loop_target_leaks_to_the_enclosing_scope() {
+    // Python's loop variable is function-scoped: a target also referenced
+    // outside the loop keeps its value after it. The scope analysis hoists
+    // the name; the loop must STORE into it instead of shadowing it with a
+    // fresh `for` binding (issue #80).
+    let out = compile(
+        "def f(items: list[int]) -> int:\n    x = 0\n    for x in items:\n        pass\n    return x\n",
+        "forleak.py",
+    );
+    assert!(
+        out.contains("for __rython_elt in items") && !out.contains("for x in items"),
+        "leaked loop target must lower to a store into the hoisted binding: {}",
+        out
+    );
+    assert!(out.contains("x = __rython_elt ;"), "generated: {}", out);
+
+    // A target only referenced inside the loop keeps its direct binding.
+    let out = compile(
+        "def f(items: list[int]) -> int:\n    s = 0\n    for v in items:\n        s = s + v\n    return s\n",
+        "forlocal.py",
+    );
+    assert!(out.contains("for v in items"), "generated: {}", out);
+    assert!(!out.contains("__rython_elt"), "generated: {}", out);
+
+    // Unused index names still lower to `_` (issue #101) unless hoisted.
+    let out = compile(
+        "def f(items: list[int]) -> int:\n    n = 0\n    for _ in items:\n        n = n + 1\n    return n\n",
+        "forunderscore.py",
+    );
+    assert!(out.contains("for _ in items"), "generated: {}", out);
+}
+
+#[test]
+fn list_remove_evaluates_receiver_and_value_once() {
+    // The old lowering spliced the receiver twice and the value inside the
+    // position closure (once per scanned element); a side-effecting
+    // receiver (`xs[which()].remove(2)`) ran twice. Both are now bound to
+    // temps before the scan (issue #80).
+    let out = compile(
+        "def f(xs: list[list[int]]) -> None:\n    xs[0].remove(2)\n",
+        "removeonce.py",
+    );
+    assert!(
+        out.contains("let __rython_recv") && out.contains("let __rython_val = 2"),
+        "receiver and value must be bound exactly once: {}",
+        out
+    );
+    assert_eq!(out.matches("py_index_mut").count(), 1, "generated: {}", out);
+}
+
+#[test]
+fn chained_assignment_to_a_container_literal_errors() {
+    // `a = b = []` would need shared aliasing: each target would get its
+    // own copy and later mutations through one name would silently diverge
+    // from Python (issue #80). Loud conversion error instead.
+    let module = crate::parse("a = b = []\n", "chainlist.py").unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            crate::CodeGenContext::Module("chainlist".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("shared aliasing"), "error: {msg}");
+
+    // A tuple literal is immutable — copies are unobservable, so it stays.
+    let module = crate::parse("a = b = (1, 2)\n", "chaintuple.py").unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            crate::CodeGenContext::Module("chaintuple".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(out.contains("__rython_chain"), "generated: {out}");
+}
+
+#[test]
+fn omitted_defaults_must_be_constant() {
+    // CPython evaluates defaults once at def time; rython inlines them at
+    // the call site. A mutable default would also be SHARED across calls,
+    // which owned values cannot express (issue #80) — loud error when a
+    // call actually omits it.
+    let module = crate::parse("def f(x=[]):\n    return x\n\nf()\n", "mutdefault.py").unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            crate::CodeGenContext::Module("mutdefault".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("mutable default") && msg.contains("SHARES"),
+        "error: {msg}"
+    );
+
+    // A non-constant default that is never omitted at any call site stays
+    // out of the way: the deprecated-note signature path already forces
+    // every argument to be passed explicitly.
+    let module = crate::parse(
+        "def g(x=compute()):\n    return x\n\ng(3)\n",
+        "nonconstdefault.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            crate::CodeGenContext::Module("nonconstdefault".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(out.contains("g (3)"), "generated: {out}");
+
+    // A constant default inlined at an omitted call site is fine.
+    let module = crate::parse("def h(x=7):\n    return x\n\nh()\n", "constdefault.py").unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            crate::CodeGenContext::Module("constdefault".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(out.contains("h (7)"), "generated: {out}");
+}
+
+#[test]
+fn user_definitions_shadow_stdlib_module_spellings() {
+    // `re = ...` then `re.search(...)` must call the user's object, not
+    // the re module (issue #80). The module intercept defers to the
+    // user-defined symbol.
+    let out = compile(
+        "def f() -> str:\n    re = \"x\"\n    return re.upper()\n",
+        "shadowre.py",
+    );
+    assert!(out.contains("re . upper ()"), "generated: {out}");
+    assert!(!out.contains("re :: upper"), "generated: {out}");
+
+    // Same for the call-dispatch modules (heapq as a callable name).
+    let out = compile(
+        "def f() -> int:\n    heapq = 5\n    return heapq\n",
+        "shadowheapq.py",
+    );
+    assert!(!out.contains("heapq :: "), "generated: {out}");
+}
+
+#[test]
 fn subscripts_lower_through_py_index() {
     // Reads follow Python index rules (negatives, catchable IndexError).
-    let out = compile("def f(items: list[int], i: int) -> int:\n    return items[i]\n", "sub.py");
-    assert!(out.contains("(items) . py_index (i) ?"), "generated: {}", out);
+    let out = compile(
+        "def f(items: list[int], i: int) -> int:\n    return items[i]\n",
+        "sub.py",
+    );
+    assert!(
+        out.contains("(items) . py_index (i) ?"),
+        "generated: {}",
+        out
+    );
 
-    // Stores go through py_set_index, not the Load lowering.
+    // Stores go through py_set_index, not the Load lowering. The value is
+    // bound first: Python evaluates the RHS, then the receiver and index
+    // (issue #80 — and a side-effecting RHS runs exactly once).
     let out = compile(
         "def f(items: list[int]):\n    items[0] = 5\n",
         "substore.py",
     );
     assert!(
-        out.contains("(items) . py_set_index (0 , 5) ?"),
+        out.contains("let __rython_val = 5 ; (items) . py_set_index (0 , __rython_val) ?"),
         "generated: {}",
         out
     );
     assert!(!out.contains("py_index (0) ? ="), "generated: {}", out);
 
     // Dict stores insert; catchable KeyError on reads comes from PyIndex.
-    let out = compile("def f():\n    d = {\"a\": 1}\n    d[\"b\"] = 2\n    return d[\"a\"]\n", "dictsub.py");
-    assert!(out.contains("py_set_index (\"b\" , 2) ?"), "generated: {}", out);
+    // String-keyed dicts own the key at the store site (py_set_index
+    // takes String for PyDict<String, V>); reads take &str. The value is
+    // bound before the store (issue #80).
+    let out = compile(
+        "def f():\n    d = {\"a\": 1}\n    d[\"b\"] = 2\n    return d[\"a\"]\n",
+        "dictsub.py",
+    );
+    assert!(
+        out.contains(
+            "let __rython_val = 2 ; (d) . py_set_index ((\"b\") . to_string () , __rython_val) ?"
+        ),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("py_index (\"a\") ?"), "generated: {}", out);
 }
 
 #[test]
 fn slices_lower_through_py_slice() {
-    let out = compile("def f(items: list[int]):\n    return items[1:3]\n", "slice1.py");
+    let out = compile(
+        "def f(items: list[int]):\n    return items[1:3]\n",
+        "slice1.py",
+    );
     assert!(
         out.contains("py_slice (Some (1) , Some (3) , None)"),
         "generated: {}",
@@ -860,7 +1442,10 @@ fn slices_lower_through_py_slice() {
 
 #[test]
 fn container_annotations_map_to_rust_types() {
-    let out = compile("def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n", "generics.py");
+    let out = compile(
+        "def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n",
+        "generics.py",
+    );
     assert!(out.contains("a : Vec < i64 >"), "generated: {}", out);
     assert!(
         out.contains("b : PyDict < String , i64 >"),
@@ -928,11 +1513,21 @@ fn bare_numeric_literals_are_anchored_in_addition() {
 fn addition_lowers_through_py_add() {
     // Python + covers String + String and list concat, which Rust's Add
     // doesn't; operands are borrowed so variables stay usable.
-    let out = compile("def f(a: str, b: str) -> str:\n    return a + b\n", "addstr.py");
+    let out = compile(
+        "def f(a: str, b: str) -> str:\n    return a + b\n",
+        "addstr.py",
+    );
     assert!(out.contains("(a) . py_add (& (b))"), "generated: {}", out);
 
-    let out = compile("def f(n: int) -> int:\n    n += 1\n    return n\n", "addaug.py");
-    assert!(out.contains("n = (n) . py_add (& (1))"), "generated: {}", out);
+    let out = compile(
+        "def f(n: int) -> int:\n    n += 1\n    return n\n",
+        "addaug.py",
+    );
+    assert!(
+        out.contains("n = (n) . py_add (& (1))"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -956,17 +1551,41 @@ fn dict_literals_and_methods_lower_through_pydict() {
         "    return x + y + z\n",
     );
     let out = compile(src, "dictops.py");
-    assert!(out.contains("py_get_default (& (\"a\") , 0)"), "generated: {}", out);
-    assert!(out.contains("py_pop (\"a\") ?"), "generated: {}", out);
-    assert!(out.contains("py_pop_default (\"gone\" , 9)"), "generated: {}", out);
-    assert!(out.contains("py_setdefault (\"b\" , 2)"), "generated: {}", out);
+    assert!(
+        out.contains("py_get_default (& ((\"a\") . to_string ()) , 0)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("py_pop ((\"a\") . to_string ()) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("py_pop_default ((\"gone\") . to_string () , 9)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("py_setdefault ((\"b\") . to_string () , 2)"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("py_keys ()"), "generated: {}", out);
     assert!(out.contains("py_values ()"), "generated: {}", out);
     assert!(out.contains("py_items ()"), "generated: {}", out);
 
-    // get with one argument returns an Option (value-or-None).
-    let out = compile("def g(d: dict[str, int]):\n    v = d.get(\"k\")\n", "dictget.py");
-    assert!(out.contains("py_get (& (\"k\"))"), "generated: {}", out);
+    // get with one argument returns an Option (value-or-None). Dict keys
+    // are String (literal or annotation), so literal keys are owned.
+    let out = compile(
+        "def g(d: dict[str, int]):\n    v = d.get(\"k\")\n",
+        "dictget.py",
+    );
+    assert!(
+        out.contains("py_get (& ((\"k\") . to_string ()))"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -979,8 +1598,15 @@ fn keyword_arguments_map_to_parameter_positions() {
         "    return volume(d=2, w=3, h=4)\n",
     );
     let out = compile(src, "kw.py");
-    // Keywords land in signature order regardless of call order.
-    assert!(out.contains("volume (3 , 4 , 2) ?"), "generated: {}", out);
+    // Keywords land in signature order regardless of call order; the
+    // arguments are bound to temps in SOURCE order first (d=2, w=3, h=4),
+    // then referenced in parameter order (issue #80). The reordering block
+    // is parenthesized before `?` so it is valid in any position (F9).
+    assert!(
+        out.contains("let __rython_arg_0 = 2 ; let __rython_arg_1 = 3 ; let __rython_arg_2 = 4 ; volume (__rython_arg_1 , __rython_arg_2 , __rython_arg_0) }) ?"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -997,12 +1623,15 @@ fn omitted_defaults_fill_at_the_call_site() {
     );
     let out = compile(src, "kwdef.py");
     assert!(
-        out.contains("greet (\"world\" , false) ?"),
+        out.contains("greet (\"world\" , false) }) ?"),
         "generated: {}",
         out
     );
+    // greet(excited=True): name's default is a constant, so it stays
+    // inlined in parameter position while the keyword is bound to a temp
+    // (evaluated in source order, then referenced in parameter order).
     assert!(
-        out.contains("greet (\"world\" , true) ?"),
+        out.contains("let __rython_arg_0 = true ; greet (\"world\" , __rython_arg_0) }) ?"),
         "keyword for the second param leaves the first defaulted: {}",
         out
     );
@@ -1021,11 +1650,7 @@ fn keywords_on_unknown_callees_error_loudly() {
             symbols,
         )
         .expect_err("keywords on unknown callee must not convert");
-    assert!(
-        format!("{}", err).contains("signature"),
-        "error: {}",
-        err
-    );
+    assert!(format!("{}", err).contains("signature"), "error: {}", err);
 }
 
 #[test]
@@ -1055,7 +1680,11 @@ fn none_lowers_to_option() {
     let out = compile(src, "opt.py");
     assert!(out.contains("found = None"), "generated: {}", out);
     assert!(out.contains("found = Some (x)"), "generated: {}", out);
-    assert!(out.contains("(found) . py_is_none ()"), "generated: {}", out);
+    assert!(
+        out.contains("(found) . py_is_none ()"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -1080,8 +1709,11 @@ fn optional_parameters_wrap_arguments_at_call_sites() {
         "    return a + b\n",
     );
     let out = compile(src, "optcall.py");
-    assert!(out.contains("label (Some (7)) ?"), "generated: {}", out);
-    assert!(out.contains("label (None) ?"), "generated: {}", out);
+    // All-positional calls emit directly (no reordering): the `?` still
+    // applies to the whole call, now wrapped in the lowering block and
+    // parenthesized so it is valid in any position (F9).
+    assert!(out.contains("({ label (Some (7)) }) ?"), "generated: {}", out);
+    assert!(out.contains("({ label (None) }) ?"), "generated: {}", out);
 }
 
 #[test]
@@ -1101,11 +1733,7 @@ fn optional_stores_from_option_values_do_not_double_wrap() {
         "    return 0\n",
     );
     let out = compile(src, "optget.py");
-    assert!(
-        out.contains("result = (d) . py_get"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("result = (d) . py_get"), "generated: {}", out);
     assert!(
         !out.contains("Some ((d) . py_get"),
         "double-wrapped dict.get store, generated: {}",
@@ -1158,11 +1786,7 @@ fn conditional_with_option_arms_stores_without_rewrap() {
         "    return 0\n",
     );
     let out = compile(src, "optifexp2.py");
-    assert!(
-        out.contains("choice = if"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("choice = if"), "generated: {}", out);
     assert!(
         !out.contains("Some (if") && !out.contains("Some ((d) . py_get"),
         "double-wrapped a conditional Option, generated: {}",
@@ -1235,7 +1859,11 @@ fn membership_uses_py_contains() {
     assert!(out.contains("py_contains"), "generated: {}", out);
 
     let out = compile("missing = x not in items", "notin.py");
-    assert!(out.contains("! (items) . py_contains"), "generated: {}", out);
+    assert!(
+        out.contains("! (items) . py_contains"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -1343,7 +1971,11 @@ fn method_receivers_follow_mutation_including_transitive_calls() {
     let out = compile(COUNTER, "receivers.py");
     // __init__ and bump store through self; double_bump only via calling
     // bump; peek reads only.
-    assert!(out.contains("fn __init__ (& mut self ,"), "generated: {}", out);
+    assert!(
+        out.contains("fn __init__ (& mut self ,"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("fn bump (& mut self ,"), "generated: {}", out);
     assert!(
         out.contains("fn double_bump (& mut self ,"),
@@ -1368,7 +2000,13 @@ fn construction_and_method_calls_propagate_exceptions() {
         out
     );
     // Keyword arguments map against the method signature; calls take `?`.
-    assert!(out.contains("(c) . bump (2) ?"), "generated: {}", out);
+    // bump(amount=2) binds the argument to a temp (the keyword reorders
+    // the emission) and references it in parameter position (issue #80).
+    assert!(
+        out.contains("let __rython_arg_0 = 2 ; (c) . bump (__rython_arg_0) ?"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("(c) . peek () ?"), "generated: {}", out);
     // A local constructing a mutating class needs a mutable binding.
     assert!(out.contains("let mut c ;"), "generated: {}", out);
@@ -1665,12 +2303,20 @@ fn bare_precision_without_type_errors_loudly() {
         "def f(x: float) -> str:\n    return \"{:.3}\".format(x)\n",
         "barep.py",
     );
-    assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+    assert!(
+        err.contains("presentation type is ambiguous"),
+        "error: {}",
+        err
+    );
     let err = compile_err(
         "def f(x: float) -> str:\n    return f\"{x:.3}\"\n",
         "barepf.py",
     );
-    assert!(err.contains("presentation type is ambiguous"), "error: {}", err);
+    assert!(
+        err.contains("presentation type is ambiguous"),
+        "error: {}",
+        err
+    );
 }
 
 // ---- Module-level globals and entry points ----
@@ -1689,14 +2335,26 @@ fn module_constants_lower_to_statics() {
         ),
         "consts.py",
     );
-    assert!(out.contains("pub static PI : f64 = 3.14159"), "generated: {}", out);
+    assert!(
+        out.contains("pub static PI : f64 = 3.14159"),
+        "generated: {}",
+        out
+    );
     assert!(
         out.contains("pub static GREETING : & 'static str = \"hello\""),
         "generated: {}",
         out
     );
-    assert!(out.contains("pub static DEBUG : bool = true"), "generated: {}", out);
-    assert!(out.contains("pub static OFFSET : i64 = - 3"), "generated: {}", out);
+    assert!(
+        out.contains("pub static DEBUG : bool = true"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("pub static OFFSET : i64 = - 3"),
+        "generated: {}",
+        out
+    );
 
     // A reassigned module name is NOT a constant; it keeps the old
     // module-init lowering.
@@ -1772,7 +2430,11 @@ fn compile_nostd(src: &str, name: &str) -> Result<String, String> {
         ..Default::default()
     };
     module
-        .to_rust(CodeGenContext::Module(name.replace(".py", "")), options, symbols)
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            options,
+            symbols,
+        )
         .map(|tokens| tokens.to_string())
         .map_err(|e| python_ast::format_error_chain(e.as_ref()))
 }
@@ -1788,7 +2450,11 @@ fn nostd_modules_carry_an_alloc_prelude() {
 
     // The std profile stays exactly as before: no alloc plumbing.
     let std_out = compile("def f(n: int) -> str:\n    return f\"n={n}\"\n", "sp.py");
-    assert!(!std_out.contains("extern crate alloc"), "generated: {}", std_out);
+    assert!(
+        !std_out.contains("extern crate alloc"),
+        "generated: {}",
+        std_out
+    );
 }
 
 #[test]
@@ -1821,10 +2487,13 @@ fn nostd_std_tier_imports_error_loudly() {
     }
 
     // alloc-tier runtime modules stay importable.
-    for src in ["import json\n", "import collections\n", "import itertools\n"] {
-        compile_nostd(src, "ok.py").unwrap_or_else(|e| {
-            panic!("alloc-tier import must convert: {:?}: {}", src, e)
-        });
+    for src in [
+        "import json\n",
+        "import collections\n",
+        "import itertools\n",
+    ] {
+        compile_nostd(src, "ok.py")
+            .unwrap_or_else(|e| panic!("alloc-tier import must convert: {:?}: {}", src, e));
     }
 }
 
@@ -1845,24 +2514,38 @@ fn nostd_main_blocks_error_loudly() {
 #[test]
 fn min_max_lower_to_variant_functions_with_exception_propagation() {
     // Single-iterable form raises on empty, so it propagates with `?`.
-    let out = compile("def f(xs: list[int]) -> int:\n    return min(xs)\n", "m1.py");
+    let out = compile(
+        "def f(xs: list[int]) -> int:\n    return min(xs)\n",
+        "m1.py",
+    );
     assert!(out.contains("min (& (xs)) ?"), "generated: {}", out);
 
     // Two and three scalar arguments fold pairwise.
-    let out = compile("def f(a: int, b: int) -> int:\n    return max(a, b)\n", "m2.py");
+    let out = compile(
+        "def f(a: int, b: int) -> int:\n    return max(a, b)\n",
+        "m2.py",
+    );
     assert!(out.contains("max2 (a , b)"), "generated: {}", out);
     let out = compile(
         "def f(a: int, b: int, c: int) -> int:\n    return min(a, b, c)\n",
         "m3.py",
     );
-    assert!(out.contains("min2 (min2 (a , b) , c)"), "generated: {}", out);
+    assert!(
+        out.contains("min2 (min2 (a , b) , c)"),
+        "generated: {}",
+        out
+    );
 
     // default= never raises; key= does.
     let out = compile(
         "def f(xs: list[int]) -> int:\n    return min(xs, default=7)\n",
         "m4.py",
     );
-    assert!(out.contains("min_default (& (xs) , 7)"), "generated: {}", out);
+    assert!(
+        out.contains("min_default (& (xs) , 7)"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         "def f(xs: list[int]) -> int:\n    return max(xs, key=lambda x: -x)\n",
         "m5.py",
@@ -1877,13 +2560,20 @@ fn min_max_lower_to_variant_functions_with_exception_propagation() {
 
 #[test]
 fn sorted_lowers_by_keyword_combination() {
-    let out = compile("def f(xs: list[int]) -> list[int]:\n    return sorted(xs)\n", "s1.py");
+    let out = compile(
+        "def f(xs: list[int]) -> list[int]:\n    return sorted(xs)\n",
+        "s1.py",
+    );
     assert!(out.contains("sorted (& (xs))"), "generated: {}", out);
     let out = compile(
         "def f(xs: list[int]) -> list[int]:\n    return sorted(xs, reverse=True)\n",
         "s2.py",
     );
-    assert!(out.contains("sorted_reverse (& (xs) , true)"), "generated: {}", out);
+    assert!(
+        out.contains("sorted_reverse (& (xs) , true)"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         "def f(xs: list[int]) -> list[int]:\n    return sorted(xs, key=lambda x: -x)\n",
         "s3.py",
@@ -1893,7 +2583,11 @@ fn sorted_lowers_by_keyword_combination() {
         "def f(xs: list[int]) -> list[int]:\n    return sorted(xs, key=lambda x: -x, reverse=True)\n",
         "s4.py",
     );
-    assert!(out.contains("sorted_key_reverse (& (xs) ,"), "generated: {}", out);
+    assert!(
+        out.contains("sorted_key_reverse (& (xs) ,"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -1917,9 +2611,15 @@ fn enumerate_start_and_pow_arities_lower_to_their_variants() {
 fn by_reference_builtins_borrow_their_argument() {
     // len/repr/reversed take references at the runtime layer; Python's
     // calls never consume the value.
-    let out = compile("def f(xs: list[int]) -> int:\n    return len(xs)\n", "b1.py");
+    let out = compile(
+        "def f(xs: list[int]) -> int:\n    return len(xs)\n",
+        "b1.py",
+    );
     assert!(out.contains("len (& (xs))"), "generated: {}", out);
-    let out = compile("def f(xs: list[int]) -> str:\n    return repr(xs)\n", "b2.py");
+    let out = compile(
+        "def f(xs: list[int]) -> str:\n    return repr(xs)\n",
+        "b2.py",
+    );
     assert!(out.contains("repr (& (xs))"), "generated: {}", out);
     let out = compile(
         "def f(xs: list[int]) -> list[int]:\n    return reversed(xs)\n",
@@ -1950,11 +2650,12 @@ fn datetime_constructors_map_keywords_onto_new() {
         "generated: {}",
         out
     );
-    let out = compile(
-        "from datetime import date\nd = date(2024, 3, 1)\n",
-        "d.py",
+    let out = compile("from datetime import date\nd = date(2024, 3, 1)\n", "d.py");
+    assert!(
+        out.contains("date :: new (2024 , 3 , 1) ?"),
+        "generated: {}",
+        out
     );
-    assert!(out.contains("date :: new (2024 , 3 , 1) ?"), "generated: {}", out);
     let out = compile(
         "from datetime import datetime\ndt = datetime(2024, 3, 1, hour=10)\n",
         "dt.py",
@@ -2010,12 +2711,20 @@ fn runtime_module_imports_lower_to_nothing_and_aliases_stay_loud() {
 fn itertools_keyword_spellings_lower_to_variants() {
     let base = "from itertools import accumulate, product, zip_longest, groupby\n";
     let out = compile(&format!("{}a = accumulate([1, 2])\n", base), "i1.py");
-    assert!(out.contains("accumulate_sum (& (vec ! [1 , 2]))"), "generated: {}", out);
+    assert!(
+        out.contains("accumulate_sum (& (vec ! [1 , 2]))"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         &format!("{}a = accumulate([1, 2], initial=10)\n", base),
         "i2.py",
     );
-    assert!(out.contains("accumulate_sum_initial ("), "generated: {}", out);
+    assert!(
+        out.contains("accumulate_sum_initial ("),
+        "generated: {}",
+        out
+    );
     let out = compile(
         &format!("{}a = accumulate([1, 2], lambda x, y: x * y)\n", base),
         "i3.py",
@@ -2070,16 +2779,32 @@ fn pure_module_calls_lower_with_borrows_and_arity_variants() {
         "from heapq import heappush, heappop\nh = [3, 1]\nheappush(h, 2)\nx = heappop(h)\n",
         "h1.py",
     );
-    assert!(out.contains("heappush (& mut (h) , 2)"), "generated: {}", out);
+    assert!(
+        out.contains("heappush (& mut (h) , 2)"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("heappop (& mut (h)) ?"), "generated: {}", out);
-    assert!(out.contains("let mut h"), "heap binding must be mut: {}", out);
+    assert!(
+        out.contains("let mut h"),
+        "heap binding must be mut: {}",
+        out
+    );
 
     // Module-attribute spelling lowers to the same shapes AND marks the
     // heap binding mutable (Devin review on #53: only the bare-function
     // spelling used to).
     let out = compile("import heapq\nh = [2, 1]\nheapq.heapify(h)\n", "h2.py");
-    assert!(out.contains("heapq :: heapify (& mut (h))"), "generated: {}", out);
-    assert!(out.contains("let mut h"), "heap binding must be mut: {}", out);
+    assert!(
+        out.contains("heapq :: heapify (& mut (h))"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("let mut h"),
+        "heap binding must be mut: {}",
+        out
+    );
 
     let out = compile("from copy import deepcopy\nc = deepcopy([1])\n", "c1.py");
     assert!(out.contains("deepcopy (& ("), "generated: {}", out);
@@ -2087,7 +2812,11 @@ fn pure_module_calls_lower_with_borrows_and_arity_variants() {
         "from textwrap import indent\ns = indent(\"a\", \"> \")\n",
         "t1.py",
     );
-    assert!(out.contains("indent (& (\"a\") , & (\"> \"))"), "generated: {}", out);
+    assert!(
+        out.contains("indent (& (\"a\") , & (\"> \"))"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -2132,10 +2861,7 @@ fn re_calls_lower_to_borrowing_fallible_paths() {
     // `match` is a Rust keyword: the runtime function is r#match.
     let out = compile("import re\nm = re.match(r\"\\d\", \"1\")\n", "r2.py");
     assert!(out.contains("re :: r#match ("), "generated: {}", out);
-    let out = compile(
-        "import re\ns = re.sub(r\"a\", \"b\", \"aa\")\n",
-        "r3.py",
-    );
+    let out = compile("import re\ns = re.sub(r\"a\", \"b\", \"aa\")\n", "r3.py");
     assert!(out.contains("re :: sub ("), "generated: {}", out);
     assert!(out.contains(") ?"), "generated: {}", out);
     // m.group() lowers to group(0).
@@ -2173,11 +2899,12 @@ fn re_calls_lower_to_borrowing_fallible_paths() {
     );
     assert!(err.contains("unsupported re flag"), "error: {}", err);
     // split's THIRD positional is maxsplit (not flags, unlike the rest).
-    let out = compile(
-        "import re\nxs = re.split(r\"a\", \"b\", 1)\n",
-        "r10.py",
+    let out = compile("import re\nxs = re.split(r\"a\", \"b\", 1)\n", "r10.py");
+    assert!(
+        out.contains("re :: split (& (\"a\") , & (\"b\") , 1 , \"\") ?"),
+        "generated: {}",
+        out
     );
-    assert!(out.contains("re :: split (& (\"a\") , & (\"b\") , 1 , \"\") ?"), "generated: {}", out);
     let out = compile(
         "import re\nxs = re.split(r\"a\", \"b\", maxsplit=2, flags=re.IGNORECASE)\n",
         "r11.py",
@@ -2251,17 +2978,29 @@ fn hashlib_and_encode_lower_correctly() {
 #[test]
 fn wrap_and_fill_lower_with_width_defaults() {
     let out = compile("from textwrap import wrap\nxs = wrap(\"a b\")\n", "w1.py");
-    assert!(out.contains("wrap (& (\"a b\") , 70) ?"), "generated: {}", out);
+    assert!(
+        out.contains("wrap (& (\"a b\") , 70) ?"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         "from textwrap import fill\ns = fill(\"a b\", width=9)\n",
         "w2.py",
     );
-    assert!(out.contains("fill (& (\"a b\") , 9) ?"), "generated: {}", out);
+    assert!(
+        out.contains("fill (& (\"a b\") , 9) ?"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         "import textwrap\nxs = textwrap.wrap(\"a b\", 12)\n",
         "w3.py",
     );
-    assert!(out.contains("textwrap :: wrap (& (\"a b\") , 12) ?"), "generated: {}", out);
+    assert!(
+        out.contains("textwrap :: wrap (& (\"a b\") , 12) ?"),
+        "generated: {}",
+        out
+    );
     // Unsupported options stay loud.
     let err = compile_err(
         "from textwrap import wrap\nxs = wrap(\"a\", initial_indent=\"> \")\n",
@@ -2281,7 +3020,11 @@ fn isinstance_lowers_to_a_static_constant_or_a_loud_error() {
         "def f(n: int) -> bool:\n    return isinstance(n, int)\n",
         "is1.py",
     );
-    assert!(out.contains("return Ok (true)") || out.contains("true"), "generated: {}", out);
+    assert!(
+        out.contains("return Ok (true)") || out.contains("true"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         "def f(n: int) -> bool:\n    return isinstance(n, str)\n",
         "is2.py",
@@ -2305,10 +3048,7 @@ fn isinstance_lowers_to_a_static_constant_or_a_loud_error() {
     assert!(out.contains("false"), "generated: {}", out);
 
     // Unknown types are loud, not guessed.
-    let err = compile_err(
-        "def f(v):\n    return isinstance(v, int)\n",
-        "is6.py",
-    );
+    let err = compile_err("def f(v):\n    return isinstance(v, int)\n", "is6.py");
     assert!(err.contains("statically"), "error: {}", err);
 }
 
@@ -2324,10 +3064,7 @@ fn hash_lowers_by_reference() {
 
 #[test]
 fn csv_reader_lowers_by_reference() {
-    let out = compile(
-        "import csv\nrows = csv.reader([\"a,b\"])\n",
-        "cv1.py",
-    );
+    let out = compile("import csv\nrows = csv.reader([\"a,b\"])\n", "cv1.py");
     assert!(out.contains("csv :: reader (& ("), "generated: {}", out);
     let out = compile(
         "from csv import reader\nrows = reader([\"a,b\"])\n",
@@ -2442,15 +3179,8 @@ fn list_sort_on_subscript_uses_place_lowering() {
 #[test]
 fn list_sort_positional_arg_is_a_loud_error() {
     // Python: TypeError: sort() takes no positional arguments.
-    let err = compile_err(
-        "def f(xs: list[int]):\n    xs.sort(True)\n",
-        "srt6.py",
-    );
-    assert!(
-        err.contains("no positional arguments"),
-        "error: {}",
-        err
-    );
+    let err = compile_err("def f(xs: list[int]):\n    xs.sort(True)\n", "srt6.py");
+    assert!(err.contains("no positional arguments"), "error: {}", err);
 }
 
 // ---- re named groups and findall tuple shapes ----
@@ -2504,11 +3234,7 @@ fn match_group_string_routes_to_group_name() {
         "    return m.group(\"word\")\n",
     );
     let out = compile(src, "gn1.py");
-    assert!(
-        out.contains("group_name (\"word\")"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("group_name (\"word\")"), "generated: {}", out);
 
     // Numeric group access is untouched.
     let src = concat!(
@@ -2583,7 +3309,11 @@ fn str_replace_positional_stays_a_plain_method_call() {
         "def f(s: str):\n    return s.replace(\"a\", \"o\")\n",
         "rep5.py",
     );
-    assert!(out.contains("replace (\"a\" , \"o\")"), "generated: {}", out);
+    assert!(
+        out.contains("replace (\"a\" , \"o\")"),
+        "generated: {}",
+        out
+    );
     assert!(!out.contains("py_replace"), "generated: {}", out);
 }
 
@@ -2607,7 +3337,11 @@ fn partial_lowers_to_a_move_closure_with_remaining_params() {
     // Calls through the bound name propagate the function's Result.
     assert!(out.contains("add5 (3) ?"), "generated: {}", out);
     // The import emits no `use` — partial has no runtime symbol.
-    assert!(!out.contains("use stdpython :: functools :: partial"), "generated: {}", out);
+    assert!(
+        !out.contains("use stdpython :: functools :: partial"),
+        "generated: {}",
+        out
+    );
 
     // Binding ALL parameters leaves a zero-argument closure.
     let src = concat!(
@@ -2676,18 +3410,32 @@ fn partial_rejects_unknown_functions_keywords_and_overbinding() {
         ),
         "part6.py",
     );
-    assert!(err.contains("takes 2 argument(s), but 3 were bound"), "error: {}", err);
+    assert!(
+        err.contains("takes 2 argument(s), but 3 were bound"),
+        "error: {}",
+        err
+    );
 }
 
 // ---- file objects, io.StringIO, csv.writer ----
 
 #[test]
 fn open_arity_splits_onto_the_option_mode() {
-    let out = compile("def f():\n    g = open(\"x.txt\")\n    return g.read()\n", "op1.py");
-    assert!(out.contains("open (& (\"x.txt\") , None :: < & str >) ?"), "generated: {}", out);
+    let out = compile(
+        "def f():\n    g = open(\"x.txt\")\n    return g.read()\n",
+        "op1.py",
+    );
+    assert!(
+        out.contains("open (& (\"x.txt\") , None :: < & str >) ?"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains(". read () ?"), "generated: {}", out);
 
-    let out = compile("def f():\n    g = open(\"x.txt\", \"w\")\n    g.write(\"hi\")\n", "op2.py");
+    let out = compile(
+        "def f():\n    g = open(\"x.txt\", \"w\")\n    g.write(\"hi\")\n",
+        "op2.py",
+    );
     assert!(
         out.contains("open (& (\"x.txt\") , Some (\"w\")) ?"),
         "generated: {}",
@@ -2713,13 +3461,25 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
     );
     let out = compile(src, "csw1.py");
     assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
-    assert!(out.contains("csv :: writer (& mut (buf))"), "generated: {}", out);
+    assert!(
+        out.contains("csv :: writer (& mut (buf))"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("let mut buf"), "generated: {}", out);
     assert!(out.contains("let mut w"), "generated: {}", out);
-    assert!(out.contains(". writerow (& (vec ! [\"a\" . to_string () , \"b\" . to_string ()])) ?")
-        || out.contains(". writerow ("), "generated: {}", out);
+    assert!(
+        out.contains(". writerow (& (vec ! [\"a\" . to_string () , \"b\" . to_string ()])) ?")
+            || out.contains(". writerow ("),
+        "generated: {}",
+        out
+    );
     // The empty record gets a typed slice.
-    assert!(out.contains("writerow (& [] as & [& str]) ?"), "generated: {}", out);
+    assert!(
+        out.contains("writerow (& [] as & [& str]) ?"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains(". getvalue () ?"), "generated: {}", out);
 
     // The seeded StringIO variant.
@@ -2749,7 +3509,11 @@ fn lru_cache_wraps_the_body_with_a_static_cache() {
     );
     let out = compile(src, "lru1.py");
     // Python's bare @lru_cache default is maxsize=128.
-    assert!(out.contains("PyLruCache :: new (Some (128"), "generated: {}", out);
+    assert!(
+        out.contains("PyLruCache :: new (Some (128"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("__lru_uncached"), "generated: {}", out);
     assert!(out.contains("static __LRU_CACHE"), "generated: {}", out);
 
@@ -2762,7 +3526,11 @@ fn lru_cache_wraps_the_body_with_a_static_cache() {
         "    return n\n",
     );
     let out = compile(src, "lru2.py");
-    assert!(out.contains("PyLruCache :: new (None)"), "generated: {}", out);
+    assert!(
+        out.contains("PyLruCache :: new (None)"),
+        "generated: {}",
+        out
+    );
 
     let src = concat!(
         "import functools\n",
@@ -2772,7 +3540,11 @@ fn lru_cache_wraps_the_body_with_a_static_cache() {
         "    return s\n",
     );
     let out = compile(src, "lru3.py");
-    assert!(out.contains("PyLruCache :: new (None)"), "generated: {}", out);
+    assert!(
+        out.contains("PyLruCache :: new (None)"),
+        "generated: {}",
+        out
+    );
     // str parameters key as concrete String.
     assert!(out.contains("(String ,)"), "generated: {}", out);
 }
@@ -2781,10 +3553,7 @@ fn lru_cache_wraps_the_body_with_a_static_cache() {
 fn unknown_decorators_and_unhashable_keys_are_loud() {
     // Silently ignoring a decorator converts the program into a
     // different one; refuse.
-    let err = compile_err(
-        "@mystery\ndef f(n: int) -> int:\n    return n\n",
-        "lru4.py",
-    );
+    let err = compile_err("@mystery\ndef f(n: int) -> int:\n    return n\n", "lru4.py");
     assert!(err.contains("not supported yet"), "error: {}", err);
     assert!(err.contains("refuses to silently ignore"), "error: {}", err);
 
@@ -2800,7 +3569,11 @@ fn unknown_decorators_and_unhashable_keys_are_loud() {
         ),
         "lru5.py",
     );
-    assert!(err.contains("must be annotated int, bool, or str"), "error: {}", err);
+    assert!(
+        err.contains("must be annotated int, bool, or str"),
+        "error: {}",
+        err
+    );
 }
 
 // ---- argparse: conversion-time parsers ----
@@ -2877,7 +3650,11 @@ fn argparse_dynamic_or_unsupported_specs_are_loud() {
         ),
         "ap4.py",
     );
-    assert!(err.contains("'nargs' is not supported yet"), "error: {}", err);
+    assert!(
+        err.contains("'nargs' is not supported yet"),
+        "error: {}",
+        err
+    );
 }
 
 // ---- chained comparisons and loop control through try ----
@@ -2905,10 +3682,17 @@ fn chained_comparison_evaluates_each_operand_once() {
         "def f(n: int) -> int:\n    return n\n\ndef g() -> bool:\n    return 1 < f(2) < f(3)\n",
         "chain2.py",
     );
-    assert!(out.contains("&& {"), "later operand must stay guarded: {}", out);
+    assert!(
+        out.contains("&& {"),
+        "later operand must stay guarded: {}",
+        out
+    );
 
     // A plain (unchained) comparison keeps the simple lowering.
-    let out = compile("def g(a: int, b: int) -> bool:\n    return a < b\n", "chain3.py");
+    let out = compile(
+        "def g(a: int, b: int) -> bool:\n    return a < b\n",
+        "chain3.py",
+    );
     assert!(!out.contains("__rython_cmp"), "generated: {}", out);
     // Comparisons lower through the PyLt trait (borrowed operands).
     assert!(out.contains("(a) . py_lt (& (b))"), "generated: {}", out);
@@ -2929,7 +3713,11 @@ fn break_and_continue_thread_out_of_a_try_body() {
         "            cleanup()\n",
     );
     let out = compile(src, "tryflow1.py");
-    assert!(out.contains("return Ok (PyFlow :: Break)"), "generated: {}", out);
+    assert!(
+        out.contains("return Ok (PyFlow :: Break)"),
+        "generated: {}",
+        out
+    );
     assert!(
         out.contains("Ok (PyFlow :: Break) => { cleanup () ; break ; }"),
         "the finally must run before the break resumes: {}",
@@ -3020,3 +3808,142 @@ fn or_none_yields_none_instead_of_dropping_it() {
     assert!(out.contains("Some (__rython_or)"), "generated: {}", out);
     assert!(out.contains("None"), "generated: {}", out);
 }
+
+// ---- Devin review on PR #103 (F1/F6/F7/F8/F10) ----
+
+#[test]
+fn module_level_empty_list_pinned_by_later_use() {
+    // F1: `xs = []` at module level used to error because type info was
+    // only computed for function bodies; the `xs.append(1)` use must pin
+    // the element type the same way it does inside a function.
+    let out = compile("xs = []\nxs.append(1)\n", "mempty.py");
+    assert!(out.contains("Vec :: < i64 > :: new ()"), "generated: {}", out);
+}
+
+#[test]
+fn module_level_empty_dict_pinned_by_later_store() {
+    let out = compile("d = {}\nd[\"k\"] = 1\n", "memptyd.py");
+    assert!(
+        out.contains("PyDict :: < String , i64 > :: from ([])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn annotated_empty_list_honors_annotation() {
+    // F8: the empty-container error suggests `xs: list[float] = []`, so the
+    // annotation must actually pin the type (it used to be discarded).
+    let out = compile("xs: list[float] = []\nxs.append(1.0)\n", "ann_empty.py");
+    assert!(out.contains("Vec :: < f64 > :: new ()"), "generated: {}", out);
+}
+
+#[test]
+fn annotated_empty_dict_honors_annotation() {
+    let out = compile("d: dict[str, int] = {}\nd[\"k\"] = 1\n", "ann_emptyd.py");
+    assert!(
+        out.contains("PyDict :: < String , i64 > :: from ([])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn post_try_lambda_gets_no_dummy_init() {
+    // F6: a variable assigned after a try statement was given a
+    // `Default::default()` initializer because the try-closure boundary
+    // scanned the whole function's assigned names; a lambda-typed variable
+    // (which cannot be Default) then failed to build.
+    let out = compile(
+        "try:\n    x = 1\nexcept Exception:\n    pass\ng = lambda: 2\n",
+        "posttry.py",
+    );
+    // `x` (assigned inside the try body) keeps its dummy init; the
+    // post-try lambda `g` must NOT get one (it cannot be Default).
+    assert!(out.contains("x = Default :: default"), "generated: {}", out);
+    assert!(!out.contains("g = Default :: default"), "generated: {}", out);
+}
+
+#[test]
+fn try_body_assigned_name_still_gets_dummy_init() {
+    // The flip side of F6: a name first assigned inside the try body IS
+    // captured possibly-uninitialized by the try closure (E0381), so it
+    // still needs the Default initializer (issue #78 regression guard).
+    let out = compile(
+        "try:\n    x = 1\nexcept Exception:\n    pass\nprint(x)\n",
+        "trybody.py",
+    );
+    assert!(out.contains("Default :: default"), "generated: {}", out);
+}
+
+#[test]
+fn starred_list_reports_unpacking_error_not_type_mix() {
+    // F7: `[*xs, 1]` used to be rejected as "(list, int) incompatible
+    // element types" because the starred collection was counted as its own
+    // element type; the accurate starred-unpacking error must surface.
+    let err = compile_err("xs = [1, 2]\ny = [*xs, 3]\n", "starred.py");
+    assert!(
+        err.contains("starred unpacking"),
+        "expected starred-unpacking error, got: {}",
+        err
+    );
+    assert!(!err.contains("incompatible element types"), "got: {}", err);
+}
+
+#[test]
+fn aliased_import_resolves_through_module_intercept() {
+    // F10: `import numpy as np` bound `np` as an Alias symbol, which
+    // module_name_shadowed treated as a user variable, so `np.zeros` never
+    // reached the numpy lowering.
+    let out = compile("import numpy as np\nx = np.zeros((2, 2))\n", "aliasnp.py");
+    assert!(out.contains("numpy :: zeros"), "generated: {}", out);
+}
+
+#[test]
+fn aliased_import_reassignment_still_shadows() {
+    // F10 guard: a later `np = ...` replaces the alias in the symbol
+    // table, so user code still wins over the module intercept.
+    let out = compile("import numpy as np\nnp = 5\nx = np\n", "shadownp.py");
+    assert!(!out.contains("numpy :: zeros"), "generated: {}", out);
+}
+
+#[test]
+fn keyword_call_as_statement_keeps_propagation() {
+    // F9: `f(a=1)` on its own line emitted `{...}?` — a bare block with `?`
+    // is not a valid statement (the block's tail value mismatches `()`),
+    // so the generated Rust failed to build. The block must be
+    // parenthesized: `({...})?`, valid in both statement and expression
+    // position.
+    let out = compile(
+        "def f(a: int) -> int:\n    return a\nf(a=1)\n",
+        "kwstmt.py",
+    );
+    assert!(
+        out.contains("({ let __rython_arg_0 = 1 ; f (__rython_arg_0) }) ?"),
+        "generated: {}",
+        out
+    );
+    // The assignment form must keep the same parenthesized shape.
+    let out = compile(
+        "def f(a: int) -> int:\n    return a\ny = f(a=1)\n",
+        "kwexpr.py",
+    );
+    assert!(
+        out.contains("y = ({ let __rython_arg_0 = 1 ; f (__rython_arg_0) }) ?"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn defaulted_call_as_statement_keeps_propagation() {
+    // F9 guard: omitted defaulted parameters go through the same mapping
+    // path, so `f(1)` (with a defaulted `b`) must also build as a statement.
+    let out = compile(
+        "def f(a: int, b: int = 10) -> int:\n    return a + b\nf(1)\n",
+        "defstmt.py",
+    );
+    assert!(out.contains("? ;"), "generated: {}", out);
+    assert!(!out.contains("} ? ;"), "bare block with `?` leaked: {}", out);
+}
+

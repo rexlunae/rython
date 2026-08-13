@@ -1493,6 +1493,50 @@ fn kernel_module_accepts_float_free_module() {
 }
 
 #[test]
+fn kernel_module_accepts_docstrings_in_function_bodies() {
+    // Issue #83: the canonical hello-world kernel module opens module_init
+    // with a docstring. Docstrings are expression statements of string
+    // literals; they must be dropped (like CPython does) instead of
+    // rejected as unsupported kernel expressions.
+    let scratch = Scratch::new("kernel-docstring");
+    let file = scratch.path().join("hello.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    \"\"\"Called on insmod. Return 0 on success, negative errno on failure.\"\"\"\n",
+            "    printk(\"Hello, kernel!\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "def module_exit():\n",
+            "    \"\"\"Called on rmmod.\"\"\"\n",
+            "    printk(\"Goodbye, kernel!\\n\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let _krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("docstring-carrying kernel module converts");
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("init_module"), "lib.rs: {}", lib);
+    assert!(lib.contains("cleanup_module"), "lib.rs: {}", lib);
+    // The docstrings must not leak into the generated Rust as stray
+    // expression statements.
+    assert!(!lib.contains("Called on insmod"), "lib.rs: {}", lib);
+    assert!(!lib.contains("Called on rmmod"), "lib.rs: {}", lib);
+}
+
+#[test]
 fn kernel_module_rust_for_linux_generates_module_macro() {
     // Issue #88: --kernel-module --rust-for-linux must emit a rust-for-linux
     // crate: a module! macro, kernel::Module impl with init(), a Drop impl
@@ -1738,6 +1782,64 @@ fn builtins_match_python_at_runtime() {
             "sq=\"it's\"",
         ],
         "builtin semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn round_and_chr_builtins_match_python_at_runtime() {
+    // Two-arg round() used to fail to compile (no round_digits wiring);
+    // chr() used to panic on surrogates. Both now match CPython (the
+    // surrogate code point is a documented exception: CPython returns a
+    // lone surrogate, which UTF-8 cannot hold, so rython raises a
+    // catchable ValueError instead).
+    let scratch = Scratch::new("round_chr");
+    let file = scratch.path().join("round_chr.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    print(round(1.15, 1))\n",
+            "    print(round(2.675, 2))\n",
+            "    print(round(2.5))\n",
+            "    print(round(1250.0, -2))\n",
+            "    print(round(3))\n",
+            "    print(chr(65))\n",
+            "    try:\n",
+            "        chr(0x110000)\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught\", e)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/round_chr"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "1.1",
+            "2.67",
+            "2",
+            "1200.0",
+            "3",
+            "A",
+            "caught chr() arg not in range(0x110000)",
+        ],
+        "round/chr diverged from CPython"
     );
 }
 

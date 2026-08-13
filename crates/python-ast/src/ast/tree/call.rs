@@ -711,7 +711,7 @@ impl<'a> CodeGen for Call {
         // stdpython builtins.
         let propagates_exceptions = match self.func.as_ref() {
             ExprType::Name(name) => {
-                matches!(name.id.as_str(), "int" | "float")
+                matches!(name.id.as_str(), "int" | "float" | "chr")
                     || match symbols.get(&name.id) {
                         Some(SymbolTableNode::FunctionDef(_)) => true,
                         Some(SymbolTableNode::ImportFrom(import)) => {
@@ -803,22 +803,32 @@ impl<'a> CodeGen for Call {
             if n.id == "range"
                 && symbols.get("range").is_none()
                 && self.keywords.is_empty()
-                && matches!(self.args.len(), 2 | 3)
+                && matches!(self.args.len(), 1 | 2 | 3)
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {
-                    rendered.push(arg.clone().to_rust(
+                    // Every range argument is an index/step: `range(len(x))`
+                    // passes usize, so coerce to i64 here rather than rely on
+                    // the runtime generic (which fails to resolve for
+                    // expression arguments of unknown type).
+                    rendered.push(crate::render_typed(
+                        arg,
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
+                        Some(crate::TypeInfo::Int),
                     )?);
                 }
-                return Ok(if rendered.len() == 2 {
-                    let (a, b) = (&rendered[0], &rendered[1]);
-                    quote!(range_start_stop(#a, #b))
-                } else {
-                    let (a, b, c) = (&rendered[0], &rendered[1], &rendered[2]);
-                    quote!(range_start_stop_step(#a, #b, #c)?)
+                return Ok(match rendered.len() {
+                    1 => quote!(range(#(#rendered),*)),
+                    2 => {
+                        let (a, b) = (&rendered[0], &rendered[1]);
+                        quote!(range_start_stop(#a, #b))
+                    }
+                    _ => {
+                        let (a, b, c) = (&rendered[0], &rendered[1], &rendered[2]);
+                        quote!(range_start_stop_step(#a, #b, #c)?)
+                    }
                 });
             }
         }
@@ -836,11 +846,15 @@ impl<'a> CodeGen for Call {
                 bname,
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
                     | "reversed" | "frozenset" | "map" | "filter" | "list"
-                    | "isinstance" | "hash" | "print" | "open"
+                    | "isinstance" | "hash" | "print" | "open" | "round"
+                    | "divmod"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {
+                    // Builtin args are borrowed or copied by the runtime;
+                    // render them plain — clone-on-reuse is only inserted
+                    // for user-function calls, whose params are owned.
                     rendered.push(arg.clone().to_rust(
                         ctx.clone(),
                         options.clone(),
@@ -994,6 +1008,54 @@ impl<'a> CodeGen for Call {
                             [b, e] => Ok(quote!(pow(#b, #e))),
                             [b, e, m] => Ok(quote!(pow_mod(#b, #e, #m)?)),
                             _ => Err("pow() takes 2 or 3 arguments".to_string().into()),
+                        };
+                    }
+                    // round(x) -> int (half-even), round(x, n) -> float.
+                    // The first argument is always numeric: coerce to f64
+                    // so round(3) works; the ndigits argument stays i64.
+                    "round" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        let render_float = |e: &crate::ExprType| {
+                            crate::render_typed(
+                                e,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::Float),
+                            )
+                        };
+                        return match self.args.len() {
+                            1 => {
+                                let a = render_float(&self.args[0])?;
+                                Ok(quote!(round(#a)))
+                            }
+                            2 => {
+                                let a = render_float(&self.args[0])?;
+                                let n = crate::render_typed(
+                                    &self.args[1],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::Int),
+                                )?;
+                                Ok(quote!(round_digits(#a, #n)))
+                            }
+                            _ => Err("round() takes 1 or 2 arguments".to_string().into()),
+                        };
+                    }
+                    // divmod(a, b) lowers to the stdpython helper, whose
+                    // floor-division and modulus steps can raise
+                    // ZeroDivisionError: the Result it returns propagates
+                    // with `?` like the other fallible builtins.
+                    "divmod" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        return match rendered.as_slice() {
+                            [a, b] => Ok(quote!(divmod(#a, #b)?)),
+                            _ => Err("divmod() takes exactly 2 arguments".to_string().into()),
                         };
                     }
                     // isinstance is statically decidable in a typed
@@ -1607,7 +1669,8 @@ impl<'a> CodeGen for Call {
                             m.id.as_str(),
                             "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv"
                                 | "io"
-                        ) =>
+                        )
+                        && !module_name_shadowed(&m.id, &symbols) =>
                     {
                         let module: &'static str = match m.id.as_str() {
                             "functools" => "functools",
@@ -1702,6 +1765,7 @@ impl<'a> CodeGen for Call {
                 // constants or |-combinations of re.IGNORECASE/I,
                 // re.MULTILINE/M, re.DOTALL/S. Anything else is loud.
                 fn flag_letters(
+                    symbols: &crate::SymbolTableScopes,
                     e: &crate::ExprType,
                 ) -> Result<String, Box<dyn std::error::Error>> {
                     let name_of = |id: &str| -> Result<String, Box<dyn std::error::Error>> {
@@ -1718,7 +1782,8 @@ impl<'a> CodeGen for Call {
                     };
                     match e {
                         ExprType::Attribute(a)
-                            if matches!(a.value.as_ref(), ExprType::Name(m) if m.id == "re") =>
+                            if matches!(a.value.as_ref(), ExprType::Name(m)
+                                if m.id == "re" && !module_name_shadowed("re", symbols)) =>
                         {
                             name_of(&a.attr)
                         }
@@ -1728,8 +1793,8 @@ impl<'a> CodeGen for Call {
                         {
                             Ok(format!(
                                 "{}{}",
-                                flag_letters(&b.left)?,
-                                flag_letters(&b.right)?
+                                flag_letters(symbols, &b.left)?,
+                                flag_letters(symbols, &b.right)?
                             ))
                         }
                         other => Err(format!(
@@ -1873,8 +1938,8 @@ impl<'a> CodeGen for Call {
                             .into());
                         }
                         let flags = match (self.args.get(2), flags_kw) {
-                            (Some(e), None) => flag_letters(e)?,
-                            (None, Some(e)) => flag_letters(&e)?,
+                            (Some(e), None) => flag_letters(&symbols, e)?,
+                            (None, Some(e)) => flag_letters(&symbols, &e)?,
                             (None, None) => String::new(),
                             _ => unreachable!(),
                         };
@@ -1955,8 +2020,8 @@ impl<'a> CodeGen for Call {
                             _ => unreachable!(),
                         };
                         let flags = match (self.args.get(3), flags_kw) {
-                            (Some(e), None) => flag_letters(e)?,
-                            (None, Some(e)) => flag_letters(&e)?,
+                            (Some(e), None) => flag_letters(&symbols, e)?,
+                            (None, Some(e)) => flag_letters(&symbols, &e)?,
                             (None, None) => String::new(),
                             _ => unreachable!(),
                         };
@@ -1990,7 +2055,7 @@ impl<'a> CodeGen for Call {
                             _ => unreachable!(),
                         };
                         let flags = match flags_kw {
-                            Some(e) => flag_letters(&e)?,
+                            Some(e) => flag_letters(&symbols, &e)?,
                             None => String::new(),
                         };
                         let p = qual("sub");
@@ -2056,7 +2121,7 @@ impl<'a> CodeGen for Call {
                         }
                         let mut sig = init.clone();
                         crate::strip_self(&mut sig.args);
-                        let mapped = map_call_arguments(
+                        let MappedArguments { prelude, args } = map_call_arguments(
                             &sig,
                             &self.args,
                             &self.keywords,
@@ -2064,7 +2129,7 @@ impl<'a> CodeGen for Call {
                             &options,
                             &symbols,
                         )?;
-                        return Ok(quote!(#cname::new(#(#mapped),*)?));
+                        return Ok(quote!({ #prelude #cname::new(#(#args),*)? }));
                     }
                     None => {
                         if !self.args.is_empty() || !self.keywords.is_empty() {
@@ -2103,7 +2168,7 @@ impl<'a> CodeGen for Call {
                     }
                     let mut sig = method;
                     crate::strip_self(&mut sig.args);
-                    let mapped = map_call_arguments(
+                    let MappedArguments { prelude, args } = map_call_arguments(
                         &sig,
                         &self.args,
                         &self.keywords,
@@ -2117,7 +2182,7 @@ impl<'a> CodeGen for Call {
                         symbols.clone(),
                     )?;
                     let method_name = crate::safe_ident(&attr.attr);
-                    return Ok(quote!((#receiver).#method_name(#(#mapped),*)?));
+                    return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
                 }
             }
             // A mutating method on a subscripted receiver must go through
@@ -2138,6 +2203,20 @@ impl<'a> CodeGen for Call {
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?
             };
+
+            // String-keyed dicts (from a literal or a `dict[str, V]`
+            // annotation) take String keys in py_setdefault/py_pop and
+            // &String in py_get/py_get_default/py_contains; literal `"a"`
+            // keys are owned at the call site so the generic impls apply.
+            let string_keyed_dict = matches!(
+                attr.value.as_ref(),
+                ExprType::Name(n)
+                    if matches!(
+                        options.name_types.get(&n.id),
+                        Some(crate::TypeInfo::Dict(k, _))
+                            if matches!(**k, crate::TypeInfo::String)
+                    )
+            );
 
             // list.sort(): in-place, stable, with Python's keyword-only
             // key=/reverse=. Vec's inherent sort demands a total order
@@ -2457,18 +2536,58 @@ impl<'a> CodeGen for Call {
                 // PyPop trait: list.pop(i) by index (IndexError), dict.pop(k)
                 // by key (KeyError).
                 ("pop", [arg]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_pop(#key)?));
+                    }
                     return Ok(quote!((#receiver).py_pop(#arg)?));
                 }
                 ("pop", [key, default]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_pop_default(#key, #default)));
+                    }
                     return Ok(quote!((#receiver).py_pop_default(#key, #default)));
                 }
                 // dict.get never raises: value-or-None (an Option), or the
                 // provided default. IndexMap's inherent get returns a
                 // borrowed Option, so both forms map to py_ versions.
                 ("get", [key]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_get(&(#key))));
+                    }
                     return Ok(quote!((#receiver).py_get(&(#key))));
                 }
                 ("get", [key, default]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
+                    }
                     return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
                 }
                 // Views materialize as Vecs in insertion order.
@@ -2482,23 +2601,42 @@ impl<'a> CodeGen for Call {
                     return Ok(quote!((#receiver).py_items()));
                 }
                 ("setdefault", [key, default]) => {
+                    if string_keyed_dict {
+                        let key = crate::render_typed(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?;
+                        return Ok(quote!((#receiver).py_setdefault(#key, #default)));
+                    }
                     return Ok(quote!((#receiver).py_setdefault(#key, #default)));
                 }
                 // list.remove(x) removes by VALUE and raises ValueError;
                 // Vec::remove removes by index — silently different.
                 ("remove", [value]) => {
+                    // The receiver and argument are each evaluated ONCE,
+                    // receiver first (CPython evaluates the primary +
+                    // attribute, then the argument). The previous shape
+                    // spliced the receiver twice and the argument inside
+                    // the position closure, so a side-effecting receiver
+                    // (`grid[which()].remove(2)`) ran twice and the
+                    // argument once per element scanned (issue #80).
                     return Ok(quote! {
                         {
-                            let __rython_pos = (#receiver)
+                            let __rython_recv = &mut (#receiver);
+                            let __rython_val = #value;
+                            let __rython_pos = __rython_recv
                                 .iter()
-                                .position(|__rython_e| __rython_e == &(#value))
+                                .position(|__rython_e| __rython_e == &__rython_val)
                                 .ok_or_else(|| {
                                     PyException::new(
                                         "ValueError",
                                         "list.remove(x): x not in list",
                                     )
                                 })?;
-                            (#receiver).remove(__rython_pos);
+                            __rython_recv.remove(__rython_pos);
                         }
                     });
                 }
@@ -2584,7 +2722,7 @@ impl<'a> CodeGen for Call {
                 || self.args.len() < pos_param_count
                 || has_optional_params;
             if simple_signature && needs_mapping {
-                let mapped = map_call_arguments(
+                let MappedArguments { prelude, args } = map_call_arguments(
                     callee_def,
                     &self.args,
                     &self.keywords,
@@ -2593,9 +2731,15 @@ impl<'a> CodeGen for Call {
                     &symbols,
                 )?;
                 let name = self.func.to_rust(ctx, options, symbols)?;
-                let call = quote!(#name(#(#mapped),*));
+                let call = quote!({ #prelude #name(#(#args),*) });
                 return Ok(if propagates_exceptions {
-                    quote!(#call?)
+                    // Parenthesize before `?`: a bare `{...}?` in statement
+                    // position is not a valid expression statement (the
+                    // block's tail value mismatches `()`), so `f(a=1)` on
+                    // its own line failed to build (Devin review on #103,
+                    // F9). `({...})?` is valid both as a statement and as
+                    // an operand in an assignment/return.
+                    quote!((#call)?)
                 } else {
                     call
                 });
@@ -2625,9 +2769,38 @@ impl<'a> CodeGen for Call {
 
         let mut all_args = Vec::new();
 
+        // When the callee is a user function defined in this module, the
+        // direct-call path (simple signature, matching arity, no mapping)
+        // still needs param-aware lowering: coerce to the parameter's
+        // annotated type and clone non-Copy names that are reused later
+        // (`f(x); g(x)` — Python shares by reference, Rust moves).
+        let pos_params: Vec<&crate::Parameter> = match &callee {
+            Some(f) => f
+                .args
+                .posonlyargs
+                .iter()
+                .chain(f.args.args.iter())
+                .collect(),
+            None => Vec::new(),
+        };
+
         // Add positional arguments
-        for arg in self.args {
-            let rust_arg = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        for (i, arg) in self.args.into_iter().enumerate() {
+            let rust_arg = if let Some(param) = pos_params.get(i) {
+                let expected = param
+                    .annotation
+                    .as_deref()
+                    .and_then(crate::call_arg_expected_type);
+                crate::render_typed_reused(
+                    &arg,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    expected,
+                )?
+            } else {
+                arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            };
             all_args.push(rust_arg);
         }
         
@@ -3045,6 +3218,97 @@ pub(crate) fn receiver_class(
 /// order: positionals fill left to right, keywords map by name, missing
 /// parameters take their default values, and every mismatch Python would
 /// raise a TypeError for is a conversion-time error.
+///
+/// Returned arguments are in parameter order, as Rust needs; when keyword
+/// arguments make that differ from Python's source evaluation order, the
+/// prelude binds each argument to a temp in source order first (CPython
+/// evaluates positionals left to right, then keywords left to right).
+struct MappedArguments {
+    prelude: TokenStream,
+    args: Vec<TokenStream>,
+}
+
+/// Defaults are evaluated ONCE at def time by CPython; rython inlines them
+/// at each call site. A scalar constant (literal, None/True/False, or a
+/// tuple of those) is safe to inline; anything else is a loud conversion
+/// error rather than a silent divergence — a mutable container would also
+/// be SHARED across calls by CPython, which owned Rust values cannot
+/// express (issue #80).
+fn check_default_constant(
+    default: &ExprType,
+    fname: &str,
+    param: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scalar = |e: &ExprType| -> bool {
+        matches!(e, ExprType::Constant(_))
+            || matches!(
+                e,
+                ExprType::Name(n) if matches!(n.id.as_str(), "None" | "True" | "False")
+            )
+    };
+    match default {
+        ExprType::Constant(_) => Ok(()),
+        ExprType::Name(n) if matches!(n.id.as_str(), "None" | "True" | "False") => Ok(()),
+        ExprType::Tuple(t) if t.elts.iter().all(&scalar) => Ok(()),
+        ExprType::Tuple(t)
+            if t.elts
+                .iter()
+                .any(|e| matches!(e, ExprType::List(_) | ExprType::Dict(_) | ExprType::Set(_))) =>
+        {
+            Err(format!(
+                "parameter `{param}` of `{fname}()` has a mutable default; CPython \
+                 evaluates defaults once at def time and SHARES the single container \
+                 across all calls, which rython's owned-value model cannot express. \
+                 Pass the container explicitly at every call site instead"
+            )
+            .into())
+        }
+        ExprType::List(_) | ExprType::Dict(_) | ExprType::Set(_) => Err(format!(
+            "parameter `{param}` of `{fname}()` has a mutable default; CPython \
+             evaluates defaults once at def time and SHARES the single container \
+             across all calls, which rython's owned-value model cannot express. \
+             Pass the container explicitly at every call site instead"
+        )
+        .into()),
+        _ => Err(format!(
+            "parameter `{param}` of `{fname}()` has a non-constant default; CPython \
+             evaluates defaults once at def time, but rython would re-evaluate this \
+             expression at every call site. Use a constant default instead (issue #80)"
+        )
+        .into()),
+    }
+}
+
+/// Whether a name is a user-defined symbol (assignment, function, class,
+/// or rust.bind) rather than an imported stdlib module. Module
+/// intercepts (`re.search`, `csv.reader`, ...) and module-path lowering
+/// (`sys.argv`, `np.dot`) must defer to user definitions: `re = my_thing;
+/// re.search(...)` calls the user's object, not the re module (issue #80).
+/// Imports (plain or from-import) are module-like by construction — and so
+/// is an aliased import (`import numpy as np` binds `np` as a module
+/// alias, not a user value; a later `np = ...` reassignment replaces the
+/// alias in the symbol table, which still shadows correctly — Devin review
+/// on #103).
+pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> bool {
+    matches!(
+        symbols.get(name),
+        Some(SymbolTableNode::Assign { .. })
+            | Some(SymbolTableNode::FunctionDef(_))
+            | Some(SymbolTableNode::ClassDef(_))
+            | Some(SymbolTableNode::RustBinding(_))
+    )
+}
+
+/// The name at the root of a dotted expression chain (`os` in `os.path`,
+/// `np` in `np.linalg.inv`), for module-vs-value resolution.
+pub(crate) fn root_name(expr: &ExprType) -> Option<&str> {
+    match expr {
+        ExprType::Name(n) => Some(&n.id),
+        ExprType::Attribute(a) => root_name(&a.value),
+        _ => None,
+    }
+}
+
 fn map_call_arguments(
     func: &crate::FunctionDef,
     args: &[ExprType],
@@ -3052,7 +3316,7 @@ fn map_call_arguments(
     ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
-) -> Result<Vec<TokenStream>, Box<dyn std::error::Error>> {
+) -> Result<MappedArguments, Box<dyn std::error::Error>> {
     let fname = &func.name;
     // Optional-annotated parameters take Option values: the Option-slot
     // lowering wraps plain arguments in Some, passes None and
@@ -3069,7 +3333,21 @@ fn map_call_arguments(
         if optional {
             crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())
         } else {
-            expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+            // Type-aware lowering: coerce the argument to the parameter's
+            // annotated type (usize → i64, i64 → f64) and clone non-Copy
+            // names that are reused later (Python shares by reference;
+            // Rust moves).
+            let expected = param
+                .annotation
+                .as_deref()
+                .and_then(crate::call_arg_expected_type);
+            crate::render_typed_reused(
+                expr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                expected,
+            )
         }
     };
 
@@ -3090,9 +3368,20 @@ fn map_call_arguments(
         .into());
     }
 
+    // Rendered values in Python's source evaluation order (positionals,
+    // then keywords), for the temp prelude when reordering is needed.
+    let mut eval_order: Vec<TokenStream> = Vec::new();
+    let total = n + func.args.kwonlyargs.len();
+    // Which eval_order index each parameter slot was filled from; None
+    // means the slot holds an inlined (constant) default.
+    let mut slot_temp: Vec<Option<usize>> = vec![None; total];
+
     let mut slots: Vec<Option<TokenStream>> = vec![None; n];
     for (i, arg) in args.iter().enumerate() {
-        slots[i] = Some(fill(pos_params[i], arg)?);
+        let value = fill(pos_params[i], arg)?;
+        eval_order.push(value.clone());
+        slot_temp[i] = Some(eval_order.len() - 1);
+        slots[i] = Some(value);
     }
 
     let mut kwonly_slots: Vec<Option<TokenStream>> = vec![None; func.args.kwonlyargs.len()];
@@ -3114,27 +3403,22 @@ fn map_call_arguments(
                 .into());
             }
             if slots[idx].is_some() {
-                return Err(format!(
-                    "{}() got multiple values for argument `{}`",
-                    fname, kw_name
-                )
-                .into());
+                return Err(
+                    format!("{}() got multiple values for argument `{}`", fname, kw_name).into(),
+                );
             }
+            eval_order.push(value.clone());
+            slot_temp[idx] = Some(eval_order.len() - 1);
             slots[idx] = Some(value);
-        } else if let Some(idx) = func
-            .args
-            .kwonlyargs
-            .iter()
-            .position(|p| &p.arg == kw_name)
-        {
+        } else if let Some(idx) = func.args.kwonlyargs.iter().position(|p| &p.arg == kw_name) {
             let value = fill(&func.args.kwonlyargs[idx], &kw.value)?;
             if kwonly_slots[idx].is_some() {
-                return Err(format!(
-                    "{}() got multiple values for argument `{}`",
-                    fname, kw_name
-                )
-                .into());
+                return Err(
+                    format!("{}() got multiple values for argument `{}`", fname, kw_name).into(),
+                );
             }
+            eval_order.push(value.clone());
+            slot_temp[n + idx] = Some(eval_order.len() - 1);
             kwonly_slots[idx] = Some(value);
         } else {
             return Err(format!(
@@ -3150,7 +3434,9 @@ fn map_call_arguments(
     for i in 0..n {
         if slots[i].is_none() {
             if i >= default_offset {
-                slots[i] = Some(fill(pos_params[i], &func.args.defaults[i - default_offset])?);
+                let default = &func.args.defaults[i - default_offset];
+                check_default_constant(default, fname, &pos_params[i].arg)?;
+                slots[i] = Some(fill(pos_params[i], default)?);
             } else {
                 return Err(format!(
                     "{}() missing required argument `{}`",
@@ -3163,23 +3449,55 @@ fn map_call_arguments(
     for (i, param) in func.args.kwonlyargs.iter().enumerate() {
         if kwonly_slots[i].is_none() {
             match func.args.kw_defaults.get(i).and_then(|d| d.as_ref()) {
-                Some(default) => kwonly_slots[i] = Some(fill(param, default)?),
+                Some(default) => {
+                    check_default_constant(default, fname, &param.arg)?;
+                    kwonly_slots[i] = Some(fill(param, default)?);
+                }
                 None => {
                     return Err(format!(
                         "{}() missing required keyword-only argument `{}`",
                         fname, param.arg
                     )
-                    .into())
+                    .into());
                 }
             }
         }
     }
 
-    Ok(slots
-        .into_iter()
-        .chain(kwonly_slots)
-        .map(|s| s.expect("all argument slots filled"))
-        .collect())
+    let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total);
+    for s in slots.into_iter().chain(kwonly_slots) {
+        final_slots.push(s.expect("all argument slots filled"));
+    }
+
+    if keywords.is_empty() {
+        // No reordering: the parameter-ordered emission is already the
+        // source order, so emit the arguments directly (no prelude).
+        return Ok(MappedArguments {
+            prelude: TokenStream::new(),
+            args: final_slots,
+        });
+    }
+
+    // Keywords reorder the emission: bind every argument to a temp in
+    // source order, then reference the temps in parameter order.
+    let mut prelude = TokenStream::new();
+    for (i, value) in eval_order.iter().enumerate() {
+        let tid = format_ident!("__rython_arg_{}", i);
+        prelude.extend(quote!(let #tid = #value;));
+    }
+    let args = (0..total)
+        .map(|i| match slot_temp[i] {
+            Some(ti) => {
+                let tid = format_ident!("__rython_arg_{}", ti);
+                quote!(#tid)
+            }
+            // A default fills the slot: it is a constant (verified by
+            // `check_default_constant`), so inlining it in parameter
+            // position cannot reorder or duplicate side effects.
+            None => final_slots[i].clone(),
+        })
+        .collect();
+    Ok(MappedArguments { prelude, args })
 }
 
 #[cfg(test)]
@@ -3206,7 +3524,11 @@ foo(a=9)",
             )
             .unwrap()
             .to_string();
-        assert!(code.contains("foo (9)"), "generated: {}", code);
+        assert!(
+            code.contains("let __rython_arg_0 = 9 ; foo (__rython_arg_0)"),
+            "generated: {}",
+            code
+        );
     }
 
     #[test]

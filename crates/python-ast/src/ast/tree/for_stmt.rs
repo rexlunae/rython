@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
-use quote::quote;
+use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -71,9 +71,35 @@ impl CodeGen for For {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let iter = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-
+        // Python's loop variable is function-scoped: when the target name
+        // LEAKS (a later statement reads it, unshadowed), the scope analysis
+        // hoists it and this loop must STORE into that binding — a fresh
+        // `for` binding would shadow the hoisted variable and the loop
+        // writes would silently vanish (issue #80). A target that merely
+        // shares a name with a hoisted variable but whose value is never
+        // observed keeps its fresh per-loop binding (otherwise a hoisted
+        // binding of a different type, or a possibly-uninitialized one,
+        // would break the generated code). Loop-local names also keep their
+        // fresh binding, and an index name that is never read in the body
+        // (or else clause) lowers to `_` so rustc does not warn about the
+        // unused binding (issue #101). The reference checks run before the
+        // body is consumed below.
+        let leaked = options.leaked_loop_targets.as_ref().clone();
+        let target_names = {
+            let mut names = Vec::new();
+            collect_target_names(&self.target, &mut names);
+            names
+        };
+        let unused_index = matches!(
+            &self.target,
+            ExprType::Name(n)
+                if !leaked.contains(&n.id)
+                    && !crate::name_referenced_in(&self.body, &n.id)
+                    && !crate::name_referenced_in(&self.orelse, &n.id)
+        );
+        let any_hoisted = target_names
+            .iter()
+            .any(|n| leaked.contains(*n));
         let has_else = !self.orelse.is_empty();
         // Break-tracking is only needed when the else clause could be skipped
         // by a break belonging to this loop; otherwise the flag would be
@@ -91,10 +117,34 @@ impl CodeGen for For {
             .collect();
         let body_stmts = body_stmts?;
 
+        // When any target name leaks, the loop element binds to a temp
+        // (`__rython_elt`) and the target lowering stores it into the
+        // real bindings; otherwise the target pattern binds directly.
+        let (loop_target, loop_inner): (TokenStream, TokenStream) = if any_hoisted {
+            let mut stmts = Vec::new();
+            let mut counter = 0usize;
+            lower_loop_target(
+                &self.target,
+                quote!(__rython_elt),
+                &leaked,
+                &mut stmts,
+                &mut counter,
+            );
+            (quote!(__rython_elt), quote!({ #(#stmts)* #(#body_stmts;)* }))
+        } else {
+            let target = if unused_index {
+                quote!(_)
+            } else {
+                self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            };
+            (target, quote!(#(#body_stmts;)*))
+        };
+        let iter = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
         if !has_else {
             Ok(quote! {
-                for #target in #iter {
-                    #(#body_stmts;)*
+                for #loop_target in #iter {
+                    #loop_inner
                 }
             })
         } else {
@@ -110,8 +160,8 @@ impl CodeGen for For {
                 Ok(quote! {
                     {
                         let mut __rython_broke = false;
-                        for #target in #iter {
-                            #(#body_stmts;)*
+                        for #loop_target in #iter {
+                            #loop_inner
                         }
                         if !__rython_broke {
                             #(#else_stmts;)*
@@ -122,14 +172,69 @@ impl CodeGen for For {
                 // No break can skip the else clause; run it unconditionally.
                 Ok(quote! {
                     {
-                        for #target in #iter {
-                            #(#body_stmts;)*
+                        for #loop_target in #iter {
+                            #loop_inner
                         }
                         #(#else_stmts;)*
                     }
                 })
             }
         }
+    }
+}
+
+/// Collect the names in a `for` target (`i` and `v` in `for i, v in ...`).
+pub(crate) fn collect_target_names<'a>(target: &'a ExprType, out: &mut Vec<&'a str>) {
+    match target {
+        ExprType::Name(n) => out.push(&n.id),
+        ExprType::Tuple(t) => {
+            for elt in &t.elts {
+                collect_target_names(elt, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Lower a `for` target into statements that bind/store each name: leaked
+/// names get a plain store into the prologue-managed binding, loop-local
+/// names a fresh `let`, and tuple targets destructure through unique temps
+/// so nested patterns never shadow a leaked outer name.
+pub(crate) fn lower_loop_target(
+    target: &ExprType,
+    value: TokenStream,
+    hoisted: &std::collections::HashSet<String>,
+    out: &mut Vec<TokenStream>,
+    counter: &mut usize,
+) {
+    match target {
+        ExprType::Name(n) => {
+            let id = crate::safe_ident(&n.id);
+            if hoisted.contains(&n.id) {
+                out.push(quote!(#id = #value;));
+            } else {
+                out.push(quote!(let #id = #value;));
+            }
+        }
+        ExprType::Tuple(t) => {
+            let mut pats = Vec::new();
+            let mut inner = Vec::new();
+            for elt in &t.elts {
+                let tname = format_ident!("__rython_elt_{}", *counter);
+                *counter += 1;
+                pats.push(quote!(#tname));
+                let v = quote!(#tname);
+                lower_loop_target(elt, v, hoisted, &mut inner, counter);
+            }
+            out.push(quote!({
+                let (#(#pats),*) = #value;
+                #(#inner)*
+            }));
+        }
+        // Subscript/attribute targets cannot reach here (they collect no
+        // names, so `any_hoisted` is false and the direct pattern path
+        // runs instead); panic loudly rather than emit a silent drop.
+        _ => unreachable!("for target must be a name or a tuple of names"),
     }
 }
 

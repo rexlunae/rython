@@ -8,6 +8,8 @@ use std::{
 use pyo3::{prelude::*, PyResult};
 use std::ffi::CString;
 
+use crate::TypeInfo;
+
 /// Supported async runtimes for Python async code generation
 #[derive(Clone, Debug, PartialEq)]
 pub enum AsyncRuntime {
@@ -128,6 +130,41 @@ pub struct PythonOptions {
     /// (numpy-rayon, numpy-simd, ...) or the emitted set_backend call
     /// fails loudly at startup.
     pub numpy_backend: Option<String>,
+
+    /// How many times each name is READ in the current scope (set per
+    /// function by the type analysis). Move-prone positions (call
+    /// arguments, container elements) clone a non-Copy name that is read
+    /// more than once, so Python's share-by-reference does not become a
+    /// Rust move error on reuse.
+    pub use_counts: std::rc::Rc<std::collections::HashMap<String, usize>>,
+
+    /// Inferred type of each local name in the current scope: parameter
+    /// annotations first, then the type of the (last) literal or container
+    /// assignment. Consumed by the type-aware lowering to insert
+    /// conversions (String ↔ &str, usize → i64) at use sites.
+    pub name_types: std::rc::Rc<std::collections::HashMap<String, TypeInfo>>,
+
+    /// Names bound to an empty `[]`/`{}` literal whose element/key types
+    /// were pinned by a later use; maps to the pinned container type.
+    /// Rendering the empty literal consults this map and emits a typed
+    /// `Vec::<T>::new()` / `PyDict::<K,V>::from([])`; a name assigned an
+    /// empty literal with no pinning use is a loud conversion-time error.
+    pub empty_pinned: std::rc::Rc<std::collections::HashMap<String, TypeInfo>>,
+
+    /// Names whose bindings are managed by the enclosing scope's prologue
+    /// (hoisted assignments plus mutable parameters): a `for`-loop target
+    /// on one of these lowers to a plain store into that binding instead
+    /// of a fresh binding that would shadow it, so Python's function-
+    /// scoped loop-variable leak survives codegen (issue #80). Set per
+    /// scope by the function/module generators.
+    pub hoisted_names: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// `for`-target names whose post-loop value is actually observed (a
+    /// read in a later statement that no re-binding shadows). Only these
+    /// lower to stores into the hoisted binding; a target that merely
+    /// shares a name with a hoisted variable for other reasons keeps its
+    /// fresh per-loop binding (issue #80).
+    pub leaked_loop_targets: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 impl Default for PythonOptions {
@@ -152,6 +189,11 @@ impl Default for PythonOptions {
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             numpy_backend: None,
+            use_counts: std::rc::Rc::new(std::collections::HashMap::new()),
+            name_types: std::rc::Rc::new(std::collections::HashMap::new()),
+            empty_pinned: std::rc::Rc::new(std::collections::HashMap::new()),
+            hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
         }
     }
 }
