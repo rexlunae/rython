@@ -1493,6 +1493,50 @@ fn kernel_module_accepts_float_free_module() {
 }
 
 #[test]
+fn kernel_module_accepts_docstrings_in_function_bodies() {
+    // Issue #83: the canonical hello-world kernel module opens module_init
+    // with a docstring. Docstrings are expression statements of string
+    // literals; they must be dropped (like CPython does) instead of
+    // rejected as unsupported kernel expressions.
+    let scratch = Scratch::new("kernel-docstring");
+    let file = scratch.path().join("hello.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    \"\"\"Called on insmod. Return 0 on success, negative errno on failure.\"\"\"\n",
+            "    printk(\"Hello, kernel!\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "def module_exit():\n",
+            "    \"\"\"Called on rmmod.\"\"\"\n",
+            "    printk(\"Goodbye, kernel!\\n\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let _krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("docstring-carrying kernel module converts");
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("init_module"), "lib.rs: {}", lib);
+    assert!(lib.contains("cleanup_module"), "lib.rs: {}", lib);
+    // The docstrings must not leak into the generated Rust as stray
+    // expression statements.
+    assert!(!lib.contains("Called on insmod"), "lib.rs: {}", lib);
+    assert!(!lib.contains("Called on rmmod"), "lib.rs: {}", lib);
+}
+
+#[test]
 fn kernel_module_rust_for_linux_generates_module_macro() {
     // Issue #88: --kernel-module --rust-for-linux must emit a rust-for-linux
     // crate: a module! macro, kernel::Module impl with init(), a Drop impl
