@@ -3806,3 +3806,102 @@ fn or_none_yields_none_instead_of_dropping_it() {
     assert!(out.contains("Some (__rython_or)"), "generated: {}", out);
     assert!(out.contains("None"), "generated: {}", out);
 }
+
+// ---- Devin review on PR #103 (F1/F6/F7/F8/F10) ----
+
+#[test]
+fn module_level_empty_list_pinned_by_later_use() {
+    // F1: `xs = []` at module level used to error because type info was
+    // only computed for function bodies; the `xs.append(1)` use must pin
+    // the element type the same way it does inside a function.
+    let out = compile("xs = []\nxs.append(1)\n", "mempty.py");
+    assert!(out.contains("Vec :: < i64 > :: new ()"), "generated: {}", out);
+}
+
+#[test]
+fn module_level_empty_dict_pinned_by_later_store() {
+    let out = compile("d = {}\nd[\"k\"] = 1\n", "memptyd.py");
+    assert!(
+        out.contains("PyDict :: < String , i64 > :: from ([])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn annotated_empty_list_honors_annotation() {
+    // F8: the empty-container error suggests `xs: list[float] = []`, so the
+    // annotation must actually pin the type (it used to be discarded).
+    let out = compile("xs: list[float] = []\nxs.append(1.0)\n", "ann_empty.py");
+    assert!(out.contains("Vec :: < f64 > :: new ()"), "generated: {}", out);
+}
+
+#[test]
+fn annotated_empty_dict_honors_annotation() {
+    let out = compile("d: dict[str, int] = {}\nd[\"k\"] = 1\n", "ann_emptyd.py");
+    assert!(
+        out.contains("PyDict :: < String , i64 > :: from ([])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn post_try_lambda_gets_no_dummy_init() {
+    // F6: a variable assigned after a try statement was given a
+    // `Default::default()` initializer because the try-closure boundary
+    // scanned the whole function's assigned names; a lambda-typed variable
+    // (which cannot be Default) then failed to build.
+    let out = compile(
+        "try:\n    x = 1\nexcept Exception:\n    pass\ng = lambda: 2\n",
+        "posttry.py",
+    );
+    // `x` (assigned inside the try body) keeps its dummy init; the
+    // post-try lambda `g` must NOT get one (it cannot be Default).
+    assert!(out.contains("x = Default :: default"), "generated: {}", out);
+    assert!(!out.contains("g = Default :: default"), "generated: {}", out);
+}
+
+#[test]
+fn try_body_assigned_name_still_gets_dummy_init() {
+    // The flip side of F6: a name first assigned inside the try body IS
+    // captured possibly-uninitialized by the try closure (E0381), so it
+    // still needs the Default initializer (issue #78 regression guard).
+    let out = compile(
+        "try:\n    x = 1\nexcept Exception:\n    pass\nprint(x)\n",
+        "trybody.py",
+    );
+    assert!(out.contains("Default :: default"), "generated: {}", out);
+}
+
+#[test]
+fn starred_list_reports_unpacking_error_not_type_mix() {
+    // F7: `[*xs, 1]` used to be rejected as "(list, int) incompatible
+    // element types" because the starred collection was counted as its own
+    // element type; the accurate starred-unpacking error must surface.
+    let err = compile_err("xs = [1, 2]\ny = [*xs, 3]\n", "starred.py");
+    assert!(
+        err.contains("starred unpacking"),
+        "expected starred-unpacking error, got: {}",
+        err
+    );
+    assert!(!err.contains("incompatible element types"), "got: {}", err);
+}
+
+#[test]
+fn aliased_import_resolves_through_module_intercept() {
+    // F10: `import numpy as np` bound `np` as an Alias symbol, which
+    // module_name_shadowed treated as a user variable, so `np.zeros` never
+    // reached the numpy lowering.
+    let out = compile("import numpy as np\nx = np.zeros((2, 2))\n", "aliasnp.py");
+    assert!(out.contains("numpy :: zeros"), "generated: {}", out);
+}
+
+#[test]
+fn aliased_import_reassignment_still_shadows() {
+    // F10 guard: a later `np = ...` replaces the alias in the symbol
+    // table, so user code still wins over the module intercept.
+    let out = compile("import numpy as np\nnp = 5\nx = np\n", "shadownp.py");
+    assert!(!out.contains("numpy :: zeros"), "generated: {}", out);
+}
+

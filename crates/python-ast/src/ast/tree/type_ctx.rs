@@ -586,9 +586,21 @@ pub fn analyze_function_types(body: &[Statement]) -> FunctionTypeInfo {
 fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
     match &stmt.statement {
         StatementType::Assign(assign) => {
-            // Record `name = <inferable expr>` (syntactic only).
+            // Record `name = <inferable expr>` (syntactic only, unless an
+            // annotation pins it — an annotated assignment's annotation
+            // wins, so `xs: list[float] = []` pins the empty literal).
             if let [ExprType::Name(name)] = assign.targets.as_slice() {
-                let mut t = syntactic_type(&assign.value);
+                let mut t = match assign
+                    .annotation
+                    .as_ref()
+                    .and_then(crate::annotation_type_info)
+                {
+                    // An annotation pins the type outright.
+                    Some(ann) => ann,
+                    // Unparseable annotation: fall back to the value's
+                    // syntactic type (still pinable by later use).
+                    None => syntactic_type(&assign.value),
+                };
                 // Dict keys normalize to String (matches literal lowering
                 // and `dict[str, V]` annotations); empty dicts and lists
                 // are remembered for pinning from later use.
@@ -1069,6 +1081,16 @@ fn statement_references(stmt: &Statement, name: &str) -> bool {
         StatementType::Expr(e) => expr_references(&e.value, name),
         StatementType::Return(r) => {
             r.as_ref().map(|e| expr_references(&e.value, name)).unwrap_or(false)
+        }
+        // Assert and raise read their expressions too: a loop index used
+        // only there is still a real reference (Devin review on #103).
+        StatementType::Assert { test, msg } => {
+            expr_references(test, name)
+                || msg.as_ref().map(|m| expr_references(m, name)).unwrap_or(false)
+        }
+        StatementType::Raise(r) => {
+            r.exc.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
+                || r.cause.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
         }
         StatementType::If(s) => {
             expr_references(&s.test, name)

@@ -847,6 +847,7 @@ impl<'a> CodeGen for Call {
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
                     | "reversed" | "frozenset" | "map" | "filter" | "list"
                     | "isinstance" | "hash" | "print" | "open" | "round"
+                    | "divmod"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -1042,6 +1043,19 @@ impl<'a> CodeGen for Call {
                                 Ok(quote!(round_digits(#a, #n)))
                             }
                             _ => Err("round() takes 1 or 2 arguments".to_string().into()),
+                        };
+                    }
+                    // divmod(a, b) lowers to the stdpython helper, whose
+                    // floor-division and modulus steps can raise
+                    // ZeroDivisionError: the Result it returns propagates
+                    // with `?` like the other fallible builtins.
+                    "divmod" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        return match rendered.as_slice() {
+                            [a, b] => Ok(quote!(divmod(#a, #b)?)),
+                            _ => Err("divmod() takes exactly 2 arguments".to_string().into()),
                         };
                     }
                     // isinstance is statically decidable in a typed
@@ -3260,18 +3274,21 @@ fn check_default_constant(
 }
 
 /// Whether a name is a user-defined symbol (assignment, function, class,
-/// alias, or rust.bind) rather than an imported stdlib module. Module
+/// or rust.bind) rather than an imported stdlib module. Module
 /// intercepts (`re.search`, `csv.reader`, ...) and module-path lowering
 /// (`sys.argv`, `np.dot`) must defer to user definitions: `re = my_thing;
 /// re.search(...)` calls the user's object, not the re module (issue #80).
-/// Imports (plain or from-import) are module-like by construction.
+/// Imports (plain or from-import) are module-like by construction — and so
+/// is an aliased import (`import numpy as np` binds `np` as a module
+/// alias, not a user value; a later `np = ...` reassignment replaces the
+/// alias in the symbol table, which still shadows correctly — Devin review
+/// on #103).
 pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> bool {
     matches!(
         symbols.get(name),
         Some(SymbolTableNode::Assign { .. })
             | Some(SymbolTableNode::FunctionDef(_))
             | Some(SymbolTableNode::ClassDef(_))
-            | Some(SymbolTableNode::Alias(_))
             | Some(SymbolTableNode::RustBinding(_))
     )
 }

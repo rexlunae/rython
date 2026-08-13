@@ -142,8 +142,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
             }
             "AnnAssign" => {
                 // An annotated assignment (`x: int = 5`) is an ordinary
-                // assignment with a type annotation we don't yet consume; a
-                // bare annotation (`x: int`) declares nothing at runtime.
+                // assignment with a type annotation we carry on the Assign
+                // node (so empty-container pinning can honor it); a bare
+                // annotation (`x: int`) declares nothing at runtime.
                 let value = ob
                     .getattr("value")
                     .map_err(|e| extraction_failure("annotated assignment value", &ob, e))?;
@@ -158,10 +159,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 let value = value
                     .extract()
                     .map_err(|e| extraction_failure("annotated assignment value", &ob, e))?;
+                let annotation = ob
+                    .getattr("annotation")
+                    .ok()
+                    .filter(|a| !a.is_none())
+                    .map(|a| a.extract())
+                    .transpose()
+                    .map_err(|e| extraction_failure("annotated assignment annotation", &ob, e))?;
                 Ok(StatementType::Assign(Assign {
                     targets: vec![target],
                     value,
                     type_comment: None,
+                    annotation,
                 }))
             }
             "AugAssign" => {

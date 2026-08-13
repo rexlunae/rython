@@ -85,6 +85,12 @@ pub(crate) const MUTATING_METHODS: &[&str] = &[
 
 struct Analysis<'r> {
     assigned: Vec<String>,
+    /// Names assigned so far in THIS walk (sequential), as opposed to
+    /// `assigned`, which is seeded with the collector's full-function list.
+    /// Closure boundaries record against the sequential list so a name first
+    /// assigned AFTER a try statement is not given a dummy initializer for a
+    /// closure it is never captured by (Devin review on #103).
+    seq_assigned: Vec<String>,
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
     closure_captured_uninit: HashSet<String>,
@@ -109,6 +115,9 @@ impl Analysis<'_> {
         if !self.assigned.contains(&name.to_string()) {
             self.assigned.push(name.to_string());
         }
+        if !self.seq_assigned.contains(&name.to_string()) {
+            self.seq_assigned.push(name.to_string());
+        }
         if multi || self.init_of(name) != Init::No {
             self.needs_mut.insert(name.to_string());
         }
@@ -118,9 +127,13 @@ impl Analysis<'_> {
     /// A generated closure is about to run over `entry_state`: every name
     /// that is not definitely initialized there will be captured
     /// possibly-uninitialized, which rustc rejects (E0381). Record them so
-    /// the hoist can give them a Default initializer.
+    /// the hoist can give them a Default initializer. Only names assigned
+    /// before this point in the walk (or inside the closure's own body,
+    /// which the caller has walked first) can be captured — a name first
+    /// assigned later in the function is not in `seq_assigned` and is left
+    /// alone.
     fn record_closure_boundary(&mut self, entry_state: &HashMap<String, Init>) {
-        for name in &self.assigned {
+        for name in &self.seq_assigned {
             if entry_state.get(name).copied().unwrap_or(Init::No) != Init::Yes {
                 self.closure_captured_uninit.insert(name.clone());
             }
@@ -187,6 +200,7 @@ pub(crate) fn analyze_scope_with(
     let noop_resolve = |_: &crate::Call| -> Option<bool> { None };
     let mut collector = Analysis {
         assigned: Vec::new(),
+        seq_assigned: Vec::new(),
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
@@ -198,6 +212,7 @@ pub(crate) fn analyze_scope_with(
 
     let mut a = Analysis {
         assigned: collector.assigned.clone(),
+        seq_assigned: Vec::new(),
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
@@ -492,9 +507,15 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 // The try body runs inside a closure; stores there behave
                 // like multi-execution stores (they mutate captured state).
                 let before = a.state.clone();
-                a.record_closure_boundary(&before);
                 walk_stmts(&s.body, a, true);
                 let after_body = a.state.clone();
+                // Record the boundary AFTER walking the body: names first
+                // assigned inside the try body are in `seq_assigned` now
+                // (their stores capture the hoisted binding, which is
+                // possibly-uninitialized when the closure is created —
+                // E0381), while names assigned later in the function are
+                // not, so they get no dummy initializer.
+                a.record_closure_boundary(&before);
                 // Handlers may run with the body only partially executed.
                 let handler_entry =
                     merge_states(vec![before, after_body.clone()]);

@@ -258,7 +258,13 @@ impl<'a> CodeGen for ExprType {
                 let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
                 for li in &l {
                     if matches!(li, ExprType::Starred(_)) {
+                        // Starred elements spread their collection's ELEMENT
+                        // type, not the collection's type: counting them here
+                        // makes `[*xs, 1]` look like a (list, int) mix and
+                        // reject it before the (accurate) starred-unpacking
+                        // error can surface (Devin review on #103).
                         has_starred = true;
+                        continue;
                     }
                     let t = crate::infer_type(&li, &options, &symbols);
                     if !matches!(t, crate::TypeInfo::PyObject) {

@@ -97,7 +97,7 @@ impl CodeGen for Module {
     fn to_rust(
         self,
         ctx: Self::Context,
-        options: Self::Options,
+        mut options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
@@ -242,6 +242,20 @@ impl CodeGen for Module {
         let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols);
         let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols);
 
+        // Module-level code gets no per-function analysis pass, so run the
+        // same type inference / empty-container pinning here: without it,
+        // `xs = []` followed by `xs.append(1)` at module level fails with
+        // "empty container literal has no inferable element type" even
+        // though the pinning use is right there (issue #81-family, Devin
+        // review on #103). The __main__ block gets its own pass.
+        {
+            let info = crate::analyze_function_types(&module_init_raw);
+            options.use_counts = std::rc::Rc::new(info.use_counts);
+            options.name_types = std::rc::Rc::new(info.name_types);
+            options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
+        }
+        let main_info = crate::analyze_function_types(&main_body_raw);
+
         for s in self.raw.body {
             // Check if this statement is an async function
             if let crate::StatementType::AsyncFunctionDef(_) = &s.statement {
@@ -271,6 +285,9 @@ impl CodeGen for Module {
                             let mut o = options.clone();
                             o.hoisted_names = std::rc::Rc::new(main_hoisted.clone());
                             o.leaked_loop_targets = std::rc::Rc::new(main_leaked.clone());
+                            o.use_counts = std::rc::Rc::new(main_info.use_counts.clone());
+                            o.name_types = std::rc::Rc::new(main_info.name_types.clone());
+                            o.empty_pinned = std::rc::Rc::new(main_info.empty_pinned.clone());
                             o
                         };
                         for body_stmt in &if_stmt.body {

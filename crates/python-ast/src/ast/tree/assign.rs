@@ -13,6 +13,11 @@ pub struct Assign {
     pub targets: Vec<ExprType>,
     pub value: ExprType,
     pub type_comment: Option<String>,
+    /// The annotation of an annotated assignment (`x: list[float] = []`),
+    /// carried so type analysis can honor it for empty-container pinning
+    /// (the error message at the empty literal suggests exactly this form —
+    /// the annotation must not be discarded, Devin review on #103).
+    pub annotation: Option<ExprType>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
@@ -32,6 +37,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
             targets: targets,
             value: value,
             type_comment: None,
+            annotation: None,
         })
     }
 }
