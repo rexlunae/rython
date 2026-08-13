@@ -904,6 +904,19 @@ impl PyPow for i64 {
             // so fail loudly rather than return a wrong integer.
             panic!("integer ** negative exponent yields a float; use a float base");
         }
+        if rhs > u32::MAX as i64 {
+            // The `as u32` truncation below would silently wrap (0 **
+            // 4294967296 must be 0, not 1). For these bases the
+            // mathematical result is 0/1/±1; anything else overflows i64
+            // beyond any doubt.
+            return match self {
+                0 => 0,
+                1 => 1,
+                -1 if rhs % 2 == 0 => 1,
+                -1 => -1,
+                _ => panic!("{} ** {} overflows i64", self, rhs),
+            };
+        }
         self.checked_pow(rhs as u32)
             .unwrap_or_else(|| panic!("{} ** {} overflows i64", self, rhs))
     }
@@ -1018,16 +1031,39 @@ pub fn round(value: f64) -> i64 {
 
 /// Python round(value, ndigits): rounds half to even at the given decimal
 /// place and returns a float.
+///
+/// CPython rounds the *correctly rounded decimal expansion*; the naive
+/// `value * 10^n; round; / 10^n` introduces a rounding error before the
+/// half-even fixup (round(1.15, 1) must be 1.1, not 1.2). Rust's float
+/// formatting performs exact correctly-rounded decimal rendering at the
+/// requested precision with ties to even, so format-then-parse reproduces
+/// CPython's results (verified over a 46-value × 9-ndigits sweep).
 pub fn round_digits(value: f64, ndigits: i64) -> f64 {
-    let factor = flt::powi(10f64, ndigits as i32);
-    let scaled = value * factor;
-    let r = flt::round(scaled);
-    let rounded = if flt::abs(scaled - flt::trunc(scaled)) == 0.5 && r % 2.0 != 0.0 {
-        r - flt::signum(scaled)
-    } else {
-        r
-    };
-    rounded / factor
+    if !value.is_finite() {
+        // round(inf, n) is inf, round(nan, n) is nan.
+        return value;
+    }
+    if ndigits >= 0 {
+        // Cap the precision: floats carry ~17 significant digits, so
+        // beyond a few hundred decimals the expansion is all zeros and
+        // parses back to the same value. The cap keeps the formatted
+        // string from becoming pathologically large.
+        let n = (ndigits as u64).min(400) as usize;
+        return format!("{:.*}", n, value).parse().unwrap_or(value);
+    }
+    // Negative ndigits: round at a power of ten (round(1250.0, -2) ->
+    // 1200.0, round(15.0, -1) -> 20.0). Scale down, round to an integer
+    // (half-even via the format path), scale back.
+    let magnitude = ndigits.unsigned_abs();
+    if magnitude > 308 {
+        // Far below the smallest subnormal: every finite value rounds to
+        // zero (round(1e308, -400) == 0.0).
+        return 0.0;
+    }
+    let factor = flt::powi(10f64, magnitude as i32);
+    let scaled = value / factor;
+    let r: f64 = format!("{:.0}", scaled).parse().unwrap_or(scaled);
+    r * factor
 }
 
 /// Python ord() builtin: code point of a one-character string.
@@ -1044,12 +1080,29 @@ pub fn ord<S: AsRef<str>>(c: S) -> i64 {
 }
 
 /// Python chr() builtin: one-character string for a code point.
-pub fn chr(code: i64) -> String {
-    u32::try_from(code)
-        .ok()
-        .and_then(char::from_u32)
-        .map(String::from)
-        .unwrap_or_else(|| panic!("chr() arg not in range(0x110000): {}", code))
+///
+/// Out-of-range arguments raise the same ValueError as CPython. Lone
+/// surrogate code points (U+D800–U+DFFF) succeed in CPython but cannot
+/// be represented in a Rust `String` (UTF-8 has no surrogate code
+/// points), so they raise a catchable ValueError instead of panicking.
+pub fn chr(code: i64) -> Result<String, PyException> {
+    if !(0..=0x10FFFF).contains(&code) {
+        return Err(PyException::new(
+            "ValueError",
+            "chr() arg not in range(0x110000)",
+        ));
+    }
+    match char::from_u32(code as u32) {
+        Some(c) => Ok(String::from(c)),
+        None => Err(PyException::new(
+            "ValueError",
+            format!(
+                "chr() arg is a surrogate code point U+{:04X}; lone surrogates \
+                 are not representable in UTF-8",
+                code
+            ),
+        )),
+    }
 }
 
 /// Python hex() builtin: `hex(255) == "0xff"`, `hex(-255) == "-0xff"`.
@@ -1731,10 +1784,10 @@ impl<T: PyRepr> PyRepr for Option<T> {
 
 /// Python's str repr: preferred single quotes (double when the text holds
 /// a single quote but no double quote), backslash/newline/return/tab
-/// escapes, and \xNN for ASCII control characters. Non-ASCII control
-/// characters use \u{NNNN}-style Python escapes; other non-ASCII text is
-/// kept literal (Python additionally escapes some exotic non-printables,
-/// e.g. paragraph separators, which is not reproduced here).
+/// escapes, and \xNN/\uNNNN/\UNNNNNNNN for everything failing
+/// str.isprintable() — controls, format characters, line/paragraph
+/// separators, and non-ASCII spaces (so repr("\xa0") is '\xa0', not a
+/// literal NBSP).
 pub fn py_str_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::with_capacity(s.len() + 2);
@@ -1749,14 +1802,14 @@ pub fn py_str_repr(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c if c.is_control() => {
-                if (c as u32) < 0x100 {
-                    out.push_str(&format!("\\x{:02x}", c as u32));
+            c if repr_escapes(c) => {
+                let cp = c as u32;
+                if cp < 0x100 {
+                    out.push_str(&format!("\\x{:02x}", cp));
+                } else if cp < 0x10000 {
+                    out.push_str(&format!("\\u{:04x}", cp));
                 } else {
-                    out.push_str(&format!("\\u{:04x}", c as u32));
+                    out.push_str(&format!("\\U{:08x}", cp));
                 }
             }
             c => out.push(c),
@@ -2009,7 +2062,8 @@ impl PyStr {
             Some(separator) => self.inner.split(separator)
                 .map(|s| PyStr::new(s))
                 .collect(),
-            None => self.inner.split_whitespace()
+            None => self.inner.split(py_is_whitespace)
+                .filter(|s| !s.is_empty())
                 .map(|s| PyStr::new(s))
                 .collect(),
         }
@@ -2023,7 +2077,7 @@ impl PyStr {
     
     /// Python str.strip() method
     pub fn strip(&self) -> PyStr {
-        PyStr::new(self.inner.trim())
+        PyStr::new(self.inner.trim_matches(py_is_whitespace).to_string())
     }
     
     /// Python str.lower() method
@@ -2051,10 +2105,11 @@ impl PyStr {
         self.inner.ends_with(suffix.as_ref())
     }
     
-    /// Python str.find() method
+    /// Python str.find() method: CHARACTER index (consistent with len and
+    /// with PyStrOps::py_find), not a byte offset.
     pub fn find<S: AsRef<str>>(&self, sub: S) -> i64 {
         match self.inner.find(sub.as_ref()) {
-            Some(pos) => pos as i64,
+            Some(pos) => self.inner[..pos].chars().count() as i64,
             None => -1,
         }
     }
@@ -2705,6 +2760,97 @@ impl<T> PyIsNone for HashSet<T> {
     }
 }
 
+/// Python's whitespace set: Rust's Unicode White_Space plus the
+/// file/group/record/unit separators U+001C–U+001F, which CPython's
+/// str.isspace()/strip()/split() treat as whitespace but Rust does not
+/// (verified the two sets differ by exactly those four code points).
+pub fn py_is_whitespace(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+/// The str.splitlines() boundary set: \n, \r, \r\n (one boundary), \v,
+/// \f, \x1c–\x1e, \x85, \u2028, \u2029. \x1f (US) is NOT a boundary.
+fn is_py_line_boundary(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\u{1c}'..='\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Does Python's repr escape this character? CPython escapes everything
+/// failing str.isprintable(): controls, format characters (Cf),
+/// line/paragraph separators (Zl/Zp), and every space separator (Zs)
+/// except U+0020. Rust's std exposes no Unicode category API, so the Cf
+/// list is enumerated (Unicode 15 format characters).
+fn repr_escapes(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
+}
+
+/// Titlecase a character the way CPython does. Rust's std has no stable
+/// char::to_titlecase, and titlecase differs from uppercase for a small
+/// fixed set (Unicode SpecialCasing: ß, the Ǆ/Ǉ/Ǌ/Ǳ families, and the
+/// ffi/ffl/ſt ligatures); everything else titlecases as uppercase.
+fn py_to_titlecase(c: char) -> String {
+    const TITLE_SPECIALS: &[(char, &str)] = &[
+        ('\u{00df}', "Ss"), // ß
+        ('\u{01c4}', "\u{01c5}"), // Ǆ -> ǅ
+        ('\u{01c5}', "\u{01c5}"),
+        ('\u{01c6}', "\u{01c5}"),
+        ('\u{01c7}', "\u{01c8}"), // Ǉ -> ǈ
+        ('\u{01c8}', "\u{01c8}"),
+        ('\u{01c9}', "\u{01c8}"),
+        ('\u{01ca}', "\u{01cb}"), // Ǌ -> ǋ
+        ('\u{01cb}', "\u{01cb}"),
+        ('\u{01cc}', "\u{01cb}"),
+        ('\u{01f1}', "\u{01f2}"), // Ǳ -> ǲ
+        ('\u{01f2}', "\u{01f2}"),
+        ('\u{01f3}', "\u{01f2}"),
+        ('\u{fb00}', "Ff"), // ﬀ
+        ('\u{fb01}', "Fi"), // ﬁ
+        ('\u{fb02}', "Fl"), // ﬂ
+        ('\u{fb03}', "Ffi"), // ﬃ
+        ('\u{fb04}', "Ffl"), // ﬄ
+        ('\u{fb05}', "St"), // ﬅ
+        ('\u{fb06}', "St"), // ﬆ
+    ];
+    match TITLE_SPECIALS.iter().find(|(ch, _)| *ch == c) {
+        Some((_, s)) => (*s).to_string(),
+        None => c.to_uppercase().collect(),
+    }
+}
+
 // ============================================================================
 // PYTHON LIST METHODS (on Vec)
 // ============================================================================
@@ -2735,7 +2881,10 @@ impl<T> PyListOps<T> for Vec<T> {
     fn py_insert(&mut self, index: i64, item: T) {
         let len = self.len() as i64;
         let idx = if index < 0 {
-            (len + index).max(0)
+            // len + i64::MIN overflows; Python prepends for any index with
+            // |index| > len, so a checked fallback to a large negative
+            // value lands at 0.
+            len.checked_add(index).unwrap_or(i64::MIN).max(0)
         } else {
             index.min(len)
         } as usize;
@@ -2895,21 +3044,20 @@ impl PyStrOps for str {
         self.to_lowercase()
     }
     fn strip(&self) -> String {
-        self.trim().to_string()
+        self.trim_matches(py_is_whitespace).to_string()
     }
     fn lstrip(&self) -> String {
-        self.trim_start().to_string()
+        self.trim_start_matches(py_is_whitespace).to_string()
     }
     fn rstrip(&self) -> String {
-        self.trim_end().to_string()
+        self.trim_end_matches(py_is_whitespace).to_string()
     }
     fn capitalize(&self) -> String {
-        // Python: first char uppercased, the rest lowercased.
+        // Python titlecases the first char (uppercase where the two differ:
+        // "ﬁle" -> "File", "ß" -> "Ss") and lowercases the rest.
         let mut chars = self.chars();
         match chars.next() {
-            Some(first) => {
-                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
-            }
+            Some(first) => py_to_titlecase(first) + &chars.as_str().to_lowercase(),
             None => String::new(),
         }
     }
@@ -2947,7 +3095,10 @@ impl PyStrOps for str {
             .collect())
     }
     fn py_split_whitespace(&self) -> Vec<String> {
-        self.split_whitespace().map(str::to_string).collect()
+        self.split(py_is_whitespace)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     }
     fn py_split_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
         if maxsplit < 0 {
@@ -2957,13 +3108,13 @@ impl PyStrOps for str {
         // are made, and the remainder keeps its internal/trailing
         // whitespace: " a b  c ".split(None, 1) == ["a", "b  c "].
         let mut out = Vec::new();
-        let mut rest = self.trim_start();
+        let mut rest = self.trim_start_matches(py_is_whitespace);
         let mut splits = 0;
         while !rest.is_empty() && splits < maxsplit {
-            match rest.find(char::is_whitespace) {
+            match rest.find(py_is_whitespace) {
                 Some(i) => {
                     out.push(rest[..i].to_string());
-                    rest = rest[i..].trim_start();
+                    rest = rest[i..].trim_start_matches(py_is_whitespace);
                     splits += 1;
                 }
                 None => break,
@@ -2982,14 +3133,14 @@ impl PyStrOps for str {
         // the right, and the remainder keeps its LEADING whitespace:
         // " a b  c ".rsplit(None, 2) == [" a", "b", "c"].
         let mut tail = Vec::new();
-        let mut rest = self.trim_end();
+        let mut rest = self.trim_end_matches(py_is_whitespace);
         let mut splits = 0;
         while !rest.is_empty() && splits < maxsplit {
-            match rest.rfind(char::is_whitespace) {
+            match rest.rfind(py_is_whitespace) {
                 Some(i) => {
                     let sep_len = rest[i..].chars().next().map_or(1, char::len_utf8);
                     tail.push(rest[i + sep_len..].to_string());
-                    rest = rest[..i].trim_end();
+                    rest = rest[..i].trim_end_matches(py_is_whitespace);
                     splits += 1;
                 }
                 None => break,
@@ -3059,7 +3210,8 @@ impl PyStrOps for str {
     }
     fn title(&self) -> String {
         // Python: the first letter after any non-alphabetic character is
-        // uppercased, the rest lowercased ("3rd" becomes "3Rd").
+        // titlecased, the rest lowercased ("3rd" becomes "3Rd"; "ǳ" ->
+        // "ǲ" where titlecase and uppercase differ).
         let mut out = String::with_capacity(self.len());
         let mut prev_alpha = false;
         for c in self.chars() {
@@ -3067,7 +3219,7 @@ impl PyStrOps for str {
                 if prev_alpha {
                     out.extend(c.to_lowercase());
                 } else {
-                    out.extend(c.to_uppercase());
+                    out.push_str(&py_to_titlecase(c));
                 }
                 prev_alpha = true;
             } else {
@@ -3109,7 +3261,32 @@ impl PyStrOps for str {
         Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self))
     }
     fn splitlines(&self) -> Vec<String> {
-        self.lines().map(str::to_string).collect()
+        // Python's boundary set, not just \n/\r\n: classic-Mac \r,
+        // \v \f \x1c-\x1e \x85 \u2028 \u2029 all split, with \r\n counted
+        // as ONE boundary. A trailing boundary does not produce a trailing
+        // empty line; consecutive boundaries produce empty lines between
+        // them ("a\n\n".splitlines() == ["a", ""]).
+        let bytes = self.as_bytes();
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = self[i..].chars().next().expect("valid UTF-8");
+            if is_py_line_boundary(c) {
+                out.push(self[start..i].to_string());
+                i += c.len_utf8();
+                if c == '\r' && i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1; // \r\n is one boundary
+                }
+                start = i;
+            } else {
+                i += c.len_utf8();
+            }
+        }
+        if start < bytes.len() {
+            out.push(self[start..].to_string());
+        }
+        out
     }
     fn join<I, S>(&self, parts: I) -> String
     where
@@ -3591,7 +3768,17 @@ impl<T: Clone> PyAdd<Vec<T>> for Vec<T> {
 /// end. Returns None when out of range (the caller raises).
 fn normalize_index(index: i64, len: usize) -> Option<usize> {
     let len = len as i64;
-    let idx = if index < 0 { len + index } else { index };
+    let idx = if index < 0 {
+        // len + i64::MIN overflows; |index| >> len means out of range, so
+        // IndexError rather than a wrapped index landing on a wrong
+        // element (lst[-9223372036854775808]).
+        match len.checked_add(index) {
+            Some(v) => v,
+            None => -1,
+        }
+    } else {
+        index
+    };
     if idx < 0 || idx >= len {
         None
     } else {
@@ -4222,8 +4409,14 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
     }
     
     let mut input = String::new();
-    io::stdin().read_line(&mut input)
+    let n = io::stdin().read_line(&mut input)
         .map_err(|e| runtime_error(&format!("I/O error: {}", e)))?;
+    if n == 0 {
+        // CPython raises EOFError at end of input; returning "" would make
+        // `while True: line = input()` spin forever (and a blank input
+        // line is also "", so `if not line: break` is not a workaround).
+        return Err(PyException::new("EOFError", "EOF when reading a line"));
+    }
     
     // Remove trailing newline
     if input.ends_with('\n') {

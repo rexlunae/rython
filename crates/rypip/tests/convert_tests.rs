@@ -1786,6 +1786,64 @@ fn builtins_match_python_at_runtime() {
 }
 
 #[test]
+fn round_and_chr_builtins_match_python_at_runtime() {
+    // Two-arg round() used to fail to compile (no round_digits wiring);
+    // chr() used to panic on surrogates. Both now match CPython (the
+    // surrogate code point is a documented exception: CPython returns a
+    // lone surrogate, which UTF-8 cannot hold, so rython raises a
+    // catchable ValueError instead).
+    let scratch = Scratch::new("round_chr");
+    let file = scratch.path().join("round_chr.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    print(round(1.15, 1))\n",
+            "    print(round(2.675, 2))\n",
+            "    print(round(2.5))\n",
+            "    print(round(1250.0, -2))\n",
+            "    print(round(3))\n",
+            "    print(chr(65))\n",
+            "    try:\n",
+            "        chr(0x110000)\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught\", e)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/round_chr"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "1.1",
+            "2.67",
+            "2",
+            "1200.0",
+            "3",
+            "A",
+            "caught chr() arg not in range(0x110000)",
+        ],
+        "round/chr diverged from CPython"
+    );
+}
+
+#[test]
 fn datetime_and_time_match_python_at_runtime() {
     // date/datetime/timedelta constructors with keywords, arithmetic
     // operators, strptime (including its catchable ValueError), and the

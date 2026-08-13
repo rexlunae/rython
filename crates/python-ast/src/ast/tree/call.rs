@@ -711,7 +711,7 @@ impl<'a> CodeGen for Call {
         // stdpython builtins.
         let propagates_exceptions = match self.func.as_ref() {
             ExprType::Name(name) => {
-                matches!(name.id.as_str(), "int" | "float")
+                matches!(name.id.as_str(), "int" | "float" | "chr")
                     || match symbols.get(&name.id) {
                         Some(SymbolTableNode::FunctionDef(_)) => true,
                         Some(SymbolTableNode::ImportFrom(import)) => {
@@ -846,7 +846,7 @@ impl<'a> CodeGen for Call {
                 bname,
                 "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
                     | "reversed" | "frozenset" | "map" | "filter" | "list"
-                    | "isinstance" | "hash" | "print" | "open"
+                    | "isinstance" | "hash" | "print" | "open" | "round"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -1007,6 +1007,41 @@ impl<'a> CodeGen for Call {
                             [b, e] => Ok(quote!(pow(#b, #e))),
                             [b, e, m] => Ok(quote!(pow_mod(#b, #e, #m)?)),
                             _ => Err("pow() takes 2 or 3 arguments".to_string().into()),
+                        };
+                    }
+                    // round(x) -> int (half-even), round(x, n) -> float.
+                    // The first argument is always numeric: coerce to f64
+                    // so round(3) works; the ndigits argument stays i64.
+                    "round" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        let render_float = |e: &crate::ExprType| {
+                            crate::render_typed(
+                                e,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::Float),
+                            )
+                        };
+                        return match self.args.len() {
+                            1 => {
+                                let a = render_float(&self.args[0])?;
+                                Ok(quote!(round(#a)))
+                            }
+                            2 => {
+                                let a = render_float(&self.args[0])?;
+                                let n = crate::render_typed(
+                                    &self.args[1],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::Int),
+                                )?;
+                                Ok(quote!(round_digits(#a, #n)))
+                            }
+                            _ => Err("round() takes 1 or 2 arguments".to_string().into()),
                         };
                     }
                     // isinstance is statically decidable in a typed

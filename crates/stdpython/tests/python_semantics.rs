@@ -91,8 +91,14 @@ fn round_is_banker_rounding() {
 fn ord_chr_hex_oct_bin() {
     assert_eq!(ord("a"), 97);
     assert_eq!(ord("é"), 233);
-    assert_eq!(chr(97), "a");
-    assert_eq!(chr(0x1F600), "😀");
+    assert_eq!(chr(97).unwrap(), "a");
+    assert_eq!(chr(0x1F600).unwrap(), "😀");
+    // Out-of-range raises the same ValueError as CPython; lone surrogates
+    // raise a catchable ValueError (CPython succeeds, but UTF-8 cannot
+    // represent them).
+    assert_eq!(chr(-1).unwrap_err().exception_type, "ValueError");
+    assert_eq!(chr(0x110000).unwrap_err().exception_type, "ValueError");
+    assert_eq!(chr(0xD800).unwrap_err().exception_type, "ValueError");
     assert_eq!(hex(255), "0xff");
     assert_eq!(hex(-255), "-0xff");
     assert_eq!(oct(8), "0o10");
@@ -332,6 +338,81 @@ fn py_list_and_str_methods_match_python() {
     // "-".join(['a', 'b']) == "a-b"
     assert_eq!("-".join(vec!["a", "b"]), "a-b");
     assert_eq!("-".join(Vec::<String>::new()), "");
+}
+
+#[test]
+fn issue81_string_divergences_match_cpython() {
+    // splitlines: full Python boundary set (\r \v \f \x1c-\x1e \x85
+    // \u2028 \u2029), \r\n as ONE boundary, no trailing empty line, but
+    // empties between consecutive boundaries.
+    assert_eq!("a\rb".splitlines(), vec!["a", "b"]);
+    assert_eq!("a\u{c}b".splitlines(), vec!["a", "b"]);
+    assert_eq!("a\u{1d}b".splitlines(), vec!["a", "b"]);
+    assert_eq!("a\u{85}b".splitlines(), vec!["a", "b"]);
+    assert_eq!("a\u{2028}b".splitlines(), vec!["a", "b"]);
+    assert_eq!("a\r\nb".splitlines(), vec!["a", "b"]);
+    assert_eq!("a\n\n".splitlines(), vec!["a", ""]);
+    assert_eq!("\n".splitlines(), vec![""]);
+    assert_eq!("".splitlines(), Vec::<String>::new());
+    assert_eq!("a\n".splitlines(), vec!["a"]);
+
+    // capitalize/title use TITLECASE, not uppercase, for the first letter.
+    assert_eq!("\u{fb01}le".capitalize(), "File"); // ﬁ -> Fi
+    assert_eq!("\u{00df}".capitalize(), "Ss"); // ß -> Ss
+    assert_eq!("\u{01f3}".title(), "\u{01f2}"); // ǳ -> ǲ
+    assert_eq!("3rd".title(), "3Rd");
+
+    // The \x1c-\x1f separators are whitespace for strip/split.
+    assert_eq!("hello\u{1f}".strip(), "hello");
+    assert_eq!("a\u{1c}b".py_split_whitespace(), vec!["a", "b"]);
+
+    // repr escapes everything str.isprintable() rejects.
+    assert_eq!(py_str_repr("\u{a0}"), "'\\xa0'");
+    assert_eq!(py_str_repr("\u{ad}"), "'\\xad'");
+    assert_eq!(py_str_repr("\u{200b}"), "'\\u200b'");
+    assert_eq!(py_str_repr("\u{2028}"), "'\\u2028'");
+    assert_eq!(py_str_repr("plain"), "'plain'");
+}
+
+#[test]
+fn issue81_round_and_pow_match_cpython() {
+    // round(x, n): half-even at the correctly-rounded decimal, verified
+    // against python3 over a 46-value × 9-ndigits sweep.
+    assert_eq!(round_digits(1.15, 1), 1.1);
+    assert_eq!(round_digits(2.675, 2), 2.67);
+    assert_eq!(round_digits(0.005, 2), 0.01); // 0.005 is stored slightly ABOVE
+    assert_eq!(round_digits(2.5, 0), 2.0);
+    assert_eq!(round_digits(3.5, 0), 4.0);
+    assert_eq!(round_digits(1250.0, -2), 1200.0);
+    assert_eq!(round_digits(1350.0, -2), 1400.0);
+    assert_eq!(round_digits(1234.5, -2), 1200.0);
+    assert_eq!(round_digits(15.0, -1), 20.0);
+    assert_eq!(round_digits(5.0, -1), 0.0);
+    assert_eq!(round_digits(1e308, -400), 0.0);
+    assert_eq!(round_digits(f64::INFINITY, 2), f64::INFINITY);
+
+    // i64 ** huge exponent: no u32 truncation (0 ** 4294967296 is 0, 1
+    // is 1, (-1) ** odd is -1); anything else overflows loudly.
+    assert_eq!(py_pow(0i64, 4294967296i64), 0);
+    assert_eq!(py_pow(1i64, 4294967296i64), 1);
+    assert_eq!(py_pow(-1i64, 4294967297i64), -1);
+    assert!(std::panic::catch_unwind(|| py_pow(2i64, 4294967296i64)).is_err());
+}
+
+#[test]
+fn issue81_negative_index_overflow_does_not_panic() {
+    // i64::MIN + len used to overflow in normalize_index; Python answers
+    // IndexError because |index| > len.
+    assert!(vec![1i64, 2]
+        .py_index(-9223372036854775808i64)
+        .is_err());
+    assert!(vec![1i64, 2]
+        .py_pop(-9223372036854775808i64)
+        .is_err());
+    // insert prepends, like Python (insert(-huge, x) == insert(0, x)).
+    let mut v = vec![1i64, 2];
+    v.py_insert(-9223372036854775808i64, 9);
+    assert_eq!(v, vec![9, 1, 2]);
 }
 
 #[test]
