@@ -111,7 +111,10 @@ impl FileOperations {
     /// An all-NULL operations table — the base for a `static` definition
     /// using struct-update syntax:
     ///
-    /// ```rust
+    /// ```ignore
+    /// // Illustrative: FileOperations and the dev_* handlers are module
+    /// // items, not doctest-visible, and the table feeds the kernel's
+    /// // file_operations, so this is not a compilable host snippet.
     /// static FOPS: FileOperations = FileOperations {
     ///     owner: &rykernel_shim::__this_module,
     ///     read: Some(dev_read),

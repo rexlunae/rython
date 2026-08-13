@@ -23,7 +23,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 /// Install as the crate's global allocator:
 ///
-/// ```rust
+/// ```ignore
+/// // Kernel-target only: the allocator calls ffi::kmalloc/ffi::kfree, which
+/// // do not exist in a host binary, so this cannot compile/link as a doctest.
 /// #[global_allocator]
 /// static ALLOCATOR: rykernel_shim::alloc::KernelAllocator =
 ///     rykernel_shim::alloc::KernelAllocator;
