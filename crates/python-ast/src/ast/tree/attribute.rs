@@ -1,8 +1,10 @@
 use proc_macro2::TokenStream;
-use pyo3::{Borrowed, PyAny, FromPyObject, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
-use crate::{extraction_failure, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes};
+use crate::{
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes, extraction_failure,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +19,12 @@ pub struct Attribute {
 impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let value = ob.getattr("value").map_err(|e| extraction_failure("Attribute.value", &ob, e))?;
-        let attr = ob.getattr("attr").map_err(|e| extraction_failure("Attribute.attr", &ob, e))?;
+        let value = ob
+            .getattr("value")
+            .map_err(|e| extraction_failure("Attribute.value", &ob, e))?;
+        let attr = ob
+            .getattr("attr")
+            .map_err(|e| extraction_failure("Attribute.attr", &ob, e))?;
         let ctx = ob
             .getattr("ctx")
             .map_err(|e| extraction_failure("attribute context", &ob, e))?
@@ -26,8 +32,14 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {
             .name()
             .map_err(|e| extraction_failure("attribute context type", &ob, e))?;
         Ok(Attribute {
-            value: Box::new(value.extract().map_err(|e| extraction_failure("Attribute.value", &ob, e))?),
-            attr: attr.extract().map_err(|e| extraction_failure("Attribute.attr", &ob, e))?,
+            value: Box::new(
+                value
+                    .extract()
+                    .map_err(|e| extraction_failure("Attribute.value", &ob, e))?,
+            ),
+            attr: attr
+                .extract()
+                .map_err(|e| extraction_failure("Attribute.attr", &ob, e))?,
             ctx: ctx.to_string(),
         })
     }
@@ -44,6 +56,28 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A Rust-module attribute (`crc32c.crc32c` where `crc32c` was
+        // `import`ed from a rython.toml binding) is a path into the bound
+        // crate — never a field access. The crate name comes from the spec
+        // so aliased imports (`import crc32c as c`) still emit the real
+        // crate path.
+        if let ExprType::Name(root) = self.value.as_ref() {
+            let module_spec = match symbols.get(&root.id) {
+                Some(crate::SymbolTableNode::Alias(canonical)) => {
+                    symbols.get(canonical).and_then(|s| match s {
+                        crate::SymbolTableNode::RustModule(spec) => Some(spec.clone()),
+                        _ => None,
+                    })
+                }
+                Some(crate::SymbolTableNode::RustModule(spec)) => Some(spec.clone()),
+                _ => None,
+            };
+            if let Some(spec) = module_spec {
+                let crate_ident = crate::safe_ident(&spec.crate_name.replace('-', "_"));
+                let attr = crate::safe_ident(&self.attr);
+                return Ok(quote!(#crate_ident::#attr));
+            }
+        }
         // If a user binding shadows the root name (e.g. a variable named
         // `re`), the attribute is a field access on that value — never a
         // stdlib module path. Computed before `self.value` is moved below.
@@ -52,7 +86,7 @@ impl<'a> CodeGen for Attribute {
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
-        
+
         // Determine if this is a module access or a field/method access
         // Module names are typically lowercase and match Python stdlib modules
         // `np`/`numpy` cover the numpy module (import numpy as np lowers to
@@ -77,10 +111,11 @@ impl<'a> CodeGen for Attribute {
             // Special handling for LazyLock static variables that need
             // dereferencing. os::environ is NOT here: it is a live-view
             // unit struct whose methods auto-ref.
-            let needs_deref = matches!((value_str.as_str(), self.attr.as_str()),
+            let needs_deref = matches!(
+                (value_str.as_str(), self.attr.as_str()),
                 ("sys", "executable") | ("sys", "argv")
             );
-            
+
             if needs_deref {
                 // Wrap dereferenced values in parentheses to ensure correct precedence
                 // This prevents *sys::executable.to_string() and ensures (*sys::executable).to_string()

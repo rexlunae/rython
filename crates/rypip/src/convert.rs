@@ -3,14 +3,15 @@
 //! PyO3 bindings so the crate can be imported from Python again.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use proc_macro2::TokenStream;
 use python_ast::{
-    parse_enhanced, python_annotation_to_rust_type, safe_ident, CodeGen, CodeGenContext,
-    PythonOptions, StatementType, SymbolTableScopes,
+    CodeGen, CodeGenContext, PythonOptions, StatementType, SymbolTableScopes, parse_enhanced,
+    python_annotation_to_rust_type, safe_ident,
 };
 use quote::quote;
 use rust_format::{Formatter, RustFmt};
@@ -46,7 +47,11 @@ fn generated_lint_attrs(mode: WarningMode) -> String {
 /// carries it; each module brings its own alloc imports (emitted by the
 /// module lowering itself).
 fn no_std_attr(opts: &ConvertOptions) -> &'static str {
-    if opts.no_std || opts.kernel_module { "#![no_std]\n" } else { "" }
+    if opts.no_std || opts.kernel_module {
+        "#![no_std]\n"
+    } else {
+        ""
+    }
 }
 
 /// How lossy-conversion warnings are treated during conversion.
@@ -184,7 +189,9 @@ fn modinfo_statics(modinfo: &std::collections::BTreeMap<String, String>) -> Stri
         let len = entry.len();
         let padded = (len + 7) & !7; // align to 8 bytes
         out.push_str("#[used]\n#[no_mangle]\n#[link_section = \".modinfo\"]\n");
-        out.push_str(&format!("static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"));
+        out.push_str(&format!(
+            "static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"
+        ));
         for _ in len..padded {
             out.push_str("\\0");
         }
@@ -205,11 +212,11 @@ fn generate_kernel_lib_rs(
     package_name: &str,
     manifest: &DeviceManifest,
 ) -> Result<GeneratedKernel> {
-    use python_ast::parse_enhanced;
     use python_ast::ast::tree::StatementType;
+    use python_ast::parse_enhanced;
 
-    let ast = parse_enhanced(source, "<kernel>".to_string())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ast =
+        parse_enhanced(source, "<kernel>".to_string()).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     if manifest.has_device {
         return generate_kernel_device(&ast, manifest, target, package_name);
@@ -241,13 +248,8 @@ fn generate_kernel_lib_rs(
                         func.name
                     ));
                 }
-                let body = lower_kernel_body(
-                    &func.body,
-                    &mut has_printk,
-                    target,
-                    is_init,
-                    &func.name,
-                )?;
+                let body =
+                    lower_kernel_body(&func.body, &mut has_printk, target, is_init, &func.name)?;
                 if is_init {
                     init_body = body;
                 } else {
@@ -266,21 +268,25 @@ fn generate_kernel_lib_rs(
     }
 
     match target {
-        KernelTarget::RawFfi => generate_kernel_raw_ffi(&init_body, &exit_body, &modinfo, has_printk)
-            .map(|code| GeneratedKernel {
-                code,
-                has_init: !init_body.is_empty(),
-                has_exit: !exit_body.is_empty(),
-                device: None,
-            }),
-        KernelTarget::RustForLinux => {
-            generate_kernel_rust_for_linux(&init_body, &exit_body, &modinfo, package_name)
-                .map(|code| GeneratedKernel {
+        KernelTarget::RawFfi => {
+            generate_kernel_raw_ffi(&init_body, &exit_body, &modinfo, has_printk).map(|code| {
+                GeneratedKernel {
                     code,
                     has_init: !init_body.is_empty(),
                     has_exit: !exit_body.is_empty(),
                     device: None,
-                })
+                }
+            })
+        }
+        KernelTarget::RustForLinux => {
+            generate_kernel_rust_for_linux(&init_body, &exit_body, &modinfo, package_name).map(
+                |code| GeneratedKernel {
+                    code,
+                    has_init: !init_body.is_empty(),
+                    has_exit: !exit_body.is_empty(),
+                    device: None,
+                },
+            )
         }
     }
 }
@@ -462,7 +468,10 @@ fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
                 let root = alias.name.split('.').next().unwrap_or("");
                 if KERNEL_FP_STDLIB.contains(&root) {
                     return Err(kernel_fp_err(
-                        &format!("import of `{}` (a floating-point stdlib module)", alias.name),
+                        &format!(
+                            "import of `{}` (a floating-point stdlib module)",
+                            alias.name
+                        ),
                         line,
                     ));
                 }
@@ -473,7 +482,10 @@ fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
             let root = imp.module.split('.').next().unwrap_or("");
             if KERNEL_FP_STDLIB.contains(&root) {
                 return Err(kernel_fp_err(
-                    &format!("import of `{}` (a floating-point stdlib module)", imp.module),
+                    &format!(
+                        "import of `{}` (a floating-point stdlib module)",
+                        imp.module
+                    ),
                     line,
                 ));
             }
@@ -581,7 +593,10 @@ fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
     }
 }
 
-fn check_kernel_with_items_no_floats(items: &[python_ast::WithItem], line: Option<usize>) -> Result<()> {
+fn check_kernel_with_items_no_floats(
+    items: &[python_ast::WithItem],
+    line: Option<usize>,
+) -> Result<()> {
     for item in items {
         check_kernel_expr_no_floats(&item.context_expr, line)?;
         if let Some(vars) = &item.optional_vars {
@@ -591,7 +606,10 @@ fn check_kernel_with_items_no_floats(items: &[python_ast::WithItem], line: Optio
     Ok(())
 }
 
-fn check_kernel_funcdef_no_floats(func: &python_ast::FunctionDef, line: Option<usize>) -> Result<()> {
+fn check_kernel_funcdef_no_floats(
+    func: &python_ast::FunctionDef,
+    line: Option<usize>,
+) -> Result<()> {
     check_kernel_args_no_floats(&func.args, line)?;
     if let Some(returns) = &func.returns {
         if annotation_mentions_float(returns) {
@@ -607,8 +625,16 @@ fn check_kernel_funcdef_no_floats(func: &python_ast::FunctionDef, line: Option<u
     Ok(())
 }
 
-fn check_kernel_args_no_floats(args: &python_ast::ParameterList, line: Option<usize>) -> Result<()> {
-    for p in args.posonlyargs.iter().chain(&args.args).chain(&args.kwonlyargs) {
+fn check_kernel_args_no_floats(
+    args: &python_ast::ParameterList,
+    line: Option<usize>,
+) -> Result<()> {
+    for p in args
+        .posonlyargs
+        .iter()
+        .chain(&args.args)
+        .chain(&args.kwonlyargs)
+    {
         if let Some(ann) = &p.annotation {
             if annotation_mentions_float(ann) {
                 return Err(kernel_fp_err(
@@ -1321,10 +1347,8 @@ fn lower_kernel_body(
                 // These are the only locals the kernel ABI supports; they
                 // exist so f-string printk interpolations have values to
                 // reference.
-                let target_is_name = matches!(
-                    assign.targets.first(),
-                    Some(python_ast::ExprType::Name(_))
-                );
+                let target_is_name =
+                    matches!(assign.targets.first(), Some(python_ast::ExprType::Name(_)));
                 if assign.targets.len() == 1 && target_is_name {
                     if let python_ast::ExprType::Constant(c) = &assign.value {
                         if let Some(litrs::Literal::Integer(ilit)) = &c.0 {
@@ -1561,24 +1585,22 @@ fn extract_kernel_call(expr: &python_ast::Expr) -> Option<KernelCall<'_>> {
 /// i64. Anything else is a loud error.
 fn lower_kernel_expr(expr: &python_ast::ExprType, line: Option<usize>) -> Result<String> {
     match expr {
-        python_ast::ExprType::Constant(c) => {
-            match &c.0 {
-                Some(litrs::Literal::String(slit)) => {
-                    let escaped = escape_c_format(slit.value());
-                    Ok(format!(
-                        "b\"{escaped}\\0\".as_ptr() as *const core::ffi::c_char"
-                    ))
-                }
-                Some(litrs::Literal::Integer(ilit)) => ilit
-                    .value::<i64>()
-                    .map(|v| v.to_string())
-                    .ok_or_else(|| kernel_body_err("integer literal is too large", line)),
-                _ => Err(kernel_body_err(
-                    "unsupported literal in module entry body (only string and integer literals)",
-                    line,
-                )),
+        python_ast::ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(slit)) => {
+                let escaped = escape_c_format(slit.value());
+                Ok(format!(
+                    "b\"{escaped}\\0\".as_ptr() as *const core::ffi::c_char"
+                ))
             }
-        }
+            Some(litrs::Literal::Integer(ilit)) => ilit
+                .value::<i64>()
+                .map(|v| v.to_string())
+                .ok_or_else(|| kernel_body_err("integer literal is too large", line)),
+            _ => Err(kernel_body_err(
+                "unsupported literal in module entry body (only string and integer literals)",
+                line,
+            )),
+        },
         _ => Err(kernel_body_err(
             "unsupported expression in module entry body (only string and integer literals)",
             line,
@@ -1613,21 +1635,24 @@ fn lower_kernel_value(expr: &python_ast::ExprType, line: Option<usize>) -> Resul
 }
 
 /// Convert `package` into a Cargo crate under `out_dir`.
-pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Result<ConvertedCrate> {
+pub fn convert(
+    package: &PyPackage,
+    out_dir: &Path,
+    opts: &ConvertOptions,
+) -> Result<ConvertedCrate> {
     if opts.no_std && opts.pyo3 {
-        bail!("PyO3 bindings require std (pyo3 links the Python runtime); drop one of --pyo3 / --no-std");
+        bail!(
+            "PyO3 bindings require std (pyo3 links the Python runtime); drop one of --pyo3 / --no-std"
+        );
     }
     if opts.kernel_module && opts.pyo3 {
         bail!("PyO3 bindings cannot be used in kernel modules");
     }
     let src_dir = out_dir.join("src");
-    fs::create_dir_all(&src_dir)
-        .with_context(|| format!("creating {}", src_dir.display()))?;
+    fs::create_dir_all(&src_dir).with_context(|| format!("creating {}", src_dir.display()))?;
 
     if opts.rust_for_linux && !opts.kernel_module {
-        bail!(
-            "rust_for_linux requires kernel_module (pass --kernel-module with --rust-for-linux)"
-        );
+        bail!("rust_for_linux requires kernel_module (pass --kernel-module with --rust-for-linux)");
     }
     if opts.driver && (opts.kernel_module || opts.pyo3 || opts.no_std) {
         bail!("--driver cannot be combined with --kernel-module, --pyo3, or --no-std");
@@ -1688,11 +1713,17 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         return convert_driver(package, out_dir, opts);
     }
 
+    // Rust-module imports (`import crc32c`): resolve the manifest once and
+    // thread the registry through every module's conversion so import
+    // statements and call sites lower to direct crate calls.
+    let rust_manifest = read_rust_module_manifest(package)?;
+    let rust_modules = rust_module_registry(package, &rust_manifest)?;
+
     // Transpile every module, collecting lossy-conversion warnings.
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for module in &package.modules {
-        let code = transpile(module, &mut warnings, opts)?;
+        let code = transpile(module, &mut warnings, opts, &rust_modules)?;
         transpiled.push((module, code));
     }
     // Bindings are generated before files are written so their warnings
@@ -1747,7 +1778,11 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         let is_root = module.path.is_empty();
         let decls = mod_decls(&children, &module.path, module.is_init || is_root);
         let allows = if is_root {
-            format!("{}{}", no_std_attr(opts), generated_lint_attrs(opts.warnings))
+            format!(
+                "{}{}",
+                no_std_attr(opts),
+                generated_lint_attrs(opts.warnings)
+            )
         } else {
             String::new()
         };
@@ -1808,17 +1843,18 @@ pub fn convert(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Re
         } else {
             mod_decls(&children, &[], true).replace("pub mod", "mod")
         };
-        let main_contents = format!(
-            "{}{}\n{}",
-            generated_lint_attrs(opts.warnings),
-            code,
-            decls
-        );
+        let main_contents = format!("{}{}\n{}", generated_lint_attrs(opts.warnings), code, decls);
         fs::write(src_dir.join("main.rs"), format_rust(&main_contents))?;
         has_binary = true;
     }
 
-    write_cargo_toml(package, out_dir, opts, has_binary, &DeviceManifest::default())?;
+    write_cargo_toml(
+        package,
+        out_dir,
+        opts,
+        has_binary,
+        &DeviceManifest::default(),
+    )?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -1883,8 +1919,8 @@ impl Default for DeviceManifest {
 /// documented defaults. Malformed values are loud conversion errors — never
 /// silently ignored.
 fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
-    let ast = parse_enhanced(source, "<driver>".to_string())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ast =
+        parse_enhanced(source, "<driver>".to_string()).map_err(|e| anyhow::anyhow!("{}", e))?;
     let mut manifest = DeviceManifest::default();
     for stmt in &ast.raw.body {
         if let python_ast::ast::tree::StatementType::Assign(assign) = &stmt.statement {
@@ -1896,14 +1932,18 @@ fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
                             if let Some(s) = expr_str_literal(value) {
                                 manifest.module_name = Some(s);
                             } else {
-                                bail!("--driver/--kernel-module: __module_name__ must be a string literal");
+                                bail!(
+                                    "--driver/--kernel-module: __module_name__ must be a string literal"
+                                );
                             }
                         }
                         "__device_path__" => {
                             if let Some(s) = expr_str_literal(value) {
                                 manifest.device_path = s;
                             } else {
-                                bail!("--driver/--kernel-module: __device_path__ must be a string literal");
+                                bail!(
+                                    "--driver/--kernel-module: __device_path__ must be a string literal"
+                                );
                             }
                         }
                         "__device_name__" => {
@@ -1911,7 +1951,9 @@ fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
                                 manifest.has_device = true;
                                 manifest.device_name = s;
                             } else {
-                                bail!("--driver/--kernel-module: __device_name__ must be a string literal");
+                                bail!(
+                                    "--driver/--kernel-module: __device_name__ must be a string literal"
+                                );
                             }
                         }
                         "__bufsz__" => {
@@ -1919,7 +1961,9 @@ fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
                                 manifest.has_device = true;
                                 manifest.bufsz = v as usize;
                             } else {
-                                bail!("--driver/--kernel-module: __bufsz__ must be an integer literal");
+                                bail!(
+                                    "--driver/--kernel-module: __bufsz__ must be an integer literal"
+                                );
                             }
                         }
                         "__magic__" => {
@@ -1927,7 +1971,9 @@ fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
                                 manifest.has_device = true;
                                 manifest.magic = v as u32;
                             } else {
-                                bail!("--driver/--kernel-module: __magic__ must be an integer literal");
+                                bail!(
+                                    "--driver/--kernel-module: __magic__ must be an integer literal"
+                                );
                             }
                         }
                         "__device_mode__" => {
@@ -1935,21 +1981,27 @@ fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
                                 manifest.has_device = true;
                                 manifest.device_mode = v as u32;
                             } else {
-                                bail!("--driver/--kernel-module: __device_mode__ must be an integer literal");
+                                bail!(
+                                    "--driver/--kernel-module: __device_mode__ must be an integer literal"
+                                );
                             }
                         }
                         "__ioc_reset__" => {
                             if let Some(v) = expr_int_literal(value) {
                                 manifest.ioc_reset = v;
                             } else {
-                                bail!("--driver/--kernel-module: __ioc_reset__ must be an integer literal");
+                                bail!(
+                                    "--driver/--kernel-module: __ioc_reset__ must be an integer literal"
+                                );
                             }
                         }
                         "__ioc_stats__" => {
                             if let Some(v) = expr_int_literal(value) {
                                 manifest.ioc_stats = v;
                             } else {
-                                bail!("--driver/--kernel-module: __ioc_stats__ must be an integer literal");
+                                bail!(
+                                    "--driver/--kernel-module: __ioc_stats__ must be an integer literal"
+                                );
                             }
                         }
                         _ => {}
@@ -1979,10 +2031,13 @@ fn parse_device_manifest(source: &str) -> Result<DeviceManifest> {
 /// the Python driver logic transpiles to `src/lib.rs` (full stdpython), and
 /// `src/main.rs` is generated syscall glue — open/read/write/ioctl around
 /// the device manifest. The only Rust in the output is this template.
-fn convert_driver(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) -> Result<ConvertedCrate> {
+fn convert_driver(
+    package: &PyPackage,
+    out_dir: &Path,
+    opts: &ConvertOptions,
+) -> Result<ConvertedCrate> {
     let src_dir = out_dir.join("src");
-    fs::create_dir_all(&src_dir)
-        .with_context(|| format!("creating {}", src_dir.display()))?;
+    fs::create_dir_all(&src_dir).with_context(|| format!("creating {}", src_dir.display()))?;
 
     let module = match package.entry_module() {
         Some(entry) => package
@@ -1998,7 +2053,9 @@ fn convert_driver(package: &PyPackage, out_dir: &Path, opts: &ConvertOptions) ->
     };
 
     let mut warnings = Vec::new();
-    let code = transpile(module, &mut warnings, opts)?;
+    let rust_manifest = read_rust_module_manifest(package)?;
+    let rust_modules = rust_module_registry(package, &rust_manifest)?;
+    let code = transpile(module, &mut warnings, opts, &rust_modules)?;
     match opts.warnings {
         WarningMode::Deny if !warnings.is_empty() => bail!(
             "lossy conversion (warnings denied):\n  {}",
@@ -2390,6 +2447,7 @@ fn transpile(
     module: &PyModule,
     warnings: &mut Vec<String>,
     opts: &ConvertOptions,
+    rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
 ) -> Result<String> {
     let mode = opts.warnings;
     let ast = parse_enhanced(&module.source, parse_filename(module))
@@ -2417,14 +2475,16 @@ fn transpile(
     let options = PythonOptions {
         lossy_warnings: mode != WarningMode::Allow,
         no_std: opts.no_std,
+        rust_modules: std::rc::Rc::new(rust_modules.clone()),
         ..Default::default()
     };
+    // Register rust-module imports in the shared symbol table so call
+    // lowering can resolve them (Import::to_rust only sees a clone).
+    let mut symbols = symbols;
+    python_ast::register_rust_module_imports(&ast.raw.body, &options, &mut symbols)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let tokens = ast
-        .to_rust(
-            CodeGenContext::Module(module_name),
-            options,
-            symbols,
-        )
+        .to_rust(CodeGenContext::Module(module_name), options, symbols)
         .map_err(|e| {
             anyhow::anyhow!(
                 "compiling {}: {}",
@@ -2701,22 +2761,22 @@ fn write_cargo_toml(
         }
     } else {
         match (&stdpython_source, opts.no_std) {
-        (StdpythonSource::Path(path), true) => format!(
-            "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
-            path.display().to_string().replace('\\', "/"),
-        ),
-        (StdpythonSource::Path(path), false) => format!(
-            "stdpython = {{ path = \"{}\" }}",
-            path.display().to_string().replace('\\', "/"),
-        ),
-        (StdpythonSource::Registry(version), true) => format!(
-            "stdpython = {{ version = \"{}\", default-features = false, features = [\"alloc\"] }}",
-            version,
-        ),
-        (StdpythonSource::Registry(version), false) => {
-            format!("stdpython = \"{}\"", version)
+            (StdpythonSource::Path(path), true) => format!(
+                "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
+                path.display().to_string().replace('\\', "/"),
+            ),
+            (StdpythonSource::Path(path), false) => format!(
+                "stdpython = {{ path = \"{}\" }}",
+                path.display().to_string().replace('\\', "/"),
+            ),
+            (StdpythonSource::Registry(version), true) => format!(
+                "stdpython = {{ version = \"{}\", default-features = false, features = [\"alloc\"] }}",
+                version,
+            ),
+            (StdpythonSource::Registry(version), false) => {
+                format!("stdpython = \"{}\"", version)
+            }
         }
-    }
     };
     let mut toml = format!(
         "# Generated by rypip from a Python package. Edit freely.\n\
@@ -2752,6 +2812,16 @@ fn write_cargo_toml(
         };
         toml.push_str(&format!("{entry}\n"));
     }
+    // Import-based rust-module deps from the rython.toml manifest.
+    let rust_manifest = read_rust_module_manifest(package)?;
+    for (name, path, version) in rust_module_dependencies(package, &rust_manifest, out_dir) {
+        let entry = match (path, version) {
+            (Some(p), _) => format!("{name} = {{ path = \"{}\" }}", p),
+            (_, Some(v)) => format!("{name} = \"{v}\""),
+            (None, None) => continue,
+        };
+        toml.push_str(&format!("{entry}\n"));
+    }
     if opts.pyo3 {
         toml.push_str(
             "pyo3 = { version = \"0.29\", features = [\"extension-module\"], optional = true }\n\n\
@@ -2762,9 +2832,7 @@ fn write_cargo_toml(
         );
     }
     if opts.kernel_module {
-        toml.push_str(
-            "\n[lib]\ncrate-type = [\"staticlib\"]\n",
-        );
+        toml.push_str("\n[lib]\ncrate-type = [\"staticlib\"]\n");
     }
     fs::write(out_dir.join("Cargo.toml"), toml)?;
     // Keep the generated crate out of any enclosing workspace.
@@ -2792,6 +2860,191 @@ fn rust_bind_dependencies(package: &PyPackage) -> Vec<(String, Option<String>, O
         }
     }
     deps
+}
+
+// ---------------------------------------------------------------------------
+// Rust modules: `import` / `from ... import` bindings into Rust crates
+// ---------------------------------------------------------------------------
+
+/// A manifest entry from `rython.toml` `[rust-modules]`.
+#[derive(Clone, Debug)]
+struct ManifestRustModule {
+    /// The actual crate name (Cargo dependency name). Defaults to the
+    /// import name.
+    crate_name: String,
+    /// Dependency spec: at most one of these is set.
+    path: Option<String>,
+    version: Option<String>,
+}
+
+/// Read `rython.toml` from the package root, if present. Returns the
+/// `[rust-modules]` table keyed by import name. Missing manifest is not an
+/// error — it simply means no import-based Rust bindings.
+fn read_rust_module_manifest(package: &PyPackage) -> Result<HashMap<String, ManifestRustModule>> {
+    let manifest_path = package.root.join("rython.toml");
+    let text = match fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => bail!("reading {}: {}", manifest_path.display(), e),
+    };
+    let value: toml::Value =
+        toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let Some(table) = value.get("rust-modules").and_then(|v| v.as_table()) else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (import_name, entry) in table {
+        let t = entry.as_table().with_context(|| {
+            format!(
+                "{}: `{import_name}` must be a table",
+                manifest_path.display()
+            )
+        })?;
+        let crate_name = t
+            .get("crate")
+            .and_then(|v| v.as_str())
+            .unwrap_or(import_name)
+            .to_string();
+        let path = t.get("path").and_then(|v| v.as_str()).map(str::to_string);
+        let version = t
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if path.is_some() && version.is_some() {
+            bail!(
+                "{}: `{import_name}` declares both path and version; give one",
+                manifest_path.display()
+            );
+        }
+        out.insert(
+            import_name.clone(),
+            ManifestRustModule {
+                crate_name,
+                path,
+                version,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// The names a module imports that could be Rust modules: `import crc32c`
+/// (and `import crc32c as c`) plus `from crc32c import ...`.
+fn imported_names(source: &str, filename: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(ast) = parse_enhanced(source, filename) else {
+        return names;
+    };
+    for stmt in &ast.raw.body {
+        match &stmt.statement {
+            StatementType::Import(imp) => {
+                for alias in &imp.names {
+                    // Only the top-level name can be a Rust module.
+                    let root = alias.name.split('.').next().unwrap_or(&alias.name);
+                    if root != "rython" && root != "rypython" {
+                        names.push(root.to_string());
+                    }
+                }
+            }
+            StatementType::ImportFrom(fr) => {
+                if fr.level == 0 && fr.module != "rython" && fr.module != "rypython" {
+                    names.push(fr.module.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Build the rust-module registry for a package: every import name that the
+/// package actually uses and that the manifest maps to a crate. Each name
+/// resolves to a `RustModuleSpec` from a `.pyi` stub (preferred) or by
+/// inference from the crate source. Names imported but absent from the
+/// manifest are deliberately NOT resolved here — they fall through to the
+/// normal import path (stdlib, sibling module, ...).
+fn rust_module_registry(
+    package: &PyPackage,
+    manifest: &HashMap<String, ManifestRustModule>,
+) -> Result<HashMap<String, python_ast::RustModuleSpec>> {
+    // Which names are actually imported anywhere in the package?
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for module in &package.modules {
+        for name in imported_names(&module.source, &parse_filename(module)) {
+            if manifest.contains_key(&name) {
+                used.insert(name);
+            }
+        }
+    }
+
+    let mut registry = HashMap::new();
+    for import_name in used {
+        let entry = &manifest[&import_name];
+        let spec = python_ast::resolve_rust_module(
+            &import_name,
+            &entry.crate_name,
+            entry.path.as_deref(),
+            entry.version.as_deref(),
+            &package.root,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        registry.insert(import_name.clone(), spec);
+    }
+    Ok(registry)
+}
+
+/// Crate dependencies for the package's rust-module imports (path/version
+/// from the manifest), deduplicated by crate name. Manifest `path`s are
+/// relative to the package root (where the manifest lives); they are
+/// rebased onto `out_dir` — the generated crate's Cargo.toml — so the
+/// copied dep spec resolves from there.
+fn rust_module_dependencies(
+    package: &PyPackage,
+    manifest: &HashMap<String, ManifestRustModule>,
+    out_dir: &Path,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deps = Vec::new();
+    for module in &package.modules {
+        for name in imported_names(&module.source, &parse_filename(module)) {
+            if let Some(entry) = manifest.get(&name) {
+                if seen.insert(entry.crate_name.clone()) {
+                    let path = entry
+                        .path
+                        .as_deref()
+                        .map(|p| rebase_path(&package.root, out_dir, p));
+                    deps.push((entry.crate_name.clone(), path, entry.version.clone()));
+                }
+            }
+        }
+    }
+    deps
+}
+
+/// Rebase `p` — a path relative to `base` — onto `to`, so the same file is
+/// addressed from `to`'s directory. Falls back to the original when either
+/// side cannot be absolutized.
+fn rebase_path(base: &Path, to: &Path, p: &str) -> String {
+    let abs = base.join(p);
+    let abs = abs.canonicalize().unwrap_or(abs);
+    let to = to.canonicalize().unwrap_or_else(|_| to.to_path_buf());
+    let mut to_components: Vec<_> = to.components().collect();
+    let mut abs_components: Vec<_> = abs.components().collect();
+    while !to_components.is_empty()
+        && !abs_components.is_empty()
+        && to_components[0] == abs_components[0]
+    {
+        to_components.remove(0);
+        abs_components.remove(0);
+    }
+    let mut out = PathBuf::new();
+    for _ in &to_components {
+        out.push("..");
+    }
+    for c in abs_components {
+        out.push(c.as_os_str());
+    }
+    out.to_string_lossy().into_owned()
 }
 
 /// Where the generated crate's stdpython dependency comes from.
@@ -2863,12 +3116,7 @@ fn resolve_rykernel_shim_path() -> Option<PathBuf> {
 ///   3. Kbuild does modpost, BTF, and the final link. The `pahole-wrapper`
 ///      works around pahole emitting no types (and therefore no `.BTF.1`)
 ///      for pure-Rust objects when the kernel passes `--lang_exclude=rust`.
-fn write_kernel_makefile(
-    name: &str,
-    out_dir: &Path,
-    has_init: bool,
-    has_exit: bool,
-) -> Result<()> {
+fn write_kernel_makefile(name: &str, out_dir: &Path, has_init: bool, has_exit: bool) -> Result<()> {
     let entry_flags = {
         let mut flags = Vec::new();
         if has_init {

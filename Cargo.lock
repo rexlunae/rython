@@ -634,6 +634,7 @@ dependencies = [
  "log",
  "python-ast",
  "rust-format",
+ "toml",
  "wild",
 ]
 

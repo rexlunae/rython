@@ -5,7 +5,7 @@ use std::{
     default::Default,
 };
 
-use pyo3::{prelude::*, PyResult};
+use pyo3::{PyResult, prelude::*};
 use std::ffi::CString;
 
 use crate::TypeInfo;
@@ -83,7 +83,6 @@ pub struct PythonOptions {
     /// Collects all of the things we need to compile imports[module][asnames]
     pub imports: BTreeMap<String, HashSet<String>>,
 
-
     pub stdpython: String,
     pub with_std_python: bool,
 
@@ -114,8 +113,7 @@ pub struct PythonOptions {
     /// annotations and literal assignments), as canonical Python type
     /// names ("int", "float", "str", "bool"). Set per function; consumed
     /// by isinstance(), which lowers to a constant.
-    pub local_types:
-        std::rc::Rc<std::collections::HashMap<String, String>>,
+    pub local_types: std::rc::Rc<std::collections::HashMap<String, String>>,
 
     /// Target stdpython's no_std (alloc) tier. Python constructs that need
     /// the OS — print/input/open, imports of os/datetime/random/…, and
@@ -165,6 +163,13 @@ pub struct PythonOptions {
     /// shares a name with a hoisted variable for other reasons keeps its
     /// fresh per-loop binding (issue #80).
     pub leaked_loop_targets: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Rust modules available to `import` / `from ... import` as
+    /// compile-time bindings, keyed by the Python-side import name. The
+    /// frontend (rypip / rythonc) populates this from the `rython.toml`
+    /// manifest; codegen resolves import statements against it and inserts
+    /// `SymbolTableNode::RustModule` symbols. Empty in library use.
+    pub rust_modules: std::rc::Rc<std::collections::HashMap<String, crate::RustModuleSpec>>,
 }
 
 impl Default for PythonOptions {
@@ -194,6 +199,7 @@ impl Default for PythonOptions {
             empty_pinned: std::rc::Rc::new(std::collections::HashMap::new()),
             hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
+            rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
         }
     }
 }

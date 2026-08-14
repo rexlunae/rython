@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// One Python module within a package.
 #[derive(Debug, Clone)]
@@ -27,6 +27,9 @@ pub struct PyPackage {
     pub name: String,
     /// Package version (from pyproject.toml, else "0.1.0").
     pub version: String,
+    /// The package root directory: the project root (where pyproject.toml /
+    /// rython.toml live), or the single file's parent for a bare file.
+    pub root: PathBuf,
     pub modules: Vec<PyModule>,
 }
 
@@ -49,7 +52,13 @@ impl PyPackage {
 pub fn sanitize_name(name: &str) -> String {
     let mut out: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         out.insert(0, '_');
@@ -76,11 +85,15 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
             .file_stem()
             .and_then(|s| s.to_str())
             .context("invalid file name")?;
-        let source = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let source =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         return Ok(PyPackage {
             name: sanitize_name(stem),
             version: "0.1.0".to_string(),
+            root: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
             modules: vec![PyModule {
                 path: vec![sanitize_name(stem)],
                 source,
@@ -112,6 +125,7 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
     Ok(PyPackage {
         name,
         version: version.unwrap_or_else(|| "0.1.0".to_string()),
+        root: path.to_path_buf(),
         modules,
     })
 }

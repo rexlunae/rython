@@ -12,7 +12,7 @@ keywords = ["python", "rust", "transpiler", "compiler", "ast"]
 categories = ["compilers", "development-tools"]
 
 [dependencies]
-syn = "2.0"
+syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 pyo3 = {version = "0.29", features=["auto-initialize", "serde"]}

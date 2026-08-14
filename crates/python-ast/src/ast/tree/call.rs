@@ -4,8 +4,8 @@ use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    extract_required_attr, CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions,
-    SymbolTableNode, SymbolTableScopes,
+    CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions, SymbolTableNode, SymbolTableScopes,
+    extract_required_attr,
 };
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -20,8 +20,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Call {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let func: ExprType = extract_required_attr(&ob, "func", "function call expression")?;
         let args: Vec<ExprType> = extract_required_attr(&ob, "args", "function call arguments")?;
-        let keywords: Vec<Keyword> = extract_required_attr(&ob, "keywords", "function call keywords")?;
-        
+        let keywords: Vec<Keyword> =
+            extract_required_attr(&ob, "keywords", "function call keywords")?;
+
         Ok(Call {
             func: Box::new(func),
             args,
@@ -35,7 +36,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Call {
 /// import) or the `functools.partial` attribute spelling? A user
 /// function named partial shadows the import in the symbol table and
 /// does not match.
-fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {    match func {
+fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match func {
         ExprType::Name(n) => {
             n.id == "partial"
                 && matches!(
@@ -109,7 +111,10 @@ fn np_render(expr: &ExprType, ctx: &NpCtx) -> Result<TokenStream, Box<dyn std::e
 }
 
 fn np_kw<'a>(keywords: &'a [Keyword], name: &str) -> Option<&'a ExprType> {
-    keywords.iter().find(|k| k.arg.as_deref() == Some(name)).map(|k| &k.value)
+    keywords
+        .iter()
+        .find(|k| k.arg.as_deref() == Some(name))
+        .map(|k| &k.value)
 }
 
 fn np_has_kw(keywords: &[Keyword], name: &str) -> bool {
@@ -170,7 +175,8 @@ fn np_is_bool_literal(expr: &ExprType) -> bool {
 fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let name = match expr {
         ExprType::Attribute(attr) => {
-            if !matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "np" || m.id == "numpy") {
+            if !matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "np" || m.id == "numpy")
+            {
                 return Err(format!(
                     "dtype= must be one of np.float64/np.float32/np.int64/np.int32/np.bool_ \
                      or a string like \"float64\" (got an unsupported expression)"
@@ -187,7 +193,7 @@ fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::E
                      or a string like \"float64\""
                         .to_string()
                         .into(),
-                )
+                );
             }
         },
         _ => {
@@ -196,7 +202,7 @@ fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::E
                  or a string like \"float64\""
                     .to_string()
                     .into(),
-            )
+            );
         }
     };
     let variant = match name.as_str() {
@@ -210,7 +216,7 @@ fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::E
                 "unsupported numpy dtype '{name}' (rython's numpy subset supports \
                  float64, float32, int64, int32, bool_)"
             )
-            .into())
+            .into());
         }
     };
     Ok(quote!(numpy::Dtype::#variant))
@@ -272,11 +278,9 @@ fn lower_numpy_call(
     if plain_name == "bool_" {
         np_no_extra_kw(&plain_name, keywords, &[])?;
         if args.len() != 1 {
-            return Err(format!(
-                "np.bool_() takes exactly 1 argument ({} given)",
-                args.len()
-            )
-            .into());
+            return Err(
+                format!("np.bool_() takes exactly 1 argument ({} given)", args.len()).into(),
+            );
         }
         let a = np_render(&args[0], &npc)?;
         return Ok(quote!((#a).py_bool()));
@@ -341,11 +345,7 @@ fn lower_numpy_call(
             np_no_extra_kw("arange", keywords, &[])?;
             let n = args.len();
             if !(1..=3).contains(&n) {
-                return Err(format!(
-                    "np.arange() takes 1 to 3 arguments ({} given)",
-                    n
-                )
-                .into());
+                return Err(format!("np.arange() takes 1 to 3 arguments ({} given)", n).into());
             }
             let any_float = args.iter().any(np_is_float_literal);
             let any_int = args.iter().any(np_is_int_literal);
@@ -406,7 +406,8 @@ fn lower_numpy_call(
         "linspace" => {
             np_no_extra_kw("linspace", keywords, &["num", "endpoint"])?;
             if let Some(endpoint) = np_kw(keywords, "endpoint") {
-                if !matches!(endpoint, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Bool(litrs::BoolLit::True)))) {
+                if !matches!(endpoint, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Bool(litrs::BoolLit::True))))
+                {
                     return Err(
                         "np.linspace(..., endpoint=False) is not supported in rython's \
                          numpy subset (endpoint defaults to True)"
@@ -453,11 +454,9 @@ fn lower_numpy_call(
         "dtype" => {
             np_no_extra_kw("dtype", keywords, &[])?;
             if args.len() != 1 {
-                return Err(format!(
-                    "np.dtype() takes exactly 1 argument ({} given)",
-                    args.len()
-                )
-                .into());
+                return Err(
+                    format!("np.dtype() takes exactly 1 argument ({} given)", args.len()).into(),
+                );
             }
             let a = np_render(&args[0], &npc)?;
             Ok(quote!(numpy::dtype(#a)))
@@ -563,7 +562,11 @@ fn lower_numpy_call(
                         .into(),
                 );
             }
-            let (c, a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?, np_render(&args[2], &npc)?);
+            let (c, a, b) = (
+                np_render(&args[0], &npc)?,
+                np_render(&args[1], &npc)?,
+                np_render(&args[2], &npc)?,
+            );
             Ok(quote!(numpy::where_(#c, #a, #b)))
         }
 
@@ -585,11 +588,10 @@ fn lower_numpy_call(
         }
 
         // Plain 1-arg pass-throughs.
-        "array" | "asarray" | "ravel" | "transpose" | "sort" | "argsort" | "negative"
-        | "abs" | "square" | "sign" | "isfinite" | "isinf" | "isnan" | "logical_not"
-        | "sqrt" | "exp" | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "arcsin"
-        | "arccos" | "arctan" | "sinh" | "cosh" | "tanh" | "floor" | "ceil" | "reciprocal"
-        | "expm1" | "log1p" => {
+        "array" | "asarray" | "ravel" | "transpose" | "sort" | "argsort" | "negative" | "abs"
+        | "square" | "sign" | "isfinite" | "isinf" | "isnan" | "logical_not" | "sqrt" | "exp"
+        | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "arcsin" | "arccos" | "arctan"
+        | "sinh" | "cosh" | "tanh" | "floor" | "ceil" | "reciprocal" | "expm1" | "log1p" => {
             np_no_extra_kw(&plain_name, keywords, &[])?;
             if args.len() != 1 {
                 return Err(format!(
@@ -632,7 +634,11 @@ fn lower_numpy_call(
                 .into());
             }
             let (a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?);
-            let name = if plain_name == "mod" { "mod_" } else { plain_name.as_str() };
+            let name = if plain_name == "mod" {
+                "mod_"
+            } else {
+                plain_name.as_str()
+            };
             let path = crate::safe_ident(name);
             Ok(quote!(numpy::#path(#a, #b)))
         }
@@ -720,9 +726,10 @@ impl<'a> CodeGen for Call {
                         }
                         // A name bound to functools.partial(f, ...) is a
                         // closure returning f's Result: propagate.
-                        Some(SymbolTableNode::Assign { value: ExprType::Call(c), .. }) => {
-                            is_partial_target(c.func.as_ref(), &symbols)
-                        }
+                        Some(SymbolTableNode::Assign {
+                            value: ExprType::Call(c),
+                            ..
+                        }) => is_partial_target(c.func.as_ref(), &symbols),
                         _ => false,
                     }
             }
@@ -735,14 +742,73 @@ impl<'a> CodeGen for Call {
         // name exactly as a user function would.
         if let ExprType::Name(n) = self.func.as_ref() {
             if let Some(SymbolTableNode::RustBinding(spec)) = symbols.get(&n.id) {
+                let spec: crate::RustModuleSpec = spec.into();
                 return lower_rust_binding_call(
-                    spec,
+                    &spec,
+                    None,
                     &self.args,
                     &self.keywords,
                     &ctx,
                     &options,
                     &symbols,
                 );
+            }
+            // A name imported from a Rust module (`from crc32c import crc32c`,
+            // optionally aliased): the symbol carries the single-function spec.
+            if let Some(SymbolTableNode::RustModule(spec)) = symbols.get(&n.id) {
+                return lower_rust_binding_call(
+                    spec,
+                    None,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                );
+            }
+        }
+        // Calls into a Rust module: `crc32c.crc32c(data, 0)` — the module
+        // name (or its alias) resolves through the symbol table to a
+        // RustModule symbol.
+        if let ExprType::Attribute(attr) = self.func.as_ref() {
+            if let ExprType::Name(root) = attr.value.as_ref() {
+                // Follow `import crc32c as c` aliases to the canonical name.
+                let module_symbol = match symbols.get(&root.id) {
+                    Some(crate::SymbolTableNode::Alias(canonical)) => {
+                        symbols.get(canonical).and_then(|s| match s {
+                            crate::SymbolTableNode::RustModule(spec) => Some(spec.clone()),
+                            _ => None,
+                        })
+                    }
+                    Some(crate::SymbolTableNode::RustModule(spec)) => Some(spec.clone()),
+                    _ => None,
+                };
+                if let Some(spec) = module_symbol {
+                    // Validate the function exists; the call itself reuses
+                    // the spec (single-function from-imports, or the full
+                    // module spec for module imports).
+                    spec.get_fn(&attr.attr).ok_or_else(|| {
+                        format!(
+                            "`{}` is not a bound function of Rust module `{}` (bound: {})",
+                            attr.attr,
+                            root.id,
+                            spec.fns
+                                .iter()
+                                .map(|f| f.fn_name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                    return lower_rust_binding_call(
+                        &spec,
+                        Some(&attr.attr),
+                        &self.args,
+                        &self.keywords,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    );
+                }
             }
         }
         // A rust.bind declaration used as a bare expression (not assigned) is
@@ -785,14 +851,7 @@ impl<'a> CodeGen for Call {
         // Anything unsupported fails HERE with a clear message instead of
         // as a cryptic error in the generated crate.
         if let Some(numpy_fn) = numpy_target(self.func.as_ref(), &symbols) {
-            return lower_numpy_call(
-                &numpy_fn,
-                &self.args,
-                &self.keywords,
-                ctx,
-                options,
-                symbols,
-            );
+            return lower_numpy_call(&numpy_fn, &self.args, &self.keywords, ctx, options, symbols);
         }
 
         // Multi-argument range() maps to the arity-specific runtime
@@ -844,9 +903,23 @@ impl<'a> CodeGen for Call {
             let bname = n.id.as_str();
             if matches!(
                 bname,
-                "min" | "max" | "sorted" | "enumerate" | "pow" | "len" | "repr"
-                    | "reversed" | "frozenset" | "map" | "filter" | "list"
-                    | "isinstance" | "hash" | "print" | "open" | "round"
+                "min"
+                    | "max"
+                    | "sorted"
+                    | "enumerate"
+                    | "pow"
+                    | "len"
+                    | "repr"
+                    | "reversed"
+                    | "frozenset"
+                    | "map"
+                    | "filter"
+                    | "list"
+                    | "isinstance"
+                    | "hash"
+                    | "print"
+                    | "open"
+                    | "round"
                     | "divmod"
             ) && symbols.get(bname).is_none()
             {
@@ -883,9 +956,7 @@ impl<'a> CodeGen for Call {
                             }
                         }
                         if rendered.is_empty() {
-                            return Err(
-                                format!("{}() expected at least 1 argument", bname).into()
-                            );
+                            return Err(format!("{}() expected at least 1 argument", bname).into());
                         }
                         if rendered.len() >= 2 {
                             if key.is_some() || default.is_some() {
@@ -973,15 +1044,11 @@ impl<'a> CodeGen for Call {
                     "enumerate" => {
                         let mut start = self.args.get(1).cloned();
                         if self.args.len() > 2 {
-                            return Err("enumerate() takes at most 2 arguments"
-                                .to_string()
-                                .into());
+                            return Err("enumerate() takes at most 2 arguments".to_string().into());
                         }
                         for kw in &self.keywords {
                             match kw.arg.as_deref() {
-                                Some("start") if start.is_none() => {
-                                    start = Some(kw.value.clone())
-                                }
+                                Some("start") if start.is_none() => start = Some(kw.value.clone()),
                                 other => return Err(unexpected(other)),
                             }
                         }
@@ -992,17 +1059,14 @@ impl<'a> CodeGen for Call {
                         return Ok(match start {
                             None => quote!(enumerate(#a)),
                             Some(s) => {
-                                let s =
-                                    s.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                let s = s.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                                 quote!(enumerate_start(#a, #s))
                             }
                         });
                     }
                     "pow" => {
                         if !self.keywords.is_empty() {
-                            return Err(unexpected(
-                                self.keywords[0].arg.as_deref(),
-                            ));
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         return match rendered.as_slice() {
                             [b, e] => Ok(quote!(pow(#b, #e))),
@@ -1073,10 +1137,7 @@ impl<'a> CodeGen for Call {
                         }
                         let target = match &self.args[1] {
                             ExprType::Name(t)
-                                if matches!(
-                                    t.id.as_str(),
-                                    "int" | "float" | "str" | "bool"
-                                ) =>
+                                if matches!(t.id.as_str(), "int" | "float" | "str" | "bool") =>
                             {
                                 t.id.clone()
                             }
@@ -1090,16 +1151,18 @@ impl<'a> CodeGen for Call {
                                 .into());
                             }
                         };
-                        let actual: Option<String> = match &self.args[0] {
-                            ExprType::Name(n) => options.local_types.get(&n.id).cloned(),
-                            lit => crate::ast::tree::function_def::simple_expr_type(lit)
-                                .map(|ty| match ty.to_string().as_str() {
-                                    "i64" => "int".to_string(),
-                                    "f64" => "float".to_string(),
-                                    "bool" => "bool".to_string(),
-                                    _ => "str".to_string(),
-                                }),
-                        };
+                        let actual: Option<String> =
+                            match &self.args[0] {
+                                ExprType::Name(n) => options.local_types.get(&n.id).cloned(),
+                                lit => crate::ast::tree::function_def::simple_expr_type(lit).map(
+                                    |ty| match ty.to_string().as_str() {
+                                        "i64" => "int".to_string(),
+                                        "f64" => "float".to_string(),
+                                        "bool" => "bool".to_string(),
+                                        _ => "str".to_string(),
+                                    },
+                                ),
+                            };
                         let Some(actual) = actual else {
                             return Err(format!(
                                 "isinstance(): the type of `{:?}` is not statically \
@@ -1110,8 +1173,7 @@ impl<'a> CodeGen for Call {
                             .into());
                         };
                         // bool is a subclass of int in Python.
-                        let result = actual == target
-                            || (actual == "bool" && target == "int");
+                        let result = actual == target || (actual == "bool" && target == "int");
                         return Ok(if result { quote!(true) } else { quote!(false) });
                     }
                     // The by-reference builtins: their runtime functions
@@ -1127,9 +1189,7 @@ impl<'a> CodeGen for Call {
                             match kw.arg.as_deref() {
                                 Some("sep") if sep.is_none() => sep = Some(kw.value.clone()),
                                 Some("end") if end.is_none() => end = Some(kw.value.clone()),
-                                Some("flush") if flush.is_none() => {
-                                    flush = Some(kw.value.clone())
-                                }
+                                Some("flush") if flush.is_none() => flush = Some(kw.value.clone()),
                                 Some("file") => {
                                     return Err("print(file=...) is not supported: \
                                                 generated code writes to stdout only"
@@ -1186,11 +1246,9 @@ impl<'a> CodeGen for Call {
                             [p] => quote!(open(&(#p), None::<&str>)?),
                             [p, m] => quote!(open(&(#p), Some(#m))?),
                             _ => {
-                                return Err(
-                                    "open() takes 1 or 2 arguments (path and mode)"
-                                        .to_string()
-                                        .into(),
-                                )
+                                return Err("open() takes 1 or 2 arguments (path and mode)"
+                                    .to_string()
+                                    .into());
                             }
                         });
                     }
@@ -1199,9 +1257,7 @@ impl<'a> CodeGen for Call {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         if rendered.len() != 1 {
-                            return Err(
-                                format!("{}() takes exactly one argument", bname).into()
-                            );
+                            return Err(format!("{}() takes exactly one argument", bname).into());
                         }
                         let f = format_ident!("{}", bname);
                         let a = &rendered[0];
@@ -1212,12 +1268,10 @@ impl<'a> CodeGen for Call {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         if rendered.len() != 1 {
-                            return Err(
-                                "frozenset() requires an iterable argument in rython \
+                            return Err("frozenset() requires an iterable argument in rython \
                                  (an empty frozenset has no inferable element type)"
-                                    .to_string()
-                                    .into(),
-                            );
+                                .to_string()
+                                .into());
                         }
                         let a = &rendered[0];
                         return Ok(quote!(frozenset(#a)));
@@ -1240,11 +1294,7 @@ impl<'a> CodeGen for Call {
                             }
                             let (f, xs) = (&rendered[0], &rendered[1]);
                             // filter(None, xs) keeps the truthy elements.
-                            if self
-                                .args
-                                .first()
-                                .is_some_and(crate::is_none_expr)
-                            {
+                            if self.args.first().is_some_and(crate::is_none_expr) {
                                 return Ok(quote!(filter_truthy(#xs)));
                             }
                             return Ok(if fallible {
@@ -1261,12 +1311,10 @@ impl<'a> CodeGen for Call {
                             }),
                             [f, a, b] => {
                                 if fallible {
-                                    return Err(
-                                        "map() over two iterables with a user-defined \
+                                    return Err("map() over two iterables with a user-defined \
                                          function is not supported yet; use a lambda"
-                                            .to_string()
-                                            .into(),
-                                    );
+                                        .to_string()
+                                        .into());
                                 }
                                 Ok(quote!(map2(#f, #a, #b)))
                             }
@@ -1280,12 +1328,10 @@ impl<'a> CodeGen for Call {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         if rendered.len() != 1 {
-                            return Err(
-                                "list() requires an iterable argument in rython (an \
+                            return Err("list() requires an iterable argument in rython (an \
                                  empty list has no inferable element type; use [])"
-                                    .to_string()
-                                    .into(),
-                            );
+                                .to_string()
+                                .into());
                         }
                         let a = &rendered[0];
                         return Ok(quote!(list(#a)));
@@ -1310,7 +1356,15 @@ impl<'a> CodeGen for Call {
                 let (params, required): (&[&str], usize) = match n.id.as_str() {
                     "date" => (&["year", "month", "day"], 3),
                     "datetime" => (
-                        &["year", "month", "day", "hour", "minute", "second", "microsecond"],
+                        &[
+                            "year",
+                            "month",
+                            "day",
+                            "hour",
+                            "minute",
+                            "second",
+                            "microsecond",
+                        ],
                         3,
                     ),
                     _ => (
@@ -1367,11 +1421,9 @@ impl<'a> CodeGen for Call {
                 for (i, slot) in slots.iter().enumerate() {
                     let tok = match slot {
                         Some(e) => {
-                            let v = e.clone().to_rust(
-                                ctx.clone(),
-                                options.clone(),
-                                symbols.clone(),
-                            )?;
+                            let v =
+                                e.clone()
+                                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                             if i < required { v } else { quote!(Some(#v)) }
                         }
                         None if i < required => {
@@ -1388,7 +1440,11 @@ impl<'a> CodeGen for Call {
                 let ty = crate::safe_ident(&n.id);
                 let call = quote!(#ty::new(#(#rendered),*));
                 // timedelta::new is infallible; date/datetime validate.
-                return Ok(if n.id == "timedelta" { call } else { quote!(#call?) });
+                return Ok(if n.id == "timedelta" {
+                    call
+                } else {
+                    quote!(#call?)
+                });
             }
         }
 
@@ -1424,9 +1480,8 @@ impl<'a> CodeGen for Call {
                         symbols.clone(),
                     )?);
                 }
-                let render = |e: crate::ExprType| {
-                    e.to_rust(ctx.clone(), options.clone(), symbols.clone())
-                };
+                let render =
+                    |e: crate::ExprType| e.to_rust(ctx.clone(), options.clone(), symbols.clone());
                 let kw_of = |allowed: &[&str]| -> Result<
                     Vec<Option<crate::ExprType>>,
                     Box<dyn std::error::Error>,
@@ -1554,9 +1609,7 @@ impl<'a> CodeGen for Call {
                     "combinations" | "combinations_with_replacement" => {
                         kw_of(&[])?;
                         if rendered.len() != 2 {
-                            return Err(
-                                format!("{}() takes an iterable and r", name).into()
-                            );
+                            return Err(format!("{}() takes an iterable and r", name).into());
                         }
                         let f = format_ident!("{}", name);
                         let (xs, r) = (&rendered[0], &rendered[1]);
@@ -1616,8 +1669,7 @@ impl<'a> CodeGen for Call {
                 )
                 .into());
             };
-            let params: Vec<String> =
-                fdef.args.args.iter().map(|p| p.arg.clone()).collect();
+            let params: Vec<String> = fdef.args.args.iter().map(|p| p.arg.clone()).collect();
             let bound_n = self.args.len() - 1;
             if bound_n > params.len() {
                 return Err(format!(
@@ -1630,11 +1682,10 @@ impl<'a> CodeGen for Call {
             }
             let mut bound = Vec::new();
             for arg in &self.args[1..] {
-                bound.push(arg.clone().to_rust(
-                    ctx.clone(),
-                    options.clone(),
-                    symbols.clone(),
-                )?);
+                bound.push(
+                    arg.clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                );
             }
             let rest: Vec<_> = params[bound_n..]
                 .iter()
@@ -1655,8 +1706,14 @@ impl<'a> CodeGen for Call {
                     Some(SymbolTableNode::ImportFrom(import))
                         if matches!(
                             import.module.as_str(),
-                            "functools" | "heapq" | "copy" | "textwrap" | "re" | "hashlib"
-                                | "csv" | "io"
+                            "functools"
+                                | "heapq"
+                                | "copy"
+                                | "textwrap"
+                                | "re"
+                                | "hashlib"
+                                | "csv"
+                                | "io"
                         ) =>
                     {
                         Some((n.id.clone(), None))
@@ -1667,10 +1724,8 @@ impl<'a> CodeGen for Call {
                     ExprType::Name(m)
                         if matches!(
                             m.id.as_str(),
-                            "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv"
-                                | "io"
-                        )
-                        && !module_name_shadowed(&m.id, &symbols) =>
+                            "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv" | "io"
+                        ) && !module_name_shadowed(&m.id, &symbols) =>
                     {
                         let module: &'static str = match m.id.as_str() {
                             "functools" => "functools",
@@ -1726,8 +1781,7 @@ impl<'a> CodeGen for Call {
                 // keywords.
                 let is_re_fn = matches!(
                     fname.as_str(),
-                    "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub"
-                        | "split"
+                    "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub" | "split"
                 );
                 let mut width_kw: Option<crate::ExprType> = None;
                 let mut flags_kw: Option<crate::ExprType> = None;
@@ -1735,11 +1789,7 @@ impl<'a> CodeGen for Call {
                 let mut maxsplit_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
-                        Some("width")
-                            if matches!(fname.as_str(), "wrap" | "fill") =>
-                        {
-                            &mut width_kw
-                        }
+                        Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
                         Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
@@ -1908,11 +1958,7 @@ impl<'a> CodeGen for Call {
                             }
                             (Some(w), None) => quote!(#w),
                             (None, Some(w)) => {
-                                let w = w.to_rust(
-                                    ctx.clone(),
-                                    options.clone(),
-                                    symbols.clone(),
-                                )?;
+                                let w = w.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                                 quote!(#w)
                             }
                             (None, None) => quote!(70),
@@ -1993,27 +2039,19 @@ impl<'a> CodeGen for Call {
                                 .into());
                         }
                         if rendered.len() > 2 && maxsplit_kw.is_some() {
-                            return Err(
-                                "split() got multiple values for argument 'maxsplit'"
-                                    .to_string()
-                                    .into(),
-                            );
+                            return Err("split() got multiple values for argument 'maxsplit'"
+                                .to_string()
+                                .into());
                         }
                         if rendered.len() > 3 && flags_kw.is_some() {
-                            return Err(
-                                "split() got multiple values for argument 'flags'"
-                                    .to_string()
-                                    .into(),
-                            );
+                            return Err("split() got multiple values for argument 'flags'"
+                                .to_string()
+                                .into());
                         }
                         let maxsplit = match (rendered.get(2), maxsplit_kw) {
                             (Some(m), None) => quote!(#m),
                             (None, Some(m)) => {
-                                let m = m.to_rust(
-                                    ctx.clone(),
-                                    options.clone(),
-                                    symbols.clone(),
-                                )?;
+                                let m = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                                 quote!(#m)
                             }
                             (None, None) => quote!(0),
@@ -2035,20 +2073,14 @@ impl<'a> CodeGen for Call {
                                 .into());
                         }
                         if rendered.len() > 3 && count_kw.is_some() {
-                            return Err(
-                                "sub() got multiple values for argument 'count'"
-                                    .to_string()
-                                    .into(),
-                            );
+                            return Err("sub() got multiple values for argument 'count'"
+                                .to_string()
+                                .into());
                         }
                         let count = match (rendered.get(3), count_kw) {
                             (Some(c), None) => quote!(#c),
                             (None, Some(c)) => {
-                                let c = c.to_rust(
-                                    ctx.clone(),
-                                    options.clone(),
-                                    symbols.clone(),
-                                )?;
+                                let c = c.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                                 quote!(#c)
                             }
                             (None, None) => quote!(0),
@@ -2095,8 +2127,11 @@ impl<'a> CodeGen for Call {
                         let p = qual("indent");
                         Ok(quote!(#p(&(#s), &(#prefix))))
                     }
-                    ("heappush" | "heappushpop" | "heapreplace" | "indent"
-                        | "nlargest" | "nsmallest", _) => Err(arity("2")),
+                    (
+                        "heappush" | "heappushpop" | "heapreplace" | "indent" | "nlargest"
+                        | "nsmallest",
+                        _,
+                    ) => Err(arity("2")),
                     _ => Err(arity("the documented number of")),
                 };
             }
@@ -2232,9 +2267,7 @@ impl<'a> CodeGen for Call {
                 for kw in &self.keywords {
                     match kw.arg.as_deref() {
                         Some("key") if key.is_none() => key = Some(kw.value.clone()),
-                        Some("reverse") if reverse.is_none() => {
-                            reverse = Some(kw.value.clone())
-                        }
+                        Some("reverse") if reverse.is_none() => reverse = Some(kw.value.clone()),
                         other => {
                             return Err(format!(
                                 "sort() got an unexpected or duplicate keyword \
@@ -2245,9 +2278,8 @@ impl<'a> CodeGen for Call {
                         }
                     }
                 }
-                let render = |e: crate::ExprType| {
-                    e.to_rust(ctx.clone(), options.clone(), symbols.clone())
-                };
+                let render =
+                    |e: crate::ExprType| e.to_rust(ctx.clone(), options.clone(), symbols.clone());
                 return Ok(match (key, reverse) {
                     (None, None) => quote!((#receiver).py_sort()),
                     (None, Some(r)) => {
@@ -2274,7 +2306,13 @@ impl<'a> CodeGen for Call {
             // stays the plain method call (str.replace among others).
             if attr.attr == "replace" && !self.keywords.is_empty() {
                 const FIELDS: [&str; 7] = [
-                    "year", "month", "day", "hour", "minute", "second", "microsecond",
+                    "year",
+                    "month",
+                    "day",
+                    "hour",
+                    "minute",
+                    "second",
+                    "microsecond",
                 ];
                 if self
                     .keywords
@@ -2304,8 +2342,7 @@ impl<'a> CodeGen for Call {
                     for (idx, slot) in slots.into_iter().enumerate() {
                         if let Some(e) = slot {
                             let field = crate::safe_ident(FIELDS[idx]);
-                            let v =
-                                e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            let v = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                             inits.push(quote!(#field: Some(#v)));
                         }
                     }
@@ -2321,16 +2358,12 @@ impl<'a> CodeGen for Call {
                 let bad = self
                     .keywords
                     .iter()
-                    .find(|kw| {
-                        !kw.arg.as_deref().is_some_and(|a| FIELDS.contains(&a))
-                    })
+                    .find(|kw| !kw.arg.as_deref().is_some_and(|a| FIELDS.contains(&a)))
                     .and_then(|kw| kw.arg.clone())
                     .unwrap_or_else(|| "**kwargs".to_string());
-                return Err(format!(
-                    "'{}' is an invalid keyword argument for replace()",
-                    bad
-                )
-                .into());
+                return Err(
+                    format!("'{}' is an invalid keyword argument for replace()", bad).into(),
+                );
             }
 
             // str.split / str.rsplit take sep and maxsplit by position or
@@ -2420,9 +2453,7 @@ impl<'a> CodeGen for Call {
             // error, never approximated output.
             if attr.attr == "format" {
                 let template = match attr.value.as_ref() {
-                    ExprType::Constant(c)
-                        if matches!(&c.0, Some(litrs::Literal::String(_))) =>
-                    {
+                    ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
                         match &c.0 {
                             Some(litrs::Literal::String(s)) => s.value().to_string(),
                             _ => unreachable!(),
@@ -2455,236 +2486,239 @@ impl<'a> CodeGen for Call {
             if !self.keywords.is_empty() {
                 // fall through
             } else {
-            let mut rendered_args = Vec::new();
-            for arg in &self.args {
-                rendered_args.push(arg.clone().to_rust(
-                    ctx.clone(),
-                    options.clone(),
-                    symbols.clone(),
-                )?);
-            }
-            match (attr.attr.as_str(), rendered_args.as_slice()) {
-                // list.append(x) pushes one element; Vec::append (inherent)
-                // concatenates another Vec — silently different.
-                ("append", [value]) => {
-                    return Ok(quote!((#receiver).push(#value)));
+                let mut rendered_args = Vec::new();
+                for arg in &self.args {
+                    rendered_args.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
                 }
-                // list.count(x): the PyListOps method takes a reference.
-                ("count", [value]) => {
-                    return Ok(quote!((#receiver).count(&(#value))));
-                }
-                // File-object and csv.Writer methods return Result (I/O
-                // can fail; Python raises): thread `?`.
-                ("read", []) | ("readline", []) | ("readlines", []) | ("close", [])
-                | ("getvalue", []) => {
-                    let m = crate::safe_ident(&attr.attr);
-                    return Ok(quote!((#receiver).#m()?));
-                }
-                ("write", [d]) => {
-                    return Ok(quote!((#receiver).write(&(#d))?));
-                }
-                ("writelines", [l]) => {
-                    return Ok(quote!((#receiver).writelines(&(#l))?));
-                }
-                ("writerow", [r]) => {
-                    // writerow([]) (an empty record) still needs an
-                    // element type for the slice.
-                    if r.to_string() == "vec ! []" {
-                        return Ok(quote!((#receiver).writerow(&[] as &[&str])?));
+                match (attr.attr.as_str(), rendered_args.as_slice()) {
+                    // list.append(x) pushes one element; Vec::append (inherent)
+                    // concatenates another Vec — silently different.
+                    ("append", [value]) => {
+                        return Ok(quote!((#receiver).push(#value)));
                     }
-                    return Ok(quote!((#receiver).writerow(&(#r))?));
-                }
-                ("writerows", [r]) => {
-                    return Ok(quote!((#receiver).writerows(&(#r))?));
-                }
-                // re Match: m.group() is m.group(0); Rust can't overload.
-                ("group", []) => {
-                    return Ok(quote!((#receiver).group(0)));
-                }
-                // m.group("name") for (?P<name>...) groups: Rust can't
-                // overload on the argument type, so the string spelling
-                // routes to group_name. Numeric group(i) falls through to
-                // the plain method call.
-                ("group", [g]) if g.to_string().starts_with('"') => {
-                    return Ok(quote!((#receiver).group_name(#g)));
-                }
-                // str.encode() / encode("utf-8"): UTF-8 bytes, which is
-                // exactly what Rust strings hold.
-                ("encode", []) => {
-                    return Ok(quote!((#receiver).as_bytes().to_vec()));
-                }
-                ("encode", [enc]) => {
-                    if enc.to_string().trim_matches('"') != "utf-8" {
-                        return Err(format!(
-                            "str.encode({}): only \"utf-8\" is supported",
-                            enc
-                        )
-                        .into());
+                    // list.count(x): the PyListOps method takes a reference.
+                    ("count", [value]) => {
+                        return Ok(quote!((#receiver).count(&(#value))));
                     }
-                    return Ok(quote!((#receiver).as_bytes().to_vec()));
-                }
-                // list.pop() returns the last element or raises IndexError
-                // (Vec::pop returns an Option).
-                ("pop", []) => {
-                    return Ok(quote! {
-                        (#receiver).pop().ok_or_else(|| {
-                            PyException::new("IndexError", "pop from empty list")
-                        })?
-                    });
-                }
-                // pop with an argument dispatches by receiver through the
-                // PyPop trait: list.pop(i) by index (IndexError), dict.pop(k)
-                // by key (KeyError).
-                ("pop", [arg]) => {
-                    if string_keyed_dict {
-                        let key = crate::render_typed(
-                            &self.args[0],
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
-                        return Ok(quote!((#receiver).py_pop(#key)?));
+                    // File-object and csv.Writer methods return Result (I/O
+                    // can fail; Python raises): thread `?`.
+                    ("read", [])
+                    | ("readline", [])
+                    | ("readlines", [])
+                    | ("close", [])
+                    | ("getvalue", []) => {
+                        let m = crate::safe_ident(&attr.attr);
+                        return Ok(quote!((#receiver).#m()?));
                     }
-                    return Ok(quote!((#receiver).py_pop(#arg)?));
-                }
-                ("pop", [key, default]) => {
-                    if string_keyed_dict {
-                        let key = crate::render_typed(
-                            &self.args[0],
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
+                    ("write", [d]) => {
+                        return Ok(quote!((#receiver).write(&(#d))?));
+                    }
+                    ("writelines", [l]) => {
+                        return Ok(quote!((#receiver).writelines(&(#l))?));
+                    }
+                    ("writerow", [r]) => {
+                        // writerow([]) (an empty record) still needs an
+                        // element type for the slice.
+                        if r.to_string() == "vec ! []" {
+                            return Ok(quote!((#receiver).writerow(&[] as &[&str])?));
+                        }
+                        return Ok(quote!((#receiver).writerow(&(#r))?));
+                    }
+                    ("writerows", [r]) => {
+                        return Ok(quote!((#receiver).writerows(&(#r))?));
+                    }
+                    // re Match: m.group() is m.group(0); Rust can't overload.
+                    ("group", []) => {
+                        return Ok(quote!((#receiver).group(0)));
+                    }
+                    // m.group("name") for (?P<name>...) groups: Rust can't
+                    // overload on the argument type, so the string spelling
+                    // routes to group_name. Numeric group(i) falls through to
+                    // the plain method call.
+                    ("group", [g]) if g.to_string().starts_with('"') => {
+                        return Ok(quote!((#receiver).group_name(#g)));
+                    }
+                    // str.encode() / encode("utf-8"): UTF-8 bytes, which is
+                    // exactly what Rust strings hold.
+                    ("encode", []) => {
+                        return Ok(quote!((#receiver).as_bytes().to_vec()));
+                    }
+                    ("encode", [enc]) => {
+                        if enc.to_string().trim_matches('"') != "utf-8" {
+                            return Err(format!(
+                                "str.encode({}): only \"utf-8\" is supported",
+                                enc
+                            )
+                            .into());
+                        }
+                        return Ok(quote!((#receiver).as_bytes().to_vec()));
+                    }
+                    // list.pop() returns the last element or raises IndexError
+                    // (Vec::pop returns an Option).
+                    ("pop", []) => {
+                        return Ok(quote! {
+                            (#receiver).pop().ok_or_else(|| {
+                                PyException::new("IndexError", "pop from empty list")
+                            })?
+                        });
+                    }
+                    // pop with an argument dispatches by receiver through the
+                    // PyPop trait: list.pop(i) by index (IndexError), dict.pop(k)
+                    // by key (KeyError).
+                    ("pop", [arg]) => {
+                        if string_keyed_dict {
+                            let key = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
+                            return Ok(quote!((#receiver).py_pop(#key)?));
+                        }
+                        return Ok(quote!((#receiver).py_pop(#arg)?));
+                    }
+                    ("pop", [key, default]) => {
+                        if string_keyed_dict {
+                            let key = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
+                            return Ok(quote!((#receiver).py_pop_default(#key, #default)));
+                        }
                         return Ok(quote!((#receiver).py_pop_default(#key, #default)));
                     }
-                    return Ok(quote!((#receiver).py_pop_default(#key, #default)));
-                }
-                // dict.get never raises: value-or-None (an Option), or the
-                // provided default. IndexMap's inherent get returns a
-                // borrowed Option, so both forms map to py_ versions.
-                ("get", [key]) => {
-                    if string_keyed_dict {
-                        let key = crate::render_typed(
-                            &self.args[0],
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
+                    // dict.get never raises: value-or-None (an Option), or the
+                    // provided default. IndexMap's inherent get returns a
+                    // borrowed Option, so both forms map to py_ versions.
+                    ("get", [key]) => {
+                        if string_keyed_dict {
+                            let key = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
+                            return Ok(quote!((#receiver).py_get(&(#key))));
+                        }
                         return Ok(quote!((#receiver).py_get(&(#key))));
                     }
-                    return Ok(quote!((#receiver).py_get(&(#key))));
-                }
-                ("get", [key, default]) => {
-                    if string_keyed_dict {
-                        let key = crate::render_typed(
-                            &self.args[0],
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
+                    ("get", [key, default]) => {
+                        if string_keyed_dict {
+                            let key = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
+                            return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
+                        }
                         return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
                     }
-                    return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
-                }
-                // Views materialize as Vecs in insertion order.
-                ("keys", []) => {
-                    return Ok(quote!((#receiver).py_keys()));
-                }
-                ("values", []) => {
-                    return Ok(quote!((#receiver).py_values()));
-                }
-                ("items", []) => {
-                    return Ok(quote!((#receiver).py_items()));
-                }
-                ("setdefault", [key, default]) => {
-                    if string_keyed_dict {
-                        let key = crate::render_typed(
-                            &self.args[0],
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
+                    // Views materialize as Vecs in insertion order.
+                    ("keys", []) => {
+                        return Ok(quote!((#receiver).py_keys()));
+                    }
+                    ("values", []) => {
+                        return Ok(quote!((#receiver).py_values()));
+                    }
+                    ("items", []) => {
+                        return Ok(quote!((#receiver).py_items()));
+                    }
+                    ("setdefault", [key, default]) => {
+                        if string_keyed_dict {
+                            let key = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
+                            return Ok(quote!((#receiver).py_setdefault(#key, #default)));
+                        }
                         return Ok(quote!((#receiver).py_setdefault(#key, #default)));
                     }
-                    return Ok(quote!((#receiver).py_setdefault(#key, #default)));
+                    // list.remove(x) removes by VALUE and raises ValueError;
+                    // Vec::remove removes by index — silently different.
+                    ("remove", [value]) => {
+                        // The receiver and argument are each evaluated ONCE,
+                        // receiver first (CPython evaluates the primary +
+                        // attribute, then the argument). The previous shape
+                        // spliced the receiver twice and the argument inside
+                        // the position closure, so a side-effecting receiver
+                        // (`grid[which()].remove(2)`) ran twice and the
+                        // argument once per element scanned (issue #80).
+                        return Ok(quote! {
+                            {
+                                let __rython_recv = &mut (#receiver);
+                                let __rython_val = #value;
+                                let __rython_pos = __rython_recv
+                                    .iter()
+                                    .position(|__rython_e| __rython_e == &__rython_val)
+                                    .ok_or_else(|| {
+                                        PyException::new(
+                                            "ValueError",
+                                            "list.remove(x): x not in list",
+                                        )
+                                    })?;
+                                __rython_recv.remove(__rython_pos);
+                            }
+                        });
+                    }
+                    // list.insert follows Python index rules (negative counts
+                    // from the end, out-of-range clamps); Vec::insert takes a
+                    // usize and panics past len.
+                    ("insert", [idx, value]) => {
+                        return Ok(quote!((#receiver).py_insert(#idx, #value)));
+                    }
+                    // partition/rpartition raise ValueError on an empty
+                    // separator, so the calls take `?`.
+                    ("partition", [sep]) => {
+                        return Ok(quote!((#receiver).partition(&(#sep))?));
+                    }
+                    ("rpartition", [sep]) => {
+                        return Ok(quote!((#receiver).rpartition(&(#sep))?));
+                    }
+                    // strip family with a chars argument (the no-arg forms
+                    // resolve through PyStrOps directly).
+                    ("strip", [chars]) => {
+                        return Ok(quote!((#receiver).py_strip_chars(&(#chars))));
+                    }
+                    ("lstrip", [chars]) => {
+                        return Ok(quote!((#receiver).py_lstrip_chars(&(#chars))));
+                    }
+                    ("rstrip", [chars]) => {
+                        return Ok(quote!((#receiver).py_rstrip_chars(&(#chars))));
+                    }
+                    // ljust/rjust: the optional fillchar selects the py_ form
+                    // (space by default).
+                    ("ljust", [width]) => {
+                        return Ok(quote!((#receiver).py_ljust(#width, " ")?));
+                    }
+                    ("ljust", [width, fill]) => {
+                        return Ok(quote!((#receiver).py_ljust(#width, &(#fill))?));
+                    }
+                    ("rjust", [width]) => {
+                        return Ok(quote!((#receiver).py_rjust(#width, " ")?));
+                    }
+                    ("rjust", [width, fill]) => {
+                        return Ok(quote!((#receiver).py_rjust(#width, &(#fill))?));
+                    }
+                    // str.find returns -1 when absent; str::find an Option.
+                    ("find", [needle]) => {
+                        return Ok(quote!((#receiver).py_find(&(#needle))));
+                    }
+                    _ => {}
                 }
-                // list.remove(x) removes by VALUE and raises ValueError;
-                // Vec::remove removes by index — silently different.
-                ("remove", [value]) => {
-                    // The receiver and argument are each evaluated ONCE,
-                    // receiver first (CPython evaluates the primary +
-                    // attribute, then the argument). The previous shape
-                    // spliced the receiver twice and the argument inside
-                    // the position closure, so a side-effecting receiver
-                    // (`grid[which()].remove(2)`) ran twice and the
-                    // argument once per element scanned (issue #80).
-                    return Ok(quote! {
-                        {
-                            let __rython_recv = &mut (#receiver);
-                            let __rython_val = #value;
-                            let __rython_pos = __rython_recv
-                                .iter()
-                                .position(|__rython_e| __rython_e == &__rython_val)
-                                .ok_or_else(|| {
-                                    PyException::new(
-                                        "ValueError",
-                                        "list.remove(x): x not in list",
-                                    )
-                                })?;
-                            __rython_recv.remove(__rython_pos);
-                        }
-                    });
-                }
-                // list.insert follows Python index rules (negative counts
-                // from the end, out-of-range clamps); Vec::insert takes a
-                // usize and panics past len.
-                ("insert", [idx, value]) => {
-                    return Ok(quote!((#receiver).py_insert(#idx, #value)));
-                }
-                // partition/rpartition raise ValueError on an empty
-                // separator, so the calls take `?`.
-                ("partition", [sep]) => {
-                    return Ok(quote!((#receiver).partition(&(#sep))?));
-                }
-                ("rpartition", [sep]) => {
-                    return Ok(quote!((#receiver).rpartition(&(#sep))?));
-                }
-                // strip family with a chars argument (the no-arg forms
-                // resolve through PyStrOps directly).
-                ("strip", [chars]) => {
-                    return Ok(quote!((#receiver).py_strip_chars(&(#chars))));
-                }
-                ("lstrip", [chars]) => {
-                    return Ok(quote!((#receiver).py_lstrip_chars(&(#chars))));
-                }
-                ("rstrip", [chars]) => {
-                    return Ok(quote!((#receiver).py_rstrip_chars(&(#chars))));
-                }
-                // ljust/rjust: the optional fillchar selects the py_ form
-                // (space by default).
-                ("ljust", [width]) => {
-                    return Ok(quote!((#receiver).py_ljust(#width, " ")?));
-                }
-                ("ljust", [width, fill]) => {
-                    return Ok(quote!((#receiver).py_ljust(#width, &(#fill))?));
-                }
-                ("rjust", [width]) => {
-                    return Ok(quote!((#receiver).py_rjust(#width, " ")?));
-                }
-                ("rjust", [width, fill]) => {
-                    return Ok(quote!((#receiver).py_rjust(#width, &(#fill))?));
-                }
-                // str.find returns -1 when absent; str::find an Option.
-                ("find", [needle]) => {
-                    return Ok(quote!((#receiver).py_find(&(#needle))));
-                }
-                _ => {}
-            }
             }
         }
 
@@ -2704,8 +2738,7 @@ impl<'a> CodeGen for Call {
         if let Some(callee_def) = &callee {
             let simple_signature =
                 callee_def.args.vararg.is_none() && callee_def.args.kwarg.is_none();
-            let pos_param_count =
-                callee_def.args.posonlyargs.len() + callee_def.args.args.len();
+            let pos_param_count = callee_def.args.posonlyargs.len() + callee_def.args.args.len();
             let has_optional_params = callee_def
                 .args
                 .posonlyargs
@@ -2765,7 +2798,9 @@ impl<'a> CodeGen for Call {
             .into());
         }
 
-        let name = self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let name = self
+            .func
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let mut all_args = Vec::new();
 
@@ -2803,16 +2838,16 @@ impl<'a> CodeGen for Call {
             };
             all_args.push(rust_arg);
         }
-        
+
         // Add keyword arguments
         for keyword in self.keywords {
             let rust_kw = keyword.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             all_args.push(rust_kw);
         }
-        
+
         // Check if we're in an async context and if the function being called is async
         let call_expr = quote!(#name(#(#all_args),*));
-        
+
         // Check if this function returns a Result that should be unwrapped
         let name_str = format!("{}", name);
 
@@ -2821,12 +2856,18 @@ impl<'a> CodeGen for Call {
         if name_str.ends_with(":: strptime") {
             return Ok(quote!(#call_expr?));
         }
-        let needs_unwrap = matches!(name_str.as_str(), 
-            "subprocess :: run" | "subprocess :: run_with_env" | "subprocess :: check_call" | 
-            "subprocess :: check_output" | "os :: getcwd" | "os :: chdir" | "os :: execv" |
-            "os :: path :: abspath"
+        let needs_unwrap = matches!(
+            name_str.as_str(),
+            "subprocess :: run"
+                | "subprocess :: run_with_env"
+                | "subprocess :: check_call"
+                | "subprocess :: check_output"
+                | "os :: getcwd"
+                | "os :: chdir"
+                | "os :: execv"
+                | "os :: path :: abspath"
         );
-        
+
         // Special handling for subprocess.run and os.execv with fallback for compatibility
         let final_call = if propagates_exceptions {
             quote!(#call_expr?)
@@ -2865,7 +2906,7 @@ impl<'a> CodeGen for Call {
         } else {
             call_expr
         };
-        
+
         // `.await` is added only by an explicit `await` expression (the Await
         // node), mirroring Python: calling an async function without await
         // does not implicitly run it. The old behavior appended `.await` to
@@ -2875,51 +2916,82 @@ impl<'a> CodeGen for Call {
     }
 }
 
-/// Lower a call to a `rust.bind`/`rust.c_bind` name: a direct call into the
-/// bound crate, with type-directed conversions between rython's Python types
-/// and the declared Rust signature.
+/// Lower a call to a bound function: a direct call into the bound crate,
+/// with type-directed conversions between rython's Python types and the
+/// declared Rust signature. Works for both declaration-style (`rust.bind`)
+/// and import-style (`import crc32c`) bindings.
 fn lower_rust_binding_call(
-    spec: &crate::RustBindSpec,
+    spec: &crate::RustModuleSpec,
+    fn_name: Option<&str>,
     args: &[ExprType],
     keywords: &[Keyword],
     ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // rust.bind declarations always bind exactly one function; import-style
+    // specs carry one (from-import) or many (module). Attribute calls name
+    // the callee; bare-name calls require a single-function spec.
+    let fspec = match fn_name {
+        Some(name) => spec.get_fn(name).ok_or_else(|| {
+            format!(
+                "`{name}` is not a bound function of crate `{}`",
+                spec.crate_name
+            )
+        })?,
+        None => {
+            if spec.fns.len() != 1 {
+                return Err(format!(
+                    "internal error: RustModule spec with multiple functions in a \
+                     bare-name call (bound: {})",
+                    spec.fns
+                        .iter()
+                        .map(|f| f.fn_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            &spec.fns[0]
+        }
+    };
+
     if !keywords.is_empty() {
         return Err(format!(
             "keyword arguments in a call to bound function `{}::{}` are not \
              supported yet; pass the arguments positionally",
-            spec.crate_name, spec.fn_name
+            spec.crate_name, fspec.fn_name
         )
         .into());
     }
-    if args.len() != spec.args.len() {
+    if args.len() != fspec.args.len() {
         return Err(format!(
             "bound function `{}::{}` takes {} argument(s), but {} were given",
             spec.crate_name,
-            spec.fn_name,
-            spec.args.len(),
+            fspec.fn_name,
+            fspec.args.len(),
             args.len()
         )
         .into());
     }
 
     let mut converted = Vec::new();
-    for ((_, ty), arg) in spec.args.iter().zip(args.iter()) {
-        let rendered = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+    for ((_, ty), arg) in fspec.args.iter().zip(args.iter()) {
+        let rendered = arg
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         converted.push(convert_rust_bind_arg(rendered, ty)?);
     }
 
     let crate_ident = format_ident!("{}", spec.crate_name.replace('-', "_"));
-    let fn_ident = format_ident!("{}", spec.fn_name);
+    let fn_ident = format_ident!("{}", fspec.fn_name);
     let call = quote!(#crate_ident::#fn_ident(#(#converted),*));
-    let call = if spec.c_abi {
+    let call = if fspec.unsafe_call {
         quote!(unsafe { #call })
     } else {
         call
     };
-    convert_rust_bind_ret(call, spec.returns.as_deref())
+    convert_rust_bind_ret(call, fspec.returns.as_deref())
 }
 
 /// Convert a Python-side argument to the declared Rust parameter type.
@@ -2947,9 +3019,7 @@ fn convert_rust_bind_arg(
         "Vec<u8>" => quote!(Vec::from(#tokens)),
         "*const u8" => quote!(#tokens.as_ptr()),
         "*mut u8" => quote!(#tokens.as_mut_ptr()),
-        other => {
-            return Err(format!("rust.bind: unsupported parameter type `{}`", other).into())
-        }
+        other => return Err(format!("rust.bind: unsupported parameter type `{}`", other).into()),
     };
     Ok(converted)
 }
@@ -2972,9 +3042,7 @@ fn convert_rust_bind_ret(
         Some("String") => call,
         Some("&str") => quote!(#call.to_string()),
         Some("Vec<u8>") => call,
-        Some(other) => {
-            return Err(format!("rust.bind: unsupported return type `{}`", other).into())
-        }
+        Some(other) => return Err(format!("rust.bind: unsupported return type `{}`", other).into()),
     };
     Ok(converted)
 }
@@ -2995,13 +3063,15 @@ fn lower_str_format(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    use crate::pyformat::{parse_template, translate_format_spec, FieldRef, Piece};
+    use crate::pyformat::{FieldRef, Piece, parse_template, translate_format_spec};
 
     let pieces = parse_template(template).map_err(|e| format!("str.format: {}", e))?;
 
     for kw in keywords {
         if kw.arg.is_none() {
-            return Err("str.format with **kwargs is not supported yet".to_string().into());
+            return Err("str.format with **kwargs is not supported yet"
+                .to_string()
+                .into());
         }
     }
 
@@ -3018,7 +3088,11 @@ fn lower_str_format(
             Piece::Literal(text) => {
                 fmt.push_str(&text.replace('{', "{{").replace('}', "}}"));
             }
-            Piece::Field { arg, conversion, spec } => {
+            Piece::Field {
+                arg,
+                conversion,
+                spec,
+            } => {
                 let index_name = match arg {
                     FieldRef::Auto => {
                         saw_auto = true;
@@ -3146,7 +3220,9 @@ fn lower_str_format(
     // Bindings: every argument evaluates exactly once, in order.
     let mut bindings = TokenStream::new();
     for (i, arg) in args.iter().enumerate() {
-        let value = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value = arg
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         if used_positions.contains(&i) {
             let ident = crate::safe_ident(&format!("__rython_fmt{}", i));
             bindings.extend(quote!(let #ident = #value;));
@@ -3192,12 +3268,13 @@ pub(crate) fn receiver_class(
     let class_name = match recv {
         ExprType::Name(n) if n.id == "self" => ctx.enclosing_class_name()?.to_string(),
         ExprType::Name(n) => match symbols.get(&n.id) {
-            Some(SymbolTableNode::Assign { value: ExprType::Call(call), .. }) => {
-                match call.func.as_ref() {
-                    ExprType::Name(cn) => cn.id.clone(),
-                    _ => return None,
-                }
-            }
+            Some(SymbolTableNode::Assign {
+                value: ExprType::Call(call),
+                ..
+            }) => match call.func.as_ref() {
+                ExprType::Name(cn) => cn.id.clone(),
+                _ => return None,
+            },
             _ => return None,
         },
         // Composition: `self.field.method()` resolves through the owner
@@ -3517,11 +3594,7 @@ foo(a=9)",
         .unwrap();
         let symbols = result.clone().find_symbols(SymbolTableScopes::new());
         let code = result
-            .to_rust(
-                CodeGenContext::Module("test".to_string()),
-                options,
-                symbols,
-            )
+            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
             .unwrap()
             .to_string();
         assert!(
@@ -3546,11 +3619,7 @@ foo(b=9)",
         .unwrap();
         let symbols = result.clone().find_symbols(SymbolTableScopes::new());
         let err = result
-            .to_rust(
-                CodeGenContext::Module("test".to_string()),
-                options,
-                symbols,
-            )
+            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
             .expect_err("unexpected keyword must not convert");
         assert!(
             format!("{}", err).contains("unexpected keyword"),

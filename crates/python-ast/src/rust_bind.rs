@@ -123,27 +123,21 @@ pub fn parse_rust_bind(call: &Call) -> Result<RustBindSpec, String> {
                 let list = match &kw.value {
                     ExprType::List(items) => items,
                     _ => {
-                        return Err(
-                            "rust.bind: the `args=` keyword must be a list of \
+                        return Err("rust.bind: the `args=` keyword must be a list of \
                              (\"name\", \"type\") tuples"
-                                .to_string(),
-                        )
+                            .to_string());
                     }
                 };
                 for item in list {
                     let (name, ty) = match item {
-                        ExprType::Tuple(t) if t.elts.len() == 2 => {
-                            (string_literal(&t.elts[0], "parameter name")?, string_literal(
-                                &t.elts[1],
-                                "parameter type",
-                            )?)
-                        }
+                        ExprType::Tuple(t) if t.elts.len() == 2 => (
+                            string_literal(&t.elts[0], "parameter name")?,
+                            string_literal(&t.elts[1], "parameter type")?,
+                        ),
                         _ => {
-                            return Err(
-                                "rust.bind: every entry of `args=` must be a \
+                            return Err("rust.bind: every entry of `args=` must be a \
                                  (\"name\", \"type\") tuple"
-                                    .to_string(),
-                            )
+                                .to_string());
                         }
                     };
                     if name.is_empty() {
@@ -165,7 +159,7 @@ pub fn parse_rust_bind(call: &Call) -> Result<RustBindSpec, String> {
                     "rust.bind: unknown keyword argument `{}` (supported: args, \
                      returns, path, version)",
                     other.unwrap_or("**kwargs")
-                ))
+                ));
             }
         }
     }
@@ -176,14 +170,14 @@ pub fn parse_rust_bind(call: &Call) -> Result<RustBindSpec, String> {
                 "rust.bind: give either `path=` or `version=` for the crate \
                  dependency, not both"
                     .to_string(),
-            )
+            );
         }
         (false, false) => {
             return Err(format!(
                 "rust.bind: `{}` needs `path=` or `version=` so the generated \
                  crate can declare its dependency on `{}`",
                 fn_name, crate_name
-            ))
+            ));
         }
         _ => {}
     }
@@ -197,6 +191,34 @@ pub fn parse_rust_bind(call: &Call) -> Result<RustBindSpec, String> {
         path,
         version,
     })
+}
+
+impl From<&RustBindSpec> for crate::RustModuleSpec {
+    /// The declaration-based binding, adapted to the import-based spec shape.
+    /// The single bound function carries the declaration's signature; the
+    /// module name (used only for error messages) is the function name.
+    fn from(spec: &RustBindSpec) -> Self {
+        crate::RustModuleSpec {
+            module_name: spec.fn_name.clone(),
+            crate_name: spec.crate_name.clone(),
+            path: spec.path.clone(),
+            version: spec.version.clone(),
+            fns: vec![crate::RustFnSpec {
+                fn_name: spec.fn_name.clone(),
+                args: spec.args.clone(),
+                returns: spec.returns.clone(),
+                unsafe_call: spec.c_abi,
+            }],
+        }
+    }
+}
+
+impl crate::RustModuleSpec {
+    /// The declaration-style spelling (`c_abi`) for the single-function
+    /// spec produced from a `rust.c_bind` declaration.
+    pub fn is_c_abi(&self) -> bool {
+        self.fns.len() == 1 && self.fns[0].unsafe_call
+    }
 }
 
 /// Every `rust.bind` declaration in a module's top-level statements — the
@@ -219,9 +241,10 @@ pub fn rust_bind_specs(body: &[crate::Statement]) -> Vec<RustBindSpec> {
 
 fn validate_param_type(ty: &str) -> Result<(), String> {
     match ty {
-        "i64" | "i32" | "u64" | "u32" | "i16" | "u16" | "i8" | "u8" | "isize" | "usize"
-        | "f64" | "f32" | "bool" | "String" | "&str" | "Vec<u8>" | "&[u8]" | "*const u8"
-        | "*mut u8" => Ok(()),
+        "i64" | "i32" | "u64" | "u32" | "i16" | "u16" | "i8" | "u8" | "isize" | "usize" | "f64"
+        | "f32" | "bool" | "String" | "&str" | "Vec<u8>" | "&[u8]" | "*const u8" | "*mut u8" => {
+            Ok(())
+        }
         other => Err(format!(
             "rust.bind: unsupported parameter type `{}`. Supported: i64 i32 u64 u32 i16 \
              u16 i8 u8 isize usize f64 f32 bool String &str Vec<u8> &[u8] *const u8 *mut u8",
@@ -232,8 +255,8 @@ fn validate_param_type(ty: &str) -> Result<(), String> {
 
 fn validate_return_type(ty: &str) -> Result<(), String> {
     match ty {
-        "i64" | "i32" | "u64" | "u32" | "i16" | "u16" | "i8" | "u8" | "isize" | "usize"
-        | "f64" | "f32" | "bool" | "String" | "&str" | "Vec<u8>" | "()" | "void" => Ok(()),
+        "i64" | "i32" | "u64" | "u32" | "i16" | "u16" | "i8" | "u8" | "isize" | "usize" | "f64"
+        | "f32" | "bool" | "String" | "&str" | "Vec<u8>" | "()" | "void" => Ok(()),
         other => Err(format!(
             "rust.bind: unsupported return type `{}`. Supported: i64 i32 u64 u32 i16 u16 \
              i8 u8 isize usize f64 f32 bool String &str Vec<u8> () void",

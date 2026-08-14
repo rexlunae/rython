@@ -1,8 +1,8 @@
-use tracing::debug;
 use proc_macro2::TokenStream;
 use pyo3::FromPyObject;
 use quote::quote;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableNode, SymbolTableScopes};
 
@@ -113,7 +113,7 @@ impl CodeGen for Import {
         self,
         ctx: Self::Context,
         options: Self::Options,
-        _symbols: Self::SymbolTable,
+        mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
@@ -125,6 +125,22 @@ impl CodeGen for Import {
                             `from rython import rust` for compile-time Rust bindings"
                     .to_string()
                     .into());
+            }
+            // Import of a Rust module: the import is compile-time-only — the
+            // name resolves through the symbol table; no `use` is emitted
+            // (the crate is a dependency, not a sibling module). Registering
+            // the module symbol lets attribute call lowering find it.
+            if let Some(spec) = options.rust_modules.get(&alias.name) {
+                let module_symbol = crate::SymbolTableNode::RustModule(spec.clone());
+                symbols.insert(alias.name.clone(), module_symbol);
+                if let Some(asname) = &alias.asname {
+                    symbols.insert(
+                        asname.clone(),
+                        crate::SymbolTableNode::Alias(alias.name.clone()),
+                    );
+                }
+                tokens.extend(TokenStream::new());
+                continue;
             }
             if options.no_std {
                 let root = alias.name.split('.').next().unwrap_or(&alias.name);
@@ -197,13 +213,14 @@ impl CodeGen for Import {
                     // Handle other imports normally
                     let names = if alias.name.contains('.') {
                         let parts: Vec<&str> = alias.name.split('.').collect();
-                        let idents: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
+                        let idents: Vec<_> =
+                            parts.iter().map(|part| crate::safe_ident(part)).collect();
                         quote!(#(#idents)::*)
                     } else {
                         let single_name = crate::safe_ident(&alias.name);
                         quote!(#single_name)
                     };
-                    
+
                     match &alias.asname {
                         None => {
                             quote! {use #names;}
@@ -215,7 +232,7 @@ impl CodeGen for Import {
                     }
                 }
             };
-            
+
             tokens.extend(rust_import);
         }
         debug!("context: {:?}", ctx);
@@ -251,12 +268,10 @@ impl CodeGen for ImportFrom {
     fn to_rust(
         self,
         ctx: Self::Context,
-        _options: Self::Options,
-        _symbols: Self::SymbolTable,
+        options: Self::Options,
+        mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         debug!("ctx: {:?}", ctx);
-
-        // typing imports (Optional, List, Dict, ...) are annotation-only:
         // annotations map to Rust types directly, so the import itself
         // lowers to nothing.
         if self.module.split('.').next() == Some("typing") {
@@ -282,7 +297,53 @@ impl CodeGen for ImportFrom {
             );
         }
 
-        if _options.no_std {
+        // `from <rust-module> import <fn> [as <alias>]`: the functions are
+        // compile-time bindings into a Rust crate; the import lowers to
+        // nothing and registers each name in the symbol table so call
+        // lowering resolves them. An unknown name is a loud error (the
+        // stub/inferred signature is the source of truth).
+        if let Some(spec) = options.rust_modules.get(&self.module) {
+            for alias in self.names.iter() {
+                if alias.name == "*" {
+                    return Err(format!(
+                        "`from {} import *`: wildcard imports of Rust modules are \
+                         not supported; import the names explicitly",
+                        self.module
+                    )
+                    .into());
+                }
+                let bind_name = alias.asname.clone().unwrap_or_else(|| alias.name.clone());
+                match spec.get_fn(&alias.name) {
+                    Some(fspec) => {
+                        let mut spec_for_binding = spec.clone();
+                        spec_for_binding.fns = vec![fspec.clone()];
+                        symbols.insert(
+                            bind_name,
+                            crate::SymbolTableNode::RustModule(spec_for_binding),
+                        );
+                    }
+                    None => {
+                        return Err(format!(
+                            "`from {} import {}`: `{}` is not a bound function of \
+                             crate `{}` (bound: {})",
+                            self.module,
+                            alias.name,
+                            alias.name,
+                            spec.crate_name,
+                            spec.fns
+                                .iter()
+                                .map(|f| f.fn_name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                        .into());
+                    }
+                }
+            }
+            return Ok(TokenStream::new());
+        }
+
+        if options.no_std {
             let root = self.module.split('.').next().unwrap_or(&self.module);
             if is_std_only_module(root) {
                 return Err(std_only_import_error(&self.module));
@@ -301,8 +362,11 @@ impl CodeGen for ImportFrom {
             .filter(|part| !part.is_empty())
             .collect();
         let module_path: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
-        let root = if parts.first().is_some_and(|first| is_stdpython_module(first)) {
-            let runtime = crate::safe_ident(&_options.stdpython);
+        let root = if parts
+            .first()
+            .is_some_and(|first| is_stdpython_module(first))
+        {
+            let runtime = crate::safe_ident(&options.stdpython);
             quote!(#runtime)
         } else {
             quote!(crate)
@@ -341,12 +405,9 @@ impl CodeGen for ImportFrom {
                     "accumulate_sum_initial",
                     "accumulate_func_initial",
                 ],
-                ("itertools", "product") => &[
-                    "product2",
-                    "product3",
-                    "product_repeat2",
-                    "product_repeat3",
-                ],
+                ("itertools", "product") => {
+                    &["product2", "product3", "product_repeat2", "product_repeat3"]
+                }
                 ("itertools", "zip_longest") => &["zip_longest_fill"],
                 ("itertools", "groupby") => &["groupby_key"],
                 ("functools", "reduce") => &["reduce_initial"],

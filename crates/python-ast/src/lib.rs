@@ -37,3 +37,6 @@ pub use parser_utils::*;
 
 pub mod rust_bind;
 pub use rust_bind::*;
+
+pub mod rust_module;
+pub use rust_module::*;
