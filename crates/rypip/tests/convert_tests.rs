@@ -3196,7 +3196,7 @@ fn driver_mode_generates_complete_driver_crate() {
             "def parse_hex(s: str) -> int:\n",
             "    return 0\n",
             "\n",
-            "def crc8(data: list[int]) -> int:\n",
+            "def crc8(data: bytes) -> int:\n",
             "    return 0\n",
         ),
     )
@@ -3252,7 +3252,7 @@ fn driver_mode_defaults_manifest_when_absent() {
     // documented default device (byte-ring misc device, /dev/rython0).
     let scratch = Scratch::new("driver-defaults");
     let file = scratch.path().join("thing.py");
-    fs::write(&file, "def crc8(data: list[int]) -> int:\n    return 0\n").unwrap();
+    fs::write(&file, "def crc8(data: bytes) -> int:\n    return 0\n").unwrap();
     let out = scratch.path().join("crate");
     let pkg = rypip::discover(&file).expect("discover");
     rypip::convert(

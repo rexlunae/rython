@@ -2227,7 +2227,7 @@ fn run_command(dev: &mut Device, fd: RawFd, line: &str) {
     };
 
     // 4. Checksum the device bytes with the generated CRC-8.
-    let crc = crc8(echo[..n].iter().map(|&b| b as i64).collect()).unwrap_or(-1);
+    let crc = crc8(echo[..n].to_vec()).unwrap_or(-1);
 
     println!("{}   [dev-echo {}B crc=0x{:02x}]", resp, n, crc);
 }
@@ -2409,7 +2409,7 @@ mod tests {
             b"WRITE 2 2a\n".to_vec(),
             vec![0xde, 0xad, 0xbe, 0xef],
         ] {
-            let got = crc8(data.iter().map(|&b| b as i64).collect()).unwrap() as u8;
+            let got = crc8(data.to_vec()).unwrap() as u8;
             assert_eq!(got, ref_crc8(&data), "data={data:02x?}");
         }
     }
