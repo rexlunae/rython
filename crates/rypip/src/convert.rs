@@ -1885,17 +1885,38 @@ pub fn convert(
     // matters for the written file order, not correctness).
     let python_module_names: std::collections::HashSet<String> =
         python_deps.iter().map(|(name, _)| name.clone()).collect();
+    // ASTs of every module of the generated crate (vendored deps + the
+    // package itself), keyed by module path.
+    let module_defs = module_def_map(
+        python_deps
+            .iter()
+            .flat_map(|(_, dep)| dep.modules.iter())
+            .chain(package.modules.iter()),
+    );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
-            let code =
-                transpile(module, &mut warnings, opts, &rust_modules, &python_module_names)?;
+            let code = transpile(
+                module,
+                &mut warnings,
+                opts,
+                &rust_modules,
+                &python_module_names,
+                &module_defs,
+            )?;
             transpiled.push((module, code));
         }
     }
     for module in &package.modules {
-        let code = transpile(module, &mut warnings, opts, &rust_modules, &python_module_names)?;
+        let code = transpile(
+            module,
+            &mut warnings,
+            opts,
+            &rust_modules,
+            &python_module_names,
+            &module_defs,
+        )?;
         transpiled.push((module, code));
     }
     // Bindings are generated before files are written so their warnings
@@ -2252,13 +2273,34 @@ fn convert_driver(
     let mut warnings = Vec::new();
     let rust_manifest = read_rust_module_manifest(package)?;
     let rust_modules = rust_module_registry(package, &rust_manifest)?;
-    let code = transpile(module, &mut warnings, opts, &rust_modules, &python_module_names)?;
+    // Driver mode still vendors python-modules deps as siblings; give the
+    // same cross-module knowledge as the plain package path.
+    let module_defs = module_def_map(
+        python_deps
+            .iter()
+            .flat_map(|(_, dep)| dep.modules.iter())
+            .chain(package.modules.iter()),
+    );
+    let code = transpile(
+        module,
+        &mut warnings,
+        opts,
+        &rust_modules,
+        &python_module_names,
+        &module_defs,
+    )?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
         for dep_module in &dep.modules {
-            let dep_code =
-                transpile(dep_module, &mut warnings, opts, &rust_modules, &python_module_names)?;
+            let dep_code = transpile(
+                dep_module,
+                &mut warnings,
+                opts,
+                &rust_modules,
+                &python_module_names,
+                &module_defs,
+            )?;
             dep_transpiled.push((dep_module, dep_code));
         }
     }
@@ -2680,6 +2722,26 @@ fn parse_filename(module: &PyModule) -> String {
     }
 }
 
+/// Cross-module class knowledge for imports within the generated crate:
+/// the parsed AST of every sibling module, keyed by module path. ImportFrom
+/// lowering uses this to bring a hierarchy class's traits into scope when
+/// the class is imported from another module (inherited methods live on
+/// the traits, and Rust method resolution requires the trait to be in
+/// scope at the call site) and to resolve imported classes for
+/// construction (`Dog("Rex")` → `Dog::new("Rex")?`).
+fn module_def_map<'a>(
+    modules: impl Iterator<Item = &'a PyModule>,
+) -> std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>> {
+    let mut map = std::collections::HashMap::new();
+    for module in modules {
+        let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) else {
+            continue;
+        };
+        map.insert(module.path.clone(), std::rc::Rc::new(ast));
+    }
+    map
+}
+
 /// Transpile one Python module to Rust source text, appending
 /// lossy-conversion warnings (which are also baked into the generated code
 /// as #[deprecated] notes, unless the warning mode suppresses them).
@@ -2689,6 +2751,7 @@ fn transpile(
     opts: &ConvertOptions,
     rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
     python_modules: &std::collections::HashSet<String>,
+    module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
 ) -> Result<String> {
     let mode = opts.warnings;
     let ast = parse_enhanced(&module.source, parse_filename(module))
@@ -2718,6 +2781,7 @@ fn transpile(
         no_std: opts.no_std,
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
         python_modules: std::rc::Rc::new(python_modules.clone()),
+        module_defs: std::rc::Rc::new(module_defs.clone()),
         // Relative imports resolve against the current module's package
         // path; empty at the crate root (the default when unset).
         module_path: module_package_path(module),

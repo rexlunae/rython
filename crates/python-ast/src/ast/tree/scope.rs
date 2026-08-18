@@ -281,6 +281,19 @@ pub(crate) fn chain_base_name(expr: &ExprType) -> Option<&str> {
     }
 }
 
+/// Whether `expr` is the real Python `super()` shape: a bare `super()` call
+/// (no arguments). The receiver of `super().m(...)` — its mutation targets
+/// the enclosing method's self even though the chain bottoms out in a Call.
+fn is_super_call(expr: &ExprType) -> bool {
+    matches!(
+        expr,
+        ExprType::Call(c)
+            if c.args.is_empty()
+                && c.keywords.is_empty()
+                && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "super")
+    )
+}
+
 /// Collect the names in a `for` target (`i` and `v` in `for i, v in ...`).
 fn for_target_names<'a>(target: &'a ExprType, out: &mut Vec<&'a str>) {
     match target {
@@ -431,11 +444,11 @@ pub(crate) fn class_call_resolver<'a>(
         let ExprType::Attribute(attr) = call.func.as_ref() else {
             return None;
         };
-        let class = crate::receiver_class(&attr.value, ctx, symbols)?;
-        if class.method_on_mro(&attr.attr, symbols).is_none() {
+        let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
+        if class.method_on_mro(&attr.attr, &class_symbols).is_none() {
             return None;
         }
-        Some(class.method_needs_mut_self(&attr.attr, symbols, options))
+        Some(class.method_needs_mut_self(&attr.attr, &class_symbols, options))
     }
 }
 
@@ -616,6 +629,12 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         if mutates {
             if let Some(name) = chain_base_name(&attr.value) {
                 a.record_mutation(name);
+            } else if is_super_call(&attr.value) {
+                // `super().m(...)` mutates the ENCLOSING method's self:
+                // the receiver chain bottoms out in a `super()` call, not a
+                // name, but the mutation is on the method's own object
+                // (super().__init__ writes the base's fields).
+                a.record_mutation("self");
             }
         }
         walk_expr(&attr.value, a);

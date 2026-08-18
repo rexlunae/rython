@@ -197,19 +197,21 @@ impl CodeGen for Module {
         // Classes that participate in an inheritance hierarchy (have a real
         // base, or are used as a base) lower with the trait machinery; every
         // other class stays a plain struct. Computed once so both sides of a
-        // hierarchy agree on the scheme.
+        // hierarchy agree on the scheme. Classes nested under containers
+        // (`if __name__ == "__main__":` and friends) count too — their
+        // class statements lower the same way.
         {
+            let mut classes = Vec::new();
+            collect_class_defs(&self.raw.body, &mut classes);
             let mut hierarchy = std::collections::HashSet::new();
-            for s in &self.raw.body {
-                if let crate::StatementType::ClassDef(c) = &s.statement {
-                    let has_real_base = c.bases.iter().any(|b| b.id != "object");
-                    if has_real_base {
-                        hierarchy.insert(c.name.clone());
-                    }
-                    for b in &c.bases {
-                        if b.id != "object" {
-                            hierarchy.insert(b.id.clone());
-                        }
+            for c in &classes {
+                let has_real_base = c.bases.iter().any(|b| b.id != "object");
+                if has_real_base {
+                    hierarchy.insert(c.name.clone());
+                }
+                for b in &c.bases {
+                    if b.id != "object" {
+                        hierarchy.insert(b.id.clone());
                     }
                 }
             }
@@ -222,15 +224,8 @@ impl CodeGen for Module {
         // method), whose signature must fit every impl, and call sites must
         // borrow the receiver mutably to match. Keyed by the root class.
         {
-            let classes: Vec<crate::ClassDef> = self
-                .raw
-                .body
-                .iter()
-                .filter_map(|s| match &s.statement {
-                    crate::StatementType::ClassDef(c) => Some(c.clone()),
-                    _ => None,
-                })
-                .collect();
+            let mut classes = Vec::new();
+            collect_class_defs(&self.raw.body, &mut classes);
             let mut trait_mut = std::collections::HashMap::<
                 String,
                 std::collections::HashSet<String>,
@@ -241,7 +236,7 @@ impl CodeGen for Module {
                     if m.name == "__init__" {
                         continue;
                     }
-                    if c.own_method_mutates(&m.name, &symbols) {
+                    if c.own_method_mutates(&m.name, &symbols, &options) {
                         // The root = the TOPMOST class in the chain that
                         // defines the method (the trait owner).
                         if let Some(root) = chain
@@ -1174,4 +1169,106 @@ def foo():
         );
         info!("module: {:?}", code);
     }
+}
+
+/// Every `ClassDef` in the module, recursing into container statements
+/// (if/for/while/with/try/async/function bodies), so classes defined under
+/// an `if __name__ == "__main__":` guard take part in the same hierarchy
+/// and trait-signature precomputes as top-level classes — their class
+/// statements lower through the same machinery.
+fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>) {
+    for s in stmts {
+        match &s.statement {
+            crate::StatementType::ClassDef(c) => out.push(c.clone()),
+            crate::StatementType::If(i) => {
+                collect_class_defs(&i.body, out);
+                collect_class_defs(&i.orelse, out);
+            }
+            crate::StatementType::For(f) => {
+                collect_class_defs(&f.body, out);
+                collect_class_defs(&f.orelse, out);
+            }
+            crate::StatementType::While(w) => {
+                collect_class_defs(&w.body, out);
+                collect_class_defs(&w.orelse, out);
+            }
+            crate::StatementType::With(w) => collect_class_defs(&w.body, out),
+            crate::StatementType::AsyncWith(w) => collect_class_defs(&w.body, out),
+            crate::StatementType::AsyncFor(f) => {
+                collect_class_defs(&f.body, out);
+                collect_class_defs(&f.orelse, out);
+            }
+            crate::StatementType::Try(t) => {
+                collect_class_defs(&t.body, out);
+                for h in &t.handlers {
+                    collect_class_defs(&h.body, out);
+                }
+                collect_class_defs(&t.orelse, out);
+                collect_class_defs(&t.finalbody, out);
+            }
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                collect_class_defs(&f.body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// For each class in `ast` that lowers with the trait machinery, the trait
+/// names that carry its methods: its own `{Name}Trait` plus one per
+/// ancestor, nearest first. Consumed by the converter so a relative import
+/// of the class from another module of the generated crate can bring the
+/// traits into scope at the call site (Rust method resolution needs the
+/// trait in scope; the class's own module defines it). Mirrors the
+/// hierarchy-class computation in `Module::to_rust`.
+pub fn module_class_traits(
+    ast: &crate::Module,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut classes = Vec::new();
+    collect_class_defs(&ast.raw.body, &mut classes);
+    let mut hierarchy = std::collections::HashSet::new();
+    for c in &classes {
+        let has_real_base = c.bases.iter().any(|b| b.id != "object");
+        if has_real_base {
+            hierarchy.insert(c.name.clone());
+        }
+        for b in &c.bases {
+            if b.id != "object" {
+                hierarchy.insert(b.id.clone());
+            }
+        }
+    }
+    let symbols = ast.clone().find_symbols(SymbolTableScopes::new());
+    let mut out = std::collections::HashMap::new();
+    for c in classes {
+        if !hierarchy.contains(&c.name) {
+            continue;
+        }
+        let traits: Vec<String> = c
+            .base_chain(&symbols)
+            .iter()
+            .map(|cc| format!("{}Trait", cc.name))
+            .collect();
+        out.insert(c.name.clone(), traits);
+    }
+    out
+}
+
+/// The `ClassDef` named `name` in `ast`, plus the module's own symbol
+/// table (so the class's base chain resolves inside the module that
+/// declared it, not the importer's scope). Used for cross-module class
+/// construction: `from .animals import Dog; Dog("Rex")` lowers against
+/// Dog's real `__init__` signature, and an inherited `__init__` resolves
+/// through the defining module's chain.
+pub fn module_class_def(
+    ast: &crate::Module,
+    name: &str,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    let symbols = ast.clone().find_symbols(SymbolTableScopes::new());
+    ast.raw.body.iter().find_map(|s| match &s.statement {
+        crate::StatementType::ClassDef(c) if c.name == name => {
+            Some((c.clone(), symbols.clone()))
+        }
+        _ => None,
+    })
 }

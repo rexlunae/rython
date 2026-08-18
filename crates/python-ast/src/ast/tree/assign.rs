@@ -232,6 +232,20 @@ impl<'a> CodeGen for Assign {
                 options.clone(),
                 symbols.clone(),
             )?;
+            // `os.environ[k] = v` routes through `os::setenv`: os.environ
+            // is an IMMUTABLE module static (a live view of the process
+            // environment) and cannot be borrowed mutably for py_set_index.
+            // The static's set-index impls (Environ: PySetIndex) cover
+            // receivers that are real values (`e = os.environ`), but the
+            // direct module-path store must go through the function.
+            let is_os_environ = matches!(
+                sub.value.as_ref(),
+                ExprType::Attribute(a)
+                    if a.attr == "environ"
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "os")
+                        && !crate::ast::tree::call::root_name(&a.value)
+                            .is_some_and(|root| crate::module_name_shadowed(root, &symbols))
+            );
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
                     // String-keyed dicts store `&str` indexes through
@@ -259,6 +273,9 @@ impl<'a> CodeGen for Assign {
                             .clone()
                             .to_rust(ctx.clone(), options.clone(), symbols.clone())?
                     };
+                    if is_os_environ {
+                        return Ok(quote!(os::setenv(#index, #value);));
+                    }
                     Ok(quote!({
                         let __rython_val = #value;
                         (#receiver).py_set_index(#index, __rython_val)?;

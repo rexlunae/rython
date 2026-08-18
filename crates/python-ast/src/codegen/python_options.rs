@@ -196,6 +196,19 @@ pub struct PythonOptions {
     /// in rython.toml): `import pylev` lowers to `use crate::pylev;` — a
     /// sibling module of the generated crate, not an external dependency.
     pub python_modules: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Cross-module class knowledge: parsed ASTs of the sibling modules of
+    /// the generated crate (vendored `[python-modules]` deps and the
+    /// package's own modules), keyed by module path. ImportFrom lowering
+    /// consults them so a hierarchy class imported from another module
+    /// works end to end: the class's traits are brought into scope (`use`
+    /// alongside the class import — Rust method resolution needs the trait
+    /// at the call site, and the class's own module defines it), and
+    /// construction (`Dog("Rex")`) resolves the imported name to its
+    /// defining `ClassDef` for signature-mapped `Dog::new(...)`. Empty in
+    /// single-module conversion.
+    pub module_defs:
+        std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
 }
 
 impl Default for PythonOptions {
@@ -230,6 +243,7 @@ impl Default for PythonOptions {
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
+            module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
         }
     }
 }

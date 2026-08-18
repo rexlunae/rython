@@ -61,7 +61,7 @@ impl<'a> CodeGen for Attribute {
         // moved below: `self.name` where `name` is a base class's field, or
         // `dog.name` where `dog` is a derived-class instance, must reach
         // through the embedded base structs (or the trait's base accessors).
-        let field_access = class_field_access(&self.value, &self.attr, &ctx, &symbols);
+        let field_access = class_field_access(&self.value, &self.attr, &ctx, &symbols, &options);
         // A Rust-module attribute (`crc32c.crc32c` where `crc32c` was
         // `import`ed from a rython.toml binding) is a path into the bound
         // crate — never a field access. The crate name comes from the spec
@@ -96,6 +96,11 @@ impl<'a> CodeGen for Attribute {
         let vendored_module_chain = module_chain
             && crate::ast::tree::call::root_name(&self.value)
                 .is_some_and(|root| options.python_modules.contains(root));
+        // Whether the chain is a single segment (`textlib.double`): the
+        // `crate::` prefix belongs to the ROOT segment only, so a nested
+        // chain (`textlib.core.double`) must NOT be re-prefixed. Checked
+        // before `self.value` is moved.
+        let single_segment_chain = matches!(self.value.as_ref(), ExprType::Name(_));
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
@@ -146,7 +151,17 @@ impl<'a> CodeGen for Attribute {
                 // lib (pub mod) and in the bin (mod textlib) alike, with no
                 // `use` statement needed. Same-package modules and stdlib
                 // paths keep their plain form.
-                Ok(quote!(crate::#value_tokens::#attr))
+                //
+                // The `crate::` prefix belongs to the ROOT segment only: a
+                // nested chain (`textlib.core.double`) renders its inner
+                // attribute (`textlib.core`) through this same branch,
+                // which already prefixes it — re-prefixing here would
+                // double it (`crate::crate::...`).
+                if single_segment_chain {
+                    Ok(quote!(crate::#value_tokens::#attr))
+                } else {
+                    Ok(quote!(#value_tokens::#attr))
+                }
             } else {
                 Ok(quote!(#value_tokens::#attr))
             }
@@ -200,20 +215,38 @@ pub(crate) fn to_rust_place(
         attr: attr.to_string(),
         ctx: "Store".to_string(),
     };
-    let field_access = class_field_access(value, attr, ctx, symbols);
+    let field_access = class_field_access(value, attr, ctx, symbols, options);
     // Mirror the module-path guard from to_rust: a store target that
-    // resolves as a module path is not a field access.
+    // resolves as a module path is not a field access. A user binding that
+    // shadows the module name (`os = {...}`) must NOT be treated as a
+    // module — the load path applies the same `module_name_shadowed` guard.
+    let root_shadowed = crate::ast::tree::call::root_name(value)
+        .is_some_and(|root| crate::module_name_shadowed(root, symbols));
     let value_tokens = attribute.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-    let is_module = crate::ast::tree::call::root_name(value)
-        .is_some_and(|_root| crate::ast::tree::attribute::is_module_path_chain(value, symbols))
-        || matches!(
-            value_tokens.to_string().as_str(),
-            "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" | "time"
-                | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re"
-                | "hashlib" | "csv" | "io" | "datetime" | "numpy" | "np"
-        );
+    let is_module = !root_shadowed
+        && (crate::ast::tree::call::root_name(value)
+            .is_some_and(|_root| crate::ast::tree::attribute::is_module_path_chain(value, symbols))
+            || matches!(
+                value_tokens.to_string().as_str(),
+                "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" | "time"
+                    | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re"
+                    | "hashlib" | "csv" | "io" | "datetime" | "numpy" | "np"
+            ));
     if is_module {
-        return Ok(quote!(#value_tokens.#attr));
+        // Module stores render as PATHS, exactly like the load form:
+        // `os.environ[k] = v` stores through `os::environ`. The attribute
+        // is an identifier — interpolating the &str directly would emit a
+        // string literal (`os . "environ"`) that the Rust compiler rejects.
+        let attr_path = crate::safe_ident(attr);
+        // Vendored deps prefix `crate::` at the ROOT segment only; nested
+        // segments already carry it from their own rendering.
+        let vendored_root = matches!(value, ExprType::Name(_))
+            && crate::ast::tree::call::root_name(value)
+                .is_some_and(|root| options.python_modules.contains(root));
+        if vendored_root {
+            return Ok(quote!(crate::#value_tokens::#attr_path));
+        }
+        return Ok(quote!(#value_tokens::#attr_path));
     }
     let attr_ident = crate::safe_ident(attr);
     match field_access {
@@ -287,9 +320,10 @@ pub(crate) fn class_field_access(
     attr: &str,
     ctx: &CodeGenContext,
     symbols: &SymbolTableScopes,
+    options: &PythonOptions,
 ) -> Option<FieldRewrite> {
-    let class = crate::receiver_class(value, ctx, symbols)?;
-    let depth = class.field_owner_depth(attr, symbols)?;
+    let (class, class_symbols) = crate::receiver_class(value, ctx, symbols, options)?;
+    let depth = class.field_owner_depth(attr, &class_symbols)?;
     let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
     if depth == 0 {
         // The receiver's own field. Direct access works for any concrete

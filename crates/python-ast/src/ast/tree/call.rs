@@ -2175,10 +2175,28 @@ impl<'a> CodeGen for Call {
         // call semantics. A derived class without its own __init__ uses the
         // first __init__ on its MRO (its synthesized constructor forwards
         // to it).
+        //
+        // An imported class name (`from .animals import Dog`) resolves
+        // through the DEFINING module's AST (options.module_defs): the
+        // import binding is just a name, but construction must map
+        // arguments against the class's real __init__ signature, and an
+        // inherited __init__ must resolve through the defining module's
+        // base chain, not the importer's scope.
         if let ExprType::Name(n) = self.func.as_ref() {
-            if let Some(SymbolTableNode::ClassDef(c)) = symbols.get(&n.id) {
+            let resolved: Option<(crate::ClassDef, SymbolTableScopes)> = match symbols.get(&n.id) {
+                Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let path = i.resolved_module_path(&options);
+                    match options.module_defs.get(&path) {
+                        Some(module) => crate::module_class_def(module, &n.id),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((class, class_symbols)) = resolved {
                 let cname = crate::safe_ident(&n.id);
-                match c.method_on_mro("__init__", &symbols) {
+                match class.method_on_mro("__init__", &class_symbols) {
                     Some(init) => {
                         if init.args.vararg.is_some() || init.args.kwarg.is_some() {
                             return Err(format!(
@@ -2196,7 +2214,7 @@ impl<'a> CodeGen for Call {
                             &self.keywords,
                             &ctx,
                             &options,
-                            &symbols,
+                            &class_symbols,
                         )?;
                         return Ok(quote!({ #prelude #cname::new(#(#args),*)? }));
                     }
@@ -2299,9 +2317,17 @@ impl<'a> CodeGen for Call {
                 // The embedded base of `super_owner` is reached from `self`
                 // by walking to `super_owner`'s struct, then one more level
                 // for its base. In a generic trait default the base accessor
-                // reaches the direct base of the generic Self.
+                // reaches the direct base of the generic Self — the MUTABLE
+                // accessor when the callee mutates self (`super().bump()`
+                // must not borrow the shared base and then fail to mutate).
+                let mutates_receiver =
+                    base.method_needs_mut_self(&attr.attr, &symbols, &options);
                 let receiver = if ctx.in_generic_trait() {
-                    quote!(self.base())
+                    if mutates_receiver {
+                        quote!(self.base_mut())
+                    } else {
+                        quote!(self.base())
+                    }
                 } else if super_owner == enclosing {
                     quote!(self.__rython_base)
                 } else {
@@ -2336,8 +2362,10 @@ impl<'a> CodeGen for Call {
             // under the class (and an inherited method keeps its `?` and
             // keyword/default mapping). Calls propagate exceptions (`?`)
             // and map keywords/defaults like any user function call.
-            if let Some(class) = receiver_class(&attr.value, &ctx, &symbols) {
-                if let Some(method) = class.method_on_mro(&attr.attr, &symbols) {
+            if let Some((class, class_symbols)) =
+                receiver_class(&attr.value, &ctx, &symbols, &options)
+            {
+                if let Some(method) = class.method_on_mro(&attr.attr, &class_symbols) {
                     if method.name == "__init__" && class.init_method().is_none() {
                         return Err(format!(
                             "`self.__init__(...)` calling an inherited `__init__` is not \
@@ -2360,7 +2388,7 @@ impl<'a> CodeGen for Call {
                         &self.keywords,
                         &ctx,
                         &options,
-                        &symbols,
+                        &class_symbols,
                     )?;
                     // A field receiver (`self.inner`, `self.items`) renders
                     // in place flavor when the callee mutates the receiver
@@ -2368,7 +2396,7 @@ impl<'a> CodeGen for Call {
                     // clones and the mutation would silently vanish. Read
                     // only callees may read through the load form.
                     let mutates_receiver =
-                        class.method_needs_mut_self(&attr.attr, &symbols, &options);
+                        class.method_needs_mut_self(&attr.attr, &class_symbols, &options);
                     let receiver = if let ExprType::Attribute(inner) = attr.value.as_ref()
                         && mutates_receiver
                         && matches!(
@@ -3457,45 +3485,76 @@ fn lower_str_format(
 /// receivers return None and fall through to the generic lowering — where
 /// a genuine user-method call fails to compile (loud), never silently
 /// drops exception propagation.
+/// Whether `expr` is a `super` reference: the bare Name (defensive; Python
+/// has no `super.foo` form) or the real shape, a `super()` Call. The
+/// receiver of `super().m(...)`.
+fn is_super_reference(expr: &ExprType) -> bool {
+    match expr {
+        ExprType::Name(n) => n.id == "super",
+        ExprType::Call(c) => {
+            c.args.is_empty()
+                && c.keywords.is_empty()
+                && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "super")
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn receiver_class(
     recv: &ExprType,
     ctx: &CodeGenContext,
     symbols: &SymbolTableScopes,
-) -> Option<crate::ClassDef> {
-    let class_name = match recv {
-        ExprType::Name(n) if n.id == "self" => ctx.enclosing_class_name()?.to_string(),
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    let (class_name, class_symbols) = match recv {
+        ExprType::Name(n) if n.id == "self" => {
+            (ctx.enclosing_class_name()?.to_string(), symbols.clone())
+        }
         // `super()` inside a method resolves to the enclosing class's base,
         // so `super().m(...)` (and mut analysis for `super().__init__`)
-        // resolve against the base class.
-        ExprType::Name(n) if n.id == "super" => {
+        // resolve against the base class. Python parses `super()` as a
+        // Call node — `super` is a function — so the receiver must match
+        // the Call shape, not a bare Name.
+        recv if is_super_reference(recv) => {
             let class_name = ctx.enclosing_class_name()?;
             let class = match symbols.get(class_name) {
                 Some(SymbolTableNode::ClassDef(c)) => c.clone(),
                 _ => return None,
             };
             let base = class.base_class(symbols)?;
-            return Some(base);
+            return Some((base, symbols.clone()));
         }
         ExprType::Name(n) => match symbols.get(&n.id) {
             Some(SymbolTableNode::Assign {
                 value: ExprType::Call(call),
                 ..
             }) => match call.func.as_ref() {
-                ExprType::Name(cn) => cn.id.clone(),
+                ExprType::Name(cn) => (cn.id.clone(), symbols.clone()),
                 _ => return None,
             },
             _ => return None,
         },
         // Composition: `self.field.method()` resolves through the owner
-        // class's field types.
+        // class's field types. `field_class` yields the field's class
+        // NAME, resolved to its ClassDef below.
         ExprType::Attribute(attr) => {
-            let owner = receiver_class(&attr.value, ctx, symbols)?;
-            owner.field_class(&attr.attr, symbols)?
+            let (owner, owner_symbols) = receiver_class(&attr.value, ctx, symbols, options)?;
+            let field = owner.field_class(&attr.attr, &owner_symbols)?;
+            (field, owner_symbols)
         }
         _ => return None,
     };
-    match symbols.get(&class_name) {
-        Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+    match class_symbols.get(&class_name) {
+        Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), class_symbols)),
+        // An imported class (`from .animals import Dog`): the binding is a
+        // name, so resolve through the DEFINING module's AST, where the
+        // class (and its base chain) is declared — with the defining
+        // module's symbol table, so `Dog`'s base `Animal` resolves there.
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            let module = options.module_defs.get(&path)?;
+            crate::module_class_def(module, &class_name)
+        }
         _ => None,
     }
 }

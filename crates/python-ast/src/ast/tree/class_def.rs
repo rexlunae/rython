@@ -88,10 +88,36 @@ impl ClassDef {
     /// Returns just `[self]` when the class has no base.
     pub(crate) fn base_chain(&self, symbols: &SymbolTableScopes) -> Vec<ClassDef> {
         let mut chain = vec![self.clone()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(self.name.clone());
         while let Some(base) = chain.last().and_then(|c| c.base_class(symbols)) {
+            // A cyclic base (`class A(A)` after the name was rebound, so
+            // the class resolves to itself) must terminate: Python looks
+            // the base up in the OUTER scope and errors when it finds the
+            // class being defined, but the symbol table can only see the
+            // rebound name. Stop before the chain grows forever; emit_class
+            // reports the cycle as a conversion error.
+            if !seen.insert(base.name.clone()) {
+                break;
+            }
             chain.push(base);
         }
         chain
+    }
+
+    /// The class name that closes an inheritance cycle (`class A(A)`), or
+    /// None for a valid chain. Walks bases like base_chain but reports the
+    /// repeat instead of silently stopping.
+    pub(crate) fn base_cycle(&self, symbols: &SymbolTableScopes) -> Option<String> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cur = Some(self.clone());
+        while let Some(c) = cur {
+            if !seen.insert(c.name.clone()) {
+                return Some(c.name.clone());
+            }
+            cur = c.base_class(symbols);
+        }
+        None
     }
 
     /// The first method named `name` found walking the MRO (the class
@@ -117,10 +143,19 @@ impl ClassDef {
     /// 1 for its direct base, etc. None when no class in the chain assigns
     /// the field. `self.attr` where attr is owned by an ancestor resolves
     /// through the ancestor's embedded struct.
+    ///
+    /// The owner is the class whose STRUCT physically holds the field — the
+    /// DEEPEST ancestor that assigns it. A derived class's own stores of a
+    /// base-owned field are filtered out of its struct (see `to_rust`), so
+    /// the field lives at the topmost assigner in the chain; `rposition`
+    /// finds that one. `.position` (nearest assigner) would report a
+    /// depth-0 owner for a field the struct no longer has, making
+    /// `self.n = n` in a subclass's own `__init__` write to a nonexistent
+    /// field.
     pub(crate) fn field_owner_depth(&self, attr: &str, symbols: &SymbolTableScopes) -> Option<usize> {
         self.base_chain(symbols)
             .iter()
-            .position(|c| c.owns_field(attr))
+            .rposition(|c| c.owns_field(attr))
     }
 
     /// The class of the value stored in field `attr`, when the field holds
@@ -197,7 +232,7 @@ impl ClassDef {
         let mut visited = std::collections::HashSet::new();
         for c in self.base_chain(symbols) {
             if c.methods().any(|mm| mm.name == method)
-                && c.method_mut_inner(method, symbols, &mut visited)
+                && c.method_mut_inner(method, symbols, &mut visited, options)
             {
                 return true;
             }
@@ -212,9 +247,10 @@ impl ClassDef {
         &self,
         method: &str,
         symbols: &SymbolTableScopes,
+        options: &PythonOptions,
     ) -> bool {
         let mut visited = std::collections::HashSet::new();
-        self.method_mut_inner(method, symbols, &mut visited)
+        self.method_mut_inner(method, symbols, &mut visited, options)
     }
 
     fn method_mut_inner(
@@ -222,6 +258,7 @@ impl ClassDef {
         method: &str,
         symbols: &SymbolTableScopes,
         visited: &mut std::collections::HashSet<(String, String)>,
+        options: &PythonOptions,
     ) -> bool {
         // A cycle in the call graph resolves optimistically: the mutation,
         // if real, is found on the acyclic part of some path.
@@ -241,11 +278,17 @@ impl ClassDef {
             let ExprType::Attribute(attr) = call.func.as_ref() else {
                 return None;
             };
-            let class = crate::receiver_class(&attr.value, &ctx, symbols)?;
-            if class.method_on_mro(&attr.attr, symbols).is_none() {
+            let (class, class_symbols) =
+                crate::receiver_class(&attr.value, &ctx, symbols, options)?;
+            if class.method_on_mro(&attr.attr, &class_symbols).is_none() {
                 return None;
             }
-            Some(class.method_mut_inner(&attr.attr, symbols, &mut **visited.borrow_mut()))
+            Some(class.method_mut_inner(
+                &attr.attr,
+                &class_symbols,
+                &mut **visited.borrow_mut(),
+                options,
+            ))
         };
         crate::analyze_scope_with(&m.body, &params, &resolve)
             .needs_mut
@@ -443,7 +486,23 @@ impl CodeGen for ClassDef {
         let base: Option<ClassDef> = match real_bases.first() {
             None => None,
             Some(base_name) => match symbols.get(base_name) {
-                Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                Some(SymbolTableNode::ClassDef(c)) => {
+                    // A base that resolves to an already-visited class in
+                    // this class's own chain is a cycle (`class A(A)` —
+                    // Python looks the base up in the outer scope, which
+                    // the symbol table can only see as the rebound name).
+                    // The embedded-struct scheme cannot represent it; fail
+                    // loudly instead of emitting an infinitely-sized
+                    // struct or looping forever in base_chain.
+                    if let Some(cycle) = self.base_cycle(&symbols) {
+                        return Err(format!(
+                            "class `{}` cannot inherit from `{}`: cyclic inheritance",
+                            self.name, cycle,
+                        )
+                        .into());
+                    }
+                    Some(c.clone())
+                }
                 _ => {
                     return Err(format!(
                         "class `{}` inherits from `{}`, which is not a class defined \
@@ -810,8 +869,20 @@ impl ClassDef {
             });
         }
 
+        // The per-class trait is PUBLIC (inherited methods are called
+        // cross-module: the struct is `pub` and re-exported, so the traits
+        // carrying its methods must be nameable wherever the struct is) and
+        // declares the direct base's trait as a supertrait. Trait default
+        // bodies are generic over `Self: {Name}Trait` only, so a new method
+        // that calls an inherited method (`def bar(self): self.foo()` where
+        // foo lives on the base) resolves `foo` through the supertrait
+        // bound; ancestor methods are not on the concrete `Self` otherwise.
+        let supertrait = base.as_ref().map(|b| {
+            let b_trait = format_ident!("{}Trait", b.name);
+            quote!(: #b_trait)
+        });
         let own_trait = quote! {
-            trait #trait_name {
+            pub trait #trait_name #supertrait {
                 #own_accessor_decls
                 #own_method_defaults
             }

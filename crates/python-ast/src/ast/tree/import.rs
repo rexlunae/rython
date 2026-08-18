@@ -276,6 +276,28 @@ pub struct ImportFrom {
     pub level: usize,
 }
 
+impl ImportFrom {
+    /// The module path this import resolves to inside the generated crate:
+    /// for a relative import, the current module path (cut by `level`) plus
+    /// the dotted module; for an absolute import, the dotted module itself.
+    /// Key into `options.module_defs` to reach the defining module's AST.
+    pub(crate) fn resolved_module_path(&self, options: &PythonOptions) -> Vec<String> {
+        let parts: Vec<&str> = self.module.split('.').filter(|p| !p.is_empty()).collect();
+        if self.level > 0 {
+            let cur = &options.module_path;
+            let cut = cur.len() + 1 - self.level;
+            cur[..cut]
+                .iter()
+                .map(|s| s.as_str())
+                .chain(parts.iter().copied())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            parts.iter().map(|s| s.to_string()).collect()
+        }
+    }
+}
+
 impl CodeGen for ImportFrom {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -506,6 +528,28 @@ impl CodeGen for ImportFrom {
                     #[allow(unused_imports)]
                     use #root #(::#base_parts)* #(::#module_path)*::#v;
                 });
+            }
+
+            // A hierarchy class imported from another module of the
+            // generated crate carries its methods on traits (`{Name}Trait`
+            // plus ancestors'), NOT on the struct — Rust method resolution
+            // needs those traits IN SCOPE at the call site, so the import
+            // brings them along: `from .animals import Dog` also imports
+            // `AnimalTrait`, and `d.get()` resolves. Only classes that
+            // lower with the trait machinery have traits; functions and
+            // plain structs get none (the per-module map is empty for
+            // them).
+            let import_module_path = self.resolved_module_path(&options);
+            if let Some(module) = options.module_defs.get(&import_module_path)
+                && let Some(traits) = crate::module_class_traits(module).get(&alias.name)
+            {
+                for trait_name in traits {
+                    let t = crate::safe_ident(trait_name);
+                    tokens.extend(quote! {
+                        #[allow(unused_imports)]
+                        use #root #(::#base_parts)* #(::#module_path)*::#t;
+                    });
+                }
             }
         }
         Ok(tokens)
