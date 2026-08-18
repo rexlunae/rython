@@ -1537,6 +1537,164 @@ fn kernel_module_accepts_docstrings_in_function_bodies() {
 }
 
 #[test]
+fn kernel_module_imports_shim_to_call_kernel_resource() {
+    // Kernel resources via the Rust compatibility layer: `from
+    // rykernel_shim import ktime_get_real_seconds` binds the import to a
+    // direct call into the shim crate (which declares the kernel's exported
+    // symbol), the result is held in an i64 local, and printk interpolates
+    // it. The module links the shim and does NOT define its own panic
+    // handler (the shim provides one).
+    let scratch = Scratch::new("kernel-shim");
+    let file = scratch.path().join("clock.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "__module_name__ = \"ryclock\"\n",
+            "\n",
+            "from rykernel_shim import ktime_get_real_seconds\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    now = ktime_get_real_seconds()\n",
+            "    printk(f\"ryclock: loaded at t={now} s\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "def module_exit():\n",
+            "    ktime_get_real_seconds()\n",
+            "    printk(\"ryclock: unloaded\\n\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let _krate = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect("shim-import kernel module converts");
+    let lib = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(
+        lib.contains("let now: i64 = rykernel_shim::ktime_get_real_seconds();"),
+        "call binding: {}",
+        lib
+    );
+    assert!(
+        lib.contains("b\"ryclock: loaded at t=%ld s\\n\\0\""),
+        "f-string interpolation: {}",
+        lib
+    );
+    assert!(lib.contains(", now"), "vararg passes the local: {}", lib);
+    assert!(
+        lib.contains("let _ = rykernel_shim::ktime_get_real_seconds();"),
+        "bare shim call statement: {}",
+        lib
+    );
+    assert!(
+        !lib.contains("#[panic_handler]"),
+        "the shim owns the panic handler: {}",
+        lib
+    );
+
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(
+        toml.contains("rykernel-shim = { path ="),
+        "Cargo.toml declares the shim dep: {}",
+        toml
+    );
+    assert!(
+        !toml.contains("stdpython"),
+        "shim modules replace the stdpython dep: {}",
+        toml
+    );
+
+    // The generated crate is genuine no_std Rust: it must cargo-check
+    // (host build — the shim compiles as std, and its extern "C" kernel
+    // symbols are declarations only, so nothing needs linking).
+    let status = check_generated(&out);
+    assert!(status.success(), "generated shim kernel crate failed to compile");
+}
+
+#[test]
+fn kernel_module_rejects_unknown_shim_import_loudly() {
+    // Only the curated allowlist of safe shim wrappers is importable; a
+    // name that is not a kernel resource is a loud conversion error.
+    let scratch = Scratch::new("kernel-shim-bad");
+    let file = scratch.path().join("clock.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "\n",
+            "from rykernel_shim import nonexistent\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    return 0\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("unknown shim import must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rykernel_shim.nonexistent"),
+        "names the bad import: {msg}"
+    );
+    assert!(
+        msg.contains("ktime_get_real_seconds"),
+        "lists the available resources: {msg}"
+    );
+}
+
+#[test]
+fn kernel_module_rejects_shim_imports_with_rust_for_linux() {
+    // The shim is owned by the raw-FFI pipeline; rust-for-linux binds the
+    // kernel crate instead.
+    let scratch = Scratch::new("kernel-shim-rfl");
+    let file = scratch.path().join("clock.py");
+    fs::write(
+        &file,
+        concat!(
+            "__module_license__ = \"GPL\"\n",
+            "\n",
+            "from rykernel_shim import ktime_get_real_seconds\n",
+            "\n",
+            "def module_init() -> int:\n",
+            "    return 0\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(
+        &pkg,
+        &out,
+        &ConvertOptions {
+            kernel_module: true,
+            rust_for_linux: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("shim imports with rust-for-linux must be rejected");
+    assert!(
+        format!("{err:#}").contains("--rust-for-linux"),
+        "names the conflicting target: {err:#}"
+    );
+}
+
+#[test]
 fn kernel_module_rust_for_linux_generates_module_macro() {
     // Issue #88: --kernel-module --rust-for-linux must emit a rust-for-linux
     // crate: a module! macro, kernel::Module impl with init(), a Drop impl

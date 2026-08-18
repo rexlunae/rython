@@ -32,6 +32,15 @@ unsafe extern "C" {
     pub fn kfree(ptr: *const c_void);
 }
 
+// time64_t ktime_get_real_seconds(void) — the kernel's wall clock, seconds
+// since the Unix epoch. Exported to modules (EXPORT_SYMBOL) and safe to
+// call from any context that can sleep (module init/exit included). Use the
+// `rykernel_shim::ktime_get_real_seconds` wrapper rather than calling this
+// directly.
+unsafe extern "C" {
+    pub fn ktime_get_real_seconds() -> i64;
+}
+
 // unsigned long _copy_to_user(void __user *to, const void *from, unsigned long n)
 // The C `copy_to_user()` macro wraps `_copy_to_user`; the underscore symbol
 // is the one actually exported to modules.

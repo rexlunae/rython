@@ -81,3 +81,15 @@ macro_rules! printk {
         }
     };
 }
+
+/// Wall-clock seconds since the Unix epoch, read from the kernel's own
+/// clock (`ktime_get_real_seconds`, exported to modules).
+///
+/// This is the canonical "kernel resource" for rython's kernel-module FFI:
+/// kernel-module Python can import it (`from rykernel_shim import
+/// ktime_get_real_seconds`) and rypip lowers the call to a direct call into
+/// this crate, which calls the kernel symbol directly. No user-space
+/// equivalent exists — this is a resource only the kernel has.
+pub fn ktime_get_real_seconds() -> i64 {
+    unsafe { ffi::ktime_get_real_seconds() }
+}

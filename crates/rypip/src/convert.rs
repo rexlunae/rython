@@ -144,7 +144,20 @@ pub struct GeneratedKernel {
     /// The generated misc device (`src/device.rs`) when the Python declares
     /// a device manifest — `None` for plain kernel modules.
     pub device: Option<String>,
+    /// The module links `rykernel-shim` (the Rust compatibility layer):
+    /// either because it generated a device, or because the Python imports
+    /// kernel resources from it (`from rykernel_shim import ...`). The
+    /// generated Cargo.toml must declare the shim, and the module must not
+    /// define its own panic handler (the shim provides one).
+    pub uses_shim: bool,
 }
+
+/// Kernel resources importable from kernel-module Python. These are safe
+/// wrappers in the rykernel-shim crate — the Rust compatibility layer that
+/// declares the kernel symbols a module needs. Each name is a `pub fn` on
+/// the shim with an integer return, callable with integer arguments, safe
+/// from module init/exit context.
+const KERNEL_SHIM_FNS: &[&str] = &["ktime_get_real_seconds"];
 
 /// Scan top-level assignments for module metadata (`__module_license__`,
 /// `__module_author__`, `__module_description__`, `__module_version__`).
@@ -232,6 +245,51 @@ fn generate_kernel_lib_rs(
     let mut has_printk = false;
     let modinfo = scan_modinfo(&ast);
 
+    // Kernel-resource imports (`from rykernel_shim import ...`): resolved
+    // against the shim's curated allowlist and lowered to direct calls into
+    // the rykernel-shim crate, exactly like rust-modules imports in user
+    // space. The import must be declared in the Python; calls to names that
+    // were never imported are loud errors.
+    let mut shim_imports: Vec<String> = Vec::new();
+    for stmt in &ast.raw.body {
+        match &stmt.statement {
+            StatementType::ImportFrom(imp) if imp.module == "rykernel_shim" => {
+                for alias in &imp.names {
+                    let name = alias.name.clone();
+                    if !KERNEL_SHIM_FNS.contains(&name.as_str()) {
+                        return Err(anyhow::anyhow!(
+                            "kernel module: `rykernel_shim.{name}` is not an importable \
+                             kernel resource (available: {})",
+                            KERNEL_SHIM_FNS.join(", ")
+                        ));
+                    }
+                    if !shim_imports.contains(&name) {
+                        shim_imports.push(name);
+                    }
+                }
+            }
+            StatementType::Import(imp) => {
+                for alias in &imp.names {
+                    if alias.name == "rykernel_shim" {
+                        for name in KERNEL_SHIM_FNS {
+                            if !shim_imports.contains(&name.to_string()) {
+                                shim_imports.push((*name).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !shim_imports.is_empty() && target == KernelTarget::RustForLinux {
+        return Err(anyhow::anyhow!(
+            "kernel module: `rykernel_shim` imports are not supported with \
+             --rust-for-linux — the raw-FFI target owns the shim; the \
+             rust-for-linux target binds the `kernel` crate instead"
+        ));
+    }
+
     // Scan top-level statements for entry points.
     for stmt in &ast.raw.body {
         match &stmt.statement {
@@ -248,8 +306,14 @@ fn generate_kernel_lib_rs(
                         func.name
                     ));
                 }
-                let body =
-                    lower_kernel_body(&func.body, &mut has_printk, target, is_init, &func.name)?;
+                let body = lower_kernel_body(
+                    &func.body,
+                    &mut has_printk,
+                    target,
+                    is_init,
+                    &func.name,
+                    &shim_imports,
+                )?;
                 if is_init {
                     init_body = body;
                 } else {
@@ -269,13 +333,19 @@ fn generate_kernel_lib_rs(
 
     match target {
         KernelTarget::RawFfi => {
-            generate_kernel_raw_ffi(&init_body, &exit_body, &modinfo, has_printk).map(|code| {
-                GeneratedKernel {
-                    code,
-                    has_init: !init_body.is_empty(),
-                    has_exit: !exit_body.is_empty(),
-                    device: None,
-                }
+            generate_kernel_raw_ffi(
+                &init_body,
+                &exit_body,
+                &modinfo,
+                has_printk,
+                !shim_imports.is_empty(),
+            )
+            .map(|code| GeneratedKernel {
+                code,
+                has_init: !init_body.is_empty(),
+                has_exit: !exit_body.is_empty(),
+                device: None,
+                uses_shim: !shim_imports.is_empty(),
             })
         }
         KernelTarget::RustForLinux => {
@@ -285,6 +355,7 @@ fn generate_kernel_lib_rs(
                     has_init: !init_body.is_empty(),
                     has_exit: !exit_body.is_empty(),
                     device: None,
+                    uses_shim: false,
                 },
             )
         }
@@ -345,6 +416,7 @@ fn generate_kernel_device(
         has_init: true,
         has_exit: true,
         device: Some(device),
+        uses_shim: false,
     })
 }
 
@@ -356,6 +428,7 @@ fn generate_kernel_raw_ffi(
     exit_body: &str,
     modinfo: &std::collections::BTreeMap<String, String>,
     has_printk: bool,
+    uses_shim: bool,
 ) -> Result<String> {
     let printk_decl = if has_printk {
         // The kernel exports `_printk`, not `printk` — `printk` is a C macro
@@ -365,6 +438,12 @@ fn generate_kernel_raw_ffi(
         ""
     };
 
+    // Kernel resources imported from Python (`from rykernel_shim import
+    // ktime_get_real_seconds`) resolve to fully-qualified calls into the
+    // shim — the Rust compatibility layer that declares the kernel symbols
+    // (the import itself is a compile-time declaration; rypip validated it
+    // against the shim's allowlist, so no `use` is needed). The shim also
+    // provides the panic handler, so the module must not define its own.
     let mut out = format!(
         "// Generated by rypip --kernel-module. Edit freely.\n\
          #![no_std]\n\n\
@@ -393,11 +472,15 @@ fn generate_kernel_raw_ffi(
     // (see `modinfo_statics`).
     out.push_str(&modinfo_statics(modinfo));
 
-    // Kernel panic handler.
-    out.push_str(
-        "#[panic_handler]\n\
-         fn panic(_info: &core::panic::PanicInfo) -> ! {\n    loop {}\n}\n\n",
-    );
+    // Kernel panic handler. The rykernel-shim crate provides one when the
+    // module links it (it prints the fault message through _printk); a
+    // module that does not use the shim defines its own.
+    if !uses_shim {
+        out.push_str(
+            "#[panic_handler]\n\
+             fn panic(_info: &core::panic::PanicInfo) -> ! {\n    loop {}\n}\n\n",
+        );
+    }
 
     // module_init entry point.
     if !init_body.is_empty() {
@@ -1286,6 +1369,7 @@ fn lower_kernel_body(
     target: KernelTarget,
     is_init: bool,
     func_name: &str,
+    shim_imports: &[String],
 ) -> Result<String> {
     let mut out = String::new();
     for stmt in body {
@@ -1304,43 +1388,63 @@ fn lower_kernel_body(
                         line,
                     ));
                 };
-                if call.name != "printk" {
-                    return Err(kernel_body_err(
-                        &format!(
-                            "unsupported call `{}()` (only printk is available in kernel modules)",
-                            call.name
-                        ),
-                        line,
-                    ));
-                }
-                if !call.keywords.is_empty() {
-                    return Err(kernel_body_err(
-                        "printk takes positional arguments only",
-                        line,
-                    ));
-                }
-                *has_printk = true;
-                let style = printk_style(target);
-                let (fmt, values) = lower_printk_args(&call.args, line, style)?;
-                match target {
-                    KernelTarget::RawFfi => {
-                        out.push_str("    unsafe {\n        _printk(");
-                        out.push_str(&format!(
-                            "b\"{fmt}\\0\".as_ptr() as *const core::ffi::c_char"
+                if call.name == "printk" {
+                    if !call.keywords.is_empty() {
+                        return Err(kernel_body_err(
+                            "printk takes positional arguments only",
+                            line,
                         ));
-                        if !values.is_empty() {
-                            out.push_str(&format!(", {}", values.join(", ")));
-                        }
-                        out.push_str(");\n    }\n");
                     }
-                    KernelTarget::RustForLinux => {
-                        out.push_str(&format!("    pr_info!(\"{fmt}\""));
-                        if !values.is_empty() {
-                            out.push_str(&format!(", {}", values.join(", ")));
+                    *has_printk = true;
+                    let style = printk_style(target);
+                    let (fmt, values) = lower_printk_args(call.args, line, style)?;
+                    match target {
+                        KernelTarget::RawFfi => {
+                            out.push_str("    unsafe {\n        _printk(");
+                            out.push_str(&format!(
+                                "b\"{fmt}\\0\".as_ptr() as *const core::ffi::c_char"
+                            ));
+                            if !values.is_empty() {
+                                out.push_str(&format!(", {}", values.join(", ")));
+                            }
+                            out.push_str(");\n    }\n");
                         }
-                        out.push_str(");\n");
+                        KernelTarget::RustForLinux => {
+                            out.push_str(&format!("    pr_info!(\"{fmt}\""));
+                            if !values.is_empty() {
+                                out.push_str(&format!(", {}", values.join(", ")));
+                            }
+                            out.push_str(");\n");
+                        }
                     }
+                    continue;
                 }
+                // A bare call to an imported kernel resource (e.g.
+                // `ktime_get_real_seconds()` on its own line): discard the
+                // value, matching Python's statement semantics.
+                if shim_imports.contains(&call.name) {
+                    if !call.keywords.is_empty() {
+                        return Err(kernel_body_err(
+                            &format!("`{}()` takes positional arguments only", call.name),
+                            line,
+                        ));
+                    }
+                    let args = lower_kernel_call_args(call.args, line)?;
+                    out.push_str(&format!(
+                        "    let _ = rykernel_shim::{}({});\n",
+                        safe_ident(&call.name),
+                        args.join(", ")
+                    ));
+                    continue;
+                }
+                return Err(kernel_body_err(
+                    &format!(
+                        "unsupported call `{}()` (only printk and imported rykernel_shim \
+                         resources are available in kernel modules)",
+                        call.name
+                    ),
+                    line,
+                ));
             }
             python_ast::StatementType::Assign(assign) => {
                 // Integer-literal local binding, e.g. `addr = 0x1fff0000`.
@@ -1363,9 +1467,39 @@ fn lower_kernel_body(
                             }
                         }
                     }
+                    // Kernel-resource call binding: `now =
+                    // ktime_get_real_seconds()` lowers to a direct call
+                    // into the shim, with the value kept as an i64 local
+                    // that printk interpolations can reference.
+                    if let python_ast::ExprType::Call(call) = &assign.value {
+                        if let python_ast::ExprType::Name(fname) = call.func.as_ref() {
+                            if shim_imports.contains(&fname.id) {
+                                if !call.keywords.is_empty() {
+                                    return Err(kernel_body_err(
+                                        &format!(
+                                            "`{}()` takes positional arguments only",
+                                            fname.id
+                                        ),
+                                        line,
+                                    ));
+                                }
+                                let args = lower_kernel_call_args(&call.args, line)?;
+                                if let python_ast::ExprType::Name(name) = &assign.targets[0] {
+                                    out.push_str(&format!(
+                                        "    let {}: i64 = rykernel_shim::{}({});\n",
+                                        safe_ident(&name.id),
+                                        safe_ident(&fname.id),
+                                        args.join(", ")
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
                 return Err(kernel_body_err(
-                    "unsupported assignment (only `name = <integer literal>` is supported)",
+                    "unsupported assignment (only `name = <integer literal>` and \
+                     `name = <imported rykernel_shim call>` are supported)",
                     line,
                 ));
             }
@@ -1634,6 +1768,16 @@ fn lower_kernel_value(expr: &python_ast::ExprType, line: Option<usize>) -> Resul
     }
 }
 
+/// Lower positional arguments of a kernel-resource call: integer literals
+/// and previously-bound i64 locals — the two value kinds the kernel ABI
+/// supports.
+fn lower_kernel_call_args(
+    args: &[python_ast::ExprType],
+    line: Option<usize>,
+) -> Result<Vec<String>> {
+    args.iter().map(|a| lower_kernel_value(a, line)).collect()
+}
+
 /// Convert `package` into a Cargo crate under `out_dir`.
 pub fn convert(
     package: &PyPackage,
@@ -1692,7 +1836,7 @@ pub fn convert(
         }
         let has_binary = false;
         let warnings = Vec::new();
-        write_cargo_toml(package, out_dir, opts, has_binary, &manifest)?;
+        write_cargo_toml(package, out_dir, opts, has_binary, &manifest, kernel.uses_shim)?;
         if !opts.rust_for_linux {
             // rust-for-linux modules are registered in the kernel tree's
             // Kbuild Makefile (rust-obj-m += <name>.o), not a standalone one.
@@ -1854,6 +1998,7 @@ pub fn convert(
         opts,
         has_binary,
         &DeviceManifest::default(),
+        false,
     )?;
 
     Ok(ConvertedCrate {
@@ -2078,7 +2223,7 @@ fn convert_driver(
         .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats));
     fs::write(src_dir.join("main.rs"), format_rust(&main))?;
 
-    write_cargo_toml(package, out_dir, opts, true, &manifest)?;
+    write_cargo_toml(package, out_dir, opts, true, &manifest, false)?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -2713,6 +2858,7 @@ fn write_cargo_toml(
     opts: &ConvertOptions,
     _has_binary: bool,
     manifest: &DeviceManifest,
+    uses_shim: bool,
 ) -> Result<()> {
     let crate_name = if opts.kernel_module {
         // Kernel modules take their name from the kernel manifest; the
@@ -2725,16 +2871,17 @@ fn write_cargo_toml(
     } else {
         package.name.clone()
     };
-    let kernel_device = opts.kernel_module && manifest.has_device;
+    // The generated device links the shim; so does a plain kernel module
+    // whose Python imports kernel resources from rykernel_shim.
+    let kernel_device = opts.kernel_module && (manifest.has_device || uses_shim);
     let stdpython_source = resolve_stdpython_source(opts)?;
     let stdpython_dep = if kernel_device {
-        // The generated device links the rython kernel shim crate. It is
-        // not published: resolve a checkout next to this tool, an explicit
-        // override, or fail loudly.
+        // The shim is not published: resolve a checkout next to this tool,
+        // an explicit override, or fail loudly.
         let shim = resolve_rykernel_shim_path().ok_or_else(|| {
             anyhow::anyhow!(
-                "--kernel-module device generation needs the rykernel-shim crate \
-                 (the generated device links it): set RYPIP_RYKERNEL_SHIM_PATH to \
+                "--kernel-module needs the rykernel-shim crate (device generation or \
+                 rykernel_shim imports link it): set RYPIP_RYKERNEL_SHIM_PATH to \
                  its checkout, or run rypip from the rython workspace \
                  (crates/rykernel-shim)"
             )
