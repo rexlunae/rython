@@ -194,6 +194,72 @@ impl CodeGen for Module {
             std::collections::HashMap::new();
         count_module_stores(&self.raw.body, &mut module_assign_counts);
 
+        // Classes that participate in an inheritance hierarchy (have a real
+        // base, or are used as a base) lower with the trait machinery; every
+        // other class stays a plain struct. Computed once so both sides of a
+        // hierarchy agree on the scheme.
+        {
+            let mut hierarchy = std::collections::HashSet::new();
+            for s in &self.raw.body {
+                if let crate::StatementType::ClassDef(c) = &s.statement {
+                    let has_real_base = c.bases.iter().any(|b| b.id != "object");
+                    if has_real_base {
+                        hierarchy.insert(c.name.clone());
+                    }
+                    for b in &c.bases {
+                        if b.id != "object" {
+                            hierarchy.insert(b.id.clone());
+                        }
+                    }
+                }
+            }
+            options.hierarchy_classes = std::rc::Rc::new(hierarchy);
+        }
+
+        // Trait method signatures widen to `&mut self` when ANY definition
+        // in the hierarchy mutates self: overrides re-emit into the ROOT
+        // class's trait (the first class in the chain that defines the
+        // method), whose signature must fit every impl, and call sites must
+        // borrow the receiver mutably to match. Keyed by the root class.
+        {
+            let classes: Vec<crate::ClassDef> = self
+                .raw
+                .body
+                .iter()
+                .filter_map(|s| match &s.statement {
+                    crate::StatementType::ClassDef(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect();
+            let mut trait_mut = std::collections::HashMap::<
+                String,
+                std::collections::HashSet<String>,
+            >::new();
+            for c in &classes {
+                let chain = c.base_chain(&symbols);
+                for m in c.methods() {
+                    if m.name == "__init__" {
+                        continue;
+                    }
+                    if c.own_method_mutates(&m.name, &symbols) {
+                        // The root = the TOPMOST class in the chain that
+                        // defines the method (the trait owner).
+                        if let Some(root) = chain
+                            .iter()
+                            .rev()
+                            .find(|cc| cc.methods().any(|mm| mm.name == m.name))
+                        {
+                            trait_mut
+                                .entry(root.name.clone())
+                                .or_default()
+                                .insert(m.name.clone());
+                        }
+                    }
+                }
+            }
+            options.trait_mut_self = std::rc::Rc::new(trait_mut);
+        }
+
         // A user `main` that returns a value cannot serve as the Rust entry
         // point directly (Result<i64, _> does not implement Termination);
         // route it through the renaming wrapper, which discards the value —
@@ -239,8 +305,8 @@ impl CodeGen for Module {
                 module_init_raw.push(s.clone());
             }
         }
-        let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols);
-        let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols);
+        let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols, &options);
+        let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols, &options);
 
         // Module-level code gets no per-function analysis pass, so run the
         // same type inference / empty-container pinning here: without it,
@@ -353,11 +419,11 @@ impl CodeGen for Module {
 
         // Hoist assigned names to declarations at the top of each generated
         // scope (assignments themselves lower to plain stores).
-        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols);
+        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols, &options);
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
-        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols);
+        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols, &options);
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -686,6 +752,7 @@ fn hoisted_name_set(
     body: &[crate::Statement],
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -694,7 +761,8 @@ fn hoisted_name_set(
     for s in body {
         symbols = s.clone().find_symbols(symbols);
     }
-    let scope = crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
+    let scope =
+        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
     let hoisted = scope
         .assigned
         .iter()
@@ -708,6 +776,7 @@ fn hoisted_declarations(
     body: &[crate::Statement],
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> TokenStream {
     // Class-aware mutation facts need the block's own assignments in the
     // symbol table (`c = Counter(...)` then `c.bump()` needs `c` mutable).
@@ -716,7 +785,7 @@ fn hoisted_declarations(
         symbols = s.clone().find_symbols(symbols);
     }
     let scope =
-        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
+        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
     let mut out = TokenStream::new();
     for name in &scope.assigned {
         // rust.bind names are compile-time symbols: the declaration

@@ -3760,6 +3760,21 @@ impl<T: Clone> PyAdd<Vec<T>> for Vec<T> {
     }
 }
 
+/// Python list repetition: [0] * 3 == [0, 0, 0]. The count is an i64
+/// (Python ints are i64 everywhere); a negative count yields an empty
+/// list, matching Python's `[] * -1 == []`.
+impl<T: Clone> PyMul<i64> for Vec<T> {
+    type Output = Vec<T>;
+    fn py_mul(&self, rhs: &i64) -> Vec<T> {
+        let n = (*rhs).max(0) as usize;
+        let mut out = Vec::with_capacity(self.len() * n);
+        for _ in 0..n {
+            out.extend_from_slice(self);
+        }
+        out
+    }
+}
+
 // ============================================================================
 // SUBSCRIPTS: x[i] reads, x[i] = v stores, and x[a:b:c] slices
 // ============================================================================

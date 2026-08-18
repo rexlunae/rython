@@ -109,6 +109,14 @@ pub struct PythonOptions {
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
 
+    /// The current module's package path within the generated crate
+    /// ("" for the crate root, "pkg" for pkg/__init__.py, "pkg.sub" for
+    /// pkg/sub/module.py). Relative imports (`from .x import y`,
+    /// `from ..x import y`) resolve against it; the empty default keeps
+    /// absolute-import behavior unchanged for any conversion that does not
+    /// set it.
+    pub module_path: Vec<String>,
+
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
     /// names ("int", "float", "str", "bool"). Set per function; consumed
@@ -129,10 +137,23 @@ pub struct PythonOptions {
     /// fails loudly at startup.
     pub numpy_backend: Option<String>,
 
-    /// How many times each name is READ in the current scope (set per
-    /// function by the type analysis). Move-prone positions (call
-    /// arguments, container elements) clone a non-Copy name that is read
-    /// more than once, so Python's share-by-reference does not become a
+    /// Class names in this module that participate in an inheritance
+    /// hierarchy (have a real base, or are used as a base by another
+    /// class). Those classes lower to struct + trait + impls instead of a
+    /// plain struct, so `self.helper()` calls can dispatch through the
+    /// trait. Set once per module; empty outside module generation.
+    pub hierarchy_classes: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Trait method names whose signature must be `&mut self`, keyed by the
+    /// owning (root) class of the trait. A method's trait signature widens
+    /// to `&mut self` when ANY definition in the hierarchy mutates self:
+    /// overrides re-emit into the root's trait, whose signature must fit
+    /// every impl, and call sites must borrow accordingly. Set once per
+    /// module; empty outside module generation (call sites then fall back
+    /// to walking the receiver's own chain).
+    pub trait_mut_self:
+        std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+
     /// Rust move error on reuse.
     pub use_counts: std::rc::Rc<std::collections::HashMap<String, usize>>,
 
@@ -170,6 +191,11 @@ pub struct PythonOptions {
     /// manifest; codegen resolves import statements against it and inserts
     /// `SymbolTableNode::RustModule` symbols. Empty in library use.
     pub rust_modules: std::rc::Rc<std::collections::HashMap<String, crate::RustModuleSpec>>,
+
+    /// Import names backed by vendored Python modules (`[python-modules]`
+    /// in rython.toml): `import pylev` lowers to `use crate::pylev;` — a
+    /// sibling module of the generated crate, not an external dependency.
+    pub python_modules: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 impl Default for PythonOptions {
@@ -191,15 +217,19 @@ impl Default for PythonOptions {
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
+            module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             numpy_backend: None,
+            hierarchy_classes: std::rc::Rc::new(std::collections::HashSet::new()),
+            trait_mut_self: std::rc::Rc::new(std::collections::HashMap::new()),
             use_counts: std::rc::Rc::new(std::collections::HashMap::new()),
             name_types: std::rc::Rc::new(std::collections::HashMap::new()),
             empty_pinned: std::rc::Rc::new(std::collections::HashMap::new()),
             hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
+            python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
         }
     }
 }

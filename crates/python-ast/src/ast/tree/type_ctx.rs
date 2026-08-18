@@ -59,10 +59,13 @@ pub enum TypeInfo {
     /// `PyRange`
     Range,
     /// `numpy::NdArray`
+    /// `numpy::NdArray`
     NdArray,
+    /// an instance of a class defined in this module (by class name); not
+    /// Copy, so reused values must be cloned at each move-prone use
+    Class(String),
     /// a borrow (`&[T]`, `&str`) from iteration or indexing
     Borrowed(Box<TypeInfo>),
-    /// anything we cannot or choose not to track
     PyObject,
 }
 
@@ -107,6 +110,10 @@ impl TypeInfo {
             }
             TypeInfo::Range => quote!(PyRange),
             TypeInfo::NdArray => quote!(numpy::NdArray),
+            TypeInfo::Class(name) => {
+                let ident = crate::safe_ident(name);
+                quote!(#ident)
+            }
             TypeInfo::Borrowed(inner) => {
                 let t = inner.to_rust_type();
                 quote!(&#t)
@@ -130,6 +137,7 @@ impl TypeInfo {
             TypeInfo::Option(_) => "Optional".into(),
             TypeInfo::Range => "range".into(),
             TypeInfo::NdArray => "ndarray".into(),
+            TypeInfo::Class(name) => name.clone(),
             TypeInfo::Borrowed(_) => "borrowed".into(),
             TypeInfo::PyObject => "unknown".into(),
         }
@@ -304,7 +312,15 @@ pub fn infer_type(
                     Box::new(TypeInfo::PyObject),
                     Box::new(TypeInfo::PyObject),
                 ),
-                _ => TypeInfo::PyObject,
+                _ => match symbols.get(&n.id) {
+                    // A class-construction call produces an instance of the
+                    // class (not Copy: reused instances must be cloned at
+                    // each move-prone use, matching Python's aliasing).
+                    Some(crate::SymbolTableNode::ClassDef(_)) => {
+                        TypeInfo::Class(n.id.clone())
+                    }
+                    _ => TypeInfo::PyObject,
+                },
             },
             ExprType::Attribute(attr) => {
                 // numpy functions produce arrays (`np.sum`, `numpy.mean`).

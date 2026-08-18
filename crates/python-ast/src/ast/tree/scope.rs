@@ -425,16 +425,17 @@ fn record_leaking_for_targets(
 pub(crate) fn class_call_resolver<'a>(
     ctx: &'a crate::CodeGenContext,
     symbols: &'a crate::SymbolTableScopes,
+    options: &'a crate::PythonOptions,
 ) -> impl Fn(&crate::Call) -> Option<bool> + 'a {
     move |call| {
         let ExprType::Attribute(attr) = call.func.as_ref() else {
             return None;
         };
         let class = crate::receiver_class(&attr.value, ctx, symbols)?;
-        if !class.methods().any(|m| m.name == attr.attr) {
+        if class.method_on_mro(&attr.attr, symbols).is_none() {
             return None;
         }
-        Some(class.method_needs_mut_self(&attr.attr, symbols))
+        Some(class.method_needs_mut_self(&attr.attr, symbols, options))
     }
 }
 

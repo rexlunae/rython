@@ -533,7 +533,11 @@ impl CodeGen for FunctionDef {
 
         // The Python convention is that functions that begin with a single underscore,
         // it's private. Otherwise, it's public. We formalize that by default.
-        let visibility = if self.name.starts_with("_") && !self.name.starts_with("__") {
+        // Trait items carry no visibility modifier at all (they are public
+        // through the trait); only inherent methods get one.
+        let visibility = if matches!(&ctx, CodeGenContext::Trait { .. }) {
+            quote!()
+        } else if self.name.starts_with("_") && !self.name.starts_with("__") {
             quote!()  // private, no visibility modifier
         } else if self.name.starts_with("__") && self.name.ends_with("__") {
             quote!(pub(crate))  // dunder methods are crate-visible
@@ -562,23 +566,30 @@ impl CodeGen for FunctionDef {
         // A `def` in a class body whose first parameter is `self` is a
         // method: `self` becomes the Rust receiver instead of a parameter —
         // `&mut self` when the method stores through `self`, directly or by
-        // calling another method of the class that does.
-        let is_method = matches!(&ctx, CodeGenContext::Class(_))
-            && self
-                .args
-                .posonlyargs
-                .first()
-                .or(self.args.args.first())
-                .is_some_and(|p| p.arg == "self");
+        // calling another method of the class that does. In a Trait context
+        // the method is emitted as a trait item (a default in the class's
+        // trait, or an override in an ancestor's trait's impl).
+        let is_method = matches!(
+            &ctx,
+            CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+        ) && self
+            .args
+            .posonlyargs
+            .first()
+            .or(self.args.args.first())
+            .is_some_and(|p| p.arg == "self");
         let mut render_args = self.args.clone();
         let method_mutates_self = is_method
             && match &ctx {
-                CodeGenContext::Class(class_name) => match symbols.get(class_name) {
-                    Some(crate::SymbolTableNode::ClassDef(c)) => {
-                        c.method_needs_mut_self(&self.name, &symbols)
+                CodeGenContext::Class(class_name)
+                | CodeGenContext::Trait { class: class_name, .. } => {
+                    match symbols.get(class_name) {
+                        Some(crate::SymbolTableNode::ClassDef(c)) => {
+                            c.method_needs_mut_self(&self.name, &symbols, &options)
+                        }
+                        _ => false,
                     }
-                    _ => false,
-                },
+                }
                 _ => false,
             };
         if is_method {
@@ -666,13 +677,20 @@ impl CodeGen for FunctionDef {
         let scope = crate::analyze_scope_with(
             &effective_body,
             &param_names,
-            &crate::class_call_resolver(&ctx, &symbols),
+            &crate::class_call_resolver(&ctx, &symbols, &options),
         );
         if is_method {
             param_names.pop();
         }
+        let forced_mut_self = matches!(
+            &ctx,
+            CodeGenContext::Trait {
+                force_mut_self: true,
+                ..
+            }
+        );
         let receiver = if is_method {
-            if method_mutates_self || scope.needs_mut.contains("self") {
+            if forced_mut_self || method_mutates_self || scope.needs_mut.contains("self") {
                 quote!(&mut self,)
             } else {
                 quote!(&self,)
@@ -896,9 +914,24 @@ impl CodeGen for FunctionDef {
         // inside functions; nothing in the lowerings inspects the outer
         // context (try/loop/async scopes are pushed explicitly below it),
         // except the enclosing class name, which the Function context carries
-        // so `self` keeps resolving in method bodies.
-        let body_ctx = CodeGenContext::Function {
-            class: ctx.enclosing_class_name().map(str::to_string),
+        // so `self` keeps resolving in method bodies. Trait method bodies
+        // keep the Trait context so field access through the generated
+        // accessors stays active.
+        let body_ctx = match &ctx {
+            CodeGenContext::Trait {
+                class,
+                generic,
+                super_target,
+                force_mut_self,
+            } => CodeGenContext::Trait {
+                class: class.clone(),
+                generic: *generic,
+                super_target: super_target.clone(),
+                force_mut_self: *force_mut_self,
+            },
+            _ => CodeGenContext::Function {
+                class: ctx.enclosing_class_name().map(str::to_string),
+            },
         };
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
             if Some(i) == argparse_parse_at {

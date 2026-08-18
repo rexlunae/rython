@@ -140,14 +140,38 @@ impl CodeGen for AugAssign {
             });
         }
 
-        let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // An attribute target (`self.age += 1`) is a read-modify-write on a
+        // place. In a generic trait default the LOAD accessor clones
+        // (`self.age()`) while the STORE must go through the mutable accessor
+        // (`*self.age_mut()`), so the two sides render differently.
+        let (target, target_load) = match &self.target {
+            ExprType::Attribute(attr) => {
+                let store = crate::ast::tree::attribute::to_rust_place(
+                    &attr.value,
+                    &attr.attr,
+                    &ctx,
+                    &options,
+                    &symbols,
+                    true,
+                )?;
+                let load = self
+                    .target
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                (store, load)
+            }
+            _ => {
+                let t = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                (t.clone(), t)
+            }
+        };
         let value = self.value.to_rust(ctx, options, symbols)?;
 
         // Generate the appropriate augmented assignment operator
         match self.op {
             // `+=` mirrors Python's `+` (string concat, list concat,
             // numeric promotion) via PyAdd.
-            BinOps::Add => Ok(quote!(#target = (#target).py_add(&(#value)))),
+            BinOps::Add => Ok(quote!(#target = (#target_load).py_add(&(#value)))),
             BinOps::Sub => Ok(quote!(#target -= #value)),
             BinOps::Mult => Ok(quote!(#target *= #value)),
             // Python's `/` is TRUE division: `x /= 2` on an int yields a
@@ -155,13 +179,13 @@ impl CodeGen for AugAssign {
             // elementwise) instead of Rust's truncating `/=` or an `as f64`
             // cast (an int target then fails to compile, which is loud
             // rather than quietly wrong).
-            BinOps::Div => Ok(quote!(#target = py_div(#target, #value))),
+            BinOps::Div => Ok(quote!(#target = py_div(#target_load, #value))),
             // Python // and % floor toward negative infinity / take the
             // divisor's sign; use the stdpython helpers instead of Rust's
             // truncating operators. The `?` propagates a catchable
             // ZeroDivisionError (issue #75).
-            BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target, #value)?)),
-            BinOps::Mod => Ok(quote!(#target = py_mod(#target, #value)?)),
+            BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target_load, #value)?)),
+            BinOps::Mod => Ok(quote!(#target = py_mod(#target_load, #value)?)),
             BinOps::BitAnd => Ok(quote!(#target &= #value)),
             BinOps::BitOr => Ok(quote!(#target |= #value)),
             BinOps::BitXor => Ok(quote!(#target ^= #value)),
@@ -169,7 +193,7 @@ impl CodeGen for AugAssign {
             BinOps::RShift => Ok(quote!(#target >>= #value)),
             BinOps::Pow => {
                 // Rust doesn't have **= operator, so we need to expand it
-                Ok(quote!(#target = py_pow(#target, #value)))
+                Ok(quote!(#target = py_pow(#target_load, #value)))
             },
             BinOps::MatMult => {
                 // Matrix multiplication assignment - not directly supported in Rust

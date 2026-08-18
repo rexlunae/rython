@@ -2063,11 +2063,16 @@ fn composed_fields_type_and_resolve_through_chains() {
 
 #[test]
 fn unsupported_class_constructs_error_loudly() {
-    let err = compile_err(
-        "class Base:\n    pass\n\nclass Child(Base):\n    pass\n",
-        "inherit.py",
+    // Inheritance itself is now supported; bases that rython cannot emit a
+    // struct for (imported modules, builtins) still fail loudly.
+    let err = compile_err("class C(str):\n    pass\n", "builtin_base.py");
+    assert!(
+        err.contains("not a class defined in this module")
+            || err.contains("inheritance")
+            || err.contains("base"),
+        "error: {}",
+        err
     );
-    assert!(err.contains("inheritance"), "error: {}", err);
 
     let err = compile_err("class C:\n    VERSION = 3\n", "classattr.py");
     assert!(err.contains("class attribute"), "error: {}", err);
@@ -2077,6 +2082,203 @@ fn unsupported_class_constructs_error_loudly() {
         "noneattr.py",
     );
     assert!(err.contains("cannot infer a type"), "error: {}", err);
+}
+
+// ---- Trait-based inheritance ----
+
+#[test]
+fn inheritance_emits_trait_machinery() {
+    let src = concat!(
+        "class Base:\n",
+        "    def __init__(self, v: int):\n",
+        "        self.v = v\n",
+        "\n",
+        "    def get(self) -> int:\n",
+        "        return self.v\n",
+        "\n",
+        "class Child(Base):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "inherit.py");
+    assert!(out.contains("trait BaseTrait"), "generated: {}", out);
+    assert!(out.contains("impl BaseTrait for Child"), "generated: {}", out);
+    assert!(
+        out.contains("pub __rython_base : Base"),
+        "derived struct must embed the direct base: {}",
+        out
+    );
+}
+
+#[test]
+fn override_reemits_into_ancestor_trait_impl() {
+    // Dog.describe overrides Animal.describe: it must be re-emitted inside
+    // `impl AnimalTrait for Dog` (Animal's trait), not into Dog's own trait.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return self.name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str, breed: str):\n",
+        "        super().__init__(name)\n",
+        "        self.breed = breed\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return super().describe() + \" \" + self.breed\n",
+        "\n",
+        "    def bark(self) -> str:\n",
+        "        return \"woof\"\n",
+    );
+    let out = compile(src, "override.py");
+    let animal_impl = out.find("impl AnimalTrait for Dog");
+    let dog_trait = out.find("trait DogTrait");
+    let dog_impl = out.find("impl DogTrait for Dog");
+    assert!(
+        animal_impl.is_some() && dog_impl.is_some(),
+        "missing impls: {}",
+        out
+    );
+    let animal_impl = animal_impl.unwrap();
+    let dog_trait = dog_trait.unwrap();
+    let dog_impl = dog_impl.unwrap();
+    // describe must NOT be a member of Dog's own trait (it belongs to
+    // Animal's), and must appear in `impl AnimalTrait for Dog`.
+    assert!(
+        !out[dog_trait..dog_impl].contains("fn describe"),
+        "describe must not live in DogTrait: {}",
+        out
+    );
+    assert!(
+        out[animal_impl..].contains("fn describe (& self"),
+        "describe must be re-emitted in AnimalTrait impl: {}",
+        out
+    );
+    // bark is a NEW method: it goes into Dog's own trait as a default.
+    assert!(
+        out[dog_trait..dog_impl].contains("fn bark (& self"),
+        "bark must be a DogTrait default: {}",
+        out
+    );
+}
+
+#[test]
+fn super_lowers_to_the_embedded_base() {
+    let src = concat!(
+        "class Base:\n",
+        "    def __init__(self, v: int):\n",
+        "        self.v = v\n",
+        "\n",
+        "    def get(self) -> int:\n",
+        "        return self.v\n",
+        "\n",
+        "class Child(Base):\n",
+        "    def get(self) -> int:\n",
+        "        return super().get() + 1\n",
+    );
+    let out = compile(src, "super.py");
+    assert!(
+        out.contains("(self . __rython_base) . get ()"),
+        "super().get() must call through the embedded base: {}",
+        out
+    );
+}
+
+#[test]
+fn mutating_override_widens_the_trait_signature() {
+    // Dog overrides Animal.grow with a mutating body; Cat inherits the
+    // non-mutating default. The trait signature must widen to `&mut self`
+    // for BOTH, or the impls would not agree — so a Cat-typed call borrows
+    // mutably too.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def grow(self) -> None:\n",
+        "        pass\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def grow(self) -> None:\n",
+        "        self.name = self.name + \"!\"\n",
+        "\n",
+        "class Cat(Animal):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "mut_override.py");
+    // The trait default itself must be &mut self (widened by Dog's override).
+    let trait_decl = out.find("trait AnimalTrait");
+    let impl_animal = out.find("impl AnimalTrait for Animal");
+    assert!(trait_decl.is_some() && impl_animal.is_some(), "{}", out);
+    assert!(
+        out[trait_decl.unwrap()..impl_animal.unwrap()].contains("fn grow (& mut self"),
+        "trait signature must widen to &mut self: {}",
+        out
+    );
+}
+
+#[test]
+fn grandchild_override_super_targets_the_definer_base() {
+    // Dog.describe overrides Animal.describe and calls super() inside it;
+    // Puppy inherits WITHOUT overriding. The re-emitted Dog body inside
+    // `impl AnimalTrait for Puppy` must therefore walk TWO embedded base
+    // levels (Dog's base is Animal, reached through Puppy's Dog).
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return self.name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return super().describe() + \" (dog)\"\n",
+        "\n",
+        "class Puppy(Dog):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "deep_super.py");
+    // Dog's body re-emitted in `impl AnimalTrait for Puppy`: super() must
+    // walk to Animal (two levels) even though Puppy's direct base is Dog.
+    assert!(
+        out.contains("(self . __rython_base . __rython_base) . describe ()"),
+        "re-emitted Dog override must super() to Animal: {}",
+        out
+    );
+}
+
+#[test]
+fn own_override_super_targets_the_direct_base() {
+    // Puppy's OWN describe calls super().describe(): it resolves Dog's
+    // override (one level up), so it walks ONE embedded base level.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return self.name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def describe(self) -> str:\n",
+        "        return super().describe() + \" (dog)\"\n",
+        "\n",
+        "class Puppy(Dog):\n",
+        "    def describe(self) -> str:\n",
+        "        return \"puppy \" + super().describe()\n",
+    );
+    let out = compile(src, "own_super.py");
+    assert!(
+        out.contains("(self . __rython_base) . describe ()"),
+        "Puppy's super() must hit Dog's struct: {}",
+        out
+    );
 }
 
 #[test]

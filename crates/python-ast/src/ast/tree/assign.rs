@@ -179,10 +179,23 @@ impl<'a> CodeGen for Assign {
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
-            let target_code =
-                target
+            // An attribute store target renders in place flavor: in a
+            // generic trait default, `self.f = v` must store through the
+            // mutable accessor (`*self.f_mut() = v`) rather than the load
+            // accessor (which clones).
+            let target_code = match target {
+                ExprType::Attribute(attr) => crate::ast::tree::attribute::to_rust_place(
+                    &attr.value,
+                    &attr.attr,
+                    &ctx,
+                    &options,
+                    &symbols,
+                    true,
+                )?,
+                _ => target
                     .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+            };
             Ok(match target {
                 ExprType::Name(name) => {
                     if !value_is_none

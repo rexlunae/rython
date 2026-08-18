@@ -142,6 +142,33 @@ impl CodeGen for Import {
                 tokens.extend(TokenStream::new());
                 continue;
             }
+            // Import of a vendored Python module (`[python-modules]` in
+            // rython.toml): it's a sibling module of the generated crate.
+            // Attribute calls lower to `crate::textlib::fn` paths, so the
+            // plain spelling emits no `use` — a `use crate::textlib;` in
+            // the binary would collide with the `mod textlib;` declaration
+            // that brings the sibling module into the bin crate. The
+            // aliased spelling still needs the import to bind the alias
+            // (`use crate::textlib as t;` — a different name, no clash).
+            {
+                let root = alias.name.split('.').next().unwrap_or(&alias.name);
+                if options.python_modules.contains(root) {
+                    if let Some(asname) = &alias.asname {
+                        let names = if alias.name.contains('.') {
+                            let parts: Vec<&str> = alias.name.split('.').collect();
+                            let idents: Vec<_> =
+                                parts.iter().map(|part| crate::safe_ident(part)).collect();
+                            quote!(#(#idents)::*)
+                        } else {
+                            let single_name = crate::safe_ident(&alias.name);
+                            quote!(#single_name)
+                        };
+                        let name = crate::safe_ident(asname);
+                        tokens.extend(quote! {use crate::#names as #name;});
+                    }
+                    continue;
+                }
+            }
             if options.no_std {
                 let root = alias.name.split('.').next().unwrap_or(&alias.name);
                 if is_std_only_module(root) {
@@ -261,6 +288,12 @@ impl CodeGen for ImportFrom {
                 alias.name.clone(),
                 SymbolTableNode::ImportFrom(self.clone()),
             );
+            // `from pylev import wf as w`: the alias resolves to the
+            // canonical name so call lowering propagates exceptions and
+            // attribute access treats it as the imported value.
+            if let Some(asname) = &alias.asname {
+                symbols.insert(asname.clone(), SymbolTableNode::Alias(alias.name.clone()));
+            }
         }
         symbols
     }
@@ -361,8 +394,31 @@ impl CodeGen for ImportFrom {
             .split('.')
             .filter(|part| !part.is_empty())
             .collect();
+        // Relative imports (`from .x import y`, `from ..x import y`, level
+        // > 0) resolve against the CURRENT module's package path
+        // (`options.module_path`, set by the converter; empty at the crate
+        // root). level 1 is this package, level 2 its parent, and so on;
+        // the resolved path always stays inside the generated crate, since
+        // the package and all its submodules are compiled into it.
+        let base_parts: Vec<_> = if self.level > 0 {
+            let cur = &options.module_path;
+            if self.level > cur.len() + 1 {
+                return Err(format!(
+                    "`from {} import ...` (level {}): relative import goes above \
+                     the crate root",
+                    self.module, self.level
+                )
+                .into());
+            }
+            let cut = cur.len() + 1 - self.level;
+            cur[..cut].iter().map(|p| crate::safe_ident(p)).collect()
+        } else {
+            Vec::new()
+        };
         let module_path: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
-        let root = if parts
+        let root = if self.level > 0 {
+            quote!(crate)
+        } else if parts
             .first()
             .is_some_and(|first| is_stdpython_module(first))
         {
@@ -385,7 +441,8 @@ impl CodeGen for ImportFrom {
                 continue;
             }
             if alias.name == "*" {
-                tokens.extend(quote! { use #root #(::#module_path)*::*; });
+                let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+                tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::*; });
                 continue;
             }
             // Some runtime functions split into arity/keyword-specific
@@ -421,17 +478,24 @@ impl CodeGen for ImportFrom {
             };
 
             let name = crate::safe_ident(&alias.name);
+            // Relative imports re-export from a sibling module: Python
+            // treats imported names as module attributes (the package
+            // `__init__.py` re-export pattern), so they lower to `pub use`
+            // — callers reach `textlib.double` through the re-export chain.
+            // Absolute imports of user modules stay plain `use`: callers
+            // import from the defining module directly.
+            let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
             let import = match &alias.asname {
                 None if variants.is_empty() => {
-                    quote! { use #root #(::#module_path)*::#name; }
+                    quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name; }
                 }
                 None => quote! {
                     #[allow(unused_imports)]
-                    use #root #(::#module_path)*::#name;
+                    #visibility use #root #(::#base_parts)* #(::#module_path)*::#name;
                 },
                 Some(asname) => {
                     let asname = crate::safe_ident(asname);
-                    quote! { use #root #(::#module_path)*::#name as #asname; }
+                    quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
                 }
             };
             tokens.extend(import);
@@ -440,7 +504,7 @@ impl CodeGen for ImportFrom {
                 let v = crate::safe_ident(variant);
                 tokens.extend(quote! {
                     #[allow(unused_imports)]
-                    use #root #(::#module_path)*::#v;
+                    use #root #(::#base_parts)* #(::#module_path)*::#v;
                 });
             }
         }

@@ -111,8 +111,21 @@ pub(crate) fn subscript_receiver_place(
                 ),
             }
         }
-        ExprType::Name(_) | ExprType::Attribute(_) => {
+        ExprType::Name(_) => {
             expr.clone().to_rust(ctx, options, symbols)
+        }
+        ExprType::Attribute(attr) => {
+            // Attribute receivers render in place flavor: in a generic trait
+            // default, `self.items[i]` must mutate through `self.items_mut()`,
+            // not the cloning load accessor.
+            crate::ast::tree::attribute::to_rust_place(
+                &attr.value,
+                &attr.attr,
+                &ctx,
+                &options,
+                &symbols,
+                false,
+            )
         }
         other => Err(format!(
             "cannot assign into a subscript of this expression: {:?} (only \
