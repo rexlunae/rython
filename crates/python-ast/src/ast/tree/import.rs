@@ -285,7 +285,7 @@ impl ImportFrom {
         let parts: Vec<&str> = self.module.split('.').filter(|p| !p.is_empty()).collect();
         if self.level > 0 {
             let cur = &options.module_path;
-            let cut = cur.len() + 1 - self.level;
+            let cut = (cur.len() + 1).saturating_sub(self.level);
             cur[..cut]
                 .iter()
                 .map(|s| s.as_str())
