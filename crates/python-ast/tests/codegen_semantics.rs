@@ -39,10 +39,13 @@ fn list_literals_keep_element_types() {
 }
 
 #[test]
-fn range_over_len_coerces_usize_to_i64() {
-    // Issue #100: len() yields usize but range() wants i64; the generated
-    // code must convert, not rely on a generic that fails to resolve for
-    // expression arguments.
+fn len_is_i64_everywhere() {
+    // len() lowers to `len(&x) as i64` (Issue #100 follow-up): the runtime
+    // length is usize, but Python ints are i64 everywhere else, and the
+    // type inference must agree — an empty list pinned from
+    // `xs.append(len(s))` must be Vec<i64>, and index/range positions must
+    // NOT get a redundant (and wrong) `.try_into().unwrap()` on a value
+    // that is already i64.
     let out = compile(
         "def forward(x: list[float]) -> list[float]:\n\
          \x20   result: list[float] = []\n\
@@ -52,13 +55,93 @@ fn range_over_len_coerces_usize_to_i64() {
         "issue100.py",
     );
     assert!(
-        out.contains("try_into () . unwrap ()"),
-        "len() must convert usize → i64: {}",
+        out.contains("len (& (x)) as i64"),
+        "len() must cast to i64: {}",
+        out
+    );
+    assert!(
+        !out.contains("try_into ()"),
+        "i64 len() must not be re-coerced: {}",
         out
     );
     assert!(
         out.contains("Vec :: < f64 > :: new ()"),
         "empty list must be pinned from the append: {}",
+        out
+    );
+}
+
+#[test]
+fn len_append_pins_empty_list_to_i64() {
+    // Issue: len() infers Usize while codegen emits i64, so an empty list
+    // whose only pinning use is `xs.append(len(s))` was declared
+    // `Vec::<usize>::new()` and then rejected when the appended i64 did
+    // not match. The pinning must agree with the emission.
+    let out = compile(
+        "def sizes(ss: list[str]) -> list[int]:\n\
+         \x20   xs = []\n\
+         \x20   for s in ss:\n\
+         \x20       xs.append(len(s))\n\
+         \x20   return xs\n",
+        "lenpin.py",
+    );
+    assert!(
+        out.contains("Vec :: < i64 > :: new ()"),
+        "empty list must pin to i64 (matching len() as i64): {}",
+        out
+    );
+    assert!(
+        !out.contains("usize"),
+        "no usize may appear in the generated code: {}",
+        out
+    );
+}
+
+#[test]
+fn field_named_base_in_hierarchy_is_a_loud_error() {
+    // A class that inherits and also stores an attribute named `base`
+    // would generate two `fn base` trait items (the embedded-base accessor
+    // plus the field accessor) — E0428 in rustc. It must be a clean
+    // conversion-time error, like the `__rython_base` field collision.
+    let err = compile_err(
+        "class Animal:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.name = 'x'\n\
+         class Dog(Animal):\n\
+         \x20   def __init__(self):\n\
+         \x20       self.base = 1\n",
+        "basefield.py",
+    );
+    assert!(
+        err.contains("attribute named `base`") && err.contains("base accessor"),
+        "expected loud base-field collision error, got: {}",
+        err
+    );
+    // `base_mut` collides the same way; `base` on a BASE-LESS class is fine
+    // (no embedded-base accessor is emitted).
+    let err = compile_err(
+        "class Animal:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.name = 'x'\n\
+         class Dog(Animal):\n\
+         \x20   def __init__(self):\n\
+         \x20       self.base_mut = 1\n",
+        "basemutfield.py",
+    );
+    assert!(
+        err.contains("attribute named `base_mut`"),
+        "expected loud base_mut-field collision error, got: {}",
+        err
+    );
+    let out = compile(
+        "class Base:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.base = 1\n",
+        "basefieldok.py",
+    );
+    assert!(
+        out.contains("pub base : i64") && !out.contains("Trait"),
+        "base field on a base-less class must compile: {}",
         out
     );
 }

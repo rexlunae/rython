@@ -289,6 +289,87 @@ fn pyo3_bindings_exclude_vendored_dependency_functions() {
     );
 }
 
+/// A vendored module's class imported by the app: calling an inherited
+/// method whose trait signature was WIDENED to `&mut self` in the defining
+/// module (by a sibling's mutating override) must borrow the receiver
+/// mutably at the call site. The `trait_mut_self` widening table is
+/// per-module, so the importing module used to miss it and emit a
+/// read-only binding the generated trait impl rejects.
+#[test]
+fn imported_hierarchy_method_widening_crosses_modules() {
+    let scratch = Scratch::new("xmod");
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/animals.py"),
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def grow(self) -> int:\n",
+            "        return 0\n",
+            "\n",
+            "class Cat(Animal):\n",
+            "    pass\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "        self.hunger = 0\n",
+            "\n",
+            "    def grow(self) -> int:\n",
+            "        self.hunger = 1\n",
+            "        return 1\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nanimals = { path = \"vendor/animals.py\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("app.py"),
+        concat!(
+            "from animals import Cat\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    c = Cat(\"Milo\")\n",
+            "    c.grow()\n",
+            "    print(c.name)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    // The call site must borrow c mutably: AnimalTrait::grow was widened to
+    // `&mut self` in animals.py because Dog.grow mutates self.hunger.
+    let main_rs = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains("let mut c"),
+        "call site must borrow c mutably (cross-module widening): {}",
+        main_rs
+    );
+    // And the trait must be in scope for the call to resolve.
+    assert!(
+        main_rs.contains("AnimalTrait"),
+        "import must bring AnimalTrait into scope: {}",
+        main_rs
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "binary exited nonzero");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Milo");
+}
+
 /// A package-directory dependency with a relative import inside it:
 /// `__init__.py` re-exports from `.core`, and the app reaches the function
 /// both directly and through the module path.

@@ -1272,3 +1272,53 @@ pub fn module_class_def(
         _ => None,
     })
 }
+
+/// Whether the trait of the hierarchy rooted at `root_name` widens `method`
+/// to `&mut self` in ANY module of the crate.
+///
+/// `trait_mut_self` is computed per module in `Module::to_rust`, so a class
+/// imported from another module has no entry in the importing module's
+/// table — yet its trait was widened (and emitted) in the DEFINING module,
+/// so call sites in the importing module must borrow the receiver mutably
+/// to match. Recomputing the module-level precompute over the shared
+/// cross-module ASTs (`options.module_defs`) recovers the defining module's
+/// widening, including the sibling-class mutations that caused it.
+///
+/// The scan is only reached when the current module's own precompute has no
+/// entry for `root_name` — i.e. the class is not a hierarchy class of the
+/// current module — so it is not on the hot path. A same-named class in
+/// another module may produce a spurious `true` (an extra `let mut`), which
+/// is always accepted by rustc; a spurious `false` (missing `mut`) is the
+/// bug this prevents, and cannot occur when the defining module is in
+/// `module_defs`, as it is for every module rypip transpiles.
+pub fn module_widens_method(
+    options: &PythonOptions,
+    root_name: &str,
+    method: &str,
+) -> bool {
+    for module in options.module_defs.values() {
+        let symbols = (**module).clone().find_symbols(SymbolTableScopes::new());
+        let mut classes = Vec::new();
+        collect_class_defs(&module.raw.body, &mut classes);
+        for c in &classes {
+            if !c.methods().any(|mm| mm.name == method) {
+                continue;
+            }
+            if !c.own_method_mutates(method, &symbols, options) {
+                continue;
+            }
+            // The root = the TOPMOST class in the chain that defines the
+            // method (the trait owner) — the same key Module::to_rust uses.
+            let chain = c.base_chain(&symbols);
+            if chain
+                .iter()
+                .rev()
+                .find(|cc| cc.methods().any(|mm| mm.name == method))
+                .is_some_and(|root| root.name == root_name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}

@@ -227,11 +227,25 @@ impl ClassDef {
             .into_iter()
             .rev()
             .find(|c| c.methods().any(|mm| mm.name == method));
-        if let Some(root) = root
+        if let Some(root) = root.as_ref()
             && options
                 .trait_mut_self
                 .get(&root.name)
                 .is_some_and(|s| s.contains(method))
+        {
+            return true;
+        }
+        // Cross-module widening: `trait_mut_self` is computed per module in
+        // `Module::to_rust`, so a class imported from another module of the
+        // same crate has no entry in the CURRENT module's table — yet its
+        // trait was widened (and emitted) in the DEFINING module, possibly
+        // by a sibling class this module never sees. When the local table
+        // has no entry for the root, the class is not a hierarchy class of
+        // the current module; recompute the precompute over the shared
+        // cross-module ASTs so call sites borrow mutably to match.
+        if let Some(root) = root.as_ref()
+            && !options.module_defs.is_empty()
+            && crate::module_widens_method(options, &root.name, method)
         {
             return true;
         }
@@ -632,6 +646,21 @@ impl CodeGen for ClassDef {
         // The generated accessors (`base`, `base_mut`, `<field>_mut`) and the
         // trait name (`{Class}Trait`) must not collide with user code.
         if in_hierarchy {
+            // A FIELD named `base`/`base_mut` collides with the embedded-base
+            // accessors the trait declares when the class has a base — two
+            // identically named trait items (E0428) instead of a clean error.
+            if base.is_some()
+                && let Some((fname, _)) = fields
+                    .iter()
+                    .find(|(name, _)| matches!(name.as_str(), "base" | "base_mut"))
+            {
+                return Err(format!(
+                    "class `{}` assigns an attribute named `{}`, which collides with \
+                     the base accessor generated for inheritance; rename the attribute",
+                    self.name, fname
+                )
+                .into());
+            }
             for m in self.methods() {
                 if matches!(m.name.as_str(), "base" | "base_mut") {
                     return Err(format!(
