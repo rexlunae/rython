@@ -218,6 +218,7 @@ impl ClassDef {
         let root = self
             .base_chain(symbols)
             .into_iter()
+            .rev()
             .find(|c| c.methods().any(|mm| mm.name == method));
         if let Some(root) = root
             && options
