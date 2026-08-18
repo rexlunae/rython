@@ -5,6 +5,192 @@
 
 use python_ast::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse};
 
+/// Two-module crate for the cross-module trait-mut cache tests: module A
+/// defines a hierarchy whose trait widens (Dog's mutating `grow` override
+/// widens Animal's trait), module B imports it and calls `grow` on a
+/// Dog-typed parameter. The importing module's own per-module precompute
+/// has no entry for Animal (the hierarchy lives in A), so call sites in B
+/// must consult the merged cross-module table.
+fn cross_module_fixture() -> (std::rc::Rc<python_ast::Module>, PythonOptions) {
+    let a = parse(
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def grow(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def grow(self) -> None:\n",
+            "        self.name = self.name + \"!\"\n",
+        ),
+        "animals.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["animals".to_string()], std::rc::Rc::new(a));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    (options.module_defs.values().next().unwrap().clone(), options)
+}
+
+#[test]
+fn composition_chain_store_goes_through_mut_accessors() {
+    // A store through a composition chain (`self.inner.x = v`) inside a
+    // generic trait default must write through the MUTABLE accessor of
+    // every hop: `self.inner_mut().x`. The old lowering rendered the
+    // receiver in load flavor (`self.inner().x`), which clones the inner
+    // struct — the store silently vanished.
+    let src = concat!(
+        "class Inner:\n",
+        "    def __init__(self, x: int):\n",
+        "        self.x = x\n",
+        "\n",
+        "class Outer(Inner):\n",
+        "    def __init__(self):\n",
+        "        self.inner: Inner = Inner(0)\n",
+        "\n",
+        "    def mutate(self):\n",
+        "        self.inner.x = 5\n",
+        "\n",
+        "class OuterChild(Outer):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "compose_store.py");
+    // The mutation widens the trait, so the default runs on &mut self.
+    assert!(
+        out.contains("fn mutate (& mut self ,"),
+        "chain store must widen the trait: {}",
+        out
+    );
+    assert!(
+        out.contains("self . inner_mut () . x"),
+        "store must go through self.inner_mut().x, not the cloning load: {}",
+        out
+    );
+    assert!(
+        !out.contains("self . inner () . x ="),
+        "store must not land on a clone (self.inner().x = ...): {}",
+        out
+    );
+}
+
+#[test]
+fn composition_chain_mutating_method_uses_mut_receivers() {
+    // `self.inner.bump()` (user-defined mutating callee) and
+    // `self.inner.nums.append(v)` (builtin mutating method) on composition
+    // fields must render the WHOLE receiver chain in place flavor inside a
+    // generic trait default. The one-hop-only rewrite used to leave deeper
+    // chains on the cloning load accessors.
+    let src = concat!(
+        "class Inner:\n",
+        "    def __init__(self, nums: list[int]):\n",
+        "        self.nums = nums\n",
+        "\n",
+        "    def bump(self):\n",
+        "        self.nums.append(2)\n",
+        "\n",
+        "class Outer(Inner):\n",
+        "    def __init__(self):\n",
+        "        self.inner: Inner = Inner([1])\n",
+        "\n",
+        "    def mutate(self):\n",
+        "        self.inner.bump()\n",
+        "        self.inner.nums.append(3)\n",
+        "\n",
+        "class OuterChild(Outer):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "compose_call.py");
+    assert!(
+        out.contains("(self . inner_mut ()) . bump ()"),
+        "user-defined mutating callee must go through self.inner_mut(): {}",
+        out
+    );
+    assert!(
+        out.contains("(self . inner_mut () . nums) . push"),
+        "builtin mutating method must go through self.inner_mut().nums: {}",
+        out
+    );
+    assert!(
+        !out.contains("self . inner () . nums ()"),
+        "must not mutate through the cloning load accessors: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_destructuring_stores_through_mut_accessors() {
+    // `self.x, self.y = ...` in a generic trait default destructures INTO
+    // the fields: each attribute target must render through its mutable
+    // accessor, not through the cloning load form.
+    let src = concat!(
+        "class Base:\n",
+        "    def __init__(self):\n",
+        "        self.x = 0\n",
+        "        self.y = 0\n",
+        "\n",
+        "    def reset(self):\n",
+        "        self.x, self.y = 1, 2\n",
+        "\n",
+        "class Child(Base):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "tuple_target.py");
+    assert!(
+        out.contains("* self . x_mut () , * self . y_mut ()"),
+        "tuple targets must destructure through the mut accessors: {}",
+        out
+    );
+}
+
+#[test]
+fn cross_module_mut_table_computed_once_and_cached() {
+    // The first fallback call builds the merged table over every module of
+    // the crate; the scan finds Dog's mutating override and widens
+    // Animal.grow — the root of the trait Dog's method re-emits into.
+    let (_, options) = cross_module_fixture();
+    assert!(
+        python_ast::module_widens_method_cached(&options, "Animal", "grow"),
+        "Dog's mutating override must widen Animal.grow across modules"
+    );
+    // The table is now cached: repeated lookups are HashMap hits, not
+    // re-scans of the module ASTs.
+    assert!(
+        matches!(
+            &*options.cross_module_mut_self.borrow(),
+            python_ast::CrossModuleMutSelf::Computed(_)
+        ),
+        "first fallback must leave the merged table cached"
+    );
+    assert!(python_ast::module_widens_method_cached(&options, "Animal", "grow"));
+    // A method no definition mutates stays un-widened.
+    assert!(!python_ast::module_widens_method_cached(&options, "Animal", "describe"));
+}
+
+#[test]
+fn cross_module_mut_reentrant_guard_does_not_recompute() {
+    // During the one-time scan, the scan's own per-method analysis consults
+    // method_needs_mut_self again. The Computing sentinel must answer false
+    // (the direct chain walk in method_needs_mut_self resolves the call)
+    // instead of recursing into another scan.
+    let (_, options) = cross_module_fixture();
+    *options.cross_module_mut_self.borrow_mut() = python_ast::CrossModuleMutSelf::Computing;
+    assert!(
+        !python_ast::module_widens_method_cached(&options, "Animal", "grow"),
+        "re-entrant fallback during a scan must not recompute"
+    );
+    assert!(
+        matches!(
+            &*options.cross_module_mut_self.borrow(),
+            python_ast::CrossModuleMutSelf::Computing
+        ),
+        "the in-progress scan state must be left untouched"
+    );
+}
 fn compile(src: &str, name: &str) -> String {
     let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed for {:?}: {}", src, e));
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());

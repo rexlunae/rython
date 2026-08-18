@@ -6,7 +6,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
+use crate::{CodeGen, CodeGenContext, CrossModuleMutSelf, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1280,45 +1280,95 @@ pub fn module_class_def(
 /// imported from another module has no entry in the importing module's
 /// table — yet its trait was widened (and emitted) in the DEFINING module,
 /// so call sites in the importing module must borrow the receiver mutably
-/// to match. Recomputing the module-level precompute over the shared
-/// cross-module ASTs (`options.module_defs`) recovers the defining module's
-/// widening, including the sibling-class mutations that caused it.
+/// to match. This consults the once-per-conversion merged table
+/// ([`cross_module_mut_self_table`], cached in
+/// `options.cross_module_mut_self`) instead of re-deriving the whole-crate
+/// analysis for every call site.
 ///
 /// The scan is only reached when the current module's own precompute has no
 /// entry for `root_name` — i.e. the class is not a hierarchy class of the
-/// current module — so it is not on the hot path. A same-named class in
-/// another module may produce a spurious `true` (an extra `let mut`), which
-/// is always accepted by rustc; a spurious `false` (missing `mut`) is the
-/// bug this prevents, and cannot occur when the defining module is in
-/// `module_defs`, as it is for every module rypip transpiles.
-pub fn module_widens_method(
+/// current module — so it is not on the hot path once the table is cached.
+/// A same-named class in another module may produce a spurious `true` (an
+/// extra `let mut`), which is always accepted by rustc; a spurious `false`
+/// (missing `mut`) is the bug this prevents, and cannot occur when the
+/// defining module is in `module_defs`, as it is for every module rypip
+/// transpiles.
+pub fn module_widens_method_cached(
     options: &PythonOptions,
     root_name: &str,
     method: &str,
 ) -> bool {
+    {
+        let state = options.cross_module_mut_self.borrow();
+        match &*state {
+            CrossModuleMutSelf::Computed(table) => {
+                return table.get(root_name).is_some_and(|s| s.contains(method));
+            }
+            CrossModuleMutSelf::Computing => {
+                // Re-entrant fallback while the one-time scan is building
+                // the table (the scan's own per-method analysis consults
+                // method_needs_mut_self again): return false and let the
+                // direct chain walk in method_needs_mut_self answer —
+                // recomputing here would recurse.
+                return false;
+            }
+            CrossModuleMutSelf::Uncomputed => {}
+        }
+    }
+    *options.cross_module_mut_self.borrow_mut() = CrossModuleMutSelf::Computing;
+    let table = cross_module_mut_self_table(options);
+    *options.cross_module_mut_self.borrow_mut() =
+        CrossModuleMutSelf::Computed(std::rc::Rc::new(table));
+    options
+        .cross_module_mut_self
+        .borrow()
+        .computed()
+        .is_some_and(|t| t.get(root_name).is_some_and(|s| s.contains(method)))
+}
+
+/// Build the merged trait-mut table over every module of the crate: root
+/// class name → method names whose trait signature must be `&mut self`
+/// (because some definition in the hierarchy mutates self). Mirrors the
+/// per-module precompute in `Module::to_rust` (same root = topmost definer
+/// keying, same `own_method_mutates` test), applied to the shared
+/// cross-module ASTs (`options.module_defs`) so a sibling module's mutation
+/// widens the defining module's trait. Re-entrant `method_needs_mut_self`
+/// fallbacks during the scan see the `Computing` sentinel and answer via
+/// the direct chain walk, so the build does not recurse into itself.
+pub fn cross_module_mut_self_table(
+    options: &PythonOptions,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut table = std::collections::HashMap::<
+        String,
+        std::collections::HashSet<String>,
+    >::new();
     for module in options.module_defs.values() {
         let symbols = (**module).clone().find_symbols(SymbolTableScopes::new());
         let mut classes = Vec::new();
         collect_class_defs(&module.raw.body, &mut classes);
         for c in &classes {
-            if !c.methods().any(|mm| mm.name == method) {
-                continue;
-            }
-            if !c.own_method_mutates(method, &symbols, options) {
-                continue;
-            }
-            // The root = the TOPMOST class in the chain that defines the
-            // method (the trait owner) — the same key Module::to_rust uses.
             let chain = c.base_chain(&symbols);
-            if chain
-                .iter()
-                .rev()
-                .find(|cc| cc.methods().any(|mm| mm.name == method))
-                .is_some_and(|root| root.name == root_name)
-            {
-                return true;
+            for m in c.methods() {
+                if m.name == "__init__" {
+                    continue;
+                }
+                if c.own_method_mutates(&m.name, &symbols, options) {
+                    // The root = the TOPMOST class in the chain that
+                    // defines the method (the trait owner) — the same key
+                    // Module::to_rust uses.
+                    if let Some(root) = chain
+                        .iter()
+                        .rev()
+                        .find(|cc| cc.methods().any(|mm| mm.name == m.name))
+                    {
+                        table
+                            .entry(root.name.clone())
+                            .or_default()
+                            .insert(m.name.clone());
+                    }
+                }
             }
         }
     }
-    false
+    table
 }

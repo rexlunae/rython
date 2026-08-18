@@ -192,6 +192,19 @@ impl<'a> CodeGen for Assign {
                     &symbols,
                     true,
                 )?,
+                // Destructuring targets are places too: `self.x, self.y = v`
+                // in a generic trait default must store through the mutable
+                // accessors (`*self.x_mut(), *self.y_mut()`), not through
+                // clones of the fields.
+                ExprType::Tuple(tuple) => {
+                    let mut elts = Vec::with_capacity(tuple.elts.len());
+                    for elt in &tuple.elts {
+                        elts.push(crate::ast::tree::attribute::to_rust_place_expr(
+                            elt, &ctx, &options, &symbols, true,
+                        )?);
+                    }
+                    quote!((#(#elts),*))
+                }
                 _ => target
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
@@ -207,8 +220,9 @@ impl<'a> CodeGen for Assign {
                         quote!(#target_code = #value;)
                     }
                 }
-                // Destructuring assignment to the hoisted names.
-                ExprType::Tuple(_) => quote!((#target_code) = #value;),
+                // Destructuring assignment to the hoisted names. `target_code`
+                // is already the parenthesized element list.
+                ExprType::Tuple(_) => quote!(#target_code = #value;),
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
                 }

@@ -245,7 +245,7 @@ impl ClassDef {
         // cross-module ASTs so call sites borrow mutably to match.
         if let Some(root) = root.as_ref()
             && !options.module_defs.is_empty()
-            && crate::module_widens_method(options, &root.name, method)
+            && crate::module_widens_method_cached(options, &root.name, method)
         {
             return true;
         }

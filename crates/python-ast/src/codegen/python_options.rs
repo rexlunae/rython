@@ -71,6 +71,30 @@ pub fn sys_path() -> PyResult<Vec<String>> {
     })
 }
 
+/// State of the one-time cross-module trait-mut table cache (see
+/// `PythonOptions::cross_module_mut_self`).
+#[derive(Clone, Debug)]
+pub enum CrossModuleMutSelf {
+    /// No module has hit the cross-module fallback yet.
+    Uncomputed,
+    /// A scan is in progress; re-entrant fallbacks must NOT recompute.
+    Computing,
+    /// The merged table, keyed by root class name → mutating method names.
+    Computed(std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>),
+}
+
+impl CrossModuleMutSelf {
+    /// The merged table, when computed.
+    pub fn computed(
+        &self,
+    ) -> Option<&std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>> {
+        match self {
+            CrossModuleMutSelf::Computed(table) => Some(table),
+            _ => None,
+        }
+    }
+}
+
 /// The global context for Python compilation.
 #[derive(Clone, Debug)]
 pub struct PythonOptions {
@@ -209,6 +233,18 @@ pub struct PythonOptions {
     /// single-module conversion.
     pub module_defs:
         std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
+
+    /// Lazily-computed merged trait-mut table over ALL modules of the crate
+    /// (`module_defs`), shared across every module's conversion: the
+    /// cross-module fallback in `method_needs_mut_self` scans each module
+    /// AST once per CONVERSION instead of once per call site. `Computing`
+    /// marks the in-progress one-time build so re-entrant fallbacks (the
+    /// scan's own analysis consults `method_needs_mut_self` again) return
+    /// false and fall through to the direct chain walk instead of
+    /// recomputing. Per-module conversions (empty `module_defs`) never
+    /// touch it.
+    pub cross_module_mut_self:
+        std::rc::Rc<std::cell::RefCell<CrossModuleMutSelf>>,
 }
 
 impl Default for PythonOptions {
@@ -244,6 +280,9 @@ impl Default for PythonOptions {
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
+            cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
+                CrossModuleMutSelf::Uncomputed,
+            )),
         }
     }
 }

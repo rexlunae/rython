@@ -370,6 +370,88 @@ fn imported_hierarchy_method_widening_crosses_modules() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Milo");
 }
 
+/// A composition chain (`self.inner.x = v`, `self.inner.bump()`) and a
+/// tuple destructuring (`self.x, self.y = ...`) inside generic trait
+/// defaults must write through the MUTABLE accessors: in the trait default
+/// the load form clones the field, so a store on top of it would vanish.
+/// Runs the generated binary to prove the mutation lands on the real
+/// fields.
+#[test]
+fn composition_stores_and_tuple_targets_persist_through_mut_accessors() {
+    let scratch = Scratch::new("compose");
+    fs::write(
+        scratch.path().join("app.py"),
+        concat!(
+            "class Inner:\n",
+            "    def __init__(self, x: int):\n",
+            "        self.x = x\n",
+            "\n",
+            "    def bump(self) -> int:\n",
+            "        self.x += 1\n",
+            "        return self.x\n",
+            "\n",
+            "class Outer(Inner):\n",
+            "    def __init__(self):\n",
+            "        self.inner: Inner = Inner(0)\n",
+            "\n",
+            "    def mutate(self) -> int:\n",
+            "        self.inner.x = 5\n",
+            "        self.inner.bump()\n",
+            "        return self.inner.x\n",
+            "\n",
+            "class Point:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "        self.y = 0\n",
+            "\n",
+            "    def reset(self) -> int:\n",
+            "        self.x, self.y = 1, 2\n",
+            "        return self.x + self.y\n",
+            "\n",
+            "class PointChild(Point):\n",
+            "    pass\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    o = Outer()\n",
+            "    print(o.mutate())\n",
+            "    p = PointChild()\n",
+            "    print(p.reset())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    // The generic trait defaults must store through the mut accessors.
+    let app_rs = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        app_rs.contains("self.inner_mut().x = 5"),
+        "chain store must go through inner_mut: {}",
+        app_rs
+    );
+    assert!(
+        app_rs.contains("*self.x_mut(), *self.y_mut()"),
+        "tuple targets must destructure through the mut accessors: {}",
+        app_rs
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "binary exited nonzero");
+    // Python: 5 + 1 = 6, and 1 + 2 = 3 — the writes must persist.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "6\n3",
+        "mutations must land on the real fields"
+    );
+}
+
 /// A package-directory dependency with a relative import inside it:
 /// `__init__.py` re-exports from `.core`, and the app reaches the function
 /// both directly and through the module path.

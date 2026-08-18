@@ -1893,30 +1893,20 @@ pub fn convert(
             .flat_map(|(_, dep)| dep.modules.iter())
             .chain(package.modules.iter()),
     );
+    // One options object per conversion: the shared `module_defs` and the
+    // cross-module trait-mut cache (computed once, reused by every module's
+    // transpile via the Rc clone).
+    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
-            let code = transpile(
-                module,
-                &mut warnings,
-                opts,
-                &rust_modules,
-                &python_module_names,
-                &module_defs,
-            )?;
+            let code = transpile(module, &mut warnings, &base_options)?;
             transpiled.push((module, code));
         }
     }
     for module in &package.modules {
-        let code = transpile(
-            module,
-            &mut warnings,
-            opts,
-            &rust_modules,
-            &python_module_names,
-            &module_defs,
-        )?;
+        let code = transpile(module, &mut warnings, &base_options)?;
         transpiled.push((module, code));
     }
     // An entry module named `main` (path ["main"]) is bin-only: its module
@@ -2332,26 +2322,13 @@ fn convert_driver(
             .flat_map(|(_, dep)| dep.modules.iter())
             .chain(package.modules.iter()),
     );
-    let code = transpile(
-        module,
-        &mut warnings,
-        opts,
-        &rust_modules,
-        &python_module_names,
-        &module_defs,
-    )?;
+    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
+    let code = transpile(module, &mut warnings, &base_options)?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
         for dep_module in &dep.modules {
-            let dep_code = transpile(
-                dep_module,
-                &mut warnings,
-                opts,
-                &rust_modules,
-                &python_module_names,
-                &module_defs,
-            )?;
+            let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
             dep_transpiled.push((dep_module, dep_code));
         }
     }
@@ -2796,15 +2773,16 @@ fn module_def_map<'a>(
 /// Transpile one Python module to Rust source text, appending
 /// lossy-conversion warnings (which are also baked into the generated code
 /// as #[deprecated] notes, unless the warning mode suppresses them).
+/// `base_options` carries the conversion-level context shared by every
+/// module (rust/python module registries, `module_defs`, and the shared
+/// cross-module trait-mut cache — the one-time merged-table scan runs on
+/// the first module that needs it and is reused by the rest); only the
+/// module's package path is per-module.
 fn transpile(
     module: &PyModule,
     warnings: &mut Vec<String>,
-    opts: &ConvertOptions,
-    rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
-    python_modules: &std::collections::HashSet<String>,
-    module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
+    base_options: &PythonOptions,
 ) -> Result<String> {
-    let mode = opts.warnings;
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
 
@@ -2827,17 +2805,10 @@ fn transpile(
         .last()
         .cloned()
         .unwrap_or_else(|| "lib".to_string());
-    let options = PythonOptions {
-        lossy_warnings: mode != WarningMode::Allow,
-        no_std: opts.no_std,
-        rust_modules: std::rc::Rc::new(rust_modules.clone()),
-        python_modules: std::rc::Rc::new(python_modules.clone()),
-        module_defs: std::rc::Rc::new(module_defs.clone()),
-        // Relative imports resolve against the current module's package
-        // path; empty at the crate root (the default when unset).
-        module_path: module_package_path(module),
-        ..Default::default()
-    };
+    let mut options = base_options.clone();
+    // Relative imports resolve against the current module's package path;
+    // empty at the crate root (the default when unset).
+    options.module_path = module_package_path(module);
     // Register rust-module imports in the shared symbol table so call
     // lowering can resolve them (Import::to_rust only sees a clone).
     let mut symbols = symbols;
@@ -2853,6 +2824,25 @@ fn transpile(
             )
         })?;
     Ok(tokens.to_string())
+}
+
+/// Conversion-level PythonOptions shared by every module of one conversion
+/// (see `transpile`): the registries, `module_defs`, and the shared
+/// cross-module trait-mut cache.
+fn conversion_base_options(
+    opts: &ConvertOptions,
+    rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
+    python_module_names: &std::collections::HashSet<String>,
+    module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
+) -> PythonOptions {
+    PythonOptions {
+        lossy_warnings: opts.warnings != WarningMode::Allow,
+        no_std: opts.no_std,
+        rust_modules: std::rc::Rc::new(rust_modules.clone()),
+        python_modules: std::rc::Rc::new(python_module_names.clone()),
+        module_defs: std::rc::Rc::new(module_defs.clone()),
+        ..Default::default()
+    }
 }
 
 /// `pub mod child;` declarations for a container module.

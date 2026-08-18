@@ -210,63 +210,124 @@ pub(crate) fn to_rust_place(
     symbols: &SymbolTableScopes,
     deref: bool,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let attribute = Attribute {
-        value: Box::new(value.clone()),
-        attr: attr.to_string(),
-        ctx: "Store".to_string(),
-    };
-    let field_access = class_field_access(value, attr, ctx, symbols, options);
-    // Mirror the module-path guard from to_rust: a store target that
-    // resolves as a module path is not a field access. A user binding that
-    // shadows the module name (`os = {...}`) must NOT be treated as a
-    // module — the load path applies the same `module_name_shadowed` guard.
-    let root_shadowed = crate::ast::tree::call::root_name(value)
-        .is_some_and(|root| crate::module_name_shadowed(root, symbols));
-    let value_tokens = attribute.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-    let is_module = !root_shadowed
-        && (crate::ast::tree::call::root_name(value)
-            .is_some_and(|_root| crate::ast::tree::attribute::is_module_path_chain(value, symbols))
-            || matches!(
-                value_tokens.to_string().as_str(),
-                "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" | "time"
-                    | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re"
-                    | "hashlib" | "csv" | "io" | "datetime" | "numpy" | "np"
-            ));
-    if is_module {
-        // Module stores render as PATHS, exactly like the load form:
-        // `os.environ[k] = v` stores through `os::environ`. The attribute
-        // is an identifier — interpolating the &str directly would emit a
-        // string literal (`os . "environ"`) that the Rust compiler rejects.
-        let attr_path = crate::safe_ident(attr);
-        // Vendored deps prefix `crate::` at the ROOT segment only; nested
-        // segments already carry it from their own rendering.
-        let vendored_root = matches!(value, ExprType::Name(_))
-            && crate::ast::tree::call::root_name(value)
-                .is_some_and(|root| options.python_modules.contains(root));
-        if vendored_root {
-            return Ok(quote!(crate::#value_tokens::#attr_path));
-        }
-        return Ok(quote!(#value_tokens::#attr_path));
-    }
-    let attr_ident = crate::safe_ident(attr);
-    match field_access {
-        None => Ok(quote!(#value_tokens.#attr_ident)),
-        Some(FieldRewrite::Accessor { field }) => {
-            let accessor = crate::safe_ident(&format!("{}_mut", field));
-            if deref {
-                Ok(quote!(*#value_tokens.#accessor()))
-            } else {
-                Ok(quote!(#value_tokens.#accessor()))
+    to_rust_place_expr(
+        &ExprType::Attribute(Attribute {
+            value: Box::new(value.clone()),
+            attr: attr.to_string(),
+            ctx: "Store".to_string(),
+        }),
+        ctx,
+        options,
+        symbols,
+        deref,
+    )
+}
+
+/// Place-flavored renderer for a whole attribute/subscript chain. Each
+/// attribute segment rewrites its receiver to place flavor recursively, so
+/// a store through a composition chain (`self.inner.x = v`, `self.a.b[i] =
+/// v`, `self.inner.items.append(v)`) keeps the write on the REAL field:
+/// in a generic trait default the load accessor clones (`self.inner()`), so
+/// a store rendered on top of it would silently vanish. The mutable
+/// accessor (`self.inner_mut()`) is a place, and field access auto-derefs
+/// through the returned `&mut`, so chaining is valid.
+///
+/// Module paths (`os.environ`, `pylev.fn`) are NOT places — they render as
+/// `::` paths exactly like the load form.
+pub(crate) fn to_rust_place_expr(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+    deref: bool,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    match expr {
+        ExprType::Attribute(attr) => {
+            // Mirror the module-path guard from to_rust: a store target
+            // that resolves as a module path is not a field access. A user
+            // binding that shadows the module name (`os = {...}`) must NOT
+            // be treated as a module — the load path applies the same
+            // `module_name_shadowed` guard.
+            let root_shadowed = crate::ast::tree::call::root_name(&attr.value)
+                .is_some_and(|root| crate::module_name_shadowed(root, symbols));
+            let value_tokens =
+                attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let is_module = !root_shadowed
+                && (crate::ast::tree::call::root_name(&attr.value).is_some_and(|_root| {
+                    crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols)
+                }) || matches!(
+                    value_tokens.to_string().as_str(),
+                    "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio"
+                        | "time" | "math" | "random" | "heapq" | "functools" | "textwrap"
+                        | "itertools" | "re" | "hashlib" | "csv" | "io" | "datetime"
+                        | "numpy" | "np"
+                ));
+            if is_module {
+                // Module stores render as PATHS, exactly like the load form.
+                // The attribute is an identifier — interpolating the &str
+                // directly would emit a string literal (`os . "environ"`)
+                // that the Rust compiler rejects.
+                let attr_path = crate::safe_ident(&attr.attr);
+                // Vendored deps prefix `crate::` at the ROOT segment only;
+                // nested segments already carry it from their own rendering.
+                let vendored_root = matches!(attr.value.as_ref(), ExprType::Name(_))
+                    && crate::ast::tree::call::root_name(&attr.value)
+                        .is_some_and(|root| options.python_modules.contains(root));
+                if vendored_root {
+                    return Ok(quote!(crate::#value_tokens::#attr_path));
+                }
+                return Ok(quote!(#value_tokens::#attr_path));
+            }
+            // The receiver must itself be a place. `class_field_access`
+            // only rewrites a receiver that is BARE `self` (its `is_self`
+            // test), so a chain like `self.inner.x` resolves `x` against
+            // `Inner` with no rewrite — the place flavor of the receiver is
+            // what keeps the store on the real field.
+            let recv_place = to_rust_place_expr(&attr.value, ctx, options, symbols, false)?;
+            let field_access =
+                class_field_access(&attr.value, &attr.attr, ctx, symbols, options);
+            let attr_ident = crate::safe_ident(&attr.attr);
+            match field_access {
+                None => Ok(quote!(#recv_place.#attr_ident)),
+                Some(FieldRewrite::Accessor { field }) => {
+                    let accessor = crate::safe_ident(&format!("{}_mut", field));
+                    if deref {
+                        Ok(quote!(*#recv_place.#accessor()))
+                    } else {
+                        Ok(quote!(#recv_place.#accessor()))
+                    }
+                }
+                Some(FieldRewrite::Chain { depth }) => {
+                    let chain = base_field_chain(depth);
+                    Ok(quote!(#recv_place #chain.#attr_ident))
+                }
+                Some(FieldRewrite::AccessorChain { depth }) => {
+                    let chain = base_mut_accessor_chain(depth);
+                    Ok(quote!(#recv_place #chain.#attr_ident))
+                }
             }
         }
-        Some(FieldRewrite::Chain { depth }) => {
-            let chain = base_field_chain(depth);
-            Ok(quote!(#value_tokens #chain.#attr_ident))
+        ExprType::Subscript(sub) => {
+            crate::ast::tree::subscript::subscript_receiver_place(
+                &ExprType::Subscript(sub.clone()),
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )
         }
-        Some(FieldRewrite::AccessorChain { depth }) => {
-            let chain = base_mut_accessor_chain(depth);
-            Ok(quote!(#value_tokens #chain.#attr_ident))
-        }
+        _ => expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()),
+    }
+}
+
+/// True when an expression chain is rooted at the method receiver `self`
+/// (`self.inner`, `self.a.b`) — the receivers whose load form clones in a
+/// generic trait default, so mutating operations must render them as
+/// places.
+pub(crate) fn chain_root_is_self(expr: &ExprType) -> bool {
+    match expr {
+        ExprType::Attribute(a) => chain_root_is_self(&a.value),
+        ExprType::Name(n) => n.id == "self",
+        _ => false,
     }
 }
 

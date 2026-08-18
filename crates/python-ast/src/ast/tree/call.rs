@@ -2397,28 +2397,28 @@ impl<'a> CodeGen for Call {
                     // only callees may read through the load form.
                     let mutates_receiver =
                         class.method_needs_mut_self(&attr.attr, &class_symbols, &options);
-                    let receiver = if let ExprType::Attribute(inner) = attr.value.as_ref()
-                        && mutates_receiver
-                        && matches!(
-                            inner.value.as_ref(),
-                            ExprType::Name(n) if n.id == "self"
-                        )
-                    {
-                        crate::ast::tree::attribute::to_rust_place(
-                            &inner.value,
-                            &inner.attr,
-                            &ctx,
-                            &options,
-                            &symbols,
-                            false,
-                        )?
-                    } else {
-                        attr.value.clone().to_rust(
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                        )?
-                    };
+                    let receiver =
+                        if mutates_receiver
+                            && crate::ast::tree::attribute::chain_root_is_self(&attr.value)
+                        {
+                            // The WHOLE chain renders as a place:
+                            // `self.outer.inner.bump()` goes through
+                            // `self.outer_mut().inner_mut().bump()`, not the
+                            // cloning load accessors.
+                            crate::ast::tree::attribute::to_rust_place_expr(
+                                &attr.value,
+                                &ctx,
+                                &options,
+                                &symbols,
+                                false,
+                            )?
+                        } else {
+                            attr.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?
+                        };
                     let method_name = crate::safe_ident(&attr.attr);
                     return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
                 }
@@ -2431,20 +2431,19 @@ impl<'a> CodeGen for Call {
             // load form (`self.items()`) clones the field: the mutable
             // accessor (`self.items_mut()`) keeps the write on the real
             // field.
-            let mutating_self_field = matches!(
-                attr.value.as_ref(),
-                ExprType::Attribute(inner)
-                    if matches!(inner.value.as_ref(), ExprType::Name(n) if n.id == "self")
-                        && ctx.in_generic_trait()
-            );
+            let mutating_self_field = ctx.in_generic_trait()
+                && matches!(attr.value.as_ref(), ExprType::Attribute(_))
+                && crate::ast::tree::attribute::chain_root_is_self(&attr.value);
             let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
                 || mutating_self_field)
                 && crate::ast::tree::scope::MUTATING_METHODS.contains(&attr.attr.as_str())
             {
-                if let ExprType::Attribute(inner) = attr.value.as_ref() {
-                    crate::ast::tree::attribute::to_rust_place(
-                        &inner.value,
-                        &inner.attr,
+                if let ExprType::Attribute(_) = attr.value.as_ref() {
+                    // The whole receiver chain renders as a place:
+                    // `self.inner.items.append(v)` mutates through
+                    // `self.inner_mut().items`, not a clone of the field.
+                    crate::ast::tree::attribute::to_rust_place_expr(
+                        &attr.value,
                         &ctx,
                         &options,
                         &symbols,
