@@ -2254,6 +2254,116 @@ fn grandchild_override_super_targets_the_definer_base() {
 }
 
 #[test]
+fn sibling_mutation_widens_through_a_middle_redefinition() {
+    // A defines m; B (middle) redefines m WITHOUT mutating; D (a sibling of
+    // B) mutates m. The widening is recorded under the TOPMOST definer (A),
+    // so a call through B-derived C must still resolve the widened
+    // signature — the nearest-definer lookup used to miss and emit a
+    // non-mut binding that the trait impl then rejects.
+    let src = concat!(
+        "class A:\n",
+        "    def m(self) -> int:\n",
+        "        return 1\n",
+        "\n",
+        "class B(A):\n",
+        "    def m(self) -> int:\n",
+        "        return 2\n",
+        "\n",
+        "class C(B):\n",
+        "    pass\n",
+        "\n",
+        "class D(A):\n",
+        "    def __init__(self, x: int):\n",
+        "        self.x = x\n",
+        "\n",
+        "    def m(self) -> int:\n",
+        "        self.x = 1\n",
+        "        return 3\n",
+        "\n",
+        "c = C()\n",
+        "y = c.m()\n",
+    );
+    let out = compile(src, "sibling_widen.py");
+    assert!(
+        out.contains("let mut c"),
+        "call site must borrow c mutably (trait widened by sibling D): {}",
+        out
+    );
+}
+
+#[test]
+fn middle_class_reassigning_base_field_emits_no_accessor() {
+    // Three-level hierarchy where the middle class re-assigns a field its
+    // own base owns (Dog sets self.name without super().__init__): the
+    // field physically lives in Animal, so `impl DogTrait for Puppy` must
+    // not emit a `name` accessor — its own trait declares only `breed` +
+    // `base`, and an undeclared trait method (or one reaching a
+    // non-existent Dog.name field) would not compile.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str, breed: str):\n",
+        "        self.name = name\n",
+        "        self.breed = breed\n",
+        "\n",
+        "class Puppy(Dog):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "reassigned_field.py");
+    // The correct layout: Animal's own field is reached from Puppy through
+    // TWO embedded base levels (Puppy -> Dog -> Animal).
+    assert!(
+        out.contains("__rython_base . __rython_base . name"),
+        "name must live two levels down in Animal: {}",
+        out
+    );
+    // Dog's own fields are only breed (+base). Slice the Dog-impl-for-Puppy
+    // block and require no `name` accessor there.
+    let start = out
+        .find("impl DogTrait for Puppy")
+        .unwrap_or_else(|| panic!("missing Dog impl for Puppy: {}", out));
+    let rest = &out[start..];
+    let end = rest
+        .find("\nimpl ")
+        .map(|i| i + start)
+        .unwrap_or(out.len());
+    let dog_impl = &out[start..end];
+    assert!(
+        !dog_impl.contains("fn name"),
+        "Dog's trait impl for Puppy must not declare a `name` accessor: {}",
+        dog_impl
+    );
+    assert!(
+        dog_impl.contains("fn breed"),
+        "Dog's own field accessor must still be emitted: {}",
+        dog_impl
+    );
+}
+
+#[test]
+fn relative_import_above_crate_root_is_a_clean_error() {
+    // A relative import with more leading dots than the module's package
+    // depth must fail loudly with the dedicated message, not panic on an
+    // index underflow in the resolved-module-path computation. The import
+    // must be USED as a class BEFORE the import statement renders:
+    // construction of an imported name forces the module-path resolution
+    // (call.rs), which runs while rendering the first statement — before
+    // the import statement's own error check fires.
+    let err = compile_err(
+        "x = Thing()\nfrom ....nope import Thing\n",
+        "deep_relative.py",
+    );
+    assert!(
+        err.contains("relative import goes above the crate root"),
+        "expected the clean above-crate-root error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn own_override_super_targets_the_direct_base() {
     // Puppy's OWN describe calls super().describe(): it resolves Dog's
     // override (one level up), so it walks ONE embedded base level.

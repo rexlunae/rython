@@ -1919,10 +1919,49 @@ pub fn convert(
         )?;
         transpiled.push((module, code));
     }
+    // An entry module named `main` (path ["main"]) is bin-only: its module
+    // file would be src/main.rs, which is the bin crate root, so it must
+    // not be declared as a lib submodule (rustc would compile the bin
+    // content — with its sibling `mod vendored;` decls — as a nested module
+    // of the lib) and its functions are not reachable from the lib (the
+    // PyO3 bindings live in the lib and must not reference them). An entry
+    // module under any OTHER name keeps its lib-side module (src/<name>.rs
+    // coexists with the src/main.rs bin).
+    let entry_is_bin_only = entry_file
+        .as_ref()
+        .map(|f| {
+            transpiled
+                .iter()
+                .find(|(m, _)| &m.file == f)
+                .is_some_and(|(m, _)| m.path == ["main"])
+        })
+        .unwrap_or(false);
     // Bindings are generated before files are written so their warnings
     // (e.g. forced Python-side renames) participate in the warning mode.
+    // Bindings describe the PACKAGE's public API only: vendored
+    // [python-modules] dependencies are internal implementation (they are
+    // transpiled and written, but must not surface as #[pyfunction]s in the
+    // generated #[pymodule], and their bare-name collisions must not rename
+    // or fail the package's own functions). A bin-only entry module is not
+    // part of the lib either, so it is skipped the same way.
     let bindings_text = if opts.pyo3 {
-        Some(generate_bindings(package, &transpiled, &mut warnings)?)
+        let package_modules: Vec<(&PyModule, String)> = package
+            .modules
+            .iter()
+            .filter(|m| {
+                !(entry_is_bin_only
+                    && entry_file
+                        .as_ref()
+                        .is_some_and(|f| &m.file == f))
+            })
+            .filter_map(|m| {
+                transpiled
+                    .iter()
+                    .find(|(tm, _)| tm.path == m.path)
+                    .map(|(tm, code)| (*tm, code.clone()))
+            })
+            .collect();
+        Some(generate_bindings(package, &package_modules, &mut warnings)?)
     } else {
         None
     };
@@ -1938,12 +1977,24 @@ pub fn convert(
 
     // Parent -> children map for `pub mod` declarations. The entry module
     // still gets a lib-side module (harmless), except a dedicated
-    // `__main__.py`, which is bin-only by convention. Non-root __init__
-    // modules register too: a sub-package whose only file is __init__.py
-    // must still be declared by its parent or its code is silently dropped.
+    // `__main__.py`, which is bin-only by convention, and a NAMED entry
+    // module (`main.py` with a `__main__` guard), which is also bin-only
+    // (see `entry_is_bin_only` above). Non-root __init__ modules register
+    // too: a sub-package whose only file is __init__.py must still be
+    // declared by its parent or its code is silently dropped.
     let mut children: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
     for (module, _) in &transpiled {
         if module.path.is_empty() || is_dunder_main(module) {
+            continue;
+        }
+        // Skip the bin-only entry module: it must not be declared as a lib
+        // module (its file is overwritten by the bin below) nor by its
+        // parent (the parent's decls are for lib modules).
+        if entry_is_bin_only
+            && entry_file
+                .as_ref()
+                .is_some_and(|f| &module.file == f)
+        {
             continue;
         }
         let (parent, name) = module.path.split_at(module.path.len() - 1);

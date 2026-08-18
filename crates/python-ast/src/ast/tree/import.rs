@@ -285,6 +285,11 @@ impl ImportFrom {
         let parts: Vec<&str> = self.module.split('.').filter(|p| !p.is_empty()).collect();
         if self.level > 0 {
             let cur = &options.module_path;
+            // A relative import with more leading dots than the current
+            // package depth reaches above the crate root; saturate so the
+            // caller gets an empty (or root-level) prefix instead of a
+            // usize underflow panic. `ImportFrom::to_rust` reports the
+            // clean "reaches above the crate root" error for the user.
             let cut = (cur.len() + 1).saturating_sub(self.level);
             cur[..cut]
                 .iter()

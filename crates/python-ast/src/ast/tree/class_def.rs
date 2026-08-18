@@ -214,7 +214,14 @@ impl ClassDef {
         // Trait signatures widen to `&mut self` when ANY definition in the
         // hierarchy mutates (overrides re-emit into the root's trait), so
         // call sites must borrow the receiver mutably to match. The
-        // module-level precompute is authoritative when present.
+        // module-level precompute is authoritative when present. The
+        // precompute keys by the TOPMOST class in the chain that defines
+        // the method (the trait owner — the first class in the chain that
+        // defines it, i.e. the last in base_chain's self→ancestor order),
+        // so the lookup must use the same key: a middle class redefining
+        // the method must still find the entry recorded under the root,
+        // or the widening is lost and call sites emit read-only borrows
+        // the widened trait does not accept.
         let root = self
             .base_chain(symbols)
             .into_iter()
@@ -379,6 +386,35 @@ impl ClassDef {
             }
         }
         Ok(fields)
+    }
+
+    /// A class's OWN fields: its `__init__` stores minus the stores that
+    /// belong to a base class's fields (those write into the embedded base
+    /// struct). This is the layout `to_rust` gives the struct and the
+    /// accessors `emit_trait` declares, so every consumer must use the same
+    /// subtraction — an ancestor that re-assigns a field its own base owns
+    /// (e.g. `class Dog(Animal): def __init__(self): self.name = ...` with
+    /// no super().__init__) must not emit an accessor for it in its trait
+    /// impl: the field physically lives in the ancestor's base struct.
+    pub(crate) fn own_fields(
+        &self,
+        symbols: &SymbolTableScopes,
+    ) -> Result<Vec<(String, TokenStream)>, Box<dyn std::error::Error>> {
+        let own_stores = self.infer_fields(symbols)?;
+        let base_owned: std::collections::HashSet<String> = self
+            .base_class(symbols)
+            .map(|b| {
+                b.base_chain(symbols)
+                    .iter()
+                    .filter_map(|c| c.infer_fields(symbols).ok())
+                    .flat_map(|f| f.into_iter().map(|(n, _)| n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(own_stores
+            .into_iter()
+            .filter(|(name, _)| !base_owned.contains(name))
+            .collect())
     }
 }
 
@@ -566,20 +602,7 @@ impl CodeGen for ClassDef {
         // A derived class's OWN fields are its __init__ stores minus the
         // stores that belong to a base class's fields (those write into the
         // embedded base struct).
-        let own_stores = self.infer_fields(&symbols)?;
-        let base_owned: std::collections::HashSet<String> = match &base {
-            Some(b) => b
-                .base_chain(&symbols)
-                .iter()
-                .filter_map(|c| c.infer_fields(&symbols).ok())
-                .flat_map(|f| f.into_iter().map(|(n, _)| n))
-                .collect(),
-            None => std::collections::HashSet::new(),
-        };
-        let fields: Vec<(String, TokenStream)> = own_stores
-            .into_iter()
-            .filter(|(name, _)| !base_owned.contains(name))
-            .collect();
+        let fields = self.own_fields(&symbols)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of
         // the same name would collide with it.
@@ -905,7 +928,12 @@ impl ClassDef {
             for _ in 0..depth {
                 chain_tokens.extend(quote!(.__rython_base));
             }
-            let a_fields = ancestor.infer_fields(symbols)?;
+            // The ancestor's OWN fields (its stores minus its own base's
+            // stores — see own_fields): an ancestor that re-assigns a field
+            // its base owns declares no accessor for it, because the field
+            // physically lives in the ancestor's base struct and the
+            // ancestor's trait only declares accessors for fields it owns.
+            let a_fields = ancestor.own_fields(symbols)?;
             let mut accessor_impls = TokenStream::new();
             // The ancestor's own base accessors, if it has a base: from the
             // derived struct, its base struct is one level deeper.

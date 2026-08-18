@@ -182,6 +182,113 @@ fn single_file_python_module_compiles_and_matches_cpython() {
     );
 }
 
+/// A package with a `__main__`-guarded entry module plus a vendored
+/// dependency: the generated PyO3 bindings must expose ONLY the package's
+/// own functions. Vendored [python-modules] dependencies are internal
+/// implementation — their functions must not surface as #[pyfunction]s,
+/// and a same-named vendored function must not rename or collide with the
+/// package's own. The named entry module is bin-only, so it too stays out
+/// of the lib's bindings.
+#[test]
+fn pyo3_bindings_exclude_vendored_dependency_functions() {
+    let scratch = Scratch::new("bindings");
+    fs::create_dir_all(scratch.path().join("vendor/vendored")).unwrap();
+    // The vendored dep defines `collide` (same name as the package's own)
+    // and `hidden_leak` — neither may appear in the bindings.
+    fs::write(
+        scratch.path().join("vendor/vendored/__init__.py"),
+        "def collide() -> int:\n    return 5\n\n\ndef hidden_leak() -> int:\n    return 99\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nvendored = { path = \"vendor/vendored\" }\n",
+    )
+    .unwrap();
+    // Root __init__: the package's OWN collide (must be the one bound).
+    fs::write(
+        scratch.path().join("__init__.py"),
+        "def collide() -> int:\n    return 7\n",
+    )
+    .unwrap();
+    // Entry module with a __main__ guard: bin-only, absent from the lib.
+    fs::write(
+        scratch.path().join("main.py"),
+        concat!(
+            "from vendored import collide\n",
+            "\n",
+            "def main() -> int:\n",
+            "    return collide()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(main())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let opts = ConvertOptions {
+        pyo3: true,
+        ..ConvertOptions::default()
+    };
+    let krate = rypip::convert(&pkg, &out, &opts).expect("convert");
+
+    let api = fs::read_to_string(out.join("src/python_api.rs")).unwrap();
+    assert!(
+        !api.contains("hidden_leak"),
+        "vendored function must not leak into bindings: {api}"
+    );
+    assert!(
+        !api.contains("vendored_collide"),
+        "vendored collision must not force a rename of package functions: {api}"
+    );
+    assert!(
+        api.contains("fn collide"),
+        "package's own collide must be bound: {api}"
+    );
+    assert!(
+        !api.contains("main_main"),
+        "bin-only entry module must not be bound: {api}"
+    );
+    // The lib must not declare the entry module as a submodule (its file
+    // is the bin), or the bindings' `crate::main::main` reference would
+    // fail to compile.
+    let lib_rs = fs::read_to_string(out.join("src/lib.rs")).unwrap();
+    assert!(
+        !lib_rs.contains("pub mod main;"),
+        "bin-only entry must not be a lib module: {lib_rs}"
+    );
+
+    // Build with the python feature and run the binary: the package's
+    // main() calls the VENDORED collide (5).
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--features")
+        .arg("python")
+        .env_remove("RUSTFLAGS")
+        .current_dir(&krate.root)
+        .status()
+        .expect("running cargo build");
+    assert!(status.success(), "generated crate failed to build with --features python");
+    // The bin target's name is the crate name from the generated Cargo.toml.
+    let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+    let crate_name = manifest
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("name = "))
+        .and_then(|v| v.trim_matches('"').split(' ').next())
+        .unwrap()
+        .to_string();
+    let bin = krate.root.join("target/debug").join(&crate_name);
+    let output = Command::new(bin).output().expect("running generated binary");
+    assert!(output.status.success(), "binary exited nonzero");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "5",
+        "main() must call the vendored collide"
+    );
+}
+
 /// A package-directory dependency with a relative import inside it:
 /// `__init__.py` re-exports from `.core`, and the app reaches the function
 /// both directly and through the module path.
