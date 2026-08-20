@@ -360,7 +360,30 @@ impl CodeGen for Module {
             &options,
         )?;
 
+        // The module docstring is emitted as #![doc] attributes above; its
+        // statement (a leading string Expr) must be SKIPPED here or it
+        // leaks into the generated module as a bare string literal (the
+        // requests build failure in the library sweep). Skip exactly when
+        // the docstring was emitted above: only then was the leading string
+        // consumed (a lone short string with no doc markers stays a bare
+        // expression statement, matching the pre-sweep behavior).
+        let mut pending_docstring = self.get_module_docstring().is_some()
+            && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
         for s in self.raw.body {
+            if pending_docstring
+                && matches!(
+                    &s.statement,
+                    crate::StatementType::Expr(e)
+                        if matches!(
+                            &e.value,
+                            crate::ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(_)))
+                        )
+                )
+            {
+                pending_docstring = false;
+                continue;
+            }
             // Check if this statement is an async function
             if let crate::StatementType::AsyncFunctionDef(_) = &s.statement {
                 has_async_functions = true;
@@ -1259,6 +1282,15 @@ impl Module {
         match &first_stmt.statement {
             StatementType::Expr(expr) => match &expr.value {
                 ExprType::Constant(c) => {
+                    // The Ellipsis sentinel is not a docstring (Protocol
+                    // stubs and `...` placeholders must not emit a bogus
+                    // #![doc]).
+                    if c.0
+                        .as_ref()
+                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                    {
+                        return None;
+                    }
                     let raw_string = c.to_string();
                     Some(self.format_module_docstring(&raw_string))
                 },

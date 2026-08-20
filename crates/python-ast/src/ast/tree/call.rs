@@ -1313,34 +1313,73 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        let target = match &self.args[1] {
+                        let targets = match &self.args[1] {
+                            // A single type name.
                             ExprType::Name(t)
-                                if matches!(t.id.as_str(), "int" | "float" | "str" | "bool") =>
+                                if matches!(
+                                    t.id.as_str(),
+                                    "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
+                                ) =>
                             {
-                                t.id.clone()
+                                vec![t.id.clone()]
+                            }
+                            // A tuple of type names: `isinstance(x, (bytearray, bytes))`
+                            // — the common "accept either of these" check. Each
+                            // element must be a statically-known type name.
+                            ExprType::Tuple(tup) => {
+                                let mut names = Vec::new();
+                                for elt in &tup.elts {
+                                    match elt {
+                                        ExprType::Name(t)
+                                            if matches!(
+                                                t.id.as_str(),
+                                                "int" | "float" | "str" | "bool" | "bytes"
+                                                    | "bytearray"
+                                            ) =>
+                                        {
+                                            names.push(t.id.clone());
+                                        }
+                                        other => {
+                                            return Err(format!(
+                                                "isinstance() tuple-of-types element must be \
+                                                 int, float, str, bool, bytes, or bytearray \
+                                                 (got `{:?}`)",
+                                                other
+                                            )
+                                            .into());
+                                        }
+                                    }
+                                }
+                                names
                             }
                             other => {
                                 return Err(format!(
                                     "isinstance() second argument must be int, float, \
-                                     str, or bool (got `{:?}`); tuples of types are not \
-                                     supported yet",
+                                     str, bool, bytes, bytearray, or a tuple of those \
+                                     (got `{:?}`); classes are not supported yet",
                                     other
                                 )
                                 .into());
                             }
                         };
-                        let actual: Option<String> =
-                            match &self.args[0] {
-                                ExprType::Name(n) => options.local_types.get(&n.id).cloned(),
-                                lit => crate::ast::tree::function_def::simple_expr_type(lit).map(
-                                    |ty| match ty.to_string().as_str() {
-                                        "i64" => "int".to_string(),
-                                        "f64" => "float".to_string(),
-                                        "bool" => "bool".to_string(),
-                                        _ => "str".to_string(),
-                                    },
-                                ),
-                            };
+                        // The Python type name each target lowers to;
+                        // bytes and bytearray BOTH lower to Vec<u8> (the
+                        // `bytes | bytearray` union is a single Rust type),
+                        // so a tuple containing either matches a bytes
+                        // argument (the local_types map records the union
+                        // annotation as "bytes").
+                        let actual: Option<String> = match &self.args[0] {
+                            ExprType::Name(n) => options.local_types.get(&n.id).cloned(),
+                            lit => crate::ast::tree::function_def::simple_expr_type(lit).map(
+                                |ty| match ty.to_string().as_str() {
+                                    "i64" => "int".to_string(),
+                                    "f64" => "float".to_string(),
+                                    "bool" => "bool".to_string(),
+                                    "Vec < u8 >" => "bytes".to_string(),
+                                    _ => "str".to_string(),
+                                },
+                            ),
+                        };
                         let Some(actual) = actual else {
                             return Err(format!(
                                 "isinstance(): the type of `{:?}` is not statically \
@@ -1350,8 +1389,14 @@ impl<'a> CodeGen for Call {
                             )
                             .into());
                         };
-                        // bool is a subclass of int in Python.
-                        let result = actual == target || (actual == "bool" && target == "int");
+                        // True when the argument's type is one of the target
+                        // types (bool is a subclass of int in Python).
+                        let result = targets.iter().any(|t| {
+                            actual == *t
+                                || (actual == "bool" && t == "int")
+                                || (actual == "bytes" && t == "bytearray")
+                                || (actual == "bytearray" && t == "bytes")
+                        });
                         return Ok(if result { quote!(true) } else { quote!(false) });
                     }
                     // The by-reference builtins: their runtime functions

@@ -636,6 +636,19 @@ impl CodeGen for Expr {
         if matches!(self.value, ExprType::NoneType(_)) {
             return Ok(quote!());
         }
+        // A bare `...` statement is a no-op (Python's Ellipsis as a
+        // statement — the Protocol-stub idiom `def f(...) -> None: ...`).
+        // As a VALUE (assignment, argument, return) Constant::to_rust
+        // rejects it loudly.
+        if matches!(
+            &self.value,
+            ExprType::Constant(c)
+                if c.0
+                    .as_ref()
+                    .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+        ) {
+            return Ok(quote!());
+        }
         self.value.to_rust(ctx, options, symbols)
     }
 }

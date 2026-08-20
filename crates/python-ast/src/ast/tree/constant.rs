@@ -98,6 +98,35 @@ pub fn try_bool(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     Ok(Some(l))
 }
 
+// Sentinel literal stored for Python's `...` (Ellipsis): the extraction
+// must succeed (a Protocol stub `def f(...) -> None: ...` is everywhere),
+// and the value/statement codegen then decides — a bare `...` statement is
+// a no-op (like `pass`), while using Ellipsis as a value is a loud error.
+// A NUL character cannot appear in real Python source literals, so the
+// sentinel string cannot collide with a genuine string constant.
+pub fn ellipsis_sentinel() -> Literal<String> {
+    Literal::parse("\"\u{0}RYTHON_ELLIPSIS\"".to_string()).expect("ellipsis sentinel literal")
+}
+
+pub fn is_ellipsis_literal(l: &Literal<String>) -> bool {
+    l.to_string() == ellipsis_sentinel().to_string()
+}
+
+/// Python's `...` (Ellipsis) singleton: extracted as the sentinel literal so
+/// parsing succeeds; codegen decides between no-op (bare statement) and loud
+/// error (value use).
+pub fn try_ellipsis(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
+    if value.is(&pyo3::types::PyEllipsis::get(value.py())) {
+        Ok(Some(ellipsis_sentinel()))
+    } else {
+        Err(crate::extraction_failure(
+            "constant",
+            value,
+            "expected Ellipsis",
+        ))
+    }
+}
+
 // This will mostly be invoked when the input is None.
 pub fn try_option(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: Option<Bound<PyAny>> = value.extract()?;
@@ -136,6 +165,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
             l
         } else if let Ok(l) = try_float(&value) {
             l
+        } else if let Ok(l) = try_ellipsis(&value) {
+            l
         } else if let Ok(l) = try_option(&value) {
             l
         } else {
@@ -162,6 +193,13 @@ impl CodeGen for Constant {
         _symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self.0 {
+            Some(c) if is_ellipsis_literal(&c) => Err(
+                "`...` (Ellipsis) as a VALUE is not supported by rython; it is only \
+                 accepted as a bare statement (a no-op, like `pass`) — Protocol \
+                 stubs such as `def f(...) -> None: ...` are the common use"
+                    .to_string()
+                    .into(),
+            ),
             Some(c) => {
                 let v: TokenStream = c
                     .to_string()

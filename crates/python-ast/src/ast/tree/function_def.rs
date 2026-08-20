@@ -836,8 +836,29 @@ impl CodeGen for FunctionDef {
                 .chain(self.args.kwonlyargs.iter())
             {
                 if let Some(ExprType::Name(ann)) = param.annotation.as_deref() {
-                    if matches!(ann.id.as_str(), "int" | "float" | "str" | "bool") {
+                    if matches!(
+                        ann.id.as_str(),
+                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
+                    ) {
                         known.insert(param.arg.clone(), ann.id.clone());
+                    }
+                }
+                // `bytes | bytearray` (a same-Rust-type union) is the "raw
+                // sequence" idiom: record it as bytes so isinstance checks
+                // against either name decide true (charset_normalizer).
+                if let Some(ExprType::BinOp(op)) = param.annotation.as_deref()
+                    && matches!(op.op, crate::BinOps::BitOr)
+                {
+                    let mut names = Vec::new();
+                    for side in [&op.left, &op.right] {
+                        if let ExprType::Name(n) = side.as_ref()
+                            && matches!(n.id.as_str(), "bytes" | "bytearray")
+                        {
+                            names.push(n.id.clone());
+                        }
+                    }
+                    if names.len() == 2 {
+                        known.insert(param.arg.clone(), "bytes".to_string());
                     }
                 }
             }
@@ -848,6 +869,7 @@ impl CodeGen for FunctionDef {
                     "i64" => "int",
                     "f64" => "float",
                     "bool" => "bool",
+                    "Vec < u8 >" => "bytes",
                     s if s.contains("str") || s.contains("String") => "str",
                     _ => continue,
                 };
@@ -2046,6 +2068,15 @@ impl FunctionDef {
         match expr.statement {
             StatementType::Expr(e) => match e.value {
                 ExprType::Constant(c) => {
+                    // The Ellipsis sentinel is NOT a docstring: a Protocol
+                    // stub `def f(...) -> None: ...` must not get a bogus
+                    // `#![doc = "\0RYTHON_ELLIPSIS"]` from its `...` body.
+                    if c.0
+                        .as_ref()
+                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                    {
+                        return None;
+                    }
                     let raw_string = c.to_string();
                     // Clean up the docstring for Rust documentation
                     Some(self.format_docstring(&raw_string))

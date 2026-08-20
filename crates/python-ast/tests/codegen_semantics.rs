@@ -38,6 +38,163 @@ fn cross_module_fixture() -> (std::rc::Rc<python_ast::Module>, PythonOptions) {
 }
 
 #[test]
+fn ellipsis_statement_is_a_noop() {
+    // Protocol stubs `def f(...) -> None: ...` are everywhere (pip's
+    // build_env, typing Protocols). The bare `...` body is a no-op like
+    // `pass`; using Ellipsis as a VALUE is a loud error.
+    let out = compile(
+        "def stub(x: int) -> None:\n    ...\n\ndef real(x: int) -> int:\n    return x + 1\n",
+        "ellipsis.py",
+    );
+    assert!(
+        !out.contains("RYTHON_ELLIPSIS"),
+        "bare `...` statement must not leak into generated code: {}",
+        out
+    );
+    assert!(out.contains("fn stub"), "stub must still be emitted: {}", out);
+    assert!(
+        out.contains("fn real"),
+        "real must still be emitted: {}",
+        out
+    );
+
+    let module = parse("y = ...", "ellipsis_val.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("ellipsis_val".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("Ellipsis as a value must be a loud error");
+    assert!(
+        err.to_string().contains("Ellipsis"),
+        "error must mention Ellipsis: {}",
+        err
+    );
+}
+
+#[test]
+fn future_import_is_a_noop() {
+    // `from __future__ import annotations` is a compiler directive; it must
+    // not lower to a `use crate::__future__::...` (an unresolved import in
+    // the generated crate — pip/__init__.py hit exactly that).
+    let out = compile(
+        "from __future__ import annotations\n\ndef f(x: int) -> int:\n    return x\n",
+        "future.py",
+    );
+    assert!(
+        !out.contains("__future__"),
+        "from __future__ must lower to nothing: {}",
+        out
+    );
+    assert!(out.contains("fn f"), "function must still be emitted: {}", out);
+}
+
+#[test]
+fn metaclass_abcmata_is_a_lossy_noop() {
+    // `metaclass=abc.ABCMeta` only enforces abstract-method instantiation
+    // at runtime; lowering the class as a plain class keeps data+methods
+    // (pip's BuildEnvironment). Other class keywords are loud errors.
+    let src = concat!(
+        "import abc\n",
+        "\n",
+        "class Shape(metaclass=abc.ABCMeta):\n",
+        "    def area(self) -> float:\n",
+        "        return 0.0\n",
+    );
+    let out = compile(src, "meta.py");
+    assert!(
+        out.contains("struct Shape"),
+        "metaclass class must still emit its struct: {}",
+        out
+    );
+
+    let module = parse("class Bad(metaclass=SomeMeta):\n    pass\n", "meta_bad.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("meta_bad".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("a non-ABCMeta class keyword must be a loud error");
+    assert!(
+        err.to_string().contains("class keyword"),
+        "error must mention the class keyword: {}",
+        err
+    );
+}
+
+#[test]
+fn isinstance_accepts_a_tuple_of_types() {
+    // `isinstance(x, (bytearray, bytes))` is the "accept either" idiom
+    // (charset_normalizer's from_bytes). Both lower to Vec<u8>, so the
+    // check against a bytes|bytearray argument is statically true.
+    let out = compile(
+        "def check(sequences: bytes | bytearray) -> bool:\n\
+         \x20   if not isinstance(sequences, (bytearray, bytes)):\n\
+         \x20       return False\n\
+         \x20   return True\n",
+        "istuple.py",
+    );
+    assert!(
+        out.contains("true"),
+        "isinstance against a bytes tuple must decide true: {}",
+        out
+    );
+    // A tuple containing a type the argument can't be decides false.
+    let out = compile(
+        "def check(x: int) -> bool:\n\
+         \x20   return isinstance(x, (str, float))\n",
+        "istuple2.py",
+    );
+    assert!(
+        out.contains("false"),
+        "isinstance against a non-matching tuple must decide false: {}",
+        out
+    );
+}
+
+#[test]
+fn exception_class_lowers_to_a_marker_struct() {
+    // Custom exceptions (`class IDNAError(UnicodeError)`, `class
+    // RequestException(IOError)`) are string-tagged PyException values at
+    // runtime; the class definition is a marker struct so `raise
+    // IDNAError(...)` / `except IDNAError` keep working. idna's IDNAError
+    // has a *args __init__ — the marker lowering must not trip the
+    // variadic-parameter guard.
+    let out = compile(
+        "class IDNAError(UnicodeError):\n\
+         \x20   code: str | None\n\
+         \x20   def __init__(self, *args: object, code=None) -> None:\n\
+         \x20       super().__init__(*args)\n\
+         \x20       self.code = code\n\
+         \n\
+         class IDNABidiError(IDNAError):\n\
+         \x20   pass\n",
+        "exc.py",
+    );
+    assert!(
+        out.contains("pub struct IDNAError ;")
+            || out.contains("pub struct IDNAError;"),
+        "exception class must lower to a marker struct: {}",
+        out
+    );
+    assert!(
+        out.contains("pub struct IDNABidiError")
+            || out.contains("pub struct IDNABidiError ;"),
+        "custom exception inheriting a custom exception must be a marker: {}",
+        out
+    );
+    assert!(
+        !out.contains("fn __init__"),
+        "the marker must not carry __init__: {}",
+        out
+    );
+}
+
+#[test]
 fn composition_chain_store_goes_through_mut_accessors() {
     // A store through a composition chain (`self.inner.x = v`) inside a
     // generic trait default must write through the MUTABLE accessor of

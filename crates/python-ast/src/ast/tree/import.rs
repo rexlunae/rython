@@ -377,6 +377,16 @@ impl CodeGen for ImportFrom {
         // declarations lower to nothing and the module never exists at
         // runtime. Only `rust` is importable — anything else is a mistake
         // worth a loud error, not a silent no-op.
+        // `from __future__ import ...` is a compiler directive, not a
+        // runtime import: the future flags (annotations, generators, ...)
+        // are either already the language's default behavior or have no
+        // Rust analogue, so the statement lowers to nothing (a `use
+        // crate::__future__::...` would be an unresolved import).
+        if self.module == "__future__" {
+            return Ok(TokenStream::new());
+        }
+
+        // `from rython import rust` — compile-time Rust bindings.
         if self.module == "rython" {
             if self.names.len() == 1
                 && self.names[0].name == "rust"

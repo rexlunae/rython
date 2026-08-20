@@ -57,8 +57,40 @@ pub struct ClassDef {
     /// or any other expression is a loud error at codegen, not a silent
     /// drop. Extracted as ExprType so the parse does not crash on them.
     pub bases: Vec<ExprType>,
-    pub keywords: Vec<String>,
+    /// Class keywords (`metaclass=...`, `**kwargs`). Python's AST stores
+    /// these as keyword objects with an optional `arg` and a value
+    /// expression — extracting them as plain strings crashed the parse.
+    /// Codegen decides per keyword: `metaclass=abc.ABCMeta` is a lossy
+    /// no-op (abstract-method enforcement has no Rust analogue), anything
+    /// else is a loud error.
+    pub keywords: Vec<ClassKeyword>,
     pub body: Vec<Statement>,
+}
+
+/// One class-definition keyword: the `arg` name (None for `**kwargs`) and
+/// the value expression.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClassKeyword {
+    pub arg: Option<String>,
+    pub value: ExprType,
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for ClassKeyword {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        use pyo3::types::PyAnyMethods;
+        let arg: Option<String> = ob
+            .getattr("arg")
+            .map_err(|e| crate::extraction_failure("class keyword arg", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class keyword arg", &ob, e))?;
+        let value: ExprType = ob
+            .getattr("value")
+            .map_err(|e| crate::extraction_failure("class keyword value", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class keyword value", &ob, e))?;
+        Ok(ClassKeyword { arg, value })
+    }
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
@@ -75,7 +107,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
             .map_err(|e| crate::extraction_failure("class bases", &ob, e))?
             .extract()
             .map_err(|e| crate::extraction_failure("class bases", &ob, e))?;
-        let keywords: Vec<String> = ob
+        let keywords: Vec<ClassKeyword> = ob
             .getattr("keywords")
             .map_err(|e| crate::extraction_failure("class keywords", &ob, e))?
             .extract()
@@ -92,6 +124,26 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
             body,
         })
     }
+}
+
+/// Whether a class is an exception class: its name matches the exception
+/// naming convention (`*Error`, `*Exception`, `*Warning`) — the same
+/// heuristic `raise` uses to construct PyException values — or one of its
+/// bases does. A custom exception inheriting a builtin (`IDNAError(UnicodeError)`)
+/// or another custom exception (`IDNABidiError(IDNAError)`) is an exception
+/// class too. Lowered as a marker struct; the runtime matches exceptions by
+/// name string, so the class carries no data.
+fn is_exception_class(class: &ClassDef) -> bool {
+    let convention = |n: &str| {
+        n.ends_with("Error") || n.ends_with("Exception") || n.ends_with("Warning")
+    };
+    if convention(&class.name) {
+        return true;
+    }
+    class.bases.iter().any(|b| match b {
+        ExprType::Name(n) => convention(&n.id),
+        _ => false,
+    })
 }
 
 impl ClassDef {
@@ -554,6 +606,64 @@ impl CodeGen for ClassDef {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let class_name = crate::safe_ident(&self.name);
+
+        // ---- Exception classes ----
+        // A class inheriting a builtin exception (or another custom
+        // exception) is lowered as a MARKER: the runtime models exceptions
+        // as string-tagged PyException values (raise/except match by name),
+        // so the class has no data or methods to carry — only its name.
+        // This keeps `raise IDNAError("msg")` / `except IDNAError` working
+        // for the ubiquitous custom-exception pattern (requests'
+        // RequestException, urllib3's HTTPError, idna's IDNAError).
+        // Exception classes with *args/**kwargs __init__ (idna) lower
+        // through here without tripping the variadic-parameter guard.
+        if is_exception_class(&self) {
+            let doc = self
+                .get_docstring()
+                .map(|d| format!("#[doc = \"{}\"]\n", d.replace('"', "\\\"")))
+                .unwrap_or_default();
+            return Ok(quote! {
+                #doc
+                #[allow(dead_code)]
+                pub struct #class_name;
+            });
+        }
+
+        // ---- Class keywords (`metaclass=...`, `**kwargs`) ----
+        // `metaclass=abc.ABCMeta` is the Protocol/ABC idiom: the metaclass
+        // only enforces abstract-method instantiation at runtime, which has
+        // no Rust analogue — lowering the class as a plain class keeps the
+        // data and methods, so it is a LOSSY no-op (surfaced through the
+        // -W channel, never silent). Any other class keyword changes class
+        // creation itself and is a loud error.
+        for kw in &self.keywords {
+            let is_abcmata = kw.arg.as_deref() == Some("metaclass")
+                && matches!(
+                    &kw.value,
+                    ExprType::Attribute(a)
+                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "abc")
+                            && a.attr == "ABCMeta"
+                );
+            if is_abcmata {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "class `{}`: `metaclass=abc.ABCMeta` is dropped (abstract-method \
+                     enforcement has no Rust analogue); the class lowers as a plain class",
+                    self.name
+                ));
+            } else {
+                let what = kw
+                    .arg
+                    .as_deref()
+                    .map(|a| format!("`{a}=...`"))
+                    .unwrap_or_else(|| "`**kwargs`".to_string());
+                return Err(format!(
+                    "class `{}` uses the class keyword {}, which is not supported \
+                     (only `metaclass=abc.ABCMeta` is accepted, as a lossy no-op)",
+                    self.name, what
+                )
+                .into());
+            }
+        }
 
         // ---- Base resolution ----
         // Single inheritance only. `object` is every class's implicit base,
@@ -1219,6 +1329,14 @@ impl ClassDef {
         match expr.statement {
             StatementType::Expr(e) => match e.value {
                 ExprType::Constant(c) => {
+                    // The Ellipsis sentinel is not a docstring (a class
+                    // whose first body statement is `...`).
+                    if c.0
+                        .as_ref()
+                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                    {
+                        return None;
+                    }
                     let raw_string = c.to_string();
                     Some(self.format_docstring(&raw_string))
                 }
