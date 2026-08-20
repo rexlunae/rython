@@ -150,6 +150,13 @@ line, never a silent behaviour change:
   representable element type and no call-through-container lowering.
   Same family as "classes as values": function objects are not
   first-class values. Blocks botocore (#3 PyPI) at its first statement.
+- **Decorator-factory expressions** — `lru_cache(maxsize=None)(fn)`
+  (the decorator factory CALLED as an expression, charset_normalizer's
+  `cached_mess_ratio = lru_cache(maxsize=None)(mess_ratio)`) needs the
+  callee's signature resolved cross-module (`mess_ratio` lives in
+  `md.py`) to synthesize the cached wrapper — the same cross-module
+  signature gap as #123. `@lru_cache` on a definition works; the
+  expression form does not.
 - **Dynamic imports and the import machinery** — `importlib`,
   `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
   modeled: rython compiles imports statically. Blocks pip's
@@ -176,11 +183,10 @@ line, never a silent behaviour change:
   rython has no cross-module call-return-type inference yet, so
   `Prefix.bin_dir = scheme.scripts` in pip's `_internal` is a loud
   error (blocks pip — #5 PyPI).
-- **`is not None` type narrowing** — `if x is not None:` does not narrow
-  an `Option<T>`-typed name to `T` for reads/iteration: a comprehension
-  over the guarded name iterates the Option (the inner value as one
-  element) and fails loudly at build time. Blocks requests at
-  charset_normalizer's `from_bytes` (`cp_isolation` guard).
+- **`is not None` narrowing** — `if x is not None:` narrows an
+  `Option<T>`-typed name to `T` for reads/iteration in the body, and an
+  if/else whose branches both leave x non-None keeps it narrowed for the
+  rest of the function (charset_normalizer's `cp_isolation` guards).
 - **Codecs** — `str.encode`/`bytes.decode` support `utf-8`, `ascii`, and
   `punycode` (RFC 3492, CPython-verified); other codec names are a loud
   error. `bytes.decode("utf-8")` etc. work through the stdpython codec
