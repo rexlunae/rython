@@ -80,6 +80,11 @@ program either converts and behaves like CPython, or conversion fails with
 a message saying exactly what isn't supported. Nothing silently diverges.
 
 What works today (all CPython-verified): functions with type annotations,
+parameter type inference for unannotated parameters (trait-bound generic
+signatures derived from how the parameter is used — `def add(a, b): return
+a + b` works for ints, floats, strings, and lists; `for x in p` infers
+`IntoIterator` with element propagation; unannotated parameters either
+infer or fail loudly at conversion time),
 classes (struct-based), control flow including `try`/`except`/`finally` and
 loop `else`, comprehensions, f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus

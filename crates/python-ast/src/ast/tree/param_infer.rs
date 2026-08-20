@@ -715,8 +715,23 @@ fn return_type_of(
                     }
                     if collector.current_fn.as_deref() == Some(callee.name.as_str()) {
                         if let Some(param_index) = callee_returned_param(callee) {
-                            if let Some(arg) = c.args.get(param_index) {
-                                return operand_type(arg, collector, param_types);
+                            // The fixpoint: the recursive call returns the
+                            // same thing the function returns on its base
+                            // path — the RETURNED parameter's own type
+                            // variable (repeat: x → A; fibonacci: n → N).
+                            // The decremented ARGUMENT's type is irrelevant
+                            // to the result (it is bound separately by
+                            // `N: PySub<i64, Output = N>`).
+                            if let Some(param_name) = callee
+                                .args
+                                .posonlyargs
+                                .iter()
+                                .chain(callee.args.args.iter())
+                                .nth(param_index)
+                            {
+                                if let Some(tv) = param_types.get(&param_name.arg) {
+                                    return Ok(tv.clone());
+                                }
                             }
                         }
                         return Err(format!(
@@ -1779,6 +1794,33 @@ impl<'a> Collector<'a> {
                             self.add(&l.id, ParamReq::Op(t, rhs));
                         }
                     }
+                    // A SELF-recursive call as the receiver: its result has
+                    // the returned parameter's type (the fixpoint), so
+                    // `fibonacci(n-1) + fibonacci(n-2)` needs
+                    // `T: PyAdd<Self>` (M4).
+                    if let ExprType::Call(c) = b.left.as_ref()
+                        && let ExprType::Name(f) = c.func.as_ref()
+                        && self.current_fn.as_deref() == Some(f.id.as_str())
+                        && let Some(crate::SymbolTableNode::FunctionDef(callee)) =
+                            self.symbols.get(&f.id)
+                        && let Some(param_index) = callee_returned_param(callee)
+                        && let Some(param) = callee
+                            .args
+                            .posonlyargs
+                            .iter()
+                            .chain(callee.args.args.iter())
+                            .nth(param_index)
+                        && self.unannotated.contains(&param.arg)
+                    {
+                        let rhs = if self.is_self_call(&b.right)
+                            || matches!(b.right.as_ref(), ExprType::Name(r) if r.id == param.arg)
+                        {
+                            RhsType::Same
+                        } else {
+                            self.rhs_of(&b.right)
+                        };
+                        self.add(&param.arg, ParamReq::Op(t, rhs));
+                    }
                 }
                 self.walk_expr(&b.left, false);
                 self.walk_expr(&b.right, false);
@@ -2595,6 +2637,14 @@ impl<'a> Collector<'a> {
             }
             _ => self.rhs_of(expr),
         }
+    }
+
+    /// Whether the expression is a call to the function being collected
+    /// (self-recursion, M4).
+    fn is_self_call(&self, expr: &ExprType) -> bool {
+        matches!(expr, ExprType::Call(c)
+            if matches!(c.func.as_ref(), ExprType::Name(f)
+                if self.current_fn.as_deref() == Some(f.id.as_str())))
     }
 
     /// The root unannotated parameter a name flows from, following the

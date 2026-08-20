@@ -4548,3 +4548,88 @@ fn iteration_inference_matches_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn stdlib_method_table_honesty_transcript() {
+    // Issue #109, M2: the STDLIB_METHOD_TABLE can never drift from the
+    // runtime — every exerciseable row (one function per entry, bound on
+    // the table's trait) converts, builds, and diffs against a pinned
+    // `// Verified against python3.` transcript. The two rows skipped are
+    // documented gaps, not coverage holes: `insert` (PyListOps<T> needs
+    // the element type the inference does not express yet) and the LIST
+    // `count` (the name is dual-str/list; the first table match wins, so
+    // the str row below is the exercised one).
+    let scratch = Scratch::new("method-table-honesty");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def f_upper(s): return s.upper()\n",
+            "def f_lower(s): return s.lower()\n",
+            "def f_strip(s): return s.strip()\n",
+            "def f_lstrip(s): return s.lstrip()\n",
+            "def f_rstrip(s): return s.rstrip()\n",
+            "def f_capitalize(s): return s.capitalize()\n",
+            "def f_title(s): return s.title()\n",
+            "def f_splitlines(s): return s.splitlines()\n",
+            "def f_find(s): return s.find(\"x\")\n",
+            "def f_count(s): return s.count(\"a\")\n",
+            "def f_split(s): return s.split(\" \")\n",
+            "def f_rsplit(s): return s.rsplit(\" \")\n",
+            "def f_partition(s): return s.partition(\" \")\n",
+            "def f_rpartition(s): return s.rpartition(\" \")\n",
+            "def f_zfill(s): return s.zfill(5)\n",
+            "def f_ljust(s): return s.ljust(5)\n",
+            "def f_rjust(s): return s.rjust(5)\n",
+            "def f_pop(xs): return xs.pop()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(f_upper(\"Hi\"))\n",
+            "    print(f_lower(\"Hi\"))\n",
+            "    print(f_strip(\"  x  \"))\n",
+            "    print(f_lstrip(\"  x\"))\n",
+            "    print(f_rstrip(\"x  \"))\n",
+            "    print(f_capitalize(\"hi\"))\n",
+            "    print(f_title(\"hello world\"))\n",
+            "    print(f_splitlines(\"a\\nb\"))\n",
+            "    print(f_find(\"xyz\"))\n",
+            "    print(f_count(\"banana\"))\n",
+            "    print(f_split(\"a b c\"))\n",
+            "    print(f_rsplit(\"a b c\"))\n",
+            "    print(f_partition(\"a b c\"))\n",
+            "    print(f_rpartition(\"a b c\"))\n",
+            "    print(f_zfill(\"42\"))\n",
+            "    print(f_ljust(\"ab\"))\n",
+            "    print(f_rjust(\"ab\"))\n",
+            "    print(f_pop([\"a\", \"b\", \"c\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    // Every str row bounds on PyStrOps; pop bounds on PyPop<i64>.
+    assert!(src.matches("T: PyStrOps").count() >= 17, "bounds: {}", src);
+    assert!(src.contains("T: PyPop<i64>"), "pop bound: {}", src);
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "HI", "hi", "x", "x", "x", "Hi", "Hello World", "['a', 'b']", "0", "3",
+            "['a', 'b', 'c']", "['a', 'b', 'c']", "('a', ' ', 'b c')", "('a b', ' ', 'c')",
+            "00042", "ab   ", "   ab", "c",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

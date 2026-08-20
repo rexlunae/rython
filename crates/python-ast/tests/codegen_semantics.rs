@@ -5177,6 +5177,26 @@ fn iterating_a_non_iterable_argument_is_a_loud_error() {
 }
 
 #[test]
+fn self_recursive_receiver_gets_a_pyadd_self_bound() {
+    // `fib(n-1) + fib(n-2)`: the receiver of `+` is the function's OWN
+    // return (the fixpoint — the returned parameter's type), so the body
+    // needs `T: PyAdd<Self>`, collected from the self-recursive call on
+    // the operator's left (M4).
+    let out = compile(
+        concat!(
+            "def fib(n):\n",
+            "    if n <= 1:\n",
+            "        return n\n",
+            "    return fib(n - 1) + fib(n - 2)\n",
+        ),
+        "inf_fib.py",
+    );
+    assert!(out.contains("T : PyAdd < T , Output = T >"), "generated: {}", out);
+    assert!(out.contains("T : PySub < i64 , Output = T >"), "generated: {}", out);
+    assert!(out.contains("-> Result < T , PyException >"), "generated: {}", out);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

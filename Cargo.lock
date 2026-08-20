@@ -643,6 +643,7 @@ dependencies = [
  "proc-macro2",
  "python-ast",
  "quote",
+ "stdpython",
 ]
 
 [[package]]

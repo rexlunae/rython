@@ -14,16 +14,27 @@ use quote::{format_ident, quote};
 /// parses it, returning the structured parse error on failure so the caller
 /// can report it against the macro invocation.
 fn load_module(mod_name: &str) -> Result<Module, python_ast::Error> {
-    let mod_name_dir = format!("src/{}/__init__.py", mod_name);
-    let mod_name_file = format!("src/{}.py", mod_name);
+    // Proc-macro expansion may run with a CWD other than the package root
+    // (cargo uses the workspace root for integration-test targets);
+    // CARGO_MANIFEST_DIR is the package root in every target, so resolve
+    // the module file against it. For downstream users this is exactly the
+    // old CWD-relative `src/{mod}.py` lookup.
+    let base = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    // Read from the package root (CARGO_MANIFEST_DIR is the package root
+    // in every target), but pass the RELATIVE name to the parser: the
+    // module name is derived from the filename.
+    let mod_name_dir = format!("{}/src/{}/__init__.py", base, mod_name);
+    let mod_name_file = format!("{}/src/{}.py", base, mod_name);
+    let rel_name_dir = format!("src/{}/__init__.py", mod_name);
+    let rel_name_file = format!("src/{}.py", mod_name);
 
     let (path, python_str) = if Path::new(&mod_name_dir).exists() {
-        (mod_name_dir.clone(), fs::read_to_string(&mod_name_dir))
+        (rel_name_dir.clone(), fs::read_to_string(&mod_name_dir))
     } else if Path::new(&mod_name_file).exists() {
-        (mod_name_file.clone(), fs::read_to_string(&mod_name_file))
+        (rel_name_file.clone(), fs::read_to_string(&mod_name_file))
     } else {
         return Err(python_ast::parsing_error(
-            python_ast::SourceLocation::new(mod_name_file.clone()),
+            python_ast::SourceLocation::new(rel_name_file.clone()),
             format!(
                 "Python module `{}` not found (looked for {} and {})",
                 mod_name, mod_name_file, mod_name_dir
