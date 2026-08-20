@@ -258,44 +258,44 @@ impl std::ops::Mul<NdArray> for bool {
 
 impl crate::PyDiv<NdArray> for NdArray {
     type Output = NdArray;
-    fn py_div(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Div, self.clone(), rhs.clone())
+    fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, self.clone(), rhs.clone()))
     }
 }
 impl crate::PyDiv<i64> for NdArray {
     type Output = NdArray;
-    fn py_div(&self, rhs: &i64) -> NdArray {
-        ufunc::binary(BinOp::Div, self.clone(), *rhs)
+    fn py_div(&self, rhs: &i64) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, self.clone(), *rhs))
     }
 }
 impl crate::PyDiv<f64> for NdArray {
     type Output = NdArray;
-    fn py_div(&self, rhs: &f64) -> NdArray {
-        ufunc::binary(BinOp::Div, self.clone(), *rhs)
+    fn py_div(&self, rhs: &f64) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, self.clone(), *rhs))
     }
 }
 impl crate::PyDiv<bool> for NdArray {
     type Output = NdArray;
-    fn py_div(&self, rhs: &bool) -> NdArray {
-        ufunc::binary(BinOp::Div, self.clone(), *rhs)
+    fn py_div(&self, rhs: &bool) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, self.clone(), *rhs))
     }
 }
 impl crate::PyDiv<NdArray> for i64 {
     type Output = NdArray;
-    fn py_div(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Div, *self, rhs.clone())
+    fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, *self, rhs.clone()))
     }
 }
 impl crate::PyDiv<NdArray> for f64 {
     type Output = NdArray;
-    fn py_div(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Div, *self, rhs.clone())
+    fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, *self, rhs.clone()))
     }
 }
 impl crate::PyDiv<NdArray> for bool {
     type Output = NdArray;
-    fn py_div(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Div, *self, rhs.clone())
+    fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
+        Ok(ufunc::binary(BinOp::Div, *self, rhs.clone()))
     }
 }
 

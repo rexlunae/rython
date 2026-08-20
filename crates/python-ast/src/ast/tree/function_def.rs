@@ -873,6 +873,16 @@ impl CodeGen for FunctionDef {
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
+        // Issue #79's cheap guard: reject aliasing shapes rython cannot
+        // model (`b = a` on a container that is later mutated, and passing
+        // a container to a function that mutates it) at conversion time
+        // instead of silently diverging or leaving the report to rustc.
+        crate::check_aliasing(
+            &effective_body,
+            &symbols,
+            &options.name_types,
+            &options.use_counts,
+        )?;
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self

@@ -5,12 +5,9 @@
 
 use crate::PyException;
 use crate::python_function;
+use crate::PyDict;
 use alloc::{format, string::String, string::ToString, vec::Vec};
 use core::fmt;
-#[cfg(feature = "std")]
-use std::collections::HashMap;
-#[cfg(not(feature = "std"))]
-use hashbrown::HashMap;
 
 /// JSONValue - represents any JSON value
 #[derive(Debug, Clone, PartialEq)]
@@ -20,10 +17,18 @@ pub enum JSONValue {
     /// Integer number. Kept separate from `Float` so `json.dumps(1)` renders
     /// as `1` while `json.dumps(1.0)` renders as `1.0`, like Python.
     Int(i64),
+    /// An integer literal too large for rython's i64 model (issue #82):
+    /// kept as its exact decimal digits so `loads`/`dumps` round-trip like
+    /// CPython instead of silently degrading to an imprecise float.
+    BigInt(String),
     Float(f64),
     String(String),
     Array(Vec<JSONValue>),
-    Object(HashMap<String, JSONValue>),
+    /// Objects use the crate's insertion-ordered `PyDict` (issue #82): a
+    /// std `HashMap` made `json.dumps(json.loads(...))` order-arbitrary and
+    /// randomized per process, breaking CPython's documented insertion-order
+    /// guarantee.
+    Object(PyDict<String, JSONValue>),
 }
 
 impl JSONValue {
@@ -39,7 +44,7 @@ impl JSONValue {
     
     /// Check if this is a number
     pub fn is_number(&self) -> bool {
-        matches!(self, JSONValue::Int(_) | JSONValue::Float(_))
+        matches!(self, JSONValue::Int(_) | JSONValue::Float(_) | JSONValue::BigInt(_))
     }
     
     /// Check if this is a string
@@ -71,6 +76,8 @@ impl JSONValue {
         match self {
             JSONValue::Int(n) => Some(*n as f64),
             JSONValue::Float(n) => Some(*n),
+            // Never silently lose precision on an exact big integer.
+            JSONValue::BigInt(_) => None,
             _ => None,
         }
     }
@@ -103,7 +110,7 @@ impl JSONValue {
     }
     
     /// Get as object
-    pub fn as_object(&self) -> Option<&HashMap<String, JSONValue>> {
+    pub fn as_object(&self) -> Option<&PyDict<String, JSONValue>> {
         if let JSONValue::Object(obj) = self {
             Some(obj)
         } else {
@@ -118,6 +125,7 @@ impl fmt::Display for JSONValue {
             JSONValue::Null => write!(f, "null"),
             JSONValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             JSONValue::Int(n) => write!(f, "{}", n),
+            JSONValue::BigInt(digits) => write!(f, "{}", digits),
             JSONValue::Float(n) => write!(f, "{}", format_json_float(*n)),
             JSONValue::String(s) => write!(f, "\"{}\"", escape_json_string(s, true)),
             JSONValue::Array(arr) => {
@@ -212,6 +220,7 @@ impl JSONEncoder {
             JSONValue::Null => "null".to_string(),
             JSONValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
             JSONValue::Int(n) => format!("{}", n),
+            JSONValue::BigInt(digits) => digits.clone(),
             JSONValue::Float(n) => {
                 if !self.allow_nan && (n.is_nan() || n.is_infinite()) {
                     panic!(
@@ -256,6 +265,7 @@ impl JSONEncoder {
             JSONValue::Null => "null".to_string(),
             JSONValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
             JSONValue::Int(n) => format!("{}", n),
+            JSONValue::BigInt(digits) => digits.clone(),
             JSONValue::Float(n) => {
                 if !self.allow_nan && (n.is_nan() || n.is_infinite()) {
                     panic!(
@@ -539,7 +549,7 @@ impl JSONParser {
         self.pos += 1; // Skip '{'
         self.skip_whitespace();
         
-        let mut result = HashMap::new();
+        let mut result = PyDict::default();
         
         if self.pos < self.input.len() && self.input[self.pos] == '}' {
             self.pos += 1;
@@ -666,6 +676,10 @@ impl JSONParser {
             if let Ok(n) = number_str.parse::<i64>() {
                 return Ok(JSONValue::Int(n));
             }
+            // Too large for i64: keep the exact digits (issue #82) so
+            // loads/dumps round-trip like CPython instead of silently
+            // degrading to an imprecise Float.
+            return Ok(JSONValue::BigInt(number_str));
         }
         match number_str.parse::<f64>() {
             Ok(n) => Ok(JSONValue::Float(n)),
@@ -688,7 +702,12 @@ impl JSONParser {
     }
     
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+        // JSON permits only space, tab, LF, CR (issue #82): Rust's
+        // is_ascii_whitespace also accepts \x0c (form feed), which CPython's
+        // json rejects.
+        while self.pos < self.input.len()
+            && matches!(self.input[self.pos], ' ' | '\t' | '\n' | '\r')
+        {
             self.pos += 1;
         }
     }

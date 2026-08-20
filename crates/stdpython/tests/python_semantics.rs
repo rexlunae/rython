@@ -111,7 +111,7 @@ fn json_dumps_matches_python_defaults() {
     use stdpython::json::JSONValue;
 
     // Default separators are ", " and ": ".
-    let mut obj = std::collections::HashMap::new();
+    let mut obj = crate::PyDict::default();
     obj.insert("a".to_string(), JSONValue::Int(1));
     let out = json::dumps(&JSONValue::Object(obj), None);
     assert_eq!(out, "{\"a\": 1}");

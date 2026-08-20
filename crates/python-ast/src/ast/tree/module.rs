@@ -315,7 +315,21 @@ impl CodeGen for Module {
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
+        // Module-level aliasing (`b = a` on a container, later mutated) is
+        // the same divergence the function-level guard rejects (issue #79).
+        crate::check_aliasing(
+            &module_init_raw,
+            &symbols,
+            &options.name_types,
+            &options.use_counts,
+        )?;
         let main_info = crate::analyze_function_types(&main_body_raw);
+        crate::check_aliasing(
+            &main_body_raw,
+            &symbols,
+            &main_info.name_types,
+            &main_info.use_counts,
+        )?;
 
         for s in self.raw.body {
             // Check if this statement is an async function

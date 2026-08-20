@@ -178,8 +178,9 @@ impl CodeGen for AugAssign {
             // float. Route through py_div (numeric → f64, numpy arrays →
             // elementwise) instead of Rust's truncating `/=` or an `as f64`
             // cast (an int target then fails to compile, which is loud
-            // rather than quietly wrong).
-            BinOps::Div => Ok(quote!(#target = py_div(#target_load, #value))),
+            // rather than quietly wrong). The `?` propagates a catchable
+            // ZeroDivisionError (issue #107).
+            BinOps::Div => Ok(quote!(#target = py_div(#target_load, #value)?)),
             // Python // and % floor toward negative infinity / take the
             // divisor's sign; use the stdpython helpers instead of Rust's
             // truncating operators. The `?` propagates a catchable
@@ -218,7 +219,7 @@ fn combine_op(
         BinOps::Add => quote!((#elem).py_add(&(#value))),
         BinOps::Sub => quote!(#elem - #value),
         BinOps::Mult => quote!(#elem * #value),
-        BinOps::Div => quote!(py_div(#elem, #value)),
+        BinOps::Div => quote!(py_div(#elem, #value)?),
         BinOps::FloorDiv => quote!(py_floordiv(#elem, #value)?),
         BinOps::Mod => quote!(py_mod(#elem, #value)?),
         BinOps::Pow => quote!(py_pow(#elem, #value)),

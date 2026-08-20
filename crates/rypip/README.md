@@ -26,9 +26,23 @@ rypip build path/to/package
 ## Package discovery
 
 `rypip` accepts a single `.py` file, a package directory (containing
-`__init__.py`), or a project directory with a `pyproject.toml` — `[project]
-name` and `version` are used for the generated crate, and both flat and
-`src/` layouts are recognized.
+`__init__.py`), or a project directory with packaging metadata. Package
+name, version, layout, and dependencies are resolved **the way Python
+itself resolves them**:
+
+- **`pyproject.toml`** — PEP 621 `[project]` (`name`, `version`,
+  `dependencies`) plus `[tool.setuptools]` (`packages`, `py-modules`,
+  `package-dir`, `[tool.setuptools.packages.find]` with `where`).
+- **`setup.cfg`** — `[metadata]` and `[options]` (packages, py_modules,
+  install_requires, `[options.packages.find]`).
+- **`setup.py`** — executed through a `python3` shim (pip-style) that
+  records the `setup(...)` call without running setuptools; a static
+  parser falls back when no interpreter is available.
+
+`find_packages()` / `[tool.setuptools.packages.find]` discover packages
+recursively (skipping hidden and underscore-prefixed directories), and both
+flat and `src/` layouts are recognized. Projects without any packaging
+metadata fall back to the historical layout heuristics.
 
 A module containing an `if __name__ == "__main__":` block (or a
 `__main__.py`) becomes the binary entry point; packages without one convert
@@ -57,9 +71,25 @@ the extension with `cargo build --features python`.
 
 ## Python library dependencies
 
-`rython.toml` next to the package can declare vendored Python libraries
-with `[python-modules]`. Each entry maps an import name to a `.py` file or a
-package directory:
+Dependencies declared in the packaging metadata — `[project] dependencies`
+or `install_requires` — are resolved **pip-style from PyPI** when they are
+not already vendored: rypip queries the PyPI JSON API, picks the newest
+version satisfying the PEP 440 specifiers, downloads the pure-Python wheel
+(or sdist), extracts it into a cache (`$RYPIP_CACHE_DIR` or
+`~/.cache/rypip`), and transpiles it into the generated crate beside the
+package's own modules.
+
+- Explicit `rython.toml` `[python-modules]` entries always win over a
+  fetched dependency (pin a local copy by vendoring it).
+- `--no-deps` skips resolution entirely; `RYPIP_OFFLINE=1` fails loudly
+  instead of fetching (a vendored or already-cached dependency still
+  resolves offline).
+- The dependency's source must fit rython's typed subset, like any other
+  vendored library — a failed conversion names the module and construct.
+
+`rython.toml` next to the package can also declare vendored Python
+libraries with `[python-modules]`. Each entry maps an import name to a
+`.py` file or a package directory:
 
 ```toml
 [python-modules]

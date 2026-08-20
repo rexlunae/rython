@@ -534,6 +534,158 @@ fn exceptions_propagate_across_functions_at_runtime() {
 }
 
 #[test]
+fn true_division_by_zero_raises_catchable_zero_division_error_at_runtime() {
+    // Issue #107: `/` used to lower to an infallible py_div, so `1 / 0`
+    // silently printed `inf` where CPython raises ZeroDivisionError —
+    // wrong output with no conversion error, no exception, no panic. The
+    // division now goes through the Result-returning helper, so a zero
+    // divisor raises the same catchable error as `//`/`%` (#75), with
+    // CPython's exact messages.
+    let scratch = Scratch::new("true-div-zero");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def try_int() -> str:\n",
+            "    try:\n",
+            "        x = 1 / 0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "def try_float() -> str:\n",
+            "    try:\n",
+            "        x = 1.0 / 0.0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "def try_mixed() -> str:\n",
+            "    try:\n",
+            "        x = 1 / 0.0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "def try_aug() -> str:\n",
+            "    y = 1.0\n",
+            "    try:\n",
+            "        y /= 0.0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(try_int())\n",
+            "    print(try_float())\n",
+            "    print(try_mixed())\n",
+            "    print(try_aug())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "division by zero",
+            "float division by zero",
+            "float division by zero",
+            "float division by zero",
+        ],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "all divisions were caught");
+}
+
+#[test]
+fn stdlib_divergence_fixes_match_cpython_at_runtime() {
+    // Issue #82 end-to-end: math (IEEE remainder, ldexp, pow domain
+    // errors) and json (insertion order, exact big integers) must behave
+    // like CPython from transpiled Python. This also proves the codegen
+    // threads `?` through Result-returning stdlib module calls (math.sqrt,
+    // math.pow, json.loads — previously rustc type errors).
+    let scratch = Scratch::new("stdlib-divergences");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import math\n",
+            "import json\n",
+            "\n",
+            "def math_checks() -> str:\n",
+            "    out = []\n",
+            "    out.append(str(math.sqrt(144.0)))\n",
+            "    out.append(str(math.remainder(1e17, 3.0)))\n",
+            "    out.append(str(math.remainder(10.0, 0.1)))\n",
+            "    out.append(str(math.ldexp(1e-300, 1074)))\n",
+            "    out.append(str(math.fmod(9.5, 3.0)))\n",
+            "    out.append(str(math.pow(-8.0, 3.0)))\n",
+            "    try:\n",
+            "        x = math.pow(0.0, -1.0)\n",
+            "        out.append(str(\"no error\"))\n",
+            "    except ValueError as e:\n",
+            "        out.append(\"caught \" + str(e))\n",
+            "    try:\n",
+            "        x = math.ldexp(1.0, 2000)\n",
+            "        out.append(str(\"no error\"))\n",
+            "    except OverflowError as e:\n",
+            "        out.append(\"caught \" + str(e))\n",
+            "    return \" | \".join(out)\n",
+            "\n",
+            "def json_checks() -> str:\n",
+            "    parsed = json.loads('{\"b\": 1, \"a\": 2, \"c\": 3}')\n",
+            "    out = [json.dumps(parsed, None)]\n",
+            "    big = json.loads('123456789012345678901234567890')\n",
+            "    out.append(json.dumps(big, None))\n",
+            "    return \" | \".join(out)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(math_checks())\n",
+            "    print(json_checks())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "12.0 | 1.0 | -5.551115123125783e-16 | 2.0240225330731062e+23 | 0.5 | -512.0 | caught math domain error | caught math range error",
+            r#"{"b": 1, "a": 2, "c": 3} | 123456789012345678901234567890"#,
+        ],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn dict_methods_match_python_at_runtime() {
     let scratch = Scratch::new("dicts");
     let file = scratch.path().join("dicts.py");
@@ -3663,6 +3815,87 @@ fn kernel_device_mode_uses_manifest_defaults() {
 }
 
 #[test]
+fn pyproject_dependencies_vendored_end_to_end_at_runtime() {
+    // A pyproject.toml project declaring `dependencies`, satisfied by a
+    // vendored rython.toml [python-modules] copy: the resolved dependency
+    // is transpiled beside the package and callable from the generated
+    // binary — the pip-style wiring, verified at runtime.
+    let scratch = Scratch::new("pyproject-deps");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        concat!(
+            "[project]\n",
+            "name = \"depapp\"\n",
+            "version = \"0.1.0\"\n",
+            "dependencies = [\"pylev>=1.3\"]\n",
+            "\n",
+            "[tool.setuptools]\n",
+            "packages = [\"depapp\"]\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("depapp")).unwrap();
+    fs::write(scratch.path().join("depapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("depapp/main.py"),
+        concat!(
+            "import pylev\n",
+            "\n",
+            "def dist(a: str, b: str) -> int:\n",
+            "    return pylev.wf_levenshtein(a, b)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(dist(\"kitten\", \"sitting\"))\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/pylev.py"),
+        concat!(
+            "def wf_levenshtein(a: str, b: str) -> int:\n",
+            "    n = len(a)\n",
+            "    m = len(b)\n",
+            "    if n == 0:\n",
+            "        return m\n",
+            "    if m == 0:\n",
+            "        return n\n",
+            "    prev = [0] * (m + 1)\n",
+            "    for j in range(m + 1):\n",
+            "        prev[j] = j\n",
+            "    for i in range(1, n + 1):\n",
+            "        cur = [0] * (m + 1)\n",
+            "        cur[0] = i\n",
+            "        for j in range(1, m + 1):\n",
+            "            cost = 0 if a[i - 1] == b[j - 1] else 1\n",
+            "            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)\n",
+            "        prev = cur\n",
+            "    return prev[m]\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\npylev = { path = \"vendor/pylev.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/depapp"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "3", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn kernel_device_mode_rejects_module_init_conflict() {
     // The generated device owns the entry points; a Python module_init
     // would be silently dropped — loud error instead.
@@ -3745,4 +3978,82 @@ fn kernel_device_mode_rejects_bad_device_name() {
         "{}",
         err
     );
+}
+
+#[test]
+fn kernel_device_mode_rejects_floating_point_loudly() {
+    // Issue #108: the device-manifest sub-mode used to return before the
+    // module-wide float scan (issue #87's FPU lazy-save guard), leaving the
+    // one path where user Python grows — ioctl handlers, buffer logic —
+    // unguarded. Every FP shape must fail the conversion exactly as in the
+    // plain kernel path.
+    let scratch = Scratch::new("kernel-device-fp");
+    let cases: &[(&str, &str)] = &[
+        (
+            "device_float_return.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    return 1\n",
+                "\n",
+                "def handle(line: str) -> str:\n",
+                "    return str(1.5)\n",
+            ),
+        ),
+        (
+            "device_float_assign.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    ratio = 2.5\n",
+                "    return 0\n",
+            ),
+        ),
+        (
+            "device_float_call.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    x = float(\"1.5\")\n",
+                "    return 0\n",
+            ),
+        ),
+        (
+            "device_import_math.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "import math\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    return 0\n",
+            ),
+        ),
+    ];
+    for (name, src) in cases {
+        let file = scratch.path().join(name);
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join(format!("crate-{}", name.replace('.', "-")));
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                kernel_module: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("floating-point device-manifest code must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("floating-point"), "{}: {}", name, msg);
+        assert!(
+            msg.contains("kernel_fpu_begin"),
+            "{}: error must mention the FPU guard workaround: {}",
+            name,
+            msg
+        );
+    }
 }

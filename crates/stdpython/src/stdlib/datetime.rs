@@ -21,6 +21,7 @@ pub struct date {
 impl date {
     /// Create a new date
     pub fn new(year: i32, month: u32, day: u32) -> Result<Self, PyException> {
+        check_year(year)?;
         if !(1..=12).contains(&month) {
             return Err(crate::value_error("month must be in 1..12"));
         }
@@ -34,12 +35,16 @@ impl date {
         Ok(Self { year, month, day })
     }
     
-    /// Get today's date
+    /// Get today's date in LOCAL time, like Python's date.today() (via
+    /// localtime on unix; non-unix hosts fall back to UTC). The old
+    /// implementation decomposed UTC seconds directly, which was off by a
+    /// day for any timezone whose local date differs from UTC (issue #82).
     pub fn today() -> Self {
         let now = SystemTime::now();
         let duration = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
-        let days_since_epoch = duration.as_secs() / 86400;
-        days_to_date(days_since_epoch as i64 + 719163) // Unix epoch offset
+        datetime::from_unix_local(duration.as_secs() as i64, duration.subsec_micros())
+            .unwrap_or_else(|_| datetime::from_unix_utc(duration.as_secs() as i64, duration.subsec_micros()))
+            .date_component()
     }
     
     /// Create date from ordinal day
@@ -47,7 +52,11 @@ impl date {
         if ordinal < 1 {
             return Err(crate::value_error("ordinal must be >= 1"));
         }
-        Ok(days_to_date(ordinal))
+        let d = days_to_date(ordinal);
+        // CPython validates the RESULTING year: fromordinal(3652060)
+        // (10000-01-01) raises "year must be in 1..9999, not 10000".
+        check_year(d.year)?;
+        Ok(d)
     }
     
     /// Convert to ordinal day
@@ -81,8 +90,12 @@ impl date {
         let iso_year = days_to_date(thursday).year;
         // Week 1 is the week whose Thursday falls in the ISO year, i.e.
         // it starts on the Monday on or before that year's January 4th.
-        let jan4 = date::new(iso_year, 1, 4).expect("January 4th is always valid");
-        let week1_monday = jan4.toordinal() - jan4.weekday() as i64;
+        // Computed from ordinals (not date::new) because a late-December
+        // date near MAXYEAR can have iso_year == 10000, which is out of
+        // the validated range (issue #82).
+        let jan4_ordinal = date_to_days(date { year: iso_year, month: 1, day: 4 });
+        let jan4_weekday = (jan4_ordinal - 1).rem_euclid(7); // 0 = Monday
+        let week1_monday = jan4_ordinal - jan4_weekday;
         let week = ((week_monday - week1_monday) / 7 + 1) as u32;
         (iso_year, week, self.isoweekday())
     }
@@ -94,14 +107,7 @@ impl date {
     
     /// Format with strftime
     pub fn strftime(&self, fmt: &str) -> String {
-        // Simplified strftime implementation
-        fmt.replace("%Y", &format!("{:04}", self.year))
-           .replace("%m", &format!("{:02}", self.month))
-           .replace("%d", &format!("{:02}", self.day))
-           .replace("%B", month_name(self.month))
-           .replace("%b", month_abbr(self.month))
-           .replace("%A", weekday_name(self.weekday()))
-           .replace("%a", weekday_abbr(self.weekday()))
+        strftime_pass(fmt, Some(*self), None)
     }
     
     /// Replace components
@@ -168,10 +174,7 @@ impl time {
     
     /// Format with strftime
     pub fn strftime(&self, fmt: &str) -> String {
-        fmt.replace("%H", &format!("{:02}", self.hour))
-           .replace("%M", &format!("{:02}", self.minute))
-           .replace("%S", &format!("{:02}", self.second))
-           .replace("%f", &format!("{:06}", self.microsecond))
+        strftime_pass(fmt, None, Some(*self))
     }
     
     /// Replace components
@@ -398,7 +401,7 @@ impl datetime {
     
     /// Format with strftime
     pub fn strftime(&self, fmt: &str) -> String {
-        self.date_component().strftime(&self.time_component().strftime(fmt))
+        strftime_pass(fmt, Some(self.date_component()), Some(self.time_component()))
     }
     
     /// Replace components
@@ -915,7 +918,10 @@ fn is_leap_year(year: i32) -> bool {
 }
 
 fn days_to_date(ordinal: i64) -> date {
-    // Simplified algorithm - not historically accurate for very old dates
+    // Exact civil-from-days algorithm; constructs the date directly so it
+    // stays usable for internal decomposition (from_unix_*, isocalendar).
+    // Public constructors validate the year afterwards (date::new,
+    // date::fromordinal), matching CPython's error messages.
     let mut year = 1;
     let mut remaining_days = ordinal - 1;
     
@@ -940,13 +946,19 @@ fn days_to_date(ordinal: i64) -> date {
         month += 1;
     }
     
-    date::new(year, month, remaining_days as u32 + 1).unwrap()
+    date {
+        year,
+        month,
+        day: remaining_days as u32 + 1,
+    }
 }
 
 fn date_to_days(d: date) -> i64 {
     let mut days = 0i64;
     
-    // Add days for complete years
+    // Add days for complete years. Public constructors guarantee year >= 1
+    // (date::new validates against MINYEAR), so `1..d.year` is never the
+    // empty range that silently collapsed years <= 1 into year 1 (issue #82).
     for y in 1..d.year {
         days += if is_leap_year(y) { 366 } else { 365 };
     }
@@ -959,6 +971,112 @@ fn date_to_days(d: date) -> i64 {
     
     // Add remaining days
     days + d.day as i64
+}
+
+/// CPython's year-range check: "year must be in 1..9999, not 0".
+fn check_year(year: i32) -> Result<(), PyException> {
+    if !(MINYEAR..=MAXYEAR).contains(&year) {
+        return Err(crate::value_error(format!(
+            "year must be in {}..{}, not {}",
+            MINYEAR, MAXYEAR, year
+        )));
+    }
+    Ok(())
+}
+
+/// A single left-to-right strftime pass (issue #82). The old chained
+/// `str::replace` re-processed inserted text — `%%d` became `%05` and
+/// `100%%` stayed `100%%` — and left every unimplemented directive as
+/// literal text. CPython's strftime scans once: `%%` is a literal percent,
+/// a known directive is substituted with the component's value, and an
+/// unknown directive stays as-is (`%q` -> `%q`).
+///
+/// A date-only receiver substitutes zeros for the time components and a
+/// time-only receiver substitutes 1900-01-01 for the date components,
+/// exactly like CPython (date.strftime('%H') -> "00",
+/// time.strftime('%Y') -> "1900").
+fn strftime_pass(fmt: &str, d: Option<date>, t: Option<time>) -> String {
+    let d = d.unwrap_or(date { year: 1900, month: 1, day: 1 });
+    let t = t.unwrap_or(time { hour: 0, minute: 0, second: 0, microsecond: 0 });
+
+    let ord = d.toordinal();
+    let jan1_ord = date_to_days(date { year: d.year, month: 1, day: 1 });
+    let doy = ord - jan1_ord + 1; // 1-based day of year (%j, %U, %W)
+    let jan1_mon = (jan1_ord - 1).rem_euclid(7); // 0 = Monday
+    let jan1_sun = jan1_ord.rem_euclid(7); // 0 = Sunday
+    let first_monday = ((7 - jan1_mon) % 7) + 1;
+    let first_sunday = ((7 - jan1_sun) % 7) + 1;
+    let week_monday = if doy < first_monday { 0 } else { (doy - first_monday) / 7 + 1 };
+    let week_sunday = if doy < first_sunday { 0 } else { (doy - first_sunday) / 7 + 1 };
+    let (iso_year, iso_week, _) = d.isocalendar();
+    let hour12 = {
+        let h = t.hour % 12;
+        if h == 0 { 12 } else { h }
+    };
+
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(dir) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        match dir {
+            '%' => out.push('%'),
+            'Y' => out.push_str(&format!("{:04}", d.year)),
+            'y' => out.push_str(&format!("{:02}", d.year.rem_euclid(100))),
+            'm' => out.push_str(&format!("{:02}", d.month)),
+            'd' => out.push_str(&format!("{:02}", d.day)),
+            'e' => out.push_str(&format!("{:2}", d.day)),
+            'B' => out.push_str(month_name(d.month)),
+            'b' => out.push_str(month_abbr(d.month)),
+            'A' => out.push_str(weekday_name(d.weekday())),
+            'a' => out.push_str(weekday_abbr(d.weekday())),
+            'j' => out.push_str(&format!("{:03}", doy)),
+            'w' => out.push_str(&format!("{}", ord.rem_euclid(7))), // 0 = Sunday
+            'u' => out.push_str(&format!("{}", d.isoweekday())),
+            'U' => out.push_str(&format!("{:02}", week_sunday)),
+            'W' => out.push_str(&format!("{:02}", week_monday)),
+            'G' => out.push_str(&format!("{:04}", iso_year)),
+            'V' => out.push_str(&format!("{:02}", iso_week)),
+            'H' => out.push_str(&format!("{:02}", t.hour)),
+            'I' => out.push_str(&format!("{:02}", hour12)),
+            'M' => out.push_str(&format!("{:02}", t.minute)),
+            'S' => out.push_str(&format!("{:02}", t.second)),
+            'f' => out.push_str(&format!("{:06}", t.microsecond)),
+            'p' => out.push_str(if t.hour < 12 { "AM" } else { "PM" }),
+            // A naive datetime has no tz: %z/%Z are empty, like CPython.
+            'z' => {}
+            'Z' => {}
+            'c' => out.push_str(&format!(
+                "{} {} {:2} {:02}:{:02}:{:02} {:04}",
+                weekday_abbr(d.weekday()),
+                month_abbr(d.month),
+                d.day,
+                t.hour,
+                t.minute,
+                t.second,
+                d.year
+            )),
+            'x' => out.push_str(&format!(
+                "{:02}/{:02}/{:02}",
+                d.month,
+                d.day,
+                d.year.rem_euclid(100)
+            )),
+            'X' => out.push_str(&format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)),
+            other => {
+                // Unknown directive: CPython leaves it literal (%q -> %q).
+                out.push('%');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 fn month_name(month: u32) -> &'static str {

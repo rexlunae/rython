@@ -8,6 +8,22 @@ use crate::{
     extract_required_attr,
 };
 
+/// Runtime-module functions that return `Result<T, PyException>` because
+/// they can raise like their Python counterparts. A call through a module
+/// path (`math.sqrt(x)`, `json.loads(s)`) into one of these threads `?`
+/// (see `propagates_exceptions`), so the exception stays catchable instead
+/// of surfacing as a rustc type error in the generated crate. The set must
+/// mirror the Result-returning `python_function!` blocks in stdpython.
+const FALLIBLE_STDLIB_FN: &[&str] = &[
+    // math: domain/range errors and overflow.
+    "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
+    "factorial", "fmod", "remainder", "ldexp",
+    // json: parse errors.
+    "loads",
+    // glob: filesystem access can fail.
+    "glob", "rglob", "iglob",
+];
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Call {
     pub func: Box<ExprType>,
@@ -748,15 +764,22 @@ impl<'a> CodeGen for Call {
             // `pylev.wf(...)` / `p: pylev` aliases: a call through a module
             // path into a transpiled (non-runtime) module returns
             // Result<T, PyException>. Runtime modules keep their own
-            // lowering (time.monotonic() returns f64, no `?`).
+            // lowering (time.monotonic() returns f64, no `?`) — except the
+            // ones that return Result because they can raise like Python
+            // (math.sqrt, math.pow, json.loads, ...); those thread `?`
+            // exactly like the fallible builtins (issue #82 makes the math
+            // family reachable from transpiled code).
             ExprType::Attribute(attr) => {
-                crate::ast::tree::call::root_name(&attr.value).is_some_and(|root| {
-                    !crate::is_stdpython_module(root)
-                        && crate::ast::tree::attribute::is_module_path_chain(
-                            &attr.value,
-                            &symbols,
-                        )
-                })
+                let root = crate::ast::tree::call::root_name(&attr.value);
+                match root {
+                    Some(root) if !crate::is_stdpython_module(&root) => {
+                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols)
+                    }
+                    Some(root) if crate::is_stdpython_module(&root) => {
+                        FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
+                    }
+                    _ => false,
+                }
             }
             _ => false,
         };
@@ -2925,9 +2948,11 @@ impl<'a> CodeGen for Call {
                     }
                     // list.insert follows Python index rules (negative counts
                     // from the end, out-of-range clamps); Vec::insert takes a
-                    // usize and panics past len.
+                    // usize and panics past len. The `?` propagates the
+                    // IndexError a bounded deque raises at its maxlen
+                    // (issue #82).
                     ("insert", [idx, value]) => {
-                        return Ok(quote!((#receiver).py_insert(#idx, #value)));
+                        return Ok(quote!((#receiver).py_insert(#idx, #value)?));
                     }
                     // partition/rpartition raise ValueError on an empty
                     // separator, so the calls take `?`.
@@ -3118,7 +3143,16 @@ impl<'a> CodeGen for Call {
         );
 
         // Special handling for subprocess.run and os.execv with fallback for compatibility
-        let final_call = if propagates_exceptions {
+        let final_call = if name_str == "json :: dumps" {
+            // json.dumps takes its object by reference; Python code passes
+            // it by value (`json.dumps(parsed)`), so borrow the first
+            // argument here instead of failing with a mismatched type.
+            if let Some((first, rest)) = all_args.split_first() {
+                quote!(#name(&(#first), #(#rest),*))
+            } else {
+                quote!(#name)
+            }
+        } else if propagates_exceptions {
             quote!(#call_expr?)
         } else if name_str == "subprocess :: run" {
             // Try mixed_args version first, fallback to regular version

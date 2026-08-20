@@ -105,6 +105,10 @@ pub struct ConvertOptions {
     /// rust-for-linux toolchain inside a rust-for-linux kernel tree.
     /// Requires `kernel_module`; overrides the raw-FFI output.
     pub rust_for_linux: bool,
+    /// Skip resolving the packaging metadata's dependencies (`[project]
+    /// dependencies` / install_requires) against PyPI. Vendored
+    /// `[python-modules]` entries always win either way.
+    pub no_deps: bool,
 }
 
 /// A converted crate on disk.
@@ -232,14 +236,17 @@ fn generate_kernel_lib_rs(
     let ast =
         parse_enhanced(source, "<kernel>".to_string()).map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // The kernel runs with the FPU in a lazy-save state: reject
+    // floating-point usage loudly instead of emitting code that can corrupt
+    // userspace state (issue #87). Unconditional — the device-manifest
+    // sub-mode (ioctl handlers, buffer logic) must not be an unguarded path
+    // (issue #108). The scan is target-independent, so run it before the
+    // has_device early return.
+    check_kernel_no_floats(&ast)?;
+
     if manifest.has_device {
         return generate_kernel_device(&ast, manifest, target, package_name);
     }
-
-    // The kernel runs with the FPU in a lazy-save state: reject
-    // floating-point usage loudly instead of emitting code that can corrupt
-    // userspace state (issue #87).
-    check_kernel_no_floats(&ast)?;
 
     let mut init_body = String::new();
     let mut exit_body = String::new();
@@ -1816,6 +1823,22 @@ pub fn convert(
         );
     }
 
+    // The packaging metadata's own dependencies ([project] dependencies,
+    // install_requires) are resolved pip-style — a PyPI fetch when they are
+    // not already vendored via [python-modules] — so a pyproject.toml
+    // project converts with its libraries wired in the same way Python
+    // would install them. Explicit manifest entries override the fetch.
+    // Kernel modules compile a single entry file and reject all python
+    // modules, so they never resolve dependencies.
+    let python_manifest = if opts.no_deps
+        || opts.kernel_module
+        || package.dependencies.is_empty()
+    {
+        python_manifest
+    } else {
+        resolve_packaging_dependencies(package, python_manifest)?
+    };
+
     // Kernel modules use a dedicated lowering path: no stdpython, no alloc,
     // raw FFI entry points with printk and module metadata.
     if opts.kernel_module {
@@ -3280,13 +3303,14 @@ fn read_rust_module_manifest(package: &PyPackage) -> Result<HashMap<String, Mani
     Ok(out)
 }
 
-/// A manifest entry from `rython.toml` `[python-modules]`: a vendored
-/// PyPI-style Python library, compiled into the generated crate.
+/// A manifest entry from `rython.toml` `[python-modules]` (or a resolved
+/// PyPI dependency): a vendored PyPI-style Python library, compiled into
+/// the generated crate.
 #[derive(Clone, Debug)]
-struct ManifestPythonModule {
+pub(crate) struct ManifestPythonModule {
     /// Path to a single .py file or a package directory, relative to the
     /// package root (where the manifest lives).
-    path: String,
+    pub(crate) path: String,
 }
 
 /// Read `rython.toml` `[python-modules]`, keyed by the Python import name
@@ -3334,6 +3358,32 @@ fn read_python_module_manifest(
     Ok(out)
 }
 
+/// Resolve the packaging metadata's declared dependencies (pyproject
+/// `[project] dependencies` / setup.cfg `install_requires` / setup.py) into
+/// `[python-modules]`-style entries, fetching from PyPI unless the
+/// dependency is already vendored explicitly (explicit entries win) or
+/// `RYPIP_OFFLINE=1` is set (then a missing dep is a loud error).
+fn resolve_packaging_dependencies(
+    package: &PyPackage,
+    explicit: HashMap<String, ManifestPythonModule>,
+) -> Result<HashMap<String, ManifestPythonModule>> {
+    let requirements = crate::resolve::parse_requirements(&package.dependencies);
+    if requirements.is_empty() {
+        return Ok(explicit);
+    }
+    let offline = std::env::var_os("RYPIP_OFFLINE").is_some();
+    let mut resolved = Vec::new();
+    for req in &requirements {
+        if explicit.contains_key(&req.name) {
+            continue;
+        }
+        let dep = crate::resolve::resolve_dependency(req, offline)
+            .with_context(|| format!("resolving dependency `{}`", req.name))?;
+        resolved.push(dep);
+    }
+    Ok(crate::resolve::merge_python_modules(explicit, resolved))
+}
+
 /// Load every `[python-modules]` dependency into an in-memory `PyPackage`,
 /// with module paths remapped under the import name: a single file
 /// `vendor/pylev/wf.py` becomes the one module `pylev`; a package directory
@@ -3372,6 +3422,7 @@ fn python_module_deps(
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from(".")),
                 modules: vec![module],
+                dependencies: Vec::new(),
             };
             deps.push((import_name.clone(), pkg));
         } else if abs.is_dir() {

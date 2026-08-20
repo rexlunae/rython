@@ -56,23 +56,34 @@ impl PurePath {
     
     /// Get parent directory
     pub fn parent(&self) -> PurePath {
-        if let Some(parent) = self.path.parent() {
-            PurePath::new(parent)
-        } else {
-            PurePath::new("")
+        match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => PurePath::new(p),
+            // Rust's Path::parent() yields "" for a bare name and None for
+            // the root; CPython reports the parent of a bare name (and of
+            // the empty path) as "." — the current directory — and the
+            // root's parent as the root itself (issue #82).
+            _ => {
+                if self.path.is_absolute() {
+                    PurePath::new(self.path.clone())
+                } else {
+                    PurePath::new(".")
+                }
+            }
         }
     }
     
     /// Get all parents
     pub fn parents(&self) -> Vec<PurePath> {
         let mut parents = Vec::new();
-        let mut current = self.path.as_path();
-        
-        while let Some(parent) = current.parent() {
-            parents.push(PurePath::new(parent));
-            current = parent;
+        let mut current = self.clone();
+        loop {
+            let next = current.parent();
+            if next == current {
+                break;
+            }
+            parents.push(next.clone());
+            current = next;
         }
-        
         parents
     }
     
@@ -92,21 +103,25 @@ impl PurePath {
     
     /// Get all suffixes
     pub fn suffixes(&self) -> Vec<String> {
+        // CPython semantics (issue #82): a name ending in '.' has no
+        // suffixes, and a leading dot does not start a suffix —
+        // PurePath('.bashrc').suffixes == [] and PurePath('file.').suffixes
+        // == [], while PurePath('a.tar.gz').suffixes == ['.tar', '.gz'].
         let name = self.name();
-        if name.is_empty() {
+        if name.is_empty() || name.ends_with('.') {
             return Vec::new();
         }
-        
-        let mut suffixes = Vec::new();
+        let name = name.trim_start_matches('.');
         let parts: Vec<&str> = name.split('.').collect();
-        
+
         if parts.len() > 1 {
-            for i in 1..parts.len() {
-                suffixes.push(format!(".{}", parts[i]));
-            }
+            parts[1..]
+                .iter()
+                .map(|p| format!(".{}", p))
+                .collect()
+        } else {
+            Vec::new()
         }
-        
-        suffixes
     }
     
     /// Get stem (filename without final suffix)
@@ -155,20 +170,33 @@ impl PurePath {
         PurePath::new(self.path.with_file_name(name.as_ref()))
     }
     
-    /// Replace suffix
-    pub fn with_suffix<S: AsRef<str>>(&self, suffix: S) -> PurePath {
+    /// Replace suffix. Validates like CPython (issue #82): a suffix must
+    /// start with '.' (except the empty string, which removes the suffix),
+    /// must not contain a separator, and '.' itself is invalid.
+    pub fn with_suffix<S: AsRef<str>>(&self, suffix: S) -> Result<PurePath, PyException> {
         let suffix = suffix.as_ref();
-        let stem = self.stem();
-        if suffix.is_empty() {
-            PurePath::new(self.path.with_file_name(stem))
-        } else {
-            let new_name = if suffix.starts_with('.') {
-                format!("{}{}", stem, suffix)
-            } else {
-                format!("{}.{}", stem, suffix)
-            };
-            PurePath::new(self.path.with_file_name(new_name))
+        if suffix.contains(std::path::MAIN_SEPARATOR)
+            || (std::path::MAIN_SEPARATOR == '\\' && suffix.contains('/'))
+        {
+            return Err(crate::value_error(format!("Invalid suffix {:?}", suffix)));
         }
+        if (!suffix.is_empty() && !suffix.starts_with('.')) || suffix == "." {
+            return Err(crate::value_error(format!("Invalid suffix {:?}", suffix)));
+        }
+        let name = self.name();
+        if name.is_empty() {
+            return Err(crate::value_error(format!(
+                "{:?} has an empty name",
+                self.to_string()
+            )));
+        }
+        let old_suffix = self.suffix();
+        let new_name = if old_suffix.is_empty() {
+            format!("{}{}", name, suffix)
+        } else {
+            format!("{}{}", &name[..name.len() - old_suffix.len()], suffix)
+        };
+        Ok(PurePath::new(self.path.with_file_name(new_name)))
     }
 }
 
@@ -326,24 +354,64 @@ impl Path {
             })
     }
     
-    /// Glob pattern matching. Like Python's Path.glob, wildcards never
-    /// match a leading dot: hidden entries only match patterns that start
-    /// with a literal dot.
+    /// Glob pattern matching. Like Python's Path.glob: patterns may span
+    /// multiple segments (`sub/*.txt`, `**/*.py` — `**` always recurses),
+    /// and wildcards never match a leading dot: hidden entries only match
+    /// patterns that start with a literal dot (issue #82 — the old
+    /// implementation only matched the leaf name against one directory
+    /// level, so multi-segment patterns silently returned []).
     #[cfg(feature = "std")]
     pub fn glob(&self, pattern: &str) -> Result<Vec<Path>, PyException> {
-        let entries = self.iterdir()?;
+        let parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
         let mut matches = Vec::new();
+        self.glob_walk(&parts, 0, &mut matches)?;
+        Ok(matches)
+    }
 
-        for entry in entries {
-            if entry.pure_path.name().starts_with('.') && !pattern.starts_with('.') {
-                continue;
+    #[cfg(feature = "std")]
+    fn glob_walk(
+        &self,
+        parts: &[&str],
+        part_index: usize,
+        matches: &mut Vec<Path>,
+    ) -> Result<(), PyException> {
+        if part_index >= parts.len() {
+            if self.exists() {
+                matches.push(self.clone());
             }
-            if entry.pure_path.match_pattern(pattern) {
-                matches.push(entry);
+            return Ok(());
+        }
+        let part = parts[part_index];
+
+        // `**` recurses: match zero directories, then descend (skipping
+        // hidden directories, like Python's pathlib).
+        if part == "**" {
+            self.glob_walk(parts, part_index + 1, matches)?;
+            if let Ok(entries) = self.iterdir() {
+                for entry in entries {
+                    if entry.is_dir() && !entry.pure_path.name().starts_with('.') {
+                        entry.glob_walk(parts, part_index, matches)?;
+                    }
+                }
             }
+            return Ok(());
         }
 
-        Ok(matches)
+        let entries = self.iterdir()?;
+        for entry in entries {
+            let name = entry.pure_path.name();
+            if name.starts_with('.') && !part.starts_with('.') {
+                continue;
+            }
+            if match_glob(&name, part) {
+                if part_index == parts.len() - 1 {
+                    matches.push(entry);
+                } else {
+                    entry.glob_walk(parts, part_index + 1, matches)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Recursive glob (hidden entries and hidden directories are skipped
@@ -474,14 +542,37 @@ pub fn path<P: AsRef<StdPath>>(p: P) -> Path {
 // Helper functions
 
 fn match_glob(text: &str, pattern: &str) -> bool {
-    // Simple glob matching - supports * and ?
+    // Simple glob matching - supports *, ?, and [...] character classes.
+    // Memoized so `*a*a*a*a*b` against a long run of 'a's stays polynomial
+    // instead of exponential backtracking (issue #82).
     let pattern_chars: Vec<char> = pattern.chars().collect();
     let text_chars: Vec<char> = text.chars().collect();
-    
-    match_glob_recursive(&text_chars, &pattern_chars, 0, 0)
+    let mut memo = std::collections::HashMap::new();
+    match_glob_memo(&text_chars, &pattern_chars, 0, 0, &mut memo)
 }
 
-fn match_glob_recursive(text: &[char], pattern: &[char], text_idx: usize, pattern_idx: usize) -> bool {
+fn match_glob_memo(
+    text: &[char],
+    pattern: &[char],
+    text_idx: usize,
+    pattern_idx: usize,
+    memo: &mut std::collections::HashMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(&v) = memo.get(&(text_idx, pattern_idx)) {
+        return v;
+    }
+    let v = match_glob_recursive(text, pattern, text_idx, pattern_idx, memo);
+    memo.insert((text_idx, pattern_idx), v);
+    v
+}
+
+fn match_glob_recursive(
+    text: &[char],
+    pattern: &[char],
+    text_idx: usize,
+    pattern_idx: usize,
+    memo: &mut std::collections::HashMap<(usize, usize), bool>,
+) -> bool {
     // Base cases
     if pattern_idx >= pattern.len() {
         return text_idx >= text.len();
@@ -495,21 +586,74 @@ fn match_glob_recursive(text: &[char], pattern: &[char], text_idx: usize, patter
     match pattern[pattern_idx] {
         '*' => {
             // Try matching zero or more characters
-            match_glob_recursive(text, pattern, text_idx, pattern_idx + 1) ||
-            match_glob_recursive(text, pattern, text_idx + 1, pattern_idx)
+            match_glob_memo(text, pattern, text_idx, pattern_idx + 1, memo) ||
+            match_glob_memo(text, pattern, text_idx + 1, pattern_idx, memo)
         }
         '?' => {
             // Match exactly one character
-            match_glob_recursive(text, pattern, text_idx + 1, pattern_idx + 1)
+            match_glob_memo(text, pattern, text_idx + 1, pattern_idx + 1, memo)
+        }
+        '[' => {
+            // Character class like [ab] or [a-z] or [!abc]
+            match match_char_class(text[text_idx], pattern, pattern_idx) {
+                Some((true, next)) => {
+                    match_glob_memo(text, pattern, text_idx + 1, next, memo)
+                }
+                _ => false,
+            }
         }
         c => {
             // Match exact character
             if text[text_idx] == c {
-                match_glob_recursive(text, pattern, text_idx + 1, pattern_idx + 1)
+                match_glob_memo(text, pattern, text_idx + 1, pattern_idx + 1, memo)
             } else {
                 false
             }
         }
+    }
+}
+
+/// Match a `[...]` character class starting at `start_idx`. Returns
+/// (matched, index just past the closing ']').
+fn match_char_class(ch: char, pattern: &[char], start_idx: usize) -> Option<(bool, usize)> {
+    if start_idx >= pattern.len() || pattern[start_idx] != '[' {
+        return None;
+    }
+    let mut idx = start_idx + 1;
+    if idx >= pattern.len() {
+        return None;
+    }
+
+    let negated = pattern[idx] == '!' || pattern[idx] == '^';
+    if negated {
+        idx += 1;
+        if idx >= pattern.len() {
+            return None;
+        }
+    }
+
+    let mut matched = false;
+    while idx < pattern.len() && pattern[idx] != ']' {
+        if idx + 2 < pattern.len() && pattern[idx + 1] == '-' {
+            let start_char = pattern[idx];
+            let end_char = pattern[idx + 2];
+            if ch >= start_char && ch <= end_char {
+                matched = true;
+            }
+            idx += 3;
+        } else {
+            if ch == pattern[idx] {
+                matched = true;
+            }
+            idx += 1;
+        }
+    }
+
+    if idx < pattern.len() && pattern[idx] == ']' {
+        idx += 1;
+        Some((if negated { !matched } else { matched }, idx))
+    } else {
+        None
     }
 }
 
@@ -532,6 +676,42 @@ mod tests {
         assert_eq!(p.suffix(), ".gz");
         assert_eq!(p.suffixes(), vec![".tar", ".gz"]);
         assert_eq!(p.stem(), "file.tar");
+        // Issue #82: leading dots and trailing dots are not suffixes.
+        assert_eq!(PurePath::new(".bashrc").suffixes(), Vec::<String>::new());
+        assert_eq!(PurePath::new("file.").suffixes(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_purepath_parent() {
+        // Issue #82: the parent of a bare name is ".", and the root's
+        // parent is itself.
+        assert_eq!(PurePath::new("a").parent(), PurePath::new("."));
+        assert_eq!(PurePath::new("").parent(), PurePath::new("."));
+        assert_eq!(PurePath::new("a/b").parent(), PurePath::new("a"));
+        assert_eq!(PurePath::new("/a").parent(), PurePath::new("/"));
+        assert_eq!(PurePath::new("/").parent(), PurePath::new("/"));
+        assert_eq!(
+            PurePath::new("a/b").parents(),
+            vec![PurePath::new("a"), PurePath::new(".")]
+        );
+        assert_eq!(PurePath::new("/").parents(), Vec::<PurePath>::new());
+    }
+
+    #[test]
+    fn test_purepath_with_suffix_validates() {
+        // Issue #82: a dotless suffix raises ValueError like CPython.
+        assert_eq!(
+            PurePath::new("a.txt").with_suffix(".md").unwrap(),
+            PurePath::new("a.md")
+        );
+        assert_eq!(
+            PurePath::new("a.txt").with_suffix("").unwrap(),
+            PurePath::new("a")
+        );
+        let err = PurePath::new("a.txt").with_suffix("md").unwrap_err();
+        assert!(err.message.contains("Invalid suffix"), "{}", err.message);
+        let err = PurePath::new("a.txt").with_suffix(".").unwrap_err();
+        assert!(err.message.contains("Invalid suffix"), "{}", err.message);
     }
     
     #[test]
@@ -547,6 +727,16 @@ mod tests {
         assert!(match_glob("test.py", "test.*"));
         assert!(match_glob("hello", "h?llo"));
         assert!(!match_glob("file.py", "*.txt"));
+        // Issue #82: character classes work, and the matcher does not
+        // blow up exponentially on `*a*a*a*a*b` against a run of 'a's.
+        assert!(match_glob("a1.txt", "[ab]*.txt"));
+        assert!(!match_glob("c1.txt", "[ab]*.txt"));
+        assert!(match_glob("hello", "[h-m]ello"));
+        assert!(match_glob("x", "[!abc]"));
+        assert!(!match_glob("a", "[!abc]"));
+        let text = "a".repeat(200);
+        let pattern = "*a*a*a*a*a*b";
+        assert!(!match_glob(&text, pattern), "must terminate quickly");
     }
 }
 // str(path) is the path string (the Display form), as in Python.

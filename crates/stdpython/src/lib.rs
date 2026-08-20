@@ -702,10 +702,12 @@ pub trait PyMod<R: ?Sized> {
 }
 
 /// Trait backing Python's `/` true division (always float) — generic so
-/// `NdArray` (numpy `divide`) can participate.
+/// `NdArray` (numpy `divide`) can participate. Returns a Result so a zero
+/// divisor raises a catchable ZeroDivisionError instead of silently
+/// yielding inf/nan (issue #107, the `/` counterpart of #75's `//`/`%`).
 pub trait PyDiv<R: ?Sized> {
     type Output;
-    fn py_div(&self, rhs: &R) -> Self::Output;
+    fn py_div(&self, rhs: &R) -> Result<Self::Output, PyException>;
 }
 
 /// Trait backing Python's `@` matrix multiplication operator.
@@ -811,12 +813,36 @@ impl PyMod<i64> for f64 {
     }
 }
 
+/// Zero test that works across the numeric operand types of the division
+/// helpers (Rust will not coerce an integer literal through `==` on `f64`).
+trait IsZero {
+    fn is_zero(&self) -> bool;
+}
+impl IsZero for i64 {
+    fn is_zero(&self) -> bool {
+        *self == 0
+    }
+}
+impl IsZero for f64 {
+    fn is_zero(&self) -> bool {
+        *self == 0.0
+    }
+}
+impl IsZero for bool {
+    fn is_zero(&self) -> bool {
+        !*self
+    }
+}
+
 macro_rules! numeric_div {
-    ($($l:ty, $r:ty => $out:ty),* $(,)?) => {
+    ($msg:expr; $($l:ty, $r:ty => $out:ty),* $(,)?) => {
         $(impl PyDiv<$r> for $l {
             type Output = $out;
-            fn py_div(&self, rhs: &$r) -> $out {
-                (*self as f64) / (*rhs as f64)
+            fn py_div(&self, rhs: &$r) -> Result<$out, PyException> {
+                if rhs.is_zero() {
+                    return Err(PyException::new("ZeroDivisionError", $msg));
+                }
+                Ok((*self as f64) / (*rhs as f64))
             }
         })*
     };
@@ -824,37 +850,49 @@ macro_rules! numeric_div {
 
 // bool operands promote through the numeric path (True → 1.0) like numpy.
 macro_rules! bool_div {
-    ($($r:ty),* $(,)?) => {
+    ($msg:expr; $($r:ty),* $(,)?) => {
         $(
             impl PyDiv<$r> for bool {
                 type Output = f64;
-                fn py_div(&self, rhs: &$r) -> f64 {
-                    (if *self { 1.0 } else { 0.0 }) / (*rhs as f64)
+                fn py_div(&self, rhs: &$r) -> Result<f64, PyException> {
+                    if rhs.is_zero() {
+                        return Err(PyException::new("ZeroDivisionError", $msg));
+                    }
+                    Ok((if *self { 1.0 } else { 0.0 }) / (*rhs as f64))
                 }
             }
             impl PyDiv<bool> for $r {
                 type Output = f64;
-                fn py_div(&self, rhs: &bool) -> f64 {
-                    (*self as f64) / if *rhs { 1.0 } else { 0.0 }
+                fn py_div(&self, rhs: &bool) -> Result<f64, PyException> {
+                    if rhs.is_zero() {
+                        return Err(PyException::new("ZeroDivisionError", $msg));
+                    }
+                    Ok((*self as f64) / if *rhs { 1.0 } else { 0.0 })
                 }
             }
         )*
     };
 }
 
-numeric_div!(
-    i64, i64 => f64,
-    i64, f64 => f64,
-    f64, i64 => f64,
-    f64, f64 => f64,
-);
+// CPython's messages: int/int (and bool, an int subclass) true division by
+// zero raises "division by zero"; any float operand raises "float division
+// by zero".
+numeric_div!("division by zero"; i64, i64 => f64);
+numeric_div!("float division by zero"; i64, f64 => f64, f64, i64 => f64, f64, f64 => f64);
 
-bool_div!(i64, f64);
+bool_div!("division by zero"; i64);
+bool_div!("float division by zero"; f64);
 
 impl PyDiv<bool> for bool {
     type Output = f64;
-    fn py_div(&self, rhs: &bool) -> f64 {
-        (if *self { 1.0 } else { 0.0 }) / if *rhs { 1.0 } else { 0.0 }
+    fn py_div(&self, rhs: &bool) -> Result<f64, PyException> {
+        if rhs.is_zero() {
+            return Err(PyException::new(
+                "ZeroDivisionError",
+                "division by zero",
+            ));
+        }
+        Ok((if *self { 1.0 } else { 0.0 }) / if *rhs { 1.0 } else { 0.0 })
     }
 }
 
@@ -870,8 +908,10 @@ pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_mod(&b)
 }
 
-/// Python `/` (true division): `py_div(3, 2) == 1.5`.
-pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> L::Output {
+/// Python `/` (true division): `py_div(3, 2) == 1.5`. Raises a catchable
+/// ZeroDivisionError on a zero divisor ("division by zero" for int operands,
+/// "float division by zero" when either operand is a float — issue #107).
+pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_div(&b)
 }
 
@@ -2023,6 +2063,16 @@ impl PyToString for String {
     }
 }
 
+// CPython's str(exc) is the exception's args rendered as a string — for a
+// `ZeroDivisionError("division by zero")` that is just "division by zero",
+// not "Type: message" (that is Display's job for the uncaught-exception
+// report).
+impl PyToString for PyException {
+    fn py_str(self) -> String {
+        self.message
+    }
+}
+
 // ============================================================================
 // PYTHON BUILT-IN TYPES AND TRAITS
 // ============================================================================
@@ -2867,8 +2917,9 @@ pub trait PyListOps<T> {
         T: PartialEq;
     /// list.insert(i, x) with Python index rules: negative indices count
     /// from the end, and out-of-range indices clamp (insert past the end
-    /// appends, before the start prepends) — never a panic.
-    fn py_insert(&mut self, index: i64, item: T);
+    /// appends, before the start prepends) — never a panic. Result so a
+    /// bounded deque can raise IndexError at its maximum size (issue #82).
+    fn py_insert(&mut self, index: i64, item: T) -> Result<(), PyException>;
 }
 
 impl<T> PyListOps<T> for Vec<T> {
@@ -2878,7 +2929,7 @@ impl<T> PyListOps<T> for Vec<T> {
     {
         self.iter().filter(|e| *e == item).count() as i64
     }
-    fn py_insert(&mut self, index: i64, item: T) {
+    fn py_insert(&mut self, index: i64, item: T) -> Result<(), PyException> {
         let len = self.len() as i64;
         let idx = if index < 0 {
             // len + i64::MIN overflows; Python prepends for any index with
@@ -2889,6 +2940,7 @@ impl<T> PyListOps<T> for Vec<T> {
             index.min(len)
         } as usize;
         self.insert(idx, item);
+        Ok(())
     }
 }
 

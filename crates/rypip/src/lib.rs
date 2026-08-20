@@ -8,6 +8,8 @@
 
 pub mod convert;
 pub mod package;
+pub mod packaging;
+pub mod resolve;
 
 use std::path::Path;
 use std::process::Command;

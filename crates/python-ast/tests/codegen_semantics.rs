@@ -1181,14 +1181,18 @@ fn zero_division_raises_catchable_zero_division_error() {
     // Issue #75: py_floordiv/py_mod used to panic on a zero divisor, so
     // `except ZeroDivisionError` could never catch them. They now return
     // Result and the call sites thread `?`, keeping the error inside the
-    // try-body closure where the handlers can match it.
-    for op in ["//", "%"] {
+    // try-body closure where the handlers can match it. Issue #107: true
+    // division `/` was still silently yielding inf/nan; it now goes through
+    // the same Result-returning helper with `?`.
+    for op in ["//", "%", "/"] {
         let src = format!(
             "def f():\n    try:\n        print(5 {op} 0)\n    except ZeroDivisionError:\n        print(\"caught\")\n"
         );
         let out = compile(&src, "zero_div.py");
         assert!(
-            out.contains("py_mod (5 , 0) ?") || out.contains("py_floordiv (5 , 0) ?"),
+            out.contains("py_mod (5 , 0) ?")
+                || out.contains("py_floordiv (5 , 0) ?")
+                || out.contains("py_div (5 , 0) ?"),
             "{} must route through the Result-returning helper with `?`: {}",
             op,
             out
@@ -1200,20 +1204,17 @@ fn zero_division_raises_catchable_zero_division_error() {
         );
     }
     // The augmented-assignment forms lower through the same helpers.
-    let src = concat!(
-        "def f():\n",
-        "    try:\n",
-        "        x = 10\n",
-        "        x //= 0\n",
-        "    except ZeroDivisionError:\n",
-        "        print(\"caught\")\n",
-    );
-    let out = compile(src, "zero_div_aug.py");
-    assert!(
-        out.contains("x = py_floordiv (x , 0) ?"),
-        "aug //= must thread `?`: {}",
-        out
-    );
+    for (op, helper) in [("//", "py_floordiv"), ("%", "py_mod"), ("/", "py_div")] {
+        let src = format!(
+            "def f():\n    try:\n        x = 10\n        x {op}= 0\n    except ZeroDivisionError:\n        print(\"caught\")\n"
+        );
+        let out = compile(&src, "zero_div_aug.py");
+        assert!(
+            out.contains(&format!("x = {helper} (x , 0) ?")),
+            "aug {op}= must thread `?`: {}",
+            out
+        );
+    }
 }
 
 #[test]
@@ -4629,5 +4630,109 @@ fn defaulted_call_as_statement_keeps_propagation() {
     );
     assert!(out.contains("? ;"), "generated: {}", out);
     assert!(!out.contains("} ? ;"), "bare block with `?` leaked: {}", out);
+}
+
+
+// ---- issue #79 cheap guard: conversion-time aliasing detection ----
+
+#[test]
+fn aliased_container_mutated_through_second_name_is_a_loud_error() {
+    // Issue #79: CPython binds a reference, so b.append shows through a;
+    // rython copies containers by value, so it would not. The cheap guard
+    // rejects the shape at conversion time instead of silently diverging.
+    let err = compile_err(
+        "def f():\n    a = [1, 2]\n    b = a\n    b.append(3)\n",
+        "alias1.py",
+    );
+    assert!(err.contains("`b = a`"), "error: {}", err);
+    assert!(err.contains("line 3"), "error: {}", err);
+}
+
+#[test]
+fn aliased_container_mutated_through_first_name_is_a_loud_error() {
+    let err = compile_err(
+        "def f():\n    a = [1, 2]\n    b = a\n    a[0] = 9\n",
+        "alias2.py",
+    );
+    assert!(err.contains("`b = a`"), "error: {}", err);
+}
+
+#[test]
+fn aliased_container_rebound_is_not_a_mutation() {
+    // Rebinding b to a NEW value never touches the shared object, so the
+    // alias is unobservable and must keep converting.
+    let out = compile(
+        "def f() -> int:\n    a = [1, 2]\n    b = a\n    b = [9]\n    return a[0]\n",
+        "alias3.py",
+    );
+    assert!(out.contains("fn f"), "generated: {}", out);
+}
+
+#[test]
+fn unmutated_alias_is_not_an_error() {
+    // No mutation anywhere: the copy is unobservable.
+    let out = compile(
+        "def f() -> int:\n    a = [1, 2]\n    b = a\n    return len(b)\n",
+        "alias4.py",
+    );
+    assert!(out.contains("fn f"), "generated: {}", out);
+}
+
+#[test]
+fn container_passed_to_mutating_function_and_reused_is_a_loud_error() {
+    // Shape 2: mutate() appends to its parameter; CPython's caller sees
+    // it, rython's clone does not.
+    let err = compile_err(
+        concat!(
+            "def mutate(xs: list[int]) -> None:\n",
+            "    xs.append(99)\n",
+            "\n",
+            "def f():\n",
+            "    a = [1, 2]\n",
+            "    mutate(a)\n",
+            "    print(a)\n",
+        ),
+        "alias5.py",
+    );
+    assert!(err.contains("`a`"), "error: {}", err);
+    assert!(err.contains("mutates it"), "error: {}", err);
+}
+
+#[test]
+fn container_passed_to_mutating_function_but_never_reused_is_fine() {
+    // The name is used only at the call: rython moves it in, the mutation
+    // happens inside, and nothing observes the caller-side copy.
+    let out = compile(
+        concat!(
+            "def mutate(xs: list[int]) -> int:\n",
+            "    xs.append(99)\n",
+            "    return len(xs)\n",
+            "\n",
+            "def f() -> int:\n",
+            "    a = [1, 2]\n",
+            "    return mutate(a)\n",
+        ),
+        "alias6.py",
+    );
+    assert!(out.contains("fn f"), "generated: {}", out);
+}
+
+#[test]
+fn scalar_alias_is_not_a_container_alias() {
+    // ints are Copy: b = a shares nothing mutable.
+    let out = compile(
+        "def f() -> int:\n    a = 5\n    b = a\n    b += 1\n    return a\n",
+        "alias7.py",
+    );
+    assert!(out.contains("fn f"), "generated: {}", out);
+}
+
+#[test]
+fn alias_inside_loop_body_is_detected() {
+    let err = compile_err(
+        "def f():\n    a = [1]\n    for i in [1, 2]:\n        b = a\n        b.append(i)\n",
+        "alias8.py",
+    );
+    assert!(err.contains("`b = a`"), "error: {}", err);
 }
 
