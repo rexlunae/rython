@@ -111,9 +111,11 @@ Known gaps:
 - **Language features**: generators/`yield`, `async`/`await`,
   `eval`/`exec`, `*args`/`**kwargs`, multiple inheritance and dunder
   protocols are not supported yet. Decorators other than
-  `functools.lru_cache`/`cache`, `classmethod`, and `staticmethod` are a
-  loud conversion error (never silently ignored); `@dataclass` parses
-  but does not synthesize `__init__` yet.
+  `functools.lru_cache`/`cache`, `classmethod`, `staticmethod`, and
+  `@dataclass` are a loud conversion error (never silently ignored);
+  `@dataclass` synthesizes `__init__` from annotated fields (defaults
+  kept), but `frozen`/`slots` are no-ops (the Rust struct is already
+  value-semantics).
 - **`lru_cache` keys** must be `int`/`bool`/`str`-annotated parameters
   — floats are not hashable in Rust, so Python's float-key caching is
   refused rather than approximated.
@@ -179,10 +181,10 @@ line, never a silent behaviour change:
   over the guarded name iterates the Option (the inner value as one
   element) and fails loudly at build time. Blocks requests at
   charset_normalizer's `from_bytes` (`cp_isolation` guard).
-- **`@dataclass` field synthesis** — the decorator parses but does not
-  synthesize `__init__`, so `Scheme(platlib=..., ...)` fails with
-  "takes no arguments". Dataclasses are common in pip._internal and
-  modern libraries generally (blocks pip — #5 PyPI).
+- **Codecs** — `str.encode`/`bytes.decode` support `utf-8`, `ascii`, and
+  `punycode` (RFC 3492, CPython-verified); other codec names are a loud
+  error. `bytes.decode("utf-8")` etc. work through the stdpython codec
+  layer.
 - **`argparse`** supports literal specs only (the parser is evaluated at
   conversion time): `str`/`int`/`float` positionals, `--long` options
   with `default=`, `store_true`, `help=`, `prog=`, `description=`.
