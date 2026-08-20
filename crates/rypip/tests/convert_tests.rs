@@ -4739,3 +4739,49 @@ fn join_and_comprehension_inference_match_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn string_aug_assign_accumulation_matches_python_transcript() {
+    // Issue #110: `out = ""; out += ...` — the string-literal binding is
+    // owned so the String rebind compiles; the accumulated value diffs
+    // against a pinned `// Verified against python3.` transcript.
+    let scratch = Scratch::new("str-aug");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def accumulate():\n",
+            "    out = \"\"\n",
+            "    for i in range(3):\n",
+            "        out += str(i)\n",
+            "    return out\n",
+            "\n",
+            "def rebind():\n",
+            "    s = \"a\"\n",
+            "    s = s + \"b\"\n",
+            "    return s\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(accumulate())\n",
+            "    print(rebind())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["012", "ab"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

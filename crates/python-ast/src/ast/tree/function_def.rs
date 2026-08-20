@@ -747,6 +747,23 @@ impl CodeGen for FunctionDef {
                         .collect(),
                 );
             }
+            // Issue #110: a name bound to a string literal and later
+            // REBOUND by a String-producing expression (`out = ""; out +=
+            // "x"`) must be owned from the first assignment
+            // (`out = "".to_string()`), or the binding stays &'static str
+            // and the String rebind mismatches at build time.
+            let mut literal_bindings: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            let mut rebound: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            scan_str_rebindings(&effective_body, &mut literal_bindings, &mut rebound);
+            options.owned_str_literals = std::rc::Rc::new(
+                literal_bindings
+                    .into_iter()
+                    .filter(|(name, _)| rebound.contains(name))
+                    .map(|(name, _)| name)
+                    .collect(),
+            );
         }
         // Statically-known local types for isinstance(): parameter
         // annotations plus literal assignments, as Python type names.
@@ -1344,6 +1361,66 @@ pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
     }
 }
 
+/// Issue #110: names bound to a string literal and later rebound by a
+/// non-literal (an aug-assign target, or a second assignment whose value
+/// is not a string literal). `literal_bindings` maps name → whether the
+/// (first) binding was a bare string literal; `rebound` collects names
+/// stored to by an aug-assign or a non-literal assignment.
+pub(crate) fn scan_str_rebindings(
+    body: &[Statement],
+    literal_bindings: &mut std::collections::HashMap<String, bool>,
+    rebound: &mut std::collections::HashSet<String>,
+) {
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Assign(a) => {
+                if let [ExprType::Name(name)] = a.targets.as_slice() {
+                    let is_literal = matches!(
+                        &a.value,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    );
+                    literal_bindings
+                        .entry(name.id.clone())
+                        .and_modify(|first| *first |= is_literal)
+                        .or_insert(is_literal);
+                    if !is_literal {
+                        rebound.insert(name.id.clone());
+                    }
+                }
+            }
+            StatementType::AugAssign(a) => {
+                if let ExprType::Name(name) = &a.target {
+                    rebound.insert(name.id.clone());
+                }
+            }
+            StatementType::If(s) => {
+                scan_str_rebindings(&s.body, literal_bindings, rebound);
+                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
+            }
+            StatementType::For(s) => {
+                scan_str_rebindings(&s.body, literal_bindings, rebound);
+                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
+            }
+            StatementType::While(s) => {
+                scan_str_rebindings(&s.body, literal_bindings, rebound);
+                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
+            }
+            StatementType::Try(t) => {
+                scan_str_rebindings(&t.body, literal_bindings, rebound);
+                for h in &t.handlers {
+                    scan_str_rebindings(&h.body, literal_bindings, rebound);
+                }
+                scan_str_rebindings(&t.orelse, literal_bindings, rebound);
+                scan_str_rebindings(&t.finalbody, literal_bindings, rebound);
+            }
+            StatementType::With(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
+            StatementType::AsyncWith(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
+            _ => {}
+        }
+    }
+}
+
 /// Collect `name = <simply-typed constant>` assignments (recursing into
 /// control-flow bodies) so returns of those names can be inferred too.
 pub(crate) fn collect_local_types(
@@ -1620,12 +1697,28 @@ impl FunctionDef {
 
         let mut locals = std::collections::HashMap::new();
         collect_local_types(&self.body, &mut locals);
+        // Issue #110: a string-literal local that is later REBOUND by a
+        // String (`out = ""; out += "x"`) is owned from its first
+        // assignment, so its type is String, not &'static str.
+        let mut literal_bindings: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
+        scan_str_rebindings(&self.body, &mut literal_bindings, &mut rebound);
 
         let mut inferred: Option<TokenStream> = None;
         for ret in &returns {
             let value = (*ret)?; // a bare `return` means the type is unit
             let ty = match value {
-                ExprType::Name(name) => locals.get(&name.id)?.clone(),
+                ExprType::Name(name) => {
+                    let t = locals.get(&name.id)?.clone();
+                    if t.to_string() == quote!(&'static str).to_string()
+                        && rebound.contains(&name.id)
+                    {
+                        quote!(String)
+                    } else {
+                        t
+                    }
+                }
                 other => simple_expr_type(other)?,
             };
             match &inferred {

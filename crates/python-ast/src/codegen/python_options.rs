@@ -203,6 +203,10 @@ pub struct PythonOptions {
     /// exactly what these warnings exist to surface. Tools may disable this
     /// to suppress the warnings at the user's explicit request.
     pub lossy_warnings: bool,
+    /// Issue #110: names bound to a string literal and later rebound by a
+    /// String-producing expression (`out = ""; out += "x"`) — their
+    /// literal assignments are owned (`"".to_string()`).
+    pub owned_str_literals: std::rc::Rc<std::collections::HashSet<String>>,
     /// M5 definition-time warnings collected during inference (a bound set
     /// no known type satisfies). The transpiler drains this after codegen;
     /// shared across option clones so pushes land in one place.
@@ -373,6 +377,7 @@ impl Default for PythonOptions {
             )),
             duck_methods_on_params: std::rc::Rc::new(std::collections::HashMap::new()),
             lossy_warnings: true,
+            owned_str_literals: std::rc::Rc::new(std::collections::HashSet::new()),
             definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,

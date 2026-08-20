@@ -5291,6 +5291,44 @@ fn list_comprehension_over_a_parameter_infers_a_vec_return() {
 }
 
 #[test]
+fn string_literal_local_rebound_by_aug_assign_is_owned() {
+    // Issue #110: `out = ""; out += "x"` — the literal assignment is owned
+    // (`"".to_string()`), the binding is String, and the return is String.
+    let out = compile(
+        concat!(
+            "def accumulate():\n",
+            "    out = \"\"\n",
+            "    out += \"x\"\n",
+            "    return out\n",
+        ),
+        "str_aug.py",
+    );
+    assert!(out.contains("out = (\"\") . to_string ()"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(!out.contains("-> Result < & 'static str"), "generated: {}", out);
+}
+
+#[test]
+fn plain_string_literal_local_stays_unowned() {
+    // A string-literal local that is never rebound keeps its old lowering
+    // (&'static str) — no to_string noise.
+    let out = compile(
+        "def plain():\n    s = \"hi\"\n    return s\n",
+        "str_plain.py",
+    );
+    assert!(!out.contains("to_string"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < & 'static str , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

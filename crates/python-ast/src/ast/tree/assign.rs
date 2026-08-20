@@ -226,6 +226,13 @@ impl<'a> CodeGen for Assign {
                         && options.optional_names.contains(&name.id)
                     {
                         quote!(#target_code = Some(#value);)
+                    } else if value_is_str_literal
+                        && options.owned_str_literals.contains(&name.id)
+                    {
+                        // Issue #110: a string-literal binding that is later
+                        // rebound by a String (`out += "x"`) must be owned
+                        // from the start.
+                        quote!(#target_code = (#value).to_string();)
                     } else {
                         quote!(#target_code = #value;)
                     }
