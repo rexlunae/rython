@@ -49,6 +49,23 @@ impl<'a> CodeGen for Assign {
 
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let mut symbols = symbols;
+        // Issue #127: `name = lru_cache(maxsize=N)(fn)` — the decorator
+        // FACTORY applied as an expression. Register `name` as the
+        // synthesized cached function so later `name(...)` call sites
+        // resolve against its (fn's) signature. (The codegen emits the
+        // synthesized function instead of the assignment; see to_rust.)
+        // find_symbols has no options, so the cross-module resolution
+        // (issue #123) can only happen when the factory's fn is defined in
+        // this module; the codegen pass has options and covers the rest.
+        if let Some(synth) =
+            crate::try_lru_cache_factory(&self, None, &symbols)
+        {
+            symbols.insert(
+                synth.name.clone(),
+                SymbolTableNode::FunctionDef(synth),
+            );
+            return symbols;
+        }
         let mut position = 0;
         for target in self.targets {
             // Only add symbols for Name assignments, not for Attribute assignments
@@ -104,6 +121,18 @@ impl<'a> CodeGen for Assign {
                 crate::parse_rust_bind(call)?;
             }
             return Ok(TokenStream::new());
+        }
+
+        // Issue #127: `name = lru_cache(maxsize=N)(fn)` — the decorator
+        // factory applied as an expression. Emit the synthesized cached
+        // function (the same @lru_cache machinery a decorated definition
+        // gets) instead of storing a callable value, which the value model
+        // cannot represent. find_symbols registered `name` as the function,
+        // so call sites already resolve; the assignment itself is consumed.
+        if let Some(synth) =
+            crate::try_lru_cache_factory(&self, Some(&options), &symbols)
+        {
+            return synth.to_rust(ctx, options, symbols);
         }
 
         let value_is_none_early = crate::is_none_expr(&self.value);

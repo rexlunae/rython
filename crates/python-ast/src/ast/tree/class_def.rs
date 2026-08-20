@@ -159,15 +159,12 @@ fn is_exception_class(class: &ClassDef) -> bool {
 
 impl ClassDef {
     /// Whether this class is decorated `@dataclass` (with or without
-    /// `(frozen=..., slots=...)` arguments).
+    /// `(frozen=..., slots=...)` arguments) — via the systematic decorator
+    /// registry (decorator.rs).
     pub fn is_dataclass(&self) -> bool {
-        self.decorator_list.iter().any(|d| match d {
-            ExprType::Name(n) => n.id == "dataclass",
-            ExprType::Call(c) => {
-                matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "dataclass")
-            }
-            _ => false,
-        })
+        self.decorator_list
+            .iter()
+            .any(|d| crate::is_dataclass_decorator(d))
     }
 
     /// Synthesize the `@dataclass` `__init__` from the annotated class-level
@@ -831,22 +828,22 @@ impl CodeGen for ClassDef {
         // `@dataclass` (with or without `(frozen=..., slots=...)` args)
         // synthesizes `__init__` from the annotated class-level fields.
         // Any other class decorator changes class creation and is a loud
-        // error, never silently dropped.
+        // error, never silently dropped — through the systematic registry.
         let is_dataclass = self.is_dataclass();
         for d in &self.decorator_list {
-            let is_dc = match d {
-                ExprType::Name(n) => n.id == "dataclass",
-                ExprType::Call(c) => matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "dataclass"),
-                _ => false,
-            };
-            if !is_dc {
-                return Err(format!(
-                    "class `{}` uses the decorator `{}`, which is not supported \
-                     (only `@dataclass` is accepted, as a synthesized __init__)",
-                    self.name,
-                    crate::ast::tree::function_def::annotation_display(d),
-                )
-                .into());
+            match crate::parse_decorator(std::slice::from_ref(d))? {
+                Some(crate::Decorator::DataClass) => {}
+                Some(other) => {
+                    return Err(format!(
+                        "class `{}` uses the decorator `{}`, which is not supported \
+                         on a class (only `@dataclass` is accepted, as a synthesized \
+                         __init__)",
+                        self.name,
+                        other.describe(),
+                    )
+                    .into());
+                }
+                None => {}
             }
         }
         if is_dataclass && self.init_method().is_some() {

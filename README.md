@@ -110,12 +110,19 @@ Known gaps:
   reassigning a name to a different type don't convert.
 - **Language features**: generators/`yield`, `async`/`await`,
   `eval`/`exec`, `*args`/`**kwargs`, multiple inheritance and dunder
-  protocols are not supported yet. Decorators other than
+  protocols are not supported yet. Decorators are handled through a
+  single systematic registry (decorator.rs) — like Rust's built-in
+  attributes, rython consumes the decorator expression at conversion
+  time and rewrites the definition. The supported set is
   `functools.lru_cache`/`cache`, `classmethod`, `staticmethod`, and
-  `@dataclass` are a loud conversion error (never silently ignored);
-  `@dataclass` synthesizes `__init__` from annotated fields (defaults
-  kept), but `frozen`/`slots` are no-ops (the Rust struct is already
-  value-semantics).
+  `@dataclass` (which synthesizes `__init__` from annotated fields,
+  defaults kept; `frozen`/`slots` are no-ops since the Rust struct is
+  already value-semantics). The decorator-FACTORY expression
+  `alias = lru_cache(maxsize=N)(fn)` lowers to the same synthesized
+  cached function. Any other decorator is a loud conversion error from
+  the registry (never silently ignored); arbitrary user decorators
+  (functions applied to definitions) are the function-as-value
+  divergence (issue #122).
 - **`lru_cache` keys** must be `int`/`bool`/`str`-annotated parameters
   — floats are not hashable in Rust, so Python's float-key caching is
   refused rather than approximated.
@@ -150,13 +157,12 @@ line, never a silent behaviour change:
   representable element type and no call-through-container lowering.
   Same family as "classes as values": function objects are not
   first-class values. Blocks botocore (#3 PyPI) at its first statement.
-- **Decorator-factory expressions** — `lru_cache(maxsize=None)(fn)`
-  (the decorator factory CALLED as an expression, charset_normalizer's
-  `cached_mess_ratio = lru_cache(maxsize=None)(mess_ratio)`) needs the
-  callee's signature resolved cross-module (`mess_ratio` lives in
-  `md.py`) to synthesize the cached wrapper — the same cross-module
-  signature gap as #123. `@lru_cache` on a definition works; the
-  expression form does not.
+- **`lru_cache` with float keys** — the decorator-factory expression
+  `alias = lru_cache(maxsize=N)(fn)` is now supported (synthesizes the
+  cached function via the decorator registry), but charset_normalizer's
+  `cached_mess_ratio = lru_cache(maxsize=None)(mess_ratio)` still hits
+  the documented float-key limitation: `mess_ratio` takes
+  `maximum_threshold: float`, and floats are not hashable in Rust.
 - **Dynamic imports and the import machinery** — `importlib`,
   `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
   modeled: rython compiles imports statically. Blocks pip's

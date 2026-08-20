@@ -300,6 +300,12 @@ impl CodeGen for Module {
             }
             // Module-level constants are static items, not runtime stores.
             if let crate::StatementType::Assign(a) = &s.statement {
+                // Issue #127: a decorator-factory assignment emits the
+                // synthesized cached function at module level (handled in
+                // the emit loop) — not a runtime store.
+                if crate::try_lru_cache_factory(a, Some(&options), &symbols).is_some() {
+                    continue;
+                }
                 if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
                     if module_assign_counts.get(&n.id) == Some(&1)
                         && const_static_type(&a.value).is_some()
@@ -436,6 +442,23 @@ impl CodeGen for Module {
             // Module-level constants become static items visible to every
             // function in the module.
             if let crate::StatementType::Assign(a) = &s.statement {
+                // Issue #127: `name = lru_cache(maxsize=N)(fn)` — the
+                // decorator factory applied as an expression. Emit the
+                // synthesized cached function as a module-level item (the
+                // same @lru_cache machinery a decorated definition gets),
+                // not an init-time store. find_symbols registered the name
+                // as the function so call sites resolve.
+                if let Some(synth) =
+                    crate::try_lru_cache_factory(a, Some(&options), &symbols)
+                {
+                    stream.extend(
+                        synth
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                            .map_err(|e| wrap_module_error(&module_filename, e))?,
+                    );
+                    continue;
+                }
                 if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
                     if module_assign_counts.get(&n.id) == Some(&1) {
                         if let Some(ty) = const_static_type(&a.value) {

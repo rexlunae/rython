@@ -402,7 +402,8 @@ fn lower_parse_args(
 /// bare @lru_cache default is 128). ANY other decorator is a loud
 /// error: silently ignoring a decorator converts a program into a
 /// different one.
-/// What a function's decorators ask for. `@classmethod`/`@staticmethod`
+/// What a function's decorators ask for, parsed through the systematic
+/// decorator registry (decorator.rs): `@classmethod`/`@staticmethod`
 /// (issue #117) make the method an ASSOCIATED function — no receiver; a
 /// classmethod additionally drops its first parameter (cls/self — the
 /// class reference). Anything else is a loud error.
@@ -414,80 +415,23 @@ pub(crate) enum MethodDecorator {
     StaticMethod,
 }
 
+/// Parse a FUNCTION's decorator list through the one registry. Only the
+/// method-shape and cache decorators apply to functions; a `@dataclass`
+/// (or anything unknown) is a loud error here (class codegen handles
+/// `@dataclass`).
 fn parse_method_decorator(
     decorators: &[ExprType],
 ) -> Result<MethodDecorator, Box<dyn std::error::Error>> {
-    let unsupported = |what: &str| -> Box<dyn std::error::Error> {
-        format!(
-            "decorator `{}` is not supported yet (only functools.lru_cache, \
-             functools.cache, classmethod, and staticmethod are); rython refuses to \
-             silently ignore it",
-            what
-        )
-        .into()
-    };
-    let name_of = |e: &ExprType| -> Option<String> {
-        match e {
-            ExprType::Name(n) => Some(n.id.clone()),
-            ExprType::Attribute(a) => match a.value.as_ref() {
-                ExprType::Name(m) if m.id == "functools" => Some(a.attr.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
-    };
-    match decorators {
-        [] => Ok(MethodDecorator::None),
-        [single] => {
-            let (base, call) = match single {
-                ExprType::Call(c) => (name_of(c.func.as_ref()), Some(c)),
-                other => (name_of(other), None),
-            };
-            match (base.as_deref(), call) {
-                (Some("classmethod"), None) => Ok(MethodDecorator::ClassMethod),
-                (Some("staticmethod"), None) => Ok(MethodDecorator::StaticMethod),
-                (Some("cache"), None) => Ok(MethodDecorator::Cache(Some(None))),
-                (Some("cache"), Some(c)) if c.args.is_empty() && c.keywords.is_empty() => {
-                    Ok(MethodDecorator::Cache(Some(None)))
-                }
-                (Some("lru_cache"), None) => Ok(MethodDecorator::Cache(Some(Some(128)))),
-                (Some("lru_cache"), Some(c)) => {
-                    let maxsize = match (c.args.as_slice(), c.keywords.as_slice()) {
-                        ([], []) => return Ok(MethodDecorator::Cache(Some(Some(128)))),
-                        ([e], []) => e.clone(),
-                        ([], [kw]) if kw.arg.as_deref() == Some("maxsize") => {
-                            kw.value.clone()
-                        }
-                        _ => {
-                            return Err(
-                                "lru_cache() takes at most a single maxsize argument"
-                                    .to_string()
-                                    .into(),
-                            )
-                        }
-                    };
-                    if crate::is_none_expr(&maxsize) {
-                        return Ok(MethodDecorator::Cache(Some(None)));
-                    }
-                    match &maxsize {
-                        ExprType::Constant(c) => match &c.0 {
-                            Some(litrs::Literal::Integer(i)) => {
-                                let n: i64 = i.value().ok_or("maxsize out of range")?;
-                                Ok(MethodDecorator::Cache(Some(Some(n))))
-                            }
-                            _ => Err("lru_cache maxsize must be an integer literal or None"
-                                .to_string()
-                                .into()),
-                        },
-                        _ => Err("lru_cache maxsize must be an integer literal or None"
-                            .to_string()
-                            .into()),
-                    }
-                }
-                _ => Err(unsupported(&format!("{:?}", single))),
-            }
-        }
-        many => Err(unsupported(&format!("{:?}", many[0]))),
+    match crate::parse_decorator(decorators)? {
+        None => Ok(MethodDecorator::None),
+        Some(d) => d.as_method_decorator().ok_or_else(|| {
+            format!(
+                "decorator `{}` does not apply to a function definition (only \
+                 functools.lru_cache, functools.cache, classmethod, and staticmethod do)",
+                d.describe()
+            )
+            .into()
+        }),
     }
 }
 

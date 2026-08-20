@@ -346,6 +346,67 @@ fn imported_function_keyword_args_resolve_cross_module() {
 }
 
 #[test]
+fn decorator_factory_expression_synthesizes_cached_function() {
+    // Issue #127: `alias = lru_cache(maxsize=N)(fn)` — the decorator
+    // FACTORY applied as an expression (charset_normalizer's
+    // `cached_mess_ratio = lru_cache(maxsize=None)(mess_ratio)`). The
+    // assignment emits a synthesized cached function named `alias` (the
+    // same @lru_cache machinery a decorated definition gets), and call
+    // sites route through the cache.
+    let out = compile(
+        "from functools import lru_cache\n\
+         \n\
+         def helper(x: int) -> int:\n\
+         \x20   return x * 2\n\
+         \n\
+         cached_helper = lru_cache(maxsize=None)(helper)\n\
+         \n\
+         def use(n: int) -> int:\n\
+         \x20   return cached_helper(n) + cached_helper(n)\n",
+        "factory.py",
+    );
+    assert!(
+        out.contains("fn cached_helper"),
+        "the factory must synthesize a cached function: {}",
+        out
+    );
+    assert!(
+        out.contains("__LRU_CACHE"),
+        "the synthesized function must carry the cache static: {}",
+        out
+    );
+    assert!(
+        out.contains("helper(x)") || out.contains("helper (x)"),
+        "the wrapper must call the wrapped function: {}",
+        out
+    );
+    // The assignment must NOT survive as a store.
+    assert!(
+        !out.contains("cached_helper ="),
+        "the factory assignment must be consumed, not stored: {}",
+        out
+    );
+}
+
+#[test]
+fn unsupported_decorator_error_is_consistent() {
+    // The systematic registry reports any unknown decorator with the same
+    // "unsupported" message whether it decorates a function or a class.
+    let err = compile_err("@my_decorator\ndef f() -> int:\n    return 1\n", "d1.py");
+    assert!(
+        err.contains("not supported yet"),
+        "function decorator error must come from the registry: {}",
+        err
+    );
+    let err = compile_err("@my_decorator\nclass C:\n    pass\n", "d2.py");
+    assert!(
+        err.contains("not supported yet"),
+        "class decorator error must come from the registry: {}",
+        err
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at

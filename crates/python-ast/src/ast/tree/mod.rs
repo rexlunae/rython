@@ -78,6 +78,9 @@ pub use if_exp::*;
 pub mod dict;
 pub use dict::*;
 
+pub mod decorator;
+pub use decorator::*;
+
 pub mod set;
 pub use set::*;
 
