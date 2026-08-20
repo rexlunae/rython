@@ -40,10 +40,15 @@ in as the oracle. The pinned surface includes:
 - **Float formatting**: `str`/`repr` use CPython's shortest-roundtrip
   algorithm; `str(1e16)` is `1e+16`, not `10000000000000000`.
 - **`hash()`**: matches CPython with `PYTHONHASHSEED=0`.
-- **Dict/set ordering**: dicts iterate in insertion order, like CPython.
+- **Dict ordering**: dicts iterate in insertion order, like CPython.
+  (Sets deliberately have no `repr` at all — printing one is a compile
+  error — so unordered set iteration is never observable output.)
 - **Sort stability** and comparison behavior.
-- **Exception types and messages**: `except ValueError` catches exactly
-  what CPython's would, and the message text matches.
+- **Exception raising and messages**: exceptions are raised where
+  CPython raises them, with pinned message text across the verified
+  surface. (Handler *matching* is exact-name plus
+  `Exception`/`BaseException` catch-alls — the hierarchy in between is
+  not modeled; see the ledger, [spec §12.3](spec.md).)
 - **Stdlib output shapes**: `argparse` help/error text, `csv` quoting,
   `datetime.strptime`, `random` with a given seed (MT19937,
   operation-for-operation), `heapq`'s exact list layout, and so on.
@@ -64,7 +69,11 @@ exception, or a panic — never a silently different answer.
 ### Integers: `i64`, not arbitrary precision
 
 CPython's `int` grows without bound; Rython's `int` is a 64-bit signed
-integer, and overflow **panics** rather than wrapping or growing.
+integer that does not grow. Overflow **panics in debug builds**; in
+release builds (which `rypip build`/`install` produce) Rust's unchecked
+arithmetic currently wraps silently — a ledgered gap
+([spec §12.2](spec.md)), and part of why overflow-adjacent arithmetic
+is out of contract until the bigint tier lands.
 
 - **Bought**: machine-speed arithmetic, `Copy` semantics, no allocation
   for numbers, viability in `no_std` and kernel contexts.
@@ -73,9 +82,11 @@ integer, and overflow **panics** rather than wrapping or growing.
   **opt-in feature flag** backing `int` with an arbitrary-precision
   crate — which also removes the overflow panic, since bigints don't
   overflow. A *silent*, magnitude-triggered fallback remains a non-goal.
-- **Edge**: until then, the panic is the loud boundary. Wrapping would
-  have been a silent divergence; checking and growing would have been a
-  semantic and performance fork from the declared model.
+- **Edge**: the debug-build panic is the loud boundary, and the
+  release-mode wrap is the known exception to it. Checking-and-growing
+  would have been a semantic and performance fork from the declared
+  model; the bigint flag is the sanctioned way to buy the Python
+  behavior.
 
 ### Static types: one name, one type
 
@@ -114,9 +125,12 @@ values). Python's aliasing is **not modeled**.
 
 ### Exceptions: same surface, different plumbing
 
-Python semantics — `try`/`except`/`else`/`finally`, typed handlers,
-matching by exception class — are reproduced, including `ZeroDivisionError`
-raised from `//` and `%` at the exact point CPython raises it. Underneath,
+Python semantics — `try`/`except`/`else`/`finally`, typed handlers
+matched by exception name (`Exception` catches everything; the
+hierarchy in between is not yet modeled) — are reproduced, including
+`ZeroDivisionError` raised from `//` and `%` at the exact point CPython
+raises it (true division `/` does not raise yet — issue #107).
+Underneath,
 there is no stack unwinding through an interpreter: fallible operations
 return `Result<T, PyException>` and `?` propagates to the nearest handler.
 

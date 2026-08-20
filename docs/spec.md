@@ -105,11 +105,13 @@ Rython is statically typed. There are no runtime type tags and no boxed
    types from later uses (§3.4).
 
 **One name, one type.** A variable binds to exactly one type for its
-whole (function-wide) scope. Rebinding a name to a different type, and
-container literals mixing incompatible element types, are loud errors —
-with one unification exception: a literal mixing `int` and `float`
-elements unifies to `float`, and string literals unify with computed
-strings as `String`.
+whole (function-wide) scope. A container literal mixing incompatible
+element types is a conversion-time loud error — with one unification
+exception: a literal mixing `int` and `float` elements unifies to
+`float`, and string literals unify with computed strings as `String`.
+Rebinding a name to a different type is not detected at conversion time
+today: it fails as a rustc type error against the single hoisted
+declaration — loud, but at the wrong layer (§12.1).
 
 ### 3.2 Type mapping
 
@@ -123,7 +125,7 @@ strings as `String`.
 | `list[T]` | `Vec<T>` | |
 | `dict[K, V]` | `PyDict<K, V>` | `PyDict` is an insertion-ordered `IndexMap` alias — Python 3.7+ dict ordering is preserved |
 | `set[T]` | `std::collections::HashSet<T>` | |
-| `frozenset[T]` | `FrozenSet<T>` (runtime type) | Constructed via `frozenset(iterable)`; empty `frozenset()` is a loud error |
+| `frozenset[T]` | `std::collections::HashSet<T>` (as an annotation) | The `frozenset(iterable)` *call* produces the distinct runtime type `FrozenSet<T>`; empty `frozenset()` is a loud error |
 | `tuple` (literal) | Rust tuple `(A, B, …)` | There is no `tuple[…]` annotation mapping; tuples exist structurally |
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
@@ -133,8 +135,12 @@ and matches a `dict[str, int]` annotation.
 
 **Bare container annotations are rejected.** `list`, `dict`, `set`,
 `tuple`, `Optional` without a subscript are loud errors ("use a
-subscripted annotation like `list[float]`"), as is any annotation the
-mapper doesn't recognize.
+subscripted annotation like `list[float]`"). Other unrecognized
+annotations split by shape: a non-name annotation the mapper can't
+handle is a loud error, but a plain-*name* annotation it doesn't know
+is rendered verbatim as a Rust type — that is what makes user-defined
+classes work as annotations, and it means a typo'd name (`x: itn`)
+surfaces in rustc rather than at conversion time (§12.1).
 
 **Unannotated parameters** lower to `impl Into<PyObject>`, where
 `PyObject` is a PyO3 alias no ordinary Rython value converts into. Such
@@ -144,18 +150,23 @@ a function type-checks as a definition but is uncallable — in practice,
 ### 3.3 Coercions
 
 Conversions Rust needs but Python doesn't write are inserted by the
-context-aware layer, and only where they are lossless:
+context-aware layer — lossless, with one documented exception (the
+`int → f64` unification):
 
 - `len(x)` and other `usize` producers coerce to `i64` at index and
   `range()` positions via `try_into().unwrap()` (overflow panics loudly
   rather than wrapping).
 - String literals gain `.to_string()` where an owned `String` is
   expected; `String`s gain `.as_str()` where a `&str` is expected.
-- `int` unifies to `f64` in mixed numeric contexts.
-- A non-`Copy` value read more than once in its function is cloned at
-  move-prone positions (call arguments, container elements) — the
-  *reuse-clone rule*. Method-call and subscript receivers are never
-  cloned, so `xs.pop(); xs.pop()` mutates one vector.
+- `int` unifies to `f64` in mixed numeric literal contexts. This is
+  lossy above 2⁵³ and accepted anyway, as the only way to compile a
+  mixed numeric list at all.
+- A non-`Copy` value read more than once in its function is cloned when
+  passed as an argument to a user-defined function with a known
+  signature — the *reuse-clone rule*. Method-call and subscript
+  receivers are never cloned, so `xs.pop(); xs.pop()` mutates one
+  vector. (Other move-prone positions, such as container elements, are
+  not yet covered by the rule.)
 
 ### 3.4 Empty containers and type pinning
 
@@ -163,9 +174,9 @@ context-aware layer, and only where they are lossless:
 assignment converts only if either:
 
 - the target is annotated (`xs: list[float] = []`), or
-- a later use in the same scope pins the type: `append`/`extend`/
-  `insert` for lists; `d[k] = v`, `get`, `pop`, `setdefault`, `in`, or
-  iteration for dicts.
+- a later use in the same scope pins the type: `append`/`push`/
+  `extend`/`insert` for lists; a subscript store (`d[k] = v`) or a
+  `get(k)` call for dicts.
 
 The literal then renders as `Vec::<T>::new()` / `PyDict::<K, V>::from([])`.
 An empty literal nothing pins is a loud error naming the variable and
@@ -189,12 +200,15 @@ unmatched group) fail loudly instead of inventing a value.
 
 - `+ - *` on `int` are plain `i64` ops (overflow: §12.2); on `float`,
   IEEE `f64` ops.
-- `/` is true division producing `float`. `//` and `%` follow Python:
-  the result takes the divisor's sign; a zero divisor raises
-  `ZeroDivisionError` as a catchable `PyException` (the operators return
-  `Result` and propagate with `?`). `divmod` is floor-based and
-  fallible. Exception: division by zero in *floats* raises
-  `ZeroDivisionError: float division by zero` exactly as CPython does.
+- `/` is true division producing `float`. **Known divergence**: `/` by
+  zero does not raise — it lowers to an infallible IEEE division, so
+  `x / 0` silently yields `inf`/`nan` where CPython raises
+  `ZeroDivisionError` (issue #107; ledgered in §12.3).
+- `//` and `%` follow Python — `//` floors toward negative infinity,
+  `%` takes the divisor's sign — and a zero divisor raises
+  `ZeroDivisionError` as a catchable `PyException` (the operators
+  return `Result` and propagate with `?`). `divmod` is floor-based and
+  fallible in the same way.
 - `**` follows Python's promotion rules (int base with non-negative int
   exponent stays int); three-argument `pow` supports the modular
   inverse.
@@ -208,8 +222,12 @@ unmatched group) fail loudly instead of inventing a value.
 Conditions implement Python truthiness through a `Truthy` trait:
 `and`/`or`/`not` recurse, comparisons pass through, and any other value
 is tested with `is_truthy()` (empty string/container and zero are
-false). Note that `and`/`or` in *condition position* are boolean; the
-value-producing form (`x = a or b`) follows the same lowering.
+false). This applies to *condition position*. The value-producing form
+(`x = a or b`) is lowered separately: Rust's short-circuiting
+`&&`/`||` over the raw operands (so it is correct for boolean operands
+and fails in rustc for others), plus a special case giving `a or None`
+`Option` semantics — Python's return-the-operand behavior for arbitrary
+truthy values is not modeled.
 
 ### 4.3 f-strings and `str.format`
 
@@ -247,10 +265,14 @@ loudly instead of being catchable (deviation, §12.2).
 
 ### 4.6 Indexing and slicing
 
-Indexing goes through checked helpers that raise `IndexError`/`KeyError`
-with CPython's message text (`"list index out of range"`). Negative
-indices and slice *reads* follow Python semantics. Slice **assignment**
-(`x[a:b] = …`) and augmented assignment to a slice are loud errors.
+Indexing goes through checked helpers that raise
+`IndexError`/`KeyError`. `IndexError` messages match CPython
+(`"list index out of range"`); `KeyError` messages currently render the
+key with Rust's `Debug` quoting (`KeyError: "name"`) where CPython uses
+repr quoting (`KeyError: 'name'`) — a message-shape divergence on the
+ledger (§12.3). Negative indices and slice *reads* follow Python
+semantics. Slice **assignment** (`x[a:b] = …`) and augmented assignment
+to a slice are loud errors.
 
 ---
 
@@ -301,9 +323,11 @@ Consequences, all enforced loudly:
   `numpy` is the exception (it is a real path, so aliasing works).
 - `from typing import …` and `from functools import partial/lru_cache/cache`
   lower to nothing.
-- Importing a module the runtime doesn't provide is a conversion error;
-  under `--no-std`, importing a std-tier module is a conversion error
-  naming the tier (§11.3).
+- Importing a module that neither the runtime nor an FFI manifest
+  provides is **not** caught at conversion time: it lowers to a bare
+  `use name;` and fails as a rustc resolution error in the generated
+  crate (§12.1). Under `--no-std`, importing a std-tier module *is* a
+  conversion error naming the tier (§11.3).
 - `from rython import rust` is the FFI declaration surface (§11.1);
   `import rython` by itself is rejected with a pointer to the correct
   spelling.
@@ -343,15 +367,21 @@ Rust has neither, so both are resolved **at each call site** at
 conversion time:
 
 - Positional arguments fill left to right; keywords map by name;
-  defaults fill the gaps. Every mismatch CPython would raise `TypeError`
-  for (unexpected keyword, multiple values, missing argument) is a
-  conversion-time error with the corresponding message.
+  defaults fill the gaps. Mismatches CPython would raise `TypeError`
+  for — an unexpected keyword, multiple values for one argument, a
+  missing required argument — are conversion-time errors with the
+  corresponding message. (One gap: surplus positional arguments on a
+  keyword-free call skip the mapping pass and surface as a rustc arity
+  error instead, §12.1.)
 - When keyword reordering would change evaluation order, arguments are
   first bound to temporaries in Python source order.
-- Only **constant** defaults are accepted. Mutable defaults (`[]`, `{}`,
-  `set()`) are rejected with an explanation of CPython's shared
-  single-evaluation semantics; non-constant defaults are rejected
-  because call-site inlining would re-evaluate them.
+- Defaults must be **constants**, checked at each call site that
+  actually omits the argument (a bad default on a function whose calls
+  all pass the argument explicitly is not flagged). Mutable
+  container-literal defaults (`[]`, `{}`, `{…}`) are rejected with an
+  explanation of CPython's shared single-evaluation semantics;
+  non-constant defaults — including `set()`, which is a call — are
+  rejected because call-site inlining would re-evaluate them.
 - Keyword arguments require the callee's signature: keywords on an
   unknown callee are a loud error. (Keyword `replace()` on the datetime
   family is special-cased in the runtime.)
@@ -411,11 +441,18 @@ impl Point {
   fields).
 - **Rejected, loudly**: inheritance from anything but `object`, class
   attributes and any class-level statement besides methods/docstring/
-  `pass`, nested classes, `async` methods, `*args`/`**kwargs` in
-  `__init__` or methods, and every dunder protocol — `__init__` is the
-  only dunder with semantics. Multiple inheritance, `super()`,
-  `__repr__`-driven printing, operator overloading: all out of the
-  current subset.
+  `pass`, nested classes, `async` methods, and `*args`/`**kwargs` in
+  `__init__`. (For other methods, the `*args`/`**kwargs` rejection
+  fires at each call site; a definition that is never called slips
+  through to rustc.)
+- **Dunder protocols are not modeled** — `__init__` is the only dunder
+  with semantics. Defining other dunder-named methods (`__repr__`,
+  `__eq__`, `__len__`, …) is *accepted*: they lower as ordinary
+  `pub(crate)` methods with no protocol wiring, so nothing calls them
+  implicitly. Protocol *uses* — printing an object, `==`, `len()`,
+  operator overloading, `super()`, multiple inheritance — are out of
+  the current subset; uses that reach codegen fail in rustc rather
+  than at conversion time (§12.1).
 
 ---
 
@@ -433,11 +470,14 @@ Matching is **by exact type-name string**, with `Exception` and
 `BaseException` matching everything. The class *hierarchy in between is
 not modeled*: `except LookupError` does not catch `IndexError`
 (deviation, §12.3). `except (A, B)` ORs the names; a dotted name
-matches on its final attribute; a bare `except:` catches all and makes
-later handlers unreachable, as in Python. `except E as e` binds a copy
-of the exception; `str(e)` is the message, `repr(e)` is
-`Type('message')`, and an uncaught exception prints `Type: message` to
-stderr and exits with status 1.
+matches on its final attribute; a bare `except:` catches all. (A bare
+`except:` anywhere but last is a `SyntaxError` in CPython's parser —
+which rython uses — so the not-last case never reaches conversion.)
+`except E as e` binds a copy of the exception; `str(e)` is the message,
+`repr(e)` is `Type('message')`. An uncaught exception exits with
+status 1, printing `Type: message` to stderr on the wrapped entry
+paths — §9 notes one entry path that currently prints Rust's `Debug`
+form instead.
 
 ### 8.2 Raising
 
@@ -463,12 +503,15 @@ limitation: `break`/`continue` inside a handler or `else` when a
 
 ### 8.4 Runtime errors: catchable vs. panic
 
-Raised as catchable `PyException`s with CPython's message text:
-`ZeroDivisionError` (`//`, `%`, `divmod`, float `/`), `IndexError`/
-`KeyError` from indexing, `ValueError` from `int()`/`chr()`/sorting
-incomparables/`math` domain errors, `FileNotFoundError`/
-`PermissionError`/… from `open`, `EOFError` from `input()`,
-`StopIteration` where modeled.
+Raised as catchable `PyException`s, with CPython's message text except
+where noted: `ZeroDivisionError` from `//`, `%`, and `divmod` — but
+**not** from `/`, which silently yields `inf` on a zero divisor (issue
+#107, §12.3); `IndexError`/`KeyError` from indexing (`KeyError`'s key
+quoting diverges, §4.6); `ValueError` from `int()` (its message omits
+CPython's "with base 10"), `chr()`, and `math` domain errors;
+`FileNotFoundError`/`PermissionError`/… from `open` (messages embed
+Rust's `io::Error` text rather than CPython's `[Errno N]` form);
+`EOFError` from `input()`.
 
 **Panics** (loud, not catchable), because the condition is not
 representable in the model: `i64` overflow, sorting a `NaN`,
@@ -489,11 +532,17 @@ exception escaping a lambda (§4.5).
   visible inside functions** — the reference fails to compile (loud,
   but with a rustc error; see §12.1).
 - The entry point is `__main__.py`, or the module containing an
-  `if __name__ == "__main__":` block. The block becomes `fn main()`
-  (directly calling the user's `main` when the block is just
-  `main()`), wrapping the `Result` so an uncaught exception prints
-  `Type: message` and exits 1. A dedicated `__main__.py` is bin-only;
-  any other entry module appears in both the library and the binary.
+  `if __name__ == "__main__":` block. The block becomes `fn main()`.
+  When the block does more than call `main()` (or module-init code
+  exists), a generated wrapper runs `__module_init__` and the body,
+  printing `Type: message` to stderr and exiting 1 on an uncaught
+  exception. When the block is just `main()` with no module-level
+  code, the user's `main` — which returns `Result` — becomes the Rust
+  entry point directly, so an uncaught exception still exits 1 but
+  prints the error's `Debug` form rather than `Type: message` (a
+  cosmetic inconsistency, §12.3). A dedicated `__main__.py` is
+  bin-only; any other entry module appears in both the library and the
+  binary.
 - Packages without an entry point convert to library crates and cannot
   be `rypip install`ed (loud error naming the fix).
 
@@ -512,9 +561,11 @@ sort), `min`/`max` (Python's NaN-fold semantics), `sum`, `abs`, `round`
 `enumerate`, `zip`, `map`/`filter`, `all`/`any`, `repr`, `hash`
 (CPython's algorithms under `PYTHONHASHSEED=0`, including siphash13 for
 strings over the internal representation), `ord`/`chr`, `isinstance`
-(on statically-known types only — otherwise a loud error), `bool`/
-`int`/`float`/`str`/`list`/`dict`/`tuple`/`set`/`frozenset`
-conversions.
+(on statically-known types only — otherwise a loud error), and the
+`bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
+(`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
+they lower unresolved and fail in rustc, §12.1; set and tuple
+*literals* work.)
 
 String, list, dict, and set methods cover the CPython surface for the
 supported types, pinned to CPython edge cases (code-point `len`,
@@ -608,9 +659,11 @@ crate is a dependency, not a module.
 
 `rypip convert --pyo3` adds a `python` cargo feature, a `cdylib` crate
 type, and a generated `#[pymodule]` wrapping every public top-level
-function whose signature is expressible in concrete types (annotated
+function whose signature is expressible in concrete types (every
+parameter annotated with a mappable type —
 `int`/`float`/`str`/`bool`/`bytes`/containers/`Optional`; no defaults,
-no `*args`/`**kwargs`, no keyword-only params). `PyException` maps onto
+no `*args`/`**kwargs`, no keyword-only or positional-only params;
+underscore-prefixed names skipped). `PyException` maps onto
 real CPython exception classes. If nothing is bindable, conversion
 fails loudly listing the skipped functions. Incompatible with
 `--no-std` and the kernel target.
@@ -624,25 +677,36 @@ std-tier imports (`os`, `sys`, `math`, `random`, `datetime`, `re`,
 `core ⊂ alloc ⊂ std`; a strictly-core tier is not implemented and
 fails loudly.
 
-### 11.4 Kernel modules (`--kernel-module`, `--rust-for-linux`, `--driver`)
+### 11.4 Kernel modules (`--kernel-module`, optionally `--rust-for-linux`)
 
 A deliberately tiny sub-language, separate from the general transpiler.
 Only `def module_init()` / `def module_exit()` (zero parameters) are
 entry points; bodies may contain `printk("…")`/`printk(f"…")`,
-integer-literal assignments, calls into the `rykernel_shim` allowlist
-(`from rykernel_shim import ktime_get_real_seconds`), `pass`, and
-`return` — anything else is a loud error. Floating point is rejected
-*anywhere in the module* (literals, `float()`, annotations, FP-using
-stdlib imports), with a message explaining the kernel's FPU state.
+assignments of integer literals or of allowlisted `rykernel_shim` call
+results, bare allowlisted shim calls
+(`from rykernel_shim import ktime_get_real_seconds`), docstrings
+(dropped, as in CPython), `pass`, and `return` — anything else is a
+loud error. Floating point is rejected *anywhere in the module*
+(literals, `float()`, annotations, FP-using stdlib imports), with a
+message explaining the kernel's FPU state — in the plain kernel
+target; the device-manifest sub-mode currently bypasses this scan
+(issue #108).
 Module metadata comes from `__module_license__` (defaults to `"GPL"`),
 `__module_author__`, `__module_description__`, `__module_version__`,
 `__module_name__`; a misc-device sub-mode is driven by
 `__device_name__`/`__bufsz__`/`__magic__`/`__device_mode__` dunders.
 The raw-FFI target generates a C-free build pipeline (Makefile +
 `-Zbuild-std`, kmalloc-backed allocator, `.modinfo` sections);
-`--rust-for-linux` generates a `module!`-macro crate for CONFIG_RUST
-kernels instead. `printk` f-strings may interpolate only integer locals
-and literals; `!s`/`!r` and format specs are loud errors.
+`--rust-for-linux` (valid only alongside `--kernel-module`) generates a
+`module!`-macro crate for CONFIG_RUST kernels instead. `printk`
+f-strings may interpolate only integer locals and literals; `!s`/`!r`
+and format specs are loud errors.
+
+`--driver` is a related but separate mode: it generates the
+*userspace* companion to a kernel device, converted through the full
+transpiler into an ordinary std crate (plus `libc`). It cannot be
+combined with `--kernel-module`, `--no-std`, or `--pyo3`, and none of
+this section's kernel restrictions apply to it.
 
 ---
 
@@ -657,9 +721,23 @@ below the bar the project sets — the failure surfaces as a rustc error
 in generated code rather than a conversion-time message:
 
 - `eval`, `exec`, `compile`, `globals`, `locals`, `getattr`, `setattr`
-  lower to unresolved calls and fail in rustc.
+  lower to unresolved calls and fail in rustc; so do the unimplemented
+  `set(xs)` and `tuple(xs)` conversion calls.
+- Importing a module neither the runtime nor an FFI manifest provides
+  lowers to a bare `use name;` and fails at resolution in rustc.
 - Reading a non-constant module global from inside a function fails in
   rustc (the global lives in `__module_init__`'s scope).
+- Rebinding a local name to a different type fails as a rustc type
+  error against the hoisted declaration.
+- A typo'd or unsupported plain-name annotation (`x: itn`) renders
+  verbatim (the mechanism that admits user classes) and fails in rustc.
+- Dunder-protocol *uses* (printing an object, `==`, `len()`, operator
+  overloading) fail in rustc — the method definitions themselves are
+  accepted but never wired to a protocol (§7).
+- Surplus positional arguments on a keyword-free call to a user
+  function skip the argument-mapping pass and fail as a rustc arity
+  error; a `*args`/`**kwargs` method that is defined but never called
+  likewise surfaces only when rustc sees a use.
 - Most aliasing shapes (`b = a` then mutate) fail in rustc's move
   checker (issue #79 proposes conversion-time detection).
 
@@ -691,6 +769,10 @@ accepted as permanent spec:
 
 | Divergence | Status |
 |---|---|
+| True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
+| Exception message shapes: `KeyError` renders keys with Rust `Debug` quoting; `int()`'s message omits "with base 10"; `open` errors embed Rust `io::Error` text instead of `[Errno N]` | Defect class, same family as issue #82 |
+| An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
+| The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
@@ -708,7 +790,8 @@ accepted as permanent spec:
   convert, `cargo build`, run the binary, compare stdout line-for-line
   against pinned CPython transcripts (comments mark
   `// Verified against python3.`). Also the loud-error matrix for
-  no_std, kernel, pyo3, and FFI modes.
+  no_std, kernel, and pyo3 modes; the FFI loud-error matrices live
+  alongside it in `rust_bind_tests.rs` and `rust_module_tests.rs`.
 - `crates/python-ast/tests/codegen_semantics.rs` — generated-Rust
   shape assertions and `compile_err` loud-error assertions.
 - `crates/stdpython/tests/python_semantics.rs` — runtime pins with the

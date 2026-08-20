@@ -95,9 +95,10 @@ boundary is real. A subset with loudly-enforced edges can be retargeted;
 Converted programs are ahead-of-time compiled, statically typed,
 monomorphized by rustc, and free of the interpreter loop and the GIL.
 Rython does not chase benchmark numbers with unsafe tricks; the speed
-comes from the model. Where CPython's semantics force a cost (insertion-
-ordered dicts, `i64` overflow checks lowered as panics, exact float
-formatting), Rython pays it, because correctness outranks speed.
+comes from the model. Where CPython's semantics force a cost
+(insertion-ordered dicts, checked division for `ZeroDivisionError`,
+exact float formatting), Rython pays it, because correctness outranks
+speed.
 
 ## Non-goals
 
@@ -141,7 +142,9 @@ holds:
 3. It converts into code that raises a typed, catchable Python exception
    at runtime, exactly where CPython would raise one — or, for the few
    cases that are only detectable at runtime and not representable
-   (`i64` overflow, sorting `NaN`), into a loud panic.
+   (sorting `NaN`; `i64` overflow, where the panic currently holds only
+   in debug builds — the release-mode wrap is a ledgered gap), into a
+   loud panic.
 
 What is never acceptable: output that differs from CPython's without an
 error. When a bug of that shape is found, it is treated as the highest-
@@ -223,8 +226,11 @@ aliases.
 ### P6. A tiered runtime: `core ⊂ alloc ⊂ std`
 
 `stdpython` is layered as a feature ladder. The `std` tier has the full
-surface. The `alloc` tier keeps everything that doesn't need an OS and
-works on embedded targets. Constructs that need a missing tier fail *at
+surface. The `alloc` tier keeps the heap-backed surface with no OS
+dependency and works on embedded targets (a few OS-free modules —
+`math`, whose float intrinsics live in std, and `re` — are still
+std-gated for implementation reasons). Constructs that need a missing
+tier fail *at
 conversion time*, with a Python-level message — not later as inscrutable
 rustc errors inside a generated crate. The kernel target builds on the
 same discipline with its own stricter rules (no floats, `printk`
@@ -274,12 +280,13 @@ reference where it can.
   Static typing remains the default model.
 - **Exceptions over panics.** Python exceptions already lower to
   `Result<T, PyException>` — `ZeroDivisionError` from `//`, `%`, and
-  float division is a catchable value that propagates with `?` to the
-  matching `except`, exactly like `raise`. The direction is to shrink
-  the remaining panic list the same way wherever CPython defines an
-  exception or a behavior for the case: arithmetic on `None` should
+  `divmod` is a catchable value that propagates with `?` to the
+  matching `except`, exactly like `raise`. The direction is to close
+  the remaining gaps the same way wherever CPython defines an
+  exception for the case: true division by zero should raise instead
+  of silently yielding `inf` (issue #107), arithmetic on `None` should
   become a catchable `TypeError`, exceptions should propagate through
-  lambda boundaries, and the bigint tier removes the overflow panic
+  lambda boundaries, and the bigint tier removes the overflow question
   altogether.
 - **A richer class model**: inheritance — single first, multiple
   eventually — plus common dunder protocols and generalized decorator

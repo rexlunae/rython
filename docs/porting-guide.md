@@ -71,7 +71,7 @@ will need refactoring. Grep for these; each maps to a rewrite in §2.
 | `getattr(`/`setattr(` for dynamic dispatch | No reflection; use explicit dispatch |
 | Metaclasses, `__init_subclass__`, class decorators | No dynamic class machinery |
 | Monkey-patching (assigning to modules/classes at runtime) | Nothing to patch at runtime |
-| Arbitrary-precision integer reliance (values beyond ±2⁶³) | `int` is `i64`; overflow is a panic (an opt-in bigint tier is planned — spec §14) |
+| Arbitrary-precision integer reliance (values beyond ±2⁶³) | `int` is `i64`; overflow panics in debug builds and may silently wrap in release builds — treat it as out of contract (an opt-in bigint tier is planned, spec §14) |
 | `threading`, `multiprocessing`, `asyncio` as APIs | Not in the subset; add concurrency in Rust after porting |
 
 **Refactorable (mechanical or semi-mechanical rewrites, §2):**
@@ -186,6 +186,10 @@ rustc (fine but confusing), and pathological forms are silent (#79).
   deviation; make equality explicit in the Python).
 - Check integer ranges: anything that can exceed ±2⁶³ must be
   redesigned (e.g. use `math` floats, or split the quantity).
+- Guard divisions explicitly: true division by zero currently yields
+  `inf` instead of raising `ZeroDivisionError` (issue #107, spec
+  §12.3) — code that relies on catching it needs an explicit zero
+  check until that lands. (`//` and `%` raise correctly.)
 
 ---
 
@@ -241,12 +245,13 @@ cd ported-crate && cargo build && cargo run -- <args>
 | Large dynamic program with a hot, typed core | Incremental: convert the core with `--pyo3`, `cargo build --features python`, import the extension from the remaining CPython code; move the boundary over time |
 | Rust project that wants Python-syntax modules | `python_module!(name)` proc-macro; the `.py` lives in `src/` and compiles into the crate |
 | Embedded / wasm, no OS | `rypip convert --no-std`; only the alloc-tier stdlib (`json`, `collections`, `itertools`, `functools`, `heapq`, `textwrap`, `hashlib`, `csv`, `string`, `copy`); no `print`/`open`/`__main__` |
-| Linux kernel module | `--kernel-module` (or `--rust-for-linux` for CONFIG_RUST trees): a tiny sub-language — see spec §11.4 before writing any Python |
+| Linux kernel module | `--kernel-module` (add `--rust-for-linux` for CONFIG_RUST trees — it requires `--kernel-module`): a tiny sub-language — see spec §11.4 before writing any Python |
 | Distributable CLI | `rypip install path/to/project` (needs an entry point) |
 
 Constraints to remember: `--pyo3` excludes `--no-std` and kernel
 targets; PyO3 export skips functions with defaults, `*args`/`**kwargs`,
-or underscore-prefixed names, and fails loudly if nothing is bindable.
+keyword-only or positional-only parameters, unannotated parameters, or
+underscore-prefixed names, and fails loudly if nothing is bindable.
 
 ### Calling existing Rust from the Python side
 
@@ -277,10 +282,12 @@ bind it instead of porting around it:
    re-express their assertions against the binary's CLI.
 3. **Property spot-checks** where output is large: hash the outputs of
    both implementations across an input corpus.
-4. **Panics audit**: grep inputs/domains for the panic conditions
-   (overflow-adjacent arithmetic, NaN sorting, `hash` on floats that
-   could be NaN) — these are contract edges, decide explicitly that
-   they're unreachable or guard them in the Python.
+4. **Contract-edge audit**: grep inputs/domains for the panic
+   conditions (overflow-adjacent arithmetic, NaN sorting, `hash` on
+   floats that could be NaN) and for the ledgered silent divergences in
+   spec §12.3 (notably `/` by zero yielding `inf`, issue #107) —
+   decide explicitly that they're unreachable or guard them in the
+   Python.
 5. Only then refactor the Rust. From this point the crate is the source
    of truth; keep the golden corpus as regression tests on the Rust
    side.
