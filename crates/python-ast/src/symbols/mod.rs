@@ -47,6 +47,25 @@ impl SymbolTableScopes {
         }
         None
     }
+
+    /// All module-level class definitions visible in this scope (the first
+    /// binding of each name wins, mirroring `get`). Used by the parameter
+    /// inference's duck-typing pass (issue #109, M3) to index user classes
+    /// by their method names.
+    pub fn all_classes(&self) -> Vec<ClassDef> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for table in self.0.iter() {
+            for value in table.symbols.values() {
+                if let SymbolTableNode::ClassDef(class) = value {
+                    if seen.insert(class.name.clone()) {
+                        out.push(class.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Default for SymbolTableScopes {

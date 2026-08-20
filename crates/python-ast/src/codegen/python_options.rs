@@ -179,6 +179,24 @@ pub struct PythonOptions {
     /// concrete-type arms that assume a Vec/str receiver.
     pub param_method_params: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// Module-level generated items collected during codegen (issue #109,
+    /// M3): duck-typing traits (HasSpeak) and their per-class impls. The
+    /// module generator drains this at the end and emits the items at the
+    /// top of the module output.
+    pub module_pending_items:
+        std::rc::Rc<std::cell::RefCell<Vec<proc_macro2::TokenStream>>>,
+
+    /// Duck-typing trait names already generated in this module (issue
+    /// #109, M3): `HasSpeak` and peers are emitted once per module even
+    /// when several functions bound parameters on the same method.
+    pub generated_duck_traits: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+
+    /// Duck-typed user-method calls on the CURRENT function's unannotated
+    /// parameters: param name → set of method names whose Has* trait
+    /// returns Result (so the call sites thread `?`).
+    pub duck_methods_on_params:
+        std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+
     /// Emit #[deprecated] notes on generated items whose conversion was
     /// lossy (dropped parameter defaults, ignored return annotations, ...).
     /// On by default: silent semantic divergence from the Python source is
@@ -345,6 +363,11 @@ impl Default for PythonOptions {
             async_runtime_dep: false,
             param_type_vars: std::rc::Rc::new(std::collections::HashMap::new()),
             param_method_params: std::rc::Rc::new(std::collections::HashSet::new()),
+            module_pending_items: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            generated_duck_traits: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
+            duck_methods_on_params: std::rc::Rc::new(std::collections::HashMap::new()),
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,

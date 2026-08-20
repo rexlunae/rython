@@ -925,6 +925,7 @@ impl CodeGen for FunctionDef {
                     &options.name_types,
                     &options.use_counts,
                     &symbols,
+                    &options,
                 )
                 .map_err(|e| {
                     format!("function `{}`: {}", self.name, e)
@@ -938,6 +939,8 @@ impl CodeGen for FunctionDef {
         options.param_type_vars = std::rc::Rc::new(inferred_signature.param_types.clone());
         options.param_method_params =
             std::rc::Rc::new(inferred_signature.method_params.clone());
+        options.duck_methods_on_params =
+            std::rc::Rc::new(inferred_signature.duck_methods_on_params.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self

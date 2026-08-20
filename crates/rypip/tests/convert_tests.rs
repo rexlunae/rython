@@ -4331,3 +4331,65 @@ fn stdlib_method_inference_matches_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn duck_typing_hear_example_matches_python_transcript() {
+    // Issue #109, M3 acceptance: `def hear(animal): return animal.speak()`
+    // becomes `fn hear<T: HasSpeak>(animal: T)`, one impl per defining
+    // class, and the compiled binary's output diffs against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("duck-hear");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Dog:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "class Cat:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"meow\"\n",
+            "\n",
+            "def hear(animal):\n",
+            "    return animal.speak()\n",
+            "\n",
+            "def praise(animal):\n",
+            "    return \"nice \" + animal.speak()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(hear(Dog()))\n",
+            "    print(hear(Cat()))\n",
+            "    print(praise(Dog()))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(src.contains("pub trait HasSpeak"), "generated: {}", src);
+    assert!(src.contains("impl HasSpeak for Dog"), "generated: {}", src);
+    assert!(src.contains("impl HasSpeak for Cat"), "generated: {}", src);
+    assert!(
+        src.contains("pub fn hear<T>(animal: T)"),
+        "generic param: {}",
+        src
+    );
+    assert!(src.contains("T: HasSpeak"), "generic bound: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["woof", "meow", "nice woof"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

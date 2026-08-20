@@ -5046,3 +5046,98 @@ fn mixed_method_bounds_on_one_parameter() {
         out
     );
 }
+
+// ---- issue #109 M3: user-class duck typing (generated Has* traits) ----
+
+#[test]
+fn two_class_method_generates_has_trait() {
+    // The issue's hear() example: a method on multiple classes bounds the
+    // parameter on a generated HasSpeak trait, with one impl per class.
+    let out = compile(
+        concat!(
+            "class Dog:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "class Cat:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"meow\"\n",
+            "\n",
+            "def hear(animal):\n",
+            "    return animal.speak()\n",
+        ),
+        "m3_hear.py",
+    );
+    assert!(out.contains("pub trait HasSpeak"), "generated: {}", out);
+    assert!(out.contains("impl HasSpeak for Dog"), "generated: {}", out);
+    assert!(out.contains("impl HasSpeak for Cat"), "generated: {}", out);
+    assert!(out.contains("fn speak (& self) -> Result < String , PyException >"), "generated: {}", out);
+    assert!(out.contains("pub fn hear < T >"), "generated: {}", out);
+    assert!(out.contains("where T : HasSpeak"), "generated: {}", out);
+    assert!(out.contains("animal . speak () ?"), "call threads `?`: {}", out);
+}
+
+#[test]
+fn single_class_method_still_generates_has_trait() {
+    // The single-implementor case still bounds on the trait, never on the
+    // concrete class.
+    let out = compile(
+        concat!(
+            "class Dog:\n",
+            "    def bark(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "def hear(d):\n",
+            "    return d.bark()\n",
+        ),
+        "m3_single.py",
+    );
+    assert!(out.contains("pub trait HasBark"), "generated: {}", out);
+    assert!(out.contains("impl HasBark for Dog"), "generated: {}", out);
+    assert!(out.contains("where T : HasBark"), "generated: {}", out);
+    assert!(!out.contains("where T : Dog"), "never the concrete class: {}", out);
+}
+
+#[test]
+fn conflicting_duck_signatures_are_a_loud_error() {
+    // Two classes define `m` with different parameter types: one trait
+    // cannot bound both, so the conversion fails loudly.
+    let err = compile_err(
+        concat!(
+            "class A:\n",
+            "    def m(self, x: int) -> int:\n",
+            "        return x\n",
+            "\n",
+            "class B:\n",
+            "    def m(self, x: str) -> int:\n",
+            "        return 1\n",
+            "\n",
+            "def f(v):\n",
+            "    return v.m(1)\n",
+        ),
+        "m3_conflict.py",
+    );
+    assert!(err.contains("conflicting"), "error: {}", err);
+    assert!(err.contains("`m`"), "error: {}", err);
+}
+
+#[test]
+fn duck_trait_generated_once_per_module() {
+    // Two functions bound on the same method share ONE trait definition.
+    let out = compile(
+        concat!(
+            "class Dog:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "def hear1(animal):\n",
+            "    return animal.speak()\n",
+            "\n",
+            "def hear2(animal):\n",
+            "    return animal.speak()\n",
+        ),
+        "m3_once.py",
+    );
+    assert_eq!(out.matches("pub trait HasSpeak").count(), 1, "generated: {}", out);
+    assert_eq!(out.matches("impl HasSpeak for Dog").count(), 1, "generated: {}", out);
+}

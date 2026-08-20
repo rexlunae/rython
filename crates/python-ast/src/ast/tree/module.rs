@@ -676,6 +676,18 @@ impl CodeGen for Module {
                 }
             });
         }
+        // Module-level generated items collected during codegen (issue
+        // #109, M3: duck-typing traits like HasSpeak and their per-class
+        // impls). Emitted at the TOP of the module, above the functions.
+        let pending = options.module_pending_items.borrow_mut().drain(..).collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let mut prefix = TokenStream::new();
+            for item in pending {
+                prefix.extend(item);
+            }
+            prefix.extend(stream);
+            stream = prefix;
+        }
         Ok(stream)
     }
 }

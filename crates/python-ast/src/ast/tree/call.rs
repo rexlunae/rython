@@ -3091,6 +3091,20 @@ impl<'a> CodeGen for Call {
             .into());
         }
 
+        // A duck-typed user-method call on an unannotated parameter (M3)
+        // returns Result (the generated Has* trait methods do): capture
+        // whether to thread `?` before self.func is moved below.
+        let duck_question = match self.func.as_ref() {
+            ExprType::Attribute(attr) => crate::ast::tree::call::root_name(&attr.value)
+                .is_some_and(|root| {
+                    options
+                        .duck_methods_on_params
+                        .get(root)
+                        .is_some_and(|methods| methods.contains(&attr.attr))
+                }),
+            _ => false,
+        };
+
         let name = self
             .func
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -3244,6 +3258,10 @@ impl<'a> CodeGen for Call {
                 let args_vec: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
                 os::execv(&program_str, args_vec).unwrap()
             })
+        } else if duck_question {
+            // The generated Has* trait method returns Result: exceptions
+            // propagate like any user-class method call.
+            quote!(#call_expr?)
         } else if needs_unwrap {
             quote!(#call_expr.unwrap())
         } else {

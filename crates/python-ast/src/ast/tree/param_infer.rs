@@ -53,9 +53,10 @@ pub enum ParamReq {
     SetIndex(RhsType, RhsType),
     /// `x in p` — `PyContains<Item>`.
     Contains(RhsType),
-    /// `p.m(...)` for a stdlib method — the trait declaring it, whether it
-    /// mutates, and the RhsType of parameterized traits (pop's index).
-    Method(&'static str, bool, Option<RhsType>),
+    /// `p.m(...)` for a method — the trait declaring it (stdlib or a
+    /// generated Has* duck trait), whether it mutates, and the RhsType of
+    /// parameterized traits (pop's index).
+    Method(String, bool, Option<RhsType>),
     /// A use no existing or generatable trait admits.
     Untranslatable(String),
 }
@@ -139,6 +140,9 @@ pub struct InferredSignature {
     /// Parameters with stdlib-method requirements (M2): their method calls
     /// dispatch through the stdlib traits.
     pub method_params: HashSet<String>,
+    /// Parameters with duck-typed user-method requirements (M3): param →
+    /// the method names whose generated Has* trait returns Result.
+    pub duck_methods_on_params: HashMap<String, HashSet<String>>,
 }
 
 impl InferredSignature {
@@ -177,6 +181,7 @@ pub fn infer_unannotated_signature(
     name_types: &HashMap<String, TypeInfo>,
     use_counts: &HashMap<String, usize>,
     symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> Result<InferredSignature, String> {
     if params.is_empty() {
         return Ok(InferredSignature::default());
@@ -187,12 +192,19 @@ pub fn infer_unannotated_signature(
         unannotated: &unannotated,
         name_types,
         symbols,
+        options,
         reqs: HashMap::new(),
         alias: HashMap::new(),
         returns: Vec::new(),
         reassigned: HashSet::new(),
+        duck_returns: HashMap::new(),
+        duck_method_calls: HashMap::new(),
+        error: None,
     };
     collector.walk(body);
+    if let Some(err) = &collector.error {
+        return Err(err.clone());
+    }
 
     // A reassigned parameter cannot keep a single inferred type.
     for name in params {
@@ -295,17 +307,19 @@ pub fn infer_unannotated_signature(
         }
     }
 
-    // Parameters with stdlib-method uses.
-    let method_params: HashSet<String> = params
-        .iter()
-        .filter(|name| {
-            collector
-                .reqs
-                .get(*name)
-                .is_some_and(|reqs| reqs.iter().any(|r| matches!(r, ParamReq::Method(..))))
-        })
-        .cloned()
-        .collect();
+    // Parameters with stdlib-method uses, and the duck-typed user-method
+    // calls (M3) that must thread `?` at their call sites.
+    let mut method_params = HashSet::new();
+    let mut duck_methods_on_params: HashMap<String, HashSet<String>> = HashMap::new();
+    for name in params {
+        let Some(reqs) = collector.reqs.get(name) else { continue };
+        if reqs.iter().any(|r| matches!(r, ParamReq::Method(..))) {
+            method_params.insert(name.clone());
+        }
+        if let Some(methods) = collector.duck_method_calls.get(name) {
+            duck_methods_on_params.insert(name.clone(), methods.clone());
+        }
+    }
 
     // Return type: every return value must unify to one type expression.
     let return_type = if collector.returns.is_empty() {
@@ -334,6 +348,7 @@ pub fn infer_unannotated_signature(
         param_types,
         return_type,
         method_params,
+        duck_methods_on_params,
     })
 }
 
@@ -412,6 +427,11 @@ fn return_type_of(
                 && let ExprType::Name(n) = a.value.as_ref()
                 && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
             {
+                // M3: a duck-typed user method's return comes from the
+                // unified class signature.
+                if let Some(ret) = collector.duck_returns.get(&a.attr) {
+                    return Ok(ret.clone());
+                }
                 if let Some((_, _, _, ret)) =
                     STDLIB_METHOD_TABLE.iter().find(|(m, ..)| *m == a.attr)
                 {
@@ -566,7 +586,15 @@ fn operand_type(
                 }
             } else if let ExprType::Attribute(a) = c.func.as_ref() {
                 // A method call on a parameter: its table return type
-                // (`s.upper() + str(n)` needs String on the left).
+                // (`s.upper() + str(n)` needs String on the left); a duck
+                // method's comes from the unified class signature.
+                if let ExprType::Name(n) = a.value.as_ref()
+                    && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+                {
+                    if let Some(ret) = collector.duck_returns.get(&a.attr) {
+                        return Ok(ret.clone());
+                    }
+                }
                 if let ExprType::Name(n) = a.value.as_ref()
                     && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
                     && let Some((_, _, _, ret)) = STDLIB_METHOD_TABLE
@@ -631,6 +659,75 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// The unified duck-typing signature of one class's method: (param names,
+/// param type strings, param name idents), all annotated.
+fn class_method_signature(
+    class: &crate::ClassDef,
+    method: &str,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+    let m = class
+        .methods()
+        .find(|m| m.name == method)
+        .ok_or_else(|| format!("internal: `{}` has no method `{}`", class.name, method))?;
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    let mut idents = Vec::new();
+    for p in m.args.posonlyargs.iter().chain(m.args.args.iter()) {
+        if p.arg == "self" {
+            continue;
+        }
+        let ann = p.annotation.as_deref().ok_or_else(|| {
+            format!(
+                "duck typing `{method}`: parameter `{}` of `{}.{}` is unannotated; \
+                 duck typing needs fully annotated signatures",
+                p.arg, class.name, method
+            )
+        })?;
+        let t = crate::python_annotation_to_rust_type(ann).ok_or_else(|| {
+            format!(
+                "duck typing `{method}`: unsupported annotation on `{}.{}`",
+                class.name, method
+            )
+        })?;
+        names.push(p.arg.clone());
+        types.push(t.to_string());
+        idents.push(crate::safe_ident(&p.arg).to_string());
+    }
+    let _ = class_method_return(class, method)?;
+    Ok((names, types, idents))
+}
+
+/// The unified return type of one class's method.
+fn class_method_return(class: &crate::ClassDef, method: &str) -> Result<TokenStream, String> {
+    let m = class
+        .methods()
+        .find(|m| m.name == method)
+        .ok_or_else(|| format!("internal: `{}` has no method `{}`", class.name, method))?;
+    m.returns
+        .as_deref()
+        .and_then(crate::python_annotation_to_rust_type)
+        .ok_or_else(|| {
+            format!(
+                "duck typing `{method}`: `{}.{method}` needs a return annotation so its \
+                 trait can be generated",
+                class.name
+            )
+        })
+}
+
+fn pascal_case(s: &str) -> String {
+    s.split('_')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut chars = p.chars();
+            match chars.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 fn bin_op_trait(op: &BinOps) -> Option<&'static str> {
     match op {
         BinOps::Add => Some("PyAdd"),
@@ -649,11 +746,19 @@ struct Collector<'a> {
     unannotated: &'a HashSet<String>,
     name_types: &'a HashMap<String, TypeInfo>,
     symbols: &'a SymbolTableScopes,
+    options: &'a crate::PythonOptions,
     reqs: HashMap<String, Vec<ParamReq>>,
     /// Local names that alias a parameter (`x = p` → x ↦ p).
     alias: HashMap<String, String>,
     returns: Vec<ExprType>,
     reassigned: HashSet<String>,
+    /// Duck-typed user-method names → their unified return type tokens.
+    duck_returns: HashMap<String, TokenStream>,
+    /// Parameters with duck-typed user-method calls: param → method names.
+    duck_method_calls: HashMap<String, HashSet<String>>,
+    /// The first duck-typing error, if any (the walker cannot return
+    /// Result, so errors are collected and surfaced after the walk).
+    error: Option<String>,
 }
 
 impl<'a> Collector<'a> {
@@ -920,7 +1025,21 @@ impl<'a> Collector<'a> {
                                 } else {
                                     None
                                 };
-                                self.add(&n.id, ParamReq::Method(*trait_name, *mutates, rhs));
+                                self.add(
+                                    &n.id,
+                                    ParamReq::Method((*trait_name).to_string(), *mutates, rhs),
+                                );
+                            } else if let Some(trait_name) = self.duck_trait_for(&a.attr, c)
+                            {
+                                // M3: a method defined by user classes in this
+                                // package. The trait is generated once; the
+                                // bound is the requirement.
+                                let mutates = self.duck_method_mutates(&a.attr);
+                                self.duck_method_calls
+                                    .entry(n.id.clone())
+                                    .or_default()
+                                    .insert(a.attr.clone());
+                                self.add(&n.id, ParamReq::Method(trait_name, mutates, None));
                             }
                         }
                     }
@@ -1019,25 +1138,38 @@ impl<'a> Collector<'a> {
             }
             ExprType::Attribute(a) => {
                 // `p.method(...)`: known stdlib methods are recorded by the
-                // Call arm (pop's bound needs the index argument). An
-                // UNKNOWN method is a loud error with the nearest known
-                // candidates — here, for attribute reads too.
+                // Call arm (pop's bound needs the index argument); user-class
+                // methods generate a duck-typing trait (M3). An UNKNOWN
+                // method is a loud error with the nearest known candidates.
                 if let ExprType::Name(n) = a.value.as_ref() {
                     if self.unannotated.contains(&n.id)
                         && STDLIB_METHOD_TABLE.iter().all(|(m, ..)| *m != a.attr)
                     {
-                        let candidates = nearest_methods(&a.attr);
-                        self.add(
-                            &n.id,
-                            ParamReq::Untranslatable(format!(
-                                "no known stdlib type provides method `{}`{}; \
-                                 annotate `{}` or define the method on a class in \
-                                 this package (issue #109)",
-                                a.attr,
-                                candidates,
-                                n.id
-                            )),
-                        );
+                        if let Some(trait_name) = self.duck_trait_for(&a.attr, &crate::Call {
+                            func: Box::new(ExprType::Attribute(a.clone())),
+                            args: Vec::new(),
+                            keywords: Vec::new(),
+                        }) {
+                            let mutates = self.duck_method_mutates(&a.attr);
+                            self.duck_method_calls
+                                .entry(n.id.clone())
+                                .or_default()
+                                .insert(a.attr.clone());
+                            self.add(&n.id, ParamReq::Method(trait_name, mutates, None));
+                        } else if self.error.is_none() {
+                            let candidates = nearest_methods(&a.attr);
+                            self.add(
+                                &n.id,
+                                ParamReq::Untranslatable(format!(
+                                    "no known stdlib type provides method `{}`{}; \
+                                     annotate `{}` or define the method on a class in \
+                                     this package (issue #109)",
+                                    a.attr,
+                                    candidates,
+                                    n.id
+                                )),
+                            );
+                        }
                     }
                 }
                 self.walk_expr(&a.value, false);
@@ -1148,6 +1280,130 @@ impl<'a> Collector<'a> {
             | ExprType::Unknown
             | ExprType::Unimplemented(_) => {}
         }
+    }
+
+    /// M3: generate (once per module) a duck-typing trait for a method
+    /// defined by user classes in this package, and return the trait name.
+    fn duck_trait_for(
+        &mut self,
+        method: &str,
+        _call: &crate::Call,
+    ) -> Option<String> {
+        let classes: Vec<crate::ClassDef> = self
+            .symbols
+            .all_classes()
+            .into_iter()
+            .filter(|c| c.methods().any(|m| m.name == method))
+            .collect();
+        if classes.is_empty() {
+            return None;
+        }
+        // Unify every defining class's signature: same parameter types in
+        // the same order, same return type.
+        let mut signatures: Vec<(String, Vec<String>, Vec<String>, Vec<String>)> = Vec::new();
+        for class in &classes {
+            match class_method_signature(class, method) {
+                Ok(sig) => signatures.push((class.name.clone(), sig.0, sig.1, sig.2)),
+                Err(e) => {
+                    self.error = Some(e);
+                    return None;
+                }
+            }
+        }
+        let first = signatures[0].clone();
+        for (class_name, _names, types, _idents) in &signatures {
+            if types != &first.2 {
+                self.error = Some(format!(
+                    "duck typing `{method}`: class `{class_name}` has a conflicting \
+                     signature (parameter types must match across every class \
+                     defining the method so one trait can bound them all)"
+                ));
+                return None;
+            }
+        }
+        let ret = match class_method_return(&classes[0], method) {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(e);
+                return None;
+            }
+        };
+
+        let trait_name = format!("Has{}", pascal_case(method));
+        let trait_ident = quote::format_ident!("{}", trait_name);
+        let method_ident = crate::safe_ident(method);
+        let mutates = self.duck_method_mutates(method);
+        let self_param = if mutates {
+            quote!(&mut self)
+        } else {
+            quote!(&self)
+        };
+
+        // Param declarations use the first class's names (Rust impls match
+        // traits by type, not name).
+        let first_class = &classes[0];
+        let first_sig = match class_method_signature(first_class, method) {
+            Ok(sig) => sig,
+            Err(e) => {
+                self.error = Some(e);
+                return None;
+            }
+        };
+        let mut param_decls = Vec::new();
+        let mut param_names = Vec::new();
+        for (p, ty) in first_sig.0.iter().zip(first_sig.1.iter()) {
+            let name = crate::safe_ident(&p);
+            let ty: TokenStream = ty.parse().unwrap_or_else(|_| quote!(i64));
+            param_decls.push(quote!(#name: #ty));
+            param_names.push(name);
+        }
+
+        if !self
+            .options
+            .generated_duck_traits
+            .borrow()
+            .contains(&trait_name)
+        {
+            let class_list = classes
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let impls = classes.iter().map(|class| {
+                let class_ident = crate::safe_ident(&class.name);
+                quote! {
+                    impl #trait_ident for #class_ident {
+                        fn #method_ident(#self_param #(, #param_decls)*) -> Result<#ret, PyException> {
+                            #class_ident::#method_ident(self #(, #param_names)*)
+                        }
+                    }
+                }
+            });
+            let doc = format!(
+                "Generated by rython from the Python method `{}` on {}                  (duck typing, issue #109): any type with this method                  satisfies the bound.",
+                method, class_list
+            );
+            let items = quote! {
+                #[doc = #doc]
+                pub trait #trait_ident {
+                    fn #method_ident(#self_param #(, #param_decls)*) -> Result<#ret, PyException>;
+                }
+                #(#impls)*
+            };
+            self.options.generated_duck_traits.borrow_mut().insert(trait_name.clone());
+            self.options.module_pending_items.borrow_mut().push(items);
+        }
+        self.duck_returns.insert(method.to_string(), ret.clone());
+        Some(trait_name)
+    }
+
+    fn duck_method_mutates(&self, method: &str) -> bool {
+        self.symbols.all_classes().iter().any(|c| {
+            c.methods().any(|m| {
+                m.name == method
+                    && c.own_method_mutates(method, &self.symbols, &self.options)
+            })
+        })
     }
 
     fn walk_comprehension(&mut self, elt: &ExprType, generators: &[crate::Comprehension]) {
