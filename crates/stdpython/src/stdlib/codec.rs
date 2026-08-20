@@ -14,7 +14,11 @@
 //!
 //! The error classes are exact: the same `PyException::new("UnicodeEncodeError",
 //! ...)` strings CPython produces for the strict handler.
+//!
+//! Pure data transformation, so this module lives on every tier (alloc +
+//! std); `format!` is the alloc crate's macro, imported explicitly.
 
+use alloc::{format, string::String, string::ToString, vec::Vec};
 use crate::PyException;
 
 /// str.encode("ascii"): 7-bit ASCII bytes; a non-ASCII character raises

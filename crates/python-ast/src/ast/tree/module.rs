@@ -1166,7 +1166,7 @@ impl Module {
         match stmt_type {
             // These are declarations that can stay at module level
             FunctionDef(_) | AsyncFunctionDef(_) | ClassDef(_) | Import(_) | ImportFrom(_)
-            | Global(_) => true,
+            | Global(_) | AnnotatedName { .. } => true,
             
             // Standalone expressions can stay at module level (e.g., constants, simple values)
             // These are typically used in tests or simple modules

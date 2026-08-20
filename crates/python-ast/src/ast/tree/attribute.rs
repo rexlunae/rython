@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 pub struct Attribute {
     pub value: Box<ExprType>,
     pub attr: String,
-    ctx: String,
+    /// Load/Store/Del context marker, carried from the Python AST.
+    pub ctx: String,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {

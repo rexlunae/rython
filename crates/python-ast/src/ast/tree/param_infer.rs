@@ -2010,6 +2010,7 @@ impl<'a> Collector<'a> {
                 | StatementType::ClassDef(_)
                 | StatementType::Import(_)
                 | StatementType::ImportFrom(_)
+                | StatementType::AnnotatedName { .. }
                 | StatementType::Pass
                 | StatementType::Break
                 | StatementType::Continue

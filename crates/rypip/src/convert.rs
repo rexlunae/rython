@@ -621,6 +621,8 @@ fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
             Ok(())
         }
         S::Global(_) => Ok(()),
+        // A bare annotated declaration (`x: int`) has no value to scan.
+        S::AnnotatedName { .. } => Ok(()),
         S::Delete(targets) => {
             for t in targets {
                 check_kernel_expr_no_floats(t, line)?;

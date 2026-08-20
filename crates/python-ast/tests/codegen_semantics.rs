@@ -180,6 +180,77 @@ fn empty_list_into_optional_name_renders_typed_empty() {
 }
 
 #[test]
+fn dataclass_synthesizes_init_from_annotated_fields() {
+    // @dataclass classes get a synthesized __init__: each annotated field
+    // becomes a parameter, the body stores self.field = field, and a
+    // defaulted field becomes a defaulted parameter. The dataclasses
+    // import is a no-op (the decorator is consumed at conversion time).
+    let out = compile(
+        "from dataclasses import dataclass\n\
+         \n\
+         @dataclass(frozen=True, slots=True)\n\
+         class Point:\n\
+         \x20   x: float\n\
+         \x20   y: float\n\
+         \x20   label: str = \"origin\"\n",
+        "dc.py",
+    );
+    assert!(
+        !out.contains("dataclasses"),
+        "the dataclasses import must lower to nothing: {}",
+        out
+    );
+    assert!(
+        out.contains("pub fn new"),
+        "the constructor must be synthesized: {}",
+        out
+    );
+    assert!(
+        out.contains("self.x = x;") || out.contains("self . x = x ;"),
+        "__init__ must store each field: {}",
+        out
+    );
+    assert!(
+        out.contains("self.label = label") || out.contains("self . label = label"),
+        "defaulted field must be stored too: {}",
+        out
+    );
+    // Constructing the dataclass works (pip's Scheme(platlib=...) pattern).
+    let out = compile(
+        "from dataclasses import dataclass\n\
+         \n\
+         @dataclass\n\
+         class Scheme:\n\
+         \x20   platlib: str\n\
+         \x20   scripts: str\n\
+         \n\
+         def get() -> Scheme:\n\
+         \x20   return Scheme(platlib=\"a\", scripts=\"b\")\n",
+        "dc2.py",
+    );
+    assert!(
+        out.contains("Scheme :: new"),
+        "dataclass construction must lower through the synthesized new: {}",
+        out
+    );
+    // A dataclass with no annotated fields is a loud error, not silent.
+    let module = parse("@dataclass\nclass Empty:\n    pass\n", "dc3.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("dc3".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("an empty @dataclass must be a loud error");
+    assert!(
+        err.to_string().contains("no annotated fields"),
+        "error must mention the missing fields: {}",
+        err
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at

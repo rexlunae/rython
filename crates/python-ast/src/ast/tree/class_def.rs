@@ -42,7 +42,7 @@ use pyo3::FromPyObject;
 use quote::{format_ident, quote};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, FunctionDef, PythonOptions, Statement,
+    Assign, CodeGen, CodeGenContext, ExprType, FunctionDef, PythonOptions, Statement,
     StatementType, SymbolTableNode, SymbolTableScopes,
 };
 use pyo3::{Borrowed, PyAny, PyResult};
@@ -64,6 +64,11 @@ pub struct ClassDef {
     /// no-op (abstract-method enforcement has no Rust analogue), anything
     /// else is a loud error.
     pub keywords: Vec<ClassKeyword>,
+    /// Class decorators (`@dataclass`, `@functools.lru_cache`, ...).
+    /// Currently only `dataclass` (with or without `(frozen=..., ...)`
+    /// args) is consumed — it synthesizes `__init__` from annotated
+    /// fields. Any other decorator is a loud error at codegen.
+    pub decorator_list: Vec<ExprType>,
     pub body: Vec<Statement>,
 }
 
@@ -117,10 +122,16 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
             .map_err(|e| crate::extraction_failure("class body", &ob, e))?
             .extract()
             .map_err(|e| crate::extraction_failure("class body", &ob, e))?;
+        let decorator_list: Vec<ExprType> = ob
+            .getattr("decorator_list")
+            .map_err(|e| crate::extraction_failure("class decorators", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class decorators", &ob, e))?;
         Ok(ClassDef {
             name,
             bases,
             keywords,
+            decorator_list,
             body,
         })
     }
@@ -147,6 +158,123 @@ fn is_exception_class(class: &ClassDef) -> bool {
 }
 
 impl ClassDef {
+    /// Whether this class is decorated `@dataclass` (with or without
+    /// `(frozen=..., slots=...)` arguments).
+    pub fn is_dataclass(&self) -> bool {
+        self.decorator_list.iter().any(|d| match d {
+            ExprType::Name(n) => n.id == "dataclass",
+            ExprType::Call(c) => {
+                matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "dataclass")
+            }
+            _ => false,
+        })
+    }
+
+    /// Synthesize the `@dataclass` `__init__` from the annotated class-level
+    /// fields and PREPEND it to the body. Idempotent: a class that already
+    /// has an `__init__` (or has already been synthesized) is untouched.
+    /// Field order = declaration order; a field with a default (`count: int
+    /// = 0`) becomes a defaulted parameter. Runs from BOTH find_symbols
+    /// (so call sites see a constructed class) and to_rust (so the emitted
+    /// class carries the method).
+    pub(crate) fn synthesize_dataclass_init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.is_dataclass() || self.init_method().is_some() {
+            return Ok(());
+        }
+        let mut params: Vec<crate::Parameter> = Vec::new();
+        let mut defaults: Vec<Box<ExprType>> = Vec::new();
+        let mut stores: Vec<Statement> = Vec::new();
+        for stmt in &self.body {
+            match &stmt.statement {
+                StatementType::AnnotatedName { name, annotation } => {
+                    params.push(crate::Parameter {
+                        arg: name.clone(),
+                        annotation: Some(Box::new(annotation.clone())),
+                        type_comment: None,
+                        lineno: None,
+                        col_offset: None,
+                        end_lineno: None,
+                        end_col_offset: None,
+                    });
+                    stores.push(dataclass_store_stmt(name));
+                }
+                // A defaulted field (`count: int = 0`) arrives as an Assign
+                // with an annotation; its value is the default.
+                StatementType::Assign(a) => {
+                    if let [ExprType::Name(n)] = a.targets.as_slice()
+                        && let Some(ann) = &a.annotation
+                    {
+                        params.push(crate::Parameter {
+                            arg: n.id.clone(),
+                            annotation: Some(Box::new(ann.clone())),
+                            type_comment: None,
+                            lineno: None,
+                            col_offset: None,
+                            end_lineno: None,
+                            end_col_offset: None,
+                        });
+                        defaults.push(Box::new(a.value.clone()));
+                        stores.push(dataclass_store_stmt(&n.id));
+                    } else {
+                        return Err(format!(
+                            "class `{}` is a @dataclass with a class-level \
+                             assignment that is not an annotated field",
+                            self.name
+                        )
+                        .into());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if params.is_empty() {
+            return Err(format!(
+                "class `{}` is a @dataclass with no annotated fields; \
+                 annotate at least one field (`x: int`)",
+                self.name
+            )
+            .into());
+        }
+        let init = FunctionDef {
+            name: "__init__".to_string(),
+            args: crate::Arguments {
+                posonlyargs: Vec::new(),
+                // `self` first, like every method; strip_self removes it
+                // where callers build the `new(...)` signature.
+                args: std::iter::once(crate::Parameter {
+                    arg: "self".to_string(),
+                    annotation: None,
+                    type_comment: None,
+                    lineno: None,
+                    col_offset: None,
+                    end_lineno: None,
+                    end_col_offset: None,
+                })
+                .chain(params)
+                .collect(),
+                vararg: None,
+                kwonlyargs: Vec::new(),
+                kw_defaults: Vec::new(),
+                kwarg: None,
+                defaults,
+            },
+            body: stores,
+            decorator_list: Vec::new(),
+            returns: None,
+        };
+        self.body.insert(
+            0,
+            Statement {
+                statement: StatementType::FunctionDef(init),
+                lineno: None,
+                col_offset: None,
+                end_lineno: None,
+                end_col_offset: None,
+            },
+        );
+        Ok(())
+    }
+
     /// The class's `__init__` method, if it defines one.
     pub fn init_method(&self) -> Option<&FunctionDef> {
         self.methods().find(|m| m.name == "__init__")
@@ -525,9 +653,31 @@ impl ClassDef {
     }
 }
 
+/// A `self.field = field` statement for a dataclass-synthesized __init__.
+fn dataclass_store_stmt(field: &str) -> Statement {    let name = || ExprType::Name(crate::ast::tree::name::Name { id: field.to_string() });
+    let attr = ExprType::Attribute(crate::ast::tree::attribute::Attribute {
+        value: Box::new(ExprType::Name(crate::ast::tree::name::Name {
+            id: "self".to_string(),
+        })),
+        attr: field.to_string(),
+        ctx: String::new(),
+    });
+    Statement {
+        lineno: None,
+        col_offset: None,
+        end_lineno: None,
+        end_col_offset: None,
+        statement: StatementType::Assign(Assign {
+            targets: vec![attr],
+            value: name(),
+            type_comment: None,
+            annotation: None,
+        }),
+    }
+}
+
 /// All parameter names of a method, `self` included.
-fn method_param_names(m: &FunctionDef) -> Vec<String> {
-    m.args
+fn method_param_names(m: &FunctionDef) -> Vec<String> {    m.args
         .posonlyargs
         .iter()
         .chain(m.args.args.iter())
@@ -593,18 +743,30 @@ impl CodeGen for ClassDef {
     type Options = PythonOptions;
     type SymbolTable = SymbolTableScopes;
 
-    fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
+    fn find_symbols(mut self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let mut symbols = symbols;
-        symbols.insert(self.name.clone(), SymbolTableNode::ClassDef(self.clone()));
+        // Synthesize the dataclass __init__ BEFORE the class enters the
+        // symbol table: call sites resolve the class through this clone,
+        // and a @dataclass without __init__ must look constructed.
+        if let Err(e) = self.synthesize_dataclass_init() {
+            symbols.insert(
+                self.name.clone(),
+                SymbolTableNode::ClassDef(self),
+            );
+            return symbols;
+        }
+        symbols.insert(self.name.clone(), SymbolTableNode::ClassDef(self));
         symbols
     }
 
     fn to_rust(
-        self,
+        mut self,
         _ctx: Self::Context,
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // `self` is consumed by value and bound mutably so the dataclass
+        // synthesis can prepend the generated __init__ to the body.
         let class_name = crate::safe_ident(&self.name);
 
         // ---- Exception classes ----
@@ -664,6 +826,48 @@ impl CodeGen for ClassDef {
                 .into());
             }
         }
+
+        // ---- Decorators ----
+        // `@dataclass` (with or without `(frozen=..., slots=...)` args)
+        // synthesizes `__init__` from the annotated class-level fields.
+        // Any other class decorator changes class creation and is a loud
+        // error, never silently dropped.
+        let is_dataclass = self.is_dataclass();
+        for d in &self.decorator_list {
+            let is_dc = match d {
+                ExprType::Name(n) => n.id == "dataclass",
+                ExprType::Call(c) => matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "dataclass"),
+                _ => false,
+            };
+            if !is_dc {
+                return Err(format!(
+                    "class `{}` uses the decorator `{}`, which is not supported \
+                     (only `@dataclass` is accepted, as a synthesized __init__)",
+                    self.name,
+                    crate::ast::tree::function_def::annotation_display(d),
+                )
+                .into());
+            }
+        }
+        if is_dataclass && self.init_method().is_some() {
+            return Err(format!(
+                "class `{}` is a @dataclass with an explicit __init__: only \
+                 dataclass-synthesized constructors are supported (write a plain \
+                 class instead)",
+                self.name
+            )
+            .into());
+        }
+        // Synthesize the dataclass __init__ from the annotated fields and
+        // PREPEND it to the body: every downstream consumer (init_method,
+        // method_on_mro, infer_fields, the constructor emission) sees it as
+        // a real method, so the rest of the lowering is unchanged. Each
+        // field becomes a parameter; a field with a default (`count: int =
+        // 0`) becomes a defaulted parameter; the body stores each
+        // `self.field = field`. (find_symbols already ran the same
+        // synthesis on the symbol-table clone so call sites resolve the
+        // constructed class; this run covers the emitted class itself.)
+        self.synthesize_dataclass_init()?;
 
         // ---- Base resolution ----
         // Single inheritance only. `object` is every class's implicit base,
@@ -732,13 +936,38 @@ impl CodeGen for ClassDef {
         };
         let in_hierarchy = base.is_some() || options.hierarchy_classes.contains(&self.name);
 
-        // Only methods (plus a docstring and `pass`) are supported in class
-        // bodies. Class-level assignments (class attributes) would need a
+        // Only methods (plus a docstring, `pass`, and — for a @dataclass —
+        // the annotated field declarations) are supported in class bodies.
+        // Class-level assignments (class attributes) would need a
         // shared-state story; erroring is the loud option.
         let body_start = if self.get_docstring().is_some() { 1 } else { 0 };
         for stmt in self.body.iter().skip(body_start) {
             match &stmt.statement {
                 StatementType::FunctionDef(_) | StatementType::Pass => {}
+                // A bare `name: T` declaration is a @dataclass field; for a
+                // non-dataclass class it is a plain annotation (no runtime
+                // effect) — allowed either way.
+                StatementType::AnnotatedName { .. } => {}
+                // A defaulted @dataclass field (`count: int = 0`) arrives as
+                // an annotated Assign; the dataclass synthesis consumed it
+                // into the generated __init__ BEFORE this loop ran (it
+                // prepends the init and keeps the field declarations in the
+                // body), so what remains here is the declaration the
+                // synthesis could not consume — only valid for dataclasses.
+                StatementType::Assign(a)
+                    if is_dataclass && a.annotation.is_some() =>
+                {
+                    if let [ExprType::Name(_)] = a.targets.as_slice() {
+                        // consumed by the synthesis; nothing to emit here
+                    } else {
+                        return Err(format!(
+                            "class `{}` is a @dataclass with a class-level \
+                             assignment that is not an annotated field",
+                            self.name
+                        )
+                        .into());
+                    }
+                }
                 StatementType::AsyncFunctionDef(f) => {
                     return Err(format!(
                         "async method `{}.{}` is not supported yet",

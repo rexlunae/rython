@@ -121,6 +121,14 @@ pub enum StatementType {
     /// the names resolve to module statics; WRITES from a function are a
     /// loud error (rython has no mutable module state).
     Global(Vec<String>),
+    /// A bare annotated declaration (`x: int` — no value). At module/class
+    /// level this is a dataclass-style field declaration; inside functions
+    /// it declares nothing at runtime (lowered as a no-op). Carried so
+    /// `@dataclass` can synthesize `__init__` from the class body.
+    AnnotatedName {
+        name: String,
+        annotation: ExprType,
+    },
     /// `del xs[i]` / `del d[k]` — removes an element (issue #112). Index
     /// targets lower through py_pop; `del name` and `del a.b` are loud
     /// errors (unbinding is not representable in the value model).
@@ -152,11 +160,33 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 // An annotated assignment (`x: int = 5`) is an ordinary
                 // assignment with a type annotation we carry on the Assign
                 // node (so empty-container pinning can honor it); a bare
-                // annotation (`x: int`) declares nothing at runtime.
+                // annotation (`x: int`) declares nothing at runtime — but
+                // it IS a dataclass field declaration at class level, so it
+                // is carried as AnnotatedName rather than dropped.
                 let value = ob
                     .getattr("value")
                     .map_err(|e| extraction_failure("annotated assignment value", &ob, e))?;
                 if value.is_none() {
+                    let target = ob
+                        .getattr("target")
+                        .map_err(|e| extraction_failure("annotated assignment target", &ob, e))?
+                        .extract()
+                        .map_err(|e| extraction_failure("annotated assignment target", &ob, e))?;
+                    let annotation = ob
+                        .getattr("annotation")
+                        .ok()
+                        .filter(|a| !a.is_none())
+                        .map(|a| a.extract())
+                        .transpose()
+                        .map_err(|e| {
+                            extraction_failure("annotated assignment annotation", &ob, e)
+                        })?;
+                    if let (ExprType::Name(n), Some(annotation)) = (target, annotation) {
+                        return Ok(StatementType::AnnotatedName {
+                            name: n.id,
+                            annotation,
+                        });
+                    }
                     return Ok(StatementType::Pass);
                 }
                 let target = ob
@@ -583,6 +613,11 @@ impl CodeGen for StatementType {
             // resolve to the module statics, and writes are rejected at
             // conversion time (issue #115).
             StatementType::Global(_) => Ok(quote! {}),
+            // A bare annotated declaration (`x: int`) declares nothing at
+            // runtime: the annotation only types the name (dataclass-style
+            // field declarations are consumed by the class codegen; inside
+            // a function the annotation types later assignments).
+            StatementType::AnnotatedName { .. } => Ok(quote! {}),
             // `del xs[i]` / `del d[k]`: Python removes the element at the
             // index (negative from the end, IndexError/KeyError when
             // missing) — the runtime's py_pop already implements exactly

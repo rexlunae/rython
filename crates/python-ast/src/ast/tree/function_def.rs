@@ -1699,6 +1699,7 @@ pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
             | StatementType::AsyncFunctionDef(_)
             | StatementType::ClassDef(_)
             | StatementType::Global(_)
+            | StatementType::AnnotatedName { .. }
             | StatementType::Pass
             | StatementType::Break
             | StatementType::Continue
@@ -1936,7 +1937,23 @@ impl FunctionDef {
                 if is_none_expr(ann) {
                     None
                 } else {
-                    crate::python_annotation_to_rust_type(ann)
+                    crate::python_annotation_to_rust_type(ann).or_else(|| {
+                        // A user-class annotation (`-> Scheme`): the type is
+                        // the class name rendered as a Rust ident — the same
+                        // path parameters use. A bare Name that is NOT a
+                        // class would fail loudly later at the call site;
+                        // mapping it here makes `-> Scheme` + `return
+                        // Scheme::new(...)` line up.
+                        match ann {
+                            ExprType::Name(n)
+                                if !matches!(n.id.as_str(), "int" | "float" | "str" | "bool" | "bytes" | "bytearray") =>
+                            {
+                                let ident = crate::safe_ident(&n.id);
+                                Some(quote!(#ident))
+                            }
+                            _ => None,
+                        }
+                    })
                 }
             })
         } else {

@@ -386,6 +386,16 @@ impl CodeGen for ImportFrom {
             return Ok(TokenStream::new());
         }
 
+        // `from dataclasses import dataclass` (and field, ...): the
+        // decorator is CONSUMED at conversion time by the class codegen
+        // (synthesized __init__), so the import is a no-op — a `use
+        // crate::dataclasses::...` would be an unresolved import. Other
+        // dataclasses names are the same: nothing from the module exists
+        // at runtime in the generated crate.
+        if self.module == "dataclasses" {
+            return Ok(TokenStream::new());
+        }
+
         // `from rython import rust` — compile-time Rust bindings.
         if self.module == "rython" {
             if self.names.len() == 1
