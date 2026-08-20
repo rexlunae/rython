@@ -180,9 +180,13 @@ line, never a silent behaviour change:
 - **Attribute reads on call results** — a field typed from
   `self.x = call(...).attr` needs the callee's return type
   (`get_scheme(...) -> Scheme`, then the dataclass field annotation).
-  rython has no cross-module call-return-type inference yet, so
-  `Prefix.bin_dir = scheme.scripts` in pip's `_internal` is a loud
-  error (blocks pip — #5 PyPI).
+  rython resolves imported functions' SIGNATURES cross-module (keyword
+  arguments and omitted defaults on `from x import f` calls work), but
+  does not yet propagate a function's `-> T` return annotation into
+  `name = call(...)` typing, so `Prefix.bin_dir = scheme.scripts` in
+  pip's `_internal` is a loud error (blocks pip — #5 PyPI). The same
+  gap shows as "cannot infer the return value" for functions whose
+  result comes from dict reads or method chains (jmespath's `compile`).
 - **`is not None` narrowing** — `if x is not None:` narrows an
   `Option<T>`-typed name to `T` for reads/iteration in the body, and an
   if/else whose branches both leave x non-None keeps it narrowed for the
