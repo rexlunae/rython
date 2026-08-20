@@ -3489,9 +3489,12 @@ fn resolve_packaging_dependencies(
         if explicit.contains_key(&req.name) {
             continue;
         }
-        let dep = crate::resolve::resolve_dependency(req, offline)
+        // Issue #113: resolve the dependency AND its transitive
+        // requirements (pip-style), so `requests` brings in urllib3,
+        // certifi, idna, charset-normalizer, ...
+        let tree = crate::resolve::resolve_dependency_tree(req, offline)
             .with_context(|| format!("resolving dependency `{}`", req.name))?;
-        resolved.push(dep);
+        resolved.extend(tree);
     }
     Ok(crate::resolve::merge_python_modules(explicit, resolved))
 }

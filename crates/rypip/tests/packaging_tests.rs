@@ -476,3 +476,35 @@ fn no_deps_skips_resolution_entirely() {
     .expect("no-deps conversion skips the fetch");
 }
 
+
+#[test]
+fn resolve_dependency_tree_pulls_transitives() {
+    // Issue #113: resolving `requests` must also resolve its transitive
+    // requirements (urllib3, certifi, idna, charset-normalizer) — the
+    // gate on the whole library-conversion use case. Gated like the other
+    // network test: run with RYPIP_TEST_NETWORK=1.
+    if std::env::var_os("RYPIP_TEST_NETWORK").is_none() {
+        eprintln!("skipping network test (set RYPIP_TEST_NETWORK=1 to run)");
+        return;
+    }
+    let scratch = Scratch::new("resolve-tree");
+    let cache = scratch.path().join("cache");
+    unsafe {
+        std::env::set_var("RYPIP_CACHE_DIR", &cache);
+        std::env::remove_var("RYPIP_OFFLINE");
+    }
+
+    let req = parse_requirement("requests>=2.0").unwrap();
+    let tree = rypip::resolve::resolve_dependency_tree(&req, false).expect("resolve tree");
+    let names: Vec<&str> = tree.iter().map(|d| d.import_name.as_str()).collect();
+    for expected in ["requests", "urllib3", "certifi", "idna", "charset_normalizer"] {
+        assert!(
+            names.contains(&expected),
+            "transitive dependency `{expected}` must be resolved; got {names:?}"
+        );
+    }
+    // Every resolved package is vendorable (has a path on disk).
+    for dep in &tree {
+        assert!(dep.path.exists(), "path for `{}` missing: {}", dep.import_name, dep.path.display());
+    }
+}

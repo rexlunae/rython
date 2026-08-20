@@ -387,6 +387,71 @@ pub fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rypip-cache")
 }
 
+/// The Requires-Dist requirements of a resolved dependency, read from its
+/// wheel METADATA or sdist PKG-INFO (issue #113: transitive resolution).
+/// Requirements gated on an OPTIONAL extra (`; extra == "x"`) are skipped —
+/// they are not installed by a plain `pip install <pkg>` either.
+pub fn dependency_requirements(dep: &ResolvedDependency) -> Result<Vec<Requirement>> {
+    let root = dep.path.parent().unwrap_or_else(|| Path::new("."));
+    let mut metadata: Option<PathBuf> = None;
+    for entry in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            let cand = if p.extension().is_some_and(|e| e == "dist-info") {
+                p.join("METADATA")
+            } else {
+                p.join("PKG-INFO")
+            };
+            if cand.is_file() {
+                metadata = Some(cand);
+                break;
+            }
+        }
+    }
+    let Some(metadata) = metadata else {
+        return Ok(Vec::new());
+    };
+    let text = fs::read_to_string(&metadata)
+        .with_context(|| format!("reading {}", metadata.display()))?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("Requires-Dist:") else {
+            continue;
+        };
+        let Ok(req) = parse_requirement(rest.trim()) else {
+            continue;
+        };
+        if req.marker.as_deref().is_some_and(|m| m.contains("extra ==")) {
+            continue;
+        }
+        out.push(req);
+    }
+    Ok(out)
+}
+
+/// Resolve a requirement AND its transitive requirements (pip-style,
+/// breadth-first). First-resolved-wins for version conflicts; cycles are
+/// cut by name (issue #113).
+pub fn resolve_dependency_tree(req: &Requirement, offline: bool) -> Result<Vec<ResolvedDependency>> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue = vec![req.clone()];
+    while let Some(r) = queue.pop() {
+        if !seen.insert(r.name.clone()) {
+            continue;
+        }
+        let dep = resolve_dependency(&r, offline)?;
+        for sub in dependency_requirements(&dep)? {
+            if !seen.contains(&sub.name) {
+                queue.push(sub);
+            }
+        }
+        out.push(dep);
+    }
+    Ok(out)
+}
+
 /// Resolve one requirement from PyPI. `offline` skips the network and
 /// fails loudly if the dependency is not already in the cache.
 pub fn resolve_dependency(req: &Requirement, offline: bool) -> Result<ResolvedDependency> {

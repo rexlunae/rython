@@ -642,7 +642,7 @@ impl CodeGen for StatementType {
                             )
                             .into());
                         }
-                        ExprType::Attribute(a) => {
+                        ExprType::Attribute(_) => {
                             return Err(format!(
                                 "del with an attribute target (removing a field) is not \
                                  supported: class fields are struct members and cannot be \
