@@ -736,6 +736,21 @@ impl CodeGen for FunctionDef {
             options.optional_names = std::rc::Rc::new(optional);
             options.clone_str_attribute_returns =
                 matches!(self.returns.as_deref(), Some(ExprType::Name(n)) if n.id == "str");
+            // Locals whose only known type is a string literal (`label =
+            // "fine"`): they lower to `&'static str`, which a `-> str`
+            // return must own. Reuse the literal-local inference, keyed by
+            // the same `&'static str` type it records.
+            if options.clone_str_attribute_returns {
+                let mut locals = std::collections::HashMap::new();
+                collect_local_types(&effective_body, &mut locals);
+                options.str_literal_locals = std::rc::Rc::new(
+                    locals
+                        .into_iter()
+                        .filter(|(_, ty)| ty.to_string() == quote!(&'static str).to_string())
+                        .map(|(name, _)| name)
+                        .collect(),
+                );
+            }
         }
         // Statically-known local types for isinstance(): parameter
         // annotations plus literal assignments, as Python type names.
@@ -1317,6 +1332,19 @@ impl FunctionDef {
     /// Tools generating call-through code (e.g. PyO3 wrappers) must use this
     /// same method so their signatures match the generated function.
     pub fn resolved_return_type(&self) -> Option<TokenStream> {
+        // A bare `str` annotation is authoritative: the inferred type for a
+        // literal-returning body (`&'static str`) is a Rust literal artifact,
+        // not the Python type, and the mismatch breaks every call site
+        // (`return self.speak()` where speak returns a literal would hand
+        // `&str` to a `-> str` context). The annotation is the contract.
+        if guarantees_return(&self.body)
+            && matches!(
+                self.returns.as_deref(),
+                Some(ExprType::Name(n)) if n.id == "str"
+            )
+        {
+            return Some(quote!(String));
+        }
         let annotated = if guarantees_return(&self.body) {
             self.returns.as_deref().and_then(|ann| {
                 if is_none_expr(ann) {

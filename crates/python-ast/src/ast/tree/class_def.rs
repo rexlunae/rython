@@ -897,6 +897,63 @@ impl ClassDef {
             );
         }
 
+        // ---- Super trampolines ----
+        // `super().m(...)` must run the ancestor's ORIGINAL body with the
+        // DERIVED self, so nested `self.x()` calls inside it keep dispatching
+        // through the most-derived class — CPython resolves them on the
+        // original object's MRO. Calling the body on the embedded base
+        // (`self.__rython_base.m(...)`) pins the receiver to the ancestor and
+        // silently resolves those nested calls to the ancestor's versions
+        // (an overridden `self.speak()` called from `Animal.describe` would
+        // emit D:... instead of D:woof).
+        //
+        // Each method the class defines gets a uniquely-named DEFAULT in its
+        // own trait whose body is the GENERIC rendering of the original body
+        // (identical to the trait-default rendering). The unique name means
+        // no override can intercept it, so
+        // `<Self as {Class}Trait>::__rython_super_{m}(self)` always runs the
+        // class's original body with `Self` = the most-derived type — and
+        // nested `self.x()` resolves through the trait bound to the derived
+        // class's override, exactly like Python. This covers BOTH lowering
+        // paths (inherent methods and re-emitted overrides), since the call
+        // site always passes the plain derived `self`.
+        let mut super_trampolines = TokenStream::new();
+        for m in methods.iter().filter(|m| m.name != "__init__") {
+            if m.name.starts_with("__rython_super_") {
+                return Err(format!(
+                    "class `{}` defines a method named `{}`, which collides with the \
+                     generated super() trampoline namespace; rename the method",
+                    self.name, m.name
+                )
+                .into());
+            }
+            // The trait signature widens to `&mut self` when ANY definition
+            // in the hierarchy mutates; the trampoline must match the
+            // (widened) default's receiver or call sites borrowing mutably
+            // would not type-check. Keyed by the ROOT (topmost definer),
+            // like the default-body widening above.
+            let root = self
+                .base_chain(symbols)
+                .into_iter()
+                .rev()
+                .find(|c| c.methods().any(|mm| mm.name == m.name));
+            let force_mut_self = root
+                .as_ref()
+                .and_then(|r| options.trait_mut_self.get(&r.name))
+                .is_some_and(|s| s.contains(&m.name));
+            let mut helper = (*m).clone();
+            helper.name = format!("__rython_super_{}", m.name);
+            let helper_ctx = CodeGenContext::Trait {
+                class: self.name.clone(),
+                generic: true,
+                super_target: None,
+                force_mut_self,
+            };
+            super_trampolines.extend(
+                helper.to_rust(helper_ctx, options.clone(), symbols.clone())?,
+            );
+        }
+
         let mut own_impl_body = TokenStream::new();
         if let Some(b) = base {
             let b_ident = crate::safe_ident(&b.name);
@@ -938,6 +995,7 @@ impl ClassDef {
             pub trait #trait_name #supertrait {
                 #own_accessor_decls
                 #own_method_defaults
+                #super_trampolines
             }
             impl #trait_name for #class_name {
                 #own_impl_body

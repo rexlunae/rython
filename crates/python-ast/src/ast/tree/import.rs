@@ -545,8 +545,9 @@ impl CodeGen for ImportFrom {
             // plain structs get none (the per-module map is empty for
             // them).
             let import_module_path = self.resolved_module_path(&options);
-            if let Some(module) = options.module_defs.get(&import_module_path)
-                && let Some(traits) = crate::module_class_traits(module).get(&alias.name)
+            if options.module_defs.contains_key(&import_module_path)
+                && let Some(traits) =
+                    crate::module_class_traits(&options, &import_module_path).get(&alias.name)
             {
                 for trait_name in traits {
                     let t = crate::safe_ident(trait_name);

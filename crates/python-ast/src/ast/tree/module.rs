@@ -6,7 +6,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, CrossModuleMutSelf, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
+use crate::{CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1221,13 +1221,98 @@ fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>
 /// traits into scope at the call site (Rust method resolution needs the
 /// trait in scope; the class's own module defines it). Mirrors the
 /// hierarchy-class computation in `Module::to_rust`.
+///
+/// Backed by the once-per-conversion [`CrossModuleClasses`] cache
+/// (`options.cross_module_classes`), so the module AST is not deep-cloned
+/// and re-scanned on every import statement.
 pub fn module_class_traits(
-    ast: &crate::Module,
+    options: &PythonOptions,
+    path: &[String],
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut classes = Vec::new();
-    collect_class_defs(&ast.raw.body, &mut classes);
+    module_class_info(options, path)
+        .map(|info| info.traits.clone())
+        .unwrap_or_default()
+}
+
+/// The `ClassDef` named `name` in the module at `path`, plus that module's
+/// own symbol table (so the class's base chain resolves inside the module
+/// that declared it, not the importer's scope). Used for cross-module class
+/// construction: `from .animals import Dog; Dog("Rex")` lowers against
+/// Dog's real `__init__` signature, and an inherited `__init__` resolves
+/// through the defining module's chain.
+///
+/// Backed by the once-per-conversion [`CrossModuleClasses`] cache
+/// (`options.cross_module_classes`): `receiver_class` consults this for
+/// EVERY attribute access on an imported class, so the defining module's
+/// symbol table must not be rebuilt per access.
+pub fn module_class_def(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    let info = module_class_info(options, path)?;
+    info.classes.get(name).cloned().map(|c| (c, info.symbols.clone()))
+}
+
+/// The cached class facts for the module at `path`, building the
+/// once-per-conversion table over every module of the crate on first use.
+fn module_class_info(
+    options: &PythonOptions,
+    path: &[String],
+) -> Option<std::rc::Rc<ModuleClassInfo>> {
+    {
+        let state = options.cross_module_classes.borrow();
+        if let CrossModuleClasses::Computed(table) = &*state {
+            return table.get(path).cloned();
+        }
+    }
+    // First use: build the table for every module in one pass (the build
+    // consults only the module's own AST and symbols, so it cannot re-enter
+    // this cache).
+    let mut table = std::collections::HashMap::new();
+    for (module_path, module) in options.module_defs.iter() {
+        table.insert(
+            module_path.clone(),
+            std::rc::Rc::new(module_class_info_for(module)),
+        );
+    }
+    *options.cross_module_classes.borrow_mut() =
+        CrossModuleClasses::Computed(std::rc::Rc::new(table));
+    options
+        .cross_module_classes
+        .borrow()
+        .computed_class_info(path)
+        .cloned()
+}
+
+impl CrossModuleClasses {
+    /// The class facts for one module path, when computed.
+    fn computed_class_info(
+        &self,
+        path: &[String],
+    ) -> Option<&std::rc::Rc<ModuleClassInfo>> {
+        match self {
+            CrossModuleClasses::Computed(table) => table.get(path),
+            _ => None,
+        }
+    }
+}
+
+/// Build the class facts for one module: its symbol table, top-level
+/// classes by name, and hierarchy-class → trait names.
+fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let mut classes = std::collections::HashMap::new();
+    for s in &module.raw.body {
+        if let crate::StatementType::ClassDef(c) = &s.statement {
+            classes.insert(c.name.clone(), c.clone());
+        }
+    }
+    let mut traits = std::collections::HashMap::new();
+    let mut class_list = Vec::new();
+    collect_class_defs(&module.raw.body, &mut class_list);
     let mut hierarchy = std::collections::HashSet::new();
-    for c in &classes {
+    for c in &class_list {
         let has_real_base = c.bases.iter().any(|b| b.id != "object");
         if has_real_base {
             hierarchy.insert(c.name.clone());
@@ -1238,39 +1323,22 @@ pub fn module_class_traits(
             }
         }
     }
-    let symbols = ast.clone().find_symbols(SymbolTableScopes::new());
-    let mut out = std::collections::HashMap::new();
-    for c in classes {
+    for c in class_list {
         if !hierarchy.contains(&c.name) {
             continue;
         }
-        let traits: Vec<String> = c
+        let t: Vec<String> = c
             .base_chain(&symbols)
             .iter()
             .map(|cc| format!("{}Trait", cc.name))
             .collect();
-        out.insert(c.name.clone(), traits);
+        traits.insert(c.name.clone(), t);
     }
-    out
-}
-
-/// The `ClassDef` named `name` in `ast`, plus the module's own symbol
-/// table (so the class's base chain resolves inside the module that
-/// declared it, not the importer's scope). Used for cross-module class
-/// construction: `from .animals import Dog; Dog("Rex")` lowers against
-/// Dog's real `__init__` signature, and an inherited `__init__` resolves
-/// through the defining module's chain.
-pub fn module_class_def(
-    ast: &crate::Module,
-    name: &str,
-) -> Option<(crate::ClassDef, SymbolTableScopes)> {
-    let symbols = ast.clone().find_symbols(SymbolTableScopes::new());
-    ast.raw.body.iter().find_map(|s| match &s.statement {
-        crate::StatementType::ClassDef(c) if c.name == name => {
-            Some((c.clone(), symbols.clone()))
-        }
-        _ => None,
-    })
+    ModuleClassInfo {
+        symbols,
+        classes,
+        traits,
+    }
 }
 
 /// Whether the trait of the hierarchy rooted at `root_name` widens `method`

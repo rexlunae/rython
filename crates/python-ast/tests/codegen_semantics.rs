@@ -148,6 +148,33 @@ fn tuple_destructuring_stores_through_mut_accessors() {
 }
 
 #[test]
+fn single_element_tuple_target_keeps_the_trailing_comma() {
+    // `x, = f()` parses as a one-element TUPLE target (`x,` — the trailing
+    // comma is what makes it one). The per-element rendering must keep it:
+    // `(x,) = ...` destructures against the one-element tuple value, while
+    // `(x) = ...` would be a parenthesized place and fail to type-check.
+    let src = concat!(
+        "def pair() -> tuple[int]:\n",
+        "    return (1,)\n",
+        "\n",
+        "def unpack() -> int:\n",
+        "    x, = pair()\n",
+        "    return x\n",
+    );
+    let out = compile(src, "single_tuple_target.py");
+    assert!(
+        out.contains("(x ,) = pair () ?"),
+        "single-element tuple target must keep the trailing comma: {}",
+        out
+    );
+    assert!(
+        !out.contains("(x) = "),
+        "must not emit a parenthesized place for a tuple target: {}",
+        out
+    );
+}
+
+#[test]
 fn cross_module_mut_table_computed_once_and_cached() {
     // The first fallback call builds the merged table over every module of
     // the crate; the scan finds Dog's mutating override and widens
@@ -169,6 +196,50 @@ fn cross_module_mut_table_computed_once_and_cached() {
     assert!(python_ast::module_widens_method_cached(&options, "Animal", "grow"));
     // A method no definition mutates stays un-widened.
     assert!(!python_ast::module_widens_method_cached(&options, "Animal", "describe"));
+}
+
+#[test]
+fn cross_module_class_info_computed_once_and_cached() {
+    // Resolving an imported class's construction/fields must build the
+    // defining module's symbol table ONCE per conversion, not per call
+    // site: the first `module_class_def` builds the table over every module
+    // of the crate and caches it; later lookups (every attribute access,
+    // method call, construction, trait import) are HashMap hits.
+    let (_, options) = cross_module_fixture();
+    // Module path of the fixture: ["animals"].
+    let (dog, symbols) = python_ast::module_class_def(&options, &["animals".to_string()], "Dog")
+        .expect("Dog must resolve through the defining module");
+    assert_eq!(dog.name, "Dog");
+    // The defining module's symbol table comes back with it, so the base
+    // chain resolves inside the module that DECLARED Dog: `Animal` must be
+    // resolvable there (the importer's scope does not name it).
+    assert!(
+        symbols.get("Animal").is_some(),
+        "defining module's symbols must resolve Dog's base Animal"
+    );
+    // The table is now cached.
+    assert!(
+        matches!(
+            &*options.cross_module_classes.borrow(),
+            python_ast::CrossModuleClasses::Computed(_)
+        ),
+        "first cross-module class lookup must leave the cache populated"
+    );
+    // Repeated lookups are cache hits and stay consistent.
+    let (dog2, _) = python_ast::module_class_def(&options, &["animals".to_string()], "Dog")
+        .expect("cached Dog lookup");
+    assert_eq!(dog2.name, "Dog");
+    // Traits: Animal is the hierarchy root, so Dog carries DogTrait (own)
+    // plus AnimalTrait (its methods re-emit there), nearest first.
+    let traits =
+        python_ast::module_class_traits(&options, &["animals".to_string()]);
+    assert_eq!(
+        traits.get("Dog").map(Vec::as_slice),
+        Some(&["DogTrait".to_string(), "AnimalTrait".to_string()][..]),
+        "Dog must import DogTrait (own) + AnimalTrait (methods re-emit there)"
+    );
+    // A class that does not exist resolves to None without poisoning the cache.
+    assert!(python_ast::module_class_def(&options, &["animals".to_string()], "Nope").is_none());
 }
 
 #[test]
@@ -2434,7 +2505,13 @@ fn override_reemits_into_ancestor_trait_impl() {
 }
 
 #[test]
-fn super_lowers_to_the_embedded_base() {
+fn super_dispatches_through_the_definer_trampoline() {
+    // `super().get()` must run the base's ORIGINAL body with the DERIVED
+    // self: the call dispatches through the base's super trampoline
+    // (`<Self as BaseTrait>::__rython_super_get(self)`), never through the
+    // embedded base struct — a call on `self.__rython_base` would pin the
+    // receiver to Base and resolve nested `self.x()` inside the body against
+    // Base, silently diverging from CPython's MRO.
     let src = concat!(
         "class Base:\n",
         "    def __init__(self, v: int):\n",
@@ -2449,8 +2526,18 @@ fn super_lowers_to_the_embedded_base() {
     );
     let out = compile(src, "super.py");
     assert!(
-        out.contains("(self . __rython_base) . get ()"),
-        "super().get() must call through the embedded base: {}",
+        out.contains("< Self as BaseTrait > :: __rython_super_get (self ,)"),
+        "super().get() must dispatch through the Base super trampoline: {}",
+        out
+    );
+    assert!(
+        out.contains("fn __rython_super_get (& self ,)"),
+        "BaseTrait must carry the __rython_super_get trampoline default: {}",
+        out
+    );
+    assert!(
+        !out.contains("__rython_base) . get ()"),
+        "must not call through the embedded base struct: {}",
         out
     );
 }
@@ -2492,8 +2579,9 @@ fn mutating_override_widens_the_trait_signature() {
 fn grandchild_override_super_targets_the_definer_base() {
     // Dog.describe overrides Animal.describe and calls super() inside it;
     // Puppy inherits WITHOUT overriding. The re-emitted Dog body inside
-    // `impl AnimalTrait for Puppy` must therefore walk TWO embedded base
-    // levels (Dog's base is Animal, reached through Puppy's Dog).
+    // `impl AnimalTrait for Puppy` must super() to ANIMAL's describe (the
+    // definer), not Dog's — via the trampoline, with the derived Self, so
+    // nested dispatch inside Animal's body still resolves against Puppy.
     let src = concat!(
         "class Animal:\n",
         "    def __init__(self, name: str):\n",
@@ -2513,11 +2601,17 @@ fn grandchild_override_super_targets_the_definer_base() {
         "    pass\n",
     );
     let out = compile(src, "deep_super.py");
-    // Dog's body re-emitted in `impl AnimalTrait for Puppy`: super() must
-    // walk to Animal (two levels) even though Puppy's direct base is Dog.
+    // The super() inside the re-emitted Dog body resolves against Dog's base
+    // (Animal — the definer), so it dispatches through AnimalTrait's
+    // trampoline.
     assert!(
-        out.contains("(self . __rython_base . __rython_base) . describe ()"),
-        "re-emitted Dog override must super() to Animal: {}",
+        out.contains("< Self as AnimalTrait > :: __rython_super_describe (self ,)"),
+        "re-emitted Dog override must super() to Animal's trampoline: {}",
+        out
+    );
+    assert!(
+        out.contains("fn __rython_super_describe (& self ,) -> Result < String , PyException >"),
+        "AnimalTrait must carry the describe trampoline: {}",
         out
     );
 }
@@ -2635,7 +2729,8 @@ fn relative_import_above_crate_root_is_a_clean_error() {
 #[test]
 fn own_override_super_targets_the_direct_base() {
     // Puppy's OWN describe calls super().describe(): it resolves Dog's
-    // override (one level up), so it walks ONE embedded base level.
+    // override (one level up), so the trampoline is DogTrait's — called
+    // with the derived Self (Puppy at the call site inside Puppy's body).
     let src = concat!(
         "class Animal:\n",
         "    def __init__(self, name: str):\n",
@@ -2654,8 +2749,16 @@ fn own_override_super_targets_the_direct_base() {
     );
     let out = compile(src, "own_super.py");
     assert!(
-        out.contains("(self . __rython_base) . describe ()"),
-        "Puppy's super() must hit Dog's struct: {}",
+        out.contains("< Self as DogTrait > :: __rython_super_describe (self ,)"),
+        "Puppy's super() must hit Dog's trampoline: {}",
+        out
+    );
+    // Dog's own body ALSO supers to Animal, and its trampoline is re-emitted
+    // nowhere: DogTrait::__rython_super_describe runs Animal's body with the
+    // derived Self.
+    assert!(
+        out.contains("< Self as AnimalTrait > :: __rython_super_describe (self ,)"),
+        "Dog's super() must hit Animal's trampoline: {}",
         out
     );
 }

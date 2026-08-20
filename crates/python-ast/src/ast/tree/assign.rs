@@ -203,7 +203,17 @@ impl<'a> CodeGen for Assign {
                             elt, &ctx, &options, &symbols, true,
                         )?);
                     }
-                    quote!((#(#elts),*))
+                    // A single-element target is still a TUPLE (`x, = f()`):
+                    // the trailing comma is what makes it one, so emit `(x,)`
+                    // — `(x)` would be a parenthesized place and the
+                    // destructuring assignment would not type-check against
+                    // the one-element tuple value.
+                    if elts.len() == 1 {
+                        let only = &elts[0];
+                        quote!((#only,))
+                    } else {
+                        quote!((#(#elts),*))
+                    }
                 }
                 _ => target
                     .clone()

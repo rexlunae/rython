@@ -2187,9 +2187,10 @@ impl<'a> CodeGen for Call {
                 Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
                 Some(SymbolTableNode::ImportFrom(i)) => {
                     let path = i.resolved_module_path(&options);
-                    match options.module_defs.get(&path) {
-                        Some(module) => crate::module_class_def(module, &n.id),
-                        None => None,
+                    if options.module_defs.contains_key(&path) {
+                        crate::module_class_def(&options, &path, &n.id)
+                    } else {
+                        None
                     }
                 }
                 _ => None,
@@ -2314,46 +2315,70 @@ impl<'a> CodeGen for Call {
                     &options,
                     &symbols,
                 )?;
-                // The embedded base of `super_owner` is reached from `self`
-                // by walking to `super_owner`'s struct, then one more level
-                // for its base. In a generic trait default the base accessor
-                // reaches the direct base of the generic Self — the MUTABLE
-                // accessor when the callee mutates self (`super().bump()`
-                // must not borrow the shared base and then fail to mutate).
-                let mutates_receiver =
-                    base.method_needs_mut_self(&attr.attr, &symbols, &options);
-                let receiver = if ctx.in_generic_trait() {
-                    if mutates_receiver {
-                        quote!(self.base_mut())
-                    } else {
-                        quote!(self.base())
-                    }
-                } else if super_owner == enclosing {
-                    quote!(self.__rython_base)
-                } else {
-                    // Re-emitted override: walk from the derived struct to
-                    // the definer's struct, then one level deeper for the
-                    // definer's own embedded base.
-                    let enclosing_class = match symbols.get(enclosing) {
-                        Some(SymbolTableNode::ClassDef(c)) => c.clone(),
-                        _ => {
-                            return Err(format!(
-                                "super() in `{}`: enclosing class `{}` is not a class",
-                                super_owner, enclosing
-                            )
-                            .into());
+                // `super().__init__(...)` stays on the embedded base struct:
+                // __init__ is a constructor, not a virtual method — it must
+                // write the base's fields through the base struct (`new`
+                // runs the chain one level at a time, so the base part is
+                // the real receiver).
+                if attr.attr == "__init__" {
+                    // The embedded base of `super_owner` is reached from
+                    // `self` by walking to `super_owner`'s struct, then one
+                    // more level for its base. In a generic trait default
+                    // the base accessor reaches the direct base of the
+                    // generic Self — the MUTABLE accessor when the callee
+                    // mutates self (`super().bump()` must not borrow the
+                    // shared base and then fail to mutate).
+                    let mutates_receiver =
+                        base.method_needs_mut_self(&attr.attr, &symbols, &options);
+                    let receiver = if ctx.in_generic_trait() {
+                        if mutates_receiver {
+                            quote!(self.base_mut())
+                        } else {
+                            quote!(self.base())
                         }
+                    } else if super_owner == enclosing {
+                        quote!(self.__rython_base)
+                    } else {
+                        // Re-emitted override: walk from the derived struct
+                        // to the definer's struct, then one level deeper for
+                        // the definer's own embedded base.
+                        let enclosing_class = match symbols.get(enclosing) {
+                            Some(SymbolTableNode::ClassDef(c)) => c.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "super() in `{}`: enclosing class `{}` is not a class",
+                                    super_owner, enclosing
+                                )
+                                .into());
+                            }
+                        };
+                        let chain = enclosing_class.base_chain(&symbols);
+                        let depth = chain
+                            .iter()
+                            .position(|c| c.name == super_owner)
+                            .map_or(0, |d| d + 1);
+                        let chain_tokens = crate::base_field_chain(depth);
+                        quote!(self #chain_tokens)
                     };
-                    let chain = enclosing_class.base_chain(&symbols);
-                    let depth = chain
-                        .iter()
-                        .position(|c| c.name == super_owner)
-                        .map_or(0, |d| d + 1);
-                    let chain_tokens = crate::base_field_chain(depth);
-                    quote!(self #chain_tokens)
-                };
-                let method_name = crate::safe_ident(&attr.attr);
-                return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
+                    let method_name = crate::safe_ident(&attr.attr);
+                    return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
+                }
+                // Non-init `super().m(...)`: dispatch through the DEFINER's
+                // super trampoline with the plain derived `self`, so the
+                // ancestor's original body runs with `Self` = the most-
+                // derived type and nested `self.x()` keeps resolving to the
+                // derived class's override (CPython's MRO). The trampoline
+                // is a uniquely-named trait default no override can
+                // intercept — see ClassDef::emit_trait.
+                let definer = base
+                    .base_chain(&symbols)
+                    .into_iter()
+                    .find(|c| c.methods().any(|mm| mm.name == attr.attr))
+                    .expect("super(): method_on_mro found the method, so its definer exists");
+                let definer_trait =
+                    crate::safe_ident(&format!("{}Trait", definer.name));
+                let helper = crate::safe_ident(&format!("__rython_super_{}", attr.attr));
+                return Ok(quote!({ #prelude <Self as #definer_trait>::#helper(self, #(#args),*)? }));
             }
             // A method call on a receiver whose class is known — `self`
             // inside a method, or a name assigned a construction — resolves
@@ -3551,8 +3576,11 @@ pub(crate) fn receiver_class(
         // module's symbol table, so `Dog`'s base `Animal` resolves there.
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
-            let module = options.module_defs.get(&path)?;
-            crate::module_class_def(module, &class_name)
+            if options.module_defs.contains_key(&path) {
+                crate::module_class_def(options, &path, &class_name)
+            } else {
+                None
+            }
         }
         _ => None,
     }
