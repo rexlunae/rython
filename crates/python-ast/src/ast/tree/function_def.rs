@@ -1197,13 +1197,25 @@ impl CodeGen for FunctionDef {
             streams
         };
 
+        // A definition-time unsatisfiability warning (M5) never blocks
+        // conversion; report it through the -W channel (drained by the
+        // transpiler) and fold it into the #[deprecated] note.
+        if let Some(dw) = &inferred_signature.definition_warning {
+            options
+                .definition_warnings
+                .borrow_mut()
+                .push(format!("function `{}`: {}", self.name, dw));
+        }
         // Lossy conversions are silent semantic changes callers may not want
         // — surface them as a compiler warning at every call site outside the
         // generated crate via a single #[deprecated] note (the standard
         // mechanism for user-defined warnings). An item can carry only one
         // #[deprecated] attribute, so all notes are folded into it.
         let lossy_warning = if options.lossy_warnings {
-            let notes = self.lossy_conversion_notes();
+            let mut notes = self.lossy_conversion_notes();
+            if let Some(dw) = &inferred_signature.definition_warning {
+                notes.push(dw.clone());
+            }
             if notes.is_empty() {
                 quote!()
             } else {

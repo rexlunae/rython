@@ -38,6 +38,10 @@
 //!   impls, so `add("a", 1)` or `hear(5)` is a loud error naming the call
 //!   instead of a rustc surprise. Runs for every body: inferred functions,
 //!   annotated/paramless functions, module init, and the __main__ block.
+//!   A definition whose bound set no known type satisfies (`p.upper()` +
+//!   `p.pop()`) stays a well-formed definition — Python allows it — and
+//!   surfaces as a -W warning (a #[deprecated] note at -W warn, a
+//!   conversion failure at -W deny).
 //!
 //! Still loud errors (later milestones): callable parameters, tuple/
 //! attribute loop targets, and method parameters.
@@ -190,6 +194,11 @@ pub struct InferredSignature {
     /// Parameters with duck-typed user-method requirements (M3): param →
     /// the method names whose generated Has* trait returns Result.
     pub duck_methods_on_params: HashMap<String, HashSet<String>>,
+    /// M5 definition-time warning: set when some parameter's bound set is
+    /// satisfied by no known rython type (`p.upper()` + `p.pop()`). A
+    /// well-formed definition in Python, so it never blocks conversion —
+    /// it surfaces through the -W machinery and as a #[deprecated] note.
+    pub definition_warning: Option<String>,
 }
 
 impl InferredSignature {
@@ -619,12 +628,35 @@ pub fn infer_unannotated_signature(
         inferred
     };
 
+    // M5 definition-time warning: a bound set no known type satisfies
+    // (`p.upper()` + `p.pop()` → PyStrOps + PyPop) is a well-formed
+    // Python definition — it never blocks conversion, but it is reported
+    // through the -W machinery and as a #[deprecated] note.
+    let definition_warning = {
+        let mut warning = None;
+        for name in &generic_params {
+            let reqs = collector.reqs.get(*name).cloned().unwrap_or_default();
+            if !reqs.is_empty() && !definitionally_satisfiable(&reqs) {
+                let traits: Vec<&str> = reqs.iter().map(trait_name_of).collect();
+                warning = Some(format!(
+                    "parameter `{name}`'s inferred bounds ({}) are satisfied by no \
+                     known rython type; every call site with a statically-known \
+                     argument type will fail — annotate the parameter (issue #109, M5)",
+                    traits.join(" + ")
+                ));
+                break;
+            }
+        }
+        warning
+    };
+
     Ok(InferredSignature {
         type_params,
         where_bounds,
         param_types,
         return_type,
         method_params,
+        definition_warning,
         duck_methods_on_params,
     })
 }
@@ -1242,6 +1274,97 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::Class(c) => c.clone(),
         TypeInfo::Borrowed(_) => "borrowed".to_string(),
         TypeInfo::PyObject => "unknown".to_string(),
+    }
+}
+
+/// The trait name of a requirement, for the definition-time warning text.
+fn trait_name_of(req: &ParamReq) -> &str {
+    match req {
+        ParamReq::Op(t, _) | ParamReq::OpOutput(t, _) | ParamReq::Cmp(t, _)
+        | ParamReq::CmpCond(t, _) | ParamReq::Conversion(t) => t,
+        ParamReq::Truthy => "Truthy",
+        ParamReq::Len => "Len",
+        ParamReq::Display => "PyDisplay",
+        ParamReq::Repr => "PyRepr",
+        ParamReq::Hash => "PyHash",
+        ParamReq::IsNone => "PyIsNone",
+        ParamReq::Index(_) => "PyIndex",
+        ParamReq::SetIndex(..) => "PySetIndex",
+        ParamReq::Contains(_) => "PyContains",
+        ParamReq::Method(t, _, _) => t.as_str(),
+        ParamReq::PyFromInt => "PyFromInt",
+        ParamReq::Iterate(_) => "IntoIterator",
+        ParamReq::Identity(_) | ParamReq::Untranslatable(_) => "?",
+    }
+}
+
+/// Whether SOME known rython type could satisfy the parameter's whole
+/// bound set (M5 definition-time warning). Only the types whose stdpython
+/// impl sets are fully enumerated are considered — i64/f64/bool/String/
+/// Vec/Dict — so the check only fires on clear contradictions. A
+/// duck-typed Has* bound makes the set satisfiable by a user class.
+fn definitionally_satisfiable(reqs: &[ParamReq]) -> bool {
+    if reqs
+        .iter()
+        .any(|r| matches!(r, ParamReq::Method(t, _, _) if t.starts_with("Has")))
+    {
+        return true;
+    }
+    let candidates = [
+        TypeInfo::Int,
+        TypeInfo::Float,
+        TypeInfo::Bool,
+        TypeInfo::String,
+        TypeInfo::StrRef,
+        TypeInfo::Vec(Box::new(TypeInfo::Int)),
+        TypeInfo::Vec(Box::new(TypeInfo::String)),
+        TypeInfo::Dict(Box::new(TypeInfo::String), Box::new(TypeInfo::Int)),
+    ];
+    candidates
+        .iter()
+        .any(|t| reqs.iter().all(|r| definition_req_satisfied(r, t)))
+}
+
+/// Whether the candidate type satisfies one requirement at DEFINITION
+/// time: a parameter rhs instantiates as the candidate itself, a concrete
+/// rhs as its type, and an unknown rhs skips the check.
+fn definition_req_satisfied(req: &ParamReq, t: &TypeInfo) -> bool {
+    let with_rhs = |rhs: &RhsType| -> Option<TypeInfo> {
+        match rhs {
+            RhsType::Concrete(tokens) => concrete_tokens_to_typeinfo(tokens),
+            RhsType::Param(_) | RhsType::Same => Some(t.clone()),
+            RhsType::Unknown => None,
+        }
+    };
+    let ok = |trait_name: &str, rhs: Option<&TypeInfo>| match rhs {
+        Some(r) => type_satisfies(t, trait_name, Some(r)),
+        None => type_satisfies(t, trait_name, None),
+    };
+    match req {
+        ParamReq::Op(tn, rhs) | ParamReq::OpOutput(tn, rhs) => {
+            with_rhs(rhs).map_or(true, |r| ok(tn, Some(&r)))
+        }
+        ParamReq::Cmp(tn, rhs) | ParamReq::CmpCond(tn, rhs) => {
+            with_rhs(rhs).map_or(true, |r| ok(tn, Some(&r)))
+        }
+        ParamReq::Conversion(tn) => type_satisfies(t, tn, None),
+        ParamReq::Truthy => type_satisfies(t, "Truthy", None),
+        ParamReq::Len => type_satisfies(t, "Len", None),
+        ParamReq::Display | ParamReq::Repr | ParamReq::IsNone => true,
+        ParamReq::Hash => type_satisfies(t, "PyHash", None),
+        ParamReq::Index(idx) => with_rhs(idx).map_or(true, |r| ok("PyIndex", Some(&r))),
+        ParamReq::SetIndex(idx, _) => with_rhs(idx).map_or(true, |r| ok("PySetIndex", Some(&r))),
+        ParamReq::Contains(item) => with_rhs(item).map_or(true, |r| ok("PyContains", Some(&r))),
+        ParamReq::Method(tn, _, rhs) => {
+            let tn = tn.as_str();
+            match rhs {
+                Some(rhs) => with_rhs(rhs).map_or(true, |r| ok(tn, Some(&r))),
+                None => type_satisfies(t, tn, None),
+            }
+        }
+        ParamReq::PyFromInt => type_satisfies(t, "PyFromInt", None),
+        ParamReq::Iterate(_) => type_satisfies(t, "IntoIterator", None),
+        ParamReq::Identity(_) | ParamReq::Untranslatable(_) => true,
     }
 }
 

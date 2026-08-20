@@ -2880,6 +2880,12 @@ fn transpile(
                 python_ast::format_error_chain(e.as_ref())
             )
         })?;
+    // M5 definition-time warnings collected during inference (a bound set
+    // no known type satisfies) — reported like any lossy-conversion
+    // warning: reported at -W warn, fatal at -W deny, suppressed at allow.
+    for w in std::mem::take(&mut *base_options.definition_warnings.borrow_mut()) {
+        warnings.push(format!("{}: {}", parse_filename(module), w));
+    }
     Ok(tokens.to_string())
 }
 

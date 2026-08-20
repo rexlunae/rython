@@ -4633,3 +4633,58 @@ fn stdlib_method_table_honesty_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn definition_time_unsatisfiable_bounds_report_and_deny() {
+    // Issue #109, M5: a parameter whose inferred bound set no known type
+    // satisfies (`p.upper()` + `p.pop()` → PyStrOps + PyPop) is a
+    // well-formed Python definition — it converts with a warning at -W
+    // warn, and -W deny promotes it to a conversion failure.
+    let scratch = Scratch::new("def-unsat");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def bad(p):\n",
+            "    p.upper()\n",
+            "    p.pop()\n",
+            "\n",
+            "def good(s):\n",
+            "    return s.upper()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+
+    // -W warn (default): converts; the generated fn carries the
+    // #[deprecated] note naming the contradiction.
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        src.contains("satisfied by no known rython type"),
+        "deprecated note: {}",
+        src
+    );
+    let good_fn = src.split("pub fn good").nth(1).unwrap_or_default();
+    assert!(
+        !good_fn.contains("satisfied by no known"),
+        "good() carries a spurious note: {}",
+        good_fn
+    );
+
+    // -W deny: the warning becomes a conversion error.
+    let out2 = scratch.path().join("crate-deny");
+    let err = rypip::convert(
+        &pkg,
+        &out2,
+        &ConvertOptions {
+            warnings: rypip::convert::WarningMode::Deny,
+            ..Default::default()
+        },
+    )
+    .expect_err("deny must fail on the definition-time warning");
+    let msg = format!("{}", err);
+    assert!(msg.contains("bad"), "error should name the function: {}", msg);
+    assert!(msg.contains("PyStrOps"), "error should list bounds: {}", msg);
+}

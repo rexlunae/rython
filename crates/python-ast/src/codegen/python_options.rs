@@ -203,6 +203,10 @@ pub struct PythonOptions {
     /// exactly what these warnings exist to surface. Tools may disable this
     /// to suppress the warnings at the user's explicit request.
     pub lossy_warnings: bool,
+    /// M5 definition-time warnings collected during inference (a bound set
+    /// no known type satisfies). The transpiler drains this after codegen;
+    /// shared across option clones so pushes land in one place.
+    pub definition_warnings: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 
     /// Names in the CURRENT scope that hold an Option (assigned None on
     /// some path, or annotated Optional): non-None stores into them wrap
@@ -369,6 +373,7 @@ impl Default for PythonOptions {
             )),
             duck_methods_on_params: std::rc::Rc::new(std::collections::HashMap::new()),
             lossy_warnings: true,
+            definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
             module_path: Vec::new(),

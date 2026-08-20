@@ -5197,6 +5197,45 @@ fn self_recursive_receiver_gets_a_pyadd_self_bound() {
 }
 
 #[test]
+fn definitionally_unsatisfiable_bounds_warn_but_convert() {
+    // M5: `p.upper()` + `p.pop()` — no known type satisfies
+    // PyStrOps + PyPop. A well-formed Python definition: it converts, with
+    // the warning baked as a #[deprecated] note (the -W channel reports
+    // it; -W deny promotes it to an error).
+    let out = compile(
+        "def bad(p):\n    p.upper()\n    p.pop()\n",
+        "inf_unsat.py",
+    );
+    assert!(
+        out.contains("satisfied by no known rython type"),
+        "deprecated note must carry the warning: {}",
+        out
+    );
+    assert!(out.contains("PyStrOps"), "generated: {}", out);
+    assert!(out.contains("PyPop"), "generated: {}", out);
+}
+
+#[test]
+fn satisfiable_bound_sets_do_not_warn() {
+    // No #[deprecated] note when some known type satisfies the bounds
+    // (PyStrOps alone, Has* duck traits, IntoIterator, ...).
+    for src in [
+        "def f(s):\n    return s.upper()\n",
+        "class Dog:\n    def speak(self) -> str:\n        return \"woof\"\ndef hear(a):\n    return a.speak()\n",
+        "def f(xs):\n    for x in xs:\n        print(x)\n",
+        "def add(a, b):\n    return a + b\n",
+    ] {
+        let out = compile(src, "inf_ok_warn.py");
+        assert!(
+            !out.contains("satisfied by no known rython type"),
+            "spurious definition warning for: {}\ngenerated: {}",
+            src,
+            out
+        );
+    }
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.
