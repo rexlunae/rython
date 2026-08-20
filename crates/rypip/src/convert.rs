@@ -2,9 +2,7 @@
 //! module per Python module, an optional binary entry point, and optional
 //! PyO3 bindings so the crate can be imported from Python again.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1938,6 +1936,11 @@ pub fn convert(
         python_deps.iter().map(|(name, _)| name.clone()).collect();
     // ASTs of every module of the generated crate (vendored deps + the
     // package itself), keyed by module path.
+    // Reachability-based module selection: a module outside the
+    // import-reachable set (a CLI helper like idna/cli.py, a __main__
+    // block, test utilities) is SKIPPED, so a divergent module the program
+    // never imports no longer blocks conversion.
+    let reachable = reachable_module_paths(package, &python_deps);
     let module_defs = module_def_map(
         python_deps
             .iter()
@@ -1958,11 +1961,17 @@ pub fn convert(
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
+            if !reachable.contains(&module.path) {
+                continue;
+            }
             let code = transpile(module, &mut warnings, &base_options)?;
             transpiled.push((module, code));
         }
     }
     for module in &package.modules {
+        if !reachable.contains(&module.path) {
+            continue;
+        }
         let code = transpile(module, &mut warnings, &base_options)?;
         transpiled.push((module, code));
     }
@@ -2373,6 +2382,11 @@ fn convert_driver(
     let rust_modules = rust_module_registry(package, &rust_manifest)?;
     // Driver mode still vendors python-modules deps as siblings; give the
     // same cross-module knowledge as the plain package path.
+    // Reachability-based module selection: a module outside the
+    // import-reachable set (a CLI helper like idna/cli.py, a __main__
+    // block, test utilities) is SKIPPED, so a divergent module the program
+    // never imports no longer blocks conversion.
+    let reachable = reachable_module_paths(package, &python_deps);
     let module_defs = module_def_map(
         python_deps
             .iter()
@@ -2392,6 +2406,9 @@ fn convert_driver(
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
         for dep_module in &dep.modules {
+            if !reachable.contains(&dep_module.path) {
+                continue;
+            }
             let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
             dep_transpiled.push((dep_module, dep_code));
         }
@@ -3151,6 +3168,17 @@ fn bindable_signature(
 /// manifest: kernel device generation swaps the stdpython dependency for
 /// the rykernel-shim crate (the device code links it directly) and takes
 /// its crate name from `__module_name__` when declared.
+/// Normalize a Python package version into a valid Cargo semver:
+/// pyproject "0.1" (valid for Python) becomes "0.1.0".
+fn cargo_version(v: &str) -> String {
+    let parts: Vec<&str> = v.trim().split('.').collect();
+    let mut out = parts[..parts.len().min(3)].to_vec();
+    while out.len() < 3 {
+        out.push("0");
+    }
+    out.join(".")
+}
+
 fn write_cargo_toml(
     package: &PyPackage,
     out_dir: &Path,
@@ -3259,7 +3287,7 @@ fn write_cargo_toml(
          [dependencies]\n\
          {stdpython_dep}\n",
         name = crate_name,
-        version = package.version,
+        version = cargo_version(&package.version),
     );
     // Userspace drivers link libc for their generated syscall glue.
     if opts.driver {
@@ -3475,6 +3503,170 @@ fn read_python_module_manifest(
 /// `[python-modules]`-style entries, fetching from PyPI unless the
 /// dependency is already vendored explicitly (explicit entries win) or
 /// `RYPIP_OFFLINE=1` is set (then a missing dep is a loud error).
+/// The module paths reachable from the program's roots (the package's own
+/// modules) by following `import`/`from ... import` statements across the
+/// package and its dependencies — absolute and relative. Unreachable
+/// modules (CLI helpers, `__main__` blocks, test utilities) are skipped by
+/// the converter, so a divergent module the program never imports cannot
+/// block conversion.
+fn reachable_module_paths(
+    package: &PyPackage,
+    deps: &[(String, PyPackage)],
+) -> std::collections::HashSet<Vec<String>> {
+    use python_ast::ast::tree::StatementType;
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut by_path: HashMap<Vec<String>, &PyModule> = HashMap::new();
+    for (_, dep) in deps {
+        for m in &dep.modules {
+            by_path.insert(m.path.clone(), m);
+        }
+    }
+    for m in &package.modules {
+        by_path.insert(m.path.clone(), m);
+    }
+
+    let mut reachable: HashSet<Vec<String>> = HashSet::new();
+    let mut queue: VecDeque<Vec<String>> = VecDeque::new();
+    for m in &package.modules {
+        queue.push_back(m.path.clone());
+    }
+
+    while let Some(path) = queue.pop_front() {
+        if !reachable.insert(path.clone()) {
+            continue;
+        }
+        let Some(module) = by_path.get(&path) else { continue };
+        // Parse with the RELATIVE module filename (like `transpile` does):
+        // parse_enhanced derives the module name from the filename, and an
+        // absolute path produces an invalid identifier (`__home__tserica__...`)
+        // which fails parsing and silently drops every import of the module.
+        let Ok(ast) = python_ast::parse_enhanced(&module.source, parse_filename(module)) else {
+            continue;
+        };
+        for stmt in &ast.raw.body {
+            reachable_walk_imports(stmt, module, &path, &by_path, &mut queue);
+        }
+    }
+    reachable
+}
+
+/// Walk one statement for imports to enqueue, recursing into nested
+/// statement lists (if/while/for/with/try bodies) AND function bodies:
+/// `from pip._internal.utils.entrypoints import _wrapper` inside `main()`
+/// (a function-local import) still makes `pip._internal...` reachable.
+/// Function bodies are walked with the function's own package path — a
+/// function-local import is relative to the module's package, not to the
+/// function.
+fn reachable_walk_imports(
+    stmt: &python_ast::ast::tree::Statement,
+    module: &PyModule,
+    path: &[String],
+    by_path: &HashMap<Vec<String>, &PyModule>,
+    queue: &mut VecDeque<Vec<String>>,
+) {
+    use python_ast::ast::tree::StatementType;
+
+    match &stmt.statement {
+        StatementType::Import(i) => {
+            for alias in &i.names {
+                let parts: Vec<&str> = alias.name.split('.').collect();
+                for len in (1..=parts.len()).rev() {
+                    let cand: Vec<String> =
+                        parts[..len].iter().map(|s| s.to_string()).collect();
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                        break;
+                    }
+                }
+            }
+        }
+        StatementType::ImportFrom(i) => {
+            let package_path: Vec<String> = if module.is_init {
+                path.to_vec()
+            } else {
+                path[..path.len().saturating_sub(1)].to_vec()
+            };
+            // Absolute imports (level == 0) resolve from the crate
+            // root; relative imports walk up `level` packages from
+            // the current package path.
+            let mut base: Vec<String> = if i.level == 0 {
+                Vec::new()
+            } else {
+                let cut = (package_path.len() + 1).saturating_sub(i.level);
+                package_path[..cut.min(package_path.len())].to_vec()
+            };
+            if i.module.is_empty() {
+                // `from . import utils` — the names are sibling
+                // modules of the resolved package.
+                for alias in &i.names {
+                    let mut cand = base.clone();
+                    cand.push(alias.name.clone());
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                    }
+                }
+            } else {
+                base.extend(
+                    i.module.split('.').filter(|p| !p.is_empty()).map(|s| s.to_string()),
+                );
+                for len in (1..=base.len()).rev() {
+                    let cand = base[..len].to_vec();
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    // Recurse into nested statement lists and function bodies.
+    match &stmt.statement {
+        StatementType::FunctionDef(f) => {
+            for b in &f.body {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::If(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::While(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::For(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::With(s) => {
+            for b in &s.body {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::Try(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()).chain(s.finalbody.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+            for h in &s.handlers {
+                for b in &h.body {
+                    reachable_walk_imports(b, module, path, by_path, queue);
+                }
+            }
+        }
+        StatementType::ClassDef(c) => {
+            for b in &c.body {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn resolve_packaging_dependencies(
     package: &PyPackage,
     explicit: HashMap<String, ManifestPythonModule>,
