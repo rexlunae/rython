@@ -3033,19 +3033,64 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!((#receiver).group_name(#g)));
                     }
                     // str.encode() / encode("utf-8"): UTF-8 bytes, which is
-                    // exactly what Rust strings hold.
+                    // exactly what Rust strings hold. ascii and punycode
+                    // (RFC 3492) go through the stdpython codec layer.
                     ("encode", []) => {
                         return Ok(quote!((#receiver).as_bytes().to_vec()));
                     }
                     ("encode", [enc]) => {
-                        if enc.to_string().trim_matches('"') != "utf-8" {
-                            return Err(format!(
-                                "str.encode({}): only \"utf-8\" is supported",
-                                enc
-                            )
-                            .into());
+                        let codec = enc.to_string().trim_matches('"').to_string();
+                        match codec.as_str() {
+                            "utf-8" => {
+                                return Ok(quote!((#receiver).as_bytes().to_vec()));
+                            }
+                            "ascii" => {
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::encode_ascii(#receiver)?
+                                ));
+                            }
+                            "punycode" => {
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::encode_punycode(#receiver)
+                                ));
+                            }
+                            other => {
+                                return Err(format!(
+                                    "str.encode({}): only utf-8, ascii, and punycode \
+                                     are supported",
+                                    other
+                                )
+                                .into());
+                            }
                         }
-                        return Ok(quote!((#receiver).as_bytes().to_vec()));
+                    }
+                    // bytes.decode("utf-8"|"ascii"|"punycode"): the codec
+                    // layer in stdpython (Rust strings ARE utf-8, so the
+                    // bytes→String conversion is the codec's job).
+                    ("decode", [enc]) => {
+                        let codec = enc.to_string().trim_matches('"').to_string();
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        let f = match codec.as_str() {
+                            "utf-8" => "decode_utf8",
+                            "ascii" => "decode_ascii",
+                            "punycode" => "decode_punycode",
+                            other => {
+                                return Err(format!(
+                                    "bytes.decode({}): only utf-8, ascii, and punycode \
+                                     are supported",
+                                    other
+                                )
+                                .into());
+                            }
+                        };
+                        let f = crate::safe_ident(f);
+                        return Ok(quote!(#runtime::stdlib::codec::#f(&(#receiver))?));
+                    }
+                    ("decode", []) => {
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        return Ok(quote!(#runtime::stdlib::codec::decode_utf8(&(#receiver))?));
                     }
                     // list.pop() returns the last element or raises IndexError
                     // (Vec::pop returns an Option). A GENERIC receiver (an

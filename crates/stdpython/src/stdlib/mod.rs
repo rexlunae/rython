@@ -108,6 +108,11 @@ pub mod hashlib;
 /// Python csv module - CSV reading over line lists
 pub mod csv;
 
+/// Python codec layer: str.encode / bytes.decode for ascii and punycode
+/// (RFC 3492), with CPython's error classes. Pure data transformation —
+/// no OS, so it lives on every tier.
+pub mod codec;
+
 /// Python numpy subset — dense N-dimensional arrays with broadcasting,
 /// ufuncs, reductions, and a small linalg module. Optional feature
 /// `numpy` pulls in the sequential engine; `numpy-rayon`, `numpy-simd`,
