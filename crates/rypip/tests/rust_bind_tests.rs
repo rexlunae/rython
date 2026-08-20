@@ -158,7 +158,7 @@ fn rust_bind_generates_direct_calls_and_dependencies() {
         main_rs
     );
     assert!(
-        main_rs.contains("rustlib::first_byte(data.as_ptr(), len(&(data)) as usize)"),
+        main_rs.contains("rustlib::first_byte(data.as_ptr(), len(&(data)) as i64 as usize)"),
         "*const u8 + usize args: {}",
         main_rs
     );

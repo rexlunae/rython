@@ -6,7 +6,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
+use crate::{CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +194,67 @@ impl CodeGen for Module {
             std::collections::HashMap::new();
         count_module_stores(&self.raw.body, &mut module_assign_counts);
 
+        // Classes that participate in an inheritance hierarchy (have a real
+        // base, or are used as a base) lower with the trait machinery; every
+        // other class stays a plain struct. Computed once so both sides of a
+        // hierarchy agree on the scheme. Classes nested under containers
+        // (`if __name__ == "__main__":` and friends) count too — their
+        // class statements lower the same way.
+        {
+            let mut classes = Vec::new();
+            collect_class_defs(&self.raw.body, &mut classes);
+            let mut hierarchy = std::collections::HashSet::new();
+            for c in &classes {
+                let has_real_base = c.bases.iter().any(|b| b.id != "object");
+                if has_real_base {
+                    hierarchy.insert(c.name.clone());
+                }
+                for b in &c.bases {
+                    if b.id != "object" {
+                        hierarchy.insert(b.id.clone());
+                    }
+                }
+            }
+            options.hierarchy_classes = std::rc::Rc::new(hierarchy);
+        }
+
+        // Trait method signatures widen to `&mut self` when ANY definition
+        // in the hierarchy mutates self: overrides re-emit into the ROOT
+        // class's trait (the first class in the chain that defines the
+        // method), whose signature must fit every impl, and call sites must
+        // borrow the receiver mutably to match. Keyed by the root class.
+        {
+            let mut classes = Vec::new();
+            collect_class_defs(&self.raw.body, &mut classes);
+            let mut trait_mut = std::collections::HashMap::<
+                String,
+                std::collections::HashSet<String>,
+            >::new();
+            for c in &classes {
+                let chain = c.base_chain(&symbols);
+                for m in c.methods() {
+                    if m.name == "__init__" {
+                        continue;
+                    }
+                    if c.own_method_mutates(&m.name, &symbols, &options) {
+                        // The root = the TOPMOST class in the chain that
+                        // defines the method (the trait owner).
+                        if let Some(root) = chain
+                            .iter()
+                            .rev()
+                            .find(|cc| cc.methods().any(|mm| mm.name == m.name))
+                        {
+                            trait_mut
+                                .entry(root.name.clone())
+                                .or_default()
+                                .insert(m.name.clone());
+                        }
+                    }
+                }
+            }
+            options.trait_mut_self = std::rc::Rc::new(trait_mut);
+        }
+
         // A user `main` that returns a value cannot serve as the Rust entry
         // point directly (Result<i64, _> does not implement Termination);
         // route it through the renaming wrapper, which discards the value —
@@ -239,8 +300,8 @@ impl CodeGen for Module {
                 module_init_raw.push(s.clone());
             }
         }
-        let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols);
-        let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols);
+        let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols, &options);
+        let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols, &options);
 
         // Module-level code gets no per-function analysis pass, so run the
         // same type inference / empty-container pinning here: without it,
@@ -353,11 +414,11 @@ impl CodeGen for Module {
 
         // Hoist assigned names to declarations at the top of each generated
         // scope (assignments themselves lower to plain stores).
-        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols);
+        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols, &options);
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
-        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols);
+        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols, &options);
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -686,6 +747,7 @@ fn hoisted_name_set(
     body: &[crate::Statement],
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -694,7 +756,8 @@ fn hoisted_name_set(
     for s in body {
         symbols = s.clone().find_symbols(symbols);
     }
-    let scope = crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
+    let scope =
+        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
     let hoisted = scope
         .assigned
         .iter()
@@ -708,6 +771,7 @@ fn hoisted_declarations(
     body: &[crate::Statement],
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> TokenStream {
     // Class-aware mutation facts need the block's own assignments in the
     // symbol table (`c = Counter(...)` then `c.bump()` needs `c` mutable).
@@ -716,7 +780,7 @@ fn hoisted_declarations(
         symbols = s.clone().find_symbols(symbols);
     }
     let scope =
-        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols));
+        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
     let mut out = TokenStream::new();
     for name in &scope.assigned {
         // rust.bind names are compile-time symbols: the declaration
@@ -1105,4 +1169,274 @@ def foo():
         );
         info!("module: {:?}", code);
     }
+}
+
+/// Every `ClassDef` in the module, recursing into container statements
+/// (if/for/while/with/try/async/function bodies), so classes defined under
+/// an `if __name__ == "__main__":` guard take part in the same hierarchy
+/// and trait-signature precomputes as top-level classes — their class
+/// statements lower through the same machinery.
+fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>) {
+    for s in stmts {
+        match &s.statement {
+            crate::StatementType::ClassDef(c) => out.push(c.clone()),
+            crate::StatementType::If(i) => {
+                collect_class_defs(&i.body, out);
+                collect_class_defs(&i.orelse, out);
+            }
+            crate::StatementType::For(f) => {
+                collect_class_defs(&f.body, out);
+                collect_class_defs(&f.orelse, out);
+            }
+            crate::StatementType::While(w) => {
+                collect_class_defs(&w.body, out);
+                collect_class_defs(&w.orelse, out);
+            }
+            crate::StatementType::With(w) => collect_class_defs(&w.body, out),
+            crate::StatementType::AsyncWith(w) => collect_class_defs(&w.body, out),
+            crate::StatementType::AsyncFor(f) => {
+                collect_class_defs(&f.body, out);
+                collect_class_defs(&f.orelse, out);
+            }
+            crate::StatementType::Try(t) => {
+                collect_class_defs(&t.body, out);
+                for h in &t.handlers {
+                    collect_class_defs(&h.body, out);
+                }
+                collect_class_defs(&t.orelse, out);
+                collect_class_defs(&t.finalbody, out);
+            }
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                collect_class_defs(&f.body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// For each class in `ast` that lowers with the trait machinery, the trait
+/// names that carry its methods: its own `{Name}Trait` plus one per
+/// ancestor, nearest first. Consumed by the converter so a relative import
+/// of the class from another module of the generated crate can bring the
+/// traits into scope at the call site (Rust method resolution needs the
+/// trait in scope; the class's own module defines it). Mirrors the
+/// hierarchy-class computation in `Module::to_rust`.
+///
+/// Backed by the once-per-conversion [`CrossModuleClasses`] cache
+/// (`options.cross_module_classes`), so the module AST is not deep-cloned
+/// and re-scanned on every import statement.
+pub fn module_class_traits(
+    options: &PythonOptions,
+    path: &[String],
+) -> std::collections::HashMap<String, Vec<String>> {
+    module_class_info(options, path)
+        .map(|info| info.traits.clone())
+        .unwrap_or_default()
+}
+
+/// The `ClassDef` named `name` in the module at `path`, plus that module's
+/// own symbol table (so the class's base chain resolves inside the module
+/// that declared it, not the importer's scope). Used for cross-module class
+/// construction: `from .animals import Dog; Dog("Rex")` lowers against
+/// Dog's real `__init__` signature, and an inherited `__init__` resolves
+/// through the defining module's chain.
+///
+/// Backed by the once-per-conversion [`CrossModuleClasses`] cache
+/// (`options.cross_module_classes`): `receiver_class` consults this for
+/// EVERY attribute access on an imported class, so the defining module's
+/// symbol table must not be rebuilt per access.
+pub fn module_class_def(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    let info = module_class_info(options, path)?;
+    info.classes.get(name).cloned().map(|c| (c, info.symbols.clone()))
+}
+
+/// The cached class facts for the module at `path`, building the
+/// once-per-conversion table over every module of the crate on first use.
+fn module_class_info(
+    options: &PythonOptions,
+    path: &[String],
+) -> Option<std::rc::Rc<ModuleClassInfo>> {
+    {
+        let state = options.cross_module_classes.borrow();
+        if let CrossModuleClasses::Computed(table) = &*state {
+            return table.get(path).cloned();
+        }
+    }
+    // First use: build the table for every module in one pass (the build
+    // consults only the module's own AST and symbols, so it cannot re-enter
+    // this cache).
+    let mut table = std::collections::HashMap::new();
+    for (module_path, module) in options.module_defs.iter() {
+        table.insert(
+            module_path.clone(),
+            std::rc::Rc::new(module_class_info_for(module)),
+        );
+    }
+    *options.cross_module_classes.borrow_mut() =
+        CrossModuleClasses::Computed(std::rc::Rc::new(table));
+    options
+        .cross_module_classes
+        .borrow()
+        .computed_class_info(path)
+        .cloned()
+}
+
+impl CrossModuleClasses {
+    /// The class facts for one module path, when computed.
+    fn computed_class_info(
+        &self,
+        path: &[String],
+    ) -> Option<&std::rc::Rc<ModuleClassInfo>> {
+        match self {
+            CrossModuleClasses::Computed(table) => table.get(path),
+            _ => None,
+        }
+    }
+}
+
+/// Build the class facts for one module: its symbol table, top-level
+/// classes by name, and hierarchy-class → trait names.
+fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let mut classes = std::collections::HashMap::new();
+    for s in &module.raw.body {
+        if let crate::StatementType::ClassDef(c) = &s.statement {
+            classes.insert(c.name.clone(), c.clone());
+        }
+    }
+    let mut traits = std::collections::HashMap::new();
+    let mut class_list = Vec::new();
+    collect_class_defs(&module.raw.body, &mut class_list);
+    let mut hierarchy = std::collections::HashSet::new();
+    for c in &class_list {
+        let has_real_base = c.bases.iter().any(|b| b.id != "object");
+        if has_real_base {
+            hierarchy.insert(c.name.clone());
+        }
+        for b in &c.bases {
+            if b.id != "object" {
+                hierarchy.insert(b.id.clone());
+            }
+        }
+    }
+    for c in class_list {
+        if !hierarchy.contains(&c.name) {
+            continue;
+        }
+        let t: Vec<String> = c
+            .base_chain(&symbols)
+            .iter()
+            .map(|cc| format!("{}Trait", cc.name))
+            .collect();
+        traits.insert(c.name.clone(), t);
+    }
+    ModuleClassInfo {
+        symbols,
+        classes,
+        traits,
+    }
+}
+
+/// Whether the trait of the hierarchy rooted at `root_name` widens `method`
+/// to `&mut self` in ANY module of the crate.
+///
+/// `trait_mut_self` is computed per module in `Module::to_rust`, so a class
+/// imported from another module has no entry in the importing module's
+/// table — yet its trait was widened (and emitted) in the DEFINING module,
+/// so call sites in the importing module must borrow the receiver mutably
+/// to match. This consults the once-per-conversion merged table
+/// ([`cross_module_mut_self_table`], cached in
+/// `options.cross_module_mut_self`) instead of re-deriving the whole-crate
+/// analysis for every call site.
+///
+/// The scan is only reached when the current module's own precompute has no
+/// entry for `root_name` — i.e. the class is not a hierarchy class of the
+/// current module — so it is not on the hot path once the table is cached.
+/// A same-named class in another module may produce a spurious `true` (an
+/// extra `let mut`), which is always accepted by rustc; a spurious `false`
+/// (missing `mut`) is the bug this prevents, and cannot occur when the
+/// defining module is in `module_defs`, as it is for every module rypip
+/// transpiles.
+pub fn module_widens_method_cached(
+    options: &PythonOptions,
+    root_name: &str,
+    method: &str,
+) -> bool {
+    {
+        let state = options.cross_module_mut_self.borrow();
+        match &*state {
+            CrossModuleMutSelf::Computed(table) => {
+                return table.get(root_name).is_some_and(|s| s.contains(method));
+            }
+            CrossModuleMutSelf::Computing => {
+                // Re-entrant fallback while the one-time scan is building
+                // the table (the scan's own per-method analysis consults
+                // method_needs_mut_self again): return false and let the
+                // direct chain walk in method_needs_mut_self answer —
+                // recomputing here would recurse.
+                return false;
+            }
+            CrossModuleMutSelf::Uncomputed => {}
+        }
+    }
+    *options.cross_module_mut_self.borrow_mut() = CrossModuleMutSelf::Computing;
+    let table = cross_module_mut_self_table(options);
+    *options.cross_module_mut_self.borrow_mut() =
+        CrossModuleMutSelf::Computed(std::rc::Rc::new(table));
+    options
+        .cross_module_mut_self
+        .borrow()
+        .computed()
+        .is_some_and(|t| t.get(root_name).is_some_and(|s| s.contains(method)))
+}
+
+/// Build the merged trait-mut table over every module of the crate: root
+/// class name → method names whose trait signature must be `&mut self`
+/// (because some definition in the hierarchy mutates self). Mirrors the
+/// per-module precompute in `Module::to_rust` (same root = topmost definer
+/// keying, same `own_method_mutates` test), applied to the shared
+/// cross-module ASTs (`options.module_defs`) so a sibling module's mutation
+/// widens the defining module's trait. Re-entrant `method_needs_mut_self`
+/// fallbacks during the scan see the `Computing` sentinel and answer via
+/// the direct chain walk, so the build does not recurse into itself.
+pub fn cross_module_mut_self_table(
+    options: &PythonOptions,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut table = std::collections::HashMap::<
+        String,
+        std::collections::HashSet<String>,
+    >::new();
+    for module in options.module_defs.values() {
+        let symbols = (**module).clone().find_symbols(SymbolTableScopes::new());
+        let mut classes = Vec::new();
+        collect_class_defs(&module.raw.body, &mut classes);
+        for c in &classes {
+            let chain = c.base_chain(&symbols);
+            for m in c.methods() {
+                if m.name == "__init__" {
+                    continue;
+                }
+                if c.own_method_mutates(&m.name, &symbols, options) {
+                    // The root = the TOPMOST class in the chain that
+                    // defines the method (the trait owner) — the same key
+                    // Module::to_rust uses.
+                    if let Some(root) = chain
+                        .iter()
+                        .rev()
+                        .find(|cc| cc.methods().any(|mm| mm.name == m.name))
+                    {
+                        table
+                            .entry(root.name.clone())
+                            .or_default()
+                            .insert(m.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    table
 }

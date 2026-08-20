@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "python-ast"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "anyhow-tracing",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "python-mod"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "path_macro",
  "proc-macro-error2",
@@ -607,11 +607,11 @@ checksum = "60e7c00b6c3bf5e38a880eec01d7e829d12ca682079f8238a464def3c4b31627"
 
 [[package]]
 name = "rykernel-shim"
-version = "1.1.0"
+version = "1.2.0"
 
 [[package]]
 name = "rypip"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "rythonc"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "stdpython"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "getrandom",
  "hashbrown 0.15.5",

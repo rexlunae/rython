@@ -142,6 +142,33 @@ impl CodeGen for Import {
                 tokens.extend(TokenStream::new());
                 continue;
             }
+            // Import of a vendored Python module (`[python-modules]` in
+            // rython.toml): it's a sibling module of the generated crate.
+            // Attribute calls lower to `crate::textlib::fn` paths, so the
+            // plain spelling emits no `use` — a `use crate::textlib;` in
+            // the binary would collide with the `mod textlib;` declaration
+            // that brings the sibling module into the bin crate. The
+            // aliased spelling still needs the import to bind the alias
+            // (`use crate::textlib as t;` — a different name, no clash).
+            {
+                let root = alias.name.split('.').next().unwrap_or(&alias.name);
+                if options.python_modules.contains(root) {
+                    if let Some(asname) = &alias.asname {
+                        let names = if alias.name.contains('.') {
+                            let parts: Vec<&str> = alias.name.split('.').collect();
+                            let idents: Vec<_> =
+                                parts.iter().map(|part| crate::safe_ident(part)).collect();
+                            quote!(#(#idents)::*)
+                        } else {
+                            let single_name = crate::safe_ident(&alias.name);
+                            quote!(#single_name)
+                        };
+                        let name = crate::safe_ident(asname);
+                        tokens.extend(quote! {use crate::#names as #name;});
+                    }
+                    continue;
+                }
+            }
             if options.no_std {
                 let root = alias.name.split('.').next().unwrap_or(&alias.name);
                 if is_std_only_module(root) {
@@ -249,6 +276,33 @@ pub struct ImportFrom {
     pub level: usize,
 }
 
+impl ImportFrom {
+    /// The module path this import resolves to inside the generated crate:
+    /// for a relative import, the current module path (cut by `level`) plus
+    /// the dotted module; for an absolute import, the dotted module itself.
+    /// Key into `options.module_defs` to reach the defining module's AST.
+    pub(crate) fn resolved_module_path(&self, options: &PythonOptions) -> Vec<String> {
+        let parts: Vec<&str> = self.module.split('.').filter(|p| !p.is_empty()).collect();
+        if self.level > 0 {
+            let cur = &options.module_path;
+            // A relative import with more leading dots than the current
+            // package depth reaches above the crate root; saturate so the
+            // caller gets an empty (or root-level) prefix instead of a
+            // usize underflow panic. `ImportFrom::to_rust` reports the
+            // clean "reaches above the crate root" error for the user.
+            let cut = (cur.len() + 1).saturating_sub(self.level);
+            cur[..cut]
+                .iter()
+                .map(|s| s.as_str())
+                .chain(parts.iter().copied())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            parts.iter().map(|s| s.to_string()).collect()
+        }
+    }
+}
+
 impl CodeGen for ImportFrom {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -261,6 +315,12 @@ impl CodeGen for ImportFrom {
                 alias.name.clone(),
                 SymbolTableNode::ImportFrom(self.clone()),
             );
+            // `from pylev import wf as w`: the alias resolves to the
+            // canonical name so call lowering propagates exceptions and
+            // attribute access treats it as the imported value.
+            if let Some(asname) = &alias.asname {
+                symbols.insert(asname.clone(), SymbolTableNode::Alias(alias.name.clone()));
+            }
         }
         symbols
     }
@@ -361,8 +421,31 @@ impl CodeGen for ImportFrom {
             .split('.')
             .filter(|part| !part.is_empty())
             .collect();
+        // Relative imports (`from .x import y`, `from ..x import y`, level
+        // > 0) resolve against the CURRENT module's package path
+        // (`options.module_path`, set by the converter; empty at the crate
+        // root). level 1 is this package, level 2 its parent, and so on;
+        // the resolved path always stays inside the generated crate, since
+        // the package and all its submodules are compiled into it.
+        let base_parts: Vec<_> = if self.level > 0 {
+            let cur = &options.module_path;
+            if self.level > cur.len() + 1 {
+                return Err(format!(
+                    "`from {} import ...` (level {}): relative import goes above \
+                     the crate root",
+                    self.module, self.level
+                )
+                .into());
+            }
+            let cut = cur.len() + 1 - self.level;
+            cur[..cut].iter().map(|p| crate::safe_ident(p)).collect()
+        } else {
+            Vec::new()
+        };
         let module_path: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
-        let root = if parts
+        let root = if self.level > 0 {
+            quote!(crate)
+        } else if parts
             .first()
             .is_some_and(|first| is_stdpython_module(first))
         {
@@ -385,7 +468,8 @@ impl CodeGen for ImportFrom {
                 continue;
             }
             if alias.name == "*" {
-                tokens.extend(quote! { use #root #(::#module_path)*::*; });
+                let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+                tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::*; });
                 continue;
             }
             // Some runtime functions split into arity/keyword-specific
@@ -421,17 +505,24 @@ impl CodeGen for ImportFrom {
             };
 
             let name = crate::safe_ident(&alias.name);
+            // Relative imports re-export from a sibling module: Python
+            // treats imported names as module attributes (the package
+            // `__init__.py` re-export pattern), so they lower to `pub use`
+            // — callers reach `textlib.double` through the re-export chain.
+            // Absolute imports of user modules stay plain `use`: callers
+            // import from the defining module directly.
+            let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
             let import = match &alias.asname {
                 None if variants.is_empty() => {
-                    quote! { use #root #(::#module_path)*::#name; }
+                    quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name; }
                 }
                 None => quote! {
                     #[allow(unused_imports)]
-                    use #root #(::#module_path)*::#name;
+                    #visibility use #root #(::#base_parts)* #(::#module_path)*::#name;
                 },
                 Some(asname) => {
                     let asname = crate::safe_ident(asname);
-                    quote! { use #root #(::#module_path)*::#name as #asname; }
+                    quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
                 }
             };
             tokens.extend(import);
@@ -440,8 +531,31 @@ impl CodeGen for ImportFrom {
                 let v = crate::safe_ident(variant);
                 tokens.extend(quote! {
                     #[allow(unused_imports)]
-                    use #root #(::#module_path)*::#v;
+                    use #root #(::#base_parts)* #(::#module_path)*::#v;
                 });
+            }
+
+            // A hierarchy class imported from another module of the
+            // generated crate carries its methods on traits (`{Name}Trait`
+            // plus ancestors'), NOT on the struct — Rust method resolution
+            // needs those traits IN SCOPE at the call site, so the import
+            // brings them along: `from .animals import Dog` also imports
+            // `AnimalTrait`, and `d.get()` resolves. Only classes that
+            // lower with the trait machinery have traits; functions and
+            // plain structs get none (the per-module map is empty for
+            // them).
+            let import_module_path = self.resolved_module_path(&options);
+            if options.module_defs.contains_key(&import_module_path)
+                && let Some(traits) =
+                    crate::module_class_traits(&options, &import_module_path).get(&alias.name)
+            {
+                for trait_name in traits {
+                    let t = crate::safe_ident(trait_name);
+                    tokens.extend(quote! {
+                        #[allow(unused_imports)]
+                        use #root #(::#base_parts)* #(::#module_path)*::#t;
+                    });
+                }
             }
         }
         Ok(tokens)

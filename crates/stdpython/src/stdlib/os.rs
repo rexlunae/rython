@@ -205,6 +205,27 @@ impl crate::PyIndex<String> for Environ {
     }
 }
 
+/// `os.environ[k] = v` sets the process environment, like Python. The
+/// value is generic over anything string-like (`"1"` literals and owned
+/// String alike), mirroring `os.setenv`'s signature.
+impl<V: crate::AsStrLike> crate::PySetIndex<&str, V> for Environ {
+    fn py_set_index(&mut self, key: &str, value: V) -> Result<(), PyException> {
+        unsafe {
+            std::env::set_var(key, value.as_str_like());
+        }
+        Ok(())
+    }
+}
+
+impl<V: crate::AsStrLike> crate::PySetIndex<String, V> for Environ {
+    fn py_set_index(&mut self, key: String, value: V) -> Result<(), PyException> {
+        unsafe {
+            std::env::set_var(key, value.as_str_like());
+        }
+        Ok(())
+    }
+}
+
 /// os.name - operating system name
 /// 
 /// This provides the name of the operating system, similar to Python's os.name.

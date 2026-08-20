@@ -44,8 +44,6 @@ pub enum TypeInfo {
     StrRef,
     /// `String` — computed strings (calls, f-strings, concatenation)
     String,
-    /// `usize` — `len()`, `count()`
-    Usize,
     /// `Vec<u8>`
     Bytes,
     /// `Vec<T>`
@@ -59,10 +57,13 @@ pub enum TypeInfo {
     /// `PyRange`
     Range,
     /// `numpy::NdArray`
+    /// `numpy::NdArray`
     NdArray,
+    /// an instance of a class defined in this module (by class name); not
+    /// Copy, so reused values must be cloned at each move-prone use
+    Class(String),
     /// a borrow (`&[T]`, `&str`) from iteration or indexing
     Borrowed(Box<TypeInfo>),
-    /// anything we cannot or choose not to track
     PyObject,
 }
 
@@ -86,7 +87,6 @@ impl TypeInfo {
             TypeInfo::Bool => quote!(bool),
             TypeInfo::StrRef => quote!(&'static str),
             TypeInfo::String => quote!(String),
-            TypeInfo::Usize => quote!(usize),
             TypeInfo::Bytes => quote!(Vec<u8>),
             TypeInfo::Vec(inner) => {
                 let t = inner.to_rust_type();
@@ -107,6 +107,10 @@ impl TypeInfo {
             }
             TypeInfo::Range => quote!(PyRange),
             TypeInfo::NdArray => quote!(numpy::NdArray),
+            TypeInfo::Class(name) => {
+                let ident = crate::safe_ident(name);
+                quote!(#ident)
+            }
             TypeInfo::Borrowed(inner) => {
                 let t = inner.to_rust_type();
                 quote!(&#t)
@@ -122,7 +126,6 @@ impl TypeInfo {
             TypeInfo::Float => "float".into(),
             TypeInfo::Bool => "bool".into(),
             TypeInfo::StrRef | TypeInfo::String => "str".into(),
-            TypeInfo::Usize => "usize".into(),
             TypeInfo::Bytes => "bytes".into(),
             TypeInfo::Vec(_) => "list".into(),
             TypeInfo::Dict(_, _) => "dict".into(),
@@ -130,6 +133,7 @@ impl TypeInfo {
             TypeInfo::Option(_) => "Optional".into(),
             TypeInfo::Range => "range".into(),
             TypeInfo::NdArray => "ndarray".into(),
+            TypeInfo::Class(name) => name.clone(),
             TypeInfo::Borrowed(_) => "borrowed".into(),
             TypeInfo::PyObject => "unknown".into(),
         }
@@ -154,11 +158,6 @@ pub fn coerce_tokens(
         // The String temporary lives until the end of the enclosing
         // statement, so borrowing it in an argument/index position is safe.
         (TypeInfo::String, TypeInfo::StrRef) => Some(quote!((#tokens).as_str())),
-        // usize → i64: len() results into index/range positions. Loud on
-        // the (theoretical) overflow rather than wrapping.
-        (TypeInfo::Usize, TypeInfo::Int) => {
-            Some(quote!((#tokens).try_into().unwrap()))
-        }
         // i64 → f64: only in all-numeric unification (mixed int/float
         // literal lists). Python's int is arbitrary precision, so this is
         // lossy above 2^53; accepted for numeric lists because it is the
@@ -293,7 +292,10 @@ pub fn infer_type(
         }
         ExprType::Call(call) => match call.func.as_ref() {
             ExprType::Name(n) => match n.id.as_str() {
-                "len" | "count" => TypeInfo::Usize,
+                // len()/count() lower to `len(&x) as i64` — Python ints are
+                // i64 everywhere (range(), indexing, arithmetic), so the
+                // inferred type must be Int, not the runtime's usize.
+                "len" | "count" => TypeInfo::Int,
                 "range" => TypeInfo::Range,
                 "str" | "repr" | "format" => TypeInfo::String,
                 "int" => TypeInfo::Int,
@@ -304,7 +306,15 @@ pub fn infer_type(
                     Box::new(TypeInfo::PyObject),
                     Box::new(TypeInfo::PyObject),
                 ),
-                _ => TypeInfo::PyObject,
+                _ => match symbols.get(&n.id) {
+                    // A class-construction call produces an instance of the
+                    // class (not Copy: reused instances must be cloned at
+                    // each move-prone use, matching Python's aliasing).
+                    Some(crate::SymbolTableNode::ClassDef(_)) => {
+                        TypeInfo::Class(n.id.clone())
+                    }
+                    _ => TypeInfo::PyObject,
+                },
             },
             ExprType::Attribute(attr) => {
                 // numpy functions produce arrays (`np.sum`, `numpy.mean`).
@@ -737,6 +747,27 @@ fn syntactic_type(expr: &ExprType) -> TypeInfo {
             }
             TypeInfo::Dict(Box::new(k), Box::new(v))
         }
+        // Builtin calls: empty-container pinning resolves `xs.append(len(s))`
+        // through here (resolve_type's fallback), so len()/count() must
+        // agree with the `as i64` codegen emission — a list pinned only from
+        // appended lengths is Vec<i64>, not Vec<usize>.
+        ExprType::Call(call) => match call.func.as_ref() {
+            ExprType::Name(n) => match n.id.as_str() {
+                "len" | "count" => TypeInfo::Int,
+                "range" => TypeInfo::Range,
+                "str" | "repr" | "format" => TypeInfo::String,
+                "int" => TypeInfo::Int,
+                "float" => TypeInfo::Float,
+                "bool" => TypeInfo::Bool,
+                "list" => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
+                "dict" => TypeInfo::Dict(
+                    Box::new(TypeInfo::PyObject),
+                    Box::new(TypeInfo::PyObject),
+                ),
+                _ => TypeInfo::PyObject,
+            },
+            _ => TypeInfo::PyObject,
+        },
         _ => TypeInfo::PyObject,
     }
 }

@@ -519,15 +519,28 @@ impl CodeGen for StatementType {
                     quote!(())
                 } else {
                     let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
-                    // A `-> str` function returning an attribute chain reads
-                    // a String field through the shared receiver: clone it
-                    // out. Python strings are immutable, so the clone
-                    // reproduces Python's semantics exactly (a bare field
-                    // read would move out of &self and not compile).
-                    if options.clone_str_attribute_returns
-                        && matches!(e.value, ExprType::Attribute(_))
-                    {
-                        quote!((#tokens).clone())
+                    // A `-> str` function's return value must be an owned
+                    // String (the annotation is authoritative — see
+                    // FunctionDef::resolved_return_type). An attribute chain
+                    // reads a String field through the shared receiver:
+                    // clone it out (a bare field read would move out of
+                    // &self and not compile). A string literal lowers to
+                    // `&'static str`; own it with to_string. Python strings
+                    // are immutable, so both reproduce Python's semantics
+                    // exactly.
+                    if options.clone_str_attribute_returns {
+                        match &e.value {
+                            ExprType::Attribute(_) => quote!((#tokens).clone()),
+                            ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                            {
+                                quote!((#tokens).to_string())
+                            }
+                            ExprType::Name(n) if options.str_literal_locals.contains(&n.id) => {
+                                quote!((#tokens).to_string())
+                            }
+                            _ => tokens,
+                        }
                     } else {
                         tokens
                     }

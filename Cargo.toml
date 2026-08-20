@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rexlunae/rython"
@@ -20,7 +20,7 @@ homepage = "https://github.com/rexlunae/rython"
 # rewrite them into registry dependencies; without a version, publishing
 # any dependent crate fails outright.
 [workspace.dependencies]
-python-ast = { path = "crates/python-ast", version = "1.1.0" }
-python-mod = { path = "crates/python-mod", version = "1.1.0" }
-rythonc = { path = "crates/rythonc", version = "1.1.0" }
-stdpython = { path = "crates/stdpython", version = "1.1.0" }
+python-ast = { path = "crates/python-ast", version = "1.2.0" }
+python-mod = { path = "crates/python-mod", version = "1.2.0" }
+rythonc = { path = "crates/rythonc", version = "1.2.0" }
+stdpython = { path = "crates/stdpython", version = "1.2.0" }

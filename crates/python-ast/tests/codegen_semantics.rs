@@ -5,6 +5,263 @@
 
 use python_ast::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse};
 
+/// Two-module crate for the cross-module trait-mut cache tests: module A
+/// defines a hierarchy whose trait widens (Dog's mutating `grow` override
+/// widens Animal's trait), module B imports it and calls `grow` on a
+/// Dog-typed parameter. The importing module's own per-module precompute
+/// has no entry for Animal (the hierarchy lives in A), so call sites in B
+/// must consult the merged cross-module table.
+fn cross_module_fixture() -> (std::rc::Rc<python_ast::Module>, PythonOptions) {
+    let a = parse(
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def grow(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def grow(self) -> None:\n",
+            "        self.name = self.name + \"!\"\n",
+        ),
+        "animals.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["animals".to_string()], std::rc::Rc::new(a));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    (options.module_defs.values().next().unwrap().clone(), options)
+}
+
+#[test]
+fn composition_chain_store_goes_through_mut_accessors() {
+    // A store through a composition chain (`self.inner.x = v`) inside a
+    // generic trait default must write through the MUTABLE accessor of
+    // every hop: `self.inner_mut().x`. The old lowering rendered the
+    // receiver in load flavor (`self.inner().x`), which clones the inner
+    // struct — the store silently vanished.
+    let src = concat!(
+        "class Inner:\n",
+        "    def __init__(self, x: int):\n",
+        "        self.x = x\n",
+        "\n",
+        "class Outer(Inner):\n",
+        "    def __init__(self):\n",
+        "        self.inner: Inner = Inner(0)\n",
+        "\n",
+        "    def mutate(self):\n",
+        "        self.inner.x = 5\n",
+        "\n",
+        "class OuterChild(Outer):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "compose_store.py");
+    // The mutation widens the trait, so the default runs on &mut self.
+    assert!(
+        out.contains("fn mutate (& mut self ,"),
+        "chain store must widen the trait: {}",
+        out
+    );
+    assert!(
+        out.contains("self . inner_mut () . x"),
+        "store must go through self.inner_mut().x, not the cloning load: {}",
+        out
+    );
+    assert!(
+        !out.contains("self . inner () . x ="),
+        "store must not land on a clone (self.inner().x = ...): {}",
+        out
+    );
+}
+
+#[test]
+fn composition_chain_mutating_method_uses_mut_receivers() {
+    // `self.inner.bump()` (user-defined mutating callee) and
+    // `self.inner.nums.append(v)` (builtin mutating method) on composition
+    // fields must render the WHOLE receiver chain in place flavor inside a
+    // generic trait default. The one-hop-only rewrite used to leave deeper
+    // chains on the cloning load accessors.
+    let src = concat!(
+        "class Inner:\n",
+        "    def __init__(self, nums: list[int]):\n",
+        "        self.nums = nums\n",
+        "\n",
+        "    def bump(self):\n",
+        "        self.nums.append(2)\n",
+        "\n",
+        "class Outer(Inner):\n",
+        "    def __init__(self):\n",
+        "        self.inner: Inner = Inner([1])\n",
+        "\n",
+        "    def mutate(self):\n",
+        "        self.inner.bump()\n",
+        "        self.inner.nums.append(3)\n",
+        "\n",
+        "class OuterChild(Outer):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "compose_call.py");
+    assert!(
+        out.contains("(self . inner_mut ()) . bump ()"),
+        "user-defined mutating callee must go through self.inner_mut(): {}",
+        out
+    );
+    assert!(
+        out.contains("(self . inner_mut () . nums) . push"),
+        "builtin mutating method must go through self.inner_mut().nums: {}",
+        out
+    );
+    assert!(
+        !out.contains("self . inner () . nums ()"),
+        "must not mutate through the cloning load accessors: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_destructuring_stores_through_mut_accessors() {
+    // `self.x, self.y = ...` in a generic trait default destructures INTO
+    // the fields: each attribute target must render through its mutable
+    // accessor, not through the cloning load form.
+    let src = concat!(
+        "class Base:\n",
+        "    def __init__(self):\n",
+        "        self.x = 0\n",
+        "        self.y = 0\n",
+        "\n",
+        "    def reset(self):\n",
+        "        self.x, self.y = 1, 2\n",
+        "\n",
+        "class Child(Base):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "tuple_target.py");
+    assert!(
+        out.contains("* self . x_mut () , * self . y_mut ()"),
+        "tuple targets must destructure through the mut accessors: {}",
+        out
+    );
+}
+
+#[test]
+fn single_element_tuple_target_keeps_the_trailing_comma() {
+    // `x, = f()` parses as a one-element TUPLE target (`x,` — the trailing
+    // comma is what makes it one). The per-element rendering must keep it:
+    // `(x,) = ...` destructures against the one-element tuple value, while
+    // `(x) = ...` would be a parenthesized place and fail to type-check.
+    let src = concat!(
+        "def pair() -> tuple[int]:\n",
+        "    return (1,)\n",
+        "\n",
+        "def unpack() -> int:\n",
+        "    x, = pair()\n",
+        "    return x\n",
+    );
+    let out = compile(src, "single_tuple_target.py");
+    assert!(
+        out.contains("(x ,) = pair () ?"),
+        "single-element tuple target must keep the trailing comma: {}",
+        out
+    );
+    assert!(
+        !out.contains("(x) = "),
+        "must not emit a parenthesized place for a tuple target: {}",
+        out
+    );
+}
+
+#[test]
+fn cross_module_mut_table_computed_once_and_cached() {
+    // The first fallback call builds the merged table over every module of
+    // the crate; the scan finds Dog's mutating override and widens
+    // Animal.grow — the root of the trait Dog's method re-emits into.
+    let (_, options) = cross_module_fixture();
+    assert!(
+        python_ast::module_widens_method_cached(&options, "Animal", "grow"),
+        "Dog's mutating override must widen Animal.grow across modules"
+    );
+    // The table is now cached: repeated lookups are HashMap hits, not
+    // re-scans of the module ASTs.
+    assert!(
+        matches!(
+            &*options.cross_module_mut_self.borrow(),
+            python_ast::CrossModuleMutSelf::Computed(_)
+        ),
+        "first fallback must leave the merged table cached"
+    );
+    assert!(python_ast::module_widens_method_cached(&options, "Animal", "grow"));
+    // A method no definition mutates stays un-widened.
+    assert!(!python_ast::module_widens_method_cached(&options, "Animal", "describe"));
+}
+
+#[test]
+fn cross_module_class_info_computed_once_and_cached() {
+    // Resolving an imported class's construction/fields must build the
+    // defining module's symbol table ONCE per conversion, not per call
+    // site: the first `module_class_def` builds the table over every module
+    // of the crate and caches it; later lookups (every attribute access,
+    // method call, construction, trait import) are HashMap hits.
+    let (_, options) = cross_module_fixture();
+    // Module path of the fixture: ["animals"].
+    let (dog, symbols) = python_ast::module_class_def(&options, &["animals".to_string()], "Dog")
+        .expect("Dog must resolve through the defining module");
+    assert_eq!(dog.name, "Dog");
+    // The defining module's symbol table comes back with it, so the base
+    // chain resolves inside the module that DECLARED Dog: `Animal` must be
+    // resolvable there (the importer's scope does not name it).
+    assert!(
+        symbols.get("Animal").is_some(),
+        "defining module's symbols must resolve Dog's base Animal"
+    );
+    // The table is now cached.
+    assert!(
+        matches!(
+            &*options.cross_module_classes.borrow(),
+            python_ast::CrossModuleClasses::Computed(_)
+        ),
+        "first cross-module class lookup must leave the cache populated"
+    );
+    // Repeated lookups are cache hits and stay consistent.
+    let (dog2, _) = python_ast::module_class_def(&options, &["animals".to_string()], "Dog")
+        .expect("cached Dog lookup");
+    assert_eq!(dog2.name, "Dog");
+    // Traits: Animal is the hierarchy root, so Dog carries DogTrait (own)
+    // plus AnimalTrait (its methods re-emit there), nearest first.
+    let traits =
+        python_ast::module_class_traits(&options, &["animals".to_string()]);
+    assert_eq!(
+        traits.get("Dog").map(Vec::as_slice),
+        Some(&["DogTrait".to_string(), "AnimalTrait".to_string()][..]),
+        "Dog must import DogTrait (own) + AnimalTrait (methods re-emit there)"
+    );
+    // A class that does not exist resolves to None without poisoning the cache.
+    assert!(python_ast::module_class_def(&options, &["animals".to_string()], "Nope").is_none());
+}
+
+#[test]
+fn cross_module_mut_reentrant_guard_does_not_recompute() {
+    // During the one-time scan, the scan's own per-method analysis consults
+    // method_needs_mut_self again. The Computing sentinel must answer false
+    // (the direct chain walk in method_needs_mut_self resolves the call)
+    // instead of recursing into another scan.
+    let (_, options) = cross_module_fixture();
+    *options.cross_module_mut_self.borrow_mut() = python_ast::CrossModuleMutSelf::Computing;
+    assert!(
+        !python_ast::module_widens_method_cached(&options, "Animal", "grow"),
+        "re-entrant fallback during a scan must not recompute"
+    );
+    assert!(
+        matches!(
+            &*options.cross_module_mut_self.borrow(),
+            python_ast::CrossModuleMutSelf::Computing
+        ),
+        "the in-progress scan state must be left untouched"
+    );
+}
 fn compile(src: &str, name: &str) -> String {
     let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed for {:?}: {}", src, e));
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
@@ -39,10 +296,13 @@ fn list_literals_keep_element_types() {
 }
 
 #[test]
-fn range_over_len_coerces_usize_to_i64() {
-    // Issue #100: len() yields usize but range() wants i64; the generated
-    // code must convert, not rely on a generic that fails to resolve for
-    // expression arguments.
+fn len_is_i64_everywhere() {
+    // len() lowers to `len(&x) as i64` (Issue #100 follow-up): the runtime
+    // length is usize, but Python ints are i64 everywhere else, and the
+    // type inference must agree — an empty list pinned from
+    // `xs.append(len(s))` must be Vec<i64>, and index/range positions must
+    // NOT get a redundant (and wrong) `.try_into().unwrap()` on a value
+    // that is already i64.
     let out = compile(
         "def forward(x: list[float]) -> list[float]:\n\
          \x20   result: list[float] = []\n\
@@ -52,13 +312,93 @@ fn range_over_len_coerces_usize_to_i64() {
         "issue100.py",
     );
     assert!(
-        out.contains("try_into () . unwrap ()"),
-        "len() must convert usize → i64: {}",
+        out.contains("len (& (x)) as i64"),
+        "len() must cast to i64: {}",
+        out
+    );
+    assert!(
+        !out.contains("try_into ()"),
+        "i64 len() must not be re-coerced: {}",
         out
     );
     assert!(
         out.contains("Vec :: < f64 > :: new ()"),
         "empty list must be pinned from the append: {}",
+        out
+    );
+}
+
+#[test]
+fn len_append_pins_empty_list_to_i64() {
+    // Issue: len() infers Usize while codegen emits i64, so an empty list
+    // whose only pinning use is `xs.append(len(s))` was declared
+    // `Vec::<usize>::new()` and then rejected when the appended i64 did
+    // not match. The pinning must agree with the emission.
+    let out = compile(
+        "def sizes(ss: list[str]) -> list[int]:\n\
+         \x20   xs = []\n\
+         \x20   for s in ss:\n\
+         \x20       xs.append(len(s))\n\
+         \x20   return xs\n",
+        "lenpin.py",
+    );
+    assert!(
+        out.contains("Vec :: < i64 > :: new ()"),
+        "empty list must pin to i64 (matching len() as i64): {}",
+        out
+    );
+    assert!(
+        !out.contains("usize"),
+        "no usize may appear in the generated code: {}",
+        out
+    );
+}
+
+#[test]
+fn field_named_base_in_hierarchy_is_a_loud_error() {
+    // A class that inherits and also stores an attribute named `base`
+    // would generate two `fn base` trait items (the embedded-base accessor
+    // plus the field accessor) — E0428 in rustc. It must be a clean
+    // conversion-time error, like the `__rython_base` field collision.
+    let err = compile_err(
+        "class Animal:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.name = 'x'\n\
+         class Dog(Animal):\n\
+         \x20   def __init__(self):\n\
+         \x20       self.base = 1\n",
+        "basefield.py",
+    );
+    assert!(
+        err.contains("attribute named `base`") && err.contains("base accessor"),
+        "expected loud base-field collision error, got: {}",
+        err
+    );
+    // `base_mut` collides the same way; `base` on a BASE-LESS class is fine
+    // (no embedded-base accessor is emitted).
+    let err = compile_err(
+        "class Animal:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.name = 'x'\n\
+         class Dog(Animal):\n\
+         \x20   def __init__(self):\n\
+         \x20       self.base_mut = 1\n",
+        "basemutfield.py",
+    );
+    assert!(
+        err.contains("attribute named `base_mut`"),
+        "expected loud base_mut-field collision error, got: {}",
+        err
+    );
+    let out = compile(
+        "class Base:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.base = 1\n",
+        "basefieldok.py",
+    );
+    assert!(
+        out.contains("pub base : i64") && !out.contains("Trait"),
+        "base field on a base-less class must compile: {}",
         out
     );
 }
@@ -2063,11 +2403,16 @@ fn composed_fields_type_and_resolve_through_chains() {
 
 #[test]
 fn unsupported_class_constructs_error_loudly() {
-    let err = compile_err(
-        "class Base:\n    pass\n\nclass Child(Base):\n    pass\n",
-        "inherit.py",
+    // Inheritance itself is now supported; bases that rython cannot emit a
+    // struct for (imported modules, builtins) still fail loudly.
+    let err = compile_err("class C(str):\n    pass\n", "builtin_base.py");
+    assert!(
+        err.contains("not a class defined in this module")
+            || err.contains("inheritance")
+            || err.contains("base"),
+        "error: {}",
+        err
     );
-    assert!(err.contains("inheritance"), "error: {}", err);
 
     let err = compile_err("class C:\n    VERSION = 3\n", "classattr.py");
     assert!(err.contains("class attribute"), "error: {}", err);
@@ -2077,6 +2422,345 @@ fn unsupported_class_constructs_error_loudly() {
         "noneattr.py",
     );
     assert!(err.contains("cannot infer a type"), "error: {}", err);
+}
+
+// ---- Trait-based inheritance ----
+
+#[test]
+fn inheritance_emits_trait_machinery() {
+    let src = concat!(
+        "class Base:\n",
+        "    def __init__(self, v: int):\n",
+        "        self.v = v\n",
+        "\n",
+        "    def get(self) -> int:\n",
+        "        return self.v\n",
+        "\n",
+        "class Child(Base):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "inherit.py");
+    assert!(out.contains("trait BaseTrait"), "generated: {}", out);
+    assert!(out.contains("impl BaseTrait for Child"), "generated: {}", out);
+    assert!(
+        out.contains("pub __rython_base : Base"),
+        "derived struct must embed the direct base: {}",
+        out
+    );
+}
+
+#[test]
+fn override_reemits_into_ancestor_trait_impl() {
+    // Dog.describe overrides Animal.describe: it must be re-emitted inside
+    // `impl AnimalTrait for Dog` (Animal's trait), not into Dog's own trait.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return self.name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str, breed: str):\n",
+        "        super().__init__(name)\n",
+        "        self.breed = breed\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return super().describe() + \" \" + self.breed\n",
+        "\n",
+        "    def bark(self) -> str:\n",
+        "        return \"woof\"\n",
+    );
+    let out = compile(src, "override.py");
+    let animal_impl = out.find("impl AnimalTrait for Dog");
+    let dog_trait = out.find("trait DogTrait");
+    let dog_impl = out.find("impl DogTrait for Dog");
+    assert!(
+        animal_impl.is_some() && dog_impl.is_some(),
+        "missing impls: {}",
+        out
+    );
+    let animal_impl = animal_impl.unwrap();
+    let dog_trait = dog_trait.unwrap();
+    let dog_impl = dog_impl.unwrap();
+    // describe must NOT be a member of Dog's own trait (it belongs to
+    // Animal's), and must appear in `impl AnimalTrait for Dog`.
+    assert!(
+        !out[dog_trait..dog_impl].contains("fn describe"),
+        "describe must not live in DogTrait: {}",
+        out
+    );
+    assert!(
+        out[animal_impl..].contains("fn describe (& self"),
+        "describe must be re-emitted in AnimalTrait impl: {}",
+        out
+    );
+    // bark is a NEW method: it goes into Dog's own trait as a default.
+    assert!(
+        out[dog_trait..dog_impl].contains("fn bark (& self"),
+        "bark must be a DogTrait default: {}",
+        out
+    );
+}
+
+#[test]
+fn super_dispatches_through_the_definer_trampoline() {
+    // `super().get()` must run the base's ORIGINAL body with the DERIVED
+    // self: the call dispatches through the base's super trampoline
+    // (`<Self as BaseTrait>::__rython_super_get(self)`), never through the
+    // embedded base struct — a call on `self.__rython_base` would pin the
+    // receiver to Base and resolve nested `self.x()` inside the body against
+    // Base, silently diverging from CPython's MRO.
+    let src = concat!(
+        "class Base:\n",
+        "    def __init__(self, v: int):\n",
+        "        self.v = v\n",
+        "\n",
+        "    def get(self) -> int:\n",
+        "        return self.v\n",
+        "\n",
+        "class Child(Base):\n",
+        "    def get(self) -> int:\n",
+        "        return super().get() + 1\n",
+    );
+    let out = compile(src, "super.py");
+    assert!(
+        out.contains("< Self as BaseTrait > :: __rython_super_get (self ,)"),
+        "super().get() must dispatch through the Base super trampoline: {}",
+        out
+    );
+    assert!(
+        out.contains("fn __rython_super_get (& self ,)"),
+        "BaseTrait must carry the __rython_super_get trampoline default: {}",
+        out
+    );
+    assert!(
+        !out.contains("__rython_base) . get ()"),
+        "must not call through the embedded base struct: {}",
+        out
+    );
+}
+
+#[test]
+fn mutating_override_widens_the_trait_signature() {
+    // Dog overrides Animal.grow with a mutating body; Cat inherits the
+    // non-mutating default. The trait signature must widen to `&mut self`
+    // for BOTH, or the impls would not agree — so a Cat-typed call borrows
+    // mutably too.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def grow(self) -> None:\n",
+        "        pass\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def grow(self) -> None:\n",
+        "        self.name = self.name + \"!\"\n",
+        "\n",
+        "class Cat(Animal):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "mut_override.py");
+    // The trait default itself must be &mut self (widened by Dog's override).
+    let trait_decl = out.find("trait AnimalTrait");
+    let impl_animal = out.find("impl AnimalTrait for Animal");
+    assert!(trait_decl.is_some() && impl_animal.is_some(), "{}", out);
+    assert!(
+        out[trait_decl.unwrap()..impl_animal.unwrap()].contains("fn grow (& mut self"),
+        "trait signature must widen to &mut self: {}",
+        out
+    );
+}
+
+#[test]
+fn grandchild_override_super_targets_the_definer_base() {
+    // Dog.describe overrides Animal.describe and calls super() inside it;
+    // Puppy inherits WITHOUT overriding. The re-emitted Dog body inside
+    // `impl AnimalTrait for Puppy` must super() to ANIMAL's describe (the
+    // definer), not Dog's — via the trampoline, with the derived Self, so
+    // nested dispatch inside Animal's body still resolves against Puppy.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return self.name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return super().describe() + \" (dog)\"\n",
+        "\n",
+        "class Puppy(Dog):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "deep_super.py");
+    // The super() inside the re-emitted Dog body resolves against Dog's base
+    // (Animal — the definer), so it dispatches through AnimalTrait's
+    // trampoline.
+    assert!(
+        out.contains("< Self as AnimalTrait > :: __rython_super_describe (self ,)"),
+        "re-emitted Dog override must super() to Animal's trampoline: {}",
+        out
+    );
+    assert!(
+        out.contains("fn __rython_super_describe (& self ,) -> Result < String , PyException >"),
+        "AnimalTrait must carry the describe trampoline: {}",
+        out
+    );
+}
+
+#[test]
+fn sibling_mutation_widens_through_a_middle_redefinition() {
+    // A defines m; B (middle) redefines m WITHOUT mutating; D (a sibling of
+    // B) mutates m. The widening is recorded under the TOPMOST definer (A),
+    // so a call through B-derived C must still resolve the widened
+    // signature — the nearest-definer lookup used to miss and emit a
+    // non-mut binding that the trait impl then rejects.
+    let src = concat!(
+        "class A:\n",
+        "    def m(self) -> int:\n",
+        "        return 1\n",
+        "\n",
+        "class B(A):\n",
+        "    def m(self) -> int:\n",
+        "        return 2\n",
+        "\n",
+        "class C(B):\n",
+        "    pass\n",
+        "\n",
+        "class D(A):\n",
+        "    def __init__(self, x: int):\n",
+        "        self.x = x\n",
+        "\n",
+        "    def m(self) -> int:\n",
+        "        self.x = 1\n",
+        "        return 3\n",
+        "\n",
+        "c = C()\n",
+        "y = c.m()\n",
+    );
+    let out = compile(src, "sibling_widen.py");
+    assert!(
+        out.contains("let mut c"),
+        "call site must borrow c mutably (trait widened by sibling D): {}",
+        out
+    );
+}
+
+#[test]
+fn middle_class_reassigning_base_field_emits_no_accessor() {
+    // Three-level hierarchy where the middle class re-assigns a field its
+    // own base owns (Dog sets self.name without super().__init__): the
+    // field physically lives in Animal, so `impl DogTrait for Puppy` must
+    // not emit a `name` accessor — its own trait declares only `breed` +
+    // `base`, and an undeclared trait method (or one reaching a
+    // non-existent Dog.name field) would not compile.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str, breed: str):\n",
+        "        self.name = name\n",
+        "        self.breed = breed\n",
+        "\n",
+        "class Puppy(Dog):\n",
+        "    pass\n",
+    );
+    let out = compile(src, "reassigned_field.py");
+    // The correct layout: Animal's own field is reached from Puppy through
+    // TWO embedded base levels (Puppy -> Dog -> Animal).
+    assert!(
+        out.contains("__rython_base . __rython_base . name"),
+        "name must live two levels down in Animal: {}",
+        out
+    );
+    // Dog's own fields are only breed (+base). Slice the Dog-impl-for-Puppy
+    // block and require no `name` accessor there.
+    let start = out
+        .find("impl DogTrait for Puppy")
+        .unwrap_or_else(|| panic!("missing Dog impl for Puppy: {}", out));
+    let rest = &out[start..];
+    let end = rest
+        .find("\nimpl ")
+        .map(|i| i + start)
+        .unwrap_or(out.len());
+    let dog_impl = &out[start..end];
+    assert!(
+        !dog_impl.contains("fn name"),
+        "Dog's trait impl for Puppy must not declare a `name` accessor: {}",
+        dog_impl
+    );
+    assert!(
+        dog_impl.contains("fn breed"),
+        "Dog's own field accessor must still be emitted: {}",
+        dog_impl
+    );
+}
+
+#[test]
+fn relative_import_above_crate_root_is_a_clean_error() {
+    // A relative import with more leading dots than the module's package
+    // depth must fail loudly with the dedicated message, not panic on an
+    // index underflow in the resolved-module-path computation. The import
+    // must be USED as a class BEFORE the import statement renders:
+    // construction of an imported name forces the module-path resolution
+    // (call.rs), which runs while rendering the first statement — before
+    // the import statement's own error check fires.
+    let err = compile_err(
+        "x = Thing()\nfrom ....nope import Thing\n",
+        "deep_relative.py",
+    );
+    assert!(
+        err.contains("relative import goes above the crate root"),
+        "expected the clean above-crate-root error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn own_override_super_targets_the_direct_base() {
+    // Puppy's OWN describe calls super().describe(): it resolves Dog's
+    // override (one level up), so the trampoline is DogTrait's — called
+    // with the derived Self (Puppy at the call site inside Puppy's body).
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "    def describe(self) -> str:\n",
+        "        return self.name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def describe(self) -> str:\n",
+        "        return super().describe() + \" (dog)\"\n",
+        "\n",
+        "class Puppy(Dog):\n",
+        "    def describe(self) -> str:\n",
+        "        return \"puppy \" + super().describe()\n",
+    );
+    let out = compile(src, "own_super.py");
+    assert!(
+        out.contains("< Self as DogTrait > :: __rython_super_describe (self ,)"),
+        "Puppy's super() must hit Dog's trampoline: {}",
+        out
+    );
+    // Dog's own body ALSO supers to Animal, and its trampoline is re-emitted
+    // nowhere: DogTrait::__rython_super_describe runs Animal's body with the
+    // derived Self.
+    assert!(
+        out.contains("< Self as AnimalTrait > :: __rython_super_describe (self ,)"),
+        "Dog's super() must hit Animal's trampoline: {}",
+        out
+    );
 }
 
 #[test]

@@ -3,7 +3,8 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types
 use quote::quote;
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes, extraction_failure,
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableNode, SymbolTableScopes,
+    extraction_failure,
 };
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,11 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // Inheritance-aware field access, computed before `self.value` is
+        // moved below: `self.name` where `name` is a base class's field, or
+        // `dog.name` where `dog` is a derived-class instance, must reach
+        // through the embedded base structs (or the trait's base accessors).
+        let field_access = class_field_access(&self.value, &self.attr, &ctx, &symbols, &options);
         // A Rust-module attribute (`crc32c.crc32c` where `crc32c` was
         // `import`ed from a rython.toml binding) is a path into the bound
         // crate — never a field access. The crate name comes from the spec
@@ -83,6 +89,18 @@ impl<'a> CodeGen for Attribute {
         // stdlib module path. Computed before `self.value` is moved below.
         let root_shadowed = crate::ast::tree::call::root_name(&self.value)
             .is_some_and(|root| crate::module_name_shadowed(root, &symbols));
+        let module_chain = is_module_path_chain(&self.value, &symbols);
+        // True when the chain's root is a vendored `[python-modules]`
+        // dependency — those lower to `crate::<dep>::<attr>` paths (see
+        // the emission below). Computed before `self.value` is moved.
+        let vendored_module_chain = module_chain
+            && crate::ast::tree::call::root_name(&self.value)
+                .is_some_and(|root| options.python_modules.contains(root));
+        // Whether the chain is a single segment (`textlib.double`): the
+        // `crate::` prefix belongs to the ROOT segment only, so a nested
+        // chain (`textlib.core.double`) must NOT be re-prefixed. Checked
+        // before `self.value` is moved.
+        let single_segment_chain = matches!(self.value.as_ref(), ExprType::Name(_));
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
@@ -91,8 +109,14 @@ impl<'a> CodeGen for Attribute {
         // Module names are typically lowercase and match Python stdlib modules
         // `np`/`numpy` cover the numpy module (import numpy as np lowers to
         // `use stdpython::numpy as np`, making np a real Rust path).
+        // A dotted chain rooted at a plain module `import` (`import pylev`)
+        // is also a module path: `pylev.wfi_levenshtein` emits
+        // `pylev::wfi_levenshtein`, and nested chains (`pylev.sub.fn`) emit
+        // `pylev::sub::fn` because each inner attribute resolves the same
+        // way. ImportFrom bindings are VALUES (a function/class), not
+        // modules, so they never turn attribute access into a path.
         let is_module_access = !root_shadowed
-            && matches!(
+            && (matches!(
                 value_str.as_str(),
                 "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
             "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re" | "hashlib" | "csv" | "io" |
@@ -104,7 +128,7 @@ impl<'a> CodeGen for Attribute {
             "numpy" | "np" |
             "os :: path" | "os::path" | // for nested modules
             "numpy :: linalg" | "np :: linalg" | "numpy::linalg" | "np::linalg" // np.linalg.inv
-            );
+            ) || module_chain);
 
         if is_module_access {
             // Use :: for module access (Python's sys.executable becomes sys::executable)
@@ -120,12 +144,295 @@ impl<'a> CodeGen for Attribute {
                 // Wrap dereferenced values in parentheses to ensure correct precedence
                 // This prevents *sys::executable.to_string() and ensures (*sys::executable).to_string()
                 Ok(quote!((*#value_tokens::#attr)))
+            } else if vendored_module_chain {
+                // Vendored `[python-modules]` deps are sibling modules of
+                // the generated crate: `textlib.double(...)` emits
+                // `crate::textlib::double(...)` — the path resolves in the
+                // lib (pub mod) and in the bin (mod textlib) alike, with no
+                // `use` statement needed. Same-package modules and stdlib
+                // paths keep their plain form.
+                //
+                // The `crate::` prefix belongs to the ROOT segment only: a
+                // nested chain (`textlib.core.double`) renders its inner
+                // attribute (`textlib.core`) through this same branch,
+                // which already prefixes it — re-prefixing here would
+                // double it (`crate::crate::...`).
+                if single_segment_chain {
+                    Ok(quote!(crate::#value_tokens::#attr))
+                } else {
+                    Ok(quote!(#value_tokens::#attr))
+                }
             } else {
                 Ok(quote!(#value_tokens::#attr))
             }
         } else {
-            // Use . for field/method access (Python's obj.field becomes obj.field)
-            Ok(quote!(#value_tokens.#attr))
+            // Use . for field/method access (Python's obj.field becomes obj.field).
+            // A class field owned by an ancestor of the receiver's class is
+            // reached through the embedded base structs (`self.__rython_base.f`)
+            // or, in a generic trait default, through the base accessors
+            // (`self.base().f`); an own field in a generic trait default goes
+            // through its accessor (`self.f()`).
+            match field_access {
+                None => Ok(quote!(#value_tokens.#attr)),
+                Some(FieldRewrite::Accessor { field }) => {
+                    let accessor = crate::safe_ident(&field);
+                    Ok(quote!(#value_tokens.#accessor()))
+                }
+                Some(FieldRewrite::Chain { depth }) => {
+                    let chain = base_field_chain(depth);
+                    Ok(quote!(#value_tokens #chain.#attr))
+                }
+                Some(FieldRewrite::AccessorChain { depth }) => {
+                    // `self.base()…​.name()` — the base accessor returns a
+                    // shared reference to the embedded struct, and the field
+                    // accessor clones it out (an ancestor's field is not on
+                    // the generic Self; a bare field access would move out
+                    // of the shared reference).
+                    let chain = base_accessor_chain(depth);
+                    Ok(quote!(#value_tokens #chain.#attr()))
+                }
+            }
         }
+    }
+}
+
+/// Store/place-flavored sibling of [`CodeGen::to_rust`]: renders an
+/// attribute so it can be ASSIGNED THROUGH. Identical to the load form
+/// everywhere except a generic trait default's own fields, where the load
+/// form clones out (`self.f()`) and a store needs the mutable accessor
+/// (`*self.f_mut() = ...`, or `self.f_mut()` without the deref when the
+/// caller wraps it as a method-call receiver / subscript place).
+pub(crate) fn to_rust_place(
+    value: &ExprType,
+    attr: &str,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+    deref: bool,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    to_rust_place_expr(
+        &ExprType::Attribute(Attribute {
+            value: Box::new(value.clone()),
+            attr: attr.to_string(),
+            ctx: "Store".to_string(),
+        }),
+        ctx,
+        options,
+        symbols,
+        deref,
+    )
+}
+
+/// Place-flavored renderer for a whole attribute/subscript chain. Each
+/// attribute segment rewrites its receiver to place flavor recursively, so
+/// a store through a composition chain (`self.inner.x = v`, `self.a.b[i] =
+/// v`, `self.inner.items.append(v)`) keeps the write on the REAL field:
+/// in a generic trait default the load accessor clones (`self.inner()`), so
+/// a store rendered on top of it would silently vanish. The mutable
+/// accessor (`self.inner_mut()`) is a place, and field access auto-derefs
+/// through the returned `&mut`, so chaining is valid.
+///
+/// Module paths (`os.environ`, `pylev.fn`) are NOT places — they render as
+/// `::` paths exactly like the load form.
+pub(crate) fn to_rust_place_expr(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+    deref: bool,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    match expr {
+        ExprType::Attribute(attr) => {
+            // Mirror the module-path guard from to_rust: a store target
+            // that resolves as a module path is not a field access. A user
+            // binding that shadows the module name (`os = {...}`) must NOT
+            // be treated as a module — the load path applies the same
+            // `module_name_shadowed` guard.
+            let root_shadowed = crate::ast::tree::call::root_name(&attr.value)
+                .is_some_and(|root| crate::module_name_shadowed(root, symbols));
+            let value_tokens =
+                attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let is_module = !root_shadowed
+                && (crate::ast::tree::call::root_name(&attr.value).is_some_and(|_root| {
+                    crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols)
+                }) || matches!(
+                    value_tokens.to_string().as_str(),
+                    "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio"
+                        | "time" | "math" | "random" | "heapq" | "functools" | "textwrap"
+                        | "itertools" | "re" | "hashlib" | "csv" | "io" | "datetime"
+                        | "numpy" | "np"
+                ));
+            if is_module {
+                // Module stores render as PATHS, exactly like the load form.
+                // The attribute is an identifier — interpolating the &str
+                // directly would emit a string literal (`os . "environ"`)
+                // that the Rust compiler rejects.
+                let attr_path = crate::safe_ident(&attr.attr);
+                // Vendored deps prefix `crate::` at the ROOT segment only;
+                // nested segments already carry it from their own rendering.
+                let vendored_root = matches!(attr.value.as_ref(), ExprType::Name(_))
+                    && crate::ast::tree::call::root_name(&attr.value)
+                        .is_some_and(|root| options.python_modules.contains(root));
+                if vendored_root {
+                    return Ok(quote!(crate::#value_tokens::#attr_path));
+                }
+                return Ok(quote!(#value_tokens::#attr_path));
+            }
+            // The receiver must itself be a place. `class_field_access`
+            // only rewrites a receiver that is BARE `self` (its `is_self`
+            // test), so a chain like `self.inner.x` resolves `x` against
+            // `Inner` with no rewrite — the place flavor of the receiver is
+            // what keeps the store on the real field.
+            let recv_place = to_rust_place_expr(&attr.value, ctx, options, symbols, false)?;
+            let field_access =
+                class_field_access(&attr.value, &attr.attr, ctx, symbols, options);
+            let attr_ident = crate::safe_ident(&attr.attr);
+            match field_access {
+                None => Ok(quote!(#recv_place.#attr_ident)),
+                Some(FieldRewrite::Accessor { field }) => {
+                    let accessor = crate::safe_ident(&format!("{}_mut", field));
+                    if deref {
+                        Ok(quote!(*#recv_place.#accessor()))
+                    } else {
+                        Ok(quote!(#recv_place.#accessor()))
+                    }
+                }
+                Some(FieldRewrite::Chain { depth }) => {
+                    let chain = base_field_chain(depth);
+                    Ok(quote!(#recv_place #chain.#attr_ident))
+                }
+                Some(FieldRewrite::AccessorChain { depth }) => {
+                    let chain = base_mut_accessor_chain(depth);
+                    Ok(quote!(#recv_place #chain.#attr_ident))
+                }
+            }
+        }
+        ExprType::Subscript(sub) => {
+            crate::ast::tree::subscript::subscript_receiver_place(
+                &ExprType::Subscript(sub.clone()),
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )
+        }
+        _ => expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()),
+    }
+}
+
+/// True when an expression chain is rooted at the method receiver `self`
+/// (`self.inner`, `self.a.b`) — the receivers whose load form clones in a
+/// generic trait default, so mutating operations must render them as
+/// places.
+pub(crate) fn chain_root_is_self(expr: &ExprType) -> bool {
+    match expr {
+        ExprType::Attribute(a) => chain_root_is_self(&a.value),
+        ExprType::Name(n) => n.id == "self",
+        _ => false,
+    }
+}
+
+/// `.__rython_base` repeated `depth` times: reaches an ancestor's embedded
+/// struct from a concrete receiver (`self.__rython_base.name`).
+pub(crate) fn base_field_chain(depth: usize) -> TokenStream {
+    let mut chain = TokenStream::new();
+    for _ in 0..depth {
+        chain.extend(quote!(.__rython_base));
+    }
+    chain
+}
+
+/// `.base()` repeated `depth` times: reaches an ancestor's struct from the
+/// generic `self` of a trait default (`self.base().name`).
+fn base_accessor_chain(depth: usize) -> TokenStream {
+    let mut chain = TokenStream::new();
+    for _ in 0..depth {
+        chain.extend(quote!(.base()));
+    }
+    chain
+}
+
+/// `.base_mut()` repeated `depth` times: the mutable form of
+/// [`base_accessor_chain`] for stores through an ancestor's fields.
+fn base_mut_accessor_chain(depth: usize) -> TokenStream {
+    let mut chain = TokenStream::new();
+    for _ in 0..depth {
+        chain.extend(quote!(.base_mut()));
+    }
+    chain
+}
+
+/// How an attribute access `value.attr` must be rewritten to reach a class
+/// field through the inheritance chain, if it is a class field at all.
+///
+/// - `Accessor`: `self` in a generic trait default, own field — the field
+///   is not on the generic `Self`, so loads go through `self.<f>()` and
+///   stores through `self.<f>_mut()`.
+/// - `Chain`: a concrete receiver (a local constructed from a class, `self`
+///   in an inherent method or an override body, or a composition chain) —
+///   the field lives inside embedded base structs, so the access is
+///   `#receiver.__rython_base…​.attr`.
+/// - `AccessorChain`: `self` in a generic trait default, ancestor field —
+///   `self.base()…​.attr` (load) / `self.base_mut()…​.attr` (place).
+///
+/// Returns None for non-fields (methods, module paths, plain struct fields
+/// that need no rewrite).
+pub(crate) fn class_field_access(
+    value: &ExprType,
+    attr: &str,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<FieldRewrite> {
+    let (class, class_symbols) = crate::receiver_class(value, ctx, symbols, options)?;
+    let depth = class.field_owner_depth(attr, &class_symbols)?;
+    let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
+    if depth == 0 {
+        // The receiver's own field. Direct access works for any concrete
+        // receiver; only the generic `self` of a trait default needs the
+        // accessor (the field is not on the generic Self).
+        if is_self && ctx.in_generic_trait() {
+            Some(FieldRewrite::Accessor {
+                field: attr.to_string(),
+            })
+        } else {
+            None
+        }
+    } else if is_self && ctx.in_generic_trait() {
+        Some(FieldRewrite::AccessorChain { depth })
+    } else {
+        Some(FieldRewrite::Chain { depth })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum FieldRewrite {
+    Accessor { field: String },
+    Chain { depth: usize },
+    AccessorChain { depth: usize },
+}
+
+/// True when a dotted expression chain is rooted at a plain module import
+/// (`import pylev` or `import pylev as p`): `pylev.fn`, `p.alias.sub.fn`.
+/// The root name must be bound to an `Import` node — an ImportFrom binding
+/// is a value (function/class), so `from x import fn; fn.attr` stays a
+/// field access. Attribute chains recurse: each segment between the root
+/// and the accessed attribute is itself a module path item, so
+/// `pkg.sub.fn` resolves `pkg.sub` the same way.
+pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match expr {
+        ExprType::Name(n) => {
+            if crate::module_name_shadowed(&n.id, symbols) {
+                return false;
+            }
+            match symbols.get(&n.id) {
+                Some(SymbolTableNode::Import(_)) => true,
+                Some(SymbolTableNode::Alias(canonical)) => {
+                    matches!(symbols.get(canonical), Some(SymbolTableNode::Import(_)))
+                }
+                _ => false,
+            }
+        }
+        ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols),
+        _ => false,
     }
 }

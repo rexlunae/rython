@@ -16,6 +16,26 @@ pub enum CodeGenContext {
     /// lowering can resolve `self` (receiver typing, `self.method()` calls)
     /// against the class's definition in the symbol table.
     Class(String),
+    /// Inside a method body being emitted as a trait item (trait-based
+    /// inheritance). `class` is the class whose struct `self` is; `generic`
+    /// is true for trait DEFAULT bodies (where `Self` is the trait's generic
+    /// implementor, so field access goes through generated accessors) and
+    /// false for override bodies in a concrete `impl Trait for Struct`
+    /// (where `self` is the concrete struct, so field access is direct).
+    Trait {
+        class: String,
+        generic: bool,
+        /// When an override originally defined by another class is re-emitted
+        /// for a derived class, `super()` inside it must resolve to the
+        /// ORIGINAL definer's base (not the derived class's base). `None`
+        /// when the method belongs to the enclosing class itself.
+        super_target: Option<String>,
+        /// Force `&mut self` on the emitted method signature even when the
+        /// method's own body does not mutate: the owning trait's signature
+        /// widened because SOME definition in the hierarchy mutates, so
+        /// every impl (and every default) must match.
+        force_mut_self: bool,
+    },
     /// Inside a function body. Carries the enclosing class name (if any) so
     /// `self` still resolves in method bodies — the codegen context otherwise
     /// loses the Class marker at the function boundary, and function bodies
@@ -108,12 +128,27 @@ impl CodeGenContext {
     pub fn enclosing_class_name(&self) -> Option<&str> {
         match self {
             CodeGenContext::Class(name) => Some(name),
+            CodeGenContext::Trait { class, .. } => Some(class),
             CodeGenContext::Function { class } => class.as_deref(),
             CodeGenContext::Async(inner) => inner.enclosing_class_name(),
             CodeGenContext::Loop { parent, .. }
             | CodeGenContext::TryBlock { parent }
             | CodeGenContext::ExceptHandler { parent } => parent.enclosing_class_name(),
             _ => None,
+        }
+    }
+
+    /// Whether this context sits inside a trait DEFAULT body, where `self`
+    /// is the trait's generic implementor and field access must go through
+    /// the generated accessors (`self.f()`, `self.base().f`).
+    pub fn in_generic_trait(&self) -> bool {
+        match self {
+            CodeGenContext::Trait { generic, .. } => *generic,
+            CodeGenContext::Async(inner) => inner.in_generic_trait(),
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.in_generic_trait(),
+            _ => false,
         }
     }
 }

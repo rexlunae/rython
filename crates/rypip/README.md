@@ -54,3 +54,42 @@ and a generated `#[pymodule]` exposing every top-level function whose
 signature is expressible in concrete Rust types (parameters annotated with
 `int`/`float`/`str`/`bool`/`bytes`, returns annotated or inferable). Build
 the extension with `cargo build --features python`.
+
+## Python library dependencies
+
+`rython.toml` next to the package can declare vendored Python libraries
+with `[python-modules]`. Each entry maps an import name to a `.py` file or a
+package directory:
+
+```toml
+[python-modules]
+pylev = { path = "vendor/wf.py" }
+textlib = { path = "vendor/textlib" }   # a package dir with __init__.py
+```
+
+The library is transpiled into the generated crate as a sibling module, so
+both import spellings work as direct calls:
+
+```python
+import pylev
+from pylev import wf_levenshtein as wf
+
+print(wf("kitten", "sitting"))      # -> wf(...)?  (exception-propagating)
+print(pylev.wfi_levenshtein("a", "b"))  # -> crate::pylev::wfi_levenshtein(...)?
+```
+
+Relative imports inside a vendored package resolve against the package path
+(`from .core import double` in `textlib/__init__.py` becomes
+`pub use crate::textlib::core::double;`, so `textlib.double` is a
+re-exported attribute exactly as in Python). Kernel modules (`--kernel-module`)
+compile a single entry file with no module tree and reject `[python-modules]`
+loudly.
+
+The library source must be written in rython's typed subset — annotate
+parameters (`: str`, `: int`, ...) and returns (`-> int`, ...); unannotated
+functions default to `Result<(), PyException>`. Modules targeting the
+`from __future__` era's Python-2 shims (e.g. `PY2: range = xrange`) must
+have those lines removed. Neither the dependency's own imports nor its
+functions' bodies may rely on constructs the transpiler does not support —
+a failed conversion names the module and the construct.
+

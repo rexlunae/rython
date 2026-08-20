@@ -179,10 +179,46 @@ impl<'a> CodeGen for Assign {
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
-            let target_code =
-                target
+            // An attribute store target renders in place flavor: in a
+            // generic trait default, `self.f = v` must store through the
+            // mutable accessor (`*self.f_mut() = v`) rather than the load
+            // accessor (which clones).
+            let target_code = match target {
+                ExprType::Attribute(attr) => crate::ast::tree::attribute::to_rust_place(
+                    &attr.value,
+                    &attr.attr,
+                    &ctx,
+                    &options,
+                    &symbols,
+                    true,
+                )?,
+                // Destructuring targets are places too: `self.x, self.y = v`
+                // in a generic trait default must store through the mutable
+                // accessors (`*self.x_mut(), *self.y_mut()`), not through
+                // clones of the fields.
+                ExprType::Tuple(tuple) => {
+                    let mut elts = Vec::with_capacity(tuple.elts.len());
+                    for elt in &tuple.elts {
+                        elts.push(crate::ast::tree::attribute::to_rust_place_expr(
+                            elt, &ctx, &options, &symbols, true,
+                        )?);
+                    }
+                    // A single-element target is still a TUPLE (`x, = f()`):
+                    // the trailing comma is what makes it one, so emit `(x,)`
+                    // — `(x)` would be a parenthesized place and the
+                    // destructuring assignment would not type-check against
+                    // the one-element tuple value.
+                    if elts.len() == 1 {
+                        let only = &elts[0];
+                        quote!((#only,))
+                    } else {
+                        quote!((#(#elts),*))
+                    }
+                }
+                _ => target
                     .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+            };
             Ok(match target {
                 ExprType::Name(name) => {
                     if !value_is_none
@@ -194,8 +230,9 @@ impl<'a> CodeGen for Assign {
                         quote!(#target_code = #value;)
                     }
                 }
-                // Destructuring assignment to the hoisted names.
-                ExprType::Tuple(_) => quote!((#target_code) = #value;),
+                // Destructuring assignment to the hoisted names. `target_code`
+                // is already the parenthesized element list.
+                ExprType::Tuple(_) => quote!(#target_code = #value;),
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
                 }
@@ -219,6 +256,20 @@ impl<'a> CodeGen for Assign {
                 options.clone(),
                 symbols.clone(),
             )?;
+            // `os.environ[k] = v` routes through `os::setenv`: os.environ
+            // is an IMMUTABLE module static (a live view of the process
+            // environment) and cannot be borrowed mutably for py_set_index.
+            // The static's set-index impls (Environ: PySetIndex) cover
+            // receivers that are real values (`e = os.environ`), but the
+            // direct module-path store must go through the function.
+            let is_os_environ = matches!(
+                sub.value.as_ref(),
+                ExprType::Attribute(a)
+                    if a.attr == "environ"
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "os")
+                        && !crate::ast::tree::call::root_name(&a.value)
+                            .is_some_and(|root| crate::module_name_shadowed(root, &symbols))
+            );
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
                     // String-keyed dicts store `&str` indexes through
@@ -246,6 +297,9 @@ impl<'a> CodeGen for Assign {
                             .clone()
                             .to_rust(ctx.clone(), options.clone(), symbols.clone())?
                     };
+                    if is_os_environ {
+                        return Ok(quote!(os::setenv(#index, #value);));
+                    }
                     Ok(quote!({
                         let __rython_val = #value;
                         (#receiver).py_set_index(#index, __rython_val)?;

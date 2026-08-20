@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ use python_ast::{
 use quote::quote;
 use rust_format::{Formatter, RustFmt};
 
-use crate::package::{PyModule, PyPackage};
+use crate::package::{PyModule, PyPackage, sanitize_name};
 
 /// Lint allowances for generated code: transpiled Python legitimately
 /// produces unused imports/variables and similar noise, and the generated
@@ -1804,6 +1805,17 @@ pub fn convert(
 
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
+    // `[python-modules]` vendors Python libraries into the generated crate
+    // as a module tree; kernel modules compile a single entry file with no
+    // tree, so a manifest that declares any is a loud error up front.
+    let python_manifest = read_python_module_manifest(package)?;
+    if opts.kernel_module && !python_manifest.is_empty() {
+        bail!(
+            "[python-modules] cannot be used with --kernel-module: kernel modules \
+             compile a single entry file with no module tree"
+        );
+    }
+
     // Kernel modules use a dedicated lowering path: no stdpython, no alloc,
     // raw FFI entry points with printk and module metadata.
     if opts.kernel_module {
@@ -1854,7 +1866,7 @@ pub fn convert(
     // wrap it in generated syscall glue — the only Rust shipped is the
     // template below; everything else comes from the Python.
     if opts.driver {
-        return convert_driver(package, out_dir, opts);
+        return convert_driver(package, out_dir, opts, &python_manifest);
     }
 
     // Rust-module imports (`import crc32c`): resolve the manifest once and
@@ -1863,17 +1875,83 @@ pub fn convert(
     let rust_manifest = read_rust_module_manifest(package)?;
     let rust_modules = rust_module_registry(package, &rust_manifest)?;
 
+    // Python-library imports (`[python-modules]`): vendored PyPI-style
+    // packages transpiled into the crate beside the package's own modules.
+    let python_deps = python_module_deps(package, &python_manifest)?;
+
     // Transpile every module, collecting lossy-conversion warnings.
+    // Dependency modules come first so their declarations are written
+    // before any module that imports them (order in `transpiled` only
+    // matters for the written file order, not correctness).
+    let python_module_names: std::collections::HashSet<String> =
+        python_deps.iter().map(|(name, _)| name.clone()).collect();
+    // ASTs of every module of the generated crate (vendored deps + the
+    // package itself), keyed by module path.
+    let module_defs = module_def_map(
+        python_deps
+            .iter()
+            .flat_map(|(_, dep)| dep.modules.iter())
+            .chain(package.modules.iter()),
+    );
+    // One options object per conversion: the shared `module_defs` and the
+    // cross-module trait-mut cache (computed once, reused by every module's
+    // transpile via the Rc clone).
+    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    for (_name, dep) in &python_deps {
+        for module in &dep.modules {
+            let code = transpile(module, &mut warnings, &base_options)?;
+            transpiled.push((module, code));
+        }
+    }
     for module in &package.modules {
-        let code = transpile(module, &mut warnings, opts, &rust_modules)?;
+        let code = transpile(module, &mut warnings, &base_options)?;
         transpiled.push((module, code));
     }
+    // An entry module named `main` (path ["main"]) is bin-only: its module
+    // file would be src/main.rs, which is the bin crate root, so it must
+    // not be declared as a lib submodule (rustc would compile the bin
+    // content — with its sibling `mod vendored;` decls — as a nested module
+    // of the lib) and its functions are not reachable from the lib (the
+    // PyO3 bindings live in the lib and must not reference them). An entry
+    // module under any OTHER name keeps its lib-side module (src/<name>.rs
+    // coexists with the src/main.rs bin).
+    let entry_is_bin_only = entry_file
+        .as_ref()
+        .map(|f| {
+            transpiled
+                .iter()
+                .find(|(m, _)| &m.file == f)
+                .is_some_and(|(m, _)| m.path == ["main"])
+        })
+        .unwrap_or(false);
     // Bindings are generated before files are written so their warnings
     // (e.g. forced Python-side renames) participate in the warning mode.
+    // Bindings describe the PACKAGE's public API only: vendored
+    // [python-modules] dependencies are internal implementation (they are
+    // transpiled and written, but must not surface as #[pyfunction]s in the
+    // generated #[pymodule], and their bare-name collisions must not rename
+    // or fail the package's own functions). A bin-only entry module is not
+    // part of the lib either, so it is skipped the same way.
     let bindings_text = if opts.pyo3 {
-        Some(generate_bindings(package, &transpiled, &mut warnings)?)
+        let package_modules: Vec<(&PyModule, String)> = package
+            .modules
+            .iter()
+            .filter(|m| {
+                !(entry_is_bin_only
+                    && entry_file
+                        .as_ref()
+                        .is_some_and(|f| &m.file == f))
+            })
+            .filter_map(|m| {
+                transpiled
+                    .iter()
+                    .find(|(tm, _)| tm.path == m.path)
+                    .map(|(tm, code)| (*tm, code.clone()))
+            })
+            .collect();
+        Some(generate_bindings(package, &package_modules, &mut warnings)?)
     } else {
         None
     };
@@ -1889,12 +1967,24 @@ pub fn convert(
 
     // Parent -> children map for `pub mod` declarations. The entry module
     // still gets a lib-side module (harmless), except a dedicated
-    // `__main__.py`, which is bin-only by convention. Non-root __init__
-    // modules register too: a sub-package whose only file is __init__.py
-    // must still be declared by its parent or its code is silently dropped.
+    // `__main__.py`, which is bin-only by convention, and a NAMED entry
+    // module (`main.py` with a `__main__` guard), which is also bin-only
+    // (see `entry_is_bin_only` above). Non-root __init__ modules register
+    // too: a sub-package whose only file is __init__.py must still be
+    // declared by its parent or its code is silently dropped.
     let mut children: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
     for (module, _) in &transpiled {
         if module.path.is_empty() || is_dunder_main(module) {
+            continue;
+        }
+        // Skip the bin-only entry module: it must not be declared as a lib
+        // module (its file is overwritten by the bin below) nor by its
+        // parent (the parent's decls are for lib modules).
+        if entry_is_bin_only
+            && entry_file
+                .as_ref()
+                .is_some_and(|f| &module.file == f)
+        {
             continue;
         }
         let (parent, name) = module.path.split_at(module.path.len() - 1);
@@ -1915,6 +2005,22 @@ pub fn convert(
     // Write module files. The lint allowances lead each file (they're inner
     // attributes), then the transpiled code (which may itself start with
     // inner doc attributes), then the `pub mod` declarations.
+    // Two modules with the same package path would overwrite each other's
+    // file — impossible within one package, but a vendored `[python-modules]`
+    // dep can collide with a package module of the same name.
+    {
+        let mut seen: HashSet<&[String]> = HashSet::new();
+        for (module, _) in &transpiled {
+            if !seen.insert(module.path.as_slice()) {
+                bail!(
+                    "duplicate module path `{}`: a [python-modules] dependency \
+                     collides with a module of the package",
+                    module.path.join(".")
+                );
+            }
+        }
+    }
+
     for (module, code) in &transpiled {
         if is_dunder_main(module) {
             continue; // handled as the binary below
@@ -2180,6 +2286,7 @@ fn convert_driver(
     package: &PyPackage,
     out_dir: &Path,
     opts: &ConvertOptions,
+    python_manifest: &HashMap<String, ManifestPythonModule>,
 ) -> Result<ConvertedCrate> {
     let src_dir = out_dir.join("src");
     fs::create_dir_all(&src_dir).with_context(|| format!("creating {}", src_dir.display()))?;
@@ -2197,10 +2304,34 @@ fn convert_driver(
             .context("driver requires at least one Python source file")?,
     };
 
+    // Python-library imports (`[python-modules]`): transpile the vendored
+    // deps and write them as sibling modules of the crate so the entry
+    // code's `from pylev import ...` resolves to `crate::pylev::...`.
+    let python_deps = python_module_deps(package, python_manifest)?;
+    let python_module_names: std::collections::HashSet<String> =
+        python_deps.iter().map(|(name, _)| name.clone()).collect();
+
     let mut warnings = Vec::new();
     let rust_manifest = read_rust_module_manifest(package)?;
     let rust_modules = rust_module_registry(package, &rust_manifest)?;
-    let code = transpile(module, &mut warnings, opts, &rust_modules)?;
+    // Driver mode still vendors python-modules deps as siblings; give the
+    // same cross-module knowledge as the plain package path.
+    let module_defs = module_def_map(
+        python_deps
+            .iter()
+            .flat_map(|(_, dep)| dep.modules.iter())
+            .chain(package.modules.iter()),
+    );
+    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
+    let code = transpile(module, &mut warnings, &base_options)?;
+
+    let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
+    for (_name, dep) in &python_deps {
+        for dep_module in &dep.modules {
+            let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
+            dep_transpiled.push((dep_module, dep_code));
+        }
+    }
     match opts.warnings {
         WarningMode::Deny if !warnings.is_empty() => bail!(
             "lossy conversion (warnings denied):\n  {}",
@@ -2211,7 +2342,41 @@ fn convert_driver(
     }
 
     // lib.rs: the driver logic, compiled from Python.
-    let lib = format!("{}\n{}", generated_lint_attrs(opts.warnings), code);
+    let mut lib = format!("{}\n{}", generated_lint_attrs(opts.warnings), code);
+
+    // The dep modules join the crate as real modules; lib.rs declares the
+    // top-level ones so `use crate::pylev::...` resolves. Sub-package
+    // declarations are written inside the dep modules themselves.
+    if !dep_transpiled.is_empty() {
+        let mut children: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
+        for (dep_module, _) in &dep_transpiled {
+            let (parent, name) = dep_module.path.split_at(dep_module.path.len() - 1);
+            children
+                .entry(parent.to_vec())
+                .or_default()
+                .push(name[0].clone());
+            for depth in 1..parent.len() + 1 {
+                let (ancestor, child) = parent.split_at(depth - 1);
+                let list = children.entry(ancestor.to_vec()).or_default();
+                if !list.contains(&child[0].to_string()) {
+                    list.push(child[0].clone());
+                }
+            }
+        }
+        for (dep_module, dep_code) in &dep_transpiled {
+            let decls = mod_decls(&children, &dep_module.path, dep_module.is_init);
+            let contents = format!("{}\n{}", dep_code, decls);
+            let file = module_file_path(&src_dir, dep_module);
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&file, format_rust(&contents))
+                .with_context(|| format!("writing {}", file.display()))?;
+        }
+        for name in children.get(&Vec::new()).cloned().unwrap_or_default() {
+            lib.push_str(&format!("\npub mod {};", name));
+        }
+    }
     fs::write(src_dir.join("lib.rs"), format_rust(&lib))?;
 
     // main.rs: the generated syscall glue, parameterized by the manifest.
@@ -2585,16 +2750,39 @@ fn parse_filename(module: &PyModule) -> String {
     }
 }
 
+/// Cross-module class knowledge for imports within the generated crate:
+/// the parsed AST of every sibling module, keyed by module path. ImportFrom
+/// lowering uses this to bring a hierarchy class's traits into scope when
+/// the class is imported from another module (inherited methods live on
+/// the traits, and Rust method resolution requires the trait to be in
+/// scope at the call site) and to resolve imported classes for
+/// construction (`Dog("Rex")` → `Dog::new("Rex")?`).
+fn module_def_map<'a>(
+    modules: impl Iterator<Item = &'a PyModule>,
+) -> std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>> {
+    let mut map = std::collections::HashMap::new();
+    for module in modules {
+        let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) else {
+            continue;
+        };
+        map.insert(module.path.clone(), std::rc::Rc::new(ast));
+    }
+    map
+}
+
 /// Transpile one Python module to Rust source text, appending
 /// lossy-conversion warnings (which are also baked into the generated code
 /// as #[deprecated] notes, unless the warning mode suppresses them).
+/// `base_options` carries the conversion-level context shared by every
+/// module (rust/python module registries, `module_defs`, and the shared
+/// cross-module trait-mut cache — the one-time merged-table scan runs on
+/// the first module that needs it and is reused by the rest); only the
+/// module's package path is per-module.
 fn transpile(
     module: &PyModule,
     warnings: &mut Vec<String>,
-    opts: &ConvertOptions,
-    rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
+    base_options: &PythonOptions,
 ) -> Result<String> {
-    let mode = opts.warnings;
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
 
@@ -2617,12 +2805,10 @@ fn transpile(
         .last()
         .cloned()
         .unwrap_or_else(|| "lib".to_string());
-    let options = PythonOptions {
-        lossy_warnings: mode != WarningMode::Allow,
-        no_std: opts.no_std,
-        rust_modules: std::rc::Rc::new(rust_modules.clone()),
-        ..Default::default()
-    };
+    let mut options = base_options.clone();
+    // Relative imports resolve against the current module's package path;
+    // empty at the crate root (the default when unset).
+    options.module_path = module_package_path(module);
     // Register rust-module imports in the shared symbol table so call
     // lowering can resolve them (Import::to_rust only sees a clone).
     let mut symbols = symbols;
@@ -2638,6 +2824,25 @@ fn transpile(
             )
         })?;
     Ok(tokens.to_string())
+}
+
+/// Conversion-level PythonOptions shared by every module of one conversion
+/// (see `transpile`): the registries, `module_defs`, and the shared
+/// cross-module trait-mut cache.
+fn conversion_base_options(
+    opts: &ConvertOptions,
+    rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
+    python_module_names: &std::collections::HashSet<String>,
+    module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
+) -> PythonOptions {
+    PythonOptions {
+        lossy_warnings: opts.warnings != WarningMode::Allow,
+        no_std: opts.no_std,
+        rust_modules: std::rc::Rc::new(rust_modules.clone()),
+        python_modules: std::rc::Rc::new(python_module_names.clone()),
+        module_defs: std::rc::Rc::new(module_defs.clone()),
+        ..Default::default()
+    }
 }
 
 /// `pub mod child;` declarations for a container module.
@@ -3073,6 +3278,144 @@ fn read_rust_module_manifest(package: &PyPackage) -> Result<HashMap<String, Mani
         );
     }
     Ok(out)
+}
+
+/// A manifest entry from `rython.toml` `[python-modules]`: a vendored
+/// PyPI-style Python library, compiled into the generated crate.
+#[derive(Clone, Debug)]
+struct ManifestPythonModule {
+    /// Path to a single .py file or a package directory, relative to the
+    /// package root (where the manifest lives).
+    path: String,
+}
+
+/// Read `rython.toml` `[python-modules]`, keyed by the Python import name
+/// (e.g. `pylev = { path = "vendor/pylev/wf.py" }`). Missing manifest or
+/// table is not an error — it simply means no Python-library imports.
+fn read_python_module_manifest(
+    package: &PyPackage,
+) -> Result<HashMap<String, ManifestPythonModule>> {
+    let manifest_path = package.root.join("rython.toml");
+    let text = match fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => bail!("reading {}: {}", manifest_path.display(), e),
+    };
+    let value: toml::Value =
+        toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let Some(table) = value.get("python-modules").and_then(|v| v.as_table()) else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (import_name, entry) in table {
+        let t = entry.as_table().with_context(|| {
+            format!(
+                "{}: `{import_name}` must be a table",
+                manifest_path.display()
+            )
+        })?;
+        let path = t
+            .get("path")
+            .and_then(|v| v.as_str())
+            .with_context(|| {
+                format!(
+                    "{}: `{import_name}` needs a `path` (a .py file or package directory)",
+                    manifest_path.display()
+                )
+            })?
+            .to_string();
+        out.insert(
+            import_name.clone(),
+            ManifestPythonModule {
+                path: path.clone(),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Load every `[python-modules]` dependency into an in-memory `PyPackage`,
+/// with module paths remapped under the import name: a single file
+/// `vendor/pylev/wf.py` becomes the one module `pylev`; a package directory
+/// `vendor/pkg/` with `__init__.py` becomes `pkg`, `pkg.sub`, ... The
+/// returned packages are keyed by import name.
+fn python_module_deps(
+    package: &PyPackage,
+    manifest: &HashMap<String, ManifestPythonModule>,
+) -> Result<Vec<(String, PyPackage)>> {
+    let mut deps = Vec::new();
+    for (import_name, entry) in manifest {
+        let abs = package.root.join(&entry.path);
+        let abs = abs.canonicalize().with_context(|| {
+            format!(
+                "python-module `{import_name}`: cannot access {}",
+                abs.display()
+            )
+        })?;
+        if abs.is_file() {
+            let source = fs::read_to_string(&abs).with_context(|| {
+                format!("python-module `{import_name}`: reading {}", abs.display())
+            })?;
+            let name = sanitize_name(import_name);
+            let file = abs.clone();
+            let module = PyModule {
+                path: vec![name.clone()],
+                source,
+                file,
+                is_init: false,
+            };
+            let pkg = PyPackage {
+                name: name.clone(),
+                version: "0.0.0".to_string(),
+                root: abs
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from(".")),
+                modules: vec![module],
+            };
+            deps.push((import_name.clone(), pkg));
+        } else if abs.is_dir() {
+            if !abs.join("__init__.py").is_file() {
+                bail!(
+                    "python-module `{import_name}`: {} is a directory without \
+                     __init__.py; vendored packages must be importable packages",
+                    abs.display()
+                );
+            }
+            let mut pkg = crate::discover(&abs).with_context(|| {
+                format!("python-module `{import_name}`: discovering {}", abs.display())
+            })?;
+            let prefix = sanitize_name(import_name);
+            for module in &mut pkg.modules {
+                module.path.insert(0, prefix.clone());
+                // The package's own __init__ was discovered as the root
+                // (empty path); after prefixing it IS the package init.
+                if module.path.len() == 1 && module.file.file_name() == Some("__init__.py".as_ref())
+                {
+                    module.is_init = true;
+                }
+            }
+            deps.push((import_name.clone(), pkg));
+        } else {
+            bail!(
+                "python-module `{import_name}`: {} is neither a file nor a directory",
+                abs.display()
+            );
+        }
+    }
+    Ok(deps)
+}
+
+/// The package path of a module for relative-import resolution:
+/// `pkg/sub/mod.py` resolves `from . import x` against `pkg/sub`. An
+/// `__init__.py` IS its package, so `pkg/sub/__init__.py` resolves against
+/// `pkg/sub`. The crate root (`path == []`) resolves against itself.
+fn module_package_path(module: &PyModule) -> Vec<String> {
+    if module.is_init {
+        module.path.clone()
+    } else {
+        module.path[..module.path.len().saturating_sub(1)].to_vec()
+    }
 }
 
 /// The names a module imports that could be Rust modules: `import crc32c`

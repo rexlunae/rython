@@ -1007,6 +1007,88 @@ fn classes_match_python_at_runtime() {
 }
 
 #[test]
+fn super_dispatch_keeps_the_derived_self_at_runtime() {
+    // super() must run the ancestor's ORIGINAL body with the DERIVED self:
+    // a `self.speak()` inside Animal.describe (reached through
+    // Dog.describe -> super().describe()) must dispatch to Dog.speak, not
+    // Animal.speak. The three-level chain additionally exercises trampoline
+    // hops (C.m -> B.m -> A.m -> C.tag).
+    let scratch = Scratch::new("super-dispatch");
+    let file = scratch.path().join("super_dispatch.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return self.speak()\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"...\"\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return \"D:\" + super().describe()\n",
+            "\n",
+            "class A:\n",
+            "    def m(self) -> str:\n",
+            "        return self.tag()\n",
+            "\n",
+            "    def tag(self) -> str:\n",
+            "        return \"A\"\n",
+            "\n",
+            "class B(A):\n",
+            "    def m(self) -> str:\n",
+            "        return super().m() + \"-B\"\n",
+            "\n",
+            "    def tag(self) -> str:\n",
+            "        return \"B\"\n",
+            "\n",
+            "class C(B):\n",
+            "    def m(self) -> str:\n",
+            "        return super().m() + \"-C\"\n",
+            "\n",
+            "    def tag(self) -> str:\n",
+            "        return \"C\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    d = Dog(\"rex\")\n",
+            "    print(d.describe())\n",
+            "    c = C()\n",
+            "    print(c.m())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/super_dispatch"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3: nested dispatch through super() must stay on
+    // the derived class (Dog.speak, C.tag).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["D:woof", "C-B-C"],
+        "super() lost the derived self: nested calls must dispatch to the override"
+    );
+}
+
+#[test]
 fn keyword_arguments_and_defaults_match_python_at_runtime() {
     let scratch = Scratch::new("kwargs");
     let file = scratch.path().join("kw.py");

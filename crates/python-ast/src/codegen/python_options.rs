@@ -71,6 +71,68 @@ pub fn sys_path() -> PyResult<Vec<String>> {
     })
 }
 
+/// State of the one-time cross-module trait-mut table cache (see
+/// `PythonOptions::cross_module_mut_self`).
+#[derive(Clone, Debug)]
+pub enum CrossModuleMutSelf {
+    /// No module has hit the cross-module fallback yet.
+    Uncomputed,
+    /// A scan is in progress; re-entrant fallbacks must NOT recompute.
+    Computing,
+    /// The merged table, keyed by root class name → mutating method names.
+    Computed(std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>),
+}
+
+impl CrossModuleMutSelf {
+    /// The merged table, when computed.
+    pub fn computed(
+        &self,
+    ) -> Option<&std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>> {
+        match self {
+            CrossModuleMutSelf::Computed(table) => Some(table),
+            _ => None,
+        }
+    }
+}
+
+/// Class-resolution facts for one module of the crate, built once per
+/// conversion and shared through [`PythonOptions::cross_module_classes`].
+///
+/// Replaces the per-call-site `ast.clone().find_symbols(...)` in
+/// [`crate::module_class_def`] / [`crate::module_class_traits`]: resolving
+/// an imported class (its fields, methods, construction, and the traits its
+/// methods live on) no longer deep-clones the whole defining module AST and
+/// rebuilds its symbol table for EVERY attribute access / method call /
+/// construction.
+#[derive(Clone, Debug)]
+pub struct ModuleClassInfo {
+    /// The module's own symbol table: base chains must resolve inside the
+    /// module that DECLARED the class, not the importer's scope.
+    pub symbols: crate::SymbolTableScopes,
+    /// Top-level classes by name, for cross-module construction
+    /// (`from .animals import Dog; Dog("Rex")` maps arguments against the
+    /// defining module's `__init__`).
+    pub classes: std::collections::HashMap<String, crate::ClassDef>,
+    /// Hierarchy classes → trait names (`{Name}Trait` plus ancestors'),
+    /// for the cross-module trait imports the import statement emits.
+    pub traits: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// State of the one-time cross-module class-resolution cache (see
+/// [`PythonOptions::cross_module_classes`]).
+#[derive(Clone, Debug)]
+pub enum CrossModuleClasses {
+    /// No module has hit the cross-module class fallback yet.
+    Uncomputed,
+    /// The per-module class facts, keyed by module path (each value an
+    /// `Rc` so lookups clone the handle, not the symbol table).
+    Computed(
+        std::rc::Rc<
+            std::collections::HashMap<Vec<String>, std::rc::Rc<ModuleClassInfo>>,
+        >,
+    ),
+}
+
 /// The global context for Python compilation.
 #[derive(Clone, Debug)]
 pub struct PythonOptions {
@@ -109,6 +171,14 @@ pub struct PythonOptions {
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
 
+    /// The current module's package path within the generated crate
+    /// ("" for the crate root, "pkg" for pkg/__init__.py, "pkg.sub" for
+    /// pkg/sub/module.py). Relative imports (`from .x import y`,
+    /// `from ..x import y`) resolve against it; the empty default keeps
+    /// absolute-import behavior unchanged for any conversion that does not
+    /// set it.
+    pub module_path: Vec<String>,
+
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
     /// names ("int", "float", "str", "bool"). Set per function; consumed
@@ -129,10 +199,23 @@ pub struct PythonOptions {
     /// fails loudly at startup.
     pub numpy_backend: Option<String>,
 
-    /// How many times each name is READ in the current scope (set per
-    /// function by the type analysis). Move-prone positions (call
-    /// arguments, container elements) clone a non-Copy name that is read
-    /// more than once, so Python's share-by-reference does not become a
+    /// Class names in this module that participate in an inheritance
+    /// hierarchy (have a real base, or are used as a base by another
+    /// class). Those classes lower to struct + trait + impls instead of a
+    /// plain struct, so `self.helper()` calls can dispatch through the
+    /// trait. Set once per module; empty outside module generation.
+    pub hierarchy_classes: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Trait method names whose signature must be `&mut self`, keyed by the
+    /// owning (root) class of the trait. A method's trait signature widens
+    /// to `&mut self` when ANY definition in the hierarchy mutates self:
+    /// overrides re-emit into the root's trait, whose signature must fit
+    /// every impl, and call sites must borrow accordingly. Set once per
+    /// module; empty outside module generation (call sites then fall back
+    /// to walking the receiver's own chain).
+    pub trait_mut_self:
+        std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+
     /// Rust move error on reuse.
     pub use_counts: std::rc::Rc<std::collections::HashMap<String, usize>>,
 
@@ -156,13 +239,18 @@ pub struct PythonOptions {
     /// scoped loop-variable leak survives codegen (issue #80). Set per
     /// scope by the function/module generators.
     pub hoisted_names: std::rc::Rc<std::collections::HashSet<String>>,
-
     /// `for`-target names whose post-loop value is actually observed (a
     /// read in a later statement that no re-binding shadows). Only these
     /// lower to stores into the hoisted binding; a target that merely
     /// shares a name with a hoisted variable for other reasons keeps its
     /// fresh per-loop binding (issue #80).
     pub leaked_loop_targets: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Locals in the current function whose only known type is a string
+    /// literal (`label = "fine"`), so they lower to `&'static str`. A
+    /// `-> str` function returning one must own the string (`to_string`)
+    /// to match its String return type. Set alongside
+    /// `clone_str_attribute_returns` by the function generator.
+    pub str_literal_locals: std::rc::Rc<std::collections::HashSet<String>>,
 
     /// Rust modules available to `import` / `from ... import` as
     /// compile-time bindings, keyed by the Python-side import name. The
@@ -170,6 +258,46 @@ pub struct PythonOptions {
     /// manifest; codegen resolves import statements against it and inserts
     /// `SymbolTableNode::RustModule` symbols. Empty in library use.
     pub rust_modules: std::rc::Rc<std::collections::HashMap<String, crate::RustModuleSpec>>,
+
+    /// Import names backed by vendored Python modules (`[python-modules]`
+    /// in rython.toml): `import pylev` lowers to `use crate::pylev;` — a
+    /// sibling module of the generated crate, not an external dependency.
+    pub python_modules: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Cross-module class knowledge: parsed ASTs of the sibling modules of
+    /// the generated crate (vendored `[python-modules]` deps and the
+    /// package's own modules), keyed by module path. ImportFrom lowering
+    /// consults them so a hierarchy class imported from another module
+    /// works end to end: the class's traits are brought into scope (`use`
+    /// alongside the class import — Rust method resolution needs the trait
+    /// at the call site, and the class's own module defines it), and
+    /// construction (`Dog("Rex")`) resolves the imported name to its
+    /// defining `ClassDef` for signature-mapped `Dog::new(...)`. Empty in
+    /// single-module conversion.
+    pub module_defs:
+        std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
+
+    /// Lazily-computed merged trait-mut table over ALL modules of the crate
+    /// (`module_defs`), shared across every module's conversion: the
+    /// cross-module fallback in `method_needs_mut_self` scans each module
+    /// AST once per CONVERSION instead of once per call site. `Computing`
+    /// marks the in-progress one-time build so re-entrant fallbacks (the
+    /// scan's own analysis consults `method_needs_mut_self` again) return
+    /// false and fall through to the direct chain walk instead of
+    /// recomputing. Per-module conversions (empty `module_defs`) never
+    /// touch it.
+    pub cross_module_mut_self:
+        std::rc::Rc<std::cell::RefCell<CrossModuleMutSelf>>,
+
+    /// Lazily-computed per-module class facts over ALL modules of the crate
+    /// (`module_defs`), shared across every module's conversion: resolving
+    /// an imported class's fields, methods, construction, and traits consults
+    /// this once-built map instead of deep-cloning the defining module AST
+    /// and rebuilding its symbol table per call site. Keyed by module path
+    /// (the same `Vec<String>` keys as `module_defs`). Per-module
+    /// conversions (empty `module_defs`) never touch it.
+    pub cross_module_classes:
+        std::rc::Rc<std::cell::RefCell<CrossModuleClasses>>,
 }
 
 impl Default for PythonOptions {
@@ -191,15 +319,27 @@ impl Default for PythonOptions {
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
+            module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             numpy_backend: None,
+            hierarchy_classes: std::rc::Rc::new(std::collections::HashSet::new()),
+            trait_mut_self: std::rc::Rc::new(std::collections::HashMap::new()),
             use_counts: std::rc::Rc::new(std::collections::HashMap::new()),
             name_types: std::rc::Rc::new(std::collections::HashMap::new()),
             empty_pinned: std::rc::Rc::new(std::collections::HashMap::new()),
             hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
+            str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
+            python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
+            module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
+            cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
+                CrossModuleMutSelf::Uncomputed,
+            )),
+            cross_module_classes: std::rc::Rc::new(std::cell::RefCell::new(
+                CrossModuleClasses::Uncomputed,
+            )),
         }
     }
 }
