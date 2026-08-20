@@ -30,7 +30,8 @@ The rest of this document walks through the consequences.
 
 Within the supported subset, Rython reproduces CPython's observable
 behavior **byte for byte**, and the end-to-end test suite enforces it by
-diffing generated-binary output against `python3` line for line:
+diffing generated-binary output line for line against transcripts
+captured from real `python3` runs and pinned as the oracle:
 
 - **Float formatting**: `str`/`repr` use CPython's shortest-roundtrip
   algorithm; `str(1e16)` is `1e+16`, not `10000000000000000`.

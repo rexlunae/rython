@@ -157,9 +157,10 @@ clone version would compile and usually "work".
 same *bytes on stdout*. `str(1e16)` is `1e+16`; `repr` of floats uses
 shortest-roundtrip formatting; `hash()` matches CPython under
 `PYTHONHASHSEED=0`; sort is stable; dicts iterate in insertion order;
-exception messages match CPython's text. The end-to-end test suite runs
-the generated binary and `python3` on the same program and diffs the
-output line for line. Divergences that are discovered but not yet fixed
+exception messages match CPython's text. The end-to-end test suite
+compiles and runs the generated binary and diffs its output line for line
+against transcripts captured from real `python3` runs and pinned into the
+tests as the oracle. Divergences that are discovered but not yet fixed
 are tracked publicly as bugs (issue #82), not reclassified as acceptable.
 
 Pinning to bytes is what makes the loud-boundary promise *testable*: a

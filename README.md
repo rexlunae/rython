@@ -34,7 +34,23 @@ CPython's exact observable behavior is a **loud error at conversion time**
 output. Supported surface is pinned against CPython byte-for-byte —
 `str(1e16)` is `1e+16`, `hash()` matches `PYTHONHASHSEED=0`, float repr,
 sort stability, and exception messages all match — and the end-to-end test
-suite diffs generated-binary output against `python3` line for line.
+suite diffs generated-binary output line for line against pinned
+transcripts of real `python3` runs.
+
+## Documentation
+
+- [Goals and design](docs/goals-and-design.md) — what Rython is, goals,
+  non-goals, and the design principles features are measured against
+- [Language specification](docs/spec.md) — the accepted Python subset,
+  type mapping, lowering semantics, error model, and the ledger of known
+  deviations
+- [CPython vs. Rython](docs/cpython-vs-rython.md) — execution-model
+  differences and the tradeoff behind each deliberate divergence
+- [Porting guide](docs/porting-guide.md) — how to translate a Python
+  project to Rust with this toolchain, written for AI agents and humans
+  alike (see also [`AGENTS.md`](AGENTS.md))
+- [Context-aware codegen](docs/context-awareness.md) — type inference
+  and coercion internals
 
 ## Crates
 
