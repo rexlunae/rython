@@ -4833,3 +4833,54 @@ fn del_statement_matches_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn warnings_module_matches_python_transcript() {
+    // Issue #111: `warnings.warn(...)` and `warnings.simplefilter(..., 
+    // append=True)` (keyword args to a runtime fn) convert, build, and the
+    // stdout diffs against a pinned `// Verified against python3.`
+    // transcript (warnings go to stderr in both).
+    let scratch = Scratch::new("warnings");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import warnings\n",
+            "\n",
+            "def check(x):\n",
+            "    if x < 0:\n",
+            "        warnings.warn(\"negative value\")\n",
+            "    return x\n",
+            "\n",
+            "def setup():\n",
+            "    warnings.simplefilter(\"ignore\")\n",
+            "    warnings.simplefilter(\"default\", append=True)\n",
+            "    warnings.warn(\"hello\", stacklevel=2)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    setup()\n",
+            "    print(check(5))\n",
+            "    print(check(-1))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["5", "-1"],
+        "stdout: {}",
+        stdout
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("negative value"), "stderr: {}", stderr);
+    assert_eq!(output.status.code(), Some(0));
+}

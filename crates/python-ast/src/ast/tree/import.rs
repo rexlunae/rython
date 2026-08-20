@@ -36,6 +36,7 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "string"
             | "sysconfig"
             | "venv"
+            | "warnings"
             | "numpy"
             // asyncio lives on the tokio-backed `async-tokio` stdpython
             // feature; generated async binaries enable it.

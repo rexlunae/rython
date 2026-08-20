@@ -72,6 +72,9 @@ pub mod tempfile;
 #[cfg(feature = "std")]
 pub mod glob;
 
+/// Python warnings module - diagnostics (issue #111).
+pub mod warnings;
+
 /// Python functools module - higher-order functions (reduce)
 pub mod functools;
 

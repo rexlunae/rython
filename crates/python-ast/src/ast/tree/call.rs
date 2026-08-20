@@ -24,6 +24,44 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "glob", "rglob", "iglob",
 ];
 
+/// Issue #111: keyword-argument signatures of stdpython runtime functions
+/// (module root, function, positional parameter names in order). Calls
+/// render through these signatures: keywords map to their slots, and
+/// omitted trailing parameters fill with `None` — Python's warnings API is
+/// the flagship (its category parameters are CLASSES, which rython cannot
+/// pass as values, so those slots stay generic).
+pub(crate) const RUNTIME_KEYWORD_SIGNATURES: &[(&str, &str, &[&str])] = &[
+    (
+        "warnings",
+        "simplefilter",
+        &["action", "category", "module", "lineno", "append"],
+    ),
+    (
+        "warnings",
+        "filterwarnings",
+        &["action", "message", "category", "module", "lineno", "append"],
+    ),
+    (
+        "warnings",
+        "warn",
+        &["message", "category", "stacklevel", "source"],
+    ),
+    (
+        "warnings",
+        "warn_explicit",
+        &[
+            "message",
+            "category",
+            "filename",
+            "lineno",
+            "module",
+            "registry",
+            "module_globals",
+            "source",
+        ],
+    ),
+];
+
 /// Strip a trailing `?` from a rendered call (`f()?` → `f()`), so the `?`
 /// can be re-applied AFTER an `.await`: an async function call renders with
 /// `?` (exceptions propagate), but the operator must unwrap the awaited
@@ -33,6 +71,86 @@ fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::To
     match rendered.trim_end().strip_suffix('?') {
         Some(inner) => inner.parse().unwrap_or_else(|_| tokens.clone()),
         None => tokens.clone(),
+    }
+}
+
+impl Call {
+    /// Issue #111: render a call to a runtime-module function whose
+    /// signature is known — keywords map to parameter slots by name and
+    /// omitted trailing parameters fill with `None` (so `warnings.warn(
+    /// "x")` and `warnings.simplefilter("ignore", append=True)` both
+    /// render). Returns None when the callee is not a signed runtime fn.
+    fn render_runtime_signature(
+        &self,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+        let (root, attr) = match self.func.as_ref() {
+            ExprType::Attribute(a) => match crate::ast::tree::call::root_name(&a.value) {
+                Some(root) => (root.to_string(), a.attr.clone()),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        if !crate::is_stdpython_module(&root) {
+            return Ok(None);
+        }
+        let Some((_, _, params)) = RUNTIME_KEYWORD_SIGNATURES
+            .iter()
+            .find(|(r, f, _)| *r == root && *f == attr)
+        else {
+            return Ok(None);
+        };
+        let mut slots: Vec<Option<ExprType>> = params.iter().map(|_| None).collect();
+        for (i, arg) in self.args.iter().enumerate() {
+            if i >= slots.len() {
+                return Err(format!(
+                    "`{attr}()` takes at most {} argument(s) ({} given)",
+                    params.len(),
+                    self.args.len() + self.keywords.len()
+                )
+                .into());
+            }
+            slots[i] = Some(arg.clone());
+        }
+        for kw in &self.keywords {
+            let Some(name) = kw.arg.as_deref() else {
+                continue;
+            };
+            let Some(pos) = params.iter().position(|p| *p == name) else {
+                return Err(format!(
+                    "`{attr}()` got an unexpected keyword argument '{name}'"
+                )
+                .into());
+            };
+            if slots[pos].is_some() {
+                return Err(format!(
+                    "`{attr}()` got multiple values for argument '{name}'"
+                )
+                .into());
+            }
+            slots[pos] = Some(kw.value.clone());
+        }
+        let mut rendered_args = Vec::new();
+        for slot in slots {
+            match slot {
+                // The signed runtime signatures take Option for every
+                // parameter: a present argument wraps in Some, an omitted
+                // one fills None.
+                Some(expr) => {
+                    let rendered =
+                        expr.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    rendered_args.push(quote!(Some(#rendered)));
+                }
+                None => rendered_args.push(quote!(None)),
+            }
+        }
+        let name = self
+            .func
+            .clone()
+            .to_rust(ctx, options, symbols)?;
+        Ok(Some(quote!(#name(#(#rendered_args),*))))
     }
 }
 
@@ -3021,6 +3139,15 @@ impl<'a> CodeGen for Call {
         // matching Python call semantics. Without a known signature,
         // keywords would silently become misordered positional arguments —
         // that is a loud conversion error instead.
+        // Issue #111: runtime-module functions with known signatures (the
+        // warnings family) accept keyword arguments and omitted trailing
+        // parameters — render through the signature's slots.
+        if let Some(call) =
+            self.render_runtime_signature(ctx.clone(), options.clone(), symbols.clone())?
+        {
+            return Ok(call);
+        }
+
         let callee = match self.func.as_ref() {
             ExprType::Name(n) => match symbols.get(&n.id) {
                 Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),

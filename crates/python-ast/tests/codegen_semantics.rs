@@ -5387,6 +5387,41 @@ fn del_name_is_a_loud_error() {
 }
 
 #[test]
+fn warnings_calls_render_through_their_signature() {
+    // Issue #111: warnings functions accept keyword arguments and omitted
+    // trailing parameters — slots fill with Some(...)/None.
+    let out = compile(
+        concat!(
+            "import warnings\n",
+            "def check(x):\n",
+            "    warnings.warn(\"hi\")\n",
+            "    warnings.simplefilter(\"ignore\", append=True)\n",
+            "    return x\n",
+        ),
+        "warnings.py",
+    );
+    assert!(
+        out.contains("warnings :: warn (Some (\"hi\") , None , None , None)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("warnings :: simplefilter (Some (\"ignore\") , None , None , None , Some (true))"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn warnings_unknown_keyword_is_a_loud_error() {
+    let err = compile_err(
+        "import warnings\ndef f():\n    warnings.warn(bogus_keyword=1)\n",
+        "warnings_bad.py",
+    );
+    assert!(err.contains("unexpected keyword"), "error: {}", err);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.
