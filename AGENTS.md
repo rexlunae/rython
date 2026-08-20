@@ -23,10 +23,11 @@ contract you're working under:
 ### The prime directive
 
 **Correct or loud — never silently different.** Every construct either
-reproduces CPython's observable behavior byte-for-byte, fails
-conversion with an error naming the construct and the fix, or raises a
-typed exception (or, where unrepresentable, panics) at the exact point
-of divergence. Read [`docs/goals-and-design.md`](docs/goals-and-design.md)
+tracks CPython's observable behavior (pinned byte-for-byte by
+transcript tests wherever verified, with known differences on the
+ledger in `docs/spec.md` §12), fails conversion with an error naming
+the construct and the fix, or raises a typed exception (or, where
+unrepresentable, panics) at the exact point of divergence. Read [`docs/goals-and-design.md`](docs/goals-and-design.md)
 before adding features; its checklist ("How to evaluate a proposed
 feature") is the review bar. Never "improve" a behavior away from
 CPython's, even when CPython's looks wrong — including exception

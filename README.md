@@ -31,7 +31,7 @@ of the interpreter and GIL — and the conversion itself is a correctness
 tool. The translator refuses to guess: anything it cannot reproduce with
 CPython's exact observable behavior is a **loud error at conversion time**
 (or a typed, catchable exception at runtime), never silently different
-output. Supported surface is pinned against CPython byte-for-byte —
+output. The supported surface is verified against CPython —
 `str(1e16)` is `1e+16`, `hash()` matches `PYTHONHASHSEED=0`, float repr,
 sort stability, and exception messages all match — and the end-to-end test
 suite diffs generated-binary output line for line against pinned
@@ -152,11 +152,18 @@ is complete. What's ahead:
 - Generalized decorator support (unblocks `dataclasses`, `property`,
   user-defined wrappers)
 - Generators and `yield` (likely as iterator-struct lowering)
-- Richer class model: inheritance, common dunder protocols
-- An arbitrary-precision integer strategy (opt-in bigint tier)
+- Richer class model: inheritance (single, then multiple), common
+  dunder protocols
+- An arbitrary-precision integer strategy: an opt-in feature flag
+  backed by a bigint crate, which also retires the overflow panic
+- An opt-in dynamic-typing escape hatch (boxed values) for multi-type
+  collections and similar compatibility wins
+- Moving remaining panic cases into catchable Python exceptions via the
+  existing `Result<T, PyException>` model
 - Broader `isinstance`/type-narrowing via real type inference
 - Binary file modes and `io.BytesIO`; file-based `json`
-- Continued stdlib expansion, always CPython-pinned with loud boundaries
+- Continued stdlib expansion, always CPython-verified with loud
+  boundaries
 
 ## Publishing
 

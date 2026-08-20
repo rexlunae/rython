@@ -37,19 +37,22 @@ own `ast` module. There is no Rython-only syntax.
 For every Python construct, a conforming implementation does exactly one
 of the following:
 
-1. **Converts it**, such that the program's observable behavior matches
-   CPython's byte for byte (under `PYTHONHASHSEED=0` where hashing is
-   observable).
+1. **Converts it**, with CPython's observable behavior as the intended
+   semantics (under `PYTHONHASHSEED=0` where hashing is observable).
 2. **Rejects it at conversion time** with a loud error.
 3. **Converts it to a loud runtime failure**: a typed `PyException`
    raised where CPython would raise one, or — for conditions the model
    cannot represent as catchable values — a panic at the point of
    divergence.
 
-Silent divergence is nonconformant. The known cases where the current
-implementation deviates from this rule are enumerated in §12 and are
-tracked as defects or documented model limits, never reclassified as
-acceptable behavior.
+Silent divergence is nonconformant. Byte-for-byte agreement with the
+reference is the *target* for converted constructs and is enforced by
+transcript tests wherever a behavior is pinned (§1.3) — it is not a
+blanket claim about the implementation. The places where the current
+toolchain knowingly differs — deliberate model tradeoffs, model limits,
+and unfixed defects — are enumerated in §12; the project's direction is
+to buy those differences down over time (§14), never to reclassify them
+as acceptable.
 
 ### 1.3 The oracle
 
@@ -662,8 +665,8 @@ in generated code rather than a conversion-time message:
 
 ### 12.2 Loud, by panic instead of exception
 
-The condition is real at runtime but not representable as a catchable
-`PyException`:
+The condition is real at runtime but not currently representable as a
+catchable `PyException`:
 
 - `i64` overflow (CPython would grow the int). Note: in release builds
   unchecked arithmetic may wrap rather than panic — treat any
@@ -672,6 +675,14 @@ The condition is real at runtime but not representable as a catchable
 - Sorting a `NaN`; `hash(nan)`.
 - Arithmetic on `None`.
 - An exception escaping a lambda body.
+
+The intended model is the one `ZeroDivisionError` already follows —
+fallible operations return `Result<T, PyException>` and propagate with
+`?` to the matching handler — and the direction (§14) is to move each
+of these cases into that model wherever CPython defines an exception
+for it (arithmetic on `None` as a catchable `TypeError`, exceptions
+propagating through lambdas), and to eliminate the overflow panic
+entirely via the bigint tier.
 
 ### 12.3 Known silent divergences (defects and model limits)
 
@@ -709,3 +720,30 @@ accepted as permanent spec:
 A change is conformant when: the construct's tests pin CPython's
 observable behavior, unsupported edges have `compile_err`-style tests,
 and no test asserts behavior that diverges from CPython silently.
+
+---
+
+## 14. Planned evolution (non-normative)
+
+Directions the language intends to grow, stated so the boundaries in
+this spec read as current edges rather than permanent walls. Rationale
+and ordering live in [`goals-and-design.md`](goals-and-design.md);
+everything here lands under §1.2's rules when it lands.
+
+- **Opt-in bigint tier**: a feature flag backing `int` with an
+  arbitrary-precision crate. Retires the overflow panic (§12.2);
+  default stays `i64`.
+- **Opt-in dynamic typing at the edges**: a boxed value type, behind a
+  flag or explicit annotation, for heterogeneous collections and
+  similar compatibility wins. Static typing stays the default.
+- **Panics → catchable exceptions**: extend the `Result<T, PyException>`
+  model of §8 to the §12.2 cases with defined CPython behavior.
+- **Class model**: single inheritance, then multiple; common dunder
+  protocols; generalized decorators (unblocking `dataclasses`,
+  `property`, user wrappers).
+- **Generators/`yield`** as iterator-struct lowering; lazy generator
+  expressions with them.
+- **Aliasing**: conversion-time detection of alias-and-mutate shapes,
+  possibly an opt-in shared-mutability lowering (issue #79).
+- **I/O and stdlib**: binary file modes, `io.BytesIO`, file-based
+  `json`; continued module expansion against the issue #82 register.

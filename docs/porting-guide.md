@@ -71,7 +71,7 @@ will need refactoring. Grep for these; each maps to a rewrite in §2.
 | `getattr(`/`setattr(` for dynamic dispatch | No reflection; use explicit dispatch |
 | Metaclasses, `__init_subclass__`, class decorators | No dynamic class machinery |
 | Monkey-patching (assigning to modules/classes at runtime) | Nothing to patch at runtime |
-| Arbitrary-precision integer reliance (values beyond ±2⁶³) | `int` is `i64`; overflow is a panic |
+| Arbitrary-precision integer reliance (values beyond ±2⁶³) | `int` is `i64`; overflow is a panic (an opt-in bigint tier is planned — spec §14) |
 | `threading`, `multiprocessing`, `asyncio` as APIs | Not in the subset; add concurrency in Rust after porting |
 
 **Refactorable (mechanical or semi-mechanical rewrites, §2):**

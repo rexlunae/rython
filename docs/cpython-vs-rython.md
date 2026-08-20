@@ -1,11 +1,15 @@
 # CPython vs. Rython: differences and tradeoffs
 
-Rython pins its observable behavior to CPython's — a converted program
-prints the same bytes CPython would print — but it gets there with a
-completely different execution model, and the differences that remain are
-deliberate engineering tradeoffs, each with a loud edge. This document
-lays out both: what is different by construction, and what each
-difference buys and costs.
+Rython tracks CPython as its reference implementation: within the
+supported subset, the goal is that a converted program prints the same
+bytes CPython would print, enforced by transcript tests wherever a
+behavior is pinned. But Rython gets there with a completely different
+execution model, and it has consciously traded away parts of Python's
+semantics — so it does not claim blanket byte-for-byte equivalence.
+The differences that remain are deliberate engineering tradeoffs, each
+with a loud edge, each recorded, and each a candidate for buying down
+over time. This document lays out both: what is different by
+construction, and what each difference buys and costs.
 
 For the normative statement of what converts and what doesn't, see
 [`spec.md`](spec.md). For why the boundaries are drawn this way, see
@@ -26,12 +30,12 @@ For the normative statement of what converts and what doesn't, see
 
 The rest of this document walks through the consequences.
 
-## What is identical by contract
+## What is pinned to the reference
 
-Within the supported subset, Rython reproduces CPython's observable
-behavior **byte for byte**, and the end-to-end test suite enforces it by
-diffing generated-binary output line for line against transcripts
-captured from real `python3` runs and pinned as the oracle:
+Where a behavior is supported and verified, it is pinned **byte for
+byte**: the end-to-end test suite diffs generated-binary output line for
+line against transcripts captured from real `python3` runs and checked
+in as the oracle. The pinned surface includes:
 
 - **Float formatting**: `str`/`repr` use CPython's shortest-roundtrip
   algorithm; `str(1e16)` is `1e+16`, not `10000000000000000`.
@@ -44,9 +48,12 @@ captured from real `python3` runs and pinned as the oracle:
   `datetime.strptime`, `random` with a given seed (MT19937,
   operation-for-operation), `heapq`'s exact list layout, and so on.
 
-Where a not-yet-fixed divergence is found in the stdlib, it is tracked as
-a public bug (issue #82), not shrugged off. The contract is the point:
-"works" means "diffs clean against CPython", not "looks right".
+Where a not-yet-fixed divergence is found in the stdlib, it is tracked
+as a public bug (issue #82), not shrugged off; the deliberate,
+model-level differences are recorded in the spec's deviation ledger
+([spec §12](spec.md)). Both lists exist to be bought down. The pinned
+surface is the point: for it, "works" means "diffs clean against
+CPython", not "looks right".
 
 ## The deliberate differences
 
@@ -62,11 +69,13 @@ integer, and overflow **panics** rather than wrapping or growing.
 - **Bought**: machine-speed arithmetic, `Copy` semantics, no allocation
   for numbers, viability in `no_std` and kernel contexts.
 - **Cost**: programs that rely on bignums (cryptography, combinatorics,
-  hashes rolled by hand) don't port. An opt-in bigint tier is on the
-  roadmap; a *silent* fallback is a non-goal.
-- **Edge**: the panic is the loud boundary. Wrapping would have been a
-  silent divergence; checking and growing would have been a semantic and
-  performance fork from the declared model.
+  hashes rolled by hand) don't port today. The planned fix is an
+  **opt-in feature flag** backing `int` with an arbitrary-precision
+  crate — which also removes the overflow panic, since bigints don't
+  overflow. A *silent*, magnitude-triggered fallback remains a non-goal.
+- **Edge**: until then, the panic is the loud boundary. Wrapping would
+  have been a silent divergence; checking and growing would have been a
+  semantic and performance fork from the declared model.
 
 ### Static types: one name, one type
 
@@ -80,7 +89,10 @@ Heterogeneous lists and cross-type rebinding are conversion errors.
 - **Cost**: idiomatic-but-dynamic Python patterns (a variable that's an
   `int` then a `str`, a list of mixed records) must be refactored before
   converting. In practice this is the largest source of porting work —
-  see the [porting guide](porting-guide.md).
+  see the [porting guide](porting-guide.md). A planned relief valve: an
+  **opt-in boxed value type** for the spots where limited dynamism buys
+  real compatibility (heterogeneous collections first), behind a flag or
+  explicit annotation, with static typing staying the default.
 
 ### Values, not references: the aliasing boundary
 
@@ -110,9 +122,13 @@ return `Result<T, PyException>` and `?` propagates to the nearest handler.
 
 - **Bought**: zero-cost when no exception is raised, and exception flow
   visible in the generated code.
-- **Cost**: conditions Rust cannot represent as catchable values remain
-  panics (integer overflow, sorting `NaN`) — these are documented
-  boundaries, not exceptions you can catch.
+- **Cost**: a few conditions currently remain panics rather than
+  catchable exceptions (integer overflow, sorting `NaN`, arithmetic on
+  `None`, an exception escaping a lambda) — documented boundaries, not
+  exceptions you can catch. The direction is to shrink this list into
+  the `Result` model wherever CPython defines an exception for the
+  case, and the planned bigint tier removes the overflow panic
+  altogether ([spec §14](spec.md)).
 
 ### No runtime dynamism
 

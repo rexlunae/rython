@@ -63,12 +63,14 @@ fast version during an incremental migration.
 
 ### 3. Correctness: a compiler that refuses to guess
 
-Conversion is itself a correctness tool. Running a Python program through
-Rython either produces a program with CPython's exact observable behavior,
-or it fails with an error saying precisely what is not supported. This is
-the project's prime directive (see *Design principles* below), and it is
-what distinguishes Rython from "Python-flavored" compilers that accept
-everything and quietly change the semantics of the parts they can't do.
+Conversion is itself a correctness tool. Running a Python program
+through Rython either produces a program whose behavior tracks the
+reference implementation — pinned by tests where verified, with every
+known difference on a public ledger — or it fails with an error saying
+precisely what is not supported. This is the project's prime directive
+(see *Design principles* below), and it is what distinguishes Rython
+from "Python-flavored" compilers that accept everything and quietly
+change the semantics of the parts they can't do.
 
 ### 4. Reach: places CPython cannot go
 
@@ -117,10 +119,10 @@ deliberately rejected, not merely postponed.
   approximation would almost always be right (e.g. chained assignment to
   a container literal, issue #104): *almost always* is precisely the kind
   of bug that escapes review.
-- **Silent bignum fallback.** `int` is `i64`. A future opt-in bigint tier
-  is on the roadmap, but transparently switching representations based on
-  value magnitude — with its pervasive performance and layout
-  consequences — is not.
+- **Silent bignum fallback.** `int` is `i64`. An opt-in bigint tier is
+  planned (see *Future directions*), but transparently switching
+  representations based on value magnitude — with its pervasive
+  performance and layout consequences — is not.
 - **Hiding the Rust.** The generated crate is the deliverable. Rython
   does not wrap the output in a launcher, a bundle format, or a build
   system of its own; it emits a crate and gets out of cargo's way.
@@ -151,20 +153,31 @@ chained-assignment guard (#104) rejects `a = b = []` outright rather than
 emit clones that would silently break Python's aliasing — even though the
 clone version would compile and usually "work".
 
-### P2. Pin to CPython, byte for byte
+### P2. Track the reference implementation; buy down the differences
 
-"Matches CPython" is defined aggressively: not "the same number", but the
-same *bytes on stdout*. `str(1e16)` is `1e+16`; `repr` of floats uses
-shortest-roundtrip formatting; `hash()` matches CPython under
-`PYTHONHASHSEED=0`; sort is stable; dicts iterate in insertion order;
-exception messages match CPython's text. The end-to-end test suite
-compiles and runs the generated binary and diffs its output line for line
-against transcripts captured from real `python3` runs and pinned into the
-tests as the oracle. Divergences that are discovered but not yet fixed
-are tracked publicly as bugs (issue #82), not reclassified as acceptable.
+CPython is the reference. Rython does **not** claim byte-for-byte
+equivalence with it: the model itself takes conscious tradeoffs (`i64`
+integers, static types, value semantics) that can produce different
+outcomes, and the stdlib still has verified, unfixed divergences. What
+the principle demands is narrower, and testable:
 
-Pinning to bytes is what makes the loud-boundary promise *testable*: a
-weaker promise ("semantically equivalent") degrades into judgment calls.
+- **Where a behavior is verified, it is pinned by transcript.** The
+  test suite diffs generated-binary output line for line against output
+  captured from real `python3` runs: `str(1e16)` is `1e+16`, `repr` of
+  floats uses shortest-roundtrip formatting, `hash()` matches CPython
+  under `PYTHONHASHSEED=0`, sort is stable, dicts iterate in insertion
+  order, exception messages match CPython's text.
+- **Where behavior differs from the reference**, the difference is
+  recorded — as a deliberate model tradeoff or an unfixed defect — in
+  the spec's deviation ledger ([spec §12](spec.md)) and the stdlib bug
+  register (issue #82), and treated as something to *buy down over
+  time*, never reclassified as acceptable.
+
+Defining "matches" by bytes-on-stdout for the pinned surface is what
+keeps the promise testable — a weaker definition ("semantically
+equivalent") degrades into judgment calls. Defining the *scope*
+honestly — pinned where verified, ledgered where not — is what keeps
+the promise true.
 
 ### P3. The boundary is enforced, not documented
 
@@ -189,7 +202,10 @@ annotations everywhere. The model is:
 - **One name, one type.** Reassigning a variable to a different type, or
   a heterogeneous list, is a conversion error — not because it couldn't
   be modeled (a boxed enum could), but because the output would stop
-  being the readable Rust that goal 1 demands.
+  being the readable Rust that goal 1 demands. An *opt-in* boxed-value
+  model for the places where limited dynamism buys real compatibility
+  (heterogeneous collections foremost) is a future direction — as an
+  explicit choice, never the default.
 
 ### P5. Value semantics with a guarded aliasing boundary
 
@@ -238,6 +254,44 @@ inheritance and dunder protocols, an opt-in bigint tier, binary file
 modes) is ordered by what unblocks real programs, but no feature ships in
 a half-state where some uses silently misbehave. "Supported" is a binary
 property of a construct, and the test suite is its definition.
+
+## Future directions
+
+Recorded here so they read as intentions, not accidents. Each will land
+under the same rules as everything else: opt-in where it changes the
+model, loud where it can't be whole, transcript-tested against the
+reference where it can.
+
+- **An opt-in bigint tier.** A feature flag backing `int` with an
+  arbitrary-precision crate, for programs that need Python's unbounded
+  integers and accept the representation cost. This also retires the
+  integer-overflow panic — under bigints, overflow simply doesn't
+  happen, matching CPython. The default stays `i64`; a silent,
+  magnitude-triggered switch stays a non-goal.
+- **Opt-in dynamic typing at the edges.** A boxed value type, behind a
+  flag or explicit annotation, for the few places where limited
+  dynamism buys real compatibility — heterogeneous collections first.
+  Static typing remains the default model.
+- **Exceptions over panics.** Python exceptions already lower to
+  `Result<T, PyException>` — `ZeroDivisionError` from `//`, `%`, and
+  float division is a catchable value that propagates with `?` to the
+  matching `except`, exactly like `raise`. The direction is to shrink
+  the remaining panic list the same way wherever CPython defines an
+  exception or a behavior for the case: arithmetic on `None` should
+  become a catchable `TypeError`, exceptions should propagate through
+  lambda boundaries, and the bigint tier removes the overflow panic
+  altogether.
+- **A richer class model**: inheritance — single first, multiple
+  eventually — plus common dunder protocols and generalized decorator
+  support (unblocking `dataclasses`, `property`, and user-defined
+  wrappers).
+- **Generators and `yield`**, likely as iterator-struct lowering.
+- **Aliasing**: conversion-time detection of alias-and-mutate shapes
+  first, possibly an opt-in shared-mutability lowering later
+  (issue #79).
+- **Continued stdlib expansion**, always reference-tracked with loud
+  boundaries, burning down the divergence register (issue #82) as it
+  goes.
 
 ## How to evaluate a proposed feature
 
