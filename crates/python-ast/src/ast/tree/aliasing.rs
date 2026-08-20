@@ -170,6 +170,7 @@ impl<'a> AliasingGuard<'a> {
                         self.visit_expr(cause);
                     }
                 }
+                StatementType::Global(_) => {}
                 StatementType::Assert { test, msg } => {
                     self.visit_expr(test);
                     if let Some(m) = msg {

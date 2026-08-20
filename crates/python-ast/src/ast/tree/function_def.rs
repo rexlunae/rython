@@ -499,6 +499,22 @@ impl CodeGen for FunctionDef {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
 
+        // Issue #115: `global x` declares module scope. Reads resolve to
+        // the module statics; WRITES need mutable module state, which
+        // rython does not model (module-level reassignment lowers to
+        // __module_init__ locals invisible to functions) — loud error
+        // naming the fix instead of a rustc surprise.
+        if let Some(name) = global_write_error(&self.body) {
+            return Err(format!(
+                "writing to module-level name `{name}` from function `{}` is not supported \
+                 (issue #115): rython has no mutable module state visible to functions; \
+                 keep the mutation inside one function, or restructure to avoid the \
+                 global",
+                self.name
+            )
+            .into());
+        }
+
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
         let argparse_rewrite = scan_argparse(&self.body)?;
@@ -1419,6 +1435,35 @@ pub(crate) fn scan_str_rebindings(
             _ => {}
         }
     }
+}
+
+/// Issue #115: a module-level name WRITTEN from this function — a `global
+/// x` declaration whose name is an Assign/AugAssign target in the same
+/// body. Returns the offending name.
+fn global_write_error(body: &[Statement]) -> Option<String> {
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Global(names) => {
+                declared.extend(names.iter().cloned());
+            }
+            StatementType::Assign(a) => {
+                for target in &a.targets {
+                    if let ExprType::Name(n) = target {
+                        written.insert(n.id.clone());
+                    }
+                }
+            }
+            StatementType::AugAssign(a) => {
+                if let ExprType::Name(n) = &a.target {
+                    written.insert(n.id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    declared.into_iter().find(|n| written.contains(n))
 }
 
 /// Collect `name = <simply-typed constant>` assignments (recursing into

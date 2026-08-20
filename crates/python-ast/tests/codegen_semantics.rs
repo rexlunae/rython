@@ -5329,6 +5329,40 @@ fn plain_string_literal_local_stays_unowned() {
 }
 
 #[test]
+fn global_declaration_with_read_converts() {
+    // Issue #115: `global x` is accepted; READS of the name resolve to
+    // the module static.
+    let out = compile(
+        concat!(
+            "DEFAULT_SESSION = \"initial\"\n",
+            "def show():\n",
+            "    global DEFAULT_SESSION\n",
+            "    print(DEFAULT_SESSION)\n",
+        ),
+        "global_read.py",
+    );
+    assert!(out.contains("pub static DEFAULT_SESSION"), "generated: {}", out);
+    assert!(!out.contains("not supported"), "generated: {}", out);
+}
+
+#[test]
+fn global_write_is_a_loud_error() {
+    // `global x; x = v` needs mutable module state, which rython does not
+    // model — a loud error naming the fix (issue #115).
+    let err = compile_err(
+        concat!(
+            "DEFAULT_SESSION = \"initial\"\n",
+            "def set_it():\n",
+            "    global DEFAULT_SESSION\n",
+            "    DEFAULT_SESSION = \"new\"\n",
+        ),
+        "global_write.py",
+    );
+    assert!(err.contains("issue #115"), "error: {}", err);
+    assert!(err.contains("DEFAULT_SESSION"), "error: {}", err);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

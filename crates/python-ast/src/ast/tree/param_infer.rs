@@ -1968,6 +1968,10 @@ impl<'a> Collector<'a> {
                         self.walk_expr(c, false);
                     }
                 }
+                StatementType::Global(_) => {
+                    // `global x`: a no-op here — writes are rejected by
+                    // the function generator (issue #115).
+                }
                 // Nested functions/classes have their own parameters.
                 StatementType::FunctionDef(_)
                 | StatementType::AsyncFunctionDef(_)

@@ -117,6 +117,10 @@ pub enum StatementType {
     AsyncFor(AsyncFor),
     Raise(Raise),
     With(With),
+    /// `global a, b` — declares module-level names (issue #115). Reads of
+    /// the names resolve to module statics; WRITES from a function are a
+    /// loud error (rython has no mutable module state).
+    Global(Vec<String>),
 
     Unimplemented(String),
 }
@@ -228,6 +232,14 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                     .extract()
                     .map_err(|e| extraction_failure("expression statement", &ob, e))?;
                 Ok(StatementType::Expr(expr))
+            }
+            "Global" => {
+                let names = ob
+                    .getattr("names")
+                    .map_err(|e| extraction_failure("global names", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("global names", &ob, e))?;
+                Ok(StatementType::Global(names))
             }
             "Return" => {
                 tracing::debug!("return expression: {}", dump(&ob, None)?);
@@ -555,6 +567,10 @@ impl CodeGen for StatementType {
             StatementType::AsyncFor(af) => af.to_rust(ctx, options, symbols),
             StatementType::Raise(r) => r.to_rust(ctx, options, symbols),
             StatementType::With(w) => w.to_rust(ctx, options, symbols),
+            // `global a, b` declares module scope — a no-op here: reads
+            // resolve to the module statics, and writes are rejected at
+            // conversion time (issue #115).
+            StatementType::Global(_) => Ok(quote! {}),
             _ => {
                 let error = err_from(StatementNotYetImplemented(self));
                 Err(error.into())
