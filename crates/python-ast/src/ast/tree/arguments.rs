@@ -164,13 +164,23 @@ pub(crate) fn is_optional_annotation(ann: &ExprType) -> bool {
 /// to `Option<T>`.
 pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
     match annotation {
-        // T | None (and None | T) is Option<T>.
+        // T | None (and None | T) is Option<T>; a union whose members map
+        // to the SAME Rust type (`bytes | bytearray` → Vec<u8>) is that
+        // type. Any other union has no single Rust type — the caller
+        // reports the unsupported annotation (issue: PyPI sweep).
         ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
             let inner = if crate::is_none_expr(&op.left) {
                 op.right.as_ref()
             } else if crate::is_none_expr(&op.right) {
                 op.left.as_ref()
             } else {
+                let l = python_annotation_to_rust_type(&op.left);
+                let r = python_annotation_to_rust_type(&op.right);
+                if let (Some(l), Some(r)) = (&l, &r)
+                    && l.to_string() == r.to_string()
+                {
+                    return Some(quote!(#l));
+                }
                 return None;
             };
             let inner = python_annotation_to_rust_type(inner)?;

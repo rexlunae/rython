@@ -5513,6 +5513,21 @@ fn type_subscript_annotation_is_tolerated() {
 }
 
 #[test]
+fn same_rust_type_union_annotations_are_accepted() {
+    // `bytes | bytearray` — a PEP 604 union whose members both map to
+    // Vec<u8> — lowers to that type (charset_normalizer's from_bytes).
+    let out = compile(
+        "def from_bytes(sequences: bytes | bytearray):\n    return len(sequences)\n",
+        "union_ann.py",
+    );
+    assert!(
+        !out.contains("unsupported annotation"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.
