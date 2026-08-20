@@ -791,8 +791,15 @@ pub fn pin_empty_containers(body: &[Statement], info: &mut FunctionTypeInfo) {
     }
     for (name, t) in suggested {
         if info.empty_pinned.contains_key(&name) {
-            info.name_types.insert(name.clone(), t.clone());
-            info.empty_pinned.insert(name, t);
+            // Unify with any existing (annotated) type: an annotated
+            // `result: list[str] = []` must not be clobbered by a use
+            // suggestion whose element type is still unknown.
+            let final_t = match info.name_types.get(&name) {
+                Some(existing) => unify(existing.clone(), t),
+                None => t,
+            };
+            info.name_types.insert(name.clone(), final_t.clone());
+            info.empty_pinned.insert(name, final_t);
         }
     }
 }

@@ -5077,6 +5077,106 @@ fn satisfiable_call_sites_still_convert() {
 }
 
 #[test]
+fn iterating_a_parameter_infers_into_iterator_bounds() {
+    // M2 iteration: `for x in p` bounds the parameter as IntoIterator and
+    // threads the element type into the loop variable, whose own uses get
+    // bounds.
+    let out = compile(
+        "def f(p):\n    for x in p:\n        print(x)\n",
+        "iter1.py",
+    );
+    assert!(
+        out.contains("where A : IntoIterator < Item = B >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("B : PyDisplay"), "generated: {}", out);
+}
+
+#[test]
+fn loop_element_as_method_receiver_infers_its_own_bounds() {
+    // `for w in words: result.append(w.upper())` — the element's method
+    // use bounds the ELEMENT (`B: PyStrOps`), not just the iterable.
+    let out = compile(
+        concat!(
+            "def shout_all(words):\n",
+            "    result: list[str] = []\n",
+            "    for w in words:\n",
+            "        result.append(w.upper())\n",
+            "    return result\n",
+        ),
+        "iter2.py",
+    );
+    assert!(
+        out.contains("A : IntoIterator < Item = B >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("B : PyStrOps"), "generated: {}", out);
+    assert!(out.contains("-> Result < Vec < String > , PyException >"), "generated: {}", out);
+}
+
+#[test]
+fn iteration_bounds_flow_through_a_callee() {
+    // `caller(v): return shout_all(v)` adopts the callee's Iterate bound
+    // (a fresh element) AND the element's own requirements.
+    let out = compile(
+        concat!(
+            "def shout_all(words):\n",
+            "    result: list[str] = []\n",
+            "    for w in words:\n",
+            "        result.append(w.upper())\n",
+            "    return result\n",
+            "def caller(v):\n",
+            "    return shout_all(v)\n",
+        ),
+        "iter3.py",
+    );
+    assert!(
+        out.contains("pub fn caller < A , B > (v : A) -> Result < Vec < String > , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("where A : IntoIterator < Item = B > , B : PyStrOps"),
+        "caller must adopt the element bounds: {}",
+        out
+    );
+}
+
+#[test]
+fn loop_element_return_with_fall_through_is_a_loud_error() {
+    // `for x in p: return x` can fall through (empty p → Python None):
+    // the inferred generic return cannot coexist with a unit fall-through.
+    let err = compile_err(
+        "def first(p):\n    for x in p:\n        return x\n",
+        "iter4.py",
+    );
+    assert!(err.contains("fall through"), "error: {}", err);
+}
+
+#[test]
+fn tuple_loop_target_is_a_loud_error() {
+    let err = compile_err(
+        "def f(p):\n    for a, b in p:\n        print(a)\n",
+        "iter5.py",
+    );
+    assert!(err.contains("tuple"), "error: {}", err);
+}
+
+#[test]
+fn iterating_a_non_iterable_argument_is_a_loud_error() {
+    // M5 call-site satisfiability: `f(5)` cannot satisfy `p`'s
+    // IntoIterator bound.
+    let err = compile_err(
+        "def f(p):\n    for x in p:\n        print(x)\nprint(f(5))\n",
+        "iter6.py",
+    );
+    assert!(err.contains("IntoIterator"), "error: {}", err);
+    assert!(err.contains("cannot satisfy"), "error: {}", err);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

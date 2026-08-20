@@ -4478,3 +4478,73 @@ fn recursion_and_flows_to_inference_match_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn iteration_inference_matches_python_transcript() {
+    // Issue #109, M2 iteration: `for w in words` over an unannotated
+    // parameter bounds it `A: IntoIterator<Item = B>` and threads the
+    // element type into the loop variable (`B: PyStrOps` / `B: Len`); a
+    // caller passing its own parameter adopts both the Iterate bound and
+    // the element requirements. Output is diffed against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("iteration-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def shout_all(words):\n",
+            "    result: list[str] = []\n",
+            "    for w in words:\n",
+            "        result.append(w.upper())\n",
+            "    return result\n",
+            "\n",
+            "def total_len(words):\n",
+            "    n = 0\n",
+            "    for w in words:\n",
+            "        n += len(w)\n",
+            "    return n\n",
+            "\n",
+            "def caller(v):\n",
+            "    return shout_all(v)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(shout_all([\"hi\", \"there\"]))\n",
+            "    print(total_len([\"ab\", \"cde\"]))\n",
+            "    print(caller([\"x\", \"y\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        src.contains("A: IntoIterator<Item = B>"),
+        "iteration bound: {}",
+        src
+    );
+    assert!(src.contains("B: PyStrOps"), "element bound: {}", src);
+    assert!(src.contains("B: Len"), "element bound: {}", src);
+    // The caller adopts both the iterable and the element bounds.
+    assert!(
+        src.contains("pub fn caller<A, B>(v: A)"),
+        "caller signature: {}",
+        src
+    );
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["['HI', 'THERE']", "5", "['X', 'Y']"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

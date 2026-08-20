@@ -15,7 +15,13 @@
 //! - M1: free functions; operator/comparison/conversion-builtin/Truthy/Len/
 //!   PyDisplay/PyRepr/PyHash/PyIndex/PyContains rows.
 //! - M2: stdlib method table (PyStrOps/PyListOps/PyPop bounds) with
-//!   forwarding impls, and per-method return types.
+//!   forwarding impls, and per-method return types. Iteration:
+//!   `for x in p` over an unannotated parameter (or an alias of one)
+//!   bounds it `T: IntoIterator<Item = E>`, and the loop variable becomes
+//!   a virtual parameter whose OWN bounds come from the body's uses of it
+//!   (`for w in words: out.append(w.upper())` → `B: PyStrOps`). The bound
+//!   and the element requirements flow through callers. A loop-target
+//!   return that can fall through (Python returns None) is a loud error.
 //! - M3: user-class duck typing — a generated `Has*` trait per method,
 //!   unified across every defining class in the package.
 //! - M4: interprocedural FlowsTo — a call to a user function adopts the
@@ -33,8 +39,8 @@
 //!   instead of a rustc surprise. Runs for every body: inferred functions,
 //!   annotated/paramless functions, module init, and the __main__ block.
 //!
-//! Still loud errors (later milestones): callable parameters, iteration
-//! over a parameter (`for x in p`), and method parameters.
+//! Still loud errors (later milestones): callable parameters, tuple/
+//! attribute loop targets, and method parameters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +72,10 @@ pub enum ParamReq {
     /// cross-PartialOrd — the bound `T: PyLe<T>` is satisfied by both i64
     /// and f64 (M4).
     PyFromInt,
+    /// `for x in p` (M2): the parameter is an iterable — `T: IntoIterator<
+    /// Item = E>`, where the element name is a virtual parameter whose own
+    /// requirements come from the loop body's uses of `x`.
+    Iterate(String),
     /// `int(p)` / `float(p)` / `bool(p)` / `str(p)` / `abs(p)` — the
     /// runtime conversion trait (`PyInt`, `PyFloat`, ...).
     Conversion(&'static str),
@@ -208,6 +218,77 @@ impl InferredSignature {
     }
 }
 
+/// Pre-scan for M2 iteration: the names bound by `for <name> in <name>`
+/// where the iterable resolves (through simple `a = p` aliases) to an
+/// unannotated parameter. These become virtual parameters whose type
+/// variable is the iteration's element type.
+fn loop_element_names(body: &[Statement], unannotated: &HashSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut alias: HashMap<String, String> = HashMap::new();
+    fn root<'a>(name: &'a str, alias: &'a HashMap<String, String>) -> Option<&'a str> {
+        let mut cur = name;
+        let mut seen = HashSet::new();
+        while let Some(next) = alias.get(cur) {
+            if !seen.insert(cur.to_string()) {
+                return None;
+            }
+            cur = next;
+        }
+        Some(cur)
+    }
+    fn walk(
+        stmts: &[Statement],
+        unannotated: &HashSet<String>,
+        alias: &mut HashMap<String, String>,
+        out: &mut Vec<String>,
+    ) {
+        for stmt in stmts {
+            match &stmt.statement {
+                StatementType::Assign(a) => {
+                    if let [ExprType::Name(target)] = a.targets.as_slice()
+                        && let ExprType::Name(src) = &a.value
+                        && (unannotated.contains(&src.id) || alias.contains_key(&src.id))
+                    {
+                        alias.insert(target.id.clone(), src.id.clone());
+                    }
+                }
+                StatementType::For(s) => {
+                    if let ExprType::Name(n) = &s.iter
+                        && let ExprType::Name(t) = &s.target
+                        && root(&n.id, alias).is_some_and(|r| unannotated.contains(r))
+                        && !out.contains(&t.id)
+                    {
+                        out.push(t.id.clone());
+                    }
+                    walk(&s.body, unannotated, alias, out);
+                    walk(&s.orelse, unannotated, alias, out);
+                }
+                StatementType::If(s) => {
+                    walk(&s.body, unannotated, alias, out);
+                    walk(&s.orelse, unannotated, alias, out);
+                }
+                StatementType::While(s) => {
+                    walk(&s.body, unannotated, alias, out);
+                    walk(&s.orelse, unannotated, alias, out);
+                }
+                StatementType::Try(t) => {
+                    walk(&t.body, unannotated, alias, out);
+                    for h in &t.handlers {
+                        walk(&h.body, unannotated, alias, out);
+                    }
+                    walk(&t.orelse, unannotated, alias, out);
+                    walk(&t.finalbody, unannotated, alias, out);
+                }
+                StatementType::With(w) => walk(&w.body, unannotated, alias, out),
+                StatementType::AsyncWith(w) => walk(&w.body, unannotated, alias, out),
+                _ => {}
+            }
+        }
+    }
+    walk(body, unannotated, &mut alias, &mut out);
+    out
+}
+
 /// The per-function inference pass. `params` are the unannotated parameter
 /// names in declaration order (excluding `self`); `name_types` and
 /// `use_counts` come from the same `analyze_function_types` pass that
@@ -223,7 +304,19 @@ pub fn infer_unannotated_signature(
     if params.is_empty() {
         return Ok(InferredSignature::default());
     }
-    let unannotated: HashSet<String> = params.iter().cloned().collect();
+    // M2 iteration: `for x in p` makes the loop variable a VIRTUAL
+    // parameter whose type variable is the iterable's element type. The
+    // pre-scan finds those targets (through `a = p` aliases) so they get
+    // type variables and their body uses are collected.
+    let fn_unannotated: HashSet<String> = params.iter().cloned().collect();
+    let elements = loop_element_names(body, &fn_unannotated);
+    let mut all_params: Vec<String> = params.to_vec();
+    for e in &elements {
+        if !all_params.contains(e) {
+            all_params.push(e.clone());
+        }
+    }
+    let unannotated: HashSet<String> = all_params.iter().cloned().collect();
     let current_fn = {
         // The function whose body we are collecting: the symbol-table
         // FunctionDef whose unannotated params match, if exactly one
@@ -267,6 +360,7 @@ pub fn infer_unannotated_signature(
         callee_cache: HashMap::new(),
         visiting: HashSet::new(),
         return_visiting: HashSet::new(),
+        loop_elements: HashMap::new(),
     };
     if let Some(f) = &current_fn {
         collector.visiting.insert(f.clone());
@@ -276,8 +370,26 @@ pub fn infer_unannotated_signature(
         return Err(err.clone());
     }
 
+    // Element names discovered during the walk (an alias-iterated
+    // parameter, or an Iterate requirement adopted from a callee) also
+    // need type variables.
+    for (elt, _param) in &collector.loop_elements {
+        if !all_params.contains(elt) {
+            all_params.push(elt.clone());
+        }
+    }
+    for reqs in collector.reqs.values() {
+        for req in reqs {
+            if let ParamReq::Iterate(elt) = req
+                && !all_params.contains(elt)
+            {
+                all_params.push(elt.clone());
+            }
+        }
+    }
+
     // A reassigned parameter cannot keep a single inferred type.
-    for name in params {
+    for name in &all_params {
         if collector.reassigned.contains(name) {
             return Err(format!(
                 "parameter `{name}` is assigned to inside the function; an inferred \
@@ -291,7 +403,7 @@ pub fn infer_unannotated_signature(
     // gets no type variable and no bounds (the concrete type's trait impls
     // are checked at the call site). Conflicting identity forces are loud.
     let mut identity_types: HashMap<String, TokenStream> = HashMap::new();
-    for name in params {
+    for name in &all_params {
         let Some(reqs) = collector.reqs.get(name) else { continue };
         for req in reqs {
             if let ParamReq::Identity(ty) = req {
@@ -315,10 +427,29 @@ pub fn infer_unannotated_signature(
 
     // One type variable per GENERIC parameter, in declaration order (single
     // param: `T`, otherwise `A`, `B`, ...).
-    let generic_params: Vec<&String> = params
+    let mut generic_params: Vec<&String> = all_params
         .iter()
         .filter(|p| !identity_types.contains_key(*p))
         .collect();
+    // A loop element of an identity-forced parameter is driven by the
+    // concrete type — drop its type variable (a declared-but-unconstrained
+    // type parameter would not compile).
+    let mut forced_elements: HashSet<String> = HashSet::new();
+    for (elt, param) in &collector.loop_elements {
+        if identity_types.contains_key(param) {
+            forced_elements.insert(elt.clone());
+        }
+    }
+    for (param, reqs) in &collector.reqs {
+        if identity_types.contains_key(param) {
+            for req in reqs {
+                if let ParamReq::Iterate(elt) = req {
+                    forced_elements.insert(elt.clone());
+                }
+            }
+        }
+    }
+    generic_params.retain(|p| !forced_elements.contains(*p));
     let mut tv_names: HashMap<String, String> = HashMap::new();
     let mut type_params = Vec::new();
     let mut param_types = HashMap::new();
@@ -333,7 +464,7 @@ pub fn infer_unannotated_signature(
             type_params.push(quote!(#ident));
         }
     }
-    for name in params {
+    for name in &all_params {
         if let Some(ty) = identity_types.get(name) {
             param_types.insert(name.clone(), ty.clone());
         } else if let Some(tv) = tv_names.get(name) {
@@ -393,6 +524,13 @@ pub fn infer_unannotated_signature(
                     quote!(#tv: #t<#rhs>)
                 }
                 ParamReq::PyFromInt => quote!(#tv: PyFromInt),
+                ParamReq::Iterate(elt) => {
+                    let elt_tv = tv_names.get(elt).ok_or_else(|| {
+                        format!("internal: loop element `{elt}` has no type variable")
+                    })?;
+                    let elt_ident = quote::format_ident!("{}", elt_tv);
+                    quote!(#tv: IntoIterator<Item = #elt_ident>)
+                }
                 ParamReq::Conversion(trait_name) => {
                     let t = quote::format_ident!("{}", trait_name);
                     quote!(#tv: #t)
@@ -958,10 +1096,47 @@ fn callee_return_type(
     let saved_fn = collector.current_fn.take();
     collector.current_fn = Some(callee.name.clone());
     collector.return_visiting.insert(callee.name.clone());
-    let result = (|| {
+    // The callee's return expressions are analyzed in the CALLEE's own
+    // scope (its name_types, params mapped to the caller's argument
+    // types): a return of a local (`return result`) resolves through the
+    // callee's analysis, while a return of a parameter stays in the
+    // caller's terms.
+    let fn_unannotated: HashSet<String> = callee
+        .args
+        .posonlyargs
+        .iter()
+        .chain(callee.args.args.iter())
+        .chain(callee.args.kwonlyargs.iter())
+        .filter(|p| p.arg != "self" && p.annotation.is_none())
+        .map(|p| p.arg.clone())
+        .collect();
+    let mut inner_unannotated = fn_unannotated.clone();
+    for e in loop_element_names(&callee.body, &fn_unannotated) {
+        inner_unannotated.insert(e);
+    }
+    let info = crate::analyze_function_types(&callee.body);
+    let result = {
+        let mut inner = Collector {
+            unannotated: &inner_unannotated,
+            name_types: &info.name_types,
+            symbols: collector.symbols,
+            options: collector.options,
+            reqs: HashMap::new(),
+            alias: HashMap::new(),
+            returns: Vec::new(),
+            reassigned: HashSet::new(),
+            duck_returns: HashMap::new(),
+            duck_method_calls: HashMap::new(),
+            error: None,
+            current_fn: Some(callee.name.clone()),
+            callee_cache: HashMap::new(),
+            visiting: HashSet::new(),
+            return_visiting: collector.return_visiting.clone(),
+            loop_elements: HashMap::new(),
+        };
         let mut inferred: Option<TokenStream> = None;
         for ret in &returns {
-            let ty = return_type_of(ret, collector, &callee_map)?;
+            let ty = return_type_of(ret, &mut inner, &callee_map)?;
             match &inferred {
                 None => inferred = Some(ty),
                 Some(prev) if prev.to_string() == ty.to_string() => {}
@@ -976,7 +1151,7 @@ fn callee_return_type(
             }
         }
         Ok(inferred.unwrap())
-    })();
+    };
     collector.current_fn = saved_fn;
     collector.return_visiting.remove(&callee.name);
     result
@@ -1154,6 +1329,17 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
         "PyStrOps" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
         "PyListOps" | "PyPop" => matches!(ty, TypeInfo::Vec(_)),
         "PyFromInt" => matches!(ty, TypeInfo::Int | TypeInfo::Float),
+        // for x in p: iterables (Vec by value, String by char, dict keys,
+        // tuples, ranges).
+        "IntoIterator" => matches!(
+            ty,
+            TypeInfo::Vec(_)
+                | TypeInfo::String
+                | TypeInfo::StrRef
+                | TypeInfo::Dict(..)
+                | TypeInfo::Tuple(_)
+                | TypeInfo::Range
+        ),
         // Generated Has* duck traits are satisfied by any user class (the
         // impl is generated for every defining class).
         _ if trait_name.starts_with("Has") => matches!(ty, TypeInfo::Class(_)),
@@ -1234,6 +1420,7 @@ pub fn check_call_sites(
         callee_cache: HashMap::new(),
         visiting: HashSet::new(),
         return_visiting: HashSet::new(),
+        loop_elements: HashMap::new(),
     };
     collector.walk(body);
     match collector.error {
@@ -1387,6 +1574,9 @@ struct Collector<'a> {
     /// Functions whose return types are being computed (cycle detection,
     /// M4).
     return_visiting: HashSet<String>,
+    /// Loop variables bound by `for x in p` over an unannotated parameter
+    /// (or an alias of one): element name → the parameter it iterates (M2).
+    loop_elements: HashMap<String, String>,
 }
 
 impl<'a> Collector<'a> {
@@ -1400,14 +1590,19 @@ impl<'a> Collector<'a> {
         for stmt in body {
             match &stmt.statement {
                 StatementType::Assign(a) => {
-                    // `x = p` makes x an alias of p; `p = ...` reassigns p.
+                    // `x = p` makes x an alias of p; any other store to an
+                    // unannotated parameter (or loop element) reassigns it,
+                    // which an inferred generic type cannot model.
                     if let [ExprType::Name(target)] = a.targets.as_slice() {
-                        if let ExprType::Name(src) = &a.value {
-                            if self.unannotated.contains(&src.id) {
+                        let aliases_param = matches!(&a.value, ExprType::Name(src)
+                            if self.unannotated.contains(&src.id)
+                                || self.alias.contains_key(&src.id));
+                        if aliases_param {
+                            if let ExprType::Name(src) = &a.value {
                                 self.alias.insert(target.id.clone(), src.id.clone());
-                            } else if self.unannotated.contains(&target.id) {
-                                self.reassigned.insert(target.id.clone());
                             }
+                        } else if self.unannotated.contains(&target.id) {
+                            self.reassigned.insert(target.id.clone());
                         }
                     }
                     // Subscript stores mutate the container: `p[i] = v`.
@@ -1474,16 +1669,33 @@ impl<'a> Collector<'a> {
                     self.walk(&s.orelse);
                 }
                 StatementType::For(s) => {
-                    // Iterating a parameter is M2 (async-stream protocol).
+                    // M2: `for x in p` over an unannotated parameter (or an
+                    // alias of one) bounds it as `IntoIterator<Item = E>`
+                    // and threads the element type into the loop variable,
+                    // which becomes a virtual parameter whose own bounds
+                    // come from the body's uses of `x`.
                     if let ExprType::Name(n) = &s.iter {
-                        self.add(
-                            &n.id,
-                            ParamReq::Untranslatable(
-                                "iterating over a parameter (`for x in p`) is not \
-                                 inferred yet (issue #109, M2)"
-                                    .to_string(),
-                            ),
-                        );
+                        if let Some(root) = self.root_unannotated(&n.id) {
+                            match &s.target {
+                                ExprType::Name(elt) => {
+                                    self.loop_elements
+                                        .insert(elt.id.clone(), root.clone());
+                                    self.add(&root, ParamReq::Iterate(elt.id.clone()));
+                                }
+                                _ => {
+                                    self.add(
+                                        &root,
+                                        ParamReq::Untranslatable(
+                                            "iterating a parameter with a tuple/attribute \
+                                             loop target is not inferred yet (issue #109, \
+                                             M2); annotate the parameter or bind the loop \
+                                             target differently"
+                                                .to_string(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                     }
                     self.walk_expr(&s.iter, false);
                     self.walk(&s.body);
@@ -2110,6 +2322,10 @@ impl<'a> Collector<'a> {
                         (t, ok)
                     }
                     ParamReq::PyFromInt => ("PyFromInt", type_satisfies(&arg_ty, "PyFromInt", None)),
+                    ParamReq::Iterate(_) => (
+                        "IntoIterator",
+                        type_satisfies(&arg_ty, "IntoIterator", None),
+                    ),
                     ParamReq::Identity(_) | ParamReq::Untranslatable(_) => continue,
                 };
                 if !ok {
@@ -2195,6 +2411,27 @@ impl<'a> Collector<'a> {
                             let mapped = self.map_callee_param(callee_name, &callee_params, args);
                             ParamReq::Method(t.clone(), *m, Some(mapped))
                         }
+                        ParamReq::Iterate(elt) => {
+                            // The callee iterates this parameter: the
+                            // caller's argument must be iterable too — a
+                            // fresh element name declares the caller-side
+                            // Item, and the callee's element requirements
+                            // adopt under it (M2 flow-through). The fresh
+                            // name is NOT in the caller's unannotated set
+                            // (it is discovered after the walk), so its
+                            // requirements are inserted directly.
+                            let fresh = format!("__rython_elt_{}", arg_param);
+                            if let Some(elt_reqs) = callee_reqs.get(elt) {
+                                for er in elt_reqs {
+                                    let mapped = self.map_adopted_req(er, &callee_params, args);
+                                    self.reqs
+                                        .entry(fresh.clone())
+                                        .or_default()
+                                        .push(mapped);
+                                }
+                            }
+                            ParamReq::Iterate(fresh)
+                        }
                         other => other.clone(),
                     };
                     self.add(&arg_param, mapped);
@@ -2225,6 +2462,36 @@ impl<'a> Collector<'a> {
         }
     }
 
+    /// Map a callee's LOOP-ELEMENT requirement into the caller's terms
+    /// (M2): parameter operands remap to the caller's arguments; a nested
+    /// iteration declares a fresh element name (the element's own body
+    /// requirements are not followed — one level of flow-through).
+    fn map_adopted_req(
+        &self,
+        req: &ParamReq,
+        callee_params: &[&crate::Parameter],
+        args: &[ExprType],
+    ) -> ParamReq {
+        match req {
+            ParamReq::Op(t, RhsType::Param(name)) => {
+                ParamReq::Op(t, self.map_callee_param(name, callee_params, args))
+            }
+            ParamReq::Cmp(t, RhsType::Param(name)) => {
+                ParamReq::Cmp(t, self.map_callee_param(name, callee_params, args))
+            }
+            ParamReq::CmpCond(t, RhsType::Param(name)) => {
+                ParamReq::CmpCond(t, self.map_callee_param(name, callee_params, args))
+            }
+            ParamReq::Method(t, m, Some(RhsType::Param(name))) => {
+                ParamReq::Method(t.clone(), *m, Some(self.map_callee_param(name, callee_params, args)))
+            }
+            ParamReq::Iterate(inner) => {
+                ParamReq::Iterate(format!("__rython_elt_{}", inner))
+            }
+            other => other.clone(),
+        }
+    }
+
     /// The requirement summary of a callee function: collect its body's
     /// requirements once per function (memoized), recursing through ITS
     /// callees. Self-recursion and cycles resolve against the in-progress
@@ -2248,7 +2515,7 @@ impl<'a> Collector<'a> {
             ));
         }
         self.visiting.insert(callee.name.clone());
-        let unannotated: HashSet<String> = callee
+        let fn_unannotated: HashSet<String> = callee
             .args
             .posonlyargs
             .iter()
@@ -2257,6 +2524,11 @@ impl<'a> Collector<'a> {
             .filter(|p| p.arg != "self" && p.annotation.is_none())
             .map(|p| p.arg.clone())
             .collect();
+        // M2: the callee's loop elements are virtual parameters too.
+        let mut unannotated = fn_unannotated.clone();
+        for e in loop_element_names(&callee.body, &fn_unannotated) {
+            unannotated.insert(e);
+        }
         let info = crate::analyze_function_types(&callee.body);
         let mut inner = Collector {
             unannotated: &unannotated,
@@ -2274,6 +2546,7 @@ impl<'a> Collector<'a> {
             callee_cache: std::mem::take(&mut self.callee_cache),
             visiting: self.visiting.clone(),
             return_visiting: self.return_visiting.clone(),
+            loop_elements: HashMap::new(),
         };
         inner.walk(&callee.body);
         let inner_error = inner.error.clone();
@@ -2321,6 +2594,24 @@ impl<'a> Collector<'a> {
                 RhsType::Same
             }
             _ => self.rhs_of(expr),
+        }
+    }
+
+    /// The root unannotated parameter a name flows from, following the
+    /// `x = p` alias chain (`a = p; for x in a` iterates p).
+    fn root_unannotated(&self, name: &str) -> Option<String> {
+        let mut cur = name.to_string();
+        let mut seen = HashSet::new();
+        while let Some(next) = self.alias.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                return None;
+            }
+            cur = next.clone();
+        }
+        if self.unannotated.contains(&cur) {
+            Some(cur)
+        } else {
+            None
         }
     }
 

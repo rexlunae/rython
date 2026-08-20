@@ -1086,6 +1086,34 @@ impl CodeGen for FunctionDef {
                         )
                     }
                 }
+            } else if inferred_signature.return_type.as_ref().is_some_and(|ty| {
+                // A return type that references a type variable (a loop
+                // element, an associated Output) cannot coexist with a
+                // fall-through path (Python returns None there) — loud,
+                // never a rustc mismatch at build time. A CONCRETE partial
+                // return (e.g. `if c: return 1`) keeps the old Result<()>
+                // shape.
+                let s = ty.to_string();
+                let tokens: Vec<&str> = s
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                inferred_signature.type_params.iter().any(|p| {
+                    let p = p.to_string();
+                    tokens.iter().any(|t| *t == p)
+                })
+            }) {
+                // Some path returns an inferred generic value while
+                // another can fall through (Python returns None there) —
+                // the value cannot be both that type and unit. Loud,
+                // never a rustc mismatch at build time (issue #109, M2).
+                return Err(
+                    "this function returns an inferred value on some path but can \
+                     fall through without one (Python would return None); annotate \
+                     its return type (issue #109, M2)"
+                        .to_string()
+                        .into(),
+                );
             } else {
                 quote!(-> Result<(), PyException>)
             }

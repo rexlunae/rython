@@ -139,7 +139,17 @@ impl CodeGen for For {
             };
             (target, quote!(#(#body_stmts;)*))
         };
-        let iter = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // The iterable is CONSUMED by the loop (IntoIterator::into_iter),
+        // so a name reused later is cloned here — Python's for loop does
+        // not consume its iterable (issue #109, M2: iteration over
+        // inferred parameters). The reuse-clone rule's `T: Clone` bound
+        // makes this compile for generic parameters.
+        let iter = crate::render_reused(
+            &self.iter,
+            ctx.clone(),
+            options.clone(),
+            symbols.clone(),
+        )?;
 
         if !has_else {
             Ok(quote! {
