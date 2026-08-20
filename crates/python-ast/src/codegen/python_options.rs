@@ -216,6 +216,13 @@ pub struct PythonOptions {
     /// some path, or annotated Optional): non-None stores into them wrap
     /// in Some. Set per scope by the function/module generators.
     pub optional_names: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Names whose Option-ness is statically narrowed away at the CURRENT
+    /// point (issue #125): inside `if x is not None:`, and after an if/else
+    /// where both branches leave x holding a non-None value. Reads of a
+    /// narrowed name unwrap (`(x).clone().unwrap()`); their type is the
+    /// Option's inner type. Threaded by the function body loop and by
+    /// If::to_rust (the body narrows from the test).
+    pub narrowed_names: std::rc::Rc<std::collections::HashSet<String>>,
 
     /// Whether the CURRENT function's return annotation is `str`: returning
     /// an attribute chain then clones the String field out of the shared
@@ -380,6 +387,7 @@ impl Default for PythonOptions {
             owned_str_literals: std::rc::Rc::new(std::collections::HashSet::new()),
             definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            narrowed_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
             module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),

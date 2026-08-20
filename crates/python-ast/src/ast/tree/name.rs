@@ -81,7 +81,7 @@ impl CodeGen for Name {
     fn to_rust(
         self,
         _ctx: Self::Context,
-        _options: Self::Options,
+        options: Self::Options,
         _symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         // Handle dotted names (like "os.path") by converting them to Rust module paths
@@ -91,6 +91,15 @@ impl CodeGen for Name {
             Ok(quote!(#(#idents)::*))
         } else {
             let name = crate::safe_ident(&self.id);
+            // Issue #125: a name narrowed by `if x is not None:` (or by an
+            // if/else whose branches both leave x non-None) still holds an
+            // Option at runtime — the binding is hoisted once. Every READ
+            // must unwrap it: Python's value IS the inner value in the
+            // narrowed region. clone() keeps the read non-consuming so the
+            // name stays usable (the hoisted binding is reused).
+            if options.narrowed_names.contains(&self.id) {
+                return Ok(quote!((#name).clone().unwrap()));
+            }
             Ok(quote!(#name))
         }
     }

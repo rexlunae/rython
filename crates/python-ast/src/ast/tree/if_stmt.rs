@@ -67,10 +67,27 @@ impl CodeGen for If {
         // so Python truthiness applies.
         let test =
             crate::condition_to_rust(&self.test, ctx.clone(), options.clone(), symbols.clone())?;
-        
-        let body_stmts: Result<Vec<_>, _> = self.body
+
+        // Issue #125: `if x is not None:` narrows x to its inner type inside
+        // the body — reads unwrap (Name::to_rust consults narrowed_names),
+        // and the comprehension/iteration over x sees the inner element
+        // type. Any other test narrows nothing.
+        let mut body_options = options.clone();
+        if let Some((narrowed, inner)) = crate::narrowing_from_test(&self.test, &options) {
+            let mut narrowed_names = options.narrowed_names.as_ref().clone();
+            narrowed_names.insert(narrowed.clone());
+            body_options.narrowed_names = std::rc::Rc::new(narrowed_names);
+            if let Some(inner) = inner {
+                let mut name_types = options.name_types.as_ref().clone();
+                name_types.insert(narrowed.clone(), inner);
+                body_options.name_types = std::rc::Rc::new(name_types);
+            }
+        }
+
+        let body_stmts: Result<Vec<_>, _> = self
+            .body
             .into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
         

@@ -1185,6 +1185,13 @@ impl CodeGen for FunctionDef {
                 class: ctx.enclosing_class_name().map(str::to_string),
             },
         };
+        // Issue #125: thread narrowed-Option state through the body. After
+        // `if x is not None: <body> else: <else>` where BOTH branches leave
+        // x holding a non-None value, x is non-None for the rest of the
+        // function (Python narrows it; the hoisted binding stays Option, so
+        // every later read must unwrap). A name assigned None on some path
+        // drops out of the narrowed set again.
+        let mut narrowed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
@@ -1197,11 +1204,14 @@ impl CodeGen for FunctionDef {
                 streams.extend(quote!(;));
                 continue;
             }
+            let mut stmt_options = options.clone();
+            stmt_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
             streams.extend(
                 s.clone()
-                    .to_rust(body_ctx.clone(), options.clone(), symbols.clone())?,
+                    .to_rust(body_ctx.clone(), stmt_options, symbols.clone())?,
             );
             streams.extend(quote!(;));
+            crate::update_narrowed_after_statement(s, &mut narrowed, &options);
         }
 
         // Every generated function returns Result<T, PyException> so raised

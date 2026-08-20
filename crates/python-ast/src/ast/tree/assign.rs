@@ -224,9 +224,26 @@ impl<'a> CodeGen for Assign {
                         quote!((#(#elts),*))
                     }
                 }
-                _ => target
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                _ => {
+                    // A plain name target is a STORE into the hoisted
+                    // binding — never an unwrap, even when the name is
+                    // narrowed (issue #125): the binding stays Option<T>
+                    // and the store wraps in Some below. Render with the
+                    // narrowed set cleared so Name::to_rust emits the bare
+                    // binding.
+                    if matches!(target, ExprType::Name(_)) {
+                        let mut store_options = options.clone();
+                        store_options.narrowed_names =
+                            std::rc::Rc::new(std::collections::HashSet::new());
+                        target
+                            .clone()
+                            .to_rust(ctx.clone(), store_options, symbols.clone())?
+                    } else {
+                        target
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    }
+                }
             };
             Ok(match target {
                 ExprType::Name(name) => {
@@ -346,11 +363,19 @@ impl<'a> CodeGen for Assign {
             if let ExprType::Name(name) = &self.targets[0]
                 && options.optional_names.contains(&name.id)
             {
-                let target_code = self.targets[0].clone().to_rust(
-                    ctx.clone(),
-                    options.clone(),
-                    symbols.clone(),
-                )?;
+                // The target is a STORE into the hoisted binding — never an
+                // unwrap, even when the name is narrowed (issue #125): the
+                // binding stays Option<T> and the store wraps in Some below.
+                let target_code = {
+                    let mut store_options = options.clone();
+                    store_options.narrowed_names =
+                        std::rc::Rc::new(std::collections::HashSet::new());
+                    self.targets[0].clone().to_rust(
+                        ctx.clone(),
+                        store_options,
+                        symbols.clone(),
+                    )?
+                };
                 // An empty-container literal was already rendered with its
                 // pinned element type above (Vec::<T>::new()); reuse it so
                 // the Some wrap lands on the typed container, not on a bare

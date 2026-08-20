@@ -251,6 +251,51 @@ fn dataclass_synthesizes_init_from_annotated_fields() {
 }
 
 #[test]
+fn is_not_none_narrows_option_names() {
+    // `if x is not None:` narrows x to its inner type in the body (reads
+    // unwrap, comprehension/iteration sees the inner element), and when
+    // both branches leave x non-None the name stays narrowed for the rest
+    // of the function (charset_normalizer's cp_isolation pattern).
+    let out = compile(
+        "def f(cp_isolation: list[str] | None = None) -> list[str]:\n\
+         \x20   if cp_isolation is not None:\n\
+         \x20       cp_isolation = [x + \"!\" for x in cp_isolation]\n\
+         \x20   else:\n\
+         \x20       cp_isolation = []\n\
+         \x20   return cp_isolation\n",
+        "narrow.py",
+    );
+    // Reads inside the narrowed body unwrap the Option.
+    assert!(
+        out.contains("clone () . unwrap ()") || out.contains("clone().unwrap()"),
+        "narrowed reads must unwrap: {}",
+        out
+    );
+    // The comprehension iterates the inner element type (String), not the
+    // Option's single inner Vec as one element.
+    assert!(
+        out.contains("for x in (cp_isolation) . clone () . unwrap ()")
+            || out.contains("for x in (cp_isolation).clone().unwrap()"),
+        "comprehension must iterate the unwrapped list: {}",
+        out
+    );
+    // The post-if return unwraps too (both branches left x non-None).
+    assert!(
+        out.contains("return Ok ((cp_isolation) . clone () . unwrap ())")
+            || out.contains("return Ok((cp_isolation).clone().unwrap())"),
+        "post-if reads must unwrap: {}",
+        out
+    );
+    // The STORE target must NOT unwrap (it wraps in Some below).
+    assert!(
+        !out.contains("(cp_isolation) . clone () . unwrap () = Some")
+            && !out.contains("(cp_isolation).clone().unwrap() = Some"),
+        "store targets must not unwrap: {}",
+        out
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at
