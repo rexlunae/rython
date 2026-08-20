@@ -3284,6 +3284,20 @@ impl<'a> CodeGen for Call {
         let callee = match self.func.as_ref() {
             ExprType::Name(n) => match symbols.get(&n.id) {
                 Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),
+                // Issue #123: an IMPORTED function (`from pip._internal.
+                // locations import get_scheme`) resolves through the
+                // defining module's AST, with that module's symbol table —
+                // the same cross-module lookup classes use. This unlocks
+                // keyword arguments on imported functions and, via
+                // `module_function_def`, return-annotation typing.
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let path = i.resolved_module_path(&options);
+                    if options.module_defs.contains_key(&path) {
+                        crate::module_function_def(&options, &path, &n.id).map(|(f, _)| f)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             _ => None,

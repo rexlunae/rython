@@ -1544,6 +1544,31 @@ pub fn module_class_def(
     info.classes.get(name).cloned().map(|c| (c, info.symbols.clone()))
 }
 
+/// Resolve a FUNCTION defined at the top level of another module of the
+/// crate, with that module's symbol table (issue #123): `from
+/// pip._internal.locations import get_scheme` + `scheme = get_scheme(...)`
+/// needs `get_scheme`'s `-> Scheme` return annotation to type
+/// `scheme.scripts`, and keyword arguments on an imported function require
+/// its signature. Returns None when the module or the function is not
+/// found (an import of a builtin/stdlib name, a vendored non-module, ...).
+pub fn module_function_def(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<(crate::FunctionDef, SymbolTableScopes)> {
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    for s in &module.raw.body {
+        if let crate::StatementType::FunctionDef(f) = &s.statement {
+            if f.name == name {
+                return Some((f.clone(), symbols));
+            }
+        }
+    }
+    None
+}
+
 /// The cached class facts for the module at `path`, building the
 /// once-per-conversion table over every module of the crate on first use.
 fn module_class_info(

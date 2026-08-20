@@ -296,6 +296,56 @@ fn is_not_none_narrows_option_names() {
 }
 
 #[test]
+fn imported_function_keyword_args_resolve_cross_module() {
+    // Issue #123: `from helpers import greet` + `greet(name, excited=True)`
+    // needs the callee's signature, which lives in the DEFINING module —
+    // the same cross-module lookup classes use. Without it, keyword
+    // arguments on imported functions were a loud error.
+    let helpers = parse(
+        "def greet(name: str, *, excited: bool = False) -> str:\n\
+         \x20   return name + (\"!\" if excited else \"\")\n",
+        "helpers.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["helpers".to_string()],
+        std::rc::Rc::new(helpers),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let caller = parse(
+        "from helpers import greet\n\
+         \ndef use() -> str:\n\
+         \x20   return greet(\"hi\", excited=True)\n",
+        "caller.py",
+    )
+    .unwrap();
+    let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
+    let out = caller
+        .to_rust(
+            CodeGenContext::Module("caller".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    // The keyword maps to its parameter position (the bool, not a string).
+    assert!(
+        out.contains("greet (__rython_arg_0 , __rython_arg_1)"),
+        "keyword must map to the parameter position: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_arg_1 = true") || out.contains("__rython_arg_1 = true ;"),
+        "excited=True must bind true: {}",
+        out
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at
