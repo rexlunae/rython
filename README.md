@@ -119,6 +119,39 @@ Known gaps:
 - **File objects** cover text modes (`r`/`w`/`a`) and `io.StringIO`;
   binary modes, `BytesIO`, `seek`/`tell`, and file-based `json`
   (`dump`/`load`) are not supported yet.
+
+## Documented divergences from CPython
+
+Determined by converting the top-5 most-downloaded PyPI packages
+(urllib3, requests, botocore, boto3, pip) and recording the blockers.
+Each is a deliberate boundary of rython's static, value-semantics model —
+a loud conversion error or build-time type error at the exact Python
+line, never a silent behaviour change:
+
+- **`*args`/`**kwargs` (variadic parameters)** — `def __init__(self,
+  num_pools=10, **connection_pool_kwargs)` is a loud error. Blocks
+  urllib3's `PoolManager` (and everything that depends on urllib3,
+  including botocore/boto3) and s3transfer's callback helpers.
+- **Dynamic imports and the import machinery** — `importlib`,
+  `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
+  modeled: rython compiles imports statically. Blocks pip's
+  `__pip-runner__.py` import-redirection bootstrapper.
+- **Runtime `argparse` objects** — the conversion-time typed-namespace
+  `argparse` works for the entry module; `argparse.ArgumentParser()`
+  with `add_argument(..., action=, help=, ...)`/`parse_args()` in
+  non-entry modules (certifi's `__main__.py`, idna's `cli.py`) is a
+  loud error.
+- **Classes as values** — a class object cannot be passed, stored, or
+  returned (`category: type[Warning]` defaults to a class, duck-typed
+  module `__getattr__` returning `importlib.import_module(...)`).
+  `type[X]` annotations are tolerated as an opaque `Option<()>` so
+  definitions compile; any call that actually passes a class is a type
+  error. Blocks dateutil's lazy submodule loading (and thereby
+  botocore/boto3's shared first module) and urllib3's
+  `disable_warnings(category=...)`.
+- **Attribute reads on unannotated parameters** — `p.attr` where `attr`
+  is neither a known method nor a field of a known class is a loud
+  error (s3transfer's `request.body.disable_callback()`).
 - **`argparse`** supports literal specs only (the parser is evaluated at
   conversion time): `str`/`int`/`float` positionals, `--long` options
   with `default=`, `store_true`, `help=`, `prog=`, `description=`.
