@@ -65,6 +65,7 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
             | "subprocess"
             | "sysconfig"
             | "venv"
+            | "warnings"
             | "numpy"
             | "asyncio"
     )

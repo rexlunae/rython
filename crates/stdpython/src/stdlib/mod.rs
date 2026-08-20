@@ -72,7 +72,9 @@ pub mod tempfile;
 #[cfg(feature = "std")]
 pub mod glob;
 
-/// Python warnings module - diagnostics (issue #111).
+/// Python warnings module - diagnostics (issue #111). std-gated: it
+/// prints to stderr, which the alloc tier has no access to.
+#[cfg(feature = "std")]
 pub mod warnings;
 
 /// Python functools module - higher-order functions (reduce)
