@@ -5493,6 +5493,26 @@ fn classmethod_and_staticmethod_lower_as_associated_functions() {
 }
 
 #[test]
+fn type_subscript_annotation_is_tolerated() {
+    // `category: type[Warning]` is a CLASS annotation — tolerated as an
+    // opaque Option<()> so the definition compiles (class-as-value calls
+    // are the documented divergence).
+    let out = compile(
+        concat!(
+            "import warnings\n",
+            "def disable_warnings(category: type[Warning] = None) -> None:\n",
+            "    warnings.simplefilter(\"ignore\", category)\n",
+        ),
+        "type_ann.py",
+    );
+    assert!(
+        !out.contains("unsupported annotation"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

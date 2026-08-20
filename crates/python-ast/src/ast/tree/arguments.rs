@@ -213,6 +213,13 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 _ => return None,
             };
             match (&sub.kind, container) {
+                // `type[X]` / `Type[X]` is a CLASS, which rython cannot
+                // pass as a value — tolerated as an opaque Option<()> so
+                // the definition compiles (a call passing an actual class
+                // is the documented class-as-value divergence).
+                (crate::SubscriptKind::Index(_), "type" | "Type") => {
+                    Some(quote!(Option<()>))
+                }
                 (crate::SubscriptKind::Index(elt), "Optional") => {
                     let inner = python_annotation_to_rust_type(elt)?;
                     Some(quote!(Option<#inner>))
