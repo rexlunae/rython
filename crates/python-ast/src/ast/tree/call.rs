@@ -2386,6 +2386,49 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // `Class.method(args)` where `method` is a @classmethod/
+        // @staticmethod (issue #117): an ASSOCIATED call — the class name
+        // is a type, so the call lowers to `Class::method(args)` with the
+        // class reference (cls) dropped from the callee signature.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let ExprType::Name(receiver) = attr.value.as_ref()
+            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(&receiver.id)
+            && let Some(method) = class.method_on_mro(&attr.attr, &symbols)
+        {
+            let is_associated = matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
+                || matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "staticmethod");
+            if is_associated {
+                if method.args.vararg.is_some() || method.args.kwarg.is_some() {
+                    return Err(format!(
+                        "`{}.{}` takes *args/**kwargs, which is not supported yet",
+                        class.name, method.name
+                    )
+                    .into());
+                }
+                let mut sig = method.clone();
+                if matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
+                {
+                    // Drop the class-reference parameter (cls/self).
+                    if !sig.args.posonlyargs.is_empty() {
+                        sig.args.posonlyargs.remove(0);
+                    } else if !sig.args.args.is_empty() {
+                        sig.args.args.remove(0);
+                    }
+                }
+                let MappedArguments { prelude, args } = map_call_arguments(
+                    &sig,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                )?;
+                let cname = crate::safe_ident(&receiver.id);
+                let method_name = crate::safe_ident(&attr.attr);
+                return Ok(quote!({ #prelude #cname::#method_name(#(#args),*)? }));
+            }
+        }
+
         // Python methods whose Rust inherent namesakes have DIFFERENT
         // semantics (or the wrong shape) are rewritten here; methods with no
         // Rust conflict resolve through the stdpython PyListOps/PyStrOps

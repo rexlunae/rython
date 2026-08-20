@@ -402,13 +402,26 @@ fn lower_parse_args(
 /// bare @lru_cache default is 128). ANY other decorator is a loud
 /// error: silently ignoring a decorator converts a program into a
 /// different one.
-fn parse_cache_decorator(
+/// What a function's decorators ask for. `@classmethod`/`@staticmethod`
+/// (issue #117) make the method an ASSOCIATED function — no receiver; a
+/// classmethod additionally drops its first parameter (cls/self — the
+/// class reference). Anything else is a loud error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MethodDecorator {
+    None,
+    Cache(Option<Option<i64>>),
+    ClassMethod,
+    StaticMethod,
+}
+
+fn parse_method_decorator(
     decorators: &[ExprType],
-) -> Result<Option<Option<i64>>, Box<dyn std::error::Error>> {
+) -> Result<MethodDecorator, Box<dyn std::error::Error>> {
     let unsupported = |what: &str| -> Box<dyn std::error::Error> {
         format!(
-            "decorator `{}` is not supported yet (only functools.lru_cache and \
-             functools.cache are); rython refuses to silently ignore it",
+            "decorator `{}` is not supported yet (only functools.lru_cache, \
+             functools.cache, classmethod, and staticmethod are); rython refuses to \
+             silently ignore it",
             what
         )
         .into()
@@ -424,21 +437,23 @@ fn parse_cache_decorator(
         }
     };
     match decorators {
-        [] => Ok(None),
+        [] => Ok(MethodDecorator::None),
         [single] => {
             let (base, call) = match single {
                 ExprType::Call(c) => (name_of(c.func.as_ref()), Some(c)),
                 other => (name_of(other), None),
             };
             match (base.as_deref(), call) {
-                (Some("cache"), None) => Ok(Some(None)),
+                (Some("classmethod"), None) => Ok(MethodDecorator::ClassMethod),
+                (Some("staticmethod"), None) => Ok(MethodDecorator::StaticMethod),
+                (Some("cache"), None) => Ok(MethodDecorator::Cache(Some(None))),
                 (Some("cache"), Some(c)) if c.args.is_empty() && c.keywords.is_empty() => {
-                    Ok(Some(None))
+                    Ok(MethodDecorator::Cache(Some(None)))
                 }
-                (Some("lru_cache"), None) => Ok(Some(Some(128))),
+                (Some("lru_cache"), None) => Ok(MethodDecorator::Cache(Some(Some(128)))),
                 (Some("lru_cache"), Some(c)) => {
                     let maxsize = match (c.args.as_slice(), c.keywords.as_slice()) {
-                        ([], []) => return Ok(Some(Some(128))),
+                        ([], []) => return Ok(MethodDecorator::Cache(Some(Some(128)))),
                         ([e], []) => e.clone(),
                         ([], [kw]) if kw.arg.as_deref() == Some("maxsize") => {
                             kw.value.clone()
@@ -452,13 +467,13 @@ fn parse_cache_decorator(
                         }
                     };
                     if crate::is_none_expr(&maxsize) {
-                        return Ok(Some(None));
+                        return Ok(MethodDecorator::Cache(Some(None)));
                     }
                     match &maxsize {
                         ExprType::Constant(c) => match &c.0 {
                             Some(litrs::Literal::Integer(i)) => {
                                 let n: i64 = i.value().ok_or("maxsize out of range")?;
-                                Ok(Some(Some(n)))
+                                Ok(MethodDecorator::Cache(Some(Some(n))))
                             }
                             _ => Err("lru_cache maxsize must be an integer literal or None"
                                 .to_string()
@@ -542,8 +557,13 @@ impl CodeGen for FunctionDef {
         });
 
         // functools cache decorators rewrite the whole definition below;
-        // any OTHER decorator is a loud error (see parse_cache_decorator).
-        let cache_spec = parse_cache_decorator(&self.decorator_list)?;
+        // @classmethod/@staticmethod change the method shape; any OTHER
+        // decorator is a loud error (see parse_method_decorator).
+        let decorator = parse_method_decorator(&self.decorator_list)?;
+        let cache_spec = match decorator {
+            MethodDecorator::Cache(spec) => spec,
+            _ => None,
+        };
         if cache_spec.is_some() && options.no_std {
             return Err(format!(
                 "@lru_cache on `{}` needs a global Mutex, which the no_std \
@@ -591,16 +611,32 @@ impl CodeGen for FunctionDef {
         // calling another method of the class that does. In a Trait context
         // the method is emitted as a trait item (a default in the class's
         // trait, or an override in an ancestor's trait's impl).
-        let is_method = matches!(
-            &ctx,
-            CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
-        ) && self
-            .args
-            .posonlyargs
-            .first()
-            .or(self.args.args.first())
-            .is_some_and(|p| p.arg == "self");
+        let is_class_method = matches!(decorator, MethodDecorator::ClassMethod);
+        let is_static_method = matches!(decorator, MethodDecorator::StaticMethod);
+        // @classmethod/@staticmethod are ASSOCIATED functions: no receiver
+        // (issue #117). A classmethod's first parameter is the class
+        // reference (cls/self) and is dropped.
+        let is_method = !is_class_method
+            && !is_static_method
+            && matches!(
+                &ctx,
+                CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+            )
+            && self
+                .args
+                .posonlyargs
+                .first()
+                .or(self.args.args.first())
+                .is_some_and(|p| p.arg == "self");
         let mut render_args = self.args.clone();
+        if is_class_method {
+            // Drop the class-reference parameter.
+            if !render_args.posonlyargs.is_empty() {
+                render_args.posonlyargs.remove(0);
+            } else if !render_args.args.is_empty() {
+                render_args.args.remove(0);
+            }
+        }
         let method_mutates_self = is_method
             && match &ctx {
                 CodeGenContext::Class(class_name)
@@ -924,24 +960,79 @@ impl CodeGen for FunctionDef {
         // `fn add<A, B>(a: A, b: B) -> Result<<A as PyAdd<B>>::Output, ...>
         // where A: PyAdd<B>`. The `impl Into<PyObject>` dead end is gone:
         // an unannotated parameter either infers or fails loudly here.
+        // A None-defaulted unannotated parameter can only ever hold None
+        // (its generic type variable would be un-inferable from None at
+        // call sites) — it gets the concrete Option<()> type and takes no
+        // part in inference (issue #117).
+        let none_defaulted: std::collections::HashSet<String> = self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+            .filter(|p| p.annotation.is_none())
+            .filter(|p| {
+                let pos = self
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(self.args.args.iter())
+                    .position(|q| q.arg == p.arg);
+                let from = self.args.posonlyargs.len() + self.args.args.len()
+                    - self.args.defaults.len();
+                match pos {
+                    Some(i) if i >= from => self
+                        .args
+                        .defaults
+                        .get(i - from)
+                        .is_some_and(|d| crate::is_none_expr(d)),
+                    _ => {
+                        let kw = self
+                            .args
+                            .kwonlyargs
+                            .iter()
+                            .zip(self.args.kw_defaults.iter())
+                            .find(|(q, _)| q.arg == p.arg);
+                        kw.is_some_and(|(_, d)| {
+                            d.as_deref().is_some_and(crate::is_none_expr)
+                        })
+                    }
+                }
+            })
+            .map(|p| p.arg.clone())
+            .collect();
         let inferred_signature = {
+            // @classmethod/@staticmethod are associated functions (no
+            // receiver, class ref dropped) — NOT methods, so unannotated
+            // parameters are inferred like free functions (issue #117).
             let is_method = matches!(
                 &ctx,
                 CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
-            ) && self
-                .args
-                .posonlyargs
-                .first()
-                .or(self.args.args.first())
-                .is_some_and(|p| p.arg == "self");
+            ) && !is_class_method
+                && !is_static_method
+                && self
+                    .args
+                    .posonlyargs
+                    .first()
+                    .or(self.args.args.first())
+                    .is_some_and(|p| p.arg == "self");
             let unannotated: Vec<String> = self
                 .args
                 .posonlyargs
                 .iter()
                 .chain(self.args.args.iter())
                 .chain(self.args.kwonlyargs.iter())
-                .filter(|p| p.arg != "self" && p.annotation.is_none())
-                .map(|p| p.arg.clone())
+                // A classmethod's first parameter is the class reference
+                // (cls/self) — dropped from the signature, so it takes no
+                // part in inference (issue #117).
+                .enumerate()
+                .filter(|(i, p)| {
+                    !(is_class_method && *i == 0)
+                        && p.arg != "self"
+                        && p.annotation.is_none()
+                        && !none_defaulted.contains(&p.arg)
+                })
+                .map(|(_, p)| p.arg.clone())
                 .collect();
             if unannotated.is_empty() {
                 // No inferred parameters: the body's calls are still
@@ -986,7 +1077,13 @@ impl CodeGen for FunctionDef {
         // (Parameter::to_rust emits `a: A` instead of the dead
         // `impl Into<PyObject>`), and the stdlib-method-bound parameters
         // into method-call dispatch (M2).
-        options.param_type_vars = std::rc::Rc::new(inferred_signature.param_types.clone());
+        // None-defaulted unannotated parameters are concrete Option<()> —
+        // nothing but None can ever be stored in them (issue #117).
+        let mut final_param_types = inferred_signature.param_types.clone();
+        for name in &none_defaulted {
+            final_param_types.insert(name.clone(), quote!(Option<()>));
+        }
+        options.param_type_vars = std::rc::Rc::new(final_param_types);
         options.param_method_params =
             std::rc::Rc::new(inferred_signature.method_params.clone());
         options.duck_methods_on_params =

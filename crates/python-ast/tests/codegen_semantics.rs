@@ -5464,6 +5464,35 @@ fn class_with_a_foreign_base_is_a_loud_error() {
 }
 
 #[test]
+fn classmethod_and_staticmethod_lower_as_associated_functions() {
+    // Issue #117: @classmethod drops the class reference parameter and
+    // emits an associated fn; @staticmethod likewise. Calls route
+    // `Class::method(...)`.
+    let out = compile(
+        concat!(
+            "class Finder:\n",
+            "    @classmethod\n",
+            "    def find_spec(cls, fullname):\n",
+            "        return fullname\n",
+            "    @staticmethod\n",
+            "    def hint():\n",
+            "        return \"hint\"\n",
+            "print(Finder.find_spec(\"pip\"))\n",
+            "print(Finder.hint())\n",
+        ),
+        "classmethod.py",
+    );
+    assert!(out.contains("Finder :: find_spec"), "generated: {}", out);
+    assert!(out.contains("Finder :: hint"), "generated: {}", out);
+    // The class reference is dropped: no receiver, no cls parameter.
+    assert!(
+        !out.contains("fn find_spec (cls"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.
