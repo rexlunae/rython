@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::FromPyObject;
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -273,11 +273,41 @@ impl CodeGen for Import {
     }
 }
 
-#[derive(Clone, Debug, FromPyObject, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ImportFrom {
+    /// The dotted module being imported FROM. `from . import x` and
+    /// `from . import` (relative imports with no module part) have
+    /// module = None in Python's AST — extracted as "" here so the
+    /// resolved path is just the current package.
     pub module: String,
     pub names: Vec<Alias>,
     pub level: usize,
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for ImportFrom {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let module: Option<String> = ob
+            .getattr("module")
+            .map_err(|e| crate::extraction_failure("ImportFrom module", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("ImportFrom module", &ob, e))?;
+        let names: Vec<Alias> = ob
+            .getattr("names")
+            .map_err(|e| crate::extraction_failure("ImportFrom names", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("ImportFrom names", &ob, e))?;
+        let level: usize = ob
+            .getattr("level")
+            .map_err(|e| crate::extraction_failure("ImportFrom level", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("ImportFrom level", &ob, e))?;
+        Ok(ImportFrom {
+            module: module.unwrap_or_default(),
+            names,
+            level,
+        })
+    }
 }
 
 impl ImportFrom {
