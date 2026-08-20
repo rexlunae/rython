@@ -1322,6 +1322,24 @@ pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
             _ => None,
         },
         ExprType::JoinedStr(_) => Some(quote!(String)),
+        // `"sep".join(iterable)` — and join on any string literal — yields
+        // an owned String (str::join / PyStrOps::join). Common idiom
+        // (version strings, path joining); the method table omits join for
+        // the unannotated-parameter bound, but concrete receivers work.
+        ExprType::Call(call) => {
+            if let ExprType::Attribute(a) = call.func.as_ref()
+                && a.attr == "join"
+                && matches!(
+                    a.value.as_ref(),
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                )
+            {
+                Some(quote!(String))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

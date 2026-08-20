@@ -5236,6 +5236,61 @@ fn satisfiable_bound_sets_do_not_warn() {
 }
 
 #[test]
+fn join_on_a_string_literal_infers_a_string_return() {
+    // Issue #116: `",".join(parts)` on a literal receiver — the return is
+    // an owned String, and the argument must be an iterable of AsRef<str>.
+    let out = compile(
+        "def join_all(parts):\n    return \",\".join(parts)\n",
+        "inf_join.py",
+    );
+    assert!(
+        out.contains("-> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("A : IntoIterator < Item = B >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("B : AsRef < str >"), "generated: {}", out);
+}
+
+#[test]
+fn genexpr_over_a_parameter_infers_iteration_bounds() {
+    // Issue #116: `".".join(str(v) for v in version)` — the pip pattern.
+    // The generator's iterable bounds IntoIterator; the element's uses
+    // (str(v)) bound the element.
+    let out = compile(
+        "def version_str(version):\n    return \".\".join(str(v) for v in version)\n",
+        "inf_genexpr.py",
+    );
+    assert!(out.contains("A : IntoIterator < Item = B >"), "generated: {}", out);
+    assert!(out.contains("B : PyToString"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn list_comprehension_over_a_parameter_infers_a_vec_return() {
+    // `[w.upper() for w in words]` — Vec<String> return, element bounds
+    // from the comprehension body (issue #116).
+    let out = compile(
+        "def upper_all(words):\n    return [w.upper() for w in words]\n",
+        "inf_listcomp.py",
+    );
+    assert!(
+        out.contains("-> Result < Vec < String > , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("B : PyStrOps"), "generated: {}", out);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

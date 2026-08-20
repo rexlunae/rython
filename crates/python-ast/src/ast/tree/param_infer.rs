@@ -80,6 +80,9 @@ pub enum ParamReq {
     /// Item = E>`, where the element name is a virtual parameter whose own
     /// requirements come from the loop body's uses of `x`.
     Iterate(String),
+    /// An element of a `"sep".join(...)` argument (issue #116): the
+    /// element must be `AsRef<str>` so `str::join`/PyStrOps::join accept it.
+    AsRefStr,
     /// `int(p)` / `float(p)` / `bool(p)` / `str(p)` / `abs(p)` — the
     /// runtime conversion trait (`PyInt`, `PyFloat`, ...).
     Conversion(&'static str),
@@ -245,6 +248,58 @@ fn loop_element_names(body: &[Statement], unannotated: &HashSet<String>) -> Vec<
         }
         Some(cur)
     }
+    // Comprehension/generator-expression targets whose iterable resolves
+    // to an unannotated parameter (`str(v) for v in version` — issue #116).
+    fn scan_comprehensions<'a>(
+        expr: &'a ExprType,
+        unannotated: &HashSet<String>,
+        alias: &'a HashMap<String, String>,
+        out: &mut Vec<String>,
+    ) {
+        let (elt, generators): (&ExprType, &[crate::Comprehension]) = match expr {
+            ExprType::ListComp(l) => (l.elt.as_ref(), &l.generators),
+            ExprType::SetComp(s) => (s.elt.as_ref(), &s.generators),
+            ExprType::DictComp(d) => (d.value.as_ref(), &d.generators),
+            ExprType::GeneratorExp(g) => (g.elt.as_ref(), &g.generators),
+            _ => return,
+        };
+        for g in generators {
+            if let ExprType::Name(n) = &g.iter
+                && let ExprType::Name(t) = &g.target
+                && root(&n.id, alias).is_some_and(|r| unannotated.contains(r))
+                && !out.contains(&t.id)
+            {
+                out.push(t.id.clone());
+            }
+        }
+        scan_expr(elt, unannotated, alias, out);
+    }
+    fn scan_expr(
+        expr: &ExprType,
+        unannotated: &HashSet<String>,
+        alias: &HashMap<String, String>,
+        out: &mut Vec<String>,
+    ) {
+        match expr {
+            ExprType::Call(c) => {
+                for arg in &c.args {
+                    scan_expr(arg, unannotated, alias, out);
+                }
+                for kw in &c.keywords {
+                    scan_expr(&kw.value, unannotated, alias, out);
+                }
+            }
+            ExprType::ListComp(_)
+            | ExprType::SetComp(_)
+            | ExprType::DictComp(_)
+            | ExprType::GeneratorExp(_) => scan_comprehensions(expr, unannotated, alias, out),
+            ExprType::IfExp(e) => {
+                scan_expr(&e.body, unannotated, alias, out);
+                scan_expr(&e.orelse, unannotated, alias, out);
+            }
+            _ => {}
+        }
+    }
     fn walk(
         stmts: &[Statement],
         unannotated: &HashSet<String>,
@@ -260,6 +315,7 @@ fn loop_element_names(body: &[Statement], unannotated: &HashSet<String>) -> Vec<
                     {
                         alias.insert(target.id.clone(), src.id.clone());
                     }
+                    scan_expr(&a.value, unannotated, alias, out);
                 }
                 StatementType::For(s) => {
                     if let ExprType::Name(n) = &s.iter
@@ -290,6 +346,8 @@ fn loop_element_names(body: &[Statement], unannotated: &HashSet<String>) -> Vec<
                 }
                 StatementType::With(w) => walk(&w.body, unannotated, alias, out),
                 StatementType::AsyncWith(w) => walk(&w.body, unannotated, alias, out),
+                StatementType::Return(Some(e)) => scan_expr(&e.value, unannotated, alias, out),
+                StatementType::Expr(e) => scan_expr(&e.value, unannotated, alias, out),
                 _ => {}
             }
         }
@@ -540,6 +598,7 @@ pub fn infer_unannotated_signature(
                     let elt_ident = quote::format_ident!("{}", elt_tv);
                     quote!(#tv: IntoIterator<Item = #elt_ident>)
                 }
+                ParamReq::AsRefStr => quote!(#tv: AsRef<str>),
                 ParamReq::Conversion(trait_name) => {
                     let t = quote::format_ident!("{}", trait_name);
                     quote!(#tv: #t)
@@ -814,6 +873,27 @@ fn return_type_of(
                     });
                 }
             }
+            // `"sep".join(...)` on a string literal (or a String/&str
+            // local) returns an owned String — the method table omits join
+            // (its bound needs a compound IntoIterator), but the concrete
+            // receiver's return is a plain String (issue #116).
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && a.attr == "join"
+                && (matches!(
+                    a.value.as_ref(),
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                ) || matches!(
+                    a.value.as_ref(),
+                    ExprType::Name(n)
+                        if matches!(
+                            collector.name_types.get(&n.id),
+                            Some(TypeInfo::String | TypeInfo::StrRef)
+                        )
+                ))
+            {
+                return Ok(quote!(String));
+            }
             if let ExprType::Name(f) = c.func.as_ref() {
                 match f.id.as_str() {
                     "int" => return Ok(quote!(i64)),
@@ -843,6 +923,12 @@ fn return_type_of(
             let left = return_type_of(&b.left, collector, param_types)?;
             let right = return_type_of(&b.right, collector, param_types)?;
             Ok(quote!(<#left as #t<#right>>::Output))
+        }
+        ExprType::ListComp(l) => {
+            // `[f(x) for x in p]` produces a Vec of the element expression's
+            // type (issue #116).
+            let elt_ty = return_type_of(&l.elt, collector, param_types)?;
+            Ok(quote!(Vec<#elt_ty>))
         }
         ExprType::IfExp(e) => {
             // `x if cond else y`: both branches must unify (recursion
@@ -1294,6 +1380,7 @@ fn trait_name_of(req: &ParamReq) -> &str {
         ParamReq::Method(t, _, _) => t.as_str(),
         ParamReq::PyFromInt => "PyFromInt",
         ParamReq::Iterate(_) => "IntoIterator",
+        ParamReq::AsRefStr => "AsRef<str>",
         ParamReq::Identity(_) | ParamReq::Untranslatable(_) => "?",
     }
 }
@@ -1364,6 +1451,7 @@ fn definition_req_satisfied(req: &ParamReq, t: &TypeInfo) -> bool {
         }
         ParamReq::PyFromInt => type_satisfies(t, "PyFromInt", None),
         ParamReq::Iterate(_) => type_satisfies(t, "IntoIterator", None),
+        ParamReq::AsRefStr => type_satisfies(t, "AsRef<str>", None),
         ParamReq::Identity(_) | ParamReq::Untranslatable(_) => true,
     }
 }
@@ -1467,6 +1555,8 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
         "PyStrOps" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
         "PyListOps" | "PyPop" => matches!(ty, TypeInfo::Vec(_)),
         "PyFromInt" => matches!(ty, TypeInfo::Int | TypeInfo::Float),
+        // "sep".join(...) elements (issue #116).
+        "AsRef<str>" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
         // for x in p: iterables (Vec by value, String by char, dict keys,
         // tuples, ranges).
         "IntoIterator" => matches!(
@@ -2029,6 +2119,49 @@ impl<'a> Collector<'a> {
                 }
             }
             ExprType::Call(c) => {
+                // `"sep".join(arg)` on a string-literal receiver: the
+                // argument must be an iterable of AsRef<str> (issue #116).
+                // For a Name argument that is (or aliases) an unannotated
+                // parameter, the requirement lands on it with a fresh
+                // element bound `E: AsRef<str>`; for a comprehension over a
+                // parameter, the element itself gets the AsRef<str> bound.
+                if let ExprType::Attribute(a) = c.func.as_ref()
+                    && a.attr == "join"
+                    && matches!(
+                        a.value.as_ref(),
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    )
+                    && let Some(arg) = c.args.first()
+                {
+                    match arg {
+                        ExprType::Name(n) => {
+                            if let Some(root) = self.root_unannotated(&n.id) {
+                                let elt = format!("__rython_elt_{}", n.id);
+                                self.add(&root, ParamReq::Iterate(elt.clone()));
+                                self.reqs
+                                    .entry(elt.clone())
+                                    .or_default()
+                                    .push(ParamReq::AsRefStr);
+                            }
+                        }
+                        ExprType::GeneratorExp(g) => {
+                            // The desugared comprehension materializes a
+                            // Vec of the ELEMENT EXPRESSION's type (e.g.
+                            // `str(v)` -> Vec<String>), which satisfies
+                            // join's AsRef<str> itself — only the iterable
+                            // bound is needed here.
+                            if let Some(generator) = g.generators.first()
+                                && let ExprType::Name(n) = &generator.iter
+                                && let Some(root) = self.root_unannotated(&n.id)
+                                && let ExprType::Name(elt) = &generator.target
+                            {
+                                self.add(&root, ParamReq::Iterate(elt.id.clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // `p.method(args)` on a parameter: record the stdlib method
                 // requirement (M2) — the trait bound; pop's bound carries
                 // the index argument's type.
@@ -2491,6 +2624,10 @@ impl<'a> Collector<'a> {
                         "IntoIterator",
                         type_satisfies(&arg_ty, "IntoIterator", None),
                     ),
+                    ParamReq::AsRefStr => (
+                        "AsRef<str>",
+                        type_satisfies(&arg_ty, "AsRef<str>", None),
+                    ),
                     ParamReq::Identity(_) | ParamReq::Untranslatable(_) => continue,
                 };
                 if !ok {
@@ -2737,13 +2874,23 @@ impl<'a> Collector<'a> {
     }
 
     fn walk_comprehension(&mut self, elt: &ExprType, generators: &[crate::Comprehension]) {
-        self.walk_expr(elt, false);
+        // `for x in p` inside a comprehension (issue #116): same as the
+        // For-statement arm — an unannotated parameter iterable bounds
+        // IntoIterator and the target becomes a virtual element parameter.
         for generator in generators {
+            if let ExprType::Name(n) = &generator.iter
+                && let Some(root) = self.root_unannotated(&n.id)
+                && let ExprType::Name(elt_name) = &generator.target
+            {
+                self.loop_elements.insert(elt_name.id.clone(), root.clone());
+                self.add(&root, ParamReq::Iterate(elt_name.id.clone()));
+            }
             self.walk_expr(&generator.iter, false);
             for cond in &generator.ifs {
                 self.walk_expr(cond, true);
             }
         }
+        self.walk_expr(elt, false);
     }
 
     /// The RhsType of an operand: a literal, a param, a param alias, a

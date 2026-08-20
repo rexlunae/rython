@@ -4688,3 +4688,54 @@ fn definition_time_unsatisfiable_bounds_report_and_deny() {
     assert!(msg.contains("bad"), "error should name the function: {}", msg);
     assert!(msg.contains("PyStrOps"), "error should list bounds: {}", msg);
 }
+
+#[test]
+fn join_and_comprehension_inference_match_python_transcript() {
+    // Issue #116 (the pip version_str pattern): `",".join(parts)` and
+    // `".".join(str(v) for v in version)` infer String returns with
+    // IntoIterator/AsRef<str> bounds, and list comprehensions over
+    // parameters infer Vec returns. Output diffed against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("join-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def join_all(parts):\n",
+            "    return \",\".join(parts)\n",
+            "\n",
+            "def version_str(version):\n",
+            "    return \".\".join(str(v) for v in version)\n",
+            "\n",
+            "def upper_all(words):\n",
+            "    return [w.upper() for w in words]\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(join_all([\"a\", \"b\", \"c\"]))\n",
+            "    print(version_str([1, 2, 3]))\n",
+            "    print(upper_all([\"hi\", \"there\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(src.contains("B: AsRef<str>"), "join bound: {}", src);
+    assert!(src.contains("Result<String, PyException>"), "return: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["a,b,c", "1.2.3", "['HI', 'THERE']"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
