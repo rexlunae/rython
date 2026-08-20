@@ -171,6 +171,16 @@ impl<'a> AliasingGuard<'a> {
                     }
                 }
                 StatementType::Global(_) => {}
+                StatementType::Delete(targets) => {
+                    // `del xs[i]` mutates the container.
+                    for target in targets {
+                        if let ExprType::Subscript(s) = target
+                            && let Some(name) = root_name_of(&s.value)
+                        {
+                            self.mutated.insert(name.to_string());
+                        }
+                    }
+                }
                 StatementType::Assert { test, msg } => {
                     self.visit_expr(test);
                     if let Some(m) = msg {

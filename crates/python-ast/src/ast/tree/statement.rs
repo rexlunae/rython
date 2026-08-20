@@ -121,6 +121,10 @@ pub enum StatementType {
     /// the names resolve to module statics; WRITES from a function are a
     /// loud error (rython has no mutable module state).
     Global(Vec<String>),
+    /// `del xs[i]` / `del d[k]` — removes an element (issue #112). Index
+    /// targets lower through py_pop; `del name` and `del a.b` are loud
+    /// errors (unbinding is not representable in the value model).
+    Delete(Vec<ExprType>),
 
     Unimplemented(String),
 }
@@ -240,6 +244,14 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                     .extract()
                     .map_err(|e| extraction_failure("global names", &ob, e))?;
                 Ok(StatementType::Global(names))
+            }
+            "Delete" => {
+                let targets = ob
+                    .getattr("targets")
+                    .map_err(|e| extraction_failure("delete targets", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("delete targets", &ob, e))?;
+                Ok(StatementType::Delete(targets))
             }
             "Return" => {
                 tracing::debug!("return expression: {}", dump(&ob, None)?);
@@ -571,6 +583,84 @@ impl CodeGen for StatementType {
             // resolve to the module statics, and writes are rejected at
             // conversion time (issue #115).
             StatementType::Global(_) => Ok(quote! {}),
+            // `del xs[i]` / `del d[k]`: Python removes the element at the
+            // index (negative from the end, IndexError/KeyError when
+            // missing) — the runtime's py_pop already implements exactly
+            // that; the returned element is discarded. `del name` and
+            // `del a.b` are loud errors: unbinding a name or removing a
+            // struct field is not representable in rython's value model.
+            StatementType::Delete(targets) => {
+                let mut stmts = Vec::new();
+                for target in targets {
+                    match target {
+                        ExprType::Subscript(sub) => {
+                            let receiver = crate::subscript_receiver_place(
+                                &sub.value,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            match &sub.kind {
+                                crate::SubscriptKind::Index(index) => {
+                                    let idx = index
+                                        .clone()
+                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                    // A string-literal KEY is owned (dict
+                                    // keys normalize to String).
+                                    let idx = if matches!(
+                                        index.as_ref(),
+                                        ExprType::Constant(c)
+                                            if matches!(
+                                                &c.0,
+                                                Some(litrs::Literal::String(_))
+                                            )
+                                    ) {
+                                        quote!((#idx).to_string())
+                                    } else {
+                                        idx
+                                    };
+                                    // py_pop takes the index BY VALUE.
+                                    stmts.push(quote!((#receiver).py_pop(#idx)?;));
+                                }
+                                crate::SubscriptKind::Slice { .. } => {
+                                    return Err(
+                                        "del with a slice target (`del xs[1:3]`) is not \
+                                         supported yet; use del with a single index, or pop \
+                                         the elements individually"
+                                            .to_string()
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                        ExprType::Name(n) => {
+                            return Err(format!(
+                                "`del {}` (unbinding a name) is not supported: rython binds \
+                                 values, and a deleted name would still be readable. Remove \
+                                 the del, or restructure (issue #112)",
+                                n.id
+                            )
+                            .into());
+                        }
+                        ExprType::Attribute(a) => {
+                            return Err(format!(
+                                "del with an attribute target (removing a field) is not \
+                                 supported: class fields are struct members and cannot be \
+                                 removed (issue #112)"
+                            )
+                            .into());
+                        }
+                        _ => {
+                            return Err(
+                                "del with this target shape is not supported (issue #112)"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Ok(quote!(#(#stmts)*))
+            }
             _ => {
                 let error = err_from(StatementNotYetImplemented(self));
                 Err(error.into())

@@ -623,6 +623,12 @@ fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
             Ok(())
         }
         S::Global(_) => Ok(()),
+        S::Delete(targets) => {
+            for t in targets {
+                check_kernel_expr_no_floats(t, line)?;
+            }
+            Ok(())
+        }
         S::If(i) => {
             check_kernel_expr_no_floats(&i.test, line)?;
             for s in i.body.iter().chain(&i.orelse) {

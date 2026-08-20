@@ -4785,3 +4785,51 @@ fn string_aug_assign_accumulation_matches_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn del_statement_matches_python_transcript() {
+    // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
+    // (string-keyed dict) lower through py_pop and diff against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("del-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def remove_second(xs):\n",
+            "    del xs[1]\n",
+            "    return xs\n",
+            "\n",
+            "def remove_negative(xs):\n",
+            "    del xs[-1]\n",
+            "    return xs\n",
+            "\n",
+            "def remove_key(d):\n",
+            "    del d[\"b\"]\n",
+            "    return d\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(remove_second([\"a\", \"b\", \"c\"]))\n",
+            "    print(remove_negative([1, 2, 3]))\n",
+            "    print(remove_key({\"a\": 1, \"b\": 2, \"c\": 3}))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["['a', 'c']", "[1, 2]", "{'a': 1, 'c': 3}"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

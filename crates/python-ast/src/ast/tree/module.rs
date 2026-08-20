@@ -1144,7 +1144,7 @@ impl Module {
             // These are executable statements that must go in the init function
             Assign(_) | AugAssign(_) | Call(_) | Return(_) |
             If(_) | For(_) | While(_) | Try(_) | With(_) | AsyncWith(_) | AsyncFor(_) |
-            Raise(_) | Assert { .. } | Pass | Break | Continue => false,
+            Raise(_) | Assert { .. } | Pass | Break | Continue | Delete(_) => false,
             
             // Handle unimplemented statements conservatively as executable
             Unimplemented(_) => false,

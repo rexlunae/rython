@@ -1553,7 +1553,12 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
             TypeInfo::String | TypeInfo::StrRef | TypeInfo::Vec(_) | TypeInfo::Dict(..)
         ),
         "PyStrOps" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
-        "PyListOps" | "PyPop" => matches!(ty, TypeInfo::Vec(_)),
+        "PyListOps" => matches!(ty, TypeInfo::Vec(_)),
+        "PyPop" => match (ty, rhs) {
+            (TypeInfo::Vec(_), Some(TypeInfo::Int)) => true,
+            (TypeInfo::Dict(..), Some(_)) => true,
+            _ => false,
+        },
         "PyFromInt" => matches!(ty, TypeInfo::Int | TypeInfo::Float),
         // "sep".join(...) elements (issue #116).
         "AsRef<str>" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
@@ -1972,6 +1977,33 @@ impl<'a> Collector<'a> {
                     // `global x`: a no-op here — writes are rejected by
                     // the function generator (issue #115).
                 }
+                StatementType::Delete(targets) => {
+                    // `del xs[i]` on an unannotated parameter (or an alias
+                    // of one) needs `T: PyPop<Idx>` (issue #112).
+                    for target in targets {
+                        if let ExprType::Subscript(s) = target
+                            && let ExprType::Name(n) = s.value.as_ref()
+                            && let Some(root) = self.root_unannotated(&n.id)
+                        {
+                            let idx = match s.kind_expr() {
+                                // A string-literal KEY is owned (dict keys
+                                // normalize to String), so the bound is
+                                // PyPop<String>, not PyPop<&str>.
+                                Some(ExprType::Constant(c))
+                                    if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                                {
+                                    RhsType::Concrete(quote!(String))
+                                }
+                                Some(e) => self.rhs_of(e),
+                                None => RhsType::Concrete(quote!(i64)),
+                            };
+                            self.add(&root, ParamReq::Method("PyPop".to_string(), true, Some(idx)));
+                        }
+                    }
+                    for target in targets {
+                        self.walk_expr(target, false);
+                    }
+                }
                 // Nested functions/classes have their own parameters.
                 StatementType::FunctionDef(_)
                 | StatementType::AsyncFunctionDef(_)
@@ -2327,7 +2359,14 @@ impl<'a> Collector<'a> {
                 let idx_expr = s.kind_expr();
                 if let ExprType::Name(n) = s.value.as_ref() {
                     if self.unannotated.contains(&n.id) {
+                        // A string-literal KEY is owned (dict keys normalize
+                        // to String) — PyIndex<String>, never PyIndex<&str>.
                         let idx = match idx_expr {
+                            Some(ExprType::Constant(c))
+                                if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                            {
+                                RhsType::Concrete(quote!(String))
+                            }
                             Some(e) => self.rhs_of(e),
                             None => RhsType::Unknown,
                         };

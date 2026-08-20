@@ -477,6 +477,20 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                     record_target(&aug.target, a, multi);
                 }
             }
+            StatementType::Delete(targets) => {
+                // `del xs[i]` mutates the container through py_pop.
+                for target in targets {
+                    if let ExprType::Subscript(s) = target {
+                        walk_expr(&s.value, a);
+                        if let ExprType::Name(name) = s.value.as_ref() {
+                            a.record_mutation(&name.id);
+                        }
+                        if let Some(idx) = crate::SubscriptKindExpr::kind_expr(s) {
+                            walk_expr(idx, a);
+                        }
+                    }
+                }
+            }
             StatementType::Expr(e) => walk_expr(&e.value, a),
             StatementType::Call(call) => walk_call(call, a),
             StatementType::Return(Some(e)) => walk_expr(&e.value, a),

@@ -5363,6 +5363,30 @@ fn global_write_is_a_loud_error() {
 }
 
 #[test]
+fn del_index_bounds_on_pypop() {
+    // Issue #112: `del xs[i]` on an unannotated parameter bounds
+    // `T: PyPop<i64>` (list) / `T: PyPop<String>` (string-keyed dict).
+    let out = compile(
+        "def drop(xs):\n    del xs[1]\n    return xs\n",
+        "del_list.py",
+    );
+    assert!(out.contains("T : PyPop < i64 >"), "generated: {}", out);
+    let out2 = compile(
+        "def drop(d):\n    del d[\"b\"]\n    return d\n",
+        "del_dict.py",
+    );
+    assert!(out2.contains("T : PyPop < String >"), "generated: {}", out2);
+}
+
+#[test]
+fn del_name_is_a_loud_error() {
+    // `del name` unbinds a binding, which the value model cannot represent.
+    let err = compile_err("import sys\ndel sys\n", "del_name.py");
+    assert!(err.contains("unbinding"), "error: {}", err);
+    assert!(err.contains("issue #112"), "error: {}", err);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.
