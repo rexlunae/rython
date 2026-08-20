@@ -123,3 +123,38 @@ have those lines removed. Neither the dependency's own imports nor its
 functions' bodies may rely on constructs the transpiler does not support —
 a failed conversion names the module and the construct.
 
+
+## async/await
+
+Python `async def`/`await` (and `async for`/`async with`, iterated
+synchronously until the runtime models async iterators) transpile to Rust
+`async fn`s. `asyncio` maps onto the tokio runtime:
+
+- `asyncio.run(coro)` drives the coroutine on the current runtime,
+- `asyncio.sleep(secs)` suspends on tokio's timer.
+
+The rest of asyncio (gather, create_task, queues, ...) is not modeled —
+calls are rejected loudly at conversion time.
+
+```python
+import asyncio
+
+async def fetch(name: str) -> str:
+    await asyncio.sleep(0.001)
+    return "hello " + name
+
+async def main() -> None:
+    print(await fetch("world"))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+A **binary** conversion with async code links the runtime through a
+default-on `async-tokio` cargo feature on the generated crate: tokio is an
+optional dependency, the entry point carries
+`#[cfg_attr(feature = "async-tokio", tokio::main)]`, and building with
+`--no-default-features` fails with a compile_error that names the feature.
+A **library** conversion with async functions transpiles them to plain
+`async fn`s and declares no runtime dependency at all — the consumer's
+executor drives them.

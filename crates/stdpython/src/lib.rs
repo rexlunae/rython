@@ -4289,6 +4289,10 @@ pub use stdlib::datetime;
 // dt.replace(hour=...) to resolve in generated code.
 #[cfg(feature = "std")]
 pub use stdlib::datetime::{PyReplace, ReplaceArgs};
+/// Python asyncio module (tokio-backed; gated on the async-tokio feature,
+/// which implies std).
+#[cfg(feature = "async-tokio")]
+pub use stdlib::asyncio;
 #[cfg(feature = "std")]
 pub use stdlib::time;
 #[cfg(feature = "std")]

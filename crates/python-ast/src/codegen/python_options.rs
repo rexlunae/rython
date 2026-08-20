@@ -28,6 +28,13 @@ pub enum AsyncRuntime {
     },
 }
 
+/// The cargo feature name on generated BINARY crates that pulls in the
+/// async runtime (tokio). Generated code gates its runtime import and the
+/// entry-point attribute on this feature, and rypip declares the feature in
+/// the generated Cargo.toml (`default = ["async-tokio"]`). Must match
+/// between codegen (python-ast) and the crate writer (rypip).
+pub const ASYNC_RUNTIME_FEATURE: &str = "async-tokio";
+
 impl Default for AsyncRuntime {
     fn default() -> Self {
         AsyncRuntime::Tokio
@@ -152,6 +159,13 @@ pub struct PythonOptions {
 
     /// The async runtime to use for async Python code
     pub async_runtime: AsyncRuntime,
+
+    /// Whether the generated crate declares and links the async runtime
+    /// dependency (generated BINARY crates with async code; the tokio crate
+    /// behind the `async-tokio` feature). When false — library conversions —
+    /// async functions transpile to plain `async fn`s with no runtime
+    /// import or entry attribute: the consumer supplies the executor.
+    pub async_runtime_dep: bool,
 
     /// Emit #[deprecated] notes on generated items whose conversion was
     /// lossy (dropped parameter defaults, ignored return annotations, ...).
@@ -316,6 +330,7 @@ impl Default for PythonOptions {
             with_std_python: true,
             allow_unsafe: false,
             async_runtime: AsyncRuntime::default(),
+            async_runtime_dep: false,
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,

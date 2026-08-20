@@ -6,7 +6,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
+use crate::{ASYNC_RUNTIME_FEATURE, CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,15 +158,22 @@ impl CodeGen for Module {
             });
         }
         
-        // Add async runtime dependency if async functions are detected
-        // We'll check this early so we can add the import at the top
-        let needs_async_runtime = self.raw.body.iter().any(|s| {
-            matches!(&s.statement, crate::StatementType::AsyncFunctionDef(_))
-        });
-        
-        if needs_async_runtime {
+        // Add async runtime dependency if async functions are detected.
+        // We'll check this early so we can add the import at the top. The
+        // import is only emitted for generated BINARY crates
+        // (options.async_runtime_dep): library conversions transpile async
+        // functions to plain async fns and leave the executor to the
+        // consumer. It is feature-gated so `--no-default-features` builds
+        // still compile (the entry point then carries the compile_error
+        // below).
+        let needs_async_runtime = module_contains_async(&self.raw.body);
+
+        if needs_async_runtime && options.async_runtime_dep {
             let runtime_import = format_ident!("{}", options.async_runtime.import());
-            stream.extend(quote!(use #runtime_import;));
+            stream.extend(quote! {
+                #[cfg(feature = #ASYNC_RUNTIME_FEATURE)]
+                use #runtime_import;
+            });
         }
         
         let mut main_body_stmts = Vec::new();
@@ -491,14 +498,26 @@ impl CodeGen for Module {
                 let user_main_is_async = stream_str.contains("pub async fn main (");
                 
                 if user_main_is_async {
-                    // User's async main becomes the Rust entry point
+                    // User's async main becomes the Rust entry point. The
+                    // runtime attribute is gated on the generated crate's
+                    // `async-tokio` feature (rypip declares it default-on
+                    // for async binaries); without it a compile_error names
+                    // the fix instead of a bare "no main function".
                     let runtime_attr = options.async_runtime.main_attribute();
                     let attr_tokens: proc_macro2::TokenStream = runtime_attr.parse()
                         .unwrap_or_else(|_| quote!(tokio::main)); // fallback to tokio::main
                     
-                    // Replace the user's function signature and add attributes
+                    // Replace the user's function signature and add the
+                    // feature-gated attribute.
                     let new_stream_str = stream_str
-                        .replace("pub async fn main (", &format!("#[{}] async fn main(", runtime_attr));
+                        .replace(
+                            "pub async fn main (",
+                            &format!(
+                                "#[cfg_attr(feature = \"{}\", {})] async fn main(",
+                                ASYNC_RUNTIME_FEATURE,
+                                runtime_attr
+                            ),
+                        );
                     stream = new_stream_str.parse::<proc_macro2::TokenStream>()
                         .unwrap_or_else(|_| stream);
                         
@@ -511,7 +530,7 @@ impl CodeGen for Module {
                             .unwrap_or_else(|_| stream);
 
                         stream.extend(quote! {
-                            #[#attr_tokens]
+                            #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                             async fn main() {
                                 let __rython_result: Result<(), PyException> = async {
                                     __module_init__()?;
@@ -525,6 +544,16 @@ impl CodeGen for Module {
                             }
                         });
                     }
+                    // A compile_error! applies to the whole crate wherever it
+                    // sits, so emit it once for the feature-off build.
+                    stream.extend(quote! {
+                        #[cfg(not(feature = #ASYNC_RUNTIME_FEATURE))]
+                        compile_error!(
+                            "this program uses async/await and needs the async runtime; \
+                             build the generated crate with --features async-tokio \
+                             (rypip enables it by default)"
+                        );
+                    });
                 } else {
                     // User's sync main becomes the Rust entry point
                     // Need to modify the function to match Rust main signature requirements
@@ -589,8 +618,19 @@ impl CodeGen for Module {
                     } else {
                         quote!()
                     };
+                    // The runtime attribute applies only when the generated
+                    // crate's `async-tokio` feature is enabled (rypip
+                    // declares it default-on for async binaries); without
+                    // it, `async fn main` has no executor, so a compile_error
+                    // names the fix instead of a bare "no main function".
                     stream.extend(quote! {
-                        #[#attr_tokens]
+                        #[cfg(not(feature = #ASYNC_RUNTIME_FEATURE))]
+                        compile_error!(
+                            "this program uses async/await and needs the async runtime; \
+                             build the generated crate with --features async-tokio \
+                             (rypip enables it by default)"
+                        );
+                        #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                         async fn main() {
                             let __rython_result: Result<(), PyException> = async {
                                 #init_call
@@ -638,6 +678,175 @@ impl CodeGen for Module {
         }
         Ok(stream)
     }
+}
+
+/// Whether a statement body contains any async construct (async def, await,
+/// async for, async with) anywhere, including nested control flow. Drives
+/// the async-runtime import and the async entry-point decision. Function
+/// and class bodies count (their code runs in this module).
+pub fn module_contains_async(body: &[crate::Statement]) -> bool {
+    fn expr_contains_async(expr: &crate::ExprType) -> bool {
+        match expr {
+            crate::ExprType::Await(_) => true,
+            crate::ExprType::Call(c) => {
+                expr_contains_async(&c.func)
+                    || c.args.iter().any(expr_contains_async)
+                    || c.keywords.iter().any(|k| expr_contains_async(&k.value))
+            }
+            crate::ExprType::BoolOp(b) => b.values.iter().any(expr_contains_async),
+            crate::ExprType::BinOp(b) => {
+                expr_contains_async(&b.left) || expr_contains_async(&b.right)
+            }
+            crate::ExprType::UnaryOp(u) => expr_contains_async(&u.operand),
+            crate::ExprType::IfExp(i) => {
+                expr_contains_async(&i.test)
+                    || expr_contains_async(&i.body)
+                    || expr_contains_async(&i.orelse)
+            }
+            crate::ExprType::Dict(d) => {
+                d.keys.iter().flatten().any(expr_contains_async)
+                    || d.values.iter().any(expr_contains_async)
+            }
+            crate::ExprType::Set(s) => s.elts.iter().any(expr_contains_async),
+            crate::ExprType::List(items) => items.iter().any(expr_contains_async),
+            crate::ExprType::Tuple(t) => t.elts.iter().any(expr_contains_async),
+            crate::ExprType::Compare(c) => {
+                expr_contains_async(&c.left) || c.comparators.iter().any(expr_contains_async)
+            }
+            crate::ExprType::Attribute(a) => expr_contains_async(&a.value),
+            crate::ExprType::Subscript(s) => {
+                expr_contains_async(&s.value)
+                    || match &s.kind {
+                        crate::SubscriptKind::Index(e) => expr_contains_async(e),
+                        crate::SubscriptKind::Slice { lower, upper, step } => {
+                            lower.as_deref().is_some_and(expr_contains_async)
+                                || upper.as_deref().is_some_and(expr_contains_async)
+                                || step.as_deref().is_some_and(expr_contains_async)
+                        }
+                    }
+            }
+            crate::ExprType::Starred(s) => expr_contains_async(&s.value),
+            crate::ExprType::NamedExpr(n) => {
+                expr_contains_async(&n.left) || expr_contains_async(&n.right)
+            }
+            crate::ExprType::Yield(y) => y.value.as_deref().is_some_and(expr_contains_async),
+            crate::ExprType::YieldFrom(y) => expr_contains_async(&y.value),
+            crate::ExprType::Lambda(l) => expr_contains_async(&l.body),
+            crate::ExprType::JoinedStr(f) => f.values.iter().any(expr_contains_async),
+            crate::ExprType::FormattedValue(f) => {
+                expr_contains_async(&f.value)
+                    || f.format_spec.as_deref().is_some_and(expr_contains_async)
+            }
+            crate::ExprType::ListComp(l) => {
+                expr_contains_async(&l.elt)
+                    || l.generators.iter().any(|g| {
+                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            crate::ExprType::SetComp(s) => {
+                expr_contains_async(&s.elt)
+                    || s.generators.iter().any(|g| {
+                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            crate::ExprType::DictComp(d) => {
+                expr_contains_async(&d.value)
+                    || d.generators.iter().any(|g| {
+                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            crate::ExprType::GeneratorExp(g) => {
+                expr_contains_async(&g.elt)
+                    || g.generators.iter().any(|gg| {
+                        expr_contains_async(&gg.iter) || gg.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_contains_async(stmt: &crate::Statement) -> bool {
+        match &stmt.statement {
+            crate::StatementType::AsyncFunctionDef(_)
+            | crate::StatementType::AsyncFor(_)
+            | crate::StatementType::AsyncWith(_) => true,
+            crate::StatementType::FunctionDef(f) => f.body.iter().any(stmt_contains_async),
+            crate::StatementType::ClassDef(c) => c.body.iter().any(stmt_contains_async),
+            crate::StatementType::If(i) => {
+                i.body.iter().any(stmt_contains_async) || i.orelse.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::For(f) => {
+                expr_contains_async(&f.iter)
+                    || f.body.iter().any(stmt_contains_async)
+                    || f.orelse.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::While(w) => {
+                w.body.iter().any(stmt_contains_async) || w.orelse.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::Try(t) => {
+                t.body.iter().any(stmt_contains_async)
+                    || t.handlers.iter().any(|h| h.body.iter().any(stmt_contains_async))
+                    || t.orelse.iter().any(stmt_contains_async)
+                    || t.finalbody.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::With(w) => w.body.iter().any(stmt_contains_async),
+            crate::StatementType::Expr(e) => expr_contains_async(&e.value),
+            crate::StatementType::Assign(a) => {
+                expr_contains_async(&a.value)
+                    || a.targets.iter().any(expr_contains_async)
+            }
+            crate::StatementType::AugAssign(a) => {
+                expr_contains_async(&a.target) || expr_contains_async(&a.value)
+            }
+            crate::StatementType::Return(Some(e)) => expr_contains_async(&e.value),
+            crate::StatementType::Raise(r) => {
+                r.exc.as_ref().is_some_and(expr_contains_async)
+                    || r.cause.as_ref().is_some_and(expr_contains_async)
+            }
+            crate::StatementType::Assert { test, msg } => {
+                expr_contains_async(test)
+                    || msg.as_deref().is_some_and(expr_contains_async)
+            }
+            _ => false,
+        }
+    }
+
+    body.iter().any(stmt_contains_async)
+}
+
+/// Whether a module body imports `asyncio` (plain or from-import, aliased
+/// or not). Drives whether the generated crate needs stdpython's
+/// tokio-backed `async-tokio` feature even for library conversions.
+pub fn module_imports_asyncio(body: &[crate::Statement]) -> bool {
+    fn stmt_imports_asyncio(stmt: &crate::Statement) -> bool {
+        match &stmt.statement {
+            crate::StatementType::Import(imp) => imp.names.iter().any(|a| {
+                a.name.split('.').next().is_some_and(|root| root == "asyncio")
+            }),
+            crate::StatementType::ImportFrom(imp) => {
+                imp.module.split('.').next().is_some_and(|root| root == "asyncio")
+            }
+            crate::StatementType::If(i) => {
+                i.body.iter().any(stmt_imports_asyncio) || i.orelse.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::For(f) => {
+                f.body.iter().any(stmt_imports_asyncio) || f.orelse.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::While(w) => {
+                w.body.iter().any(stmt_imports_asyncio) || w.orelse.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::Try(t) => {
+                t.body.iter().any(stmt_imports_asyncio)
+                    || t.handlers.iter().any(|h| h.body.iter().any(stmt_imports_asyncio))
+                    || t.orelse.iter().any(stmt_imports_asyncio)
+                    || t.finalbody.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::With(w) => w.body.iter().any(stmt_imports_asyncio),
+            crate::StatementType::FunctionDef(f) => f.body.iter().any(stmt_imports_asyncio),
+            _ => false,
+        }
+    }
+    body.iter().any(stmt_imports_asyncio)
 }
 
 /// Count stores to each name across MODULE scope: top-level assignments

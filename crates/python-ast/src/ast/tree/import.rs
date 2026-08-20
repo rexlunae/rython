@@ -37,6 +37,9 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             | "sysconfig"
             | "venv"
             | "numpy"
+            // asyncio lives on the tokio-backed `async-tokio` stdpython
+            // feature; generated async binaries enable it.
+            | "asyncio"
     )
 }
 
@@ -62,6 +65,7 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
             | "sysconfig"
             | "venv"
             | "numpy"
+            | "asyncio"
     )
 }
 
@@ -224,7 +228,7 @@ impl CodeGen for Import {
                     quote! {}
                 }
                 // Python stdlib modules that don't have direct Rust equivalents
-                "urllib" | "xml" | "asyncio" => {
+                "urllib" | "xml" => {
                     // These will be provided by the stdpython runtime
                     // Generate a comment instead of a use statement
                     quote! {

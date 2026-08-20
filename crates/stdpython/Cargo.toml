@@ -30,10 +30,17 @@ numpy-simd = []
 numpy-cuda = []
 numpy-vulkan = []
 
+# The asyncio module (asyncio.run / asyncio.sleep) maps onto the tokio
+# runtime. Generated async BINARIES enable this on their stdpython
+# dependency; plain async library crates (which never call asyncio) do not
+# need it.
+async-tokio = ["std", "dep:tokio", "tokio/rt-multi-thread", "tokio/time", "tokio/macros"]
+
 [dependencies]
 pyo3 = {version = "0.29", features=["auto-initialize"], optional = true}
 paste = "1.0"
 rayon = { version = "1.10", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"], optional = true }
 indexmap = { version = "2", default-features = false }
 getrandom = { version = "0.3", optional = true }
 hashbrown = { version = "0.15", optional = true }

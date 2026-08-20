@@ -1812,6 +1812,27 @@ pub fn convert(
 
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
+    // Async usage across the package: any async construct (async def/await/
+    // async for/async with) needs an executor, and any `import asyncio`
+    // needs the tokio-backed stdpython module. Binary conversions link the
+    // runtime themselves (tokio behind the `async-tokio` feature); library
+    // conversions expose plain async fns and only pull stdpython's
+    // asyncio module when they import it.
+    let (package_uses_async, package_imports_asyncio) = package_async_flags(package);
+    if opts.kernel_module && package_uses_async {
+        bail!(
+            "kernel modules cannot use async/await: the kernel has no user-space \
+             executor, and the generated entry points are synchronous"
+        );
+    }
+    if opts.no_std && (package_uses_async || package_imports_asyncio) {
+        bail!(
+            "async/await (and asyncio) require the tokio runtime, which the no_std \
+             profile does not provide; convert without --no-std"
+        );
+    }
+    let async_runtime_dep = entry_file.is_some() && package_uses_async;
+
     // `[python-modules]` vendors Python libraries into the generated crate
     // as a module tree; kernel modules compile a single entry file with no
     // tree, so a manifest that declares any is a loud error up front.
@@ -1919,7 +1940,13 @@ pub fn convert(
     // One options object per conversion: the shared `module_defs` and the
     // cross-module trait-mut cache (computed once, reused by every module's
     // transpile via the Rc clone).
-    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
+    let base_options = conversion_base_options(
+        opts,
+        &rust_modules,
+        &python_module_names,
+        &module_defs,
+        async_runtime_dep,
+    );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {
@@ -2345,7 +2372,14 @@ fn convert_driver(
             .flat_map(|(_, dep)| dep.modules.iter())
             .chain(package.modules.iter()),
     );
-    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
+    let (package_uses_async, _) = package_async_flags(package);
+    let base_options = conversion_base_options(
+        opts,
+        &rust_modules,
+        &python_module_names,
+        &module_defs,
+        package_uses_async,
+    );
     let code = transpile(module, &mut warnings, &base_options)?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
@@ -2849,6 +2883,28 @@ fn transpile(
     Ok(tokens.to_string())
 }
 
+/// Whether any module of the package contains async constructs (async def/
+/// await/async for/async with) and whether any imports `asyncio`. Parse
+/// failures are ignored — the transpile pass reports them with context.
+fn package_async_flags(package: &PyPackage) -> (bool, bool) {
+    let mut uses_async = false;
+    let mut imports_asyncio = false;
+    for module in &package.modules {
+        if uses_async && imports_asyncio {
+            break;
+        }
+        if let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) {
+            if !uses_async && python_ast::module_contains_async(&ast.raw.body) {
+                uses_async = true;
+            }
+            if !imports_asyncio && python_ast::module_imports_asyncio(&ast.raw.body) {
+                imports_asyncio = true;
+            }
+        }
+    }
+    (uses_async, imports_asyncio)
+}
+
 /// Conversion-level PythonOptions shared by every module of one conversion
 /// (see `transpile`): the registries, `module_defs`, and the shared
 /// cross-module trait-mut cache.
@@ -2857,6 +2913,7 @@ fn conversion_base_options(
     rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
     python_module_names: &std::collections::HashSet<String>,
     module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
+    async_runtime_dep: bool,
 ) -> PythonOptions {
     PythonOptions {
         lossy_warnings: opts.warnings != WarningMode::Allow,
@@ -2864,6 +2921,7 @@ fn conversion_base_options(
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
         python_modules: std::rc::Rc::new(python_module_names.clone()),
         module_defs: std::rc::Rc::new(module_defs.clone()),
+        async_runtime_dep,
         ..Default::default()
     }
 }
@@ -3084,10 +3142,21 @@ fn write_cargo_toml(
     package: &PyPackage,
     out_dir: &Path,
     opts: &ConvertOptions,
-    _has_binary: bool,
+    has_binary: bool,
     manifest: &DeviceManifest,
     uses_shim: bool,
 ) -> Result<()> {
+    // Async usage drives two Cargo.toml decisions: a BINARY crate with async
+    // code links tokio behind a default-on `async-tokio` feature (the codegen
+    // gates its entry attribute and `use tokio;` on that feature), and any
+    // crate that imports asyncio enables stdpython's tokio-backed asyncio
+    // module.
+    let (uses_async, imports_asyncio) = package_async_flags(package);
+    let async_binary = has_binary && uses_async;
+    // stdpython's tokio-backed asyncio module is only needed when the code
+    // actually imports asyncio (plain async fns need no runtime module).
+    let needs_async_stdpython = imports_asyncio;
+
     let crate_name = if opts.kernel_module {
         // Kernel modules take their name from the kernel manifest; the
         // userspace driver keeps the package name (the glue and the
@@ -3135,21 +3204,36 @@ fn write_cargo_toml(
             ),
         }
     } else {
+        // The std tier of stdpython, with the tokio-backed asyncio module
+        // when the package uses it (async code or `import asyncio`).
+        let async_feature = if needs_async_stdpython {
+            ", features = [\"async-tokio\"]"
+        } else {
+            ""
+        };
         match (&stdpython_source, opts.no_std) {
             (StdpythonSource::Path(path), true) => format!(
                 "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
                 path.display().to_string().replace('\\', "/"),
             ),
             (StdpythonSource::Path(path), false) => format!(
-                "stdpython = {{ path = \"{}\" }}",
+                "stdpython = {{ path = \"{}\"{} }}",
                 path.display().to_string().replace('\\', "/"),
+                async_feature,
             ),
             (StdpythonSource::Registry(version), true) => format!(
                 "stdpython = {{ version = \"{}\", default-features = false, features = [\"alloc\"] }}",
                 version,
             ),
             (StdpythonSource::Registry(version), false) => {
-                format!("stdpython = \"{}\"", version)
+                if needs_async_stdpython {
+                    format!(
+                        "stdpython = {{ version = \"{}\", features = [\"async-tokio\"] }}",
+                        version
+                    )
+                } else {
+                    format!("stdpython = \"{}\"", version)
+                }
             }
         }
     };
@@ -3208,6 +3292,21 @@ fn write_cargo_toml(
     }
     if opts.kernel_module {
         toml.push_str("\n[lib]\ncrate-type = [\"staticlib\"]\n");
+    }
+    // Async BINARY crates link the runtime (tokio) behind a default-on
+    // `async-tokio` feature: the generated entry point carries
+    // `#[cfg_attr(feature = "async-tokio", tokio::main)]` and a
+    // compile_error that names the feature when it is off
+    // (`--no-default-features`). Library conversions never declare tokio:
+    // their async functions are plain async fns, driven by the consumer's
+    // executor.
+    if async_binary {
+        toml.push_str(
+            "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"], optional = true }\n\n\
+             [features]\n\
+             default = [\"async-tokio\"]\n\
+             async-tokio = [\"dep:tokio\"]\n\n",
+        );
     }
     fs::write(out_dir.join("Cargo.toml"), toml)?;
     // Keep the generated crate out of any enclosing workspace.

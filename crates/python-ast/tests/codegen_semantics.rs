@@ -4736,3 +4736,123 @@ fn alias_inside_loop_body_is_detected() {
     assert!(err.contains("`b = a`"), "error: {}", err);
 }
 
+
+// ---- async/await: runtime feature gating, asyncio lowering ----
+
+/// Compile with a custom options object.
+fn compile_with_options(
+    src: &str,
+    name: &str,
+    options: PythonOptions,
+) -> Result<String, String> {
+    let module = parse(src, name).map_err(|e| format!("{e}"))?;
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            options,
+            symbols,
+        )
+        .map(|t| t.to_string())
+        .map_err(|e| format!("{}", e))
+}
+
+#[test]
+fn async_binary_entry_is_feature_gated_and_imports_runtime() {
+    // A BINARY conversion (async_runtime_dep) emits the runtime import and
+    // the entry attribute behind the async-tokio feature, plus a
+    // compile_error that names the feature when it is off.
+    let src = concat!(
+        "import asyncio\n",
+        "async def main() -> None:\n",
+        "    await asyncio.sleep(0)\n",
+        "\n",
+        "if __name__ == \"__main__\":\n",
+        "    asyncio.run(main())\n",
+    );
+    let out = compile_with_options(
+        src,
+        "asyncbin.py",
+        PythonOptions {
+            async_runtime_dep: true,
+            ..Default::default()
+        },
+    )
+    .expect("async binary converts");
+    assert!(
+        out.contains("cfg_attr (feature = \"async-tokio\" , tokio :: main)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("cfg (feature = \"async-tokio\")") && out.contains("use tokio ;"),
+        "runtime import must be feature-gated: {}",
+        out
+    );
+    assert!(
+        out.contains("compile_error !"),
+        "feature-off build must name the fix: {}",
+        out
+    );
+}
+
+#[test]
+fn async_library_has_no_runtime_import_or_entry_attribute() {
+    // A LIBRARY conversion (async_runtime_dep unset) transpiles async
+    // functions to plain async fns with no tokio import, no entry
+    // attribute, and no compile_error: the consumer brings the executor.
+    let src = "async def compute(x: int) -> int:\n    return x * 2\n";
+    let out = compile_with_options(src, "asynclib.py", PythonOptions::default())
+        .expect("async library converts");
+    assert!(out.contains("pub async fn compute"), "generated: {}", out);
+    assert!(!out.contains("tokio"), "no runtime import for a lib: {}", out);
+    assert!(!out.contains("compile_error"), "no feature error for a lib: {}", out);
+    assert!(!out.contains("cfg_attr"), "no entry attribute for a lib: {}", out);
+}
+
+#[test]
+fn asyncio_run_lowers_to_awaited_coroutine() {
+    // asyncio.run(coro) drives the coroutine on the current runtime: the
+    // argument's trailing `?` (calls to user async functions propagate) is
+    // moved after the `.await`, so the Result unwraps, not the future.
+    let out = compile(
+        concat!(
+            "import asyncio\n",
+            "async def helper() -> int:\n",
+            "    return 1\n",
+            "async def main() -> None:\n",
+            "    asyncio.run(helper())\n",
+        ),
+        "asyncio_run.py",
+    );
+    assert!(
+        out.contains("asyncio :: run (helper () ,) . await ?"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("run (helper () ?)"),
+        "the `?` must apply to the awaited Result, not the future: {}",
+        out
+    );
+}
+
+#[test]
+fn await_asyncio_sleep_awaits_once() {
+    // `await asyncio.sleep(1)` coerces the int argument to a float and the
+    // enclosing Await node adds exactly ONE `.await`.
+    let out = compile(
+        "import asyncio\nasync def f() -> None:\n    await asyncio.sleep(1)\n",
+        "asyncio_sleep.py",
+    );
+    assert!(
+        out.contains("asyncio :: sleep ((1) as f64) . await"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains(". await . await"),
+        "exactly one await: {}",
+        out
+    );
+}

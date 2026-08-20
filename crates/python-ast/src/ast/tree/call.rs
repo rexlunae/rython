@@ -24,6 +24,18 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "glob", "rglob", "iglob",
 ];
 
+/// Strip a trailing `?` from a rendered call (`f()?` → `f()`), so the `?`
+/// can be re-applied AFTER an `.await`: an async function call renders with
+/// `?` (exceptions propagate), but the operator must unwrap the awaited
+/// Result, not the future. Mirrors the Await node's reordering.
+fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let rendered = tokens.to_string();
+    match rendered.trim_end().strip_suffix('?') {
+        Some(inner) => inner.parse().unwrap_or_else(|_| tokens.clone()),
+        None => tokens.clone(),
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Call {
     pub func: Box<ExprType>,
@@ -3094,6 +3106,9 @@ impl<'a> CodeGen for Call {
         };
 
         // Add positional arguments
+        // (captured before the consuming loop so asyncio::sleep can re-render
+        // its first argument as a float)
+        let first_arg_expr = self.args.first().cloned();
         for (i, arg) in self.args.into_iter().enumerate() {
             let rust_arg = if let Some(param) = pos_params.get(i) {
                 let expected = param
@@ -3151,6 +3166,44 @@ impl<'a> CodeGen for Call {
                 quote!(#name(&(#first), #(#rest),*))
             } else {
                 quote!(#name)
+            }
+        } else if name_str == "asyncio :: run" {
+            // asyncio.run(coro): drive the coroutine on the CURRENT runtime
+            // (rython's entry point already runs under tokio), so the call
+            // lowers to awaiting the future and unwrapping its Result. The
+            // coroutine argument renders with a trailing `?` (calls to user
+            // async functions propagate exceptions), which must apply to
+            // the awaited Result, not the future — strip it like the Await
+            // node does. In a synchronous context rustc rejects the `.await`
+            // loudly.
+            if let Some((first, rest)) = all_args.split_first() {
+                let inner = strip_trailing_question(first);
+                quote!(asyncio::run(#inner, #(#rest),*).await?)
+            } else {
+                quote!(#call_expr.await?)
+            }
+        } else if name_str == "asyncio :: sleep" {
+            // asyncio.sleep(secs): suspend on tokio's timer. The argument
+            // is a float in Python (`asyncio.sleep(1)` is valid too), so
+            // coerce it like round() does. The enclosing `await` expression
+            // (Await node) appends the `.await` — Python requires
+            // `await asyncio.sleep(...)`, exactly like CPython's
+            // "coroutine never awaited" warning when it is missing.
+            if let Some(first) = first_arg_expr {
+                let coerced = crate::render_typed(
+                    &first,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(crate::TypeInfo::Float),
+                )?;
+                if all_args.len() > 1 {
+                    quote!(#name(#coerced, #(#all_args[1..]),*))
+                } else {
+                    quote!(#name(#coerced))
+                }
+            } else {
+                quote!(#call_expr)
             }
         } else if propagates_exceptions {
             quote!(#call_expr?)

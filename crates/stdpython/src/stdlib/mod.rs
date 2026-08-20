@@ -42,6 +42,12 @@ pub mod datetime;
 #[cfg(feature = "std")]
 pub mod time;
 
+/// Python asyncio module - a thin mapping onto the tokio runtime
+/// (asyncio.run / asyncio.sleep). Feature-gated: only generated async
+/// binaries enable `async-tokio`.
+#[cfg(feature = "async-tokio")]
+pub mod asyncio;
+
 /// Python string module - string constants and classes
 pub mod string;
 

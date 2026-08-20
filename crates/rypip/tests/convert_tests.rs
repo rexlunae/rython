@@ -3896,6 +3896,137 @@ fn pyproject_dependencies_vendored_end_to_end_at_runtime() {
 }
 
 #[test]
+fn async_binary_builds_and_runs_on_the_tokio_runtime() {
+    // Python async/await end-to-end: `async def`/`await` transpile to Rust
+    // async fns, asyncio.sleep maps onto tokio's timer, asyncio.run drives
+    // the coroutine, and the generated BINARY crate declares tokio behind a
+    // default-on `async-tokio` feature (the entry carries the feature-gated
+    // #[tokio::main] attribute).
+    let scratch = Scratch::new("async-bin");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import asyncio\n",
+            "\n",
+            "async def fetch(name: str) -> str:\n",
+            "    await asyncio.sleep(0.001)\n",
+            "    return \"hello \" + name\n",
+            "\n",
+            "async def main() -> None:\n",
+            "    result = await fetch(\"world\")\n",
+            "    print(result)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    asyncio.run(main())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    // The generated binary crate declares tokio behind the default-on
+    // feature and stdpython with the tokio-backed asyncio module.
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("tokio"), "Cargo.toml: {}", toml);
+    assert!(toml.contains("async-tokio"), "Cargo.toml: {}", toml);
+    assert!(toml.contains("default = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
+    assert!(toml.contains("features = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
+    // The entry module's code is feature-gated.
+    let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("cfg_attr(feature = \"async-tokio\", tokio::main)"),
+        "main.rs: {}",
+        main
+    );
+    assert!(
+        main.contains("compile_error!"),
+        "feature-off build must name the fix: {}",
+        main
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "async binary failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "hello world", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn async_binary_without_feature_fails_with_compile_error() {
+    // --no-default-features drops tokio; the generated entry's compile_error
+    // names the fix instead of a bare "no main function".
+    let scratch = Scratch::new("async-nofeature");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import asyncio\n",
+            "async def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "if __name__ == \"__main__\":\n",
+            "    asyncio.run(main())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--no-default-features")
+        .env_remove("RUSTFLAGS")
+        .current_dir(&krate.root)
+        .output()
+        .expect("cargo build");
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("async-tokio"),
+        "compile_error must name the feature: {}",
+        stderr
+    );
+    assert!(!status.status.success(), "feature-off build must fail");
+}
+
+#[test]
+fn async_library_conversion_gets_no_runtime_dependency() {
+    // A library crate with async functions transpiles them to plain async
+    // fns; the generated Cargo.toml has NO tokio dependency and no feature
+    // (the consumer brings the executor), and the code has no runtime
+    // import or entry attribute.
+    let scratch = Scratch::new("async-lib");
+    let file = scratch.path().join("libmod.py");
+    fs::write(
+        &file,
+        "async def compute(x: int) -> int:\n    return x * 2\n",
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(
+        !toml.contains("tokio"),
+        "library conversions must not link tokio: {}",
+        toml
+    );
+    let lib = fs::read_to_string(out.join("src/libmod.rs")).unwrap();
+    assert!(lib.contains("pub async fn compute"), "libmod.rs: {}", lib);
+    assert!(!lib.contains("use tokio"), "no runtime import: {}", lib);
+    assert!(!lib.contains("compile_error"), "no feature error: {}", lib);
+    assert!(!lib.contains("cfg_attr"), "no entry attribute: {}", lib);
+
+    // The library builds (async fns are just async fns).
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "async library failed to compile");
+}
+
+#[test]
 fn kernel_device_mode_rejects_module_init_conflict() {
     // The generated device owns the entry points; a Python module_init
     // would be silently dropped — loud error instead.
