@@ -45,15 +45,53 @@ use crate::{
     CodeGen, CodeGenContext, ExprType, FunctionDef, Name, PythonOptions, Statement,
     StatementType, SymbolTableNode, SymbolTableScopes,
 };
+use pyo3::{Borrowed, PyAny, PyResult};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, FromPyObject, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ClassDef {
     pub name: String,
-    pub bases: Vec<Name>,
+    /// The base expressions. Only simple same-module `Name` bases lower
+    /// (the embedded-struct + trait scheme); a dotted base (`queue.Queue`)
+    /// or any other expression is a loud error at codegen, not a silent
+    /// drop. Extracted as ExprType so the parse does not crash on them.
+    pub bases: Vec<ExprType>,
     pub keywords: Vec<String>,
     pub body: Vec<Statement>,
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
+    type Error = pyo3::PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        use pyo3::types::PyAnyMethods;
+        let name: String = ob
+            .getattr("name")
+            .map_err(|e| crate::extraction_failure("class name", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class name", &ob, e))?;
+        let bases: Vec<ExprType> = ob
+            .getattr("bases")
+            .map_err(|e| crate::extraction_failure("class bases", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class bases", &ob, e))?;
+        let keywords: Vec<String> = ob
+            .getattr("keywords")
+            .map_err(|e| crate::extraction_failure("class keywords", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class keywords", &ob, e))?;
+        let body: Vec<Statement> = ob
+            .getattr("body")
+            .map_err(|e| crate::extraction_failure("class body", &ob, e))?
+            .extract()
+            .map_err(|e| crate::extraction_failure("class body", &ob, e))?;
+        Ok(ClassDef {
+            name,
+            bases,
+            keywords,
+            body,
+        })
+    }
 }
 
 impl ClassDef {
@@ -77,8 +115,11 @@ impl ClassDef {
         let base = self
             .bases
             .iter()
-            .find(|b| b.id != "object")?;
-        match symbols.get(&base.id) {
+            .find(|b| matches!(b, ExprType::Name(n) if n.id != "object"))?;
+        let ExprType::Name(n) = base else {
+            return None;
+        };
+        match symbols.get(&n.id) {
             Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
             _ => None,
         }
@@ -519,11 +560,25 @@ impl CodeGen for ClassDef {
         // so naming it changes nothing. The base must be a class defined in
         // this module: the embedded-struct + trait scheme cannot represent an
         // imported or builtin base faithfully.
+        // A base that is not a simple same-module Name (a dotted
+        // `queue.Queue`, a call, ...) cannot lower in the embedded-struct +
+        // trait scheme — loud error, never a silent drop.
+        if let Some(bad) = self.bases.iter().find(|b| !matches!(b, ExprType::Name(_))) {
+            return Err(format!(
+                "class `{}` inherits from a base rython cannot lower (only single \
+                 inheritance from classes defined in this module is supported); \
+                 restructure the class hierarchy (issue: the PyPI sweep)",
+                self.name
+            )
+            .into());
+        }
         let real_bases: Vec<&str> = self
             .bases
             .iter()
-            .map(|b| b.id.as_str())
-            .filter(|b| *b != "object")
+            .filter_map(|b| match b {
+                ExprType::Name(n) if n.id != "object" => Some(n.id.as_str()),
+                _ => None,
+            })
             .collect();
         if real_bases.len() > 1 {
             return Err(format!(

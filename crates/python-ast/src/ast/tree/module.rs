@@ -212,13 +212,18 @@ impl CodeGen for Module {
             collect_class_defs(&self.raw.body, &mut classes);
             let mut hierarchy = std::collections::HashSet::new();
             for c in &classes {
-                let has_real_base = c.bases.iter().any(|b| b.id != "object");
+                let has_real_base = c
+                    .bases
+                    .iter()
+                    .any(|b| matches!(b, crate::ExprType::Name(n) if n.id != "object"));
                 if has_real_base {
                     hierarchy.insert(c.name.clone());
                 }
                 for b in &c.bases {
-                    if b.id != "object" {
-                        hierarchy.insert(b.id.clone());
+                    if let crate::ExprType::Name(n) = b
+                        && n.id != "object"
+                    {
+                        hierarchy.insert(n.id.clone());
                     }
                 }
             }
@@ -1563,13 +1568,18 @@ fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
     collect_class_defs(&module.raw.body, &mut class_list);
     let mut hierarchy = std::collections::HashSet::new();
     for c in &class_list {
-        let has_real_base = c.bases.iter().any(|b| b.id != "object");
+        let has_real_base = c
+            .bases
+            .iter()
+            .any(|b| matches!(b, crate::ExprType::Name(n) if n.id != "object"));
         if has_real_base {
             hierarchy.insert(c.name.clone());
         }
         for b in &c.bases {
-            if b.id != "object" {
-                hierarchy.insert(b.id.clone());
+            if let crate::ExprType::Name(n) = b
+                && n.id != "object"
+            {
+                hierarchy.insert(n.id.clone());
             }
         }
     }

@@ -508,3 +508,16 @@ fn resolve_dependency_tree_pulls_transitives() {
         assert!(dep.path.exists(), "path for `{}` missing: {}", dep.import_name, dep.path.display());
     }
 }
+
+#[test]
+fn parse_requirement_handles_parenthesized_specifiers() {
+    // PEP 508 parenthesized form used by botocore/boto3 metadata:
+    // `jmespath (<2.0.0,>=0.7.1)` — the paren must not leak into the name.
+    let req = parse_requirement("jmespath (<2.0.0,>=0.7.1)").unwrap();
+    assert_eq!(req.name, "jmespath");
+    assert_eq!(req.specifiers, vec![("<".to_string(), "2.0.0".to_string()), (">=".to_string(), "0.7.1".to_string())]);
+
+    let req = parse_requirement("urllib3 (!=2.2.0,<3,>=1.25.4)").unwrap();
+    assert_eq!(req.name, "urllib3");
+    assert_eq!(req.specifiers.len(), 3);
+}

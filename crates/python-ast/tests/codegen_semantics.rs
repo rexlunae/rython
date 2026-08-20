@@ -5422,6 +5422,22 @@ fn warnings_unknown_keyword_is_a_loud_error() {
 }
 
 #[test]
+fn class_with_a_foreign_base_is_a_loud_error() {
+    // A dotted base (`class ShutdownQueue(queue.Queue)`) used to crash the
+    // parser (bases extracted as Vec<Name>); it must be a clear loud error
+    // naming the class (only same-module single inheritance lowers).
+    let err = compile_err(
+        concat!(
+            "class ShutdownQueue(queue.Queue):\n",
+            "    pass\n",
+        ),
+        "foreign_base.py",
+    );
+    assert!(err.contains("ShutdownQueue"), "error: {}", err);
+    assert!(err.contains("cannot lower"), "error: {}", err);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.

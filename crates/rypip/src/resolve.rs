@@ -67,11 +67,19 @@ pub fn parse_requirement(s: &str) -> Result<Requirement> {
     };
 
     // Name then specifiers: `name>=1.0,<2.0`.
-    let split_at = name_part
-        .find(|c: char| c == '>' || c == '<' || c == '=' || c == '!' || c == '~')
+    // PEP 508 parenthesized specifiers (`name (>=1.0,<2.0)` — used by
+    // botocore/boto3 metadata) put the whole specifier list in parens;
+    // treat the opening paren as the name/specifier boundary so the paren
+    // does not leak into the name (issue: the transitive sweep).
+    let open_paren = name_part.find('(');
+    let split_at = open_paren
+        .or_else(|| name_part.find(|c: char| c == '>' || c == '<' || c == '=' || c == '!' || c == '~'))
         .unwrap_or(name_part.len());
     let name = name_part[..split_at].trim();
-    let spec_part = name_part[split_at..].trim();
+    let mut spec_part = name_part[split_at..].trim();
+    if open_paren.is_some() {
+        spec_part = spec_part.trim_start_matches('(').trim_end_matches(')').trim();
+    }
     if name.is_empty() {
         bail!("requirement `{s}` has no distribution name");
     }
@@ -610,8 +618,9 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Option<ResolvedDependency
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        // The .dist-info metadata directory is not a distribution root.
-        if name.ends_with(".dist-info") {
+        // The .dist-info metadata directory is not a distribution root,
+        // and neither is the wheel DATA directory (`{dist}-{version}.data`).
+        if name.ends_with(".dist-info") || name.contains(".data") {
             continue;
         }
         // Layout: `{dist}-{version}/` where the version may itself contain
@@ -671,6 +680,24 @@ fn extract_distribution(artifact: &Path, extract_dir: &Path, dist_name: &str) ->
         return Ok(top);
     }
 
+    // A top-level .py file next to the dist-info: the single-module wheel
+    // layout (six-1.17.0 extracts to six.py + six-1.17.0.dist-info/).
+    let module_files: Vec<PathBuf> = fs::read_dir(extract_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "py"))
+        .collect();
+    if module_files.len() == 1 {
+        let only_metadata_dirs = fs::read_dir(extract_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .all(|d| is_dist_info(&d));
+        if only_metadata_dirs {
+            return Ok(extract_dir.to_path_buf());
+        }
+    }
+
     if file_name.ends_with(".whl") || file_name.ends_with(".zip") {
         let file = fs::File::open(artifact)
             .with_context(|| format!("opening {}", artifact.display()))?;
@@ -726,6 +753,14 @@ fn extract_distribution(artifact: &Path, extract_dir: &Path, dist_name: &str) ->
             )
         }
     }
+}
+
+/// Whether a directory is itself a `.dist-info` directory (its name ends
+/// with `.dist-info`) — a wheel's metadata dir, distinct from a package.
+fn is_dist_info(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".dist-info"))
 }
 
 fn has_dist_info(dir: &Path) -> bool {
