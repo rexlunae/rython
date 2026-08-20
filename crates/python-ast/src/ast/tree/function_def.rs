@@ -905,6 +905,17 @@ impl CodeGen for FunctionDef {
                 .map(|p| p.arg.clone())
                 .collect();
             if unannotated.is_empty() {
+                // No inferred parameters: the body's calls are still
+                // checked against callee bounds (M5, call-site
+                // satisfiability) — the inference collector only walks
+                // functions with unannotated parameters.
+                crate::check_call_sites(
+                    &effective_body,
+                    &symbols,
+                    &options.name_types,
+                    &options,
+                )
+                .map_err(|e| format!("function `{}`: {}", self.name, e))?;
                 crate::InferredSignature::default()
             } else if is_method {
                 // M1 covers free functions; methods (and __init__) need

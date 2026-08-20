@@ -26,6 +26,12 @@
 //!   `n = 2` or `n = 2.5`), and the callee's return type flows to the
 //!   caller's return. Mutual recursion without annotations is a loud
 //!   error.
+//! - M5: call-site satisfiability — a call whose arguments are statically
+//!   known (literals, typed locals) is verified against the callee's
+//!   inferred bounds at conversion time, mirroring stdpython's actual
+//!   impls, so `add("a", 1)` or `hear(5)` is a loud error naming the call
+//!   instead of a rustc surprise. Runs for every body: inferred functions,
+//!   annotated/paramless functions, module init, and the __main__ block.
 //!
 //! Still loud errors (later milestones): callable parameters, iteration
 //! over a parameter (`for x in p`), and method parameters.
@@ -1019,6 +1025,223 @@ fn collect_expr_branches<'e>(expr: &'e ExprType, out: &mut Vec<&'e ExprType>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M5: call-site satisfiability. A call whose arguments are statically known
+// (literals, typed locals) is checked against the callee's inferred bounds
+// at CONVERSION time — an unsatisfiable call is a loud error naming the
+// Python line, never a rustc surprise at build time. The table mirrors
+// stdpython's actual trait impls (including Rust std's missing int/float
+// cross-PartialOrd/PartialEq), and is deliberately permissive for types the
+// table is unsure about (no false positives).
+// ---------------------------------------------------------------------------
+
+/// Python-facing type names for error messages.
+fn type_display(ty: &TypeInfo) -> String {
+    match ty {
+        TypeInfo::Int => "int".to_string(),
+        TypeInfo::Float => "float".to_string(),
+        TypeInfo::Bool => "bool".to_string(),
+        TypeInfo::StrRef | TypeInfo::String => "str".to_string(),
+        TypeInfo::Bytes => "bytes".to_string(),
+        TypeInfo::Vec(_) => "list".to_string(),
+        TypeInfo::Dict(..) => "dict".to_string(),
+        TypeInfo::Tuple(_) => "tuple".to_string(),
+        TypeInfo::Option(_) => "optional".to_string(),
+        TypeInfo::Range => "range".to_string(),
+        TypeInfo::NdArray => "array".to_string(),
+        TypeInfo::Class(c) => c.clone(),
+        TypeInfo::Borrowed(_) => "borrowed".to_string(),
+        TypeInfo::PyObject => "unknown".to_string(),
+    }
+}
+
+/// Whether a value of type `ty` satisfies the trait bound the inference
+/// emits for an unannotated parameter. `rhs` is the other operand's type
+/// (None for unary bounds). Permissive (true) for types whose stdpython
+/// impl set the table does not enumerate — the check only ever rejects
+/// clear mismatches.
+fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bool {
+    let uncertain = |t: &TypeInfo| {
+        matches!(
+            t,
+            TypeInfo::PyObject
+                | TypeInfo::NdArray
+                | TypeInfo::Class(_)
+                | TypeInfo::Tuple(_)
+                | TypeInfo::Option(_)
+                | TypeInfo::Range
+                | TypeInfo::Bytes
+                | TypeInfo::Borrowed(_)
+        )
+    };
+    if uncertain(ty) {
+        return true;
+    }
+    match trait_name {
+        // Operators: numeric promotion like stdpython's numeric_add /
+        // numeric_sub_mul; strings and lists concatenate with themselves.
+        "PyAdd" | "PySub" | "PyMul" => match (ty, rhs) {
+            (TypeInfo::Int, Some(TypeInfo::Int | TypeInfo::Float)) => true,
+            (TypeInfo::Float, Some(TypeInfo::Int | TypeInfo::Float)) => true,
+            (TypeInfo::String | TypeInfo::StrRef, Some(TypeInfo::String | TypeInfo::StrRef)) => {
+                trait_name == "PyAdd"
+            }
+            (TypeInfo::Vec(_), Some(TypeInfo::Vec(_))) => trait_name == "PyAdd",
+            _ => false,
+        },
+        // Comparisons: Rust std's PartialEq/PartialOrd blankets are
+        // same-type only — there is NO int/float cross comparison in std
+        // (which is why literals convert via PyFromInt instead).
+        "PyEq" | "PyNe" | "PyLt" | "PyLe" | "PyGt" | "PyGe" => match (ty, rhs) {
+            (TypeInfo::Int, Some(TypeInfo::Int)) => true,
+            (TypeInfo::Float, Some(TypeInfo::Float)) => true,
+            (TypeInfo::Bool, Some(TypeInfo::Bool)) => true,
+            (TypeInfo::String | TypeInfo::StrRef, Some(TypeInfo::String | TypeInfo::StrRef)) => {
+                true
+            }
+            (TypeInfo::Vec(_), Some(TypeInfo::Vec(_))) => true,
+            (TypeInfo::Dict(..), Some(TypeInfo::Dict(..))) => {
+                matches!(trait_name, "PyEq" | "PyNe")
+            }
+            _ => false,
+        },
+        // int()/float()/bool() accept strings too (Python parses them),
+        // mirroring stdpython's PyInt for &str/String, PyFloat for
+        // &str/String, PyBool for &str/String.
+        "PyInt" => matches!(
+            ty,
+            TypeInfo::Int | TypeInfo::Bool | TypeInfo::Float | TypeInfo::String | TypeInfo::StrRef
+        ),
+        "PyFloat" => matches!(
+            ty,
+            TypeInfo::Int | TypeInfo::Float | TypeInfo::String | TypeInfo::StrRef
+        ),
+        "PyBool" => matches!(
+            ty,
+            TypeInfo::Int
+                | TypeInfo::Float
+                | TypeInfo::Bool
+                | TypeInfo::String
+                | TypeInfo::StrRef
+        ),
+        "PyToString" | "PyDisplay" | "PyRepr" => true,
+        "PyAbs" => matches!(ty, TypeInfo::Int | TypeInfo::Float),
+        "Truthy" => true,
+        "Len" => matches!(
+            ty,
+            TypeInfo::String | TypeInfo::Vec(_) | TypeInfo::Dict(..)
+        ),
+        "PyHash" => matches!(
+            ty,
+            TypeInfo::Int | TypeInfo::Float | TypeInfo::Bool | TypeInfo::String | TypeInfo::StrRef
+        ),
+        "PyIsNone" => true,
+        "PyIndex" => match (ty, rhs) {
+            (TypeInfo::String, Some(TypeInfo::Int)) => true,
+            (TypeInfo::Vec(_), Some(TypeInfo::Int)) => true,
+            (TypeInfo::Dict(..), Some(_)) => true,
+            _ => false,
+        },
+        "PySetIndex" => match (ty, rhs) {
+            (TypeInfo::Vec(_), Some(TypeInfo::Int)) => true,
+            (TypeInfo::Dict(..), Some(_)) => true,
+            _ => false,
+        },
+        "PyContains" => matches!(
+            ty,
+            TypeInfo::String | TypeInfo::StrRef | TypeInfo::Vec(_) | TypeInfo::Dict(..)
+        ),
+        "PyStrOps" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
+        "PyListOps" | "PyPop" => matches!(ty, TypeInfo::Vec(_)),
+        "PyFromInt" => matches!(ty, TypeInfo::Int | TypeInfo::Float),
+        // Generated Has* duck traits are satisfied by any user class (the
+        // impl is generated for every defining class).
+        _ if trait_name.starts_with("Has") => matches!(ty, TypeInfo::Class(_)),
+        _ => false,
+    }
+}
+
+/// Map a bound's concrete-rhs token stream back to a TypeInfo, for the
+/// satisfiability check.
+fn concrete_tokens_to_typeinfo(tokens: &TokenStream) -> Option<TypeInfo> {
+    match tokens.to_string().as_str() {
+        "i64" => Some(TypeInfo::Int),
+        "f64" => Some(TypeInfo::Float),
+        "bool" => Some(TypeInfo::Bool),
+        "String" => Some(TypeInfo::String),
+        "& str" | "& 'static str" => Some(TypeInfo::StrRef),
+        s if s.starts_with("Vec <") => Some(TypeInfo::Vec(Box::new(TypeInfo::PyObject))),
+        _ => None,
+    }
+}
+
+/// The statically-known type of a call argument: a literal (including a
+/// leading unary minus), or a name with a typed analysis entry. Parameters
+/// and computed expressions are None (their requirements flow through
+/// propagate_from_callee instead — M4).
+fn static_arg_type(expr: &ExprType, collector: &Collector) -> Option<TypeInfo> {
+    match expr {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(_)) => Some(TypeInfo::Int),
+            Some(litrs::Literal::Float(_)) => Some(TypeInfo::Float),
+            Some(litrs::Literal::String(_)) => Some(TypeInfo::StrRef),
+            Some(litrs::Literal::Bool(_)) => Some(TypeInfo::Bool),
+            _ => None,
+        },
+        ExprType::UnaryOp(u) if matches!(u.op, crate::Ops::USub) => {
+            match static_arg_type(u.operand.as_ref(), collector) {
+                Some(TypeInfo::Int) | Some(TypeInfo::Float) => {
+                    Some(match u.operand.as_ref() {
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::Integer(_))) =>
+                        {
+                            TypeInfo::Int
+                        }
+                        _ => TypeInfo::Float,
+                    })
+                }
+                _ => None,
+            }
+        }
+        ExprType::Name(n) => collector.name_types.get(&n.id).cloned(),
+        _ => None,
+    }
+}
+
+/// M5: run the call-site satisfiability check over a whole body (module
+/// init, __main__ block, or a function without unannotated parameters).
+/// Collectors already walk inferred functions, so those need no extra pass.
+pub fn check_call_sites(
+    body: &[Statement],
+    symbols: &SymbolTableScopes,
+    name_types: &HashMap<String, TypeInfo>,
+    options: &crate::PythonOptions,
+) -> Result<(), String> {
+    let empty = HashSet::new();
+    let mut collector = Collector {
+        unannotated: &empty,
+        name_types,
+        symbols,
+        options,
+        reqs: HashMap::new(),
+        alias: HashMap::new(),
+        returns: Vec::new(),
+        reassigned: HashSet::new(),
+        duck_returns: HashMap::new(),
+        duck_method_calls: HashMap::new(),
+        error: None,
+        current_fn: None,
+        callee_cache: HashMap::new(),
+        visiting: HashSet::new(),
+        return_visiting: HashSet::new(),
+    };
+    collector.walk(body);
+    match collector.error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// The index of the parameter a callee returns, when every bare-parameter
 /// return names the SAME parameter (mixed non-param returns are allowed —
 /// they unify via the recursion rule at the caller).
@@ -1528,12 +1751,15 @@ impl<'a> Collector<'a> {
                 }
                 // A parameter passed to a user function (M4): adopt the
                 // callee's parameter requirements (FlowsTo) or the concrete
-                // type of an annotated callee parameter.
+                // type of an annotated callee parameter. Statically-known
+                // arguments are also checked against the callee's inferred
+                // bounds (M5, call-site satisfiability).
                 if let ExprType::Name(f) = c.func.as_ref() {
                     if let Some(crate::SymbolTableNode::FunctionDef(callee)) =
                         self.symbols.get(&f.id)
                     {
                         self.propagate_from_callee(callee, &c.args);
+                        self.check_call_site(callee, &c.args);
                     }
                 }
                 self.walk_expr(&c.func, false);
@@ -1809,6 +2035,100 @@ impl<'a> Collector<'a> {
     /// arguments — a concretely-annotated callee parameter identity-forces
     /// the argument; an unannotated callee parameter propagates its bounds
     /// with inter-parameter references remapped to the caller's arguments.
+    /// M5: verify a call's statically-known arguments satisfy the callee's
+    /// inferred bounds (a loud conversion error, never a rustc surprise).
+    /// Arguments whose type is not statically known are skipped — their
+    /// requirements flow through propagate_from_callee instead.
+    fn check_call_site(&mut self, callee: &crate::FunctionDef, args: &[ExprType]) {
+        if self.error.is_some() {
+            return;
+        }
+        let callee_params: Vec<&crate::Parameter> = callee
+            .args
+            .posonlyargs
+            .iter()
+            .chain(callee.args.args.iter())
+            .collect();
+        let callee_reqs = match self.callee_requirements(callee) {
+            Ok(r) => r,
+            Err(_) => return, // the callee's own inference reports this
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param) = callee_params.get(i) else { continue };
+            let Some(param_reqs) = callee_reqs.get(&param.arg) else { continue };
+            let Some(arg_ty) = static_arg_type(arg, self) else { continue };
+            for req in param_reqs {
+                // Resolve the requirement's rhs to a concrete type.
+                let rhs_ty = |rhs: &RhsType| -> Option<TypeInfo> {
+                    match rhs {
+                        RhsType::Concrete(t) => concrete_tokens_to_typeinfo(t),
+                        RhsType::Param(name) => {
+                            let idx = callee_params.iter().position(|p| p.arg == *name)?;
+                            args.get(idx).and_then(|a| static_arg_type(a, self))
+                        }
+                        RhsType::Same => Some(arg_ty.clone()),
+                        RhsType::Unknown => None,
+                    }
+                };
+                let (trait_name, ok) = match req {
+                    ParamReq::Op(t, rhs) => {
+                        (*t, rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))))
+                    }
+                    ParamReq::OpOutput(t, rhs) => {
+                        (*t, rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))))
+                    }
+                    ParamReq::Cmp(t, rhs) | ParamReq::CmpCond(t, rhs) => {
+                        (*t, rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))))
+                    }
+                    ParamReq::Conversion(t) => (*t, type_satisfies(&arg_ty, t, None)),
+                    ParamReq::Truthy => ("Truthy", type_satisfies(&arg_ty, "Truthy", None)),
+                    ParamReq::Len => ("Len", type_satisfies(&arg_ty, "Len", None)),
+                    ParamReq::Display => ("PyDisplay", true),
+                    ParamReq::Repr => ("PyRepr", true),
+                    ParamReq::Hash => ("PyHash", type_satisfies(&arg_ty, "PyHash", None)),
+                    ParamReq::IsNone => ("PyIsNone", true),
+                    ParamReq::Index(idx) => (
+                        "PyIndex",
+                        rhs_ty(idx).map_or(true, |r| type_satisfies(&arg_ty, "PyIndex", Some(&r))),
+                    ),
+                    ParamReq::SetIndex(idx, _) => (
+                        "PySetIndex",
+                        rhs_ty(idx).map_or(true, |r| type_satisfies(&arg_ty, "PySetIndex", Some(&r))),
+                    ),
+                    ParamReq::Contains(item) => (
+                        "PyContains",
+                        rhs_ty(item)
+                            .map_or(true, |r| type_satisfies(&arg_ty, "PyContains", Some(&r))),
+                    ),
+                    ParamReq::Method(t, _, rhs) => {
+                        let t = t.as_str();
+                        let ok = match rhs {
+                            Some(rhs) => rhs_ty(rhs)
+                                .map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))),
+                            None => type_satisfies(&arg_ty, t, None),
+                        };
+                        (t, ok)
+                    }
+                    ParamReq::PyFromInt => ("PyFromInt", type_satisfies(&arg_ty, "PyFromInt", None)),
+                    ParamReq::Identity(_) | ParamReq::Untranslatable(_) => continue,
+                };
+                if !ok {
+                    self.error = Some(format!(
+                        "call to `{}` cannot satisfy parameter `{}`'s inferred bound `{}`: \
+                         an argument of type `{}` does not implement it. Annotate `{}` or \
+                         the argument (issue #109, M5)",
+                        callee.name,
+                        param.arg,
+                        trait_name,
+                        type_display(&arg_ty),
+                        param.arg,
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
     fn propagate_from_callee(&mut self, callee: &crate::FunctionDef, args: &[ExprType]) {
         let callee_params: Vec<&crate::Parameter> = callee
             .args

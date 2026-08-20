@@ -330,12 +330,26 @@ impl CodeGen for Module {
             &options.name_types,
             &options.use_counts,
         )?;
+        // Issue #109, M5: module-level calls (including the __main__ block)
+        // are checked against callee inferred bounds at conversion time.
+        crate::check_call_sites(
+            &module_init_raw,
+            &symbols,
+            &options.name_types,
+            &options,
+        )?;
         let main_info = crate::analyze_function_types(&main_body_raw);
         crate::check_aliasing(
             &main_body_raw,
             &symbols,
             &main_info.name_types,
             &main_info.use_counts,
+        )?;
+        crate::check_call_sites(
+            &main_body_raw,
+            &symbols,
+            &main_info.name_types,
+            &options,
         )?;
 
         for s in self.raw.body {

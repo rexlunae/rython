@@ -5012,6 +5012,71 @@ fn unannotated_callee_return_flows_to_the_callers_return() {
 }
 
 #[test]
+fn unsatisfiable_call_site_is_a_loud_error_at_module_level() {
+    // M5 call-site satisfiability: `add("a", 1)` — a String argument cannot
+    // satisfy `a`'s inferred `PyAdd` bound (stdpython only adds strings
+    // with strings; Python would raise TypeError at runtime). Loud at
+    // conversion time, never a rustc surprise.
+    let err = compile_err(
+        "def add(a, b):\n    return a + b\nprint(add(\"a\", 1))\n",
+        "inf_m5_mod.py",
+    );
+    assert!(err.contains("cannot satisfy"), "error: {}", err);
+    assert!(err.contains("PyAdd"), "error: {}", err);
+    assert!(err.contains("str"), "error: {}", err);
+}
+
+#[test]
+fn unsatisfiable_call_site_is_a_loud_error_inside_a_function() {
+    // The same check fires for calls inside annotated/paramless functions,
+    // which have no inference collector of their own.
+    let err = compile_err(
+        "def add(a, b):\n    return a + b\ndef wrapper(x):\n    return add(x, \"boom\")\nprint(wrapper(1))\n",
+        "inf_m5_fn.py",
+    );
+    assert!(err.contains("cannot satisfy"), "error: {}", err);
+    assert!(err.contains("`x`"), "error: {}", err);
+}
+
+#[test]
+fn call_site_check_rejects_string_where_a_number_is_required() {
+    // `is_big("hello")`: a str cannot satisfy the numeric comparison
+    // bounds (PyFromInt) — Python raises TypeError for str > int too.
+    let err = compile_err(
+        "def is_big(n):\n    return n > 0\nprint(is_big(\"hello\"))\n",
+        "inf_m5_str.py",
+    );
+    assert!(err.contains("cannot satisfy"), "error: {}", err);
+    assert!(err.contains("PyFromInt"), "error: {}", err);
+}
+
+#[test]
+fn satisfiable_call_sites_still_convert() {
+    // Every accepted call site from M1/M4 keeps converting: numeric
+    // promotion, string concatenation, param-to-param flow (checked at
+    // the outer call), and comparisons with literal conversion.
+    let out = compile(
+        concat!(
+            "def add(a, b):\n",
+            "    return a + b\n",
+            "def positive(n):\n",
+            "    return n > 0\n",
+            "def caller(v):\n",
+            "    return add(v, 1)\n",
+            "print(add(1, 2))\n",
+            "print(add(1.5, 2.5))\n",
+            "print(add(\"ab\", \"cd\"))\n",
+            "print(caller(7))\n",
+            "print(positive(3))\n",
+            "print(positive(-1))\n",
+        ),
+        "inf_m5_ok.py",
+    );
+    assert!(out.contains("PyAdd"), "generated: {}", out);
+    assert!(!out.contains("cannot satisfy"), "generated: {}", out);
+}
+
+#[test]
 fn mutually_recursive_returns_are_a_loud_error() {
     // M4: mutual recursion without return annotations cannot be resolved
     // to a single return type — loud error naming the cycle.
