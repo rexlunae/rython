@@ -111,8 +111,9 @@ Known gaps:
 - **Language features**: generators/`yield`, `async`/`await`,
   `eval`/`exec`, `*args`/`**kwargs`, multiple inheritance and dunder
   protocols are not supported yet. Decorators other than
-  `functools.lru_cache`/`cache` are a loud conversion error (never
-  silently ignored).
+  `functools.lru_cache`/`cache`, `classmethod`, and `staticmethod` are a
+  loud conversion error (never silently ignored); `@dataclass` parses
+  but does not synthesize `__init__` yet.
 - **`lru_cache` keys** must be `int`/`bool`/`str`-annotated parameters
   — floats are not hashable in Rust, so Python's float-key caching is
   refused rather than approximated.
@@ -132,6 +133,21 @@ line, never a silent behaviour change:
   num_pools=10, **connection_pool_kwargs)` is a loud error. Blocks
   urllib3's `PoolManager` (and everything that depends on urllib3,
   including botocore/boto3) and s3transfer's callback helpers.
+- **Heterogeneous unions** — a parameter/field annotated with a union
+  whose members map to different Rust types (`str | bytes`,
+  `str | bytes | int | float`) has no single Rust type and is a loud
+  error; only same-Rust-type unions (`bytes | bytearray` → `Vec<u8>`)
+  and `T | None` → `Option<T>` lower. Pervasive in requests
+  (`to_native_string(string: str | bytes)`, `UriType = str | bytes`,
+  auth/cookies/models/sessions/utils) — blocks requests (#1 PyPI) at
+  its own code.
+- **Callables in containers** — a list/dict whose elements are function
+  objects (`botocore._INITIALIZERS`, populated by
+  `register_initializer(callback)` and invoked via
+  `for initializer in _INITIALIZERS: initializer(session)`) has no
+  representable element type and no call-through-container lowering.
+  Same family as "classes as values": function objects are not
+  first-class values. Blocks botocore (#3 PyPI) at its first statement.
 - **Dynamic imports and the import machinery** — `importlib`,
   `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
   modeled: rython compiles imports statically. Blocks pip's
@@ -152,6 +168,16 @@ line, never a silent behaviour change:
 - **Attribute reads on unannotated parameters** — `p.attr` where `attr`
   is neither a known method nor a field of a known class is a loud
   error (s3transfer's `request.body.disable_callback()`).
+- **Attribute reads on call results** — a field typed from
+  `self.x = call(...).attr` needs the callee's return type
+  (`get_scheme(...) -> Scheme`, then the dataclass field annotation).
+  rython has no cross-module call-return-type inference yet, so
+  `Prefix.bin_dir = scheme.scripts` in pip's `_internal` is a loud
+  error (blocks pip — #5 PyPI).
+- **`@dataclass` field synthesis** — the decorator parses but does not
+  synthesize `__init__`, so `Scheme(platlib=..., ...)` fails with
+  "takes no arguments". Dataclasses are common in pip._internal and
+  modern libraries generally (blocks pip — #5 PyPI).
 - **`argparse`** supports literal specs only (the parser is evaluated at
   conversion time): `str`/`int`/`float` positionals, `--long` options
   with `default=`, `store_true`, `help=`, `prog=`, `description=`.
