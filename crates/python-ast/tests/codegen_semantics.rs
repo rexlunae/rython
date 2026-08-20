@@ -157,6 +157,29 @@ fn isinstance_accepts_a_tuple_of_types() {
 }
 
 #[test]
+fn empty_list_into_optional_name_renders_typed_empty() {
+    // `cp_isolation: list[str] | None = None`, then `cp_isolation = []` on
+    // the None path (charset_normalizer's from_bytes): the empty literal
+    // must render as the INNER typed container (Vec::<String>::new()) and
+    // the optional-store wrap adds the Some — the old code had no
+    // Option(inner) arm and failed with "no inferable element type".
+    let out = compile(
+        "def f(cp_isolation: list[str] | None = None) -> list[str]:\n\
+         \x20   if cp_isolation is not None:\n\
+         \x20       cp_isolation = cp_isolation\n\
+         \x20   else:\n\
+         \x20       cp_isolation = []\n\
+         \x20   return cp_isolation\n",
+        "optempty.py",
+    );
+    assert!(
+        out.contains("Vec :: < String > :: new ()") || out.contains("Vec::<String>::new()"),
+        "empty literal into an Optional name must render the typed inner container: {}",
+        out
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at

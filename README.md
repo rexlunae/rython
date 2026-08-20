@@ -174,6 +174,11 @@ line, never a silent behaviour change:
   rython has no cross-module call-return-type inference yet, so
   `Prefix.bin_dir = scheme.scripts` in pip's `_internal` is a loud
   error (blocks pip — #5 PyPI).
+- **`is not None` type narrowing** — `if x is not None:` does not narrow
+  an `Option<T>`-typed name to `T` for reads/iteration: a comprehension
+  over the guarded name iterates the Option (the inner value as one
+  element) and fails loudly at build time. Blocks requests at
+  charset_normalizer's `from_bytes` (`cp_isolation` guard).
 - **`@dataclass` field synthesis** — the decorator parses but does not
   synthesize `__init__`, so `Scheme(platlib=..., ...)` fails with
   "takes no arguments". Dataclasses are common in pip._internal and

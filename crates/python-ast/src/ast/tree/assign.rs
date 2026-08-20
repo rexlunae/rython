@@ -130,7 +130,16 @@ impl<'a> CodeGen for Assign {
                 // name_types carries the FINAL per-name type: later typed
                 // assignments and pinning uses both refine it, so an empty
                 // store is rendered against the binding's final type.
+                // An Optional name (`xs: list[str] | None = None`, later
+                // `xs = []` on the None path — charset_normalizer's
+                // `cp_isolation`) renders the INNER typed empty container;
+                // the optional-store wrap (assigning into an optional slot)
+                // adds the Some.
                 let pinned = options.name_types.get(&name.id).cloned();
+                let pinned = match &pinned {
+                    Some(crate::TypeInfo::Option(inner)) => Some((**inner).clone()),
+                    other => other.clone(),
+                };
                 match pinned {
                     Some(crate::TypeInfo::Vec(inner)) if !matches!(*inner, crate::TypeInfo::PyObject) => {
                         let t = inner.to_rust_type();
@@ -342,12 +351,20 @@ impl<'a> CodeGen for Assign {
                     options.clone(),
                     symbols.clone(),
                 )?;
-                let value = crate::lower_optional_value(
-                    &value_expr,
-                    ctx.clone(),
-                    options.clone(),
-                    symbols.clone(),
-                )?;
+                // An empty-container literal was already rendered with its
+                // pinned element type above (Vec::<T>::new()); reuse it so
+                // the Some wrap lands on the typed container, not on a bare
+                // vec![] that rustc cannot infer.
+                let value = if is_empty_container_literal(&value_expr) {
+                    quote!(Some(#value))
+                } else {
+                    crate::lower_optional_value(
+                        &value_expr,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?
+                };
                 return Ok(quote!(#target_code = #value;));
             }
             render(&self.targets[0], &value)
@@ -388,4 +405,11 @@ fn is_container_literal(expr: &ExprType) -> bool {
             | ExprType::DictComp(_)
             | ExprType::SetComp(_)
     )
+}
+
+/// Whether an expression is an EMPTY `[]`/`{}` literal (the shape the
+/// pinned-element-type rendering above handles).
+fn is_empty_container_literal(expr: &ExprType) -> bool {
+    matches!(expr, ExprType::List(l) if l.is_empty())
+        || matches!(expr, ExprType::Dict(d) if d.keys.is_empty())
 }

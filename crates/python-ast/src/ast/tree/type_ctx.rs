@@ -531,6 +531,27 @@ pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
 /// type codegen produces for it. Used to derive the expected type of a
 /// call argument from the callee's parameter annotation.
 pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
+    // `T | None` (and `None | T`) is Option<T>; the inner type resolves
+    // through the same mapping. A union of two non-None members that map
+    // to the same TypeInfo (bytes | bytearray) is that type.
+    if let ExprType::BinOp(op) = ann
+        && matches!(op.op, crate::BinOps::BitOr)
+    {
+        if crate::is_none_expr(&op.left) {
+            return Some(TypeInfo::Option(Box::new(annotation_type_info(&op.right)?)));
+        }
+        if crate::is_none_expr(&op.right) {
+            return Some(TypeInfo::Option(Box::new(annotation_type_info(&op.left)?)));
+        }
+        let l = annotation_type_info(&op.left);
+        let r = annotation_type_info(&op.right);
+        if let (Some(l), Some(r)) = (l, r)
+            && l == r
+        {
+            return Some(l);
+        }
+        return None;
+    }
     match ann {
         ExprType::Name(n) => match n.id.as_str() {
             "int" => Some(TypeInfo::Int),
