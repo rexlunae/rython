@@ -4343,7 +4343,6 @@ pub use stdlib::pathlib;
 pub use stdlib::tempfile;
 #[cfg(feature = "std")]
 pub use stdlib::glob;
-#[cfg(feature = "std")]
 pub use stdlib::warnings;
 #[cfg(feature = "std")]
 pub use stdlib::numpy;

@@ -72,9 +72,10 @@ pub mod tempfile;
 #[cfg(feature = "std")]
 pub mod glob;
 
-/// Python warnings module - diagnostics (issue #111). std-gated: it
-/// prints to stderr, which the alloc tier has no access to.
-#[cfg(feature = "std")]
+/// Python warnings module - diagnostics (issue #111). The HOOKS (filter
+/// action, warn) live on every tier; the stderr OUTPUT is std-only, and
+/// the alloc tier simply has no default output (warn is a no-op there,
+/// like `log` with no logger).
 pub mod warnings;
 
 /// Python functools module - higher-order functions (reduce)
