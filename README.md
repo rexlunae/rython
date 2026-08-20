@@ -123,9 +123,11 @@ Known gaps:
   the registry (never silently ignored); arbitrary user decorators
   (functions applied to definitions) are the function-as-value
   divergence (issue #122).
-- **`lru_cache` keys** must be `int`/`bool`/`str`-annotated parameters
-  — floats are not hashable in Rust, so Python's float-key caching is
-  refused rather than approximated.
+- **`lru_cache` keys** must be `int`/`bool`/`str`/`float`-annotated
+  parameters. Floats use the `PyFloatKey` wrapper with Python's exact
+  semantics: `-0.0 == 0.0` (they share a cache entry) and `NaN != NaN`
+  (a NaN key never hits, so the wrapped function is called every time —
+  exactly CPython's dict behavior).
 - **File objects** cover text modes (`r`/`w`/`a`) and `io.StringIO`;
   binary modes, `BytesIO`, `seek`/`tell`, and file-based `json`
   (`dump`/`load`) are not supported yet.
@@ -157,12 +159,6 @@ line, never a silent behaviour change:
   representable element type and no call-through-container lowering.
   Same family as "classes as values": function objects are not
   first-class values. Blocks botocore (#3 PyPI) at its first statement.
-- **`lru_cache` with float keys** — the decorator-factory expression
-  `alias = lru_cache(maxsize=N)(fn)` is now supported (synthesizes the
-  cached function via the decorator registry), but charset_normalizer's
-  `cached_mess_ratio = lru_cache(maxsize=None)(mess_ratio)` still hits
-  the documented float-key limitation: `mess_ratio` takes
-  `maximum_threshold: float`, and floats are not hashable in Rust.
 - **Dynamic imports and the import machinery** — `importlib`,
   `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
   modeled: rython compiles imports statically. Blocks pip's

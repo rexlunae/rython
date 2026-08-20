@@ -630,10 +630,16 @@ impl CodeGen for FunctionDef {
                         Some(ExprType::Name(n)) if n.id == "int" => quote!(i64),
                         Some(ExprType::Name(n)) if n.id == "bool" => quote!(bool),
                         Some(ExprType::Name(n)) if n.id == "str" => quote!(String),
+                        // float keys use the PyFloatKey wrapper: Python
+                        // semantics (-0.0 == 0.0, NaN never hits) differ
+                        // from Rust's f64 Hash/Eq.
+                        Some(ExprType::Name(n)) if n.id == "float" => {
+                            quote!(stdpython::stdlib::functools::PyFloatKey)
+                        }
                         _ => {
                             return Err(format!(
                                 "@lru_cache on `{}`: parameter `{}` must be annotated \
-                                 int, bool, or str (the arguments form the cache key)",
+                                 int, bool, str, or float (the arguments form the cache key)",
                                 self.name, p.arg
                             )
                             .into());
@@ -1267,6 +1273,42 @@ impl CodeGen for FunctionDef {
             };
             let key_types: Vec<&TokenStream> = key.iter().map(|(_, t)| t).collect();
             let key_names: Vec<&proc_macro2::Ident> = key.iter().map(|(n, _)| n).collect();
+            // The __lru_uncached fn takes the RAW parameter types (float
+            // stays f64 for the wrapped call); only the cache KEY tuple
+            // wraps floats in PyFloatKey.
+            let uncached_types: Vec<TokenStream> = key
+                .iter()
+                .zip(self.args.args.iter())
+                .map(|((_, ty), p)| {
+                    if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "float")
+                        && ty.to_string().contains("PyFloatKey")
+                    {
+                        crate::python_annotation_to_rust_type(
+                            p.annotation.as_deref().expect("float annotated"),
+                        )
+                        .unwrap_or_else(|| quote!(f64))
+                    } else {
+                        quote!(#ty)
+                    }
+                })
+                .collect();
+            // The cache KEY tuple: floats wrap in PyFloatKey (Python float
+            // semantics); everything else is the raw value cloned. The
+            // __lru_uncached call always passes the raw values.
+            let key_vals: Vec<TokenStream> = key
+                .iter()
+                .zip(self.args.args.iter())
+                .map(|((name, ty), p)| {
+                    let ident = name;
+                    if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "float")
+                        && ty.to_string().contains("PyFloatKey")
+                    {
+                        quote!(stdpython::stdlib::functools::PyFloatKey(#ident))
+                    } else {
+                        quote!(#ident.clone())
+                    }
+                })
+                .collect();
             let ret = match self.resolved_return_type() {
                 Some(ty) => quote!(#ty),
                 None => quote!(()),
@@ -1290,19 +1332,19 @@ impl CodeGen for FunctionDef {
                 if let Some(__hit) = __LRU_CACHE
                     .lock()
                     .expect("lru_cache mutex poisoned")
-                    .get(&(#((#key_names).clone(),)*))
+                    .get(&(#(#key_vals,)*))
                 {
                     return Ok(__hit);
                 }
                 #[allow(non_snake_case)]
-                fn __lru_uncached(#(#key_names: #key_types),*) -> Result<#ret, PyException> {
+                fn __lru_uncached(#(#key_names: #uncached_types),*) -> Result<#ret, PyException> {
                     #streams
                 }
                 let __lru_value = __lru_uncached(#((#key_names).clone()),*)?;
                 __LRU_CACHE
                     .lock()
                     .expect("lru_cache mutex poisoned")
-                    .put((#((#key_names).clone(),)*), __lru_value.clone());
+                    .put((#(#key_vals,)*), __lru_value.clone());
                 Ok(__lru_value)
             }
         } else {

@@ -407,6 +407,31 @@ fn unsupported_decorator_error_is_consistent() {
 }
 
 #[test]
+fn lru_cache_float_keys_use_python_semantics() {
+    // @lru_cache on a function with a float parameter: the cache key wraps
+    // the float in PyFloatKey (Python semantics: -0.0 == 0.0, NaN never
+    // hits), while the inner fn still takes the raw f64.
+    let out = compile(
+        "from functools import lru_cache\n\
+         \n\
+         @lru_cache(maxsize=None)\n\
+         def f(x: float, s: str) -> float:\n\
+         \x20   return x\n",
+        "lrufloat.py",
+    );
+    assert!(
+        out.contains("PyFloatKey"),
+        "float cache keys must wrap in PyFloatKey: {}",
+        out
+    );
+    assert!(
+        out.contains("fn __lru_uncached") || out.contains("fn __lru_uncached "),
+        "the uncached fn must be emitted: {}",
+        out
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at
@@ -4655,9 +4680,9 @@ fn unknown_decorators_and_unhashable_keys_are_loud() {
     assert!(err.contains("not supported yet"), "error: {}", err);
     assert!(err.contains("refuses to silently ignore"), "error: {}", err);
 
-    // Floats are not hashable cache keys in Rust; Python would cache
-    // them, which cannot be reproduced — loud.
-    let err = compile_err(
+    // Floats ARE supported as cache keys, with Python's semantics
+    // (-0.0 == 0.0, NaN never hits) via the PyFloatKey wrapper.
+    let out = compile(
         concat!(
             "from functools import lru_cache\n",
             "\n",
@@ -4667,11 +4692,7 @@ fn unknown_decorators_and_unhashable_keys_are_loud() {
         ),
         "lru5.py",
     );
-    assert!(
-        err.contains("must be annotated int, bool, or str"),
-        "error: {}",
-        err
-    );
+    assert!(out.contains("PyFloatKey"), "float keys must wrap: {}", out);
 }
 
 // ---- argparse: conversion-time parsers ----

@@ -51,6 +51,65 @@ pub struct PyLruCache<K, V> {
     maxsize: Option<usize>,
 }
 
+/// A float cache key with PYTHON's float semantics: `-0.0 == 0.0` (so they
+/// share a cache entry) and `NaN != NaN` (so a NaN key never hits, and the
+/// wrapped function is called every time — exactly CPython, where a dict
+/// lookup on NaN misses). Hash normalizes -0.0 to +0.0 so equal keys hash
+/// equal; Eq uses float `==` so NaN never matches, not even itself.
+#[derive(Clone, Copy, Debug)]
+pub struct PyFloatKey(pub f64);
+
+impl PartialEq for PyFloatKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for PyFloatKey {}
+
+impl core::hash::Hash for PyFloatKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        let bits = if self.0 == 0.0 { 0.0 } else { self.0 }.to_bits();
+        bits.hash(state);
+    }
+}
+
+impl core::fmt::Display for PyFloatKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// Whether a type can serve as an lru_cache key; the compiler emits the
+/// concrete key tuple from the parameter annotations, so this only exists
+/// to document the supported set (the codegen enforces it loudly).
+pub trait PyCacheKey: core::hash::Hash + Eq + Clone {}
+impl<T: core::hash::Hash + Eq + Clone> PyCacheKey for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::PyFloatKey;
+
+    #[test]
+    fn float_key_python_semantics() {
+        // -0.0 and 0.0 compare equal in Python, so they share a cache key.
+        assert_eq!(PyFloatKey(-0.0), PyFloatKey(0.0));
+        // NaN never equals itself: a NaN key must never hit.
+        assert_ne!(PyFloatKey(f64::NAN), PyFloatKey(f64::NAN));
+    }
+
+    #[test]
+    fn float_key_lru_cache_roundtrip() {
+        let mut cache = super::PyLruCache::new(None);
+        cache.put(PyFloatKey(0.5), 10i64);
+        assert_eq!(cache.get(&PyFloatKey(0.5)), Some(10));
+        // 0.0 and -0.0 share the entry.
+        cache.put(PyFloatKey(0.0), 20);
+        assert_eq!(cache.get(&PyFloatKey(-0.0)), Some(20));
+        // A NaN key never hits: get returns None.
+        assert_eq!(cache.get(&PyFloatKey(f64::NAN)), None);
+    }
+}
+
 impl<K: core::hash::Hash + Eq + Clone, V: Clone> PyLruCache<K, V> {
     /// maxsize None is unbounded (functools.cache); Python's default
     /// for bare @lru_cache is Some(128).
