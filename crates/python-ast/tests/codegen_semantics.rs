@@ -4959,14 +4959,16 @@ fn callable_parameter_is_a_loud_error() {
 }
 
 #[test]
-fn attribute_access_on_unannotated_parameter_is_a_loud_error() {
-    // The method table is M2: p.upper() has no bound yet.
+fn unknown_method_on_unannotated_parameter_is_a_loud_error() {
+    // M2's method table covers the stdlib traits; an unknown method is a
+    // loud error with the nearest candidates, never a rustc surprise.
     let err = compile_err(
-        "def shout(s):\n    return s.upper()\n",
+        "def frob(s):\n    return s.upar()\n",
         "inf_attr.py",
     );
     assert!(err.contains("`s`"), "error: {}", err);
-    assert!(err.contains("M2"), "error: {}", err);
+    assert!(err.contains("upar"), "error: {}", err);
+    assert!(err.contains("upper"), "candidates: {}", err);
 }
 
 #[test]
@@ -4987,4 +4989,60 @@ fn no_impl_into_pyobject_anywhere_for_unannotated_params() {
     let out = compile("def f(x):\n    return x\n", "inf_id.py");
     assert!(out.contains("pub fn f < T > (x : T)"), "generated: {}", out);
     assert!(!out.contains("Into < PyObject >"), "no fallback: {}", out);
+}
+
+// ---- issue #109 M2: stdlib method table (duck-typed method bounds) ----
+
+#[test]
+fn str_methods_infer_pystrops_bounds() {
+    let out = compile(
+        "def shout(s):\n    return s.upper()\n",
+        "m2_upper.py",
+    );
+    assert!(out.contains("pub fn shout < T >"), "generated: {}", out);
+    assert!(out.contains("where T : PyStrOps"), "generated: {}", out);
+    assert!(out.contains("-> Result < String , PyException >"), "generated: {}", out);
+
+    let out = compile(
+        "def parts(s):\n    return s.split(\" \")\n",
+        "m2_split.py",
+    );
+    assert!(out.contains("T : PyStrOps"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < Vec < String > , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn pop_infers_pypop_with_index_type() {
+    let out = compile(
+        "def last(xs):\n    return xs.pop()\n",
+        "m2_pop.py",
+    );
+    assert!(out.contains("where T : PyPop < i64 >"), "generated: {}", out);
+    assert!(
+        out.contains("< T as PyPop < i64 >> :: Output"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn mixed_method_bounds_on_one_parameter() {
+    // A parameter used through several stdlib methods accumulates exactly
+    // those bounds (minimal constraint).
+    let out = compile(
+        "def stats(s):\n    n = s.count(\"a\")\n    return s.upper() + str(n)\n",
+        "m2_mixed.py",
+    );
+    assert!(out.contains("where T : PyStrOps"), "generated: {}", out);
+    // s is read twice (count + upper), so the reuse-clone rule adds Clone.
+    assert!(out.contains("T : Clone"), "generated: {}", out);
+    assert!(
+        out.contains("-> Result < < String as PyAdd < String >> :: Output , PyException >"),
+        "generated: {}",
+        out
+    );
 }

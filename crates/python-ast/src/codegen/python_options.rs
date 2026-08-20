@@ -173,6 +173,12 @@ pub struct PythonOptions {
     /// fallback. Set per function by the function generator.
     pub param_type_vars: std::rc::Rc<std::collections::HashMap<String, proc_macro2::TokenStream>>,
 
+    /// Unannotated parameters of the CURRENT function whose uses include a
+    /// stdlib method call (issue #109, M2): their method calls dispatch
+    /// through the stdlib trait (e.g. `p.pop()` → `py_pop`), never through
+    /// concrete-type arms that assume a Vec/str receiver.
+    pub param_method_params: std::rc::Rc<std::collections::HashSet<String>>,
+
     /// Emit #[deprecated] notes on generated items whose conversion was
     /// lossy (dropped parameter defaults, ignored return annotations, ...).
     /// On by default: silent semantic divergence from the Python source is
@@ -338,6 +344,7 @@ impl Default for PythonOptions {
             async_runtime: AsyncRuntime::default(),
             async_runtime_dep: false,
             param_type_vars: std::rc::Rc::new(std::collections::HashMap::new()),
+            param_method_params: std::rc::Rc::new(std::collections::HashSet::new()),
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,

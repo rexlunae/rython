@@ -933,8 +933,11 @@ impl CodeGen for FunctionDef {
         };
         // Thread the inferred type variables into parameter rendering
         // (Parameter::to_rust emits `a: A` instead of the dead
-        // `impl Into<PyObject>`).
+        // `impl Into<PyObject>`), and the stdlib-method-bound parameters
+        // into method-call dispatch (M2).
         options.param_type_vars = std::rc::Rc::new(inferred_signature.param_types.clone());
+        options.param_method_params =
+            std::rc::Rc::new(inferred_signature.method_params.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self

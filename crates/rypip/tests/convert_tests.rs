@@ -4268,3 +4268,66 @@ fn unannotated_params_infer_generics_matching_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn stdlib_method_inference_matches_python_transcript() {
+    // Issue #109, M2: method calls on unannotated parameters infer the
+    // stdlib trait bound (PyStrOps/PyPop), the String receiver satisfies
+    // it via the owned-type impl, and the compiled binary's output diffs
+    // against a pinned `// Verified against python3.` transcript.
+    let scratch = Scratch::new("method-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def shout(s):\n",
+            "    return s.upper()\n",
+            "\n",
+            "def words(s):\n",
+            "    return s.split(\" \")\n",
+            "\n",
+            "def position(s):\n",
+            "    return s.find(\"x\")\n",
+            "\n",
+            "def last(xs):\n",
+            "    return xs.pop()\n",
+            "\n",
+            "def count_letters(s):\n",
+            "    return s.count(\"a\")\n",
+            "\n",
+            "def strip_it(s):\n",
+            "    return s.strip()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(shout(\"hi\"))\n",
+            "    print(words(\"a b c\"))\n",
+            "    print(position(\"xyz\"))\n",
+            "    print(last([1, 2, 3]))\n",
+            "    print(count_letters(\"banana\"))\n",
+            "    print(strip_it(\"  x  \"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(src.contains("T: PyStrOps"), "bound: {}", src);
+    assert!(src.contains("T: PyPop<i64>"), "bound: {}", src);
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["HI", "['a', 'b', 'c']", "0", "3", "3", "x"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

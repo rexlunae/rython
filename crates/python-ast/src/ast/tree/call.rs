@@ -2842,8 +2842,15 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!((#receiver).as_bytes().to_vec()));
                     }
                     // list.pop() returns the last element or raises IndexError
-                    // (Vec::pop returns an Option).
+                    // (Vec::pop returns an Option). A GENERIC receiver (an
+                    // unannotated parameter with a PyPop bound, issue #109
+                    // M2) has no inherent pop: route through the trait.
                     ("pop", []) => {
+                        let generic = crate::ast::tree::call::root_name(&attr.value)
+                            .is_some_and(|root| options.param_method_params.contains(root));
+                        if generic {
+                            return Ok(quote!((#receiver).py_pop(-1)?));
+                        }
                         return Ok(quote! {
                             (#receiver).pop().ok_or_else(|| {
                                 PyException::new("IndexError", "pop from empty list")

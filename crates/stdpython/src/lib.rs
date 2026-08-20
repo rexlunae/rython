@@ -3088,79 +3088,79 @@ pub trait PyStrOps {
         S: AsRef<str>;
 }
 
-impl PyStrOps for str {
+impl<T: AsRef<str> + ?Sized> PyStrOps for T {
     fn upper(&self) -> String {
-        self.to_uppercase()
+        self.as_ref().to_uppercase()
     }
     fn lower(&self) -> String {
-        self.to_lowercase()
+        self.as_ref().to_lowercase()
     }
     fn strip(&self) -> String {
-        self.trim_matches(py_is_whitespace).to_string()
+        self.as_ref().trim_matches(py_is_whitespace).to_string()
     }
     fn lstrip(&self) -> String {
-        self.trim_start_matches(py_is_whitespace).to_string()
+        self.as_ref().trim_start_matches(py_is_whitespace).to_string()
     }
     fn rstrip(&self) -> String {
-        self.trim_end_matches(py_is_whitespace).to_string()
+        self.as_ref().trim_end_matches(py_is_whitespace).to_string()
     }
     fn capitalize(&self) -> String {
         // Python titlecases the first char (uppercase where the two differ:
         // "ﬁle" -> "File", "ß" -> "Ss") and lowercases the rest.
-        let mut chars = self.chars();
+        let mut chars = self.as_ref().chars();
         match chars.next() {
             Some(first) => py_to_titlecase(first) + &chars.as_str().to_lowercase(),
             None => String::new(),
         }
     }
     fn startswith(&self, prefix: &str) -> bool {
-        self.starts_with(prefix)
+        self.as_ref().starts_with(prefix)
     }
     fn endswith(&self, suffix: &str) -> bool {
-        self.ends_with(suffix)
+        self.as_ref().ends_with(suffix)
     }
     fn py_find(&self, needle: &str) -> i64 {
-        match self.find(needle) {
-            Some(byte_idx) => self[..byte_idx].chars().count() as i64,
+        match self.as_ref().find(needle) {
+            Some(byte_idx) => self.as_ref()[..byte_idx].chars().count() as i64,
             None => -1,
         }
     }
     fn count<S: AsRef<str>>(&self, sub: S) -> i64 {
-        self.matches(sub.as_ref()).count() as i64
+        self.as_ref().matches(sub.as_ref()).count() as i64
     }
     fn py_split(&self, sep: &str) -> Result<Vec<String>, PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
-        Ok(self.split(sep).map(str::to_string).collect())
+        Ok(self.as_ref().split(sep).map(str::to_string).collect())
     }
     fn py_split_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
         if maxsplit < 0 {
-            return self.py_split(sep);
+            return self.as_ref().py_split(sep);
         }
-        Ok(self
+        Ok(self.as_ref()
             .splitn(maxsplit as usize + 1, sep)
             .map(str::to_string)
             .collect())
     }
     fn py_split_whitespace(&self) -> Vec<String> {
-        self.split(py_is_whitespace)
+        self.as_ref().split(py_is_whitespace)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect()
     }
     fn py_split_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
         if maxsplit < 0 {
-            return self.py_split_whitespace();
+            return self.as_ref().py_split_whitespace();
         }
         // Python: leading whitespace is consumed, at most maxsplit splits
         // are made, and the remainder keeps its internal/trailing
         // whitespace: " a b  c ".split(None, 1) == ["a", "b  c "].
         let mut out = Vec::new();
-        let mut rest = self.trim_start_matches(py_is_whitespace);
+        let mut rest = self.as_ref().trim_start_matches(py_is_whitespace);
         let mut splits = 0;
         while !rest.is_empty() && splits < maxsplit {
             match rest.find(py_is_whitespace) {
@@ -3179,13 +3179,13 @@ impl PyStrOps for str {
     }
     fn py_rsplit_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
         if maxsplit < 0 {
-            return self.py_split_whitespace();
+            return self.as_ref().py_split_whitespace();
         }
         // Mirror image: trailing whitespace is consumed, splits count from
         // the right, and the remainder keeps its LEADING whitespace:
         // " a b  c ".rsplit(None, 2) == [" a", "b", "c"].
         let mut tail = Vec::new();
-        let mut rest = self.trim_end_matches(py_is_whitespace);
+        let mut rest = self.as_ref().trim_end_matches(py_is_whitespace);
         let mut splits = 0;
         while !rest.is_empty() && splits < maxsplit {
             match rest.rfind(py_is_whitespace) {
@@ -3206,16 +3206,16 @@ impl PyStrOps for str {
         out
     }
     fn py_rsplit(&self, sep: &str) -> Result<Vec<String>, PyException> {
-        self.py_split(sep)
+        self.as_ref().py_split(sep)
     }
     fn py_rsplit_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
         if maxsplit < 0 {
-            return self.py_split(sep);
+            return self.as_ref().py_split(sep);
         }
-        let mut parts: Vec<String> = self
+        let mut parts: Vec<String> = self.as_ref()
             .rsplitn(maxsplit as usize + 1, sep)
             .map(str::to_string)
             .collect();
@@ -3226,47 +3226,47 @@ impl PyStrOps for str {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
-        match self.find(sep) {
+        match self.as_ref().find(sep) {
             Some(i) => Ok((
-                self[..i].to_string(),
+                self.as_ref()[..i].to_string(),
                 sep.to_string(),
-                self[i + sep.len()..].to_string(),
+                self.as_ref()[i + sep.len()..].to_string(),
             )),
-            None => Ok((self.to_string(), String::new(), String::new())),
+            None => Ok((self.as_ref().to_string(), String::new(), String::new())),
         }
     }
     fn rpartition(&self, sep: &str) -> Result<(String, String, String), PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
-        match self.rfind(sep) {
+        match self.as_ref().rfind(sep) {
             Some(i) => Ok((
-                self[..i].to_string(),
+                self.as_ref()[..i].to_string(),
                 sep.to_string(),
-                self[i + sep.len()..].to_string(),
+                self.as_ref()[i + sep.len()..].to_string(),
             )),
-            None => Ok((String::new(), String::new(), self.to_string())),
+            None => Ok((String::new(), String::new(), self.as_ref().to_string())),
         }
     }
     fn py_strip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.trim_matches(|c| set.contains(&c)).to_string()
+        self.as_ref().trim_matches(|c| set.contains(&c)).to_string()
     }
     fn py_lstrip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.trim_start_matches(|c| set.contains(&c)).to_string()
+        self.as_ref().trim_start_matches(|c| set.contains(&c)).to_string()
     }
     fn py_rstrip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.trim_end_matches(|c| set.contains(&c)).to_string()
+        self.as_ref().trim_end_matches(|c| set.contains(&c)).to_string()
     }
     fn title(&self) -> String {
         // Python: the first letter after any non-alphabetic character is
         // titlecased, the rest lowercased ("3rd" becomes "3Rd"; "ǳ" ->
         // "ǲ" where titlecase and uppercase differ).
-        let mut out = String::with_capacity(self.len());
+        let mut out = String::with_capacity(self.as_ref().len());
         let mut prev_alpha = false;
-        for c in self.chars() {
+        for c in self.as_ref().chars() {
             if c.is_alphabetic() {
                 if prev_alpha {
                     out.extend(c.to_lowercase());
@@ -3283,34 +3283,34 @@ impl PyStrOps for str {
     }
     fn zfill(&self, width: i64) -> String {
         let width = width.max(0) as usize;
-        let count = self.chars().count();
+        let count = self.as_ref().chars().count();
         if count >= width {
-            return self.to_string();
+            return self.as_ref().to_string();
         }
         let zeros = "0".repeat(width - count);
-        if let Some(rest) = self.strip_prefix(['+', '-']) {
-            format!("{}{}{}", &self[..1], zeros, rest)
+        if let Some(rest) = self.as_ref().strip_prefix(['+', '-']) {
+            format!("{}{}{}", &self.as_ref()[..1], zeros, rest)
         } else {
-            format!("{}{}", zeros, self)
+            format!("{}{}", zeros, self.as_ref())
         }
     }
     fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
         let width = width.max(0) as usize;
-        let count = self.chars().count();
+        let count = self.as_ref().chars().count();
         if count >= width {
-            return Ok(self.to_string());
+            return Ok(self.as_ref().to_string());
         }
-        Ok(format!("{}{}", self, fill_char.to_string().repeat(width - count)))
+        Ok(format!("{}{}", self.as_ref(), fill_char.to_string().repeat(width - count)))
     }
     fn py_rjust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
         let width = width.max(0) as usize;
-        let count = self.chars().count();
+        let count = self.as_ref().chars().count();
         if count >= width {
-            return Ok(self.to_string());
+            return Ok(self.as_ref().to_string());
         }
-        Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self))
+        Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self.as_ref()))
     }
     fn splitlines(&self) -> Vec<String> {
         // Python's boundary set, not just \n/\r\n: classic-Mac \r,
@@ -3318,14 +3318,14 @@ impl PyStrOps for str {
         // as ONE boundary. A trailing boundary does not produce a trailing
         // empty line; consecutive boundaries produce empty lines between
         // them ("a\n\n".splitlines() == ["a", ""]).
-        let bytes = self.as_bytes();
+        let bytes = self.as_ref().as_bytes();
         let mut out = Vec::new();
         let mut start = 0;
         let mut i = 0;
         while i < bytes.len() {
-            let c = self[i..].chars().next().expect("valid UTF-8");
+            let c = self.as_ref()[i..].chars().next().expect("valid UTF-8");
             if is_py_line_boundary(c) {
-                out.push(self[start..i].to_string());
+                out.push(self.as_ref()[start..i].to_string());
                 i += c.len_utf8();
                 if c == '\r' && i < bytes.len() && bytes[i] == b'\n' {
                     i += 1; // \r\n is one boundary
@@ -3336,7 +3336,7 @@ impl PyStrOps for str {
             }
         }
         if start < bytes.len() {
-            out.push(self[start..].to_string());
+            out.push(self.as_ref()[start..].to_string());
         }
         out
     }
@@ -3349,7 +3349,7 @@ impl PyStrOps for str {
             .into_iter()
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>()
-            .join(self)
+            .join(self.as_ref())
     }
 }
 

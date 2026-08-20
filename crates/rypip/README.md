@@ -74,11 +74,14 @@ where
 work — exactly like Python. Inferred bounds cover operators, comparisons
 (`n > 0` bounds on `PyGt<i64>`, never forcing `n: i64`), conversion builtins
 (`int(p)` → `PyInt`), truthiness, `len`, `print`/f-strings, `repr`, `hash`,
-indexing, and `in`. The `impl Into<PyObject>` fallback is gone: a use with
-no existing or generatable trait (calling a parameter, method/attribute
-access, iteration, passing to a user function) is a loud conversion error
-naming the parameter, the use, and the milestone that will cover it.
-Annotations always win over inference.
+indexing, `in`, and the stdlib **method table** (`s.upper()` → `PyStrOps`,
+`xs.pop()` → `PyPop<i64>`, `s.split(...)`, `s.count(...)`, `s.find(...)`,
+... — the owned `String` receiver satisfies `PyStrOps` through a blanket
+`AsRef<str>` impl). The `impl Into<PyObject>` fallback is gone: a use with
+no existing or generatable trait (calling a parameter, unknown methods,
+iteration, passing to a user function) is a loud conversion error naming
+the parameter, the use, and the milestone that will cover it. Annotations
+always win over inference.
 
 ## Generated crates
 

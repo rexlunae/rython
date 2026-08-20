@@ -53,6 +53,9 @@ pub enum ParamReq {
     SetIndex(RhsType, RhsType),
     /// `x in p` — `PyContains<Item>`.
     Contains(RhsType),
+    /// `p.m(...)` for a stdlib method — the trait declaring it, whether it
+    /// mutates, and the RhsType of parameterized traits (pop's index).
+    Method(&'static str, bool, Option<RhsType>),
     /// A use no existing or generatable trait admits.
     Untranslatable(String),
 }
@@ -70,6 +73,58 @@ pub enum RhsType {
     Unknown,
 }
 
+/// The return type of a stdlib method, for return-type inference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MethodReturn {
+    /// `-> String`
+    Str,
+    /// `-> Vec<String>`
+    VecStr,
+    /// `-> i64`
+    I64,
+    /// `-> bool`
+    Bool,
+    /// `-> (String, String, String)`
+    TripleStr,
+    /// `-> ()` (mutating, returns None in Python)
+    Unit,
+    /// pop(): the element type is unknown without deeper propagation.
+    Unknown,
+}
+
+/// The M2 stdlib method table: Python method name → (trait bound, mutates
+/// the receiver, return type). Every entry's trait method exists in
+/// stdpython (PyStrOps/PyListOps/PyPop), and the codegen emits the
+/// trait-method call for these names on any receiver.
+pub const STDLIB_METHOD_TABLE: &[(&str, &str, bool, MethodReturn)] = &[
+    // str methods (PyStrOps, non-mutating).
+    ("upper", "PyStrOps", false, MethodReturn::Str),
+    ("lower", "PyStrOps", false, MethodReturn::Str),
+    ("strip", "PyStrOps", false, MethodReturn::Str),
+    ("lstrip", "PyStrOps", false, MethodReturn::Str),
+    ("rstrip", "PyStrOps", false, MethodReturn::Str),
+    ("capitalize", "PyStrOps", false, MethodReturn::Str),
+    ("title", "PyStrOps", false, MethodReturn::Str),
+    ("splitlines", "PyStrOps", false, MethodReturn::VecStr),
+    ("find", "PyStrOps", false, MethodReturn::I64),
+    ("count", "PyStrOps", false, MethodReturn::I64),
+    ("split", "PyStrOps", false, MethodReturn::VecStr),
+    ("rsplit", "PyStrOps", false, MethodReturn::VecStr),
+    ("partition", "PyStrOps", false, MethodReturn::TripleStr),
+    ("rpartition", "PyStrOps", false, MethodReturn::TripleStr),
+    ("zfill", "PyStrOps", false, MethodReturn::Str),
+    ("ljust", "PyStrOps", false, MethodReturn::Str),
+    ("rjust", "PyStrOps", false, MethodReturn::Str),
+    // join is not listed: its argument needs a compound
+    // IntoIterator<Item: AsRef<str>> bound, which M2 does not express. A
+    // `p.join(...)` call on an unannotated parameter is a loud error. 
+
+    // list methods (PyListOps / PyPop, mutating).
+    ("insert", "PyListOps", true, MethodReturn::Unit),
+    ("count", "PyListOps", false, MethodReturn::I64),
+    ("pop", "PyPop", true, MethodReturn::Unknown),
+];
+
 /// The inferred signature for a function with unannotated parameters.
 #[derive(Debug, Default)]
 pub struct InferredSignature {
@@ -81,6 +136,9 @@ pub struct InferredSignature {
     pub param_types: HashMap<String, TokenStream>,
     /// The Ok type of the Result return, when inferable from the returns.
     pub return_type: Option<TokenStream>,
+    /// Parameters with stdlib-method requirements (M2): their method calls
+    /// dispatch through the stdlib traits.
+    pub method_params: HashSet<String>,
 }
 
 impl InferredSignature {
@@ -213,6 +271,16 @@ pub fn infer_unannotated_signature(
                     let item = render_rhs(item, &tv_names)?;
                     quote!(#tv: PyContains<#item>)
                 }
+                ParamReq::Method(trait_name, _, rhs) => {
+                    let t = quote::format_ident!("{}", trait_name);
+                    match rhs {
+                        Some(rhs) => {
+                            let rhs = render_rhs(rhs, &tv_names)?;
+                            quote!(#tv: #t<#rhs>)
+                        }
+                        None => quote!(#tv: #t),
+                    }
+                }
                 ParamReq::Untranslatable(_) => unreachable!("handled above"),
             };
             if seen.insert(bound.to_string()) {
@@ -226,6 +294,18 @@ pub fn infer_unannotated_signature(
             where_bounds.push(quote!(#tv: Clone));
         }
     }
+
+    // Parameters with stdlib-method uses.
+    let method_params: HashSet<String> = params
+        .iter()
+        .filter(|name| {
+            collector
+                .reqs
+                .get(*name)
+                .is_some_and(|reqs| reqs.iter().any(|r| matches!(r, ParamReq::Method(..))))
+        })
+        .cloned()
+        .collect();
 
     // Return type: every return value must unify to one type expression.
     let return_type = if collector.returns.is_empty() {
@@ -253,6 +333,7 @@ pub fn infer_unannotated_signature(
         where_bounds,
         param_types,
         return_type,
+        method_params,
     })
 }
 
@@ -326,6 +407,40 @@ fn return_type_of(
             _ => Err(err()),
         },
         ExprType::Call(c) => {
+            // A method call on a parameter: the table's return type.
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && let ExprType::Name(n) = a.value.as_ref()
+                && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+            {
+                if let Some((_, _, _, ret)) =
+                    STDLIB_METHOD_TABLE.iter().find(|(m, ..)| *m == a.attr)
+                {
+                    // pop() returns the element: `<T as PyPop<Idx>>::Output`.
+                    if *ret == MethodReturn::Unknown && a.attr == "pop" {
+                        let tv = param_tv_of(&n.id, collector, tv_names);
+                        let idx = match c.args.first() {
+                            Some(arg) => operand_type(arg, collector, tv_names)?,
+                            None => quote!(i64),
+                        };
+                        return Ok(quote!(<#tv as PyPop<#idx>>::Output));
+                    }
+                    return Ok(match ret {
+                        MethodReturn::Str => quote!(String),
+                        MethodReturn::VecStr => quote!(Vec<String>),
+                        MethodReturn::I64 => quote!(i64),
+                        MethodReturn::Bool => quote!(bool),
+                        MethodReturn::TripleStr => quote!((String, String, String)),
+                        MethodReturn::Unit => quote!(()),
+                        MethodReturn::Unknown => {
+                            return Err(
+                                "cannot infer the type of this method call in a return; \
+                                 annotate the function's return type (issue #109)"
+                                    .to_string(),
+                            )
+                        }
+                    });
+                }
+            }
             if let ExprType::Name(f) = c.func.as_ref() {
                 match f.id.as_str() {
                     "int" => return Ok(quote!(i64)),
@@ -372,6 +487,26 @@ fn return_type_of(
             Ok(quote!(<#left as #t<#right>>::Output))
         }
         _ => Err(err()),
+    }
+}
+
+/// The type-variable ident for a parameter name (or its alias).
+fn param_tv_of(
+    name: &str,
+    collector: &Collector,
+    tv_names: &HashMap<String, String>,
+) -> TokenStream {
+    let p = if tv_names.contains_key(name) {
+        Some(name.to_string())
+    } else {
+        collector.alias.get(name).cloned()
+    };
+    match p.and_then(|p| tv_names.get(&p)) {
+        Some(tv) => {
+            let ident = quote::format_ident!("{}", tv);
+            quote!(#ident)
+        }
+        None => quote!(__rython_unknown__),
     }
 }
 
@@ -429,12 +564,71 @@ fn operand_type(
                     "len" => quote!(i64),
                     _ => return Err(err()),
                 }
+            } else if let ExprType::Attribute(a) = c.func.as_ref() {
+                // A method call on a parameter: its table return type
+                // (`s.upper() + str(n)` needs String on the left).
+                if let ExprType::Name(n) = a.value.as_ref()
+                    && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+                    && let Some((_, _, _, ret)) = STDLIB_METHOD_TABLE
+                        .iter()
+                        .find(|(m, ..)| *m == a.attr)
+                {
+                    match ret {
+                        MethodReturn::Str => quote!(String),
+                        MethodReturn::VecStr => quote!(Vec<String>),
+                        MethodReturn::I64 => quote!(i64),
+                        MethodReturn::Bool => quote!(bool),
+                        MethodReturn::TripleStr => quote!((String, String, String)),
+                        MethodReturn::Unit => quote!(()),
+                        MethodReturn::Unknown => return Err(err()),
+                    }
+                } else {
+                    return Err(err());
+                }
             } else {
                 return Err(err());
             }
         }
         _ => return Err(err()),
     })
+}
+
+/// Suggest the closest known stdlib methods for an unknown one, for the
+/// loud-error message ("did you mean ...?").
+fn nearest_methods(method: &str) -> String {
+    let known: Vec<&str> = STDLIB_METHOD_TABLE.iter().map(|(m, ..)| *m).collect();
+    let mut scored: Vec<(usize, &str)> = known
+        .iter()
+        .map(|m| (levenshtein(method, m), *m))
+        .collect();
+    scored.sort_by_key(|(d, _)| *d);
+    let close: Vec<&str> = scored
+        .iter()
+        .take(3)
+        .filter(|(d, _)| *d <= 3)
+        .map(|(_, m)| *m)
+        .collect();
+    if close.is_empty() {
+        String::new()
+    } else {
+        format!(" (did you mean {})", close.join(", "))
+    }
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 fn bin_op_trait(op: &BinOps) -> Option<&'static str> {
@@ -645,7 +839,7 @@ impl<'a> Collector<'a> {
                 self.walk_expr(&b.right, false);
             }
             ExprType::Compare(c) => {
-                let mut operands: Vec<&ExprType> =
+                let operands: Vec<&ExprType> =
                     std::iter::once(c.left.as_ref()).chain(c.comparators.iter()).collect();
                 for (i, op) in c.ops.iter().enumerate() {
                     let left = operands[i];
@@ -708,6 +902,29 @@ impl<'a> Collector<'a> {
                 }
             }
             ExprType::Call(c) => {
+                // `p.method(args)` on a parameter: record the stdlib method
+                // requirement (M2) — the trait bound; pop's bound carries
+                // the index argument's type.
+                if let ExprType::Attribute(a) = c.func.as_ref() {
+                    if let ExprType::Name(n) = a.value.as_ref() {
+                        if self.unannotated.contains(&n.id) {
+                            if let Some((_, trait_name, mutates, _)) = STDLIB_METHOD_TABLE
+                                .iter()
+                                .find(|(m, ..)| *m == a.attr)
+                            {
+                                let rhs = if *trait_name == "PyPop" {
+                                    match c.args.first() {
+                                        Some(arg) => Some(self.rhs_of(arg)),
+                                        None => Some(RhsType::Concrete(quote!(i64))),
+                                    }
+                                } else {
+                                    None
+                                };
+                                self.add(&n.id, ParamReq::Method(*trait_name, *mutates, rhs));
+                            }
+                        }
+                    }
+                }
                 // Builtins with a parameter argument: conversions, len,
                 // repr, hash, print. A user function shadowing the name
                 // means it is not the builtin.
@@ -801,15 +1018,24 @@ impl<'a> Collector<'a> {
                 }
             }
             ExprType::Attribute(a) => {
-                // `p.attr` / `p.method(...)` — the method table is M2.
+                // `p.method(...)`: known stdlib methods are recorded by the
+                // Call arm (pop's bound needs the index argument). An
+                // UNKNOWN method is a loud error with the nearest known
+                // candidates — here, for attribute reads too.
                 if let ExprType::Name(n) = a.value.as_ref() {
-                    if self.unannotated.contains(&n.id) {
+                    if self.unannotated.contains(&n.id)
+                        && STDLIB_METHOD_TABLE.iter().all(|(m, ..)| *m != a.attr)
+                    {
+                        let candidates = nearest_methods(&a.attr);
                         self.add(
                             &n.id,
                             ParamReq::Untranslatable(format!(
-                                "accessing `.{}(...)` on a parameter is not inferred yet \
-                                 (issue #109, M2); annotate `{}`",
-                                a.attr, n.id
+                                "no known stdlib type provides method `{}`{}; \
+                                 annotate `{}` or define the method on a class in \
+                                 this package (issue #109)",
+                                a.attr,
+                                candidates,
+                                n.id
                             )),
                         );
                     }
