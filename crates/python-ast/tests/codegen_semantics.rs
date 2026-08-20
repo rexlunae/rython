@@ -1406,9 +1406,10 @@ fn assert_lowers_to_assertion_error() {
         "def f(n):\n    assert n > 0, \"need positive\"\n",
         "assert.py",
     );
-    // Comparisons lower through the PyGt trait (borrowed operands).
+    // Comparisons lower through the PyGt trait (borrowed operands); the
+    // integer literal is converted to the parameter's own type (M4).
     assert!(
-        out.contains("if ! ((n) . py_gt (& (0)))"),
+        out.contains("if ! ((n) . py_gt (& (T :: py_from_int (0))))"),
         "generated: {}",
         out
     );
@@ -4911,13 +4912,16 @@ fn int_conversion_yields_a_bound_not_a_concrete_type() {
 
 #[test]
 fn literal_comparison_is_a_bound_not_a_numeric_type() {
-    // `n > 0` bounds on PyGt<i64> — it must NOT force `n: i64` (CPython
-    // accepts any comparable instantiation).
+    // `n > 0` bounds on PyGt<T> + PyFromInt — it must NOT force `n: i64`
+    // (CPython accepts any comparable instantiation, and Rust std has no
+    // int/float cross-PartialOrd, so the literal converts to the
+    // parameter's own type).
     let out = compile("def positive(n):\n    return n > 0\n", "inf_cmp.py");
     assert!(out.contains("pub fn positive < T >"), "generated: {}", out);
-    assert!(out.contains("T : PyGt < i64 >"), "generated: {}", out);
+    assert!(out.contains("T : PyGt < T >"), "generated: {}", out);
+    assert!(out.contains("T : PyFromInt"), "generated: {}", out);
     assert!(
-        out.contains("< T as PyGt < i64 >> :: Output"),
+        out.contains("< T as PyGt < T >> :: Output"),
         "generated: {}",
         out
     );
@@ -4972,14 +4976,55 @@ fn unknown_method_on_unannotated_parameter_is_a_loud_error() {
 }
 
 #[test]
-fn passing_unannotated_parameter_to_user_function_is_a_loud_error() {
-    // Interprocedural flow is M4.
-    let err = compile_err(
+fn annotated_callee_parameter_identity_forces_the_argument() {
+    // M4 FlowsTo: `g(v)` with an ANNOTATED callee parameter forces `v` to
+    // the concrete type — no type variable, no bounds, the concrete type's
+    // impls are checked at the call site.
+    let out = compile(
         "def g(x: int) -> int:\n    return x\ndef f(v):\n    return g(v)\n",
         "inf_flow.py",
     );
-    assert!(err.contains("`v`"), "error: {}", err);
-    assert!(err.contains("M4"), "error: {}", err);
+    assert!(out.contains("pub fn f (v : i64)"), "generated: {}", out);
+    assert!(!out.contains("pub fn f < T >"), "generated: {}", out);
+    assert!(out.contains("return Ok (g (v) ?)"), "generated: {}", out);
+}
+
+#[test]
+fn unannotated_callee_return_flows_to_the_callers_return() {
+    // M4 FlowsTo: `caller(v): return helper(v)` where `helper(x): return
+    // x * 2` — the callee's return type (in terms of its parameter) flows
+    // to the caller's return.
+    let out = compile(
+        concat!(
+            "def helper(x):\n",
+            "    return x * 2\n",
+            "def caller(v):\n",
+            "    return helper(v)\n",
+        ),
+        "inf_flow2.py",
+    );
+    assert!(
+        out.contains("pub fn caller < T > (v : T) -> Result < < T as PyMul < i64 >> :: Output"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("T : PyMul < i64 >"), "generated: {}", out);
+}
+
+#[test]
+fn mutually_recursive_returns_are_a_loud_error() {
+    // M4: mutual recursion without return annotations cannot be resolved
+    // to a single return type — loud error naming the cycle.
+    let err = compile_err(
+        concat!(
+            "def a(x):\n",
+            "    return b(x)\n",
+            "def b(y):\n",
+            "    return a(y)\n",
+        ),
+        "inf_mutrec.py",
+    );
+    assert!(err.contains("mutually recursive"), "error: {}", err);
 }
 
 #[test]

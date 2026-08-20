@@ -3136,13 +3136,28 @@ impl<'a> CodeGen for Call {
                     .annotation
                     .as_deref()
                     .and_then(crate::call_arg_expected_type);
-                crate::render_typed_reused(
+                let rendered = crate::render_typed_reused(
                     &arg,
                     ctx.clone(),
                     options.clone(),
                     symbols.clone(),
                     expected,
-                )?
+                )?;
+                // An unannotated (inferred) parameter takes OWNED string
+                // literals: the recursion fixpoint needs
+                // `T: PyAdd<T, Output = T>`, which only String (not a
+                // `&'static str` literal) satisfies for self-adding params.
+                if param.annotation.is_none()
+                    && matches!(
+                        &arg,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    )
+                {
+                    quote!((#rendered).to_string())
+                } else {
+                    rendered
+                }
             } else {
                 arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
             };

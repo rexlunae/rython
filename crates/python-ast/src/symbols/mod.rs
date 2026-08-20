@@ -66,6 +66,24 @@ impl SymbolTableScopes {
         }
         out
     }
+
+    /// All module-level function definitions visible in this scope (the
+    /// first binding of each name wins). Used by the parameter inference's
+    /// interprocedural pass (issue #109, M4) to resolve callees.
+    pub fn all_functions(&self) -> Vec<FunctionDef> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for table in self.0.iter() {
+            for value in table.symbols.values() {
+                if let SymbolTableNode::FunctionDef(f) = value {
+                    if seen.insert(f.name.clone()) {
+                        out.push(f.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Default for SymbolTableScopes {

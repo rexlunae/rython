@@ -4393,3 +4393,88 @@ fn duck_typing_hear_example_matches_python_transcript() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn recursion_and_flows_to_inference_match_python_transcript() {
+    // Issue #109, M4 acceptance: interprocedural FlowsTo. `repeat` is
+    // SELF-recursive — the fixpoint gives `x` the recursion's type
+    // (`A: PyAdd<A, Output = A>`) and `n` a generic that accepts both int
+    // and float calls (`B: PyLe<B, Output = bool> + PyFromInt +
+    // PySub<i64, Output = B>`, per the issue's `repeat(x, 2.5)`). The
+    // 2-deep helper chain flows the callee's return type through the
+    // caller. Output is diffed against a pinned `// Verified against
+    // python3.` transcript.
+    let scratch = Scratch::new("recursion-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def repeat(x, n):\n",
+            "    return x if n <= 0 else x + repeat(x, n - 1)\n",
+            "\n",
+            "def helper(x):\n",
+            "    return x * 2\n",
+            "\n",
+            "def caller(v):\n",
+            "    return helper(v)\n",
+            "\n",
+            "def positive(n):\n",
+            "    return n > 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(repeat(2, 3))\n",
+            "    print(repeat(2.5, 3))\n",
+            "    print(repeat(\"a\", 3))\n",
+            "    print(repeat(2, 2.5))\n",
+            "    print(repeat(\"a\", 2.5))\n",
+            "    print(caller(21))\n",
+            "    print(caller(1.5))\n",
+            "    print(positive(3))\n",
+            "    print(positive(-1))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    // The recursive fixpoint: x adds with itself (the recursion returns
+    // x's type) — `A: PyAdd<A, Output = A>`.
+    assert!(src.contains("A: PyAdd<A, Output = A>"), "repeat bounds: {}", src);
+    // The count accepts int AND float call sites: comparison with the
+    // literal converts via PyFromInt, and the decrement's Output must be
+    // the parameter again.
+    assert!(src.contains("B: PyLe<B, Output = bool>"), "repeat bounds: {}", src);
+    assert!(src.contains("B: PyFromInt"), "repeat bounds: {}", src);
+    assert!(src.contains("B: PySub<i64, Output = B>"), "repeat bounds: {}", src);
+    assert!(
+        src.contains("pub fn repeat<A, B>(x: A, n: B)"),
+        "repeat signature: {}",
+        src
+    );
+    // The 2-deep helper chain flows the callee's return through the
+    // caller: `caller` returns `<T as PyMul<i64>>::Output` like `helper`.
+    assert!(
+        src.contains("pub fn caller<T>(v: T) -> Result<<T as PyMul<i64>>::Output"),
+        "caller signature: {}",
+        src
+    );
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "8", "10.0", "aaaa", "8", "aaaa", "42", "3.0", "True", "False",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

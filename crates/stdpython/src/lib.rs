@@ -3567,6 +3567,25 @@ impl<K: Eq + Hash, V> Len for PyDict<K, V> {
     }
 }
 
+/// Convert an integer literal to a parameter's own type (M4): Rust std has
+/// no `From<i64>` for `f64` and no int/float cross-PartialOrd, so a generic
+/// parameter compared with an integer literal (`n <= 0`) gets
+/// `T: PyFromInt` and the literal is converted through this trait —
+/// identity for i64, float promotion for f64, exactly Python's semantics.
+pub trait PyFromInt {
+    fn py_from_int(value: i64) -> Self;
+}
+impl PyFromInt for i64 {
+    fn py_from_int(value: i64) -> Self {
+        value
+    }
+}
+impl PyFromInt for f64 {
+    fn py_from_int(value: i64) -> Self {
+        value as f64
+    }
+}
+
 // ============================================================================
 // PYTHON `+`: numeric addition, string and list concatenation
 // ============================================================================
@@ -3655,6 +3674,7 @@ impl<L: PartialOrd<R>, R: ?Sized> PyGe<R> for L {
         self >= rhs
     }
 }
+
 
 // ============================================================================
 // `-` and `*` (PySub / PyMul)

@@ -178,6 +178,29 @@ impl CodeGen for Compare {
             let comparator = comparator_ast
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // A GENERIC (inferred) parameter compares with an integer
+            // literal converted to the parameter's own type via
+            // stdpython's PyFromInt (`B::py_from_int(0)`): Rust std has no
+            // int/float cross-PartialOrd, so the bounds
+            // `B: PyLe<B> + PyFromInt` are satisfied by both i64 and f64
+            // (Python promotes `2.5 <= 0` to a float comparison).
+            let comparator = if let ExprType::Name(n) = left_ast {
+                if let Some(tv) = options.param_type_vars.get(&n.id) {
+                    if matches!(
+                        comparator_ast,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::Integer(_)))
+                    ) {
+                        quote!(#tv :: py_from_int(#comparator))
+                    } else {
+                        comparator
+                    }
+                } else {
+                    comparator
+                }
+            } else {
+                comparator
+            };
             // Comparisons route through the stdpython PyEq/PyNe/PyLt/PyLe/
             // PyGt/PyGe traits (in scope via `use stdpython::*`): scalars
             // and containers get their existing PartialEq/PartialOrd

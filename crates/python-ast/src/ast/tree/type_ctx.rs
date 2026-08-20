@@ -472,7 +472,12 @@ pub fn render_reused(
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
-            if !t.is_copy() && !matches!(t, TypeInfo::PyObject) {
+            // An inferred (unannotated) parameter is not statically Copy —
+            // the reuse-clone rule adds `T: Clone` for it, so clone it
+            // here too (a generic value would otherwise be moved into the
+            // call while still being used).
+            let inferred_param = options.param_type_vars.contains_key(&n.id);
+            if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
                 return Ok(quote!((#tokens).clone()));
             }
         }
@@ -495,7 +500,11 @@ pub fn render_typed_reused(
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
-            if !t.is_copy() && !matches!(t, TypeInfo::PyObject) {
+            // See render_reused: an inferred parameter is not statically
+            // Copy, so clone it at the call site (its `T: Clone` bound is
+            // the reuse-clone rule's).
+            let inferred_param = options.param_type_vars.contains_key(&n.id);
+            if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
                 return Ok(quote!((#tokens).clone()));
             }
         }

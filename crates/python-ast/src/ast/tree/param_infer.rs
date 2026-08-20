@@ -1,5 +1,5 @@
-//! M1 of issue #109: parameter type inference — trait-bound generic
-//! signatures for unannotated parameters.
+//! Issue #109: parameter type inference — trait-bound generic signatures
+//! for unannotated parameters (milestones M1–M4).
 //!
 //! An unannotated parameter used to lower to `impl Into<PyObject>`, which
 //! no ordinary rython value satisfies — such functions converted but were
@@ -11,10 +11,24 @@
 //! no existing or generatable trait is a loud conversion error — never
 //! silently accepted, never deferred to rustc.
 //!
-//! Scope (M1): free functions; operator/comparison/conversion-builtin/
-//! Truthy/Len/PyDisplay/PyRepr/PyHash/PyIndex/PyContains rows. Method
-//! parameters, callable parameters, iteration, and interprocedural flow are
-//! loud errors naming the gap (later milestones).
+//! Scope:
+//! - M1: free functions; operator/comparison/conversion-builtin/Truthy/Len/
+//!   PyDisplay/PyRepr/PyHash/PyIndex/PyContains rows.
+//! - M2: stdlib method table (PyStrOps/PyListOps/PyPop bounds) with
+//!   forwarding impls, and per-method return types.
+//! - M3: user-class duck typing — a generated `Has*` trait per method,
+//!   unified across every defining class in the package.
+//! - M4: interprocedural FlowsTo — a call to a user function adopts the
+//!   callee's parameter requirements (a concretely-annotated callee
+//!   parameter identity-forces the argument's type; self-recursion is a
+//!   fixpoint: `repeat(x, n)` gets `A: PyAdd<A, Output = A>` and
+//!   `B: PyLe<B> + PyFromInt + PySub<i64, Output = B>`, callable with
+//!   `n = 2` or `n = 2.5`), and the callee's return type flows to the
+//!   caller's return. Mutual recursion without annotations is a loud
+//!   error.
+//!
+//! Still loud errors (later milestones): callable parameters, iteration
+//! over a parameter (`for x in p`), and method parameters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,8 +44,22 @@ use crate::{ExprType, Statement, SymbolTableScopes, TypeInfo};
 pub enum ParamReq {
     /// `p OP rhs` — the Py* operator trait and the other operand's type.
     Op(&'static str, RhsType),
+    /// `p OP rhs` where the result flows BACK into the same parameter (the
+    /// recursion fixpoint, M4): the op's Output must be the parameter's
+    /// type (`T: PySub<i64, Output = T>` for `repeat(x, n - 1)`).
+    OpOutput(&'static str, RhsType),
+    /// `p CMP rhs` in a CONDITION (`if p <= 0:`): the comparison must be a
+    /// bool (`T: PyLe<i64, Output = bool>`), mirroring Python's always-bool
+    /// comparisons.
+    CmpCond(&'static str, RhsType),
     /// `p CMP rhs` — the Py* comparison trait and the other operand's type.
     Cmp(&'static str, RhsType),
+    /// `p CMP <int literal>`: the literal is converted to the parameter's
+    /// own type via stdpython's `PyFromInt` (identity for i64, float
+    /// promotion for f64), because Rust std has no int/float
+    /// cross-PartialOrd — the bound `T: PyLe<T>` is satisfied by both i64
+    /// and f64 (M4).
+    PyFromInt,
     /// `int(p)` / `float(p)` / `bool(p)` / `str(p)` / `abs(p)` — the
     /// runtime conversion trait (`PyInt`, `PyFloat`, ...).
     Conversion(&'static str),
@@ -57,6 +85,9 @@ pub enum ParamReq {
     /// generated Has* duck trait), whether it mutates, and the RhsType of
     /// parameterized traits (pop's index).
     Method(String, bool, Option<RhsType>),
+    /// `p` flows into a concretely-annotated parameter of a known function
+    /// (M4): the concrete type is identity-forced.
+    Identity(TokenStream),
     /// A use no existing or generatable trait admits.
     Untranslatable(String),
 }
@@ -187,6 +218,32 @@ pub fn infer_unannotated_signature(
         return Ok(InferredSignature::default());
     }
     let unannotated: HashSet<String> = params.iter().cloned().collect();
+    let current_fn = {
+        // The function whose body we are collecting: the symbol-table
+        // FunctionDef whose unannotated params match, if exactly one
+        // module function has this param list (used for self-recursion).
+        let mut fns = symbols
+            .all_functions()
+            .into_iter()
+            .filter(|f| {
+                let un: HashSet<String> = f
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(f.args.args.iter())
+                    .chain(f.args.kwonlyargs.iter())
+                    .filter(|p| p.arg != "self" && p.annotation.is_none())
+                    .map(|p| p.arg.clone())
+                    .collect();
+                un == unannotated
+            })
+            .collect::<Vec<_>>();
+        if fns.len() == 1 {
+            fns.pop().map(|f| f.name)
+        } else {
+            None
+        }
+    };
 
     let mut collector = Collector {
         unannotated: &unannotated,
@@ -200,7 +257,14 @@ pub fn infer_unannotated_signature(
         duck_returns: HashMap::new(),
         duck_method_calls: HashMap::new(),
         error: None,
+        current_fn: current_fn.clone(),
+        callee_cache: HashMap::new(),
+        visiting: HashSet::new(),
+        return_visiting: HashSet::new(),
     };
+    if let Some(f) = &current_fn {
+        collector.visiting.insert(f.clone());
+    }
     collector.walk(body);
     if let Some(err) = &collector.error {
         return Err(err.clone());
@@ -216,30 +280,67 @@ pub fn infer_unannotated_signature(
         }
     }
 
-    // One type variable per parameter, in declaration order (single param:
-    // `T`, otherwise `A`, `B`, ... per the issue's naming guidance).
+    // Identity-forced parameters first (M4): a parameter that flows into a
+    // concretely-annotated callee parameter takes that concrete type; it
+    // gets no type variable and no bounds (the concrete type's trait impls
+    // are checked at the call site). Conflicting identity forces are loud.
+    let mut identity_types: HashMap<String, TokenStream> = HashMap::new();
+    for name in params {
+        let Some(reqs) = collector.reqs.get(name) else { continue };
+        for req in reqs {
+            if let ParamReq::Identity(ty) = req {
+                match identity_types.get(name) {
+                    Some(prev) if prev.to_string() != ty.to_string() => {
+                        return Err(format!(
+                            "parameter `{name}` is forced to two different concrete \
+                             types ({} and {}); the call sites disagree — annotate \
+                             `{name}` explicitly",
+                            prev, ty
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        identity_types.insert(name.clone(), ty.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // One type variable per GENERIC parameter, in declaration order (single
+    // param: `T`, otherwise `A`, `B`, ...).
+    let generic_params: Vec<&String> = params
+        .iter()
+        .filter(|p| !identity_types.contains_key(*p))
+        .collect();
     let mut tv_names: HashMap<String, String> = HashMap::new();
     let mut type_params = Vec::new();
     let mut param_types = HashMap::new();
-    if params.len() == 1 {
-        tv_names.insert(params[0].clone(), "T".to_string());
+    if generic_params.len() == 1 {
+        tv_names.insert(generic_params[0].clone(), "T".to_string());
         type_params.push(quote!(T));
-        param_types.insert(params[0].clone(), quote!(T));
     } else {
-        for (i, name) in params.iter().enumerate() {
+        for (i, name) in generic_params.iter().enumerate() {
             let tv = format!("{}", (b'A' + i as u8) as char);
-            tv_names.insert(name.clone(), tv.clone());
+            tv_names.insert((*name).clone(), tv.clone());
             let ident = quote::format_ident!("{}", tv);
             type_params.push(quote!(#ident));
+        }
+    }
+    for name in params {
+        if let Some(ty) = identity_types.get(name) {
+            param_types.insert(name.clone(), ty.clone());
+        } else if let Some(tv) = tv_names.get(name) {
+            let ident = quote::format_ident!("{}", tv);
             param_types.insert(name.clone(), quote!(#ident));
         }
     }
 
-    // Resolve each parameter's requirement set into bounds.
+    // Resolve each GENERIC parameter's requirement set into bounds.
     let mut where_bounds = Vec::new();
-    for name in params {
-        let tv = quote::format_ident!("{}", tv_names.get(name).unwrap());
-        let reqs = collector.reqs.get(name).cloned().unwrap_or_default();
+    for name in &generic_params {
+        let tv = quote::format_ident!("{}", tv_names.get(*name).unwrap());
+        let reqs = collector.reqs.get(*name).cloned().unwrap_or_default();
         let mut seen = HashSet::new();
         for req in &reqs {
             if let ParamReq::Untranslatable(what) = req {
@@ -249,17 +350,43 @@ pub fn infer_unannotated_signature(
                      bound (issue #109: parameter type inference, M1)"
                 ));
             }
+            // Identity is impossible here (identity params aren't generic).
+            if matches!(req, ParamReq::Identity(_)) {
+                continue;
+            }
             let bound = match req {
                 ParamReq::Op(trait_name, rhs) => {
                     let t = quote::format_ident!("{}", trait_name);
-                    let rhs = render_rhs(rhs, &tv_names)?;
-                    quote!(#tv: #t<#rhs>)
+                    // A self-referential op (`x + x`, `x + repeat(x, ...)`)
+                    // feeds its result back as the parameter itself — the
+                    // recursion fixpoint — so its Output must BE the
+                    // parameter's type (true for every stdpython scalar,
+                    // string, and list).
+                    let is_self = matches!(rhs, RhsType::Same)
+                        || matches!(rhs, RhsType::Param(p) if p == *name);
+                    let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
+                    if is_self {
+                        quote!(#tv: #t<#rhs, Output = #tv>)
+                    } else {
+                        quote!(#tv: #t<#rhs>)
+                    }
+                }
+                ParamReq::OpOutput(trait_name, rhs) => {
+                    let t = quote::format_ident!("{}", trait_name);
+                    let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
+                    quote!(#tv: #t<#rhs, Output = #tv>)
+                }
+                ParamReq::CmpCond(trait_name, rhs) => {
+                    let t = quote::format_ident!("{}", trait_name);
+                    let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
+                    quote!(#tv: #t<#rhs, Output = bool>)
                 }
                 ParamReq::Cmp(trait_name, rhs) => {
                     let t = quote::format_ident!("{}", trait_name);
-                    let rhs = render_rhs(rhs, &tv_names)?;
+                    let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
                     quote!(#tv: #t<#rhs>)
                 }
+                ParamReq::PyFromInt => quote!(#tv: PyFromInt),
                 ParamReq::Conversion(trait_name) => {
                     let t = quote::format_ident!("{}", trait_name);
                     quote!(#tv: #t)
@@ -271,28 +398,29 @@ pub fn infer_unannotated_signature(
                 ParamReq::Hash => quote!(#tv: PyHash),
                 ParamReq::IsNone => quote!(#tv: PyIsNone),
                 ParamReq::Index(idx) => {
-                    let idx = render_rhs(idx, &tv_names)?;
+                    let idx = render_rhs(idx, &param_types, &quote!(#tv))?;
                     quote!(#tv: PyIndex<#idx>)
                 }
                 ParamReq::SetIndex(idx, val) => {
-                    let idx = render_rhs(idx, &tv_names)?;
-                    let val = render_rhs(val, &tv_names)?;
+                    let idx = render_rhs(idx, &param_types, &quote!(#tv))?;
+                    let val = render_rhs(val, &param_types, &quote!(#tv))?;
                     quote!(#tv: PySetIndex<#idx, #val>)
                 }
                 ParamReq::Contains(item) => {
-                    let item = render_rhs(item, &tv_names)?;
+                    let item = render_rhs(item, &param_types, &quote!(#tv))?;
                     quote!(#tv: PyContains<#item>)
                 }
                 ParamReq::Method(trait_name, _, rhs) => {
                     let t = quote::format_ident!("{}", trait_name);
                     match rhs {
                         Some(rhs) => {
-                            let rhs = render_rhs(rhs, &tv_names)?;
+                            let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
                             quote!(#tv: #t<#rhs>)
                         }
                         None => quote!(#tv: #t),
                     }
                 }
+                ParamReq::Identity(_) => unreachable!("skipped above"),
                 ParamReq::Untranslatable(_) => unreachable!("handled above"),
             };
             if seen.insert(bound.to_string()) {
@@ -302,7 +430,7 @@ pub fn infer_unannotated_signature(
         // The reuse-clone rule: a generic parameter is not known Copy, so a
         // parameter read more than once needs `T: Clone` — the rule itself
         // is a use, so the bound stays minimal.
-        if use_counts.get(name).copied().unwrap_or(0) > 1 {
+        if use_counts.get(*name).copied().unwrap_or(0) > 1 {
             where_bounds.push(quote!(#tv: Clone));
         }
     }
@@ -326,11 +454,16 @@ pub fn infer_unannotated_signature(
         None
     } else {
         let mut inferred: Option<TokenStream> = None;
-        for ret in &collector.returns {
-            let ty = return_type_of(ret, &collector, &tv_names)?;
+        let returns: Vec<ExprType> = collector.returns.clone();
+        for ret in &returns {
+            let ty = return_type_of(ret, &mut collector, &param_types)?;
             match &inferred {
                 None => inferred = Some(ty),
                 Some(prev) if prev.to_string() == ty.to_string() => {}
+                // Recursive fixpoint (M4): `<X as PyOp<X>>::Output` unifies
+                // with X — the recursive call returns the parameter's type
+                // (int/str/list all satisfy PyOp<Self>::Output == Self).
+                Some(prev) if unifies_with_recursion(prev, &ty) => {}
                 _ => {
                     return Err(format!(
                         "return statements have different types; annotate the \
@@ -352,24 +485,26 @@ pub fn infer_unannotated_signature(
     })
 }
 
-/// Render an operand's type for a where-bound: the parameter's variable,
-/// the concrete type, or Self for same-param operands.
-fn render_rhs(rhs: &RhsType, tv_names: &HashMap<String, String>) -> Result<TokenStream, String> {
+/// Render an operand's type for a where-bound: the parameter's variable
+/// (or identity-forced concrete type), the concrete type, or Self for
+/// same-param operands.
+fn render_rhs(
+    rhs: &RhsType,
+    param_types: &HashMap<String, TokenStream>,
+    same: &TokenStream,
+) -> Result<TokenStream, String> {
     Ok(match rhs {
         RhsType::Concrete(t) => t.clone(),
-        RhsType::Param(name) => match tv_names.get(name) {
-            Some(tv) => {
-                let ident = quote::format_ident!("{}", tv);
-                quote!(#ident)
-            }
+        RhsType::Param(name) => match param_types.get(name) {
+            Some(ty) => ty.clone(),
             None => {
                 return Err(format!(
                     "internal: parameter `{name}` used as an operand but has no \
-                     type variable"
+                     type"
                 ))
             }
         },
-        RhsType::Same => quote!(Self),
+        RhsType::Same => same.clone(),
         RhsType::Unknown => {
             return Err(
                 "the other operand's type cannot be inferred; annotate the \
@@ -384,19 +519,16 @@ fn render_rhs(rhs: &RhsType, tv_names: &HashMap<String, String>) -> Result<Token
 /// variables.
 fn return_type_of(
     expr: &ExprType,
-    collector: &Collector,
-    tv_names: &HashMap<String, String>,
+    collector: &mut Collector,
+    param_types: &HashMap<String, TokenStream>,
 ) -> Result<TokenStream, String> {
     let param_tv = |name: &str| -> Option<TokenStream> {
-        let p = if tv_names.contains_key(name) {
+        let p = if param_types.contains_key(name) {
             Some(name.to_string())
         } else {
             collector.alias.get(name).cloned()
         };
-        p.and_then(|p| tv_names.get(&p)).map(|tv| {
-            let ident = quote::format_ident!("{}", tv);
-            quote!(#ident)
-        })
+        p.and_then(|p| param_types.get(&p)).cloned()
     };
     let err = || {
         "cannot infer the type of this return value; annotate the function's \
@@ -422,10 +554,40 @@ fn return_type_of(
             _ => Err(err()),
         },
         ExprType::Call(c) => {
+            // A call to a user function (M4): its return annotation, or —
+            // via FlowsTo — the callee's return type in the caller's terms.
+            // Self-recursion resolves to the returned parameter's argument
+            // type (the fixpoint: repeat returns x).
+            if let ExprType::Name(f) = c.func.as_ref() {
+                if let Some(crate::SymbolTableNode::FunctionDef(callee)) =
+                    collector.symbols.get(&f.id)
+                {
+                    if let Some(ann) = callee
+                        .returns
+                        .as_deref()
+                        .and_then(crate::python_annotation_to_rust_type)
+                    {
+                        return Ok(ann);
+                    }
+                    if collector.current_fn.as_deref() == Some(callee.name.as_str()) {
+                        if let Some(param_index) = callee_returned_param(callee) {
+                            if let Some(arg) = c.args.get(param_index) {
+                                return operand_type(arg, collector, param_types);
+                            }
+                        }
+                        return Err(format!(
+                            "recursive call to `{}` does not return one of its \
+                             parameters; annotate `{}`'s return type (issue #109, M4)",
+                            callee.name, callee.name
+                        ));
+                    }
+                    return callee_return_type(callee, &c.args, collector, param_types);
+                }
+            }
             // A method call on a parameter: the table's return type.
             if let ExprType::Attribute(a) = c.func.as_ref()
                 && let ExprType::Name(n) = a.value.as_ref()
-                && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+                && (param_types.contains_key(&n.id) || collector.alias.contains_key(&n.id))
             {
                 // M3: a duck-typed user method's return comes from the
                 // unified class signature.
@@ -437,9 +599,9 @@ fn return_type_of(
                 {
                     // pop() returns the element: `<T as PyPop<Idx>>::Output`.
                     if *ret == MethodReturn::Unknown && a.attr == "pop" {
-                        let tv = param_tv_of(&n.id, collector, tv_names);
+                        let tv = param_tv_of(&n.id, collector, param_types);
                         let idx = match c.args.first() {
-                            Some(arg) => operand_type(arg, collector, tv_names)?,
+                            Some(arg) => operand_type(arg, collector, param_types)?,
                             None => quote!(i64),
                         };
                         return Ok(quote!(<#tv as PyPop<#idx>>::Output));
@@ -484,9 +646,29 @@ fn return_type_of(
         ExprType::BinOp(b) => {
             let trait_name = bin_op_trait(&b.op).ok_or_else(err)?;
             let t = quote::format_ident!("{}", trait_name);
-            let left = operand_type(&b.left, collector, tv_names)?;
-            let right = operand_type(&b.right, collector, tv_names)?;
+            // Operands are typed with return_type_of (not operand_type):
+            // an operand may itself be a user-function call whose return
+            // type flows here (M4, e.g. `x + repeat(x, n - 1)`).
+            let left = return_type_of(&b.left, collector, param_types)?;
+            let right = return_type_of(&b.right, collector, param_types)?;
             Ok(quote!(<#left as #t<#right>>::Output))
+        }
+        ExprType::IfExp(e) => {
+            // `x if cond else y`: both branches must unify (recursion
+            // fixpoint included: repeat's `x` vs `x + repeat(...)`).
+            let body_ty = return_type_of(&e.body, collector, param_types)?;
+            let orelse_ty = return_type_of(&e.orelse, collector, param_types)?;
+            if body_ty.to_string() == orelse_ty.to_string() {
+                Ok(body_ty)
+            } else if unifies_with_recursion(&body_ty, &orelse_ty) {
+                Ok(body_ty)
+            } else {
+                Err(
+                    "if-expression branches have different types; annotate the \
+                     function's return type (issue #109)"
+                        .to_string(),
+                )
+            }
         }
         ExprType::Compare(c) => {
             let trait_name = match c.ops.first() {
@@ -499,9 +681,27 @@ fn return_type_of(
                 _ => return Err(err()),
             };
             let t = quote::format_ident!("{}", trait_name);
-            let left = operand_type(&c.left, collector, tv_names)?;
+            let left = return_type_of(&c.left, collector, param_types)?;
+            // An integer-literal comparator against a parameter compares
+            // with the parameter's OWN type (`n <= 0` → `<B as PyLe<B>>`),
+            // matching the `B: PyLe<Self> + From<i64>` bounds.
             let right = match c.comparators.first() {
-                Some(r) => operand_type(r, collector, tv_names)?,
+                Some(r) => {
+                    if matches!(
+                        c.left.as_ref(),
+                        ExprType::Name(n)
+                            if param_types.contains_key(&n.id)
+                                || collector.alias.contains_key(&n.id)
+                    ) && matches!(
+                        r,
+                        ExprType::Constant(cn)
+                            if matches!(&cn.0, Some(litrs::Literal::Integer(_)))
+                    ) {
+                        left.clone()
+                    } else {
+                        return_type_of(r, collector, param_types)?
+                    }
+                }
                 None => quote!(Self),
             };
             Ok(quote!(<#left as #t<#right>>::Output))
@@ -510,22 +710,20 @@ fn return_type_of(
     }
 }
 
-/// The type-variable ident for a parameter name (or its alias).
+/// The type tokens for a parameter name (or its alias): its type variable
+/// or identity-forced concrete type.
 fn param_tv_of(
     name: &str,
     collector: &Collector,
-    tv_names: &HashMap<String, String>,
+    param_types: &HashMap<String, TokenStream>,
 ) -> TokenStream {
-    let p = if tv_names.contains_key(name) {
+    let p = if param_types.contains_key(name) {
         Some(name.to_string())
     } else {
         collector.alias.get(name).cloned()
     };
-    match p.and_then(|p| tv_names.get(&p)) {
-        Some(tv) => {
-            let ident = quote::format_ident!("{}", tv);
-            quote!(#ident)
-        }
+    match p.and_then(|p| param_types.get(&p)) {
+        Some(ty) => ty.clone(),
         None => quote!(__rython_unknown__),
     }
 }
@@ -535,7 +733,7 @@ fn param_tv_of(
 fn operand_type(
     expr: &ExprType,
     collector: &Collector,
-    tv_names: &HashMap<String, String>,
+    param_types: &HashMap<String, TokenStream>,
 ) -> Result<TokenStream, String> {
     let err = || {
         "the operand's type cannot be inferred; annotate the function's return \
@@ -545,15 +743,14 @@ fn operand_type(
     Ok(match expr {
         ExprType::Name(n) => {
             // A parameter (directly or via an alias).
-            let p = if tv_names.contains_key(&n.id) {
+            let p = if param_types.contains_key(&n.id) {
                 Some(n.id.clone())
             } else {
                 collector.alias.get(&n.id).cloned()
             };
             if let Some(p) = p {
-                if let Some(tv) = tv_names.get(&p) {
-                    let ident = quote::format_ident!("{}", tv);
-                    quote!(#ident)
+                if let Some(ty) = param_types.get(&p) {
+                    ty.clone()
                 } else {
                     return Err(err());
                 }
@@ -589,14 +786,14 @@ fn operand_type(
                 // (`s.upper() + str(n)` needs String on the left); a duck
                 // method's comes from the unified class signature.
                 if let ExprType::Name(n) = a.value.as_ref()
-                    && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+                    && (param_types.contains_key(&n.id) || collector.alias.contains_key(&n.id))
                 {
                     if let Some(ret) = collector.duck_returns.get(&a.attr) {
                         return Ok(ret.clone());
                     }
                 }
                 if let ExprType::Name(n) = a.value.as_ref()
-                    && (tv_names.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+                    && (param_types.contains_key(&n.id) || collector.alias.contains_key(&n.id))
                     && let Some((_, _, _, ret)) = STDLIB_METHOD_TABLE
                         .iter()
                         .find(|(m, ..)| *m == a.attr)
@@ -715,6 +912,205 @@ fn class_method_return(class: &crate::ClassDef, method: &str) -> Result<TokenStr
         })
 }
 
+/// The return type of a call to a NON-recursive user function, expressed in
+/// the CALLER's terms: the callee's return expressions are re-analyzed with
+/// the callee's parameters mapped to the caller's argument types (FlowsTo).
+/// Mutual recursion without return annotations is a loud error.
+fn callee_return_type(
+    callee: &crate::FunctionDef,
+    args: &[ExprType],
+    collector: &mut Collector,
+    param_types: &HashMap<String, TokenStream>,
+) -> Result<TokenStream, String> {
+    if collector.return_visiting.contains(&callee.name) {
+        return Err(format!(
+            "mutually recursive functions without return annotations are not \
+             inferred yet (issue #109, M4); annotate a return type in the cycle"
+        ));
+    }
+    let callee_params: Vec<&str> = callee
+        .args
+        .posonlyargs
+        .iter()
+        .chain(callee.args.args.iter())
+        .map(|p| p.arg.as_str())
+        .collect();
+    let mut callee_map: HashMap<String, TokenStream> = HashMap::new();
+    for (i, name) in callee_params.iter().enumerate() {
+        let Some(arg) = args.get(i) else { continue };
+        callee_map.insert(name.to_string(), return_type_of(arg, collector, param_types)?);
+    }
+    let mut returns = Vec::new();
+    collect_return_exprs(&callee.body, &mut returns);
+    if returns.is_empty() {
+        return Err(format!(
+            "cannot infer the return type of `{}`: it has no return statements; \
+             annotate the callee's return type (issue #109, M4)",
+            callee.name
+        ));
+    }
+    let saved_fn = collector.current_fn.take();
+    collector.current_fn = Some(callee.name.clone());
+    collector.return_visiting.insert(callee.name.clone());
+    let result = (|| {
+        let mut inferred: Option<TokenStream> = None;
+        for ret in &returns {
+            let ty = return_type_of(ret, collector, &callee_map)?;
+            match &inferred {
+                None => inferred = Some(ty),
+                Some(prev) if prev.to_string() == ty.to_string() => {}
+                Some(prev) if unifies_with_recursion(prev, &ty) => {}
+                _ => {
+                    return Err(format!(
+                        "`{}`'s return statements have different types; annotate \
+                         its return type (issue #109, M4)",
+                        callee.name
+                    ))
+                }
+            }
+        }
+        Ok(inferred.unwrap())
+    })();
+    collector.current_fn = saved_fn;
+    collector.return_visiting.remove(&callee.name);
+    result
+}
+
+/// Collect every return expression in a body (walks nested statements).
+fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Return(Some(e)) => out.push(e.value.clone()),
+            StatementType::If(s) => {
+                collect_return_exprs(&s.body, out);
+                collect_return_exprs(&s.orelse, out);
+            }
+            StatementType::For(s) => {
+                collect_return_exprs(&s.body, out);
+                collect_return_exprs(&s.orelse, out);
+            }
+            StatementType::While(s) => {
+                collect_return_exprs(&s.body, out);
+                collect_return_exprs(&s.orelse, out);
+            }
+            StatementType::Try(t) => {
+                collect_return_exprs(&t.body, out);
+                for h in &t.handlers {
+                    collect_return_exprs(&h.body, out);
+                }
+                collect_return_exprs(&t.orelse, out);
+                collect_return_exprs(&t.finalbody, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The leaf values of an expression: itself, or the branches of an
+/// if-expression (recursively) — the branches a returned expression can
+/// actually evaluate to.
+fn collect_expr_branches<'e>(expr: &'e ExprType, out: &mut Vec<&'e ExprType>) {
+    match expr {
+        ExprType::IfExp(e) => {
+            collect_expr_branches(&e.body, out);
+            collect_expr_branches(&e.orelse, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// The index of the parameter a callee returns, when every bare-parameter
+/// return names the SAME parameter (mixed non-param returns are allowed —
+/// they unify via the recursion rule at the caller).
+fn callee_returned_param(callee: &crate::FunctionDef) -> Option<usize> {
+    let params: Vec<&str> = callee
+        .args
+        .posonlyargs
+        .iter()
+        .chain(callee.args.args.iter())
+        .map(|p| p.arg.as_str())
+        .collect();
+    let mut found: Option<usize> = None;
+    fn walk_returns(
+        body: &[Statement],
+        params: &[&str],
+        found: &mut Option<usize>,
+        conflict: &mut bool,
+    ) {
+        for stmt in body {
+            match &stmt.statement {
+                StatementType::Return(Some(e)) => {
+                    // A bare-parameter return — also inside an if-expression
+                    // (`return x if ... else ...`).
+                    let mut expr_returns = Vec::new();
+                    collect_expr_branches(&e.value, &mut expr_returns);
+                    for expr in expr_returns {
+                        if let ExprType::Name(n) = expr {
+                            if let Some(i) = params.iter().position(|p| p == &n.id.as_str()) {
+                                match found {
+                                    None => *found = Some(i),
+                                    Some(prev) if *prev != i => *conflict = true,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                StatementType::If(s) => {
+                    walk_returns(&s.body, params, found, conflict);
+                    walk_returns(&s.orelse, params, found, conflict);
+                }
+                StatementType::For(s) => {
+                    walk_returns(&s.body, params, found, conflict);
+                    walk_returns(&s.orelse, params, found, conflict);
+                }
+                StatementType::While(s) => {
+                    walk_returns(&s.body, params, found, conflict);
+                    walk_returns(&s.orelse, params, found, conflict);
+                }
+                StatementType::Try(t) => {
+                    walk_returns(&t.body, params, found, conflict);
+                    for h in &t.handlers {
+                        walk_returns(&h.body, params, found, conflict);
+                    }
+                    walk_returns(&t.orelse, params, found, conflict);
+                    walk_returns(&t.finalbody, params, found, conflict);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut conflict = false;
+    walk_returns(&callee.body, &params, &mut found, &mut conflict);
+    if conflict {
+        None
+    } else {
+        found
+    }
+}
+
+/// `<X as PyOp<X>>::Output` unifies with `X` (the recursive-call fixpoint:
+/// int/str/list all satisfy PyOp<Self>::Output == Self). The operator's
+/// argument must be the SAME X — `<A as PyAdd<B>>::Output` does NOT unify
+/// with A.
+fn unifies_with_recursion(a: &TokenStream, b: &TokenStream) -> bool {
+    let (a, b) = (a.to_string(), b.to_string());
+    fn inner(x: &str, other: &str) -> bool {
+        // other == "< X as Py<Op> < X > > :: Output"
+        let prefix = format!("< {} as ", x);
+        let suffix = "> :: Output";
+        if !(other.starts_with(&prefix) && other.ends_with(suffix)) {
+            return false;
+        }
+        let mid = &other[prefix.len()..other.len() - suffix.len()];
+        match mid.strip_suffix(&format!(" < {} >", x)) {
+            Some(op) => op.starts_with("Py"),
+            None => false,
+        }
+    }
+    inner(&a, &b) || inner(&b, &a)
+}
+
 fn pascal_case(s: &str) -> String {
     s.split('_')
         .filter(|p| !p.is_empty())
@@ -759,6 +1155,15 @@ struct Collector<'a> {
     /// The first duck-typing error, if any (the walker cannot return
     /// Result, so errors are collected and surfaced after the walk).
     error: Option<String>,
+    /// The function being collected (for self-recursion detection, M4).
+    current_fn: Option<String>,
+    /// Callee requirement summaries, memoized (M4): fn name → param → reqs.
+    callee_cache: HashMap<String, HashMap<String, Vec<ParamReq>>>,
+    /// Functions whose requirements are being collected (cycle detection).
+    visiting: HashSet<String>,
+    /// Functions whose return types are being computed (cycle detection,
+    /// M4).
+    return_visiting: HashSet<String>,
 }
 
 impl<'a> Collector<'a> {
@@ -980,10 +1385,27 @@ impl<'a> Collector<'a> {
                                 _ => "PyEq",
                             };
                             // Only the receiver (left) operand is
-                            // constrained: `left.py_cmp(&right)`.
+                            // constrained: `left.py_cmp(&right)`. A
+                            // comparison in a CONDITION must yield bool
+                            // (CmpCond); elsewhere its Output is the
+                            // comparison's type.
                             if let ExprType::Name(l) = left {
                                 if self.unannotated.contains(&l.id) {
-                                    self.add(&l.id, ParamReq::Cmp(trait_name, self.rhs_of(right)));
+                                    let req = if truthy {
+                                        ParamReq::CmpCond(trait_name, self.cmp_rhs_of(right))
+                                    } else {
+                                        ParamReq::Cmp(trait_name, self.cmp_rhs_of(right))
+                                    };
+                                    self.add(&l.id, req);
+                                    // The integer literal converts to the
+                                    // parameter's own type (`B: From<i64>`).
+                                    if matches!(
+                                        right,
+                                        ExprType::Constant(c)
+                                            if matches!(&c.0, Some(litrs::Literal::Integer(_)))
+                                    ) {
+                                        self.add(&l.id, ParamReq::PyFromInt);
+                                    }
                                 }
                             }
                         }
@@ -1104,28 +1526,14 @@ impl<'a> Collector<'a> {
                         );
                     }
                 }
-                // A parameter passed to a user function (interprocedural
-                // flow is M4).
+                // A parameter passed to a user function (M4): adopt the
+                // callee's parameter requirements (FlowsTo) or the concrete
+                // type of an annotated callee parameter.
                 if let ExprType::Name(f) = c.func.as_ref() {
-                    if self
-                        .symbols
-                        .get(&f.id)
-                        .is_some_and(|s| matches!(s, crate::SymbolTableNode::FunctionDef(_)))
+                    if let Some(crate::SymbolTableNode::FunctionDef(callee)) =
+                        self.symbols.get(&f.id)
                     {
-                        for arg in &c.args {
-                            if let ExprType::Name(n) = arg {
-                                if self.unannotated.contains(&n.id) {
-                                    self.add(
-                                        &n.id,
-                                        ParamReq::Untranslatable(format!(
-                                            "passing `{}` to user function `{}` is not \
-                                             inferred yet (issue #109, M4); annotate `{}`",
-                                            n.id, f.id, n.id
-                                        )),
-                                    );
-                                }
-                            }
-                        }
+                        self.propagate_from_callee(callee, &c.args);
                     }
                 }
                 self.walk_expr(&c.func, false);
@@ -1397,6 +1805,170 @@ impl<'a> Collector<'a> {
         Some(trait_name)
     }
 
+    /// M4: adopt a callee's parameter requirements onto the caller's
+    /// arguments — a concretely-annotated callee parameter identity-forces
+    /// the argument; an unannotated callee parameter propagates its bounds
+    /// with inter-parameter references remapped to the caller's arguments.
+    fn propagate_from_callee(&mut self, callee: &crate::FunctionDef, args: &[ExprType]) {
+        let callee_params: Vec<&crate::Parameter> = callee
+            .args
+            .posonlyargs
+            .iter()
+            .chain(callee.args.args.iter())
+            .collect();
+        // Self-recursion (M4): the fixpoint — every non-parameter argument
+        // must BE the corresponding parameter, so an expression argument
+        // like `n - 1` needs `N: PySub<i64, Output = N>`.
+        if self.current_fn.as_deref() == Some(callee.name.as_str()) {
+            for (i, arg) in args.iter().enumerate() {
+                if callee_params.get(i).is_none() {
+                    continue;
+                }
+                if let ExprType::BinOp(b) = arg
+                    && let Some(t) = bin_op_trait(&b.op)
+                    && let ExprType::Name(n) = b.left.as_ref()
+                    && self.unannotated.contains(&n.id)
+                {
+                    self.add(&n.id, ParamReq::OpOutput(t, self.rhs_of(&b.right)));
+                }
+            }
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let Some(arg_param) = (match arg {
+                ExprType::Name(n) if self.unannotated.contains(&n.id) => Some(n.id.clone()),
+                ExprType::Name(n) => self.alias.get(&n.id).cloned(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(callee_param) = callee_params.get(i) else { continue };
+            if let Some(ann) = callee_param.annotation.as_deref() {
+                // Identity-forced: the argument takes the concrete type.
+                if let Some(ty) = crate::python_annotation_to_rust_type(ann) {
+                    self.add(&arg_param, ParamReq::Identity(ty));
+                }
+                continue;
+            }
+            if !callee_param.arg.contains("__") && callee_param.arg == callee_param.arg {
+                // Unannotated callee parameter: adopt its requirements.
+                let callee_reqs = match self.callee_requirements(callee) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.error = Some(e);
+                        return;
+                    }
+                };
+                let Some(param_reqs) = callee_reqs.get(&callee_param.arg) else {
+                    continue;
+                };
+                for req in param_reqs {
+                    let mapped = match req {
+                        ParamReq::Op(t, RhsType::Param(callee_name)) => {
+                            let mapped = self.map_callee_param(callee_name, &callee_params, args);
+                            ParamReq::Op(t, mapped)
+                        }
+                        ParamReq::Cmp(t, RhsType::Param(callee_name)) => {
+                            let mapped = self.map_callee_param(callee_name, &callee_params, args);
+                            ParamReq::Cmp(t, mapped)
+                        }
+                        ParamReq::Method(t, m, Some(RhsType::Param(callee_name))) => {
+                            let mapped = self.map_callee_param(callee_name, &callee_params, args);
+                            ParamReq::Method(t.clone(), *m, Some(mapped))
+                        }
+                        other => other.clone(),
+                    };
+                    self.add(&arg_param, mapped);
+                }
+            }
+        }
+    }
+
+    /// Map a callee parameter NAME to the caller's argument at the same
+    /// position: a parameter argument stays a parameter, anything else is
+    /// its static type.
+    fn map_callee_param(
+        &self,
+        callee_name: &str,
+        callee_params: &[&crate::Parameter],
+        args: &[ExprType],
+    ) -> RhsType {
+        let index = callee_params.iter().position(|p| p.arg == callee_name);
+        match index.and_then(|i| args.get(i)) {
+            Some(ExprType::Name(n)) if self.unannotated.contains(&n.id) => {
+                RhsType::Param(n.id.clone())
+            }
+            Some(ExprType::Name(n)) if self.alias.contains_key(&n.id) => {
+                RhsType::Param(self.alias.get(&n.id).unwrap().clone())
+            }
+            Some(other) => self.rhs_of(other),
+            None => RhsType::Unknown,
+        }
+    }
+
+    /// The requirement summary of a callee function: collect its body's
+    /// requirements once per function (memoized), recursing through ITS
+    /// callees. Self-recursion and cycles resolve against the in-progress
+    /// sets (a fixpoint; mutual recursion is a loud error).
+    fn callee_requirements(
+        &mut self,
+        callee: &crate::FunctionDef,
+    ) -> Result<HashMap<String, Vec<ParamReq>>, String> {
+        if let Some(cached) = self.callee_cache.get(&callee.name) {
+            return Ok(cached.clone());
+        }
+        if self.visiting.contains(&callee.name) {
+            if self.current_fn.as_deref() == Some(callee.name.as_str()) {
+                // Self-recursion: the callee IS the current function; its
+                // requirements are the ones being collected.
+                return Ok(self.reqs.clone());
+            }
+            return Err(format!(
+                "mutually recursive functions with unannotated parameters are not \
+                 inferred yet (issue #109, M4); annotate the parameters of the cycle"
+            ));
+        }
+        self.visiting.insert(callee.name.clone());
+        let unannotated: HashSet<String> = callee
+            .args
+            .posonlyargs
+            .iter()
+            .chain(callee.args.args.iter())
+            .chain(callee.args.kwonlyargs.iter())
+            .filter(|p| p.arg != "self" && p.annotation.is_none())
+            .map(|p| p.arg.clone())
+            .collect();
+        let info = crate::analyze_function_types(&callee.body);
+        let mut inner = Collector {
+            unannotated: &unannotated,
+            name_types: &info.name_types,
+            symbols: self.symbols,
+            options: self.options,
+            reqs: HashMap::new(),
+            alias: HashMap::new(),
+            returns: Vec::new(),
+            reassigned: HashSet::new(),
+            duck_returns: HashMap::new(),
+            duck_method_calls: HashMap::new(),
+            error: None,
+            current_fn: Some(callee.name.clone()),
+            callee_cache: std::mem::take(&mut self.callee_cache),
+            visiting: self.visiting.clone(),
+            return_visiting: self.return_visiting.clone(),
+        };
+        inner.walk(&callee.body);
+        let inner_error = inner.error.clone();
+        let inner_reqs = inner.reqs.clone();
+        let inner_cache = inner.callee_cache;
+        let inner_visiting = inner.visiting;
+        self.callee_cache = inner_cache;
+        self.visiting = inner_visiting;
+        if let Some(e) = inner_error {
+            return Err(e);
+        }
+        self.callee_cache.insert(callee.name.clone(), inner_reqs.clone());
+        Ok(inner_reqs)
+    }
+
     fn duck_method_mutates(&self, method: &str) -> bool {
         self.symbols.all_classes().iter().any(|c| {
             c.methods().any(|m| {
@@ -1418,6 +1990,20 @@ impl<'a> Collector<'a> {
 
     /// The RhsType of an operand: a literal, a param, a param alias, a
     /// typed local, or Unknown.
+    /// The rhs of a COMPARISON with a parameter: an integer literal is
+    /// typed as the parameter's OWN type — Python promotes ints to floats
+    /// (`2.5 <= 0`), and Rust std has no int/float cross-PartialOrd, so the
+    /// only bound both i64 and f64 satisfy is `T: PyLe<Self>` (the literal
+    /// converts via `From<i64>`).
+    fn cmp_rhs_of(&self, expr: &ExprType) -> RhsType {
+        match expr {
+            ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Integer(_))) => {
+                RhsType::Same
+            }
+            _ => self.rhs_of(expr),
+        }
+    }
+
     fn rhs_of(&self, expr: &ExprType) -> RhsType {
         match expr {
             ExprType::Name(n) => {
@@ -1442,6 +2028,22 @@ impl<'a> Collector<'a> {
                 // -1 / -1.0 anchor like their operand.
                 if matches!(u.op, crate::Ops::USub) {
                     self.rhs_of(&u.operand)
+                } else {
+                    RhsType::Unknown
+                }
+            }
+            ExprType::Call(c) => {
+                // M4: a call to a user function that returns one of its own
+                // parameters — the operand's type IS that parameter's (for
+                // self-recursion this is the fixpoint: `x + repeat(x, n-1)`
+                // constrains only `T: PyAdd<T>`).
+                if let ExprType::Name(f) = c.func.as_ref()
+                    && let Some(crate::SymbolTableNode::FunctionDef(callee)) =
+                        self.symbols.get(&f.id)
+                    && let Some(param_index) = callee_returned_param(callee)
+                    && let Some(arg) = c.args.get(param_index)
+                {
+                    self.rhs_of(arg)
                 } else {
                     RhsType::Unknown
                 }
