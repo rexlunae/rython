@@ -351,3 +351,58 @@ fn spooled_tempfile_negative_seek_raises() {
     let err = f.seek(-100, 2).expect_err("negative seek past start");
     assert_eq!(err.message, "negative seek value -95");
 }
+
+#[test]
+fn date_today_uses_local_time_like_now() {
+    // Issue #82: date.today() used to decompose UTC seconds, off by a day
+    // in any timezone whose local date differs from UTC's. It must agree
+    // with datetime.now() (which goes through from_unix_local).
+    let today = crate::date::today();
+    let now = datetime::now().date_component();
+    assert!(
+        (today.toordinal() as i64 - now.toordinal() as i64).abs() <= 1,
+        "today() {} should be within a day of now() {}",
+        today.toordinal(),
+        now.toordinal()
+    );
+}
+
+#[test]
+fn glob_relative_patterns_yield_relative_paths_and_starstar_is_not_recursive_by_default() {
+    // Issue #82: glob.glob used to resolve the base to current_dir() and
+    // return absolute paths; `**` was always recursive (CPython's default
+    // is recursive=False, where `**` behaves like `*`), and `{a,b}` brace
+    // expansion was implemented even though CPython's glob does not have it.
+    let scratch = std::env::temp_dir().join(format!(
+        "rython-glob-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(scratch.join("sub")).unwrap();
+    std::fs::write(scratch.join("a.txt"), b"").unwrap();
+    std::fs::write(scratch.join("sub").join("b.txt"), b"").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    let _ = std::env::set_current_dir(&scratch);
+    let relative = glob::glob("*.txt").unwrap();
+    assert_eq!(
+        relative,
+        vec!["a.txt".to_string()],
+        "relative pattern must yield relative paths"
+    );
+    // `**` without recursive=True behaves like `*` (matches ONE level,
+    // like CPython's glob.glob("**/*.txt") -> ['sub/b.txt'], but never
+    // descends deeper).
+    std::fs::create_dir_all(scratch.join("sub").join("deep")).unwrap();
+    std::fs::write(scratch.join("sub").join("deep").join("c.txt"), b"").unwrap();
+    let starstar = glob::glob("**/*.txt").unwrap();
+    assert_eq!(
+        starstar,
+        vec!["sub/b.txt".to_string()],
+        "`**` must match exactly one level by default"
+    );
+    // {a,b} is NOT brace expansion in CPython's glob.
+    let braces = glob::glob("{a,b}.txt").unwrap();
+    assert!(braces.is_empty(), "brace expansion must not exist: {:?}", braces);
+    let _ = std::env::set_current_dir(cwd);
+    std::fs::remove_dir_all(&scratch).unwrap();
+}
