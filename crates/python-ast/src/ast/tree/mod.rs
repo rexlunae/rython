@@ -125,3 +125,6 @@ pub use with_stmt::*;
 
 pub mod aliasing;
 pub use aliasing::*;
+
+pub mod param_infer;
+pub use param_infer::*;

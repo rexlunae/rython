@@ -641,7 +641,7 @@ fn mut_is_inferred_only_where_needed() {
     assert!(!out.contains("let mut x"), "generated: {}", out);
 
     // A store inside a loop may execute repeatedly: mut required.
-    let src = "def g(items):\n    total = 0\n    for i in items:\n        total = total + i\n    return total\n";
+    let src = "def g(items: list[int]) -> int:\n    total = 0\n    for i in items:\n        total = total + i\n    return total\n";
     let out = compile(src, "loopmut.py");
     assert!(out.contains("let mut total"), "generated: {}", out);
 
@@ -699,7 +699,12 @@ fn chained_assignment_assigns_each_target() {
 
 #[test]
 fn attribute_assignment_is_not_a_let() {
-    let out = compile("def f(obj):\n    obj.field = 1\n", "attr.py");
+    // The param is annotated so this stays a test of ASSIGNMENT lowering
+    // (unannotated params with attribute stores are an M2 inference gap).
+    let out = compile(
+        "class Point:\n    def __init__(self) -> None:\n        self.field = 0\n\ndef f(obj: Point) -> None:\n    obj.field = 1\n",
+        "attr.py",
+    );
     assert!(!out.contains("let obj . field"), "generated: {}", out);
     assert!(!out.contains("let mut obj . field"), "generated: {}", out);
 }
@@ -842,7 +847,7 @@ fn async_calls_do_not_guess_await() {
 
 #[test]
 fn explicit_await_still_awaits() {
-    let src = "async def f(x):\n    return await g(x)\n";
+    let src = "async def f(x: int) -> int:\n    return await g(x)\n";
     let out = compile(src, "await2.py");
     assert!(out.contains(". await"), "generated: {}", out);
 }
@@ -907,7 +912,7 @@ fn return_type_inferred_from_string_literal() {
 #[test]
 fn mixed_returns_get_no_annotation() {
     let out = compile(
-        "def f(c):\n    if c:\n        return 1\n    return \"s\"\n",
+        "def f(c: bool):\n    if c:\n        return 1\n    return \"s\"\n",
         "ret4.py",
     );
     assert!(
@@ -949,7 +954,7 @@ fn partial_return_gets_no_annotation() {
 #[test]
 fn return_in_loop_only_gets_no_annotation() {
     let out = compile(
-        "def f(items):\n    for x in items:\n        return 1\n",
+        "def f(items: list[int]):\n    for x in items:\n        return 1\n",
         "ret8.py",
     );
     assert!(!out.contains("-> i64"), "generated: {}", out);
@@ -4855,4 +4860,131 @@ fn await_asyncio_sleep_awaits_once() {
         "exactly one await: {}",
         out
     );
+}
+
+// ---- issue #109 M1: parameter type inference (trait-bound generics) ----
+
+#[test]
+fn unannotated_add_infers_pyadd_bounds() {
+    // The issue's acceptance example: `def add(a, b): return a + b` becomes
+    // one generic function (`fn add<A, B>(a: A, b: B) -> Result<<A as
+    // PyAdd<B>>::Output, ...> where A: PyAdd<B>`), NOT the dead
+    // `impl Into<PyObject>` fallback.
+    let out = compile(
+        "def add(a, b):\n    return a + b\n",
+        "inf_add.py",
+    );
+    assert!(out.contains("fn add < A , B >"), "generated: {}", out);
+    assert!(out.contains("where A : PyAdd < B >"), "generated: {}", out);
+    assert!(
+        out.contains("< A as PyAdd < B >> :: Output"),
+        "generated: {}",
+        out
+    );
+    assert!(!out.contains("Into < PyObject >"), "no dead fallback: {}", out);
+}
+
+#[test]
+fn unannotated_multi_param_add_uses_letter_variables() {
+    let out = compile(
+        "def add(a, b):\n    return a + b\n",
+        "inf_add2.py",
+    );
+    assert!(out.contains("fn add < A , B >"), "generated: {}", out);
+    assert!(out.contains("where A : PyAdd < B >"), "generated: {}", out);
+    assert!(
+        out.contains("< A as PyAdd < B >> :: Output"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn int_conversion_yields_a_bound_not_a_concrete_type() {
+    // The issue's minimal-constraint rule: `int(p)` bounds on PyInt, never
+    // forces `p: i64`.
+    let out = compile("def to_int(x):\n    return int(x)\n", "inf_int.py");
+    assert!(out.contains("pub fn to_int < T >"), "generated: {}", out);
+    assert!(out.contains("where T : PyInt"), "generated: {}", out);
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+}
+
+#[test]
+fn literal_comparison_is_a_bound_not_a_numeric_type() {
+    // `n > 0` bounds on PyGt<i64> — it must NOT force `n: i64` (CPython
+    // accepts any comparable instantiation).
+    let out = compile("def positive(n):\n    return n > 0\n", "inf_cmp.py");
+    assert!(out.contains("pub fn positive < T >"), "generated: {}", out);
+    assert!(out.contains("T : PyGt < i64 >"), "generated: {}", out);
+    assert!(
+        out.contains("< T as PyGt < i64 >> :: Output"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn truthiness_lens_and_display_infer_bounds() {
+    let out = compile(
+        concat!(
+            "def f(x, ys, z):\n",
+            "    if x:\n",
+            "        n = len(ys)\n",
+            "        print(z)\n",
+            "        return n\n",
+            "    return 0\n",
+        ),
+        "inf_multi.py",
+    );
+    assert!(out.contains("where A : Truthy , B : Len , C : PyDisplay"), "generated: {}", out);
+}
+
+#[test]
+fn unannotated_method_parameter_is_a_loud_error() {
+    // M1 infers free functions only: a method's unannotated parameter is a
+    // loud error naming the gap, not the old uncallable fallback.
+    let err = compile_err(
+        "class C:\n    def m(self, x):\n        return x\n",
+        "inf_method.py",
+    );
+    assert!(err.contains("annotate"), "error: {}", err);
+    assert!(err.contains("M1"), "error: {}", err);
+}
+
+#[test]
+fn callable_parameter_is_a_loud_error() {
+    let err = compile_err("def f(cb):\n    return cb(1)\n", "inf_callable.py");
+    assert!(err.contains("`cb`"), "error: {}", err);
+    assert!(err.contains("callable"), "error: {}", err);
+}
+
+#[test]
+fn attribute_access_on_unannotated_parameter_is_a_loud_error() {
+    // The method table is M2: p.upper() has no bound yet.
+    let err = compile_err(
+        "def shout(s):\n    return s.upper()\n",
+        "inf_attr.py",
+    );
+    assert!(err.contains("`s`"), "error: {}", err);
+    assert!(err.contains("M2"), "error: {}", err);
+}
+
+#[test]
+fn passing_unannotated_parameter_to_user_function_is_a_loud_error() {
+    // Interprocedural flow is M4.
+    let err = compile_err(
+        "def g(x: int) -> int:\n    return x\ndef f(v):\n    return g(v)\n",
+        "inf_flow.py",
+    );
+    assert!(err.contains("`v`"), "error: {}", err);
+    assert!(err.contains("M4"), "error: {}", err);
+}
+
+#[test]
+fn no_impl_into_pyobject_anywhere_for_unannotated_params() {
+    // The fallback is deleted: every unannotated parameter either infers or
+    // errors loudly.
+    let out = compile("def f(x):\n    return x\n", "inf_id.py");
+    assert!(out.contains("pub fn f < T > (x : T)"), "generated: {}", out);
+    assert!(!out.contains("Into < PyObject >"), "no fallback: {}", out);
 }

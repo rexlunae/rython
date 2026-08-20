@@ -4188,3 +4188,83 @@ fn kernel_device_mode_rejects_floating_point_loudly() {
         );
     }
 }
+
+#[test]
+fn unannotated_params_infer_generics_matching_python_transcript() {
+    // Issue #109, M1 acceptance: `def add(a, b): return a + b` becomes ONE
+    // generic function (not the dead impl Into<PyObject>) that monomorphizes
+    // per call site; the compiled binary's output is diffed against a
+    // pinned `// Verified against python3.` transcript.
+    let scratch = Scratch::new("param-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def add(a, b):\n",
+            "    return a + b\n",
+            "\n",
+            "def to_int(x):\n",
+            "    return int(x)\n",
+            "\n",
+            "def positive(n):\n",
+            "    return n > 0\n",
+            "\n",
+            "def describe(x):\n",
+            "    return \"val=\" + str(x)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(add(1, 2))\n",
+            "    print(add(1.5, 2.5))\n",
+            "    print(add(\"ab\", \"cd\"))\n",
+            "    print(add([1], [2]))\n",
+            "    print(to_int(\"42\"))\n",
+            "    print(positive(3))\n",
+            "    print(positive(-1))\n",
+            "    print(describe(7))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+
+    // The generated source uses trait-bound generics, never the dead
+    // fallback.
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        src.contains("pub fn add<A, B>(a: A, b: B)"),
+        "generic signature: {}",
+        src
+    );
+    assert!(src.contains("A: PyAdd<B>"), "bound: {}", src);
+    assert!(
+        src.contains("<A as PyAdd<B>>::Output"),
+        "associated return: {}",
+        src
+    );
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "3",
+            "4.0",
+            "abcd",
+            "[1, 2]",
+            "42",
+            "True",
+            "False",
+            "val=7",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

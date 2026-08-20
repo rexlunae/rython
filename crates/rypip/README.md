@@ -48,6 +48,38 @@ A module containing an `if __name__ == "__main__":` block (or a
 `__main__.py`) becomes the binary entry point; packages without one convert
 to library crates and cannot be `install`ed.
 
+## Unannotated parameters (parameter type inference)
+
+Annotations were de facto mandatory: an unannotated parameter used to lower
+to `impl Into<PyObject>`, which no ordinary rython value satisfies — such
+functions converted but were uncallable, and the failure surfaced in rustc.
+Since issue #109's M1, an unannotated parameter's type is **inferred from
+its uses** and emitted as a trait-bound generic signature, monomorphized by
+rustc per call site:
+
+```python
+def add(a, b):
+    return a + b
+```
+```rust
+pub fn add<A, B>(a: A, b: B) -> Result<<A as PyAdd<B>>::Output, PyException>
+where
+    A: PyAdd<B>,
+{
+    return Ok(a.py_add(&b));
+}
+```
+
+`add(1, 2)`, `add(1.5, 2.5)`, `add("ab", "cd")`, and `add([1], [2])` all
+work — exactly like Python. Inferred bounds cover operators, comparisons
+(`n > 0` bounds on `PyGt<i64>`, never forcing `n: i64`), conversion builtins
+(`int(p)` → `PyInt`), truthiness, `len`, `print`/f-strings, `repr`, `hash`,
+indexing, and `in`. The `impl Into<PyObject>` fallback is gone: a use with
+no existing or generatable trait (calling a parameter, method/attribute
+access, iteration, passing to a user function) is a loud conversion error
+naming the parameter, the use, and the milestone that will cover it.
+Annotations always win over inference.
+
 ## Generated crates
 
 Each Python module becomes a Rust module; subpackages become nested modules.

@@ -596,10 +596,6 @@ impl CodeGen for FunctionDef {
             crate::strip_self(&mut render_args);
         }
 
-        let parameters = render_args
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-
         // A cached function's arguments form the cache KEY, so every
         // parameter needs a hashable, nameable type: int, bool, or str
         // (floats are not hashable in Rust — Python would cache them,
@@ -883,6 +879,62 @@ impl CodeGen for FunctionDef {
             &options.name_types,
             &options.use_counts,
         )?;
+        // Issue #109, M1: parameter type inference. Unannotated parameters
+        // (other than `self`) get trait-bound generic signatures derived
+        // from their uses — `def add(a, b): return a + b` becomes
+        // `fn add<A, B>(a: A, b: B) -> Result<<A as PyAdd<B>>::Output, ...>
+        // where A: PyAdd<B>`. The `impl Into<PyObject>` dead end is gone:
+        // an unannotated parameter either infers or fails loudly here.
+        let inferred_signature = {
+            let is_method = matches!(
+                &ctx,
+                CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+            ) && self
+                .args
+                .posonlyargs
+                .first()
+                .or(self.args.args.first())
+                .is_some_and(|p| p.arg == "self");
+            let unannotated: Vec<String> = self
+                .args
+                .posonlyargs
+                .iter()
+                .chain(self.args.args.iter())
+                .chain(self.args.kwonlyargs.iter())
+                .filter(|p| p.arg != "self" && p.annotation.is_none())
+                .map(|p| p.arg.clone())
+                .collect();
+            if unannotated.is_empty() {
+                crate::InferredSignature::default()
+            } else if is_method {
+                // M1 covers free functions; methods (and __init__) need
+                // concrete parameter types — a loud error beats the old
+                // uncallable `impl Into<PyObject>`.
+                return Err(format!(
+                    "parameter(s) `{}` of method `{}` are unannotated; annotate them \
+                     (issue #109, M1 infers free functions only; method parameters are \
+                     inferred in a later milestone)",
+                    unannotated.join("`, `"),
+                    self.name
+                )
+                .into());
+            } else {
+                crate::infer_unannotated_signature(
+                    &effective_body,
+                    &unannotated,
+                    &options.name_types,
+                    &options.use_counts,
+                    &symbols,
+                )
+                .map_err(|e| {
+                    format!("function `{}`: {}", self.name, e)
+                })?
+            }
+        };
+        // Thread the inferred type variables into parameter rendering
+        // (Parameter::to_rust emits `a: A` instead of the dead
+        // `impl Into<PyObject>`).
+        options.param_type_vars = std::rc::Rc::new(inferred_signature.param_types.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self
@@ -999,9 +1051,32 @@ impl CodeGen for FunctionDef {
             )
             .into());
         }
-        let return_type = match self.resolved_return_type() {
-            Some(ty) => quote!(-> Result<#ty, PyException>),
-            None => quote!(-> Result<(), PyException>),
+        let return_type = if inferred_signature.is_generic() && self.returns.is_none() {
+            // The inferred generic return (issue #109, M1): a parameter's
+            // variable, a conversion result, or an associated Output. Only
+            // when every path returns — a fall-through body returns unit.
+            // An explicit return annotation always wins.
+            if guarantees_return(&self.body) {
+                match &inferred_signature.return_type {
+                    Some(ty) => quote!(-> Result<#ty, PyException>),
+                    None => {
+                        return Err(
+                            "could not infer this function's return type from its \
+                             unannotated parameters; add a return annotation \
+                             (issue #109, M1)"
+                                .to_string()
+                                .into(),
+                        )
+                    }
+                }
+            } else {
+                quote!(-> Result<(), PyException>)
+            }
+        } else {
+            match self.resolved_return_type() {
+                Some(ty) => quote!(-> Result<#ty, PyException>),
+                None => quote!(-> Result<(), PyException>),
+            }
         };
 
         // A body that can fall off the end implicitly returns None: give the
@@ -1016,6 +1091,18 @@ impl CodeGen for FunctionDef {
         // computes through the inner fn on a miss, and stores the clone.
         // Recursive calls in the body resolve to the OUTER item, so
         // recursion hits the cache, exactly like Python's wrapper.
+        // @lru_cache keys must stay concrete (int/bool/str): an inferred
+        // generic parameter cannot be hashed into a static key, so it is a
+        // loud error (issue #109).
+        if cache_spec.is_some() && inferred_signature.is_generic() {
+            return Err(
+                "functools.lru_cache on a function with unannotated parameters is not \
+                 supported: the cache key needs a concrete type. Annotate the \
+                 parameters (issue #109)"
+                    .to_string()
+                    .into(),
+            );
+        }
         let streams = if let (Some(maxsize), Some(key)) = (cache_spec, cache_key.as_ref()) {
             let maxsize_tokens = match maxsize {
                 None => quote!(None),
@@ -1082,6 +1169,16 @@ impl CodeGen for FunctionDef {
             quote!()
         };
 
+        let generic_header = inferred_signature.generic_header();
+        let where_clause = inferred_signature.where_clause();
+
+        // Render the parameter list now: the inference pass has populated
+        // options.param_type_vars, so unannotated parameters render as
+        // their inferred type variables (`a: A`).
+        let parameters = render_args
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
             let doc_lines: Vec<_> = docstring
@@ -1099,14 +1196,14 @@ impl CodeGen for FunctionDef {
             quote! {
                 #(#doc_lines)*
                 #lossy_warning
-                #visibility #is_async fn #fn_name(#receiver #parameters) #return_type {
+                #visibility #is_async fn #fn_name #generic_header(#receiver #parameters) #return_type #where_clause {
                     #streams
                 }
             }
         } else {
             quote! {
                 #lossy_warning
-                #visibility #is_async fn #fn_name(#receiver #parameters) #return_type {
+                #visibility #is_async fn #fn_name #generic_header(#receiver #parameters) #return_type #where_clause {
                     #streams
                 }
             }

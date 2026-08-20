@@ -276,8 +276,22 @@ impl CodeGen for Parameter {
             };
             Ok(quote!(#param_name: #rust_type))
         } else {
-            // Default to generic type for untyped parameters
-            Ok(quote!(#param_name: impl Into<PyObject>))
+            // An unannotated parameter: the per-function inference pass
+            // (issue #109, M1) gives it a type-variable name from its uses
+            // (`def add(a, b): return a + b` → `a: A`). The old
+            // `impl Into<PyObject>` fallback is gone: no ordinary rython
+            // value satisfies it, so such functions converted but were
+            // uncallable. If no variable was inferred, the function
+            // generator already failed loudly with the reason.
+            match options.param_type_vars.get(&self.arg) {
+                Some(tv) => Ok(quote!(#param_name: #tv)),
+                None => Err(format!(
+                    "parameter `{}` has no inferred type; annotate it (issue #109: \
+                     parameter type inference)",
+                    self.arg
+                )
+                .into()),
+            }
         }
     }
 }

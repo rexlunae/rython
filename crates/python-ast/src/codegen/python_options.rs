@@ -167,6 +167,12 @@ pub struct PythonOptions {
     /// import or entry attribute: the consumer supplies the executor.
     pub async_runtime_dep: bool,
 
+    /// The inferred type-variable name for each unannotated parameter of the
+    /// CURRENT function (issue #109, M1): `a` → `A`. Parameter rendering
+    /// consults this instead of emitting the dead `impl Into<PyObject>`
+    /// fallback. Set per function by the function generator.
+    pub param_type_vars: std::rc::Rc<std::collections::HashMap<String, proc_macro2::TokenStream>>,
+
     /// Emit #[deprecated] notes on generated items whose conversion was
     /// lossy (dropped parameter defaults, ignored return annotations, ...).
     /// On by default: silent semantic divergence from the Python source is
@@ -331,6 +337,7 @@ impl Default for PythonOptions {
             allow_unsafe: false,
             async_runtime: AsyncRuntime::default(),
             async_runtime_dep: false,
+            param_type_vars: std::rc::Rc::new(std::collections::HashMap::new()),
             lossy_warnings: true,
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             clone_str_attribute_returns: false,
