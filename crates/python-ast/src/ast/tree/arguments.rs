@@ -194,7 +194,7 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
             "float" => Some(quote!(f64)),
             "str" => Some(quote!(String)),
             "bool" => Some(quote!(bool)),
-            "bytes" => Some(quote!(Vec<u8>)),
+            "bytes" | "bytearray" => Some(quote!(Vec<u8>)),
             _ => None,
         },
         // numpy scalar type annotations: np.float64 → f64, np.int32 → i32,
