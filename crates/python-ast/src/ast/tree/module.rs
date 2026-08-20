@@ -335,6 +335,9 @@ impl CodeGen for Module {
             &options.name_types,
             &options.use_counts,
         )?;
+        // Issue #112: `del name` at module level lowers to a no-op; a use
+        // after the del is a loud error (the module body is one scope).
+        crate::check_deleted_names(&module_init_raw)?;
         // Issue #109, M5: module-level calls (including the __main__ block)
         // are checked against callee inferred bounds at conversion time.
         crate::check_call_sites(

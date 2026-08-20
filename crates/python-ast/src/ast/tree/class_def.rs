@@ -42,7 +42,7 @@ use pyo3::FromPyObject;
 use quote::{format_ident, quote};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, FunctionDef, Name, PythonOptions, Statement,
+    CodeGen, CodeGenContext, ExprType, FunctionDef, PythonOptions, Statement,
     StatementType, SymbolTableNode, SymbolTableScopes,
 };
 use pyo3::{Borrowed, PyAny, PyResult};
@@ -563,7 +563,7 @@ impl CodeGen for ClassDef {
         // A base that is not a simple same-module Name (a dotted
         // `queue.Queue`, a call, ...) cannot lower in the embedded-struct +
         // trait scheme — loud error, never a silent drop.
-        if let Some(bad) = self.bases.iter().find(|b| !matches!(b, ExprType::Name(_))) {
+        if let Some(_bad) = self.bases.iter().find(|b| !matches!(b, ExprType::Name(_))) {
             return Err(format!(
                 "class `{}` inherits from a base rython cannot lower (only single \
                  inheritance from classes defined in this module is supported); \

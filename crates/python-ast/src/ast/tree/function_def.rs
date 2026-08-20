@@ -514,6 +514,12 @@ impl CodeGen for FunctionDef {
             )
             .into());
         }
+        // Issue #112: `del name` lowers to a no-op, which is faithful ONLY
+        // while the name is never referenced afterwards — this pass makes
+        // any such use a loud error (and a reassignment/import clears the
+        // deletion, like Python's `del x; x = 1`).
+        check_deleted_names(&self.body)
+            .map_err(|e| format!("function `{}`: {}", self.name, e))?;
 
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
@@ -1434,6 +1440,163 @@ pub(crate) fn scan_str_rebindings(
             StatementType::AsyncWith(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
             _ => {}
         }
+    }
+}
+
+/// Issue #112: a `del name` whose name is referenced afterwards (or whose
+/// deletion is conditional) cannot lower to a no-op — the value would
+/// still be readable where Python raises NameError. Loud error; a
+/// reassignment or import clears the deletion (Python rebinds).
+pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
+    let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let check = |stmt: &Statement, deleted: &mut std::collections::HashSet<String>| -> Result<(), String> {
+        let walk_expr = |expr: &ExprType, deleted: &std::collections::HashSet<String>| -> Result<(), String> {
+            for name in deleted {
+                if crate::expr_references(expr, name) {
+                    return Err(format!(
+                        "`del {name}` then a use of `{name}`: rython cannot unbind a \
+                         binding (the value would still be readable where Python raises \
+                         NameError). Remove the del, or reassign `{name}` first (issue \
+                         #112)"
+                    ));
+                }
+            }
+            Ok(())
+        };
+        match &stmt.statement {
+            StatementType::Delete(targets) => {
+                for target in targets {
+                    if let ExprType::Name(n) = target {
+                        deleted.insert(n.id.clone());
+                    }
+                }
+                Ok(())
+            }
+            StatementType::Assign(a) => {
+                for target in &a.targets {
+                    if let ExprType::Name(n) = target {
+                        deleted.remove(&n.id);
+                    }
+                }
+                walk_expr(&a.value, deleted)?;
+                for target in &a.targets {
+                    walk_expr(target, deleted)?;
+                }
+                Ok(())
+            }
+            StatementType::AugAssign(a) => {
+                if let ExprType::Name(n) = &a.target {
+                    deleted.remove(&n.id);
+                }
+                walk_expr(&a.target, deleted)?;
+                walk_expr(&a.value, deleted)
+            }
+            StatementType::Import(i) => {
+                for alias in &i.names {
+                    deleted.remove(&alias.name);
+                }
+                Ok(())
+            }
+            StatementType::ImportFrom(i) => {
+                for alias in &i.names {
+                    deleted.remove(&alias.name);
+                    if let Some(asname) = &alias.asname {
+                        deleted.remove(asname);
+                    }
+                }
+                Ok(())
+            }
+            StatementType::For(f) => {
+                // The loop target rebinds each iteration.
+                deleted.remove(&loop_target_name(&f.target));
+                walk_expr(&f.iter, deleted)?;
+                walk_expr(&f.target, deleted)?;
+                check_deleted_names(&f.body)?;
+                check_deleted_names(&f.orelse)?;
+                Ok(())
+            }
+            StatementType::If(s) => {
+                walk_expr(&s.test, deleted)?;
+                check_deleted_names(&s.body)?;
+                check_deleted_names(&s.orelse)?;
+                Ok(())
+            }
+            StatementType::While(s) => {
+                walk_expr(&s.test, deleted)?;
+                check_deleted_names(&s.body)?;
+                check_deleted_names(&s.orelse)?;
+                Ok(())
+            }
+            StatementType::Try(t) => {
+                check_deleted_names(&t.body)?;
+                for h in &t.handlers {
+                    check_deleted_names(&h.body)?;
+                }
+                check_deleted_names(&t.orelse)?;
+                check_deleted_names(&t.finalbody)?;
+                Ok(())
+            }
+            StatementType::With(w) => check_deleted_names(&w.body),
+            StatementType::AsyncWith(w) => check_deleted_names(&w.body),
+            StatementType::AsyncFor(f) => {
+                deleted.remove(&loop_target_name(&f.target));
+                walk_expr(&f.iter, deleted)?;
+                walk_expr(&f.target, deleted)?;
+                check_deleted_names(&f.body)?;
+                check_deleted_names(&f.orelse)?;
+                Ok(())
+            }
+            StatementType::Expr(e) => walk_expr(&e.value, deleted),
+            StatementType::Return(Some(e)) => walk_expr(&e.value, deleted),
+            StatementType::Return(None) => Ok(()),
+            StatementType::Call(c) => {
+                walk_expr(&c.func, deleted)?;
+                for arg in &c.args {
+                    walk_expr(arg, deleted)?;
+                }
+                for kw in &c.keywords {
+                    walk_expr(&kw.value, deleted)?;
+                }
+                Ok(())
+            }
+            StatementType::Assert { test, msg } => {
+                walk_expr(test, deleted)?;
+                if let Some(m) = msg {
+                    walk_expr(m, deleted)?;
+                }
+                Ok(())
+            }
+            StatementType::Raise(r) => {
+                if let Some(exc) = &r.exc {
+                    walk_expr(exc, deleted)?;
+                }
+                if let Some(cause) = &r.cause {
+                    walk_expr(cause, deleted)?;
+                }
+                Ok(())
+            }
+            // Nested functions/classes have their own scope.
+            StatementType::FunctionDef(_)
+            | StatementType::AsyncFunctionDef(_)
+            | StatementType::ClassDef(_)
+            | StatementType::Global(_)
+            | StatementType::Pass
+            | StatementType::Break
+            | StatementType::Continue
+            | StatementType::Unimplemented(_) => Ok(()),
+        }
+    };
+    for stmt in body {
+        check(stmt, &mut deleted)?;
+    }
+    Ok(())
+}
+
+/// The name bound by a for-loop target (single-name targets only).
+fn loop_target_name(target: &ExprType) -> String {
+    match target {
+        ExprType::Name(n) => n.id.clone(),
+        _ => String::new(),
     }
 }
 

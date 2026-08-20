@@ -5379,11 +5379,37 @@ fn del_index_bounds_on_pypop() {
 }
 
 #[test]
-fn del_name_is_a_loud_error() {
-    // `del name` unbinds a binding, which the value model cannot represent.
-    let err = compile_err("import sys\ndel sys\n", "del_name.py");
-    assert!(err.contains("unbinding"), "error: {}", err);
+fn del_name_unused_afterwards_is_a_noop() {
+    // Issue #112: `del name` lowers to a no-op when the name is never
+    // referenced afterwards — behaviorally identical to Python.
+    let out = compile(
+        "from logging import NullHandler\nlog = NullHandler\ndel NullHandler\n",
+        "del_noop.py",
+    );
+    assert!(!out.contains("not supported"), "generated: {}", out);
+    assert!(!out.contains("unbinding"), "generated: {}", out);
+}
+
+#[test]
+fn use_after_del_is_a_loud_error() {
+    // `del x` then a use of `x` would still see the value where Python
+    // raises NameError — loud error.
+    let err = compile_err(
+        "import sys\ndef f():\n    del sys\n    return sys\n",
+        "del_use.py",
+    );
+    assert!(err.contains("del sys"), "error: {}", err);
     assert!(err.contains("issue #112"), "error: {}", err);
+}
+
+#[test]
+fn del_then_reassign_is_allowed() {
+    // Python's `del x; x = 1` rebinds — no error.
+    let out = compile(
+        "x = 0\ndef f():\n    x = 1\n    del x\n    x = 2\n    return x\n",
+        "del_rebind.py",
+    );
+    assert!(!out.contains("unbinding"), "generated: {}", out);
 }
 
 #[test]

@@ -633,14 +633,12 @@ impl CodeGen for StatementType {
                                 }
                             }
                         }
-                        ExprType::Name(n) => {
-                            return Err(format!(
-                                "`del {}` (unbinding a name) is not supported: rython binds \
-                                 values, and a deleted name would still be readable. Remove \
-                                 the del, or restructure (issue #112)",
-                                n.id
-                            )
-                            .into());
+                        ExprType::Name(_) => {
+                            // `del name` unbinds the binding. Lowered to a
+                            // no-op: behaviorally identical as long as the
+                            // name is not referenced afterwards, which the
+                            // check_deleted_names pass enforces loudly
+                            // (issue #112).
                         }
                         ExprType::Attribute(_) => {
                             return Err(format!(
