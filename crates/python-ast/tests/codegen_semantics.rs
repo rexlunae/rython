@@ -432,6 +432,180 @@ fn lru_cache_float_keys_use_python_semantics() {
 }
 
 #[test]
+fn str_bytes_union_narrows_via_isinstance() {
+    // Issue #121: a `str | bytes` parameter lowers to StrOrBytes and
+    // isinstance checks narrow each branch to the concrete type — the
+    // pattern requests' to_native_string and idna's ulabel use.
+    let out = compile(
+        "def to_native(string: str | bytes) -> str:\n\
+         \x20   if isinstance(string, str):\n\
+         \x20       out = string\n\
+         \x20   else:\n\
+         \x20       out = string.decode(\"ascii\")\n\
+         \x20   return out\n",
+        "union.py",
+    );
+    assert!(
+        out.contains("StrOrBytes"),
+        "str | bytes must lower to StrOrBytes: {}",
+        out
+    );
+    assert!(
+        out.contains("is_str ()") || out.contains("is_str()"),
+        "isinstance(str) must dispatch at runtime: {}",
+        out
+    );
+    assert!(
+        out.contains("as_str () . unwrap ()") || out.contains("as_str().unwrap()"),
+        "the str branch must read as_str().unwrap(): {}",
+        out
+    );
+    assert!(
+        out.contains("as_bytes () . unwrap ()") || out.contains("as_bytes().unwrap()"),
+        "the bytes branch must read as_bytes().unwrap(): {}",
+        out
+    );
+    assert!(
+        out.contains("decode_ascii") || out.contains("decode_by_name"),
+        "bytes branch must decode through the codec: {}",
+        out
+    );
+}
+
+#[test]
+fn bytes_like_methods_on_narrowed_bytes() {
+    // idna's ulabel: after `isinstance(label, (bytes, bytearray))`, the
+    // bytes branch uses lower/startswith/endswith and str(bytes,
+    // encoding=...).
+    let out = compile(
+        "def ulabel(label: str | bytes | bytearray) -> str:\n\
+         \x20   if isinstance(label, (bytes, bytearray)):\n\
+         \x20       b = bytes(label)\n\
+         \x20       b = b.lower()\n\
+         \x20       if b.startswith(b\"xn--\"):\n\
+         \x20           b = b[4:]\n\
+         \x20       return str(b, encoding=\"ascii\")\n\
+         \x20   return label\n",
+        "ulabel.py",
+    );
+    assert!(
+        out.contains("into_bytes_like"),
+        "bytes(label) must lower through into_bytes_like: {}",
+        out
+    );
+    assert!(
+        out.contains("lower ()") || out.contains(".lower()"),
+        "bytes .lower() must dispatch: {}",
+        out
+    );
+    assert!(
+        out.contains("decode_by_name"),
+        "str(bytes, encoding=...) must decode: {}",
+        out
+    );
+}
+
+#[test]
+fn exception_class_isinstance_matches_by_name() {
+    // `isinstance(e, LookupError)` where e is a caught exception tests the
+    // PyException's name string (charset_normalizer's codec fallback).
+    let out = compile(
+        "def f() -> bool:\n\
+         \x20   try:\n\
+         \x20       x = 1\n\
+         \x20   except (UnicodeDecodeError, LookupError) as e:\n\
+         \x20       return isinstance(e, LookupError)\n\
+         \x20   return False\n",
+        "isexc.py",
+    );
+    assert!(
+        out.contains("matches"),
+        "isinstance on a caught exception must lower to .matches: {}",
+        out
+    );
+}
+
+#[test]
+fn typing_calls_are_noops_and_type_aliases_emit_pub_types() {
+    // typing-module calls (TypeVar, Protocol, TypeAlias, cast, ...) exist
+    // only for the type system; a call lowers to nothing. A module-level
+    // `name = str` (requests' compat `builtin_str = str`) is a TYPE ALIAS:
+    // it emits a pub type (so re-exports resolve) and isinstance resolution
+    // treats the name as the builtin type.
+    let out = compile(
+        "from typing import TypeVar, Protocol, TypeAlias, cast\n\
+         \n\
+         _T_co = TypeVar(\"_T_co\", covariant=True)\n\
+         \n\
+         class SupportsRead(Protocol[_T_co]):\n\
+         \x20   def read(self, length: int = 1) -> _T_co: ...\n\
+         \n\
+         HookType: TypeAlias = str\n",
+        "typing.py",
+    );
+    assert!(
+        !out.contains("TypeVar"),
+        "TypeVar call must lower to nothing: {}",
+        out
+    );
+    assert!(
+        !out.contains("Protocol"),
+        "Protocol base must lower to nothing: {}",
+        out
+    );
+    // The Protocol class body has a method with `...` stub — fine.
+
+    let out = compile(
+        "builtin_str = str\n\
+         bytes_alias = bytes\n",
+        "aliases.py",
+    );
+    assert!(
+        out.contains("pub type builtin_str = String") || out.contains("pub type builtin_str"),
+        "str alias must emit a pub type: {}",
+        out
+    );
+    assert!(
+        out.contains("pub type bytes_alias") || out.contains("pub type bytes_alias = Vec < u8 >"),
+        "bytes alias must emit a pub type: {}",
+        out
+    );
+    // The alias assignment must not survive as a runtime store.
+    assert!(
+        !out.contains("builtin_str = str;"),
+        "the alias must not be a runtime store: {}",
+        out
+    );
+}
+
+#[test]
+fn type_checking_blocks_are_skipped() {
+    // `if TYPE_CHECKING:` never runs at runtime — the block (imports,
+    // type-only class definitions) must be skipped entirely (requests'
+    // _types.py `_ValidatedRequest(PreparedRequest)`).
+    let out = compile(
+        "if TYPE_CHECKING:\n\
+         \x20   from .models import PreparedRequest\n\
+         \x20   class _ValidatedRequest(PreparedRequest):\n\
+         \x20       url: str\n\
+         \n\
+         def f() -> int:\n\
+         \x20   return 1\n",
+        "tc.py",
+    );
+    assert!(
+        !out.contains("_ValidatedRequest"),
+        "TYPE_CHECKING block must be skipped: {}",
+        out
+    );
+    assert!(
+        out.contains("fn f"),
+        "code after the block must still emit: {}",
+        out
+    );
+}
+
+#[test]
 fn exception_class_lowers_to_a_marker_struct() {
     // Custom exceptions (`class IDNAError(UnicodeError)`, `class
     // RequestException(IOError)`) are string-tagged PyException values at

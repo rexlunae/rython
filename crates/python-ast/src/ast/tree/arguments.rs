@@ -157,6 +157,48 @@ pub(crate) fn is_optional_annotation(ann: &ExprType) -> bool {
     }
 }
 
+/// Whether an annotation is the Python `str` type name.
+pub fn is_str_annotation(ann: &ExprType) -> bool {
+    matches!(ann, ExprType::Name(n) if n.id == "str")
+}
+
+/// Whether an annotation is a bytes-like type name (`bytes`/`bytearray`).
+pub fn is_bytes_annotation(ann: &ExprType) -> bool {
+    matches!(ann, ExprType::Name(n) if matches!(n.id.as_str(), "bytes" | "bytearray"))
+}
+
+/// Collect every member of a `|` union chain (left-associative in the
+/// Python AST: `str | bytes | bytearray` is `(str | bytes) | bytearray`).
+/// Returns the leaf members in order, or None when the expression is not a
+/// union.
+pub fn union_members(ann: &ExprType) -> Option<Vec<&ExprType>> {
+    match ann {
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            let mut members = union_members(&op.left)?;
+            members.push(&op.right);
+            Some(members)
+        }
+        _ => Some(vec![ann]),
+    }
+}
+
+/// Whether a union annotation is exactly the supported StrOrBytes pair:
+/// one `str` member and one-or-more bytes-like members (`str | bytes`,
+/// `str | bytes | bytearray`), with no None (None makes it Optional).
+pub fn is_str_bytes_union(ann: &ExprType) -> bool {
+    let members = match union_members(ann) {
+        Some(m) if m.len() >= 2 => m,
+        _ => return false,
+    };
+    if members.iter().any(|m| crate::is_none_expr(m)) {
+        return false;
+    }
+    let has_str = members.iter().any(|m| is_str_annotation(m));
+    let has_bytes = members.iter().any(|m| is_bytes_annotation(m));
+    let all_known = members.iter().all(|m| is_str_annotation(m) || is_bytes_annotation(m));
+    has_str && has_bytes && all_known
+}
+
 /// Map a Python type annotation to a Rust type, when the mapping is known.
 /// `int`/`float`/`str`/`bool`/`bytes` map to concrete Rust types, and
 /// `list[T]`/`dict[K, V]`/`set[T]` map to the corresponding std containers
@@ -166,20 +208,36 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
     match annotation {
         // T | None (and None | T) is Option<T>; a union whose members map
         // to the SAME Rust type (`bytes | bytearray` → Vec<u8>) is that
-        // type. Any other union has no single Rust type — the caller
-        // reports the unsupported annotation (issue: PyPI sweep).
+        // type. `str | bytes` (and `str | bytes | bytearray`) is the
+        // StrOrBytes heterogeneous union (issue #121). Any other union has
+        // no single Rust type — the caller reports the unsupported
+        // annotation.
         ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
             let inner = if crate::is_none_expr(&op.left) {
                 op.right.as_ref()
             } else if crate::is_none_expr(&op.right) {
                 op.left.as_ref()
             } else {
-                let l = python_annotation_to_rust_type(&op.left);
-                let r = python_annotation_to_rust_type(&op.right);
-                if let (Some(l), Some(r)) = (&l, &r)
-                    && l.to_string() == r.to_string()
-                {
-                    return Some(quote!(#l));
+                // All members map to the same Rust type?
+                let members = crate::union_members(annotation).unwrap_or_default();
+                let mut all_same: Option<TokenStream> = None;
+                let mut same = true;
+                for m in &members {
+                    match python_annotation_to_rust_type(m) {
+                        Some(t) if all_same.is_none() => all_same = Some(t),
+                        Some(t) if all_same.as_ref().is_some_and(|p| p.to_string() == t.to_string()) => {}
+                        _ => {
+                            same = false;
+                            break;
+                        }
+                    }
+                }
+                if same && let Some(t) = all_same {
+                    return Some(t);
+                }
+                // str | bytes — the StrOrBytes heterogeneous union.
+                if crate::is_str_bytes_union(annotation) {
+                    return Some(quote!(stdpython::StrOrBytes));
                 }
                 return None;
             };

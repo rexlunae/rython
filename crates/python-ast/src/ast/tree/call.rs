@@ -856,6 +856,18 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // typing-module calls are compile-time-only: TypeVar, Protocol,
+        // TypeAlias, cast, runtime_checkable, Literal, ... exist only for
+        // the type system (annotations are strings under `from __future__
+        // import annotations`), so a call lowers to nothing — the same
+        // treatment the `from typing import ...` import already gets.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id) {
+                if i.module.split('.').next() == Some("typing") {
+                    return Ok(TokenStream::new());
+                }
+            }
+        }
         // Calls to functions that return Result<T, PyException> get `?` so
         // exceptions propagate to the caller (or an enclosing try block),
         // as in Python: user-defined functions (known from the symbol
@@ -1099,6 +1111,8 @@ impl<'a> CodeGen for Call {
                     | "open"
                     | "round"
                     | "divmod"
+                    | "bytes"
+                    | "str"
             ) && symbols.get(bname).is_none()
             {
                 let mut rendered = Vec::new();
@@ -1313,15 +1327,101 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
+                        // Exception-class isinstance: `isinstance(e,
+                        // LookupError)` where e is a caught exception tests
+                        // the PyException's name string — the same match
+                        // except handlers use (charset_normalizer's codec
+                        // fallback). The target may be an exception class
+                        // NAME even though classes aren't values.
+                        let is_exc_class = |name: &str| -> bool {
+                            crate::ast::tree::raise_stmt::is_exception_class_name(name)
+                                || match symbols.get(name) {
+                                    Some(SymbolTableNode::ClassDef(c)) => {
+                                        crate::is_exception_class(c)
+                                    }
+                                    _ => false,
+                                }
+                        };
+                        if let ExprType::Name(n) = &self.args[0]
+                            && let ExprType::Name(t) = &self.args[1]
+                            && is_exc_class(&t.id)
+                        {
+                            let arg = self.args[0].clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            let kind = &t.id;
+                            return Ok(quote!((#arg).matches(#kind)));
+                        }
+                        // Resolve a non-builtin type NAME through symbols:
+                        // `builtin_str = str` (requests' compat alias), an
+                        // import alias, or an imported name (`from .compat
+                        // import builtin_str`) yields the underlying builtin
+                        // type name. Returns None when the name is not a
+                        // statically-known type.
+                        fn resolve_type_name(
+                            id: &str,
+                            options: &PythonOptions,
+                            symbols: &SymbolTableScopes,
+                        ) -> Option<String> {
+                            match symbols.get(id) {
+                                Some(SymbolTableNode::Assign { value, .. }) => {
+                                    match value {
+                                        ExprType::Name(n)
+                                            if matches!(
+                                                n.id.as_str(),
+                                                "int" | "float" | "str" | "bool" | "bytes"
+                                                    | "bytearray"
+                                            ) =>
+                                        {
+                                            Some(n.id.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                Some(SymbolTableNode::Alias(canonical)) => {
+                                    resolve_type_name(canonical, options, symbols)
+                                }
+                                // An imported name: resolve it through the
+                                // DEFINING module's symbol table, where the
+                                // alias assignment lives.
+                                Some(SymbolTableNode::ImportFrom(i)) => {
+                                    let path = i.resolved_module_path(options);
+                                    if options.module_defs.contains_key(&path) {
+                                        let module =
+                                            options.module_defs.get(&path)?;
+                                        let module: &crate::Module = module;
+                                        let syms = module
+                                            .clone()
+                                            .find_symbols(SymbolTableScopes::new());
+                                        resolve_type_name(id, options, &syms)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
                         let targets = match &self.args[1] {
-                            // A single type name.
-                            ExprType::Name(t)
+                            // A single type name (or a name resolving to one).
+                            ExprType::Name(t) => {
+                                let id = resolve_type_name(&t.id, &options, &symbols)
+                                    .unwrap_or_else(|| t.id.clone());
                                 if matches!(
-                                    t.id.as_str(),
+                                    id.as_str(),
                                     "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
-                                ) =>
-                            {
-                                vec![t.id.clone()]
+                                ) {
+                                    vec![id]
+                                } else {
+                                    return Err(format!(
+                                        "isinstance() second argument must be int, float, \
+                                         str, bool, bytes, bytearray, or a tuple of those \
+                                         (got `{:?}`); classes are not supported yet",
+                                        t
+                                    )
+                                    .into());
+                                }
                             }
                             // A tuple of type names: `isinstance(x, (bytearray, bytes))`
                             // — the common "accept either of these" check. Each
@@ -1330,14 +1430,24 @@ impl<'a> CodeGen for Call {
                                 let mut names = Vec::new();
                                 for elt in &tup.elts {
                                     match elt {
-                                        ExprType::Name(t)
+                                        ExprType::Name(t) => {
+                                            let id = resolve_type_name(&t.id, &options, &symbols)
+                                                .unwrap_or_else(|| t.id.clone());
                                             if matches!(
-                                                t.id.as_str(),
+                                                id.as_str(),
                                                 "int" | "float" | "str" | "bool" | "bytes"
                                                     | "bytearray"
-                                            ) =>
-                                        {
-                                            names.push(t.id.clone());
+                                            ) {
+                                                names.push(id);
+                                            } else {
+                                                return Err(format!(
+                                                    "isinstance() tuple-of-types element must \
+                                                     be int, float, str, bool, bytes, or \
+                                                     bytearray (got `{:?}`)",
+                                                    t
+                                                )
+                                                .into());
+                                            }
                                         }
                                         other => {
                                             return Err(format!(
@@ -1362,6 +1472,47 @@ impl<'a> CodeGen for Call {
                                 .into());
                             }
                         };
+                        // A StrOrBytes-typed argument (str | bytes union):
+                        // isinstance is a RUNTIME dispatch (is_bytes /
+                        // is_str), not a static constant — the branch body
+                        // narrows the name (issue #121).
+                        if let ExprType::Name(n) = &self.args[0]
+                            && options
+                                .name_types
+                                .get(&n.id)
+                                .is_some_and(|t| matches!(t, crate::TypeInfo::StrOrBytes))
+                        {
+                            let arg = self.args[0].clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            let targets_bytes = targets.iter().any(|t| {
+                                matches!(t.as_str(), "bytes" | "bytearray")
+                            });
+                            let targets_str = targets.iter().any(|t| t == "str");
+                            if targets_bytes && targets_str {
+                                return Err(format!(
+                                    "isinstance(x, (str, bytes)) on a str|bytes union is \
+                                     always true; the check is pointless"
+                                )
+                                .into());
+                            }
+                            let method = if targets_bytes {
+                                "is_bytes"
+                            } else if targets_str {
+                                "is_str"
+                            } else {
+                                return Err(format!(
+                                    "isinstance() on a str|bytes value must test str, \
+                                     bytes, or bytearray (got {:?})",
+                                    self.args[1]
+                                )
+                                .into());
+                            };
+                            let method = crate::safe_ident(method);
+                            return Ok(quote!((#arg).#method()));
+                        }
                         // The Python type name each target lowers to;
                         // bytes and bytearray BOTH lower to Vec<u8> (the
                         // `bytes | bytearray` union is a single Rust type),
@@ -1565,6 +1716,69 @@ impl<'a> CodeGen for Call {
                         }
                         let a = &rendered[0];
                         return Ok(quote!(list(#a)));
+                    }
+                    // bytes(x): the byte representation. On a str|bytes
+                    // union this extracts the bytes branch (idna's
+                    // `label_bytes = bytes(label)` after the isinstance
+                    // check); on a String it is UTF-8 bytes; on bytes it
+                    // is the identity.
+                    "bytes" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err("bytes() takes exactly 1 argument".to_string().into());
+                        }
+                        let a = &rendered[0];
+                        return Ok(quote!((#a).into_bytes_like()));
+                    }
+                    // str(x): Python display (py_display); str(bytes,
+                    // encoding=...): decode bytes with the codec.
+                    "str" => {
+                        let mut encoding = None;
+                        for kw in &self.keywords {
+                            match kw.arg.as_deref() {
+                                Some("encoding") if encoding.is_none() => {
+                                    encoding = Some(kw.value.clone())
+                                }
+                                other => return Err(unexpected(other)),
+                            }
+                        }
+                        match (rendered.len(), encoding) {
+                            // str(x): the runtime str() (PyToString bound —
+                            // works for generic inferred params).
+                            (1, None) => {
+                                let a = &rendered[0];
+                                return Ok(quote!(str(#a)));
+                            }
+                            // str(bytes, encoding=...) — decode the bytes
+                            // with the codec (charset_normalizer's
+                            // `str((...), encoding=encoding_iana)`).
+                            (1, Some(enc)) => {
+                                let a = &rendered[0];
+                                let enc = enc.to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                ));
+                            }
+                            (2, _) => {
+                                let (a, enc) = (&rendered[0], &rendered[1]);
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                ));
+                            }
+                            _ => {
+                                return Err("str() takes at most 2 arguments"
+                                    .to_string()
+                                    .into())
+                            }
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -3070,23 +3284,28 @@ impl<'a> CodeGen for Call {
                     // layer in stdpython (Rust strings ARE utf-8, so the
                     // bytes→String conversion is the codec's job).
                     ("decode", [enc]) => {
+                        // A literal codec name dispatches at conversion
+                        // time; a runtime name (a parameter) goes through
+                        // the codec registry dispatch.
                         let codec = enc.to_string().trim_matches('"').to_string();
                         let runtime = crate::safe_ident(&options.stdpython);
-                        let f = match codec.as_str() {
-                            "utf-8" => "decode_utf8",
-                            "ascii" => "decode_ascii",
-                            "punycode" => "decode_punycode",
-                            other => {
-                                return Err(format!(
-                                    "bytes.decode({}): only utf-8, ascii, and punycode \
-                                     are supported",
-                                    other
-                                )
-                                .into());
-                            }
-                        };
-                        let f = crate::safe_ident(f);
-                        return Ok(quote!(#runtime::stdlib::codec::#f(&(#receiver))?));
+                        if matches!(
+                            codec.as_str(),
+                            "utf-8" | "ascii" | "punycode"
+                        ) {
+                            let f = crate::safe_ident(match codec.as_str() {
+                                "utf-8" => "decode_utf8",
+                                "ascii" => "decode_ascii",
+                                _ => "decode_punycode",
+                            });
+                            return Ok(quote!(
+                                #runtime::stdlib::codec::#f(&(#receiver))?
+                            ));
+                        }
+                        // Runtime codec name: dispatch in the runtime.
+                        return Ok(quote!(
+                            #runtime::stdlib::codec::decode_by_name(&(#receiver), #enc)?
+                        ));
                     }
                     ("decode", []) => {
                         let runtime = crate::safe_ident(&options.stdpython);
@@ -3262,6 +3481,47 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!((#receiver).py_find(&(#needle))));
                     }
                     _ => {}
+                }
+                // Issue #121: bytes methods on a name narrowed to Vec<u8>
+                // (the bytes branch of a str|bytes union) — ASCII byte-wise
+                // semantics, matching Python's bytes methods.
+                let narrowed_bytes = crate::ast::tree::call::root_name(&attr.value)
+                    .is_some_and(|root| {
+                        options
+                            .narrowed_names
+                            .get(root)
+                            .is_some_and(|t| matches!(t, crate::TypeInfo::Bytes))
+                    });
+                if narrowed_bytes {
+                    match attr.attr.as_str() {
+                        "lower" => {
+                            return Ok(quote!((#receiver).lower()));
+                        }
+                        "startswith" => {
+                            if let Some(arg) = self.args.first() {
+                                let arg = arg.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                return Ok(quote!((#receiver).startswith(&(#arg))));
+                            }
+                        }
+                        "endswith" => {
+                            if let Some(arg) = self.args.first() {
+                                let arg = arg.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                return Ok(quote!((#receiver).endswith(&(#arg))));
+                            }
+                        }
+                        "isascii" => {
+                            return Ok(quote!((#receiver).isascii()));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }

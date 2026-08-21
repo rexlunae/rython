@@ -146,12 +146,16 @@ line, never a silent behaviour change:
   including botocore/boto3) and s3transfer's callback helpers.
 - **Heterogeneous unions** — a parameter/field annotated with a union
   whose members map to different Rust types (`str | bytes`,
-  `str | bytes | int | float`) has no single Rust type and is a loud
-  error; only same-Rust-type unions (`bytes | bytearray` → `Vec<u8>`)
-  and `T | None` → `Option<T>` lower. Pervasive in requests
-  (`to_native_string(string: str | bytes)`, `UriType = str | bytes`,
-  auth/cookies/models/sessions/utils) — blocks requests (#1 PyPI) at
-  its own code.
+  `str | bytes | int | float`) has no single Rust type. The common
+  two-member `str | bytes` (and `str | bytes | bytearray`) lowers to the
+  `StrOrBytes` runtime union, narrowed by `isinstance(x, (bytes,
+  bytearray))` checks into the concrete branch; `T | None` →
+  `Option<T>`; same-Rust-type unions (`bytes | bytearray` → `Vec<u8>`).
+  Wider unions (`bool | str | None` in requests' `verify`, `str | bytes
+  | int | float` in `UriType`) remain a loud error. `from typing import
+  ...` names (TypeVar/Protocol/TypeAlias/cast) and `if TYPE_CHECKING:`
+  blocks are compile-time-only and lower to nothing; module-level
+  `name = str` type aliases emit a `pub type`.
 - **Callables in containers** — a list/dict whose elements are function
   objects (`botocore._INITIALIZERS`, populated by
   `register_initializer(callback)` and invoked via

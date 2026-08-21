@@ -97,8 +97,20 @@ impl CodeGen for Name {
             // must unwrap it: Python's value IS the inner value in the
             // narrowed region. clone() keeps the read non-consuming so the
             // name stays usable (the hoisted binding is reused).
-            if options.narrowed_names.contains(&self.id) {
-                return Ok(quote!((#name).clone().unwrap()));
+            // Issue #121: a `str | bytes` union narrowed by isinstance
+            // reads the concrete branch (String via as_str, Vec<u8> via
+            // as_bytes) — a runtime conversion, not an unwrap.
+            if let Some(target) = options.narrowed_names.get(&self.id) {
+                return Ok(match target {
+                    crate::TypeInfo::StrOrBytes => quote!((#name)),
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                        quote!((#name).as_str().unwrap().to_string())
+                    }
+                    crate::TypeInfo::Bytes => {
+                        quote!((#name).as_bytes().unwrap().to_vec())
+                    }
+                    _ => quote!((#name).clone().unwrap()),
+                });
             }
             Ok(quote!(#name))
         }

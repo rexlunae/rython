@@ -2208,6 +2208,119 @@ impl Truthy for PyStr {
     }
 }
 
+/// The `str | bytes` (and `str | bytes | bytearray`) heterogeneous union:
+/// a value that is either a Python str or raw bytes. This is the bounded
+/// slice of the boxed-heterogeneous-value divergence (issue #121) that
+/// real libraries need (idna's labels, requests' `to_native_string`).
+/// Codegen narrows it through `isinstance(x, (bytes, bytearray))` checks
+/// into the concrete String/Vec<u8> branch; the union itself only needs
+/// len, truthiness, and the isinstance/bytes/str dispatch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StrOrBytes {
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+impl StrOrBytes {
+    pub fn is_str(&self) -> bool {
+        matches!(self, StrOrBytes::Str(_))
+    }
+    pub fn is_bytes(&self) -> bool {
+        matches!(self, StrOrBytes::Bytes(_))
+    }
+    /// Python len(): characters for a str, octets for bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            StrOrBytes::Str(s) => s.chars().count(),
+            StrOrBytes::Bytes(b) => b.len(),
+        }
+    }
+    /// The str view; only valid after isinstance narrowing (Python has no
+    /// str(bytes) without an encoding).
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            StrOrBytes::Str(s) => Some(s.as_str()),
+            StrOrBytes::Bytes(_) => None,
+        }
+    }
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            StrOrBytes::Bytes(b) => Some(b.as_slice()),
+            StrOrBytes::Str(_) => None,
+        }
+    }
+}
+
+impl Truthy for StrOrBytes {
+    fn is_truthy(&self) -> bool {
+        !self.len() == 0
+    }
+}
+
+impl Len for StrOrBytes {
+    fn len(&self) -> usize {
+        StrOrBytes::len(self)
+    }
+}
+
+/// `bytes(x)` lowering: the byte representation of a str (UTF-8), a
+/// str|bytes union (the bytes branch), or bytes themselves (identity).
+pub trait IntoBytesLike {
+    fn into_bytes_like(self) -> Vec<u8>;
+}
+impl IntoBytesLike for String {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self.into_bytes()
+    }
+}
+impl IntoBytesLike for &str {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+impl IntoBytesLike for Vec<u8> {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self
+    }
+}
+impl IntoBytesLike for &[u8] {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+impl IntoBytesLike for StrOrBytes {
+    fn into_bytes_like(self) -> Vec<u8> {
+        match self {
+            StrOrBytes::Str(s) => s.into_bytes(),
+            StrOrBytes::Bytes(b) => b,
+        }
+    }
+}
+
+/// Python bytes methods that a narrowed `str | bytes` union exercises
+/// (idna's A-label handling: lower/startswith/endswith/isascii). ASCII
+/// byte-wise semantics, matching Python's bytes methods.
+pub trait PyBytesOps {
+    fn lower(&self) -> Vec<u8>;
+    fn startswith(&self, prefix: &[u8]) -> bool;
+    fn endswith(&self, suffix: &[u8]) -> bool;
+    fn isascii(&self) -> bool;
+}
+impl PyBytesOps for Vec<u8> {
+    fn lower(&self) -> Vec<u8> {
+        self.iter().map(|b| b.to_ascii_lowercase()).collect()
+    }
+    fn startswith(&self, prefix: &[u8]) -> bool {
+        self.starts_with(prefix)
+    }
+    fn endswith(&self, suffix: &[u8]) -> bool {
+        self.ends_with(suffix)
+    }
+    fn isascii(&self) -> bool {
+        self.iter().all(|b| b.is_ascii())
+    }
+}
+
 /// Python-style list type with all list methods
 #[derive(Debug, Clone, PartialEq)]
 pub struct PyList<T> {

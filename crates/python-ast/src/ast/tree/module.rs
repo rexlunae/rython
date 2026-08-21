@@ -287,6 +287,11 @@ impl CodeGen for Module {
         // drive both the hoisted sets and hoisted_declarations.
         for s in &self.raw.body {
             if let crate::StatementType::If(if_stmt) = &s.statement {
+                // `if TYPE_CHECKING:` never runs at runtime — skip the
+                // whole block (imports, type-only classes).
+                if Self::is_type_checking_test(&if_stmt.test) {
+                    continue;
+                }
                 let test_str = format!("{:?}", if_stmt.test);
                 if test_str.contains("__name__") && test_str.contains("__main__") {
                     let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body)
@@ -304,6 +309,17 @@ impl CodeGen for Module {
                 // synthesized cached function at module level (handled in
                 // the emit loop) — not a runtime store.
                 if crate::try_lru_cache_factory(a, Some(&options), &symbols).is_some() {
+                    continue;
+                }
+                // A type alias (`builtin_str = str`) is a declaration, not
+                // a runtime store.
+                if let [crate::ExprType::Name(_)] = a.targets.as_slice()
+                    && let crate::ExprType::Name(n) = &a.value
+                    && matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                    )
+                {
                     continue;
                 }
                 if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
@@ -437,11 +453,41 @@ impl CodeGen for Module {
                     // Skip generating this if statement - we've processed its contents
                     continue;
                 }
+                // `if TYPE_CHECKING:` never runs at runtime: skip the whole
+                // block (imports, type-only classes).
+                if Self::is_type_checking_test(&if_stmt.test) {
+                    continue;
+                }
             }
             
             // Module-level constants become static items visible to every
             // function in the module.
             if let crate::StatementType::Assign(a) = &s.statement {
+                // A type alias (`builtin_str = str`): emit the pub type at
+                // module level so re-exports resolve; Assign::to_rust also
+                // knows this shape, but the module path must place it as a
+                // declaration, not an init-time store.
+                if let [crate::ExprType::Name(target)] = a.targets.as_slice()
+                    && let crate::ExprType::Name(n) = &a.value
+                    && matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                    )
+                {
+                    let ty = match n.id.as_str() {
+                        "str" => quote!(String),
+                        "bytes" | "bytearray" => quote!(Vec<u8>),
+                        "int" => quote!(i64),
+                        "float" => quote!(f64),
+                        _ => quote!(bool),
+                    };
+                    let ident = crate::safe_ident(&target.id);
+                    stream.extend(quote! {
+                        #[allow(dead_code)]
+                        pub type #ident = #ty;
+                    });
+                    continue;
+                }
                 // Issue #127: `name = lru_cache(maxsize=N)(fn)` — the
                 // decorator factory applied as an expression. Emit the
                 // synthesized cached function as a module-level item (the
@@ -1144,6 +1190,21 @@ impl Module {
     /// - main()
     /// - result = main()
     /// - sys.exit(main())
+    /// Whether an if-test is `TYPE_CHECKING` (or `typing.TYPE_CHECKING`):
+    /// the compile-time-only guard that never runs at runtime — its block
+    /// (imports, type-only class definitions) must be skipped entirely
+    /// (requests' _types.py).
+    fn is_type_checking_test(test: &crate::ExprType) -> bool {
+        match test {
+            crate::ExprType::Name(n) => n.id == "TYPE_CHECKING",
+            crate::ExprType::Attribute(a) => {
+                matches!(a.value.as_ref(), crate::ExprType::Name(m) if m.id == "typing")
+                    && a.attr == "TYPE_CHECKING"
+            }
+            _ => false,
+        }
+    }
+
     fn is_simple_main_call_block(body: &[crate::Statement]) -> bool {
         // Must have exactly one statement
         if body.len() != 1 {

@@ -144,7 +144,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
 /// or another custom exception (`IDNABidiError(IDNAError)`) is an exception
 /// class too. Lowered as a marker struct; the runtime matches exceptions by
 /// name string, so the class carries no data.
-fn is_exception_class(class: &ClassDef) -> bool {
+pub fn is_exception_class(class: &ClassDef) -> bool {
     let convention = |n: &str| {
         n.ends_with("Error") || n.ends_with("Exception") || n.ends_with("Warning")
     };
@@ -777,6 +777,34 @@ impl CodeGen for ClassDef {
         // Exception classes with *args/**kwargs __init__ (idna) lower
         // through here without tripping the variadic-parameter guard.
         if is_exception_class(&self) {
+            let doc = self
+                .get_docstring()
+                .map(|d| format!("#[doc = \"{}\"]\n", d.replace('"', "\\\"")))
+                .unwrap_or_default();
+            return Ok(quote! {
+                #doc
+                #[allow(dead_code)]
+                pub struct #class_name;
+            });
+        }
+
+        // A typing.Protocol subclass (or a class whose base resolves to a
+        // typing import): type-only — its methods are stubs, so it lowers
+        // as an empty marker struct like an exception class. The base may
+        // be a Subscript (`Protocol[_T_co]`) which otherwise errors.
+        let is_protocol = self.decorator_list.iter().any(|d| {
+            matches!(
+                d,
+                ExprType::Name(n) if n.id == "runtime_checkable"
+            )
+        }) || self.bases.iter().any(|b| match b {
+            ExprType::Name(n) => n.id == "Protocol",
+            ExprType::Subscript(s) => {
+                matches!(s.value.as_ref(), ExprType::Name(n) if n.id == "Protocol")
+            }
+            _ => false,
+        });
+        if is_protocol {
             let doc = self
                 .get_docstring()
                 .map(|d| format!("#[doc = \"{}\"]\n", d.replace('"', "\\\"")))

@@ -636,10 +636,20 @@ impl CodeGen for FunctionDef {
                         Some(ExprType::Name(n)) if n.id == "float" => {
                             quote!(stdpython::stdlib::functools::PyFloatKey)
                         }
+                        // Optional keys: `x: str | None` caches on the
+                        // Option (charset_normalizer's lg_inclusion).
+                        Some(ann)
+                            if crate::is_optional_annotation(ann) =>
+                        {
+                            let inner = crate::python_annotation_to_rust_type(ann)
+                                .unwrap_or_else(|| quote!(String));
+                            quote!(Option<#inner>)
+                        }
                         _ => {
                             return Err(format!(
                                 "@lru_cache on `{}`: parameter `{}` must be annotated \
-                                 int, bool, str, or float (the arguments form the cache key)",
+                                 int, bool, str, float, or Optional (the arguments form \
+                                 the cache key)",
                                 self.name, p.arg
                             )
                             .into());
@@ -881,6 +891,9 @@ impl CodeGen for FunctionDef {
                         other => {
                             if let Some(t) = crate::annotation_type_info(other) {
                                 info.name_types.insert(p.arg.clone(), t);
+                            } else if crate::is_str_bytes_union(other) {
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::StrOrBytes);
                             } else if crate::python_annotation_to_rust_type(other).is_none() {
                                 // The annotation is genuinely unsupported
                                 // (e.g. a custom type): fail loudly at
@@ -911,7 +924,7 @@ impl CodeGen for FunctionDef {
                 name_types: options.name_types.as_ref().clone(),
                 empty_pinned: options.empty_pinned.as_ref().clone(),
             };
-            crate::pin_empty_containers(&effective_body, &mut info);
+            crate::pin_empty_containers(&effective_body, &mut info, Some(&symbols));
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
@@ -1141,7 +1154,8 @@ impl CodeGen for FunctionDef {
         // function (Python narrows it; the hoisted binding stays Option, so
         // every later read must unwrap). A name assigned None on some path
         // drops out of the narrowed set again.
-        let mut narrowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut narrowed: std::collections::HashMap<String, crate::TypeInfo> =
+            std::collections::HashMap::new();
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");

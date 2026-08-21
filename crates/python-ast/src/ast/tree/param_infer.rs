@@ -1357,6 +1357,7 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::Option(_) => "optional".to_string(),
         TypeInfo::Range => "range".to_string(),
         TypeInfo::NdArray => "array".to_string(),
+        TypeInfo::StrOrBytes => "str | bytes".to_string(),
         TypeInfo::Class(c) => c.clone(),
         TypeInfo::Borrowed(_) => "borrowed".to_string(),
         TypeInfo::PyObject => "unknown".to_string(),

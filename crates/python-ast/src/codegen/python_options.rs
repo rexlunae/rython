@@ -222,7 +222,7 @@ pub struct PythonOptions {
     /// narrowed name unwrap (`(x).clone().unwrap()`); their type is the
     /// Option's inner type. Threaded by the function body loop and by
     /// If::to_rust (the body narrows from the test).
-    pub narrowed_names: std::rc::Rc<std::collections::HashSet<String>>,
+    pub narrowed_names: std::rc::Rc<std::collections::HashMap<String, crate::TypeInfo>>,
 
     /// Whether the CURRENT function's return annotation is `str`: returning
     /// an attribute chain then clones the String field out of the shared
@@ -387,7 +387,7 @@ impl Default for PythonOptions {
             owned_str_literals: std::rc::Rc::new(std::collections::HashSet::new()),
             definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
-            narrowed_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
             clone_str_attribute_returns: false,
             module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),

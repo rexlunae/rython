@@ -59,6 +59,10 @@ pub enum TypeInfo {
     /// `numpy::NdArray`
     /// `numpy::NdArray`
     NdArray,
+    /// `stdpython::StrOrBytes` — the `str | bytes` heterogeneous union
+    /// (issue #121): a value that is either a String or Vec<u8>, narrowed
+    /// by isinstance checks.
+    StrOrBytes,
     /// an instance of a class defined in this module (by class name); not
     /// Copy, so reused values must be cloned at each move-prone use
     Class(String),
@@ -107,6 +111,7 @@ impl TypeInfo {
             }
             TypeInfo::Range => quote!(PyRange),
             TypeInfo::NdArray => quote!(numpy::NdArray),
+            TypeInfo::StrOrBytes => quote!(stdpython::StrOrBytes),
             TypeInfo::Class(name) => {
                 let ident = crate::safe_ident(name);
                 quote!(#ident)
@@ -133,6 +138,7 @@ impl TypeInfo {
             TypeInfo::Option(_) => "Optional".into(),
             TypeInfo::Range => "range".into(),
             TypeInfo::NdArray => "ndarray".into(),
+            TypeInfo::StrOrBytes => "str | bytes".into(),
             TypeInfo::Class(name) => name.clone(),
             TypeInfo::Borrowed(_) => "borrowed".into(),
             TypeInfo::PyObject => "unknown".into(),
@@ -619,7 +625,7 @@ pub fn analyze_function_types(body: &[Statement]) -> FunctionTypeInfo {
     for stmt in body {
         analyze_statement_types(stmt, &mut info);
     }
-    pin_empty_containers(body, &mut info);
+    pin_empty_containers(body, &mut info, None);
     info
 }
 
@@ -731,10 +737,30 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
                 analyze_statement_types(b, info);
             }
         }
-        StatementType::FunctionDef(_) => {
+        StatementType::FunctionDef(f) => {
             // A nested function is a new scope: its locals do not belong to
-            // the enclosing function's type analysis. (Captured reads of
-            // outer names are rare and would only tune clone-on-reuse.)
+            // the enclosing function's type analysis. BUT its ANNOTATED
+            // parameter types are usable for empty-container pinning — a
+            // nested closure `def inner(x: float): md_ratios.append(x)`
+            // pins the outer `md_ratios = []` to Vec<f64> (charset_
+            // normalizer's from_bytes). Record them and recurse the body
+            // so captured uses of enclosing empty containers resolve.
+            for p in f
+                .args
+                .posonlyargs
+                .iter()
+                .chain(f.args.args.iter())
+                .chain(f.args.kwonlyargs.iter())
+            {
+                if let Some(ann) = p.annotation.as_deref()
+                    && let Some(t) = crate::annotation_type_info(ann)
+                {
+                    info.name_types.insert(p.arg.clone(), t);
+                }
+            }
+            for b in &f.body {
+                analyze_statement_types(b, info);
+            }
         }
         _ => {}
     }
@@ -805,10 +831,14 @@ fn syntactic_type(expr: &ExprType) -> TypeInfo {
 /// Pin the element/key types of empty containers from a later use. Called
 /// with the full statement list AFTER `name_types` is populated so that
 /// `append(d[k])` can resolve `d`'s type too.
-pub fn pin_empty_containers(body: &[Statement], info: &mut FunctionTypeInfo) {
+pub fn pin_empty_containers(
+    body: &[Statement],
+    info: &mut FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+) {
     let mut suggested: HashMap<String, TypeInfo> = HashMap::new();
     for stmt in body {
-        collect_use_suggestions(stmt, info, &mut suggested);
+        collect_use_suggestions(stmt, info, symbols, &mut suggested);
     }
     for (name, t) in suggested {
         if info.empty_pinned.contains_key(&name) {
@@ -828,6 +858,7 @@ pub fn pin_empty_containers(body: &[Statement], info: &mut FunctionTypeInfo) {
 fn collect_use_suggestions(
     stmt: &Statement,
     info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
     out: &mut HashMap<String, TypeInfo>,
 ) {
     match &stmt.statement {
@@ -842,7 +873,7 @@ fn collect_use_suggestions(
                 match attr.attr.as_str() {
                     "append" | "push" => {
                         if let Some(arg) = call.args.first() {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols);
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), t.clone()))
                                 .or_insert(TypeInfo::Vec(Box::new(t)));
@@ -850,7 +881,7 @@ fn collect_use_suggestions(
                     }
                     "insert" => {
                         if let Some(arg) = call.args.get(1) {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols);
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), t.clone()))
                                 .or_insert(TypeInfo::Vec(Box::new(t)));
@@ -865,11 +896,11 @@ fn collect_use_suggestions(
                     && let ExprType::Name(recv) = sub.value.as_ref()
                     && info.empty_pinned.contains_key(&recv.id)
                 {
-                    let v = resolve_type(&assign.value, info);
+                    let v = resolve_type(&assign.value, info, symbols);
                     if let crate::SubscriptKind::Index(idx) = &sub.kind {
                         // Keys normalize to String, matching dict literals
                         // and `dict[str, V]` annotations.
-                        let k = match resolve_type(idx, info) {
+                        let k = match resolve_type(idx, info, symbols) {
                             TypeInfo::StrRef => TypeInfo::String,
                             other => other,
                         };
@@ -891,7 +922,7 @@ fn collect_use_suggestions(
                     // d.get(k) read pins the key type.
                     "get" => {
                         if let Some(arg) = call.args.first() {
-                            let k = match resolve_type(arg, info) {
+                            let k = match resolve_type(arg, info, symbols) {
                                 TypeInfo::StrRef => TypeInfo::String,
                                 other => other,
                             };
@@ -908,7 +939,7 @@ fn collect_use_suggestions(
                     // `xs.append(v)` pins xs's element type.
                     "append" | "push" => {
                         if let Some(arg) = call.args.first() {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols);
                             let suggestion = TypeInfo::Vec(Box::new(t));
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
@@ -918,7 +949,7 @@ fn collect_use_suggestions(
                     // `xs.extend(ys)` pins xs's element type to ys's.
                     "extend" => {
                         if let Some(arg) = call.args.first() {
-                            let t = match resolve_type(arg, info) {
+                            let t = match resolve_type(arg, info, symbols) {
                                 TypeInfo::Vec(e) => *e,
                                 other => other,
                             };
@@ -930,7 +961,7 @@ fn collect_use_suggestions(
                     }
                     "insert" => {
                         if let Some(arg) = call.args.get(1) {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols);
                             let suggestion = TypeInfo::Vec(Box::new(t));
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
@@ -947,35 +978,46 @@ fn collect_use_suggestions(
     match &stmt.statement {
         StatementType::If(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, out);
             }
             for b in &s.orelse {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, out);
             }
         }
         StatementType::While(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, out);
             }
         }
         StatementType::For(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, out);
             }
         }
         StatementType::With(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, out);
             }
         }
         StatementType::Try(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, out);
             }
             for h in &s.handlers {
                 for b in &h.body {
-                    collect_use_suggestions(b, info, out);
+                    collect_use_suggestions(b, info, symbols, out);
                 }
+            }
+        }
+        // A NESTED function captures enclosing names (Python closure
+        // semantics): `md_ratios.append(x)` inside a nested def pins the
+        // outer `md_ratios = []` (charset_normalizer's from_bytes). The
+        // nested function's OWN locals must not pollute the enclosing
+        // analysis, but a use of an enclosing empty container is exactly
+        // the pin we want.
+        StatementType::FunctionDef(f) => {
+            for b in &f.body {
+                collect_use_suggestions(b, info, symbols, out);
             }
         }
         _ => {}
@@ -984,13 +1026,32 @@ fn collect_use_suggestions(
 
 /// Resolve a name's type through the name_types map (falling back to
 /// syntactic inference for expressions that don't need the map).
-fn resolve_type(expr: &ExprType, info: &FunctionTypeInfo) -> TypeInfo {
+fn resolve_type(
+    expr: &ExprType,
+    info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+) -> TypeInfo {
     match expr {
         ExprType::Name(n) => info
             .name_types
             .get(&n.id)
             .cloned()
             .unwrap_or_else(|| syntactic_type(expr)),
+        // A call to a known function resolves through its return
+        // annotation: `md_ratios.append(cached_mess_ratio(...))` pins the
+        // element type from the cached fn's `-> float` (charset_normalizer).
+        ExprType::Call(call) => {
+            if let ExprType::Name(callee) = call.func.as_ref()
+                && let Some(symbols) = symbols
+            {
+                if let Some(SymbolTableNode::FunctionDef(f)) = symbols.get(&callee.id) {
+                    if let Some(ty) = f.resolved_return_type() {
+                        return ty_to_typeinfo(&ty);
+                    }
+                }
+            }
+            syntactic_type(expr)
+        }
         // `xs[i]` resolves through the receiver's recorded type so
         // `out.append(xs[0])` pins `out`'s element type from a
         // `list[float]` parameter.
@@ -1007,6 +1068,25 @@ fn resolve_type(expr: &ExprType, info: &FunctionTypeInfo) -> TypeInfo {
             syntactic_type(expr)
         }
         _ => syntactic_type(expr),
+    }
+}
+
+/// Map a resolved Rust type token (from a function's return annotation) to
+/// a TypeInfo.
+fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
+    let s = ty.to_string();
+    if s.contains("i64") {
+        TypeInfo::Int
+    } else if s.contains("f64") {
+        TypeInfo::Float
+    } else if s.contains("bool") {
+        TypeInfo::Bool
+    } else if s.contains("String") || s.contains("str") {
+        TypeInfo::String
+    } else if s.contains("Vec < u8 >") || s.contains("Vec<u8>") {
+        TypeInfo::Bytes
+    } else {
+        TypeInfo::PyObject
     }
 }
 

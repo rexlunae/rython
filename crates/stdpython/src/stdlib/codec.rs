@@ -72,6 +72,20 @@ pub fn decode_utf8(b: &[u8]) -> Result<String, PyException> {
     })
 }
 
+/// bytes.decode(name) with a RUNTIME codec name (a parameter, not a
+/// literal): dispatch on the name string, like CPython's codec registry.
+pub fn decode_by_name<N: AsRef<str>>(b: &[u8], name: N) -> Result<String, PyException> {
+    match name.as_ref() {
+        "utf-8" | "utf8" => decode_utf8(b),
+        "ascii" => decode_ascii(b),
+        "punycode" => decode_punycode(b),
+        other => Err(PyException::new(
+            "LookupError",
+            format!("unknown encoding: {}", other),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Punycode (RFC 3492) — the "bootstring" codec used by IDNA A-labels.
 // ---------------------------------------------------------------------------

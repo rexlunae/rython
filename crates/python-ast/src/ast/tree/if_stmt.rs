@@ -73,15 +73,33 @@ impl CodeGen for If {
         // and the comprehension/iteration over x sees the inner element
         // type. Any other test narrows nothing.
         let mut body_options = options.clone();
+        let mut else_options = options.clone();
         if let Some((narrowed, inner)) = crate::narrowing_from_test(&self.test, &options) {
             let mut narrowed_names = options.narrowed_names.as_ref().clone();
-            narrowed_names.insert(narrowed.clone());
+            // The narrowed type: the Option's inner type, or for a
+            // str|bytes union narrowed by isinstance, the concrete branch
+            // type carried in the map value (String/Bytes).
+            let target = inner.clone().unwrap_or(crate::TypeInfo::StrOrBytes);
+            narrowed_names.insert(narrowed.clone(), target);
             body_options.narrowed_names = std::rc::Rc::new(narrowed_names);
             if let Some(inner) = inner {
                 let mut name_types = options.name_types.as_ref().clone();
                 name_types.insert(narrowed.clone(), inner);
                 body_options.name_types = std::rc::Rc::new(name_types);
             }
+        }
+        // Issue #121: `if isinstance(x, (bytes, bytearray)):` (or its
+        // negation) narrows a str|bytes union to the CONCRETE branch in the
+        // body AND the complementary branch in the else.
+        if let Some((name, body_ty, else_ty)) =
+            crate::isinstance_narrowing(&self.test, &options, &symbols)
+        {
+            let mut body_n = options.narrowed_names.as_ref().clone();
+            body_n.insert(name.clone(), body_ty);
+            body_options.narrowed_names = std::rc::Rc::new(body_n);
+            let mut else_n = options.narrowed_names.as_ref().clone();
+            else_n.insert(name.clone(), else_ty);
+            else_options.narrowed_names = std::rc::Rc::new(else_n);
         }
 
         let body_stmts: Result<Vec<_>, _> = self
@@ -100,7 +118,7 @@ impl CodeGen for If {
         } else {
             let else_stmts: Result<Vec<_>, _> = self.orelse
                 .into_iter()
-                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+                .map(|stmt| stmt.to_rust(ctx.clone(), else_options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
             

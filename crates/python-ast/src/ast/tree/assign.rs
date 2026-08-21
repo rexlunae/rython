@@ -123,6 +123,36 @@ impl<'a> CodeGen for Assign {
             return Ok(TokenStream::new());
         }
 
+        // A module-level TYPE ALIAS: `builtin_str = str` / `bytes = bytes`
+        // (requests' compat) binds a name to a builtin TYPE. rython cannot
+        // hold a type as a value (the classes-as-values divergence), but
+        // the assignment is consumed by isinstance resolution at conversion
+        // time. Emit a `pub type` alias so re-exports (`from .compat import
+        // builtin_str`) resolve to a real item, mapping the builtin name to
+        // its Rust type.
+        if matches!(ctx, CodeGenContext::Module(_))
+            && self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && let ExprType::Name(n) = &self.value
+            && matches!(
+                n.id.as_str(),
+                "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+            )
+        {
+            let ty = match n.id.as_str() {
+                "str" => quote!(String),
+                "bytes" | "bytearray" => quote!(Vec<u8>),
+                "int" => quote!(i64),
+                "float" => quote!(f64),
+                _ => quote!(bool),
+            };
+            let ident = crate::safe_ident(&target.id);
+            return Ok(quote! {
+                #[allow(dead_code)]
+                pub type #ident = #ty;
+            });
+        }
+
         // Issue #127: `name = lru_cache(maxsize=N)(fn)` — the decorator
         // factory applied as an expression. Emit the synthesized cached
         // function (the same @lru_cache machinery a decorated definition
@@ -263,7 +293,7 @@ impl<'a> CodeGen for Assign {
                     if matches!(target, ExprType::Name(_)) {
                         let mut store_options = options.clone();
                         store_options.narrowed_names =
-                            std::rc::Rc::new(std::collections::HashSet::new());
+                            std::rc::Rc::new(std::collections::HashMap::new());
                         target
                             .clone()
                             .to_rust(ctx.clone(), store_options, symbols.clone())?
@@ -398,7 +428,7 @@ impl<'a> CodeGen for Assign {
                 let target_code = {
                     let mut store_options = options.clone();
                     store_options.narrowed_names =
-                        std::rc::Rc::new(std::collections::HashSet::new());
+                        std::rc::Rc::new(std::collections::HashMap::new());
                     self.targets[0].clone().to_rust(
                         ctx.clone(),
                         store_options,

@@ -785,6 +785,127 @@ pub fn narrowing_from_test(
     Some((n.id.clone(), inner))
 }
 
+/// Issue #121: `if isinstance(x, (bytes, bytearray)):` (or
+/// `if not isinstance(...)`) narrows a `str | bytes` union: the tested
+/// branch becomes the concrete bytes type, the other branch becomes
+/// String. Returns (name, body_type, else_type). None for any other test.
+pub fn isinstance_narrowing(
+    test: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<(String, crate::TypeInfo, crate::TypeInfo)> {
+    use crate::ExprType;
+    // The test may be wrapped in a unary not: `if not isinstance(...)`.
+    let (negated, inner) = match test {
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::Not) => {
+            (true, u.operand.as_ref())
+        }
+        other => (false, other),
+    };
+    let ExprType::Call(call) = inner else {
+        return None;
+    };
+    let ExprType::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id != "isinstance" || call.args.len() != 2 {
+        return None;
+    }
+    let ExprType::Name(n) = &call.args[0] else {
+        return None;
+    };
+    // The name must be a str|bytes union.
+    if !options
+        .name_types
+        .get(&n.id)
+        .is_some_and(|t| matches!(t, crate::TypeInfo::StrOrBytes))
+    {
+        return None;
+    }
+    // The second argument: a tuple of (bytes, bytearray) or a single
+    // bytes/bytearray name (narrows to bytes); or str (narrows to String).
+    // Aliased type names (`builtin_str = str`) and imported aliases
+    // (`from .compat import builtin_str`) resolve through symbols.
+    fn resolve_type_name(
+        id: &str,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
+    ) -> Option<String> {
+        match symbols.get(id) {
+            Some(crate::SymbolTableNode::Assign { value, .. }) => match value {
+                ExprType::Name(n)
+                    if matches!(
+                        n.id.as_str(),
+                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
+                    ) =>
+                {
+                    Some(n.id.clone())
+                }
+                _ => None,
+            },
+            Some(crate::SymbolTableNode::Alias(canonical)) => {
+                resolve_type_name(canonical, options, symbols)
+            }
+            Some(crate::SymbolTableNode::ImportFrom(i)) => {
+                let path = i.resolved_module_path(options);
+                if options.module_defs.contains_key(&path) {
+                    let module = options.module_defs.get(&path)?;
+                    let module: &crate::Module = module;
+                    let syms = module
+                        .clone()
+                        .find_symbols(SymbolTableScopes::new());
+                    resolve_type_name(id, options, &syms)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    let targets_bytes = match &call.args[1] {
+        ExprType::Name(t) => {
+            let id = resolve_type_name(&t.id, options, symbols)
+                .unwrap_or_else(|| t.id.clone());
+            crate::is_bytes_annotation(&ExprType::Name(crate::ast::tree::name::Name { id }))
+        }
+        ExprType::Tuple(tup) => {
+            !tup.elts.is_empty()
+                && tup.elts.iter().all(|e| match e {
+                    ExprType::Name(t) => {
+                        let id = resolve_type_name(&t.id, options, symbols)
+                            .unwrap_or_else(|| t.id.clone());
+                        crate::is_bytes_annotation(&ExprType::Name(
+                            crate::ast::tree::name::Name { id },
+                        ))
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    };
+    let targets_str = match &call.args[1] {
+        ExprType::Name(t) => {
+            let id = resolve_type_name(&t.id, options, symbols)
+                .unwrap_or_else(|| t.id.clone());
+            crate::is_str_annotation(&ExprType::Name(crate::ast::tree::name::Name { id }))
+        }
+        _ => false,
+    };
+    let (tested, other) = if targets_bytes {
+        (crate::TypeInfo::Bytes, crate::TypeInfo::String)
+    } else if targets_str {
+        (crate::TypeInfo::String, crate::TypeInfo::Bytes)
+    } else {
+        return None;
+    };
+    let (body_ty, else_ty) = if negated {
+        (other, tested)
+    } else {
+        (tested, other)
+    };
+    Some((n.id.clone(), body_ty, else_ty))
+}
+
 /// Issue #125: update the function-level narrowed set after a statement.
 /// An `if x is not None: <body> else: <else>` where BOTH branches leave x
 /// non-None narrows x for the rest of the function. Any statement that can
@@ -793,18 +914,21 @@ pub fn narrowing_from_test(
 /// statically non-None removes x).
 pub fn update_narrowed_after_statement(
     stmt: &crate::Statement,
-    narrowed: &mut std::collections::HashSet<String>,
+    narrowed: &mut std::collections::HashMap<String, crate::TypeInfo>,
     options: &PythonOptions,
 ) {
     match &stmt.statement {
         crate::StatementType::If(i) => {
             // The test narrows x in the body; both branches leaving x
             // non-None narrows x AFTER the if/else.
-            if let Some((name, _)) = narrowing_from_test(&i.test, options) {
+            if let Some((name, inner)) = narrowing_from_test(&i.test, options) {
                 let body_ok = branch_ends_non_none(&i.body);
                 let else_ok = branch_ends_non_none(&i.orelse);
                 if body_ok && else_ok {
-                    narrowed.insert(name);
+                    narrowed.insert(
+                        name,
+                        inner.unwrap_or(crate::TypeInfo::StrOrBytes),
+                    );
                 }
             }
             // A name narrowed by an INNER statement only narrows within that
@@ -815,7 +939,7 @@ pub fn update_narrowed_after_statement(
         // narrowing; an assignment of a statically non-None value keeps it.
         crate::StatementType::Assign(a) => {
             if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                if narrowed.contains(&n.id) && !statically_non_none(&a.value) {
+                if narrowed.contains_key(&n.id) && !statically_non_none(&a.value) {
                     narrowed.remove(&n.id);
                 }
             }
