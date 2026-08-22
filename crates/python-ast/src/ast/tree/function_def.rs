@@ -2425,8 +2425,18 @@ impl FunctionDef {
                             ExprType::Name(n)
                                 if !matches!(n.id.as_str(), "int" | "float" | "str" | "bool" | "bytes" | "bytearray") =>
                             {
-                                let ident = crate::safe_ident(&n.id);
-                                Some(quote!(#ident))
+                                if n.id == "Self" {
+                                    // typing.Self (`def __enter__(self) ->
+                                    // Self` — requests' models): the
+                                    // enclosing class — the Rust `Self`
+                                    // impl-keyword is exactly that (the
+                                    // safe_ident `Self_` escaping is wrong
+                                    // inside an impl block).
+                                    Some(quote!(Self))
+                                } else {
+                                    let ident = crate::safe_ident(&n.id);
+                                    Some(quote!(#ident))
+                                }
                             }
                             _ => None,
                         }
