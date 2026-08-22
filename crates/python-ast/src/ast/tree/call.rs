@@ -1323,7 +1323,7 @@ impl<'a> CodeGen for Call {
                 let root = crate::ast::tree::call::root_name(&attr.value);
                 match root {
                     Some(root) if !crate::is_stdpython_module(&root) => {
-                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols)
+                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols, &options)
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
                         FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
@@ -4400,6 +4400,7 @@ impl<'a> CodeGen for Call {
                 && !crate::ast::tree::attribute::is_module_path_chain(
                     &attr.value,
                     &symbols,
+                    &options,
                 )
             {
                 if self.args.len() > 2 {
@@ -5012,8 +5013,15 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!((#receiver).py_setdefault(#key, #default)));
                     }
                     // list.remove(x) removes by VALUE and raises ValueError;
-                    // Vec::remove removes by index — silently different.
-                    ("remove", [value]) => {
+                    // Vec::remove removes by index — silently different. A
+                    // MODULE-PATH receiver (`os.remove(path)` — requests'
+                    // utils) is the runtime function, not a list method.
+                    ("remove", [value])
+                        if !crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value,
+                            &symbols,
+                            &options,
+                        ) => {
                         // The receiver and argument are each evaluated ONCE,
                         // receiver first (CPython evaluates the primary +
                         // attribute, then the argument). The previous shape

@@ -113,7 +113,7 @@ impl<'a> CodeGen for Attribute {
                 .then(|| receiver.id.clone()),
             _ => None,
         };
-        let module_chain = is_module_path_chain(&self.value, &symbols);
+        let module_chain = is_module_path_chain(&self.value, &symbols, &options);
         // True when the chain's root is a vendored `[python-modules]`
         // dependency — those lower to `crate::<dep>::<attr>` paths (see
         // the emission below). Computed before `self.value` is moved.
@@ -338,7 +338,7 @@ pub(crate) fn to_rust_place_expr(
                 attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let is_module = !root_shadowed
                 && (crate::ast::tree::call::root_name(&attr.value).is_some_and(|_root| {
-                    crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols)
+                    crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols, options)
                 }) || matches!(
                     value_tokens.to_string().as_str(),
                     "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio"
@@ -502,7 +502,11 @@ pub(crate) enum FieldRewrite {
 /// field access. Attribute chains recurse: each segment between the root
 /// and the accessed attribute is itself a module path item, so
 /// `pkg.sub.fn` resolves `pkg.sub` the same way.
-pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+pub(crate) fn is_module_path_chain(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
     match expr {
         ExprType::Name(n) => {
             if crate::module_name_shadowed(&n.id, symbols) {
@@ -511,21 +515,31 @@ pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes)
             match symbols.get(&n.id) {
                 Some(SymbolTableNode::Import(_)) => true,
                 Some(SymbolTableNode::Alias(canonical)) => {
-                    matches!(symbols.get(canonical), Some(SymbolTableNode::Import(_)))
+                    // Follow the alias to the canonical name — which may be
+                    // a submodule import (`from .. import connection as
+                    // urllib3_connection`).
+                    is_module_path_chain(
+                        &ExprType::Name(crate::ast::tree::name::Name {
+                            id: canonical.clone(),
+                        }),
+                        symbols,
+                        options,
+                    )
                 }
-                // `from . import exceptions` — a RELATIVE SUBMODULE import
-                // (ImportFrom with an EMPTY module, level > 0): the name IS
-                // a module, so `exceptions.SecurityWarning` resolves as a
-                // path (`crate::urllib3::exceptions::SecurityWarning`).
-                Some(SymbolTableNode::ImportFrom(ifm))
-                    if ifm.module.is_empty() && ifm.level > 0 =>
-                {
-                    true
+                // A RELATIVE SUBMODULE import (`from . import exceptions`,
+                // `from .util import ssl_`): the name IS a module when the
+                // submodule exists in the crate — attribute reads resolve
+                // as paths (`exceptions.SecurityWarning`,
+                // `ssl_.ALPN_PROTOCOLS`).
+                Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                    let mut sub = ifm.resolved_module_path(options);
+                    sub.push(n.id.clone());
+                    options.module_defs.contains_key(&sub)
                 }
                 _ => false,
             }
         }
-        ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols),
+        ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols, options),
         _ => false,
     }
 }
