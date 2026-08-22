@@ -1560,6 +1560,18 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // `object()` — a unique sentinel (`self._body_position = object()` —
+        // requests' models): the boxed None (unique objects have no
+        // analogue — the sentinel divergence). `memoryview(...)` — the
+        // buffer-view builtin — a boxed value (annotations already resolve
+        // memoryview to PyValue).
+        if let ExprType::Name(n) = self.func.as_ref()
+            && matches!(n.id.as_str(), "object" | "memoryview")
+            && symbols.get(&n.id).is_none()
+        {
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+
         // Builtins with keyword variants or by-reference runtime shapes:
         // min/max (key=, default=, n-ary), sorted (key=, reverse=),
         // enumerate (start=), pow (3-arg modular), and the by-reference
