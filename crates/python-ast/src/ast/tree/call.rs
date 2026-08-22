@@ -140,14 +140,30 @@ impl Call {
             slots[pos] = Some(kw.value.clone());
         }
         let mut rendered_args = Vec::new();
-        for slot in slots {
+        for (i, slot) in slots.iter().enumerate() {
+            // The warning CATEGORY and SOURCE parameters of
+            // `warnings.warn`/`warn_explicit` are warning-class/source
+            // VALUES — classes cannot be runtime values in rython. They
+            // lower as None (the warning fires unconditionally; documented
+            // divergence).
+            let is_warning_class_slot = (attr == "warn" || attr == "warn_explicit")
+                && matches!(params.get(i).copied(), Some("category" | "source"));
             match slot {
                 // The signed runtime signatures take Option for every
                 // parameter: a present argument wraps in Some, an omitted
                 // one fills None.
+                Some(expr) if is_warning_class_slot => {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "warnings.{attr}() `{}` (a warning-class value) is dropped: \
+                         classes cannot be runtime values in rython (the \
+                         class-as-value divergence)",
+                        params[i]
+                    ));
+                    rendered_args.push(quote!(None));
+                }
                 Some(expr) => {
                     let rendered =
-                        expr.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     rendered_args.push(quote!(Some(#rendered)));
                 }
                 None => rendered_args.push(quote!(None)),
@@ -938,13 +954,20 @@ impl<'a> CodeGen for Call {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         // typing-module calls are compile-time-only: TypeVar, Protocol,
-        // TypeAlias, cast, runtime_checkable, Literal, ... exist only for
+        // TypeAlias, runtime_checkable, Literal, ... exist only for
         // the type system (annotations are strings under `from __future__
         // import annotations`), so a call lowers to nothing — the same
         // treatment the `from typing import ...` import already gets.
+        // `cast(T, value)` is special: it IS a runtime identity (the value
+        // passes through unchanged), so it lowers to its VALUE argument —
+        // an empty lowering would break `cookie_jar = cast("CookieJar",
+        // prep._cookies)` into `cookie_jar = ;` (requests' auth).
         if let ExprType::Name(n) = self.func.as_ref() {
             if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id) {
                 if i.module.split('.').next() == Some("typing") {
+                    if n.id == "cast" && self.args.len() == 2 {
+                        return self.args[1].clone().to_rust(ctx, options, symbols);
+                    }
                     return Ok(TokenStream::new());
                 }
             }
@@ -3262,6 +3285,18 @@ impl<'a> CodeGen for Call {
                     ("StringIO", [initial]) => {
                         let p = qual("StringIO_seeded");
                         Ok(quote!(#p(&(#initial))))
+                    }
+                    // io.BytesIO: the runtime has no binary in-memory buffer
+                    // (only the StringIO text buffer) — the call boxes as
+                    // PyValue (the file-object divergence).
+                    ("BytesIO", _) => {
+                        options.definition_warnings.borrow_mut().push(
+                            "io.BytesIO(...) lowers as the boxed PyValue (no binary \
+                             in-memory buffer in rython — the file-object \
+                             divergence)"
+                                .to_string(),
+                        );
+                        Ok(quote!(stdpython::PyValue::None_))
                     }
                     // csv.writer(f) borrows the file mutably for the
                     // writer's lifetime (scope analysis marks f mut).

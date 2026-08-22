@@ -1294,6 +1294,12 @@ impl FunctionDef {
             }
         }
         for name in &scope.assigned {
+            // Python's `_` discard target (`(scheme, _, host, port, _) =
+            // parse_url(...)` — idna/urllib3): a wildcard, never a hoisted
+            // binding — `let mut _;` is not legal Rust.
+            if name == "_" {
+                continue;
+            }
             let ident = crate::safe_ident(name);
             if scope.needs_mut.contains(name) {
                 if scope.closure_captured_uninit.contains(name) {

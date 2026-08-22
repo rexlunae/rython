@@ -11,6 +11,30 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 python_function! {
+    /// os.urandom - cryptographically secure random bytes (requests' digest
+    /// auth nonce). Falls back to a std RNG when the OS source fails.
+    pub fn urandom(size: i64) -> Vec<u8>
+    [signature: (size)]
+    [concrete_types: (i64) -> Vec<u8>]
+    {
+        let mut out = vec![0u8; size.max(0) as usize];
+        getrandom::fill(&mut out).unwrap_or_else(|_| {
+            // std fallback: not cryptographically strong, but the digest
+            // auth nonce only needs uniqueness.
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let seed = t.as_nanos() as u64;
+            let mut s = seed;
+            for b in out.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = (s >> 33) as u8;
+            }
+        });
+        out
+    }
+}
+
+python_function! {
     /// os.execv - execute a program (generic version using traits)
     /// 
     /// # Arguments
@@ -251,6 +275,25 @@ pub mod path {
     
     /// os.path.sep - path separator for the current platform
     pub static sep: &str = if cfg!(target_os = "windows") { "\\" } else { "/" };
+
+    python_function! {
+        /// os.path.expanduser - expand `~` to the current user's home
+        /// directory (urllib3's ca-cert resolution). A leading `~/` (or
+        /// bare `~`) expands via $HOME; other paths pass through.
+        pub fn expanduser<P>(path: P) -> String
+        where [P: AsPathLike]
+        [signature: (path)]
+        [concrete_types: (String) -> String]
+        {
+            let s = path.as_path_like().to_string();
+            if s == "~" || s.starts_with("~/") || s.starts_with("~\\") {
+                if let Ok(home) = std::env::var("HOME") {
+                    return format!("{}{}", home, &s[1..]);
+                }
+            }
+            s
+        }
+    }
 
     python_function! {
         /// os.path.dirname - everything before the final slash, following

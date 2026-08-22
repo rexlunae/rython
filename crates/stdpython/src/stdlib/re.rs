@@ -214,7 +214,7 @@ impl PyMatchOps for Option<PyMatch> {
 
 /// Compile with Python flag letters ("i", "m", "s") applied as an
 /// inline group, which the regex crate shares with Python's syntax.
-fn compile(pattern: &str, flags: &str) -> Result<regex::Regex, PyException> {
+pub fn compile(pattern: &str, flags: &str) -> Result<regex::Regex, PyException> {
     let pattern = if flags.is_empty() {
         alloc::borrow::Cow::Borrowed(pattern)
     } else {

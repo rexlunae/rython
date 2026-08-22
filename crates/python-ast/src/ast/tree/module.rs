@@ -399,6 +399,7 @@ impl CodeGen for Module {
         // expression statement, matching the pre-sweep behavior).
         let mut pending_docstring = self.get_module_docstring().is_some()
             && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
+        let mut seen_non_doc_statement = false;
         for s in self.raw.body {
             if pending_docstring
                 && matches!(
@@ -467,6 +468,24 @@ impl CodeGen for Module {
                     continue;
                 }
             }
+            // A NON-LEADING module-level bare STRING expression
+            // (`"IDNA Mapping Table from UTS46."` — idna's uts46data, a
+            // docstring mid-module) is an annotation with no runtime
+            // effect: a bare string literal in item position is not legal
+            // Rust. Drop it. A module whose FIRST statement is a bare
+            // string (a lone-string test module) keeps it — the
+            // pre-sweep behavior the tests rely on.
+            if seen_non_doc_statement
+                && let crate::StatementType::Expr(e) = &s.statement
+                && matches!(
+                    &e.value,
+                    crate::ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                )
+            {
+                continue;
+            }
+            seen_non_doc_statement = true;
             
             // Module-level constants become static items visible to every
             // function in the module.
