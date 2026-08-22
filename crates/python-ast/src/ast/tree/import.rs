@@ -106,6 +106,16 @@ impl CodeGen for Import {
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let mut symbols = symbols;
         for alias in self.names.iter() {
+            // `import a.b.c` binds the ROOT name `a` in Python (a later
+            // statement can reference `a.b`). Register the root too, so
+            // module-chain resolution works for submodule attribute calls
+            // (`import h2.config` — urllib3's http2: `h2.config.
+            // H2Configuration(...)`).
+            if let Some(root) = alias.name.split('.').next() {
+                if !root.is_empty() && root != &alias.name {
+                    symbols.insert(root.to_string(), SymbolTableNode::Import(self.clone()));
+                }
+            }
             symbols.insert(alias.name.clone(), SymbolTableNode::Import(self.clone()));
             if let Some(a) = alias.asname.clone() {
                 symbols.insert(a, SymbolTableNode::Alias(alias.name.clone()))

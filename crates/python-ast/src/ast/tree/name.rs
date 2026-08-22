@@ -82,7 +82,7 @@ impl CodeGen for Name {
         self,
         _ctx: Self::Context,
         options: Self::Options,
-        _symbols: Self::SymbolTable,
+        symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         // Handle dotted names (like "os.path") by converting them to Rust module paths
         if self.id.contains('.') {
@@ -153,6 +153,14 @@ impl CodeGen for Name {
                      (the callable-as-value divergence, issue #122)",
                     self.id
                 ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // The builtin `NotImplemented` singleton (`return NotImplemented`
+            // in `__eq__` fallbacks — requests' structures, urllib3's
+            // collections): the comparison sentinel — a boxed None
+            // (rython's comparisons return bool; the sentinel has no
+            // analogue — documented divergence).
+            if self.id == "NotImplemented" && symbols.get("NotImplemented").is_none() {
                 return Ok(quote!(stdpython::PyValue::None_));
             }
             Ok(quote!(#name))

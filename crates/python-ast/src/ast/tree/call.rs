@@ -74,6 +74,55 @@ pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc
     }
 }
 
+/// A Name resolving (through ImportFrom re-export chains) to a module-level
+/// LITERAL constant (`DEFAULT_POOLSIZE = 10` — requests/adapters, used as a
+/// dropped DEFAULT in sessions.py's `HTTPAdapter()` call): render the
+/// constant's VALUE tokens — the call site does not import the name. Only
+/// literal values inline (anything else keeps the bare name).
+fn resolve_constant_name(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TokenStream> {
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..16 {
+        match syms.get(&current) {
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let path = ifm.resolved_module_path(options);
+                if !options.module_defs.contains_key(&path) {
+                    return None;
+                }
+                let defining = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let module = &options.module_defs[&path];
+                let module: &crate::Module = module;
+                syms = module.clone().find_symbols(SymbolTableScopes::new());
+                current = defining;
+            }
+            Some(SymbolTableNode::Assign { value, .. }) => {
+                // Literal-only: the value must be a constant the caller
+                // can inline without the defining module's context.
+                if crate::ast::tree::module::const_static_type(value).is_some() {
+                    let rendered = value.clone().to_rust(
+                        CodeGenContext::Module("constant".to_string()),
+                        options.clone(),
+                        syms.clone(),
+                    );
+                    return rendered.ok();
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Follow a compat builtin-alias import chain (`from .compat import
 /// builtin_str` where compat does `builtin_str = str`): the name resolves to
 /// one of the builtin type names (str/bytes/int/float/bool), which the call
@@ -6369,6 +6418,15 @@ fn map_call_arguments(
             .annotation
             .as_deref()
             .is_some_and(crate::is_optional_annotation);
+        // A cross-module constant name used as a dropped DEFAULT
+        // (`HTTPAdapter()` — sessions.py, whose __init__ defaults reference
+        // adapters.py's `DEFAULT_POOLSIZE = 10`): the call site does not
+        // import the name, so inline the constant's VALUE.
+        if let ExprType::Name(n) = expr
+            && let Some(v) = resolve_constant_name(&n.id, &symbols, &options)
+        {
+            return Ok(v);
+        }
         // A CALLABLE parameter (`dict_class: type = OrderedDict` —
         // requests' sessions): rython cannot hold a class/function as a
         // value (the callables-as-data divergence), so any argument passed
