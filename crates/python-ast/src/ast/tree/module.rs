@@ -275,7 +275,7 @@ impl CodeGen for Module {
             matches!(
                 &s.statement,
                 crate::StatementType::FunctionDef(f)
-                    if f.name == "main" && f.resolved_return_type().is_some()
+                    if f.name == "main" && f.resolved_return_type(&symbols, &options).is_some()
             )
         });
 

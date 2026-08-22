@@ -1982,9 +1982,9 @@ fn resolve_type_inner(
             // Fall back to the plain (non-alias) return-annotation path
             // for functions whose annotation maps directly.
             if let ExprType::Name(callee) = call.func.as_ref()
-                && let Some(symbols) = symbols
+                && let (Some(symbols), Some(options)) = (symbols, options)
                 && let Some(SymbolTableNode::FunctionDef(f)) = symbols.get(&callee.id)
-                && let Some(ty) = f.resolved_return_type()
+                && let Some(ty) = f.resolved_return_type(symbols, options)
             {
                 return ty_to_typeinfo(&ty);
             }

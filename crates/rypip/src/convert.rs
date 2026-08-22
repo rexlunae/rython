@@ -3168,7 +3168,10 @@ fn bindable_signature(
     // carries — resolved_return_type is the single source of truth (it gates
     // annotations on all-paths-return, so a function that can fall through
     // binds as returning unit, matching the generated `()`).
-    let ret = func.resolved_return_type();
+    let ret = func.resolved_return_type(
+        &python_ast::SymbolTableScopes::new(),
+        &python_ast::PythonOptions::default(),
+    );
     Some((params, names, ret))
 }
 

@@ -1418,7 +1418,7 @@ impl FunctionDef {
         // docs.client._allowlist_generate_presigned_url). Set BEFORE the
         // body statements render (they clone options per statement).
         options.fn_return_is_pyvalue = matches!(
-            self.resolved_return_type(),
+            self.resolved_return_type(&symbols, &options),
             Some(ref ty) if ty.to_string() == "stdpython :: PyValue"
         );
 
@@ -1544,7 +1544,7 @@ impl FunctionDef {
                 quote!(-> Result<(), PyException>)
             }
         } else {
-            match self.resolved_return_type() {
+            match self.resolved_return_type(&symbols, &options) {
                 Some(ty) => quote!(-> Result<#ty, PyException>),
                 None => quote!(-> Result<(), PyException>),
             }
@@ -1630,7 +1630,7 @@ impl FunctionDef {
                     }
                 })
                 .collect();
-            let ret = match self.resolved_return_type() {
+            let ret = match self.resolved_return_type(&symbols, &options) {
                 Some(ty) => quote!(#ty),
                 None => quote!(()),
             };
@@ -2469,7 +2469,11 @@ impl FunctionDef {
     ///
     /// Tools generating call-through code (e.g. PyO3 wrappers) must use this
     /// same method so their signatures match the generated function.
-    pub fn resolved_return_type(&self) -> Option<TokenStream> {
+    pub fn resolved_return_type(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
         // A bare `str` annotation is authoritative: the inferred type for a
         // literal-returning body (`&'static str`) is a Rust literal artifact,
         // not the Python type, and the mismatch breaks every call site
@@ -2507,6 +2511,26 @@ impl FunctionDef {
                                     // safe_ident `Self_` escaping is wrong
                                     // inside an impl block).
                                     Some(quote!(Self))
+                                } else if let Some(SymbolTableNode::ImportFrom(ifm)) =
+                                    symbols.get(&n.id)
+                                {
+                                    let runtime_item =
+                                        crate::ast::tree::module::module_def_has_runtime_item(
+                                            options,
+                                            &ifm.resolved_module_path(options),
+                                            &n.id,
+                                        );
+                                    if runtime_item {
+                                        let ident = crate::safe_ident(&n.id);
+                                        Some(quote!(#ident))
+                                    } else {
+                                        // An imported name with NO runtime item
+                                        // (`-> BaseHTTPConnection` — a
+                                        // TYPE_CHECKING-only Protocol stub in
+                                        // urllib3's _base_connection): the boxed
+                                        // PyValue.
+                                        Some(quote!(stdpython::PyValue))
+                                    }
                                 } else {
                                     let ident = crate::safe_ident(&n.id);
                                     Some(quote!(#ident))
