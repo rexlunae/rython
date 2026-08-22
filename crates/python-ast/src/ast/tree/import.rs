@@ -213,15 +213,19 @@ impl CodeGen for Import {
                 // Runtime-provided modules are already in scope through
                 // `use stdpython::*` (each is re-exported at the crate
                 // root), so the import lowers to nothing — a bare
-                // `use math;` would not even resolve.
+                // `use math;` would not even resolve. An ALIASED import
+                // (`import time as t`, `import json as _json`) binds the
+                // alias as a real path (`use stdpython::time as t;`) so
+                // `t::monotonic()` / `_json::loads()` resolve — the same
+                // spelling numpy's alias arm uses.
                 name if is_stdpython_module(name) => {
-                    if let Some(_asname) = &alias.asname {
-                        // The module can't be re-bound with `use` (it's a
-                        // glob-imported name, not a path), so the alias
-                        // resolves through the symbol table: the runtime
-                        // dispatch follows `_json` → Alias("json") to the
-                        // same module (urllib3's `import json as _json`).
-                        quote! {}
+                    if let Some(asname) = &alias.asname {
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        let module = crate::safe_ident(name);
+                        let asname = crate::safe_ident(asname);
+                        quote! {
+                            use #runtime::#module as #asname;
+                        }
                     } else {
                         quote! {}
                     }
