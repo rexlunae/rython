@@ -210,6 +210,18 @@ impl<'a> CodeGen for Assign {
             ));
             return Ok(TokenStream::new());
         }
+        // A CLASS NAME stored as a VALUE (`HTTPConnectionPool.ConnectionCls
+        // = EmscriptenHTTPConnection` — urllib3's emscripten inject, or
+        // `X.attr = SomeClass`): classes cannot be runtime values (the
+        // classes-as-values divergence) — the store drops.
+        if crate::is_class_value_expr(&self.value, &symbols) {
+            options.definition_warnings.borrow_mut().push(format!(
+                "assignment of a class (`{:?}`) as a value is dropped (classes \
+                 cannot be runtime values in rython)",
+                self.value
+            ));
+            return Ok(TokenStream::new());
+        }
 
         let value_is_none_early = crate::is_none_expr(&self.value);
         let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
