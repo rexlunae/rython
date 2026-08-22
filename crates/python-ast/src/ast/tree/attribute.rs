@@ -191,6 +191,14 @@ impl<'a> CodeGen for Attribute {
                 ("sys", "executable") | ("sys", "argv")
             );
 
+            // `sys.modules` — the process's import registry (requests'
+            // packages.py aliasing): rython's crate is static, so the
+            // registry is always empty — the read lowers to an empty dict
+            // (list(sys.modules) iterates nothing, indexing misses).
+            if value_str == "sys" && self.attr == "modules" {
+                return Ok(quote!(PyDict::<String, stdpython::PyValue>::from([])));
+            }
+
             if needs_deref {
                 // Wrap dereferenced values in parentheses to ensure correct precedence
                 // This prevents *sys::executable.to_string() and ensures (*sys::executable).to_string()

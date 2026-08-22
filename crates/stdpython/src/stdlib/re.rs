@@ -7,6 +7,14 @@
 
 use crate::PyException;
 
+/// re.IGNORECASE — the case-insensitive flag, passed as the flags string
+/// (`re.compile("x", re.IGNORECASE)` — requests' auth; `re.I` is the same
+/// constant).
+pub const IGNORECASE: &str = "i";
+
+/// re.I — the short spelling of re.IGNORECASE.
+pub const I: &str = "i";
+
 /// A successful match: the Python Match object surface.
 #[derive(Debug, Clone)]
 pub struct PyMatch {
