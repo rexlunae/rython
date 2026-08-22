@@ -225,6 +225,17 @@ impl<'a> CodeGen for Attribute {
                 Ok(quote!(#value_tokens::#attr))
             }
         } else {
+            // A read on an EXTERNAL-module receiver (`TLSVersion.
+            // MINIMUM_SUPPORTED` — from ssl, external): the attribute has
+            // no runtime item — the boxed None.
+            if let Some(root) = &external_root {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the module `{}` is external to the generated \
+                     crate (external-module divergence)",
+                    root, self.attr, root
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             // A read on a BOXED-PyValue receiver (`self._response().body
             // .closed` — the emscripten response's `body` field is PyValue):
             // the attribute has no static shape — the boxed None (the
