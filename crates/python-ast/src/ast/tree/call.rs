@@ -1197,6 +1197,9 @@ impl<'a> CodeGen for Call {
                     | "getattr"
                     | "hasattr"
                     | "setattr"
+                    | "type"
+                    | "set"
+                    | "bytearray"
             ) && symbols.get(bname).is_none()
                 // A loop element shadowing the builtin (`for filter in ...:
                 // filter(**kwargs)` — botocore's docs client): the call
@@ -2002,6 +2005,69 @@ impl<'a> CodeGen for Call {
                                 .to_string(),
                         );
                         return Ok(quote!(stdpython::PyValue::None_));
+                    }
+                    // `type(x)` — Python's class object. rython cannot
+                    // represent classes as values, but the COMMON pattern
+                    // `type(self).__name__` (a class name string for
+                    // repr/error messages — urllib3, requests) resolves
+                    // statically: `type(self)` inside a method is the
+                    // enclosing class's name as a string literal. Any other
+                    // `type(...)` call boxes as PyValue (the class-as-value
+                    // divergence).
+                    "type" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        // The 3-argument form `type(name, bases, dict)`
+                        // CREATES a class at runtime (boto3's
+                        // collection.py) — the class-as-value divergence:
+                        // boxed PyValue.
+                        if rendered.len() == 3 {
+                            options.definition_warnings.borrow_mut().push(
+                                "type(name, bases, dict) — runtime class creation — \
+                                 lowers as the boxed PyValue (classes cannot be \
+                                 runtime values in rython)"
+                                    .to_string(),
+                            );
+                            return Ok(quote!(stdpython::PyValue::None_));
+                        }
+                        if rendered.len() != 1 {
+                            return Err("type() takes exactly one argument".to_string().into());
+                        }
+                        if let Some(enclosing) = ctx.enclosing_class_name()
+                            && matches!(
+                                self.args.first(),
+                                Some(ExprType::Name(n)) if n.id == "self"
+                            )
+                        {
+                            let name = crate::safe_ident(enclosing);
+                            return Ok(quote!(stringify!(#name).to_string()));
+                        }
+                        options.definition_warnings.borrow_mut().push(
+                            "type(...) lowers as the boxed PyValue (classes cannot \
+                             be runtime values in rython — the class-as-value \
+                             divergence)"
+                                .to_string(),
+                        );
+                        return Ok(quote!(stdpython::PyValue::None_));
+                    }
+                    // `set()` / `bytearray()` — constructors whose empty
+                    // form has no inferable element type: the boxed None
+                    // (the empty-set divergence); a non-empty `set([...])`
+                    // keeps the runtime call.
+                    "set" | "bytearray" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.is_empty() {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "an empty {}() lowers as the boxed None (the \
+                                 empty-set divergence)",
+                                bname
+                            ));
+                            return Ok(quote!(stdpython::PyValue::None_));
+                        }
+                        return Ok(quote!(#bname(#(#rendered),*)));
                     }
                     "frozenset" => {
                         if !self.keywords.is_empty() {
