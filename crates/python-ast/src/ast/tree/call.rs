@@ -1188,7 +1188,7 @@ fn is_class_target(
 /// Resolve the class behind a construction call (`Point(args)`), through
 /// aliases (`TimeoutSauce` → `Timeout`) and re-export chains (`util` →
 /// `.timeout`), returning the ClassDef with its defining module's symbols.
-fn resolve_construction_class(
+pub(crate) fn resolve_construction_class(
     name: &str,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,

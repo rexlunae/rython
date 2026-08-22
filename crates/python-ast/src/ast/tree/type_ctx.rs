@@ -501,7 +501,11 @@ pub fn render_typed(
                 symbols.get(&n.id),
                 Some(SymbolTableNode::Alias(c))
                     if matches!(symbols.get(c), Some(SymbolTableNode::ClassDef(_)))
-            ))
+            )
+            // An IMPORTED class (`from .structures import
+            // CaseInsensitiveDict` — a class used as a value argument):
+            // resolve through the defining module.
+            || crate::ast::tree::call::resolve_construction_class(&n.id, &symbols, &options).is_some())
     {
         options.definition_warnings.borrow_mut().push(format!(
             "class `{}` used as a value lowers to the boxed None (classes cannot be \
