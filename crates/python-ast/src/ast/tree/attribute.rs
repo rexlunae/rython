@@ -90,6 +90,29 @@ impl<'a> CodeGen for Attribute {
         // stdlib module path. Computed before `self.value` is moved below.
         let root_shadowed = crate::ast::tree::call::root_name(&self.value)
             .is_some_and(|root| crate::module_name_shadowed(root, &symbols));
+        // A CLASS-CONSTANT read (`GzipDecoderState.SWALLOW_DATA` — urllib3's
+        // response decoders): literal class-level constants emit as
+        // `impl X { pub const NAME: T = v; }` (class_def.rs), so the read
+        // renders `X::NAME`, not `X.NAME`. Computed before moves below.
+        let class_const_read: Option<String> = match self.value.as_ref() {
+            ExprType::Name(receiver) => symbols
+                .get(&receiver.id)
+                .is_some_and(|s| match s {
+                    crate::SymbolTableNode::ClassDef(class) => class.body.iter().any(|bs| {
+                        matches!(
+                            &bs.statement,
+                            crate::StatementType::Assign(a)
+                                if a.targets.len() == 1
+                                    && matches!(&a.targets[0], ExprType::Name(n) if n.id == self.attr)
+                                    && crate::ast::tree::module::const_static_type(&a.value)
+                                        .is_some()
+                        )
+                    }),
+                    _ => false,
+                })
+                .then(|| receiver.id.clone()),
+            _ => None,
+        };
         let module_chain = is_module_path_chain(&self.value, &symbols);
         // True when the chain's root is a vendored `[python-modules]`
         // dependency — those lower to `crate::<dep>::<attr>` paths (see
@@ -184,6 +207,12 @@ impl<'a> CodeGen for Attribute {
                 Ok(quote!(#value_tokens::#attr))
             }
         } else {
+            // A class-constant read (`GzipDecoderState.SWALLOW_DATA`):
+            // `X::NAME` — the const lives on the class's impl block.
+            if let Some(receiver) = &class_const_read {
+                let receiver = crate::safe_ident(receiver);
+                return Ok(quote!(#receiver::#attr));
+            }
             // Use . for field/method access (Python's obj.field becomes obj.field).
             // A class field owned by an ancestor of the receiver's class is
             // reached through the embedded base structs (`self.__rython_base.f`)

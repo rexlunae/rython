@@ -490,6 +490,26 @@ pub fn render_typed(
     symbols: SymbolTableScopes,
     expected: Option<TypeInfo>,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A class name used as a VALUE (`merge_setting(..., dict_class=OrderedDict)`
+    // — requests' sessions): classes are compile-time types, not runtime
+    // values (the classes-as-values divergence), so the value lowers to the
+    // boxed None. This is a value-position renderer — callees and type
+    // positions never come through here.
+    if let ExprType::Name(n) = expr
+        && (matches!(symbols.get(&n.id), Some(SymbolTableNode::ClassDef(_)))
+            || matches!(
+                symbols.get(&n.id),
+                Some(SymbolTableNode::Alias(c))
+                    if matches!(symbols.get(c), Some(SymbolTableNode::ClassDef(_)))
+            ))
+    {
+        options.definition_warnings.borrow_mut().push(format!(
+            "class `{}` used as a value lowers to the boxed None (classes cannot be \
+             runtime values in rython)",
+            n.id
+        ));
+        return Ok(quote!(stdpython::PyValue::None_));
+    }
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;

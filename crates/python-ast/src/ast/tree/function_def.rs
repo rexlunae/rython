@@ -1214,6 +1214,24 @@ impl FunctionDef {
                 let mut sig = crate::InferredSignature::default();
                 sig.called_params =
                     crate::collect_called_params(&effective_body, &symbols, &options);
+                // A parameter annotated bare `type` (`dict_class: type =
+                // OrderedDict` — requests' sessions) is a CALLABLE: calls
+                // through it drop (the callable-as-value divergence) — the
+                // codegen cannot hold a class/function as a value.
+                for p in self
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(self.args.args.iter())
+                    .chain(self.args.kwonlyargs.iter())
+                {
+                    if p.annotation
+                        .as_deref()
+                        .is_some_and(crate::ast::tree::arguments::is_type_annotation)
+                    {
+                        sig.called_params.insert(p.arg.clone());
+                    }
+                }
                 sig
             } else if is_method {
                 // An unannotated method parameter lowers as boxed PyValue

@@ -1768,7 +1768,7 @@ fn is_type_alias_value(value: &crate::ExprType) -> bool {
     }
 }
 
-fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {    match value {
+pub(crate) fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {    match value {
         crate::ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),

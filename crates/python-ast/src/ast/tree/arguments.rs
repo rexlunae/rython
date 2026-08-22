@@ -253,8 +253,17 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
 /// `list[T]`/`dict[K, V]`/`set[T]` map to the corresponding std containers
 /// when their element annotations map too. `Optional[T]` / `T | None` map
 /// to `Option<T>`.
-pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
-    match annotation {
+/// Whether an annotation is the bare `type` marker — a CALLABLE/class
+/// parameter (`dict_class: type = OrderedDict` — requests' sessions).
+/// rython cannot hold callables as values (the callables-as-data
+/// divergence): the parameter lowers to a boxed PyValue, its arguments
+/// lower to the boxed None, and calls through it drop (function_def.rs /
+/// map_call_arguments / Parameter::to_rust).
+pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
+    matches!(annotation, ExprType::Name(n) if n.id == "type")
+}
+
+pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {    match annotation {
         // T | None (and None | T) is Option<T>; a union whose members map
         // to the SAME Rust type (`bytes | bytearray` → Vec<u8>) is that
         // type. `str | bytes` (and `str | bytes | bytearray`) is the
@@ -490,6 +499,13 @@ impl CodeGen for Parameter {
             // the function prologue converts it (`let s: String = s.into()`).
             if matches!(&*annotation, ExprType::Name(n) if n.id == "str") {
                 return Ok(quote!(#param_name: impl Into<String>));
+            }
+            // A bare `type` annotation (`dict_class: type = OrderedDict` —
+            // requests' sessions): a callable/class — rython cannot hold
+            // callables as values (the callables-as-data divergence), so
+            // the parameter is a boxed PyValue.
+            if crate::ast::tree::arguments::is_type_annotation(&annotation) {
+                return Ok(quote!(#param_name: stdpython::PyValue));
             }
             // A `None`-only annotation (`cookiejar: None = None`): nothing
             // but None can ever be stored.

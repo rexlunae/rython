@@ -1416,7 +1416,7 @@ impl CodeGen for ClassDef {
 
     fn to_rust(
         mut self,
-        _ctx: Self::Context,
+        ctx: Self::Context,
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -1805,9 +1805,28 @@ impl CodeGen for ClassDef {
         // Class-level assignments (class attributes) would need a
         // shared-state story; erroring is the loud option.
         let body_start = if self.get_docstring().is_some() { 1 } else { 0 };
+        // Class-level LITERAL constants (`FIRST_MEMBER = 0`,
+        // `SWALLOW_DATA = 2` — urllib3's GzipDecoderState): emitted as
+        // `impl X { pub const NAME: T = v; }` so class-attribute reads
+        // (`X.NAME`, rendered `X::NAME` — attribute.rs) resolve.
+        let mut class_constants = TokenStream::new();
         for stmt in self.body.iter().skip(body_start) {
             match &stmt.statement {
                 StatementType::FunctionDef(_) | StatementType::Pass => {}
+                // A class-level literal constant assignment (int/float/
+                // bool/string): an associated const, not a struct field.
+                StatementType::Assign(a)
+                    if a.targets.len() == 1
+                        && let ExprType::Name(n) = &a.targets[0]
+                        && let Some(ty) = crate::ast::tree::module::const_static_type(&a.value) =>
+                {
+                    let ident = crate::safe_ident(&n.id);
+                    let value = a
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    class_constants.extend(quote!(pub const #ident: #ty = #value;));
+                }
                 // A string-literal Expr anywhere in the body (a docstring
                 // placed after a class constant — botocore's TokenSigner):
                 // metadata, no runtime effect.
@@ -2204,6 +2223,7 @@ impl CodeGen for ClassDef {
             }
             #trait_stream
             impl #class_name {
+                #class_constants
                 #constructor
                 #init_forwarder
                 #methods_stream

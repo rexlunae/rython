@@ -74,6 +74,94 @@ pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc
     }
 }
 
+/// Follow a compat builtin-alias import chain (`from .compat import
+/// builtin_str` where compat does `builtin_str = str`): the name resolves to
+/// one of the builtin type names (str/bytes/int/float/bool), which the call
+/// re-dispatches to. None when the chain does not end in a builtin alias.
+fn resolve_builtin_alias(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<String> {
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..16 {
+        match syms.get(&current) {
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let path = ifm.resolved_module_path(options);
+                if !options.module_defs.contains_key(&path) {
+                    return None;
+                }
+                let defining = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let module = &options.module_defs[&path];
+                let module: &crate::Module = module;
+                syms = module.clone().find_symbols(SymbolTableScopes::new());
+                current = defining;
+            }
+            Some(SymbolTableNode::Assign { value, .. }) => {
+                if let ExprType::Name(b) = value {
+                    let b = b.id.as_str();
+                    // A SELF-alias (`str = str` — requests' compat) would
+                    // re-dispatch to the same name forever.
+                    if b == current {
+                        return None;
+                    }
+                    if matches!(b, "str" | "bytes" | "bytearray" | "int" | "float" | "bool") {
+                        return Some(b.to_string());
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Follow an ImportFrom re-export chain (`from .compat import OrderedDict`
+/// where compat does `from collections import OrderedDict`) through the
+/// generated crate's modules; true when the chain ends in a stdpython
+/// module — the name is a stdpython class, whose construction lowers to the
+/// runtime `::new` (the stdpython-construction divergence).
+fn stdpython_reexport_chain(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..16 {
+        match syms.get(&current) {
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let path = ifm.resolved_module_path(options);
+                if !options.module_defs.contains_key(&path) {
+                    return crate::is_stdpython_module(
+                        ifm.module.split('.').next().unwrap_or(""),
+                    );
+                }
+                // Re-export chain: hop into the defining module's scope.
+                let defining = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let module = &options.module_defs[&path];
+                let module: &crate::Module = module;
+                syms = module.clone().find_symbols(SymbolTableScopes::new());
+                current = defining;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// datetime constructors: `date` / `datetime` / `timedelta`. Shared by the
 /// `from datetime import ...` Name path (`date(2025, 1, 1)`) and the
 /// module-qualified attribute path (`datetime.date(...)` — urllib3's
@@ -1123,6 +1211,19 @@ impl<'a> CodeGen for Call {
                     return Ok(TokenStream::new());
                 }
             }
+        }
+        // A compat builtin ALIAS used as a callee (`builtin_str = str` —
+        // requests/compat, called as `builtin_str(x)` in models.py): the
+        // alias resolves through its defining module to the builtin name,
+        // so the call re-dispatches exactly like the builtin (`str(x)`).
+        if let ExprType::Name(n) = self.func.as_ref()
+            && let Some(builtin) = resolve_builtin_alias(&n.id, &symbols, &options)
+        {
+            let mut c = self.clone();
+            c.func = Box::new(ExprType::Name(crate::ast::tree::name::Name {
+                id: builtin,
+            }));
+            return c.to_rust(ctx, options, symbols);
         }
         // Calls to functions that return Result<T, PyException> get `?` so
         // exceptions propagate to the caller (or an enclosing try block),
@@ -3582,6 +3683,46 @@ impl<'a> CodeGen for Call {
                     }
                 }
             }
+            // A stdpython class (`from collections import OrderedDict`
+            // — `OrderedDict()` in requests' sessions/structures, or a
+            // re-export chain through a sibling module — `from
+            // .compat import OrderedDict` where compat re-exports
+            // collections'): stdpython classes aren't in module_defs,
+            // so the signature mapping above cannot resolve; lower to
+            // the runtime `::new` constructor with the arguments passed
+            // positionally (the stdpython-construction divergence).
+            let stdpython_class = match symbols.get(&n.id) {
+                Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                    crate::is_stdpython_module(ifm.module.split('.').next().unwrap_or(""))
+                        || stdpython_reexport_chain(&n.id, &symbols, &options)
+                }
+                Some(crate::SymbolTableNode::Alias(canonical)) => {
+                    stdpython_reexport_chain(canonical, &symbols, &options)
+                }
+                _ => false,
+            };
+            if stdpython_class {
+                let cname = crate::safe_ident(&n.id);
+                let mut args = Vec::new();
+                for arg in &self.args {
+                    args.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                for kw in &self.keywords {
+                    args.push(kw.value.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                if args.is_empty() {
+                    return Ok(quote!(#cname::new()));
+                }
+                return Ok(quote!(#cname::new(#(#args),*)));
+            }
         }
 
         // `Class.method(args)` where `method` is a @classmethod/
@@ -5099,31 +5240,48 @@ impl<'a> CodeGen for Call {
         let first_arg_expr = self.args.first().cloned();
         for (i, arg) in self.args.into_iter().enumerate() {
             let rust_arg = if let Some(param) = pos_params.get(i) {
-                let expected = param
+                // A CALLABLE parameter (`dict_class: type`): the argument
+                // (a class name) lowers to the boxed None — the
+                // callables-as-data divergence.
+                if param
                     .annotation
                     .as_deref()
-                    .and_then(crate::call_arg_expected_type);
-                let rendered = crate::render_typed_reused(
-                    &arg,
-                    ctx.clone(),
-                    options.clone(),
-                    symbols.clone(),
-                    expected,
-                )?;
-                // An unannotated (inferred) parameter takes OWNED string
-                // literals: the recursion fixpoint needs
-                // `T: PyAdd<T, Output = T>`, which only String (not a
-                // `&'static str` literal) satisfies for self-adding params.
-                if param.annotation.is_none()
-                    && matches!(
-                        &arg,
-                        ExprType::Constant(c)
-                            if matches!(&c.0, Some(litrs::Literal::String(_)))
-                    )
+                    .is_some_and(crate::ast::tree::arguments::is_type_annotation)
                 {
-                    quote!((#rendered).to_string())
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "callable argument for `{}` (a `type`-annotated parameter) \
+                         lowers to the boxed None (callables cannot be runtime \
+                         values in rython)",
+                        param.arg
+                    ));
+                    quote!(stdpython::PyValue::None_)
                 } else {
-                    rendered
+                    let expected = param
+                        .annotation
+                        .as_deref()
+                        .and_then(crate::call_arg_expected_type);
+                    let rendered = crate::render_typed_reused(
+                        &arg,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        expected,
+                    )?;
+                    // An unannotated (inferred) parameter takes OWNED string
+                    // literals: the recursion fixpoint needs
+                    // `T: PyAdd<T, Output = T>`, which only String (not a
+                    // `&'static str` literal) satisfies for self-adding params.
+                    if param.annotation.is_none()
+                        && matches!(
+                            &arg,
+                            ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(_)))
+                        )
+                    {
+                        quote!((#rendered).to_string())
+                    } else {
+                        rendered
+                    }
                 }
             } else {
                 arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
@@ -6189,6 +6347,19 @@ fn map_call_arguments(
             .annotation
             .as_deref()
             .is_some_and(crate::is_optional_annotation);
+        // A CALLABLE parameter (`dict_class: type = OrderedDict` —
+        // requests' sessions): rython cannot hold a class/function as a
+        // value (the callables-as-data divergence), so any argument passed
+        // for it lowers to the boxed None.
+        if param.annotation.as_deref().is_some_and(crate::ast::tree::arguments::is_type_annotation)
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "callable argument for `{}` (a `type`-annotated parameter) lowers to \
+                 the boxed None (callables cannot be runtime values in rython)",
+                param.arg
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
         if optional {
             crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())
         } else {
