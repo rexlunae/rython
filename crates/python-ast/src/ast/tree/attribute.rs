@@ -505,6 +505,15 @@ pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes)
                 Some(SymbolTableNode::Alias(canonical)) => {
                     matches!(symbols.get(canonical), Some(SymbolTableNode::Import(_)))
                 }
+                // `from . import exceptions` — a RELATIVE SUBMODULE import
+                // (ImportFrom with an EMPTY module, level > 0): the name IS
+                // a module, so `exceptions.SecurityWarning` resolves as a
+                // path (`crate::urllib3::exceptions::SecurityWarning`).
+                Some(SymbolTableNode::ImportFrom(ifm))
+                    if ifm.module.is_empty() && ifm.level > 0 =>
+                {
+                    true
+                }
                 _ => false,
             }
         }

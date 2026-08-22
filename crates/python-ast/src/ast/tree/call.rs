@@ -431,12 +431,14 @@ impl Call {
         let mut rendered_args = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
             // The warning CATEGORY and SOURCE parameters of
-            // `warnings.warn`/`warn_explicit` are warning-class/source
-            // VALUES — classes cannot be runtime values in rython. They
-            // lower as None (the warning fires unconditionally; documented
-            // divergence).
-            let is_warning_class_slot = (attr == "warn" || attr == "warn_explicit")
-                && matches!(params.get(i).copied(), Some("category" | "source"));
+            // `warnings.warn`/`warn_explicit`/`simplefilter`/
+            // `filterwarnings` are warning-class VALUES — classes cannot be
+            // runtime values in rython. They lower as None (the warning
+            // fires unconditionally; documented divergence).
+            let is_warning_class_slot = matches!(
+                attr.as_str(),
+                "warn" | "warn_explicit" | "simplefilter" | "filterwarnings"
+            ) && matches!(params.get(i).copied(), Some("category" | "source"));
             match slot {
                 // The signed runtime signatures take Option for every
                 // parameter: a present argument wraps in Some, an omitted
