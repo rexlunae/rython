@@ -3545,15 +3545,26 @@ impl<'a> CodeGen for Call {
         // `Class.method(args)` where `method` is a @classmethod/
         // @staticmethod (issue #117): an ASSOCIATED call — the class name
         // is a type, so the call lowers to `Class::method(args)` with the
-        // class reference (cls) dropped from the callee signature.
+        // class reference (cls) dropped from the callee signature. The
+        // class may be IMPORTED (`Retry.from_int(...)` — requests/adapters
+        // uses urllib3's Retry): resolve through the defining module, the
+        // same path construction calls use.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && let ExprType::Name(receiver) = attr.value.as_ref()
-            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(&receiver.id)
-            && let Some(method) = class.method_on_mro(&attr.attr, &symbols)
         {
-            let is_associated = matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
-                || matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "staticmethod");
-            if is_associated {
+            // Same-module class, or an imported one resolved through its
+            // defining module.
+            let resolved = match symbols.get(&receiver.id) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => {
+                    Some((c.clone(), symbols.clone()))
+                }
+                _ => resolve_construction_class(&receiver.id, &symbols, &options),
+            };
+            if let Some((class, class_symbols)) = resolved
+                && let Some(method) = class.method_on_mro(&attr.attr, &class_symbols)
+                && (matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
+                    || matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "staticmethod"))
+            {
                 let mut sig = method.clone();
                 if matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
                 {

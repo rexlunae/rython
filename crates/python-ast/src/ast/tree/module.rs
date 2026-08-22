@@ -2393,8 +2393,20 @@ pub fn resolve_imported_class(
             // The relative import resolves in the DEFINING module's PACKAGE
             // context: module_class_def's path includes the module name
             // (["urllib3", "connection"]), but resolved_module_path expects
-            // the package path (["urllib3"]).
-            ctx.module_path = path[..path.len().saturating_sub(1)].to_vec();
+            // the package path (["urllib3"]). An __init__ module IS its own
+            // package: its package path is the full module path
+            // (["urllib3", "util"] for urllib3/util/__init__.py — the
+            // re-export chain `from urllib3.util import Timeout` follows
+            // through it). Detect by a longer module key under the path.
+            let is_package = options
+                .module_defs
+                .keys()
+                .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+            ctx.module_path = if is_package {
+                path.to_vec()
+            } else {
+                path[..path.len().saturating_sub(1)].to_vec()
+            };
             let path2 = i.resolved_module_path(&ctx);
             resolve_imported_class(options, &path2, &defining, depth + 1)
         }
