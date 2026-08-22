@@ -214,6 +214,63 @@ line, never a silent behaviour change:
   `groupdict` of an unmatched group) fail loudly instead; sorting
   `NaN` panics, since Python's `NaN` ordering is not reproducible.
 
+### Round 8: the top-5 PyPI sweep (all five convert)
+
+All five target packages (urllib3, requests, botocore, boto3, pip) now
+convert end-to-end. Getting the last one (pip, with its deep vendored
+tree: distlib, pygments, rich, packaging, cachecontrol, resolvelib)
+through required a second family of documented divergences — each one a
+loud `-W` warning at the exact Python line, never a silent behaviour
+change:
+
+- **Static imports and dead fallbacks** — `try: from tokenize import
+  detect_encoding / except ImportError:` fallbacks are dropped: rython's
+  imports are static, so an ImportError handler around an import can
+  never run. Python-2-era gates (`if sys.version_info[0] < 3:`) are
+  evaluated at conversion time (rython is Python 3.11) and the dead
+  branch is dropped.
+- **`*`/`**` spreads into typed constructors** — `datetime(*date[:6],
+  tzinfo=timezone.utc)` (cachecontrol's expiry heuristic) and
+  `timedelta(**kw)` lower to `now()` / zero: the spread's element types
+  are dynamic. `csv.reader(**dialect)` and `hashlib.md5(*args,
+  **kwargs)` spreads are dropped (the defaults are the excel dialect /
+  empty in practice).
+- **Boxed containers** — empty lists/dicts/sets whose element type is
+  unknowable at the store (`result: list[float] = []` pins fine; a
+  PyValue-poisoned `1 + len(archive)` field, `{**a, **b}` all-spread
+  dicts, `[1, 2, 3, None, 4, True, False, "Hello World"]` demo mixes)
+  lower as `Vec<PyValue>` / `PyDict<String, PyValue>`.
+- **Aliasing at the boundary** — a chained assignment to a container
+  literal (`result[key] = entries = {}` — distlib's read_exports) clones
+  per target: Python shares ONE dict, rython's value semantics give each
+  target a copy (issues #79/#104). `del obj.attr` on a non-self object
+  (pygments' module-proxy cleanup) is dropped.
+- **Callables held as data** — `self.get = self._entries[-1].get`, a
+  `lambda x: x` default, `@rich_repr`/`@auto` local wrapper decorators,
+  and `_lexer_cache[name](**options)` (a class stored in a dict and
+  constructed) all lower as boxed PyValue or drop the call (issue #122
+  family).
+- **Typing metadata** — `metaclass=AnyName`, TypedDict's `total=`,
+  `type[X]` annotations, string-literal forward references (`"IO[str]"`),
+  external dotted annotations (`wintypes.HANDLE`), `Dict[int, None]`,
+  `cast(List[str], ...)[:]`, and `nonlocal` declarations are all
+  conversion-time no-ops (the class lowers as a plain struct; the
+  parameter boxes as PyValue).
+- **String formatting edges** — `f"{size:,}"` (thousands separator) and
+  `f"{x:{width}}"` (dynamic width) route through runtime formatters;
+  `str.format` on a template that cannot be resolved at conversion time
+  (a parameter-stored field) is dropped.
+- **Recursion fixpoint** — a self-recursive function whose base returns
+  build strings (`regex_opt_inner` — pygments' regexopt, recursing on
+  string slices) resolves its recursive calls to String.
+- **Miscellaneous** — tuple loop targets now support any arity
+  (`for base, suffix, dest in rules:`); a conditional re-flags argument
+  (`0 if case_sensitive else re.IGNORECASE`) resolves statically;
+  `isinstance(value, expected_type)` with a `type[T]` parameter is
+  statically true; generators return a Vec of yielded values (the
+  `yield` divergence); `self.bit = 1 << bit_no` fields infer i64;
+  `re.UNICODE` is a no-op (rython's regex is already Unicode).
+
 ## Roadmap
 
 The previously tracked stdlib/feature backlog ([#19](https://github.com/rexlunae/rython/issues/19),

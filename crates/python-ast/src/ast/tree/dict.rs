@@ -49,13 +49,17 @@ impl CodeGen for Dict {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut pairs = Vec::new();
+        let mut spreads: Vec<TokenStream> = Vec::new();
         // Type-aware dict lowering: infer the key/value types across the
         // literal and coerce each pair to them, so `{1: 'a', 2: b}`
         // becomes PyDict<i64, String> with the string literal owned.
+        // Issue #121: a store into a `dict[str, Any]` name forces the
+        // value type to the boxed PyValue, so mixed values wrap.
         let mut k_expected = crate::TypeInfo::PyObject;
         let mut v_expected = crate::TypeInfo::PyObject;
         let mut k_distinct: Vec<crate::TypeInfo> = Vec::new();
         let mut v_distinct: Vec<crate::TypeInfo> = Vec::new();
+        let forced_kv = options.dict_forced_kv.as_ref().clone();
         for (key, value) in self.keys.iter().zip(self.values.iter()) {
             if let Some(k) = key {
                 let kt = crate::infer_type(k, &options, &symbols);
@@ -74,7 +78,12 @@ impl CodeGen for Dict {
                 v_expected = crate::unify(v_expected, vt);
             }
         }
-        if k_distinct.len() > 1 && matches!(k_expected, crate::TypeInfo::PyObject) {
+        // A forced key/value type overrides the mixed-type check: the
+        // assignment target dictates the element type.
+        if forced_kv.is_none()
+            && k_distinct.len() > 1
+            && matches!(k_expected, crate::TypeInfo::PyObject)
+        {
             let kinds = k_distinct
                 .iter()
                 .map(|d| d.display())
@@ -86,17 +95,67 @@ impl CodeGen for Dict {
             )
             .into());
         }
-        if v_distinct.len() > 1 && matches!(v_expected, crate::TypeInfo::PyObject) {
-            let kinds = v_distinct
-                .iter()
-                .map(|d| d.display())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "dict literal mixes incompatible value types ({kinds}); values \
-                 must share a common type"
-            )
-            .into());
+        if forced_kv.is_none()
+            && v_distinct.len() > 1
+            && matches!(v_expected, crate::TypeInfo::PyObject)
+        {
+            // All values are TUPLES of strings of different lengths
+            // (`{100: ("continue",), 101: ("switching_protocols",), 103:
+            // ("processing", "early-hints"), ...}` — requests' status
+            // codes): unify to Vec<String>.
+            let all_str_tuples = v_distinct.iter().all(|t| match t {
+                crate::TypeInfo::Tuple(ts) => {
+                    !ts.is_empty()
+                        && ts.iter().all(|e| {
+                            matches!(
+                                e,
+                                crate::TypeInfo::StrRef | crate::TypeInfo::String
+                            )
+                        })
+                }
+                _ => false,
+            });
+            if !all_str_tuples {
+                // A HETEROGENEOUS value set that is still BOXABLE
+                // (Optional + bool + str... — urllib3's socks_options
+                // dict: `socks_version` (Optional), `rdns` (bool)):
+                // the values box into the heterogeneous PyValue, matching
+                // `dict[str, Any]` lowering (issue #121).
+                let boxable = v_distinct.iter().all(|t| match t {
+                    crate::TypeInfo::Option(_)
+                    | crate::TypeInfo::Bool
+                    | crate::TypeInfo::Int
+                    | crate::TypeInfo::Float
+                    | crate::TypeInfo::String
+                    | crate::TypeInfo::StrRef
+                    | crate::TypeInfo::Bytes
+                    | crate::TypeInfo::PyValue
+                    // A container value (`exclude_input: underlying_
+                    // operation_members` — a list — boto3's collection
+                    // docs): boxed too. A CLASS instance value
+                    // (`"handlers": [RichPipStreamHandler(...)]` — pip's
+                    // logging dictConfig): boxed too.
+                    | crate::TypeInfo::Vec(_)
+                    | crate::TypeInfo::Dict(_, _)
+                    | crate::TypeInfo::Tuple(_)
+                    | crate::TypeInfo::Class(_) => true,
+                    _ => false,
+                });
+                if !boxable {
+                    let kinds = v_distinct
+                        .iter()
+                        .map(|d| d.display())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "dict literal mixes incompatible value types ({kinds}); values \
+                         must share a common type"
+                    )
+                    .into());
+                }
+                v_expected = crate::TypeInfo::PyValue;
+                v_distinct = vec![crate::TypeInfo::PyValue];
+            }
         }
         let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {
             None
@@ -111,7 +170,9 @@ impl CodeGen for Dict {
                 other => other,
             })
         };
-        let v_expected = if matches!(v_expected, crate::TypeInfo::PyObject) {
+        let v_expected = if let Some((_, fv)) = forced_kv.clone() {
+            Some(fv)
+        } else if matches!(v_expected, crate::TypeInfo::PyObject) {
             None
         } else {
             Some(v_expected)
@@ -137,22 +198,66 @@ impl CodeGen for Dict {
                     pairs.push(quote! { (#key_tokens, #value_tokens) });
                 }
                 None => {
-                    // `{**other}` has no direct HashMap-literal equivalent;
-                    // fail the conversion rather than emitting invalid Rust.
-                    return Err("dictionary unpacking (`{**other}`) is not yet supported \
-                                in dict literals"
-                        .to_string()
-                        .into());
+                    // `{**other}`: a spread merges the other dict's entries.
+                    let spread = value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    spreads.push(spread);
                 }
             }
         }
-        
-        // PyDict (an insertion-ordered map) rather than HashMap: Python
-        // dicts preserve insertion order, and keys()/items()/iteration
-        // must match.
-        Ok(quote! {
-            PyDict::from([#(#pairs),*])
-        })
+
+        // A spread merges via PyDict::update — the key/value types come
+        // from the literal pairs, or from the first spread's own type when
+        // the literal is all spreads (`{**a, **b}`). A literal without
+        // spreads keeps the plain PyDict::from inference.
+        let keys = pairs.iter();
+        if spreads.is_empty() {
+            // PyDict (an insertion-ordered map) rather than HashMap: Python
+            // dicts preserve insertion order, and keys()/items()/iteration
+            // must match.
+            Ok(quote! {
+                PyDict::from([#(#keys),*])
+            })
+        } else {
+            let (k_ty, v_ty) = if let Some((fk, fv)) = forced_kv.clone() {
+                (fk.to_rust_type(), fv.to_rust_type())
+            } else if let (Some(k), Some(v)) = (k_expected.clone(), v_expected.clone())
+                && !pairs.is_empty()
+            {
+                (k.to_rust_type(), v.to_rust_type())
+            } else if let Some(k) = k_expected.clone()
+                && !pairs.is_empty()
+            {
+                // A typed key but an UNKNOWN value (`{**scheme, 'name':
+                // self._strip_sig_prefix(...)}` — botocore's regions): the
+                // value boxes as PyValue.
+                (k.to_rust_type(), quote!(stdpython::PyValue))
+            } else if let Some(first) = self
+                    .keys
+                    .iter()
+                    .zip(self.values.iter())
+                    .find(|(k, _)| k.is_none())
+                    .map(|(_, v)| v)
+                    && let crate::TypeInfo::Dict(k, v) =
+                        crate::infer_type(first, &options, &symbols)
+                {
+                    (k.to_rust_type(), v.to_rust_type())
+                } else {
+                    // An all-spread literal with no statically-known types
+                    // (`{**request_dict['context'].get('signing', {}),
+                    // **signing_context}` — botocore's utils): a boxed
+                    // PyDict<String, PyValue> (the boxed-dict divergence).
+                    (quote!(String), quote!(stdpython::PyValue))
+                };
+            Ok(quote! {
+                {
+                    let mut __rython_dict = PyDict::<#k_ty, #v_ty>::from([#(#keys),*]);
+                    #( __rython_dict.update(#spreads); )*
+                    __rython_dict
+                }
+            })
+        }
     }
 }
 

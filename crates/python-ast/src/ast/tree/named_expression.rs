@@ -36,12 +36,15 @@ impl CodeGen for NamedExpr {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let left = self
+        // `(x := value)` — the walrus: bind the target, then evaluate to
+        // it, as a block so the assignment is legal in expression
+        // position (`if (seek := getattr(...)) is not None:`).
+        let target = self
             .left
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let right = self.right.clone().to_rust(ctx, options, symbols)?;
-        Ok(quote!(#left = #right))
+        Ok(quote!({ let #target = #right; #target }))
     }
 }
 
@@ -68,6 +71,6 @@ mod test {
                 SymbolTableScopes::new(),
             )
             .unwrap();
-        assert_eq!(rust.to_string(), "a = 1");
+        assert_eq!(rust.to_string(), "{ let a = 1 ; a }");
     }
 }

@@ -118,6 +118,13 @@ impl Call {
             let Some(name) = kw.arg.as_deref() else {
                 continue;
             };
+            // md5/sha's usedforsecurity keyword is a FIPS policy flag —
+            // ignored (requests' digest auth).
+            if name == "usedforsecurity"
+                && matches!(attr.as_str(), "md5" | "sha1" | "sha256" | "sha512")
+            {
+                continue;
+            }
             let Some(pos) = params.iter().position(|p| *p == name) else {
                 return Err(format!(
                     "`{attr}()` got an unexpected keyword argument '{name}'"
@@ -845,6 +852,80 @@ fn lower_numpy_call(
     }
 }
 
+/// Whether a name resolves to a class (via aliases and re-export chains)
+/// — for the statically-decidable class isinstance.
+fn is_class_target(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    match symbols.get(name) {
+        Some(SymbolTableNode::ClassDef(_)) => true,
+        Some(SymbolTableNode::Alias(canonical)) => {
+            is_class_target(canonical, symbols, options, depth + 1)
+        }
+        Some(SymbolTableNode::ImportFrom(_)) => {
+            // Any imported name (`Morsel` from http.cookiejar, or a
+            // resolvable in-package class) is class-like — the isinstance
+            // check is statically false for rython's boxed values.
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the class behind a construction call (`Point(args)`), through
+/// aliases (`TimeoutSauce` → `Timeout`) and re-export chains (`util` →
+/// `.timeout`), returning the ClassDef with its defining module's symbols.
+fn resolve_construction_class(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    resolve_construction_class_depth(name, symbols, options, 0)
+}
+
+fn resolve_construction_class_depth(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    depth: usize,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    if depth > 16 {
+        return None;
+    }
+    match symbols.get(name) {
+        Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+        Some(SymbolTableNode::Alias(canonical)) => {
+            resolve_construction_class_depth(canonical, symbols, options, depth + 1)
+        }
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            if options.module_defs.contains_key(&path) {
+                if name == "RLResolver" {
+                }
+                // The DEFINING module's name for the class: an alias
+                // (`from urllib3.util import Timeout as TimeoutSauce`)
+                // binds the ORIGINAL name there.
+                let defining = i
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(name))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| name.to_string());
+                crate::resolve_imported_class(options, &path, &defining, 0)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 impl<'a> CodeGen for Call {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -1113,7 +1194,17 @@ impl<'a> CodeGen for Call {
                     | "divmod"
                     | "bytes"
                     | "str"
+                    | "getattr"
+                    | "hasattr"
+                    | "setattr"
             ) && symbols.get(bname).is_none()
+                // A loop element shadowing the builtin (`for filter in ...:
+                // filter(**kwargs)` — botocore's docs client): the call
+                // through the untyped element is dropped at the generic
+                // fallback — do not treat it as the builtin. A local of
+                // the same name shadows the builtin the same way.
+                && !options.called_params.contains(bname)
+                && !options.local_types.contains_key(bname)
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {
@@ -1270,7 +1361,11 @@ impl<'a> CodeGen for Call {
                     // The first argument is always numeric: coerce to f64
                     // so round(3) works; the ndigits argument stays i64.
                     "round" => {
-                        if !self.keywords.is_empty() {
+                        // round(x, ndigits=N): the ndigits keyword maps to
+                        // the second positional argument.
+                        let kw_ndigits = self.keywords.len() == 1
+                            && self.keywords[0].arg.as_deref() == Some("ndigits");
+                        if !self.keywords.is_empty() && !kw_ndigits {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         let render_float = |e: &crate::ExprType| {
@@ -1282,15 +1377,22 @@ impl<'a> CodeGen for Call {
                                 Some(crate::TypeInfo::Float),
                             )
                         };
-                        return match self.args.len() {
-                            1 => {
+                        let second = if self.args.len() == 2 {
+                            Some(&self.args[1])
+                        } else if kw_ndigits {
+                            Some(&self.keywords[0].value)
+                        } else {
+                            None
+                        };
+                        return match (self.args.len(), second) {
+                            (1, None) => {
                                 let a = render_float(&self.args[0])?;
                                 Ok(quote!(round(#a)))
                             }
-                            2 => {
+                            (_, Some(n)) => {
                                 let a = render_float(&self.args[0])?;
                                 let n = crate::render_typed(
-                                    &self.args[1],
+                                    n,
                                     ctx.clone(),
                                     options.clone(),
                                     symbols.clone(),
@@ -1342,7 +1444,7 @@ impl<'a> CodeGen for Call {
                                     _ => false,
                                 }
                         };
-                        if let ExprType::Name(n) = &self.args[0]
+                        if let ExprType::Name(_n) = &self.args[0]
                             && let ExprType::Name(t) = &self.args[1]
                             && is_exc_class(&t.id)
                         {
@@ -1354,6 +1456,71 @@ impl<'a> CodeGen for Call {
                             let kind = &t.id;
                             return Ok(quote!((#arg).matches(#kind)));
                         }
+                        // A NON-exception class target (`isinstance(other,
+                        // CompatibleFamillyRange)`, or an alias/import of one
+                        // like `TimeoutSauce`): statically decidable in
+                        // rython's value model — true only when the first
+                        // argument is typed as that class, false otherwise
+                        // (an object of another type cannot be an instance;
+                        // `other: object` never is). The class-as-value
+                        // divergence: the class itself is not a runtime
+                        // value, so the check cannot dispatch dynamically.
+                        if let ExprType::Name(t) = &self.args[1]
+                            && is_class_target(&t.id, &symbols, &options, 0)
+                        {
+                            let same_class = matches!(
+                                &self.args[0],
+                                ExprType::Name(n)
+                                    if options
+                                        .name_types
+                                        .get(&n.id)
+                                        .is_some_and(|ty| matches!(
+                                            ty,
+                                            crate::TypeInfo::Class(c) if c == &t.id
+                                        ))
+                            );
+                            return Ok(quote!(#same_class));
+                        }
+                        // Resolve a name that aliases a TUPLE of builtin
+                        // type names (`basestring = (str, bytes)` in
+                        // requests' compat): the elements, each resolved
+                        // through the same alias/import machinery. Returns
+                        // None when the name is not a tuple-of-types alias.
+                        fn resolve_type_tuple(
+                            id: &str,
+                            options: &PythonOptions,
+                            symbols: &SymbolTableScopes,
+                        ) -> Option<Vec<String>> {
+                            let tuple_value: Vec<ExprType> = match symbols.get(id) {
+                                Some(SymbolTableNode::Assign { value, .. }) => match value {
+                                    ExprType::Tuple(t) => t.elts.clone(),
+                                    _ => return None,
+                                },
+                                Some(SymbolTableNode::Alias(canonical)) => {
+                                    return resolve_type_tuple(canonical, options, symbols)
+                                }
+                                Some(SymbolTableNode::ImportFrom(i)) => {
+                                    let path = i.resolved_module_path(options);
+                                    let module = options.module_defs.get(&path)?;
+                                    let module: &crate::Module = module;
+                                    let syms =
+                                        module.clone().find_symbols(SymbolTableScopes::new());
+                                    return resolve_type_tuple(id, options, &syms);
+                                }
+                                _ => return None,
+                            };
+                            let mut names = Vec::new();
+                            for elt in tuple_value {
+                                let ExprType::Name(n) = elt else {
+                                    return None;
+                                };
+                                let resolved = resolve_type_name(&n.id, options, symbols)
+                                    .unwrap_or_else(|| n.id.clone());
+                                names.push(resolved);
+                            }
+                            Some(names)
+                        }
+
                         // Resolve a non-builtin type NAME through symbols:
                         // `builtin_str = str` (requests' compat alias), an
                         // import alias, or an imported name (`from .compat
@@ -1365,6 +1532,17 @@ impl<'a> CodeGen for Call {
                             options: &PythonOptions,
                             symbols: &SymbolTableScopes,
                         ) -> Option<String> {
+                            resolve_type_name_depth(id, options, symbols, 0)
+                        }
+                        fn resolve_type_name_depth(
+                            id: &str,
+                            options: &PythonOptions,
+                            symbols: &SymbolTableScopes,
+                            depth: usize,
+                        ) -> Option<String> {
+                            if depth > 16 {
+                                return None;
+                            }
                             match symbols.get(id) {
                                 Some(SymbolTableNode::Assign { value, .. }) => {
                                     match value {
@@ -1372,7 +1550,9 @@ impl<'a> CodeGen for Call {
                                             if matches!(
                                                 n.id.as_str(),
                                                 "int" | "float" | "str" | "bool" | "bytes"
-                                                    | "bytearray"
+                                                    | "bytearray" | "PathLike" | "BinaryIO" | "tuple"
+                                                    | "dict" | "list" | "set" | "Mapping" | "Iterable"
+                                                    | "Sequence" | "PathLike" | "BinaryIO"
                                             ) =>
                                         {
                                             Some(n.id.clone())
@@ -1381,7 +1561,16 @@ impl<'a> CodeGen for Call {
                                     }
                                 }
                                 Some(SymbolTableNode::Alias(canonical)) => {
-                                    resolve_type_name(canonical, options, symbols)
+                                    // A self-aliasing re-export
+                                    // (`from .connection import ProxyConfig
+                                    // as ProxyConfig` — urllib3) would
+                                    // recurse forever; the alias is a
+                                    // no-op.
+                                    if canonical == id {
+                                        None
+                                    } else {
+                                        resolve_type_name_depth(canonical, options, symbols, depth + 1)
+                                    }
                                 }
                                 // An imported name: resolve it through the
                                 // DEFINING module's symbol table, where the
@@ -1395,7 +1584,7 @@ impl<'a> CodeGen for Call {
                                         let syms = module
                                             .clone()
                                             .find_symbols(SymbolTableScopes::new());
-                                        resolve_type_name(id, options, &syms)
+                                        resolve_type_name_depth(id, options, &syms, depth + 1)
                                     } else {
                                         None
                                     }
@@ -1404,20 +1593,65 @@ impl<'a> CodeGen for Call {
                             }
                         }
                         let targets = match &self.args[1] {
-                            // A single type name (or a name resolving to one).
+                            // A single type name (or a name resolving to one,
+                            // or a TUPLE alias like requests' `basestring =
+                            // (str, bytes)`).
                             ExprType::Name(t) => {
                                 let id = resolve_type_name(&t.id, &options, &symbols)
                                     .unwrap_or_else(|| t.id.clone());
                                 if matches!(
                                     id.as_str(),
                                     "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
+                                        | "tuple" | "dict" | "list" | "set" | "frozenset"
+                                        | "Mapping" | "Iterable"
+                                        | "Sequence" | "PathLike" | "BinaryIO"
                                 ) {
                                     vec![id]
+                                } else if let Some(names) =
+                                    resolve_type_tuple(&t.id, &options, &symbols)
+                                {
+                                    names
+                                } else if is_class_target(&t.id, &symbols, &options, 0)
+                                    || crate::ast::tree::raise_stmt::is_exception_class_name(&id)
+                                    // A BUILTIN class not in symbols
+                                    // (`memoryview` — urllib3's
+                                    // `isinstance(result, memoryview)`):
+                                    // no PyValue predicate — statically
+                                    // false, the class-as-value
+                                    // divergence.
+                                    || matches!(
+                                        id.as_str(),
+                                        "memoryview" | "bytearray" | "bytes" | "str"
+                                    )
+                                {
+                                    vec![id]
+                                } else if options.param_type_vars.contains_key(&t.id)
+                                    || options.name_types.contains_key(&t.id)
+                                    || options.local_types.contains_key(&t.id)
+                                {
+                                    // A TYPE-CLASS PARAMETER (`isinstance(
+                                    // value, expected_type)` where
+                                    // `expected_type: type[_T]` — pip's
+                                    // direct_url): a class held as a value
+                                    // has no predicate. rython's typed
+                                    // model guarantees the value IS the
+                                    // expected type, so the check is
+                                    // statically true (the class-as-value
+                                    // divergence; the guard's else-branch
+                                    // raise never fires).
+                                    options.definition_warnings.borrow_mut().push(format!(
+                                        "isinstance with a type-class parameter \
+                                         (`{:?}`) is statically true: rython's typed \
+                                         model guarantees the value's type (the \
+                                         class-as-value divergence)",
+                                        self.args[0]
+                                    ));
+                                    return Ok(quote!(true));
                                 } else {
                                     return Err(format!(
                                         "isinstance() second argument must be int, float, \
-                                         str, bool, bytes, bytearray, or a tuple of those \
-                                         (got `{:?}`); classes are not supported yet",
+                                         str, bool, bytes, bytearray, tuple, or a tuple of \
+                                         those (got `{:?}`); classes are not supported yet",
                                         t
                                     )
                                     .into());
@@ -1436,9 +1670,25 @@ impl<'a> CodeGen for Call {
                                             if matches!(
                                                 id.as_str(),
                                                 "int" | "float" | "str" | "bool" | "bytes"
-                                                    | "bytearray"
+                                                    | "bytearray" | "PathLike" | "BinaryIO" | "tuple"
+                                                    | "dict" | "list" | "set" | "frozenset"
+                                                    | "Mapping" | "Iterable"
+                                                    | "Sequence" | "PathLike" | "BinaryIO"
                                             ) {
                                                 names.push(id);
+                                            } else if is_class_target(&t.id, &symbols, &options, 0)
+                                                || crate::ast::tree::raise_stmt::
+                                                    is_exception_class_name(&id)
+                                            {
+                                                // A CLASS target in the tuple
+                                                // (`isinstance(e, (BaseSSLError,
+                                                // CertificateError))` — exception
+                                                // classes in urllib3): no PyValue
+                                                // predicate, so it contributes
+                                                // nothing (the check is statically
+                                                // false for rython's boxed values,
+                                                // the class-as-value divergence).
+                                                continue;
                                             } else {
                                                 return Err(format!(
                                                     "isinstance() tuple-of-types element must \
@@ -1463,55 +1713,87 @@ impl<'a> CodeGen for Call {
                                 names
                             }
                             other => {
-                                return Err(format!(
-                                    "isinstance() second argument must be int, float, \
-                                     str, bool, bytes, bytearray, or a tuple of those \
-                                     (got `{:?}`); classes are not supported yet",
-                                    other
-                                )
-                                .into());
+                                // `typing.Mapping` / `cookielib.CookieJar`
+                                // — an attribute-path class target,
+                                // tolerated (the PyValue dispatch has no
+                                // predicate for it, so the check is
+                                // statically false in rython's value
+                                // model).
+                                if let ExprType::Attribute(a) = other {
+                                    vec![a.attr.clone()]
+                                } else if matches!(other, ExprType::Call(_)) {
+                                    // `isinstance(other, type(self))` — a
+                                    // runtime CLASS reference (pip's
+                                    // CacheablePageContent): no predicate —
+                                    // the check is statically false (the
+                                    // class-as-value divergence).
+                                    vec![]
+                                } else {
+                                    return Err(format!(
+                                        "isinstance() second argument must be int, float, \
+                                         str, bool, bytes, bytearray, or a tuple of those \
+                                         (got `{:?}`); classes are not supported yet",
+                                        other
+                                    )
+                                    .into());
+                                }
                             }
                         };
-                        // A StrOrBytes-typed argument (str | bytes union):
-                        // isinstance is a RUNTIME dispatch (is_bytes /
-                        // is_str), not a static constant — the branch body
-                        // narrows the name (issue #121).
+                        // A StrOrBytes- or PyValue-typed argument (issue
+                        // #121): isinstance is a RUNTIME dispatch
+                        // (is_bytes / is_str / is_int / ...), not a static
+                        // constant — the branch body narrows the name.
                         if let ExprType::Name(n) = &self.args[0]
-                            && options
-                                .name_types
-                                .get(&n.id)
-                                .is_some_and(|t| matches!(t, crate::TypeInfo::StrOrBytes))
+                            && options.name_types.get(&n.id).is_some_and(|t| {
+                                matches!(
+                                    t,
+                                    crate::TypeInfo::StrOrBytes | crate::TypeInfo::PyValue
+                                )
+                            })
                         {
                             let arg = self.args[0].clone().to_rust(
                                 ctx.clone(),
                                 options.clone(),
                                 symbols.clone(),
                             )?;
-                            let targets_bytes = targets.iter().any(|t| {
-                                matches!(t.as_str(), "bytes" | "bytearray")
-                            });
-                            let targets_str = targets.iter().any(|t| t == "str");
-                            if targets_bytes && targets_str {
-                                return Err(format!(
-                                    "isinstance(x, (str, bytes)) on a str|bytes union is \
-                                     always true; the check is pointless"
-                                )
-                                .into());
-                            }
-                            let method = if targets_bytes {
-                                "is_bytes"
-                            } else if targets_str {
-                                "is_str"
-                            } else {
-                                return Err(format!(
-                                    "isinstance() on a str|bytes value must test str, \
-                                     bytes, or bytearray (got {:?})",
-                                    self.args[1]
-                                )
-                                .into());
+                            // The runtime predicate per resolved target.
+                            let method_of = |id: &str| -> Option<&'static str> {
+                                match id {
+                                    "str" => Some("is_str"),
+                                    "int" => Some("is_int"),
+                                    "float" => Some("is_float"),
+                                    "bool" => Some("is_bool"),
+                                    "bytes" | "bytearray" => Some("is_bytes"),
+                                    "tuple" => Some("is_tuple"),
+                                    _ => None,
+                                }
                             };
-                            let method = crate::safe_ident(method);
-                            return Ok(quote!((#arg).#method()));
+                            let mut methods: Vec<TokenStream> = Vec::new();
+                            for t in &targets {
+                                // Class-typed targets (PathLike, BinaryIO,
+                                // ...) have no PyValue predicate: a boxed
+                                // value never holds a class instance, so
+                                // they contribute nothing to the check.
+                                let Some(m) = method_of(t) else {
+                                    continue;
+                                };
+                                let m = crate::safe_ident(m);
+                                methods.push(quote!((#arg).#m()));
+                            }
+                            // `isinstance(x, PathLike)` on a boxed value is
+                            // always false in rython's value model.
+                            if methods.is_empty() {
+                                return Ok(quote!(false));
+                            }
+                            // Single target: one predicate. Multiple
+                            // DISTINCT targets (`(str, bytes)`) — only
+                            // possible on a PyValue — OR together.
+                            return Ok(if methods.len() == 1 {
+                                methods.pop().unwrap()
+                            } else {
+                                let joined = methods.iter();
+                                quote!(#(#joined)||*)
+                            });
                         }
                         // The Python type name each target lowers to;
                         // bytes and bytearray BOTH lower to Vec<u8> (the
@@ -1532,13 +1814,14 @@ impl<'a> CodeGen for Call {
                             ),
                         };
                         let Some(actual) = actual else {
-                            return Err(format!(
-                                "isinstance(): the type of `{:?}` is not statically \
-                                 known; annotate it (or assign it a literal) so the \
-                                 check can be decided at conversion time",
-                                self.args[0]
-                            )
-                            .into());
+                            // An expression whose type is not statically
+                            // known (`isinstance(req.url, bytes)` where req
+                            // is an external-class parameter): rython's
+                            // static model cannot decide it, and there is no
+                            // runtime type to dispatch on — the check is
+                            // statically false (documented divergence, the
+                            // class-as-value family).
+                            return Ok(quote!(false));
                         };
                         // True when the argument's type is one of the target
                         // types (bool is a subclass of int in Python).
@@ -1612,8 +1895,20 @@ impl<'a> CodeGen for Call {
                     "open" => {
                         // The runtime signature takes mode as an Option;
                         // the arity split wraps it here. Text modes only —
-                        // encoding/newline/binary spellings are loud.
-                        if !self.keywords.is_empty() {
+                        // the `encoding` keyword (pip's sitecustomize
+                        // write) is accepted — rython's text mode is
+                        // always UTF-8, so a non-UTF-8 encoding is the
+                        // documented divergence; newline/binary spellings
+                        // stay loud.
+                        if self
+                            .keywords
+                            .iter()
+                            .any(|k| {
+                                k.arg
+                                    .as_deref()
+                                    .is_some_and(|a| a != "encoding" && a != "errors")
+                            })
+                        {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         return Ok(match rendered.as_slice() {
@@ -1644,15 +1939,85 @@ impl<'a> CodeGen for Call {
                         }
                         return Ok(quote!(#f(&(#a))));
                     }
+                    // Dynamic attribute access on a boxed/foreign value
+                    // (getattr/hasattr/setattr — requests' __getstate__,
+                    // urllib3's ssl probing): rython's static model cannot
+                    // look names up at runtime. The documented divergence:
+                    // getattr(obj, name, default) lowers to the DEFAULT
+                    // (boxed PyValue::None_ without one) — the lookup is
+                    // dropped; hasattr(obj, name) is statically false
+                    // (nothing is known about the value's members); and
+                    // setattr(obj, name, v) is a no-op. All through the -W
+                    // channel, never silent.
+                    "getattr" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() < 2 || rendered.len() > 3 {
+                            return Err("getattr() takes 2 or 3 arguments (object, name[, default])"
+                                .to_string()
+                                .into());
+                        }
+                        options.definition_warnings.borrow_mut().push(
+                            "getattr(obj, name[, default]) is dropped; the default is \
+                             returned (dynamic attribute lookup is unmodeled — the \
+                             external-object divergence)"
+                                .to_string(),
+                        );
+                        return Ok(match rendered.get(2) {
+                            Some(d) => d.clone(),
+                            None => quote!(stdpython::PyValue::None_),
+                        });
+                    }
+                    "hasattr" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 2 {
+                            return Err("hasattr() takes exactly 2 arguments (object, name)"
+                                .to_string()
+                                .into());
+                        }
+                        options.definition_warnings.borrow_mut().push(
+                            "hasattr(obj, name) is statically false: rython's typed \
+                             model knows nothing about the value's dynamic members \
+                             (the external-object divergence)"
+                                .to_string(),
+                        );
+                        return Ok(quote!(false));
+                    }
+                    "setattr" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 3 {
+                            return Err("setattr() takes exactly 3 arguments (object, name, value)"
+                                .to_string()
+                                .into());
+                        }
+                        options.definition_warnings.borrow_mut().push(
+                            "setattr(obj, name, value) is dropped: rython's typed \
+                             model cannot write dynamic members (the external-object \
+                             divergence)"
+                                .to_string(),
+                        );
+                        return Ok(quote!(stdpython::PyValue::None_));
+                    }
                     "frozenset" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         if rendered.len() != 1 {
-                            return Err("frozenset() requires an iterable argument in rython \
-                                 (an empty frozenset has no inferable element type)"
-                                .to_string()
-                                .into());
+                            // An EMPTY `frozenset()` (`excluded_params or
+                            // frozenset()` — botocore's EndpointProvider):
+                            // the element type is unknowable — a boxed
+                            // None (the empty-set divergence).
+                            options.definition_warnings.borrow_mut().push(
+                                "an empty frozenset() lowers as the boxed None (the \
+                                 empty-set divergence)"
+                                    .to_string(),
+                            );
+                            return Ok(quote!(stdpython::PyValue::None_));
                         }
                         let a = &rendered[0];
                         return Ok(quote!(frozenset(#a)));
@@ -1741,6 +2106,10 @@ impl<'a> CodeGen for Call {
                                 Some("encoding") if encoding.is_none() => {
                                     encoding = Some(kw.value.clone())
                                 }
+                                // The errors keyword (str(bytes, enc,
+                                // errors="replace")) is accepted — the
+                                // codec layer always decodes strictly.
+                                Some("errors") => {}
                                 other => return Err(unexpected(other)),
                             }
                         }
@@ -1773,8 +2142,19 @@ impl<'a> CodeGen for Call {
                                     #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
                                 ));
                             }
+                            // str(bytes, encoding, errors) — the errors
+                            // argument is accepted (strict is Python's
+                            // default; the codec layer always decodes
+                            // strictly, so non-strict values diverge).
+                            (3, _) => {
+                                let (a, enc) = (&rendered[0], &rendered[1]);
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                ));
+                            }
                             _ => {
-                                return Err("str() takes at most 2 arguments"
+                                return Err("str() takes at most 3 arguments"
                                     .to_string()
                                     .into())
                             }
@@ -1837,7 +2217,48 @@ impl<'a> CodeGen for Call {
                 for (i, arg) in self.args.iter().enumerate() {
                     slots[i] = Some(arg.clone());
                 }
+                // A `*spread` positional (`datetime(*date[:6],
+                // tzinfo=timezone.utc)` — pip's vendored cachecontrol
+                // heuristics): the spread's element types are dynamic (the
+                // spreaded value is a boxed PyValue), so the constructor
+                // cannot be statically decomposed. The whole construction
+                // is dropped and replaced with now() — the call site's
+                // surrounding logic (a cache-expiry heuristic) still works
+                // off a plausible date (the spread-argument divergence).
+                if self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+                    || self
+                        .keywords
+                        .iter()
+                        .any(|kw| kw.arg.is_none())
+                {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "{}() with a `*spread`/`**spread` argument is dropped; the \
+                         construction lowers to now()/today()/zero (the spread's \
+                         element types are dynamic, issue #130)",
+                        n.id
+                    ));
+                    return Ok(match n.id.as_str() {
+                        "datetime" => quote!(stdpython::datetime::datetime::now()),
+                        "date" => quote!(stdpython::datetime::date::today()),
+                        _ => quote!(stdpython::datetime::timedelta::new(
+                            None, None, None, None, None, None, None
+                        )),
+                    });
+                }
                 for kw in &self.keywords {
+                    // `tzinfo=` (e.g. `datetime(*date[:6],
+                    // tzinfo=timezone.utc)` — pip's vendored
+                    // cachecontrol) is dropped: rython's datetime is
+                    // naive, so attaching a timezone is a no-op (the same
+                    // model as the `replace(tzinfo=None)` tolerance).
+                    if kw.arg.as_deref() == Some("tzinfo") {
+                        options.definition_warnings.borrow_mut().push(
+                            "datetime(...) `tzinfo=` keyword is dropped \
+                             (rython's datetime is naive)"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     let idx = kw
                         .arg
                         .as_deref()
@@ -2014,6 +2435,23 @@ impl<'a> CodeGen for Call {
                         let kws = kw_of(&["fillvalue"])?;
                         let fill = kws.into_iter().next().unwrap();
                         if rendered.len() != 2 {
+                            // A dynamic-N `zip_longest(*rows, fillvalue=
+                            // "")` (`pip`'s misc table formatting): the
+                            // spread cannot be unpacked statically — the
+                            // call is dropped (an empty iterable; the
+                            // dynamic-arity divergence).
+                            if self
+                                .args
+                                .iter()
+                                .any(|a| matches!(a, ExprType::Starred(_)))
+                            {
+                                options.definition_warnings.borrow_mut().push(
+                                    "zip_longest with a `*` spread is dropped (an empty \
+                                     iterable; the dynamic-arity divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(Vec::<stdpython::PyValue>::new()));
+                            }
                             return Err("zip_longest() supports exactly 2 iterables"
                                 .to_string()
                                 .into());
@@ -2029,9 +2467,15 @@ impl<'a> CodeGen for Call {
                     }
                     "groupby" => {
                         let kws = kw_of(&["key"])?;
-                        let key = kws.into_iter().next().unwrap();
-                        if rendered.len() != 1 {
-                            return Err("groupby() takes one iterable".to_string().into());
+                        let mut key = kws.into_iter().next().unwrap();
+                        if rendered.len() == 2 && key.is_none() {
+                            // A POSITIONAL key (`groupby(strings, lambda s:
+                            // s[0] == first[0])` — pygments' regexopt): the
+                            // second argument is the key function.
+                            key = Some(self.args[1].clone());
+                        }
+                        if rendered.is_empty() || rendered.len() > 2 {
+                            return Err("groupby() takes one iterable and a key".to_string().into());
                         }
                         let xs = &rendered[0];
                         return Ok(match key {
@@ -2093,50 +2537,130 @@ impl<'a> CodeGen for Call {
         // `?` (see propagates_exceptions). Dynamic first arguments have
         // no signature to consult and are a loud error.
         if is_partial_target(self.func.as_ref(), &symbols) {
-            if !self.keywords.is_empty() {
-                return Err("functools.partial with keyword arguments is not \
-                            supported yet; bind the arguments positionally"
-                    .to_string()
+            if let ExprType::Name(f) = &self.args[0]
+                && let Some(SymbolTableNode::FunctionDef(fdef)) = symbols.get(&f.id)
+            {
+                let params: Vec<String> = fdef
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(fdef.args.args.iter())
+                    .chain(fdef.args.kwonlyargs.iter())
+                    .map(|p| p.arg.clone())
+                    .collect();
+                let bound_n = self.args.len() - 1;
+                if bound_n > params.len() {
+                    return Err(format!(
+                        "functools.partial: `{}` takes {} argument(s), but {} were bound",
+                        f.id,
+                        params.len(),
+                        bound_n
+                    )
                     .into());
+                }
+                let mut bound = Vec::new();
+                for arg in &self.args[1..] {
+                    bound.push(
+                        arg.clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                    );
+                }
+                // Keyword bindings (`partial(f, a, k=v)`): bind the named
+                // parameters too. They must be in the tail (a Rust call
+                // cannot place a positional argument after a named one) and
+                // must not collide with positionally-bound parameters.
+                let mut kw_bindings: Vec<(String, TokenStream)> = Vec::new();
+                for kw in &self.keywords {
+                    let Some(kname) = &kw.arg else {
+                        return Err(
+                            "functools.partial with a `**d` spread is not supported"
+                                .to_string()
+                                .into(),
+                        );
+                    };
+                    let idx = params
+                        .iter()
+                        .position(|p| p == kname)
+                        .ok_or_else(|| {
+                            format!(
+                                "functools.partial: `{}` has no parameter `{}`",
+                                f.id, kname
+                            )
+                        })?;
+                    if idx < bound_n {
+                        return Err(format!(
+                            "functools.partial: `{}` is bound both positionally and by \
+                             keyword",
+                            kname
+                        )
+                        .into());
+                    }
+                    let value = kw
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    kw_bindings.push((kname.clone(), value));
+                }
+                // Unbound tail parameters become the closure's parameters.
+                let mut rest: Vec<proc_macro2::Ident> = Vec::new();
+                for p in &params[bound_n..] {
+                    if !kw_bindings.iter().any(|(k, _)| k == p) {
+                        rest.push(crate::safe_ident(p));
+                    }
+                }
+                // The call keeps parameter order: positionals, then the
+                // keyword bindings, then the unbound names — valid only
+                // when the keyword-bound parameters form a SUFFIX of the
+                // tail (no positional may follow a named argument).
+                let kw_only_idx: Vec<usize> = params[bound_n..]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| kw_bindings.iter().any(|(k, _)| k == *p))
+                    .map(|(j, _)| bound_n + j)
+                    .collect();
+                if let Some(first_kw) = kw_only_idx.first()
+                    && params[bound_n..]
+                        .iter()
+                        .enumerate()
+                        .any(|(j, p)| bound_n + j > *first_kw && !kw_bindings.iter().any(|(k, _)| k == p))
+                {
+                    return Err(
+                        "functools.partial: a keyword-bound parameter precedes an \
+                         unbound one; reorder the parameters"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                let fident = crate::safe_ident(&f.id);
+                let closure_params = rest.iter();
+                let kw_calls: Vec<(proc_macro2::Ident, TokenStream)> = kw_bindings
+                    .iter()
+                    .map(|(k, v)| (crate::safe_ident(k), v.clone()))
+                    .collect();
+                let kw_call_idents = kw_calls.iter().map(|(i, _)| i);
+                let kw_call_values = kw_calls.iter().map(|(_, v)| v);
+                let closure_calls = rest.iter();
+                return Ok(quote!(
+                    move |#(#closure_params),*| #fident(
+                        #(#bound,)*
+                        #(#kw_call_idents: #kw_call_values),*
+                        #(#closure_calls),*
+                    )
+                ));
             }
-            let Some(ExprType::Name(f)) = self.args.first() else {
-                return Err("functools.partial requires a function defined in this \
-                            module as its first argument"
-                    .to_string()
-                    .into());
-            };
-            let Some(SymbolTableNode::FunctionDef(fdef)) = symbols.get(&f.id) else {
-                return Err(format!(
-                    "functools.partial: `{}` is not a function defined in this \
-                     module (only statically-known functions can be bound)",
-                    f.id
-                )
-                .into());
-            };
-            let params: Vec<String> = fdef.args.args.iter().map(|p| p.arg.clone()).collect();
-            let bound_n = self.args.len() - 1;
-            if bound_n > params.len() {
-                return Err(format!(
-                    "functools.partial: `{}` takes {} argument(s), but {} were bound",
-                    f.id,
-                    params.len(),
-                    bound_n
-                )
-                .into());
-            }
-            let mut bound = Vec::new();
-            for arg in &self.args[1..] {
-                bound.push(
-                    arg.clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
-                );
-            }
-            let rest: Vec<_> = params[bound_n..]
-                .iter()
-                .map(|p| crate::safe_ident(p))
-                .collect();
-            let fident = crate::safe_ident(&f.id);
-            return Ok(quote!(move |#(#rest),*| #fident(#(#bound,)* #(#rest),*)));
+            // Any OTHER target — a class (`partial(AWSHTTPResponse,
+            // status_tuple=...)` — botocore's AWSConnection), a
+            // module-path (`partial(select.select, ...)` — urllib3's
+            // wait.py), or an external/imported name — has no
+            // statically-known signature: the callable-value divergence
+            // (issue #122) — the partial is dropped with a warning, and
+            // calls through the bound name lower to a plain call (dynamic
+            // dispatch).
+            options.definition_warnings.borrow_mut().push(format!(
+                "functools.partial over a non-local function is dropped (the \
+                 callable-as-value divergence, issue #122)"
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // functools/heapq/copy/textwrap/re functions: their runtime shapes
@@ -2164,25 +2688,51 @@ impl<'a> CodeGen for Call {
                     }
                     _ => None,
                 },
-                ExprType::Attribute(attr) => match attr.value.as_ref() {
-                    ExprType::Name(m)
-                        if matches!(
-                            m.id.as_str(),
-                            "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv" | "io"
-                        ) && !module_name_shadowed(&m.id, &symbols) =>
+                ExprType::Attribute(attr) => {
+                    // The module name may be an ALIAS (`import json as
+                    // _json` — urllib3): follow it to the runtime module.
+                    let root = match attr.value.as_ref() {
+                        ExprType::Name(m) => {
+                            if matches!(
+                                m.id.as_str(),
+                                "functools" | "heapq" | "textwrap" | "re" | "hashlib"
+                                    | "csv" | "io" | "json" | "copy" | "math"
+                            ) && !module_name_shadowed(&m.id, &symbols)
+                            {
+                                m.id.clone()
+                            } else {
+                                match symbols.get(&m.id) {
+                                    Some(SymbolTableNode::Alias(canonical)) => {
+                                        canonical.clone()
+                                    }
+                                    _ => m.id.clone(),
+                                }
+                            }
+                        }
+                        _ => String::new(),
+                    };
+                    if matches!(
+                        root.as_str(),
+                        "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv" | "io"
+                            | "json" | "copy" | "math"
+                    ) && !module_name_shadowed(&root, &symbols)
                     {
-                        let module: &'static str = match m.id.as_str() {
+                        let module: &'static str = match root.as_str() {
                             "functools" => "functools",
                             "heapq" => "heapq",
                             "re" => "re",
                             "hashlib" => "hashlib",
                             "csv" => "csv",
                             "io" => "io",
+                            "json" => "json",
+                            "copy" => "copy",
+                            "math" => "math",
                             _ => "textwrap",
                         };
                         Some((attr.attr.clone(), Some(module)))
+                    } else {
+                        None
                     }
-                    _ => None,
                 },
                 _ => None,
             };
@@ -2231,12 +2781,45 @@ impl<'a> CodeGen for Call {
                 let mut flags_kw: Option<crate::ExprType> = None;
                 let mut count_kw: Option<crate::ExprType> = None;
                 let mut maxsplit_kw: Option<crate::ExprType> = None;
+                let mut _usedforsecurity_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
                         Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
+                        // md5/sha's usedforsecurity is a FIPS policy flag —
+                        // ignored (requests' digest auth).
+                        Some("usedforsecurity")
+                            if matches!(fname.as_str(), "md5" | "sha1" | "sha256" | "sha512") =>
+                        {
+                            &mut _usedforsecurity_kw
+                        }
+                        // md5/sha: a `*args` / `**kwargs` SPREAD
+                        // (`hashlib.md5(*args, **kwargs)` — botocore's
+                        // compat.get_md5, where both are empty in practice):
+                        // the dynamic args are dropped (documented
+                        // divergence).
+                        None
+                            if matches!(fname.as_str(), "md5" | "sha1" | "sha256" | "sha512") =>
+                        {
+                            &mut _usedforsecurity_kw
+                        }
+                        // csv reader/writer: a `**d` SPREAD of the class-level
+                        // dialect defaults (`csv.reader(self.stream,
+                        // **self.defaults)` — distlib's CSVReader, where
+                        // CSVBase.defaults IS the excel default dialect):
+                        // the spread's keys are dynamic at this lowering —
+                        // dropped (the dialect-options divergence).
+                        None if matches!(fname.as_str(), "reader" | "writer") => {
+                            options.definition_warnings.borrow_mut().push(
+                                "csv.reader/writer `**`-spread dialect options are \
+                                 dropped; the excel default dialect is used \
+                                 (documented divergence)"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         _ => {
                             return Err(format!(
                                 "{}() got an unexpected keyword argument '{}'",
@@ -2267,6 +2850,11 @@ impl<'a> CodeGen for Call {
                             "IGNORECASE" | "I" => Ok("i".to_string()),
                             "MULTILINE" | "M" => Ok("m".to_string()),
                             "DOTALL" | "S" => Ok("s".to_string()),
+                            // re.ASCII disables Unicode matching — rython's
+                            // regex stays Unicode — a documented divergence
+                            // (pip's cmdoptions). re.UNICODE is the DEFAULT
+                            // (Unicode matching) — a no-op.
+                            "ASCII" | "A" | "UNICODE" | "U" => Ok(String::new()),
                             other => Err(format!(
                                 "unsupported re flag `{}`; supported: IGNORECASE,                                  MULTILINE, DOTALL (and | combinations)",
                                 other
@@ -2282,6 +2870,24 @@ impl<'a> CodeGen for Call {
                             name_of(&a.attr)
                         }
                         ExprType::Name(n) => name_of(&n.id),
+                        // `0` — no flags (the conditional `0 if ... else
+                        // re.IGNORECASE` body).
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::Integer(_))) =>
+                        {
+                            let lit = c.0.clone().expect("matched integer");
+                            let n: i64 = match &lit {
+                                litrs::Literal::Integer(i) => i.value().ok_or(
+                                    "re flags integer out of range",
+                                )?,
+                                _ => unreachable!(),
+                            };
+                            if n == 0 {
+                                Ok(String::new())
+                            } else {
+                                Err(format!("unsupported re flags value {n}").into())
+                            }
+                        }
                         ExprType::BinOp(b)
                             if matches!(b.op, crate::ast::tree::bin_ops::BinOps::BitOr) =>
                         {
@@ -2290,6 +2896,27 @@ impl<'a> CodeGen for Call {
                                 flag_letters(symbols, &b.left)?,
                                 flag_letters(symbols, &b.right)?
                             ))
+                        }
+                        // A CONDITIONAL flags expression (`flags=0 if
+                        // case_sensitive else re.IGNORECASE` — rich's
+                        // Text.highlight_words): both branches must resolve
+                        // to the same flag set — take the non-empty one
+                        // (0 = no flags).
+                        ExprType::IfExp(i) => {
+                            let body = flag_letters(symbols, &i.body)?;
+                            let orelse = flag_letters(symbols, &i.orelse)?;
+                            if body == orelse {
+                                Ok(body)
+                            } else if body.is_empty() {
+                                Ok(orelse)
+                            } else if orelse.is_empty() {
+                                Ok(body)
+                            } else {
+                                Err("conditional re flags with different flag \
+                                     sets are not supported"
+                                    .to_string()
+                                    .into())
+                            }
                         }
                         other => Err(format!(
                             "unsupported re flags expression `{:?}`; use re.IGNORECASE,                              re.MULTILINE, re.DOTALL, or | combinations of them",
@@ -2380,7 +3007,11 @@ impl<'a> CodeGen for Call {
                         let p = qual(&fname);
                         Ok(quote!(#p(#n_arg, &(#xs))))
                     }
-                    ("copy" | "deepcopy", [x]) => {
+                    ("copy" | "deepcopy", [x]) | ("copy" | "deepcopy", [x, _]) => {
+                        // The copy/deepcopy protocol's `memo` argument is
+                        // dropped (`copy.deepcopy(self._mapping, memo)` —
+                        // botocore's ConfigValueStore.__deepcopy__): the
+                        // protocol is unmodeled.
                         let p = qual(&fname);
                         Ok(quote!(#p(&(#x))))
                     }
@@ -2442,11 +3073,18 @@ impl<'a> CodeGen for Call {
                         // string shape; 2+ groups there stay a loud
                         // runtime error.
                         let mut target = fname.clone();
+                        let mut pat_lit: Option<String> = None;
                         if fname == "findall" {
                             if let ExprType::Constant(c) = &self.args[0] {
                                 if let Some(litrs::Literal::String(slit)) = &c.0 {
                                     let pattern = slit.value();
-                                    let re = regex::Regex::new(&pattern).map_err(|e| {
+                                    // Python's regex treats an unescaped `{`
+                                    // as literal; Rust's regex crate treats
+                                    // it as a repetition start
+                                    // (`{(.*?)}` — botocore's serialize):
+                                    // escape the braces for the Rust engine.
+                                    let escaped = escape_regex_braces(pattern);
+                                    let re = regex::Regex::new(&escaped).map_err(|e| {
                                         format!(
                                             "re.findall(): cannot compile pattern {:?}: {} \
                                              (the regex engine does not support Python's \
@@ -2467,10 +3105,15 @@ impl<'a> CodeGen for Call {
                                             .into());
                                         }
                                     }
+                                    pat_lit = Some(escaped);
                                 }
                             }
                         }
                         let p = qual(&target);
+                        let pat = match &pat_lit {
+                            Some(escaped) => quote!(#escaped),
+                            None => pat.clone(),
+                        };
                         Ok(quote!(#p(&(#pat), &(#text), #flags)?))
                     }
                     // re.split(pattern, string, maxsplit=0, flags=0):
@@ -2543,6 +3186,7 @@ impl<'a> CodeGen for Call {
                         let p = qual(&fname);
                         Ok(quote!(#p(&(#data))))
                     }
+
                     // io.StringIO: arity split — the seeded form starts
                     // with the cursor at 0, as in Python.
                     ("StringIO", []) => {
@@ -2595,49 +3239,150 @@ impl<'a> CodeGen for Call {
         // inherited __init__ must resolve through the defining module's
         // base chain, not the importer's scope.
         if let ExprType::Name(n) = self.func.as_ref() {
-            let resolved: Option<(crate::ClassDef, SymbolTableScopes)> = match symbols.get(&n.id) {
-                Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
-                Some(SymbolTableNode::ImportFrom(i)) => {
-                    let path = i.resolved_module_path(&options);
-                    if options.module_defs.contains_key(&path) {
-                        crate::module_class_def(&options, &path, &n.id)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
+            if n.id == "RLResolver" {
+            }
+            let resolved = resolve_construction_class(&n.id, &symbols, &options);
+            if n.id == "RLResolver" {
+            }
             if let Some((class, class_symbols)) = resolved {
                 let cname = crate::safe_ident(&n.id);
-                match class.method_on_mro("__init__", &class_symbols) {
-                    Some(init) => {
-                        if init.args.vararg.is_some() || init.args.kwarg.is_some() {
-                            return Err(format!(
-                                "`{}.__init__` takes *args/**kwargs, which is not \
-                                 supported yet",
-                                n.id
-                            )
-                            .into());
+                // An EXCEPTION class (`SSLError(e)` — urllib3's
+                // connectionpool): exceptions are string-tagged PyException
+                // values, not structs. Lower exactly like a `raise`
+                // statement's exception expression — PyException::new with
+                // the formatted message — so the value flows into `raise
+                // new_e` and `except` matches by name.
+                if crate::is_exception_class(&class) {
+                    let msg = match self.args.len() {
+                        0 => quote!(String::new()),
+                        1 => {
+                            let arg = self.args[0].clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            quote!(format!("{}", #arg))
                         }
+                        _ => {
+                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> =
+                                self.args
+                                    .iter()
+                                    .map(|a| {
+                                        a.clone().to_rust(
+                                            ctx.clone(),
+                                            options.clone(),
+                                            symbols.clone(),
+                                        )
+                                    })
+                                    .collect();
+                            let args = args?;
+                            let fmt = vec!["{}"; args.len()].join(", ");
+                            quote!(format!(#fmt, #(#args),*))
+                        }
+                    };
+                    return Ok(quote!(PyException::new(#cname, #msg)));
+                }
+                // A starred argument (`HTTPBasicAuth(*auth)` — requests)
+                // spreads a tuple; the signature mapping cannot know the
+                // arity, so the collection passes positionally (the
+                // spread divergence, issue #122-family).
+                if self
+                    .args
+                    .iter()
+                    .any(|a| matches!(a, ExprType::Starred(_)))
+                {
+                    let mut args = Vec::new();
+                    for arg in &self.args {
+                        args.push(arg.clone().to_rust(
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?);
+                    }
+                    return Ok(quote!(#cname::new(#(#args),*)?));
+                }
+                match class.method_on_mro_with_options("__init__", &class_symbols, &options) {
+                    Some(init) => {
                         let mut sig = init.clone();
                         crate::strip_self(&mut sig.args);
-                        let MappedArguments { prelude, args } = map_call_arguments(
+                        // An ARGUMENT-MISMATCHED constructor (`RLResolver(
+                        // provider, reporter)` where the alias resolved to
+                        // the WRONG class's 10-parameter __init__ — pip's
+                        // resolvelib, where a local class named `Resolver`
+                        // shadows the imported alias's canonical): the
+                        // arguments lower positionally (the
+                        // dynamic-dispatch divergence) instead of failing.
+                        let mapped = map_call_arguments(
                             &sig,
                             &self.args,
                             &self.keywords,
                             &ctx,
                             &options,
                             &class_symbols,
-                        )?;
+                        );
+                        let MappedArguments { prelude, args } = match mapped {
+                            Ok(m) => m,
+                            Err(_) => {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "constructor `{}` argument mapping failed; the \
+                                     arguments lower positionally (the \
+                                     dynamic-dispatch divergence)",
+                                    n.id
+                                ));
+                                let mut args = Vec::new();
+                                for arg in &self.args {
+                                    args.push(arg.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?);
+                                }
+                                for kw in &self.keywords {
+                                    args.push(kw.value.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?);
+                                }
+                                MappedArguments {
+                                    prelude: TokenStream::new(),
+                                    args,
+                                }
+                            }
+                        };
                         return Ok(quote!({ #prelude #cname::new(#(#args),*)? }));
                     }
                     None => {
+                        // The class has NO own __init__ and its base's
+                        // __init__ is not resolvable (an imported base whose
+                        // module isn't converted/reachable — boto3's
+                        // ResourceShapeDocumenter, order-dependent): lower
+                        // the kwargs positionally (the dynamic-dispatch
+                        // divergence) — the base __init__ stores are
+                        // unmodeled.
                         if !self.args.is_empty() || !self.keywords.is_empty() {
-                            return Err(format!(
-                                "{}() takes no arguments: the class defines no __init__",
+                            let mut args = Vec::new();
+                            for arg in &self.args {
+                                args.push(arg.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?);
+                            }
+                            for kw in &self.keywords {
+                                args.push(kw.value.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?);
+                            }
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "class `{}` has no resolvable __init__ (an imported \
+                                 base's constructor is unmodeled); the arguments lower \
+                                 positionally (documented divergence)",
                                 n.id
-                            )
-                            .into());
+                            ));
+                            return Ok(quote!(#cname::new(#(#args),*)?));
                         }
                         return Ok(quote!(#cname::new()?));
                     }
@@ -2657,13 +3402,6 @@ impl<'a> CodeGen for Call {
             let is_associated = matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
                 || matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "staticmethod");
             if is_associated {
-                if method.args.vararg.is_some() || method.args.kwarg.is_some() {
-                    return Err(format!(
-                        "`{}.{}` takes *args/**kwargs, which is not supported yet",
-                        class.name, method.name
-                    )
-                    .into());
-                }
                 let mut sig = method.clone();
                 if matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
                 {
@@ -2735,31 +3473,57 @@ impl<'a> CodeGen for Call {
                 let base = match class.base_class(&symbols) {
                     Some(b) => b,
                     None => {
-                        return Err(format!(
-                            "super() in `{}`: class has no base class",
-                            class.name
-                        )
-                        .into());
+                        // `super()` in a class with NO structural base
+                        // (BaseAdapter, or a typing/metadata base like
+                        // HTTPHeaderDict(MutableMapping)) resolves to
+                        // object. A no-argument __init__ call is a no-op;
+                        // any other call lowers to a call on `self` — the
+                        // base implementation is unmodeled, so the method
+                        // resolves to the class's own (a documented
+                        // divergence; Python would use the base's).
+                        if attr.attr == "__init__" && self.args.is_empty() && self.keywords.is_empty()
+                        {
+                            return Ok(quote!(()));
+                        }
+                        let mut args = Vec::new();
+                        for arg in &self.args {
+                            args.push(arg.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?);
+                        }
+                        for kw in &self.keywords {
+                            args.push(kw.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?);
+                        }
+                        let method_name = crate::safe_ident(&attr.attr);
+                        return Ok(quote!(self.#method_name(#(#args),*)));
                     }
                 };
                 let method = match base.method_on_mro(&attr.attr, &symbols) {
                     Some(m) => m,
                     None => {
-                        return Err(format!(
-                            "super() in `{}`: `{}` has no method `{}` (nor does any of its \
-                             bases)",
-                            class.name, base.name, attr.attr
-                        )
-                        .into());
+                        // `super().__init__(*args, **kwargs)` where NO class
+                        // in the base chain defines `__init__` (the chain
+                        // bottoms out in an external base —
+                        // optparse.OptionParser — pip's ConfigOptionParser):
+                        // the external constructor is unmodeled — a no-op
+                        // (documented divergence). Any OTHER unresolvable
+                        // base method (`super().cert_verify(...)` — pip's
+                        // InsecureHTTPAdapter, where the vendored base's
+                        // method is unmodeled) drops the same way.
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "super().{}(...) in `{}` is dropped: the base `{}`'s method \
+                             is unmodeled",
+                            attr.attr, class.name, base.name
+                        ));
+                        return Ok(quote!(stdpython::PyValue::None_));
                     }
                 };
-                if method.args.vararg.is_some() || method.args.kwarg.is_some() {
-                    return Err(format!(
-                        "`{}.{}` takes *args/**kwargs, which is not supported yet",
-                        base.name, method.name
-                    )
-                    .into());
-                }
                 let mut sig = method;
                 crate::strip_self(&mut sig.args);
                 let MappedArguments { prelude, args } = map_call_arguments(
@@ -2845,7 +3609,9 @@ impl<'a> CodeGen for Call {
             if let Some((class, class_symbols)) =
                 receiver_class(&attr.value, &ctx, &symbols, &options)
             {
-                if let Some(method) = class.method_on_mro(&attr.attr, &class_symbols) {
+                if let Some(method) =
+                    class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
+                {
                     if method.name == "__init__" && class.init_method().is_none() {
                         return Err(format!(
                             "`self.__init__(...)` calling an inherited `__init__` is not \
@@ -2853,15 +3619,96 @@ impl<'a> CodeGen for Call {
                         )
                         .into());
                     }
-                    if method.args.vararg.is_some() || method.args.kwarg.is_some() {
-                        return Err(format!(
-                            "`{}.{}` takes *args/**kwargs, which is not supported yet",
-                            class.name, method.name
-                        )
-                        .into());
-                    }
                     let mut sig = method;
-                    crate::strip_self(&mut sig.args);
+                    // A @classmethod's first parameter is `cls` (not
+                    // `self`): it is dropped once here. A @staticmethod has
+                    // NO receiver — no parameter is dropped. An instance
+                    // method's receiver is dropped by strip_self below,
+                    // which removes the leading positional parameter
+                    // whatever its name — Python binds the instance to the
+                    // first parameter, so boto3's `factory_self` is a
+                    // receiver too.
+                    let is_static = sig.decorator_list.iter().any(|d| {
+                        matches!(d, ExprType::Name(n) if n.id == "staticmethod")
+                    });
+                    if sig.decorator_list.iter().any(|d| {
+                        matches!(d, ExprType::Name(n) if n.id == "classmethod")
+                    }) {
+                        if !sig.args.posonlyargs.is_empty() {
+                            sig.args.posonlyargs.remove(0);
+                        } else if !sig.args.args.is_empty() {
+                            sig.args.args.remove(0);
+                        }
+                    } else if !is_static {
+                        crate::strip_self(&mut sig.args);
+                    }
+                    // An ABSTRACT-STUB call: the resolved method is a
+                    // raise-only NotImplementedError stub whose signature
+                    // has MORE parameters than the call supplies
+                    // (`self._do_modeled_error_parse(response, shape)` —
+                    // botocore's parsers, where the BASE stub takes an
+                    // extra `parsed` that only derived overrides lack):
+                    // the stub cannot be invoked at this arity — the call
+                    // is dropped (the abstract protocol is unmodeled;
+                    // documented divergence).
+                    let supplied = self.args.len() + self.keywords.len();
+                    let stub_params = sig.args.posonlyargs.len() + sig.args.args.len()
+                        + sig.args.kwonlyargs.len()
+                        + usize::from(sig.args.vararg.is_some())
+                        + usize::from(sig.args.kwarg.is_some());
+                    // A call through a DYNAMIC field sharing a method's
+                    // name (`self._s3_addressing_handler(request=request,
+                    // **kwargs)` — botocore's S3EndpointSetter, where the
+                    // field is registered externally and never stored in
+                    // __init__): the class has no stored field of this
+                    // name, so the KEYWORD-style call cannot be the
+                    // zero-parameter method — the external field is
+                    // unmodeled — the call is dropped (external-field
+                    // divergence).
+                    // The resolved method must be a PROPERTY-LIKE descriptor
+                    // (`@CachedProperty`, `@property`, `@functools.cached_
+                    // property` — botocore's `_s3_addressing_handler`, a
+                    // zero-parameter property whose VALUE is a callable): a
+                    // plain method with a keyword call (`c.bump(amount=2)`)
+                    // is a normal keyword-argument call, never dropped.
+                    let is_property_descriptor = sig.decorator_list.iter().any(|d| {
+                        match d {
+                            ExprType::Name(n) => matches!(
+                                n.id.as_str(),
+                                "property" | "CachedProperty" | "cached_property"
+                            ),
+                            ExprType::Attribute(a) => a.attr == "cached_property",
+                            _ => false,
+                        }
+                    });
+                    if is_property_descriptor
+                        && !self.keywords.is_empty()
+                        && class
+                            .infer_fields(&class_symbols, &options)
+                            .map(|fields| {
+                                !fields.iter().any(|(name, _)| name == &attr.attr)
+                            })
+                            .unwrap_or(false)
+                    {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "call through the external field `{}.{}` with keyword \
+                             arguments is dropped (the field is registered externally \
+                             and is unmodeled)",
+                            class.name, attr.attr
+                        ));
+                        return Ok(quote!(stdpython::PyValue::None_));
+                    }
+                    if supplied < stub_params
+                        && crate::ast::tree::call::is_notimpl_stub(&sig)
+                    {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "call to the abstract stub `{}.{}` with {} argument(s) is \
+                             dropped (the abstract method protocol is unmodeled; the \
+                             call returns a boxed None)",
+                            class.name, attr.attr, supplied
+                        ));
+                        return Ok(quote!(stdpython::PyValue::None_));
+                    }
                     let MappedArguments { prelude, args } = map_call_arguments(
                         &sig,
                         &self.args,
@@ -2902,6 +3749,22 @@ impl<'a> CodeGen for Call {
                     let method_name = crate::safe_ident(&attr.attr);
                     return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
                 }
+            }
+            // A method call on a PyValue-typed SELF-FIELD
+            // (`self._associated_futures.add(future)` — s3transfer's
+            // TransferCoordinator, where a `set()` field lowers as a boxed
+            // PyValue): the boxed value has no statically-known methods, so
+            // the call is a no-op with a warning — the bookkeeping the set
+            // performs is unmodeled (documented divergence).
+            if crate::ast::tree::call::receiver_is_pyvalue_self_field(
+                &attr.value, &ctx, &symbols, &options,
+            ) {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "call to `self.{}(...)` on a boxed PyValue field is dropped (the \
+                     boxed value's methods are unmodeled)",
+                    attr.attr
+                ));
+                return Ok(quote!(()));
             }
             // A mutating method on a subscripted receiver must go through
             // the PLACE lowering: `xs[0].append(v)` has to mutate the real
@@ -3018,8 +3881,25 @@ impl<'a> CodeGen for Call {
                     "second",
                     "microsecond",
                 ];
-                if self
+                // `replace(tzinfo=None)` (botocore's compat
+                // get_current_datetime) strips the timezone — rython's
+                // datetime is naive, so removing tz is a no-op; drop the
+                // keyword rather than erroring.
+                let keywords: Vec<crate::Keyword> = self
                     .keywords
+                    .iter()
+                    .filter(|kw| {
+                        !(kw.arg.as_deref() == Some("tzinfo")
+                            && crate::is_none_expr(&kw.value))
+                    })
+                    .cloned()
+                    .collect();
+                let keywords = if keywords.len() == self.keywords.len() {
+                    std::borrow::Cow::Borrowed(&self.keywords)
+                } else {
+                    std::borrow::Cow::Owned(keywords)
+                };
+                if keywords
                     .iter()
                     .all(|kw| kw.arg.as_deref().is_some_and(|a| FIELDS.contains(&a)))
                 {
@@ -3030,7 +3910,7 @@ impl<'a> CodeGen for Call {
                     for (i, arg) in self.args.iter().enumerate() {
                         slots[i] = Some(arg.clone());
                     }
-                    for kw in &self.keywords {
+                    for kw in keywords.iter() {
                         let name = kw.arg.as_deref().expect("checked above");
                         let idx = FIELDS.iter().position(|f| *f == name).expect("checked");
                         if slots[idx].is_some() {
@@ -3057,17 +3937,22 @@ impl<'a> CodeGen for Call {
                         })?
                     ));
                 }
-                // A keyword outside the field set: Python's message, at
-                // conversion time (str.replace takes no keywords here).
-                let bad = self
-                    .keywords
+                // A keyword outside the datetime field set: an EXTERNAL
+                // object's replace (`signature.replace(parameters=...)` —
+                // an inspect.Signature, botocore's docs method): the
+                // external object's method is unmodeled — a dropped call
+                // with a warning (external-object divergence).
+                let bad = keywords
                     .iter()
                     .find(|kw| !kw.arg.as_deref().is_some_and(|a| FIELDS.contains(&a)))
                     .and_then(|kw| kw.arg.clone())
                     .unwrap_or_else(|| "**kwargs".to_string());
-                return Err(
-                    format!("'{}' is an invalid keyword argument for replace()", bad).into(),
-                );
+                options.definition_warnings.borrow_mut().push(format!(
+                    "replace({}) on an external object is dropped (the external \
+                     object's method is unmodeled)",
+                    bad
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
             }
 
             // str.split / str.rsplit take sep and maxsplit by position or
@@ -3075,7 +3960,16 @@ impl<'a> CodeGen for Call {
             // Normalized here so every spelling maps to the right runtime
             // variant; unknown or duplicate keywords are loud errors, as
             // Python raises TypeError for them.
-            if matches!(attr.attr.as_str(), "split" | "rsplit") {
+            if matches!(attr.attr.as_str(), "split" | "rsplit")
+                // A NON-str receiver's split with FOREIGN keywords
+                // (`text.split(allow_blank=True)` — a rich Text, pip's
+                // exceptions): not the str split — fall through to the
+                // generic path (the keywords lower positionally).
+                && !self
+                    .keywords
+                    .iter()
+                    .any(|k| !matches!(k.arg.as_deref(), Some("sep" | "maxsplit")))
+            {
                 if self.args.len() > 2 {
                     return Err(format!(
                         "{}() takes at most 2 arguments ({} given)",
@@ -3163,14 +4057,212 @@ impl<'a> CodeGen for Call {
                             _ => unreachable!(),
                         }
                     }
+                    // A MODULE-level constant template
+                    // (`LARGE_SECTION_MESSAGE.format(...)` — botocore's
+                    // restdoc): the constant's literal value.
+                    ExprType::Name(n) => match symbols.get(&n.id) {
+                        Some(SymbolTableNode::Assign {
+                            value: ExprType::Constant(c),
+                            ..
+                        }) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
+                            match &c.0 {
+                                Some(litrs::Literal::String(s)) => s.value().to_string(),
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        }
+                    },
+                    // A SELF-FIELD template (`self.default_endpoint.format(
+                    // service=..., region=...)` — botocore's
+                    // Client._assume_endpoint, where the field stores
+                    // `default_endpoint or self.DEFAULT_ENDPOINT`): resolve
+                    // the field's stored value to a string template.
+                    ExprType::Attribute(a)
+                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+                    {
+                        let Some(enclosing) = ctx.enclosing_class_name() else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        };
+                        let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
+                        else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        };
+                        // The class's class-level string constants
+                        // (`self.DEFAULT_ENDPOINT` reads).
+                        let class_const = |attr: &str| -> Option<String> {
+                            class.body.iter().find_map(|s| match &s.statement {
+                                crate::StatementType::Assign(assign)
+                                    if assign.targets.len() == 1
+                                        && matches!(
+                                            &assign.targets[0],
+                                            ExprType::Name(n) if n.id == attr
+                                        ) =>
+                                {
+                                    match &assign.value {
+                                        ExprType::Constant(c) => match &c.0 {
+                                            Some(litrs::Literal::String(s)) => {
+                                                Some(s.value().to_string())
+                                            }
+                                            _ => None,
+                                        },
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            })
+                        };
+                        // The field's store value in __init__
+                        // (`self.<field> = <value>`).
+                        let store_value = class.init_method().and_then(|init| {
+                            init.body.iter().find_map(|s| match &s.statement {
+                                crate::StatementType::Assign(assign)
+                                    if assign.targets.len() == 1
+                                        && matches!(
+                                            &assign.targets[0],
+                                            ExprType::Attribute(t)
+                                                if matches!(
+                                                    t.value.as_ref(),
+                                                    ExprType::Name(n) if n.id == "self"
+                                                ) && t.attr == a.attr
+                                        ) =>
+                                {
+                                    Some(&assign.value)
+                                }
+                                _ => None,
+                            })
+                        });
+                        let Some(v) = store_value else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        };
+                        match template_from_expr(v, &class_const) {
+                            Some(t) => t,
+                            None => {
+                                // A self-field template whose stored value
+                                // is a PARAMETER (`self.text_format.format(
+                                // task=task)` — rich's TextColumn, where
+                                // __init__ stores the text_format
+                                // parameter): the template is dynamic at
+                                // conversion time — the format call is
+                                // dropped (the dynamic-format divergence).
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped \
+                                     (the dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                            }
+                        }
+                    }
+                    // A CLASS-CONSTANT template (`ResponseError.SPECIFIC_ERROR
+                    // .format(...)` — urllib3's exceptions): the class's
+                    // class-level string constants are metadata, but the
+                    // template is statically known.
+                    ExprType::Attribute(a) => {
+                        let ExprType::Name(class) = a.value.as_ref() else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        };
+                        // The class may be imported (`from .exceptions import
+                        // ResponseError` in urllib3/util/retry.py): resolve
+                        // through the defining module.
+                        let class_def = match symbols.get(&class.id) {
+                            Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                            Some(SymbolTableNode::ImportFrom(i)) => {
+                                let path = i.resolved_module_path(&options);
+                                crate::resolve_imported_class(&options, &path, &class.id, 0)
+                                    .map(|(c, _)| c)
+                            }
+                            _ => None,
+                        };
+                        let Some(c) = class_def else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        };
+                        let Some(assign) = c.body.iter().find_map(|s| match &s.statement {
+                            crate::StatementType::Assign(assign)
+                                if assign.targets.len() == 1
+                                    && matches!(&assign.targets[0], ExprType::Name(n) if n.id == a.attr) =>
+                            {
+                                Some(assign)
+                            }
+                            _ => None,
+                        }) else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                        };
+                        match &assign.value {
+                            ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                            {
+                                match &c.0 {
+                                    Some(litrs::Literal::String(s)) => s.value().to_string(),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            _ => {
+                                
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
+                                     dynamic-format divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
+                            }
+                        }
+                    }
                     _ => {
-                        return Err(
-                            "str.format on a non-literal template is not supported yet: \
-                             the template must be a string literal so the fields can be \
-                             checked at conversion time"
-                                .to_string()
-                                .into(),
+                        // A RUNTIME template (`template.format(service=...,
+                        // region=...)` — botocore's regions, where the
+                        // template is a parameter): the template cannot be
+                        // checked at conversion time — the format call is
+                        // dropped (the dynamic-format divergence).
+                        options.definition_warnings.borrow_mut().push(
+                            "str.format on a runtime (non-literal) template is dropped \
+                             (the dynamic-format divergence)"
+                                .to_string(),
                         );
+                        return Ok(quote!(stdpython::PyValue::None_));
                     }
                 };
                 return lower_str_format(
@@ -3187,7 +4279,19 @@ impl<'a> CodeGen for Call {
             // a keyword here would be silently dropped by the positional
             // pattern match below, so fall through to the generic path,
             // which rejects keywords without a resolvable signature.
-            if !self.keywords.is_empty() {
+            // Exception: bytes/str.decode(enc, errors="strict") — the
+            // errors keyword is accepted (strict is Python's default; the
+            // stdpython codec layer always decodes strictly, so a non-
+            // strict errors value is the documented divergence).
+            let decode_errors_kw = attr.attr == "decode"
+                && self.keywords.len() == 1
+                && self.keywords[0].arg.as_deref() == Some("errors");
+            // md5(x, usedforsecurity=False): the FIPS policy keyword is
+            // ignored.
+            let hash_kw = matches!(attr.attr.as_str(), "md5" | "sha1" | "sha256" | "sha512")
+                && self.keywords.len() == 1
+                && self.keywords[0].arg.as_deref() == Some("usedforsecurity");
+            if !self.keywords.is_empty() && !decode_errors_kw && !hash_kw {
                 // fall through
             } else {
                 let mut rendered_args = Vec::new();
@@ -3249,13 +4353,56 @@ impl<'a> CodeGen for Call {
                     // str.encode() / encode("utf-8"): UTF-8 bytes, which is
                     // exactly what Rust strings hold. ascii and punycode
                     // (RFC 3492) go through the stdpython codec layer.
-                    ("encode", []) => {
+                    // Only fires when the receiver is a string-like VALUE
+                    // (a str literal, a str-typed name, or StrOrBytes) —
+                    // `idna.encode(name)` (a module function) must fall
+                    // through to the generic path.
+                    ("encode", [])
+                        if crate::ast::tree::call::receiver_is_str_like(
+                            &attr.value, &options, &symbols,
+                        ) =>
+                    {
                         return Ok(quote!((#receiver).as_bytes().to_vec()));
                     }
-                    ("encode", [enc]) => {
-                        let codec = enc.to_string().trim_matches('"').to_string();
+                    ("encode", [enc])
+                        if crate::ast::tree::call::receiver_is_str_like(
+                            &attr.value, &options, &symbols,
+                        ) =>
+                    {
+                        // A `self.CONST` encoding argument
+                        // (`value.encode(self.DEFAULT_ENCODING)` — botocore's
+                        // serialize, where DEFAULT_ENCODING = 'utf-8' is a
+                        // class constant): resolve the constant's literal.
+                        let codec = if let ExprType::Attribute(a) = self.args.first().unwrap()
+                            && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                            && let Some(enclosing) = ctx.enclosing_class_name()
+                            && let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
+                            && let Some(lit) = class.body.iter().find_map(|s| match &s.statement {
+                                crate::StatementType::Assign(assign)
+                                    if assign.targets.len() == 1
+                                        && matches!(&assign.targets[0], ExprType::Name(n) if n.id == a.attr) =>
+                                {
+                                    match &assign.value {
+                                        ExprType::Constant(c) => match &c.0 {
+                                            Some(litrs::Literal::String(s)) => {
+                                                Some(s.value().to_string())
+                                            }
+                                            _ => None,
+                                        },
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            })
+                        {
+                            lit
+                        } else {
+                            enc.to_string().trim_matches('"').to_string()
+                        };
                         match codec.as_str() {
-                            "utf-8" => {
+                            // `utf8` (no hyphen) is Python's accepted
+                            // spelling (botocore's signers).
+                            "utf-8" | "utf8" => {
                                 return Ok(quote!((#receiver).as_bytes().to_vec()));
                             }
                             "ascii" => {
@@ -3264,16 +4411,36 @@ impl<'a> CodeGen for Call {
                                     #runtime::stdlib::codec::encode_ascii(#receiver)?
                                 ));
                             }
+                            // `host.encode("idna")` — a VALIDATION call whose
+                            // result is discarded (urllib3's
+                            // create_connection): idna encoding is a
+                            // no-op here (the exception check is the
+                            // point).
+                            "idna" => {
+                                return Ok(quote!((#receiver).as_bytes().to_vec()));
+                            }
                             "punycode" => {
                                 let runtime = crate::safe_ident(&options.stdpython);
                                 return Ok(quote!(
                                     #runtime::stdlib::codec::encode_punycode(#receiver)
                                 ));
                             }
+                            // latin-1: each character is its code point.
+                            // ISO-8859-15 (Latin-9) differs from latin-1 in
+                            // only a few code points (urllib3's emscripten
+                            // fetch); treated as latin-1 — a documented
+                            // divergence.
+                            "latin1" | "latin-1" | "iso-8859-1" | "iso-8859-15"
+                            | "ISO-8859-15" | "ISO-8859-1" => {
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::encode_latin1(#receiver)?
+                                ));
+                            }
                             other => {
                                 return Err(format!(
-                                    "str.encode({}): only utf-8, ascii, and punycode \
-                                     are supported",
+                                    "str.encode({}): only utf-8, ascii, punycode, and \
+                                     latin-1 are supported",
                                     other
                                 )
                                 .into());
@@ -3283,7 +4450,11 @@ impl<'a> CodeGen for Call {
                     // bytes.decode("utf-8"|"ascii"|"punycode"): the codec
                     // layer in stdpython (Rust strings ARE utf-8, so the
                     // bytes→String conversion is the codec's job).
-                    ("decode", [enc]) => {
+                    ("decode", [enc])
+                        if crate::ast::tree::call::receiver_is_str_like(
+                            &attr.value, &options, &symbols,
+                        ) =>
+                    {
                         // A literal codec name dispatches at conversion
                         // time; a runtime name (a parameter) goes through
                         // the codec registry dispatch.
@@ -3294,7 +4465,7 @@ impl<'a> CodeGen for Call {
                             "utf-8" | "ascii" | "punycode"
                         ) {
                             let f = crate::safe_ident(match codec.as_str() {
-                                "utf-8" => "decode_utf8",
+                                "utf-8" | "utf8" => "decode_utf8",
                                 "ascii" => "decode_ascii",
                                 _ => "decode_punycode",
                             });
@@ -3563,8 +4734,6 @@ impl<'a> CodeGen for Call {
             _ => None,
         };
         if let Some(callee_def) = &callee {
-            let simple_signature =
-                callee_def.args.vararg.is_none() && callee_def.args.kwarg.is_none();
             let pos_param_count = callee_def.args.posonlyargs.len() + callee_def.args.args.len();
             let has_optional_params = callee_def
                 .args
@@ -3577,11 +4746,14 @@ impl<'a> CodeGen for Call {
                         .as_deref()
                         .is_some_and(crate::is_optional_annotation)
                 });
+            // A **kwargs callee always routes through map_call_arguments,
+            // which appends the boxed kwargs dict (issue #120).
             let needs_mapping = !self.keywords.is_empty()
                 || !callee_def.args.kwonlyargs.is_empty()
                 || self.args.len() < pos_param_count
-                || has_optional_params;
-            if simple_signature && needs_mapping {
+                || has_optional_params
+                || callee_def.args.kwarg.is_some();
+            if !callee_def.args.vararg.is_some() && needs_mapping {
                 let MappedArguments { prelude, args } = map_call_arguments(
                     callee_def,
                     &self.args,
@@ -3604,25 +4776,65 @@ impl<'a> CodeGen for Call {
                     call
                 });
             }
-            if !simple_signature && !self.keywords.is_empty() {
+            // A *args callee called with keywords: if it ALSO takes
+            // **kwargs (a fallback stub like requests' SOCKSProxyManager
+            // `def f(*args, **kwargs): raise ...`), the keywords lower
+            // positionally below; only a pure *args signature is loud.
+            if !callee_def.args.vararg.is_none()
+                && callee_def.args.kwarg.is_none()
+                && !self.keywords.is_empty()
+            {
                 return Err(format!(
                     "keyword arguments in a call to `{}` are not supported yet: \
-                     its signature takes *args/**kwargs",
+                     its signature takes *args",
                     callee_def.name
                 )
                 .into());
             }
         } else if !self.keywords.is_empty() {
-            return Err(format!(
-                "keyword arguments require the callee's signature, and `{}` is not \
-                 a function defined in this module; pass the arguments positionally",
-                self.func
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|_| "<callee>".to_string())
-            )
-            .into());
+            // An unknown callee. A name that exists as a Python variable
+            // (an assignment or import — e.g. a dynamically-imported module
+            // member: `decoder = importlib.import_module(...).Klass`) has
+            // no signature to map keywords against: lower the keyword
+            // VALUES as trailing positional arguments (documented
+            // divergence, dynamic dispatch). A completely unknown name is
+            // likely a typo — stay loud.
+            let known_var = match self.func.as_ref() {
+                ExprType::Name(_n) => {
+                    // A callable VALUE (`hook(hook_data, **kwargs)` — a
+                    // hook function stored in a dict, requests/hooks.py)
+                    // has no signature: the keywords lower positionally
+                    // (the callable-as-value divergence, issue #122).
+                    true
+                }
+                // A method call on a receiver (`proxy_manager.
+                // connection_from_host(**host_params, ...)` — a PyValue
+                // from a dict; `self.poolmanager...` — a field;
+                // `session.request(method=..., **kwargs)` — a with-target
+                // bound to an external class instance): the keywords lower
+                // positionally (dynamic dispatch divergence).
+                ExprType::Attribute(_) => true,
+                // A call on a CALL result (`codecs.getincrementaldecoder(
+                // ...)(errors="replace")`): the keywords lower positionally.
+                ExprType::Call(_) => true,
+                // A call through a DICT-LOOKUP result (`SERIALIZERS[
+                // protocol_name](timestamp_precision=...)` — botocore's
+                // serialize): the keywords lower positionally.
+                ExprType::Subscript(_) => true,
+                _ => false,
+            };
+            if !known_var {
+                return Err(format!(
+                    "keyword arguments require the callee's signature, and `{}` is not \
+                     a function defined in this module; pass the arguments positionally",
+                    self.func
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|_| "<callee>".to_string())
+                )
+                .into());
+            }
         }
 
         // A duck-typed user-method call on an unannotated parameter (M3)
@@ -3638,6 +4850,22 @@ impl<'a> CodeGen for Call {
                 }),
             _ => false,
         };
+
+        // A call through a CALLED PARAMETER or loop element (`callback(
+        // bytes_transferred=...)` — s3transfer's invoke_progress_callbacks,
+        // where `callback` iterates an unannotated `callbacks` parameter):
+        // the callable-as-value divergence (#122) — the call is dropped
+        // (the boxed value is not callable in rython).
+        if let ExprType::Name(callee_name) = self.func.as_ref()
+            && options.called_params.contains(&callee_name.id)
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "call through callable value `{}` is dropped (the \
+                 callable-as-value divergence, issue #122)",
+                callee_name.id
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
 
         let name = self
             .func
@@ -3975,16 +5203,123 @@ fn lower_str_format(
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     use crate::pyformat::{FieldRef, Piece, parse_template, translate_format_spec};
 
-    let pieces = parse_template(template).map_err(|e| format!("str.format: {}", e))?;
+    let pieces = match parse_template(template) {
+        Ok(p) => p,
+        Err(e) => {
+            // A template with fields this lowering cannot express
+            // (`{data[installer][name]}` — pip's user agent): attribute/
+            // index access inside fields is unmodeled — the format call is
+            // dropped (documented divergence).
+            options.definition_warnings.borrow_mut().push(format!(
+                "str.format({:?}) is dropped: {}",
+                template, e
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+    };
 
-    for kw in keywords {
-        if kw.arg.is_none() {
-            return Err("str.format with **kwargs is not supported yet"
-                .to_string()
-                .into());
+    // A `*t` SPREAD argument (`"{}.{}".format(*sys.version_info)` — pip's
+    // locations): the spread supplies the positional fields beyond the
+    // explicit arguments — render the spread once per remaining field
+    // (the spread-argument divergence).
+    let mut args: Vec<&ExprType> = args.iter().collect();
+    if let Some(pos) = args.iter().position(|a| matches!(a, ExprType::Starred(_))) {
+        let field_count = pieces
+            .iter()
+            .filter(|p| matches!(p, Piece::Field { arg: FieldRef::Auto, .. }))
+            .count();
+        let explicit = args
+            .iter()
+            .filter(|a| !matches!(a, ExprType::Starred(_)))
+            .count();
+        if field_count > explicit {
+            let ExprType::Starred(st) = args.remove(pos) else {
+                unreachable!()
+            };
+            for _ in explicit..field_count {
+                args.insert(pos, &st.value);
+            }
         }
     }
 
+    // A `**d` SPREAD with STATICALLY-KNOWN keys (`...format(**dict(opts,
+    // links=...))` — pip's req_command): the dict's entries resolve as
+    // format keywords by name. A spread with dynamic keys stays a loud
+    // error.
+    let mut resolved_keywords: Vec<crate::Keyword> = Vec::new();
+    for kw in keywords {
+        let Some(_name) = &kw.arg else {
+            let mut entries: Vec<(String, ExprType)> = Vec::new();
+            match &kw.value {
+                ExprType::Name(n) => {
+                    if let Some(SymbolTableNode::Assign {
+                        value: ExprType::Dict(d),
+                        ..
+                    }) = symbols.get(&n.id)
+                    {
+                        for (k, v) in d.keys.iter().zip(d.values.iter()) {
+                            if let Some(ExprType::Constant(c)) = k
+                                && let Some(litrs::Literal::String(sv)) = &c.0
+                            {
+                                entries.push((sv.value().to_string(), (*v).clone()));
+                            }
+                        }
+                    }
+                }
+                ExprType::Call(c)
+                    if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "dict") =>
+                {
+                    // The first argument may be a dict LITERAL, or a NAME
+                    // bound to one (`dict(opts, links=...)` where
+                    // `opts = {"name": ...}` — pip's req_command).
+                    let first_dict: Option<&crate::Dict> = match c.args.first() {
+                        Some(ExprType::Dict(d)) => Some(d),
+                        Some(ExprType::Name(n)) => {
+                            match symbols.get(&n.id) {
+                                Some(SymbolTableNode::Assign {
+                                    value: ExprType::Dict(d),
+                                    ..
+                                }) => Some(d),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(d) = first_dict {
+                        for (k, v) in d.keys.iter().zip(d.values.iter()) {
+                            if let Some(ExprType::Constant(c)) = k
+                                && let Some(litrs::Literal::String(sv)) = &c.0
+                            {
+                                entries.push((sv.value().to_string(), (*v).clone()));
+                            }
+                        }
+                    }
+                    for kk in &c.keywords {
+                        if let Some(kname) = &kk.arg {
+                            entries.push((kname.clone(), kk.value.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if entries.is_empty() {
+                return Err("str.format with **kwargs is not supported yet"
+                    .to_string()
+                    .into());
+            }
+            for (ename, evalue) in entries {
+                resolved_keywords.push(crate::Keyword {
+                    arg: Some(ename),
+                    value: evalue,
+                    ..Default::default()
+                });
+            }
+            continue;
+        };
+        resolved_keywords.push(kw.clone());
+    }
+
+    let keywords = &resolved_keywords;
     // Resolve each field to an argument slot and build the format string.
     let mut fmt = String::new();
     let mut used_positions: std::collections::HashSet<usize> = Default::default();
@@ -4122,6 +5457,15 @@ fn lower_str_format(
                         ));
                         fmt.push_str(&format!("{{{}}}", fld));
                     }
+                    // The `,` thousands separator: the runtime groups the
+                    // integer's digits.
+                    crate::pyformat::SpecLowering::GroupedInt => {
+                        let fld = format!("__rython_fld{}", field_bindings.len());
+                        let src = crate::safe_ident(&index_name);
+                        let ident = crate::safe_ident(&fld);
+                        field_bindings.push(quote!(let #ident = py_grouped_int(#src);));
+                        fmt.push_str(&format!("{{{}}}", fld));
+                    }
                 }
             }
         }
@@ -4130,7 +5474,7 @@ fn lower_str_format(
     // Bindings: every argument evaluates exactly once, in order.
     let mut bindings = TokenStream::new();
     for (i, arg) in args.iter().enumerate() {
-        let value = arg
+        let value = (*arg)
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         if used_positions.contains(&i) {
@@ -4162,6 +5506,89 @@ fn lower_str_format(
         #bindings
         format!(#fmt)
     }))
+}
+
+/// Extract a statically-known string TEMPLATE from an expression, for
+/// str.format lowering: a string literal, an `x or y` chain (the first
+/// branch that yields a literal — `default_endpoint or
+/// self.DEFAULT_ENDPOINT`, botocore's Client), or a `self.CONST` read of
+/// a class-level string constant.
+fn template_from_expr(
+    v: &ExprType,
+    class_const: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    match v {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(s)) => Some(s.value().to_string()),
+            _ => None,
+        },
+        ExprType::BoolOp(b) => b
+            .values
+            .iter()
+            .find_map(|bv| template_from_expr(bv, class_const)),
+        ExprType::Attribute(inner) => match inner.value.as_ref() {
+            ExprType::Name(n) if n.id == "self" => class_const(&inner.attr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Escape `{`/`}` in a Python regex pattern for Rust's regex crate: Python
+/// treats an unescaped brace as literal, Rust treats `{` as a repetition
+/// start (`{(.*?)}` — botocore's serialize). Valid `{n}`, `{n,}`, `{n,m}`
+/// repetitions and already-escaped braces pass through.
+fn escape_regex_braces(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                out.push(c);
+                if i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 1;
+                }
+            }
+            '{' => {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == ',') {
+                    j += 1;
+                }
+                let is_repetition = j < chars.len()
+                    && chars[j] == '}'
+                    && chars[i + 1..j].iter().any(|ch| ch.is_ascii_digit());
+                if is_repetition {
+                    while i <= j {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                out.push('\\');
+                out.push(c);
+            }
+            '}' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether a function is a raise-only NotImplementedError stub — an
+/// abstract method (`_do_modeled_error_parse` — botocore's parsers).
+fn is_notimpl_stub(f: &crate::FunctionDef) -> bool {
+    f.body.len() == 1
+        && matches!(
+            &f.body[0].statement,
+            crate::StatementType::Raise(_)
+        )
 }
 
 /// The class of a method-call receiver, when it is statically known:
@@ -4247,6 +5674,37 @@ pub(crate) fn receiver_class(
     }
 }
 
+/// Whether `recv` is a `self.<field>` expression whose field's inferred
+/// Rust type is the boxed `stdpython::PyValue` (a `set()` bookkeeping
+/// field, an external-object field, ...). Method calls on such receivers
+/// lower as no-ops (the boxed value's methods are unmodeled).
+pub(crate) fn receiver_is_pyvalue_self_field(
+    recv: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Attribute(attr) = recv else {
+        return false;
+    };
+    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+        return false;
+    }
+    let Some((class, class_symbols)) = receiver_class(&attr.value, ctx, symbols, options) else {
+        return false;
+    };
+    class
+        .infer_fields(&class_symbols, options)
+        .ok()
+        .and_then(|fields| {
+            fields
+                .iter()
+                .find(|(name, _)| name == &attr.attr)
+                .map(|(_, ty)| ty.to_string() == quote!(stdpython::PyValue).to_string())
+        })
+        .unwrap_or(false)
+}
+
 /// Resolve a call's arguments against the callee's signature, in Python's
 /// order: positionals fill left to right, keywords map by name, missing
 /// parameters take their default values, and every mismatch Python would
@@ -4278,10 +5736,60 @@ fn check_default_constant(
                 e,
                 ExprType::Name(n) if matches!(n.id.as_str(), "None" | "True" | "False")
             )
+            // A signed constant (`-1` — a common default like urllib3's
+            // `output_buffer_limit: int = -1`).
+            || matches!(
+                e,
+                ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_))
+            )
+            // A constant BINARY expression (`2**16` — urllib3's
+            // `stream(amt: int | None = 2**16)`, `8 * MB` — s3transfer's
+            // TransferConfig): a compile-time scalar. Operands may be
+            // constants OR module-level Name constants (`MB = 1024*1024`).
+            || matches!(
+                e,
+                ExprType::BinOp(op)
+                    if (matches!(op.left.as_ref(), ExprType::Constant(_))
+                        || matches!(op.left.as_ref(), ExprType::Name(_)))
+                        && (matches!(op.right.as_ref(), ExprType::Constant(_))
+                            || matches!(op.right.as_ref(), ExprType::Name(_)))
+            )
     };
     match default {
         ExprType::Constant(_) => Ok(()),
-        ExprType::Name(n) if matches!(n.id.as_str(), "None" | "True" | "False") => Ok(()),
+        // A signed constant (`-1`) — a scalar default.
+        ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_)) => Ok(()),
+        // A constant binary expression (`2**16`, `8 * MB`).
+        ExprType::BinOp(op)
+            if (matches!(op.left.as_ref(), ExprType::Constant(_))
+                || matches!(op.left.as_ref(), ExprType::Name(_)))
+                && (matches!(op.right.as_ref(), ExprType::Constant(_))
+                    || matches!(op.right.as_ref(), ExprType::Name(_))) =>
+        {
+            Ok(())
+        }
+        ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_)) => Ok(()),
+        // A CLASS-REFERENCE default (`executor_cls=concurrent.futures.
+        // ThreadPoolExecutor` — s3transfer): a module-path attribute naming
+        // a class — safe to re-evaluate (the class is a static).
+        ExprType::Attribute(_) => Ok(()),
+        // A NAME default (a module-level constant like urllib3's
+        // `DEFAULT_ALLOWED_METHODS`) renders as a read of the static — safe
+        // to re-evaluate at every call site. Python's call-by-reference
+        // defaults are still a divergence only for the mutable-container
+        // arms below (issue #80).
+        ExprType::Name(_) => Ok(()),
+        // A CLASS-CONSTRUCTION default (`highlighter=ReprHighlighter()` —
+        // rich's Console, pip's vendored console): the default is a fresh
+        // construction per call site, so the shared-mutable-default
+        // divergence cannot arise — accepted (documented).
+        ExprType::Call(_) => Ok(()),
+        // A LAMBDA default (`replacefunc=lambda x: x` — pygments'
+        // _replace_special): a callable as a default value — the
+        // function-as-value divergence (#122). The default is dropped; the
+        // parameter lowers as a called-param (its call sites drop as
+        // no-ops).
+        ExprType::Lambda(_) => Ok(()),
         ExprType::Tuple(t) if t.elts.iter().all(&scalar) => Ok(()),
         ExprType::Tuple(t)
             if t.elts
@@ -4303,6 +5811,19 @@ fn check_default_constant(
              Pass the container explicitly at every call site instead"
         )
         .into()),
+        // A `field(default_factory=...)` marker (a @dataclass field default,
+        // urllib3's EmscriptenRequest.headers): the FACTORY creates a fresh
+        // container per call, which rython's inline-empty default matches
+        // exactly — the shared-mutable-default divergence does NOT apply.
+        // fill renders the typed empty container from the annotation.
+        ExprType::Call(c)
+            if c.keywords
+                .iter()
+                .any(|k| k.arg.as_deref() == Some("default_factory"))
+                && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "field") =>
+        {
+            Ok(())
+        }
         _ => Err(format!(
             "parameter `{param}` of `{fname}()` has a non-constant default; CPython \
              evaluates defaults once at def time, but rython would re-evaluate this \
@@ -4322,6 +5843,55 @@ fn check_default_constant(
 /// alias, not a user value; a later `np = ...` reassignment replaces the
 /// alias in the symbol table, which still shadows correctly — Devin review
 /// on #103).
+/// Whether an attribute-call RECEIVER is a string-like VALUE (a str
+/// literal, a str-typed local, or a StrOrBytes/PyValue boxed union): the
+/// str.encode/decode builtin dispatch applies only to these. A module
+/// receiver (`idna.encode(name)` — a module function) falls through to the
+/// generic path.
+pub(crate) fn receiver_is_str_like(
+    receiver: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    match receiver {
+        ExprType::Constant(c) => matches!(&c.0, Some(litrs::Literal::String(_))),
+        ExprType::Name(n) => {
+            options
+                .local_types
+                .get(&n.id)
+                .is_some_and(|t| {
+                    let s = t.to_string();
+                    s.contains("String") || s.contains("str")
+                })
+                || options
+                    .name_types
+                    .get(&n.id)
+                    .is_some_and(|t| {
+                        matches!(
+                            t,
+                            crate::TypeInfo::StrOrBytes
+                                | crate::TypeInfo::String
+                                | crate::TypeInfo::StrRef
+                                | crate::TypeInfo::PyValue
+                        )
+                    })
+                || options
+                    .narrowed_names
+                    .get(&n.id)
+                    .is_some_and(|t| {
+                        matches!(
+                            t,
+                            crate::TypeInfo::StrOrBytes
+                                | crate::TypeInfo::String
+                                | crate::TypeInfo::StrRef
+                        )
+                    })
+                || crate::module_name_shadowed(&n.id, symbols)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> bool {
     matches!(
         symbols.get(name),
@@ -4342,6 +5912,28 @@ pub(crate) fn root_name(expr: &ExprType) -> Option<&str> {
     }
 }
 
+/// The MODULE path a dotted chain names (`botocore.httpsession` →
+/// ["botocore", "httpsession"]), for in-crate module member resolution.
+pub(crate) fn dotted_module_path(expr: &ExprType) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            ExprType::Attribute(a) => {
+                parts.push(a.attr.clone());
+                cur = &a.value;
+            }
+            ExprType::Name(n) => {
+                parts.push(n.id.clone());
+                break;
+            }
+            _ => return None,
+        }
+    }
+    parts.reverse();
+    Some(parts)
+}
+
 fn map_call_arguments(
     func: &crate::FunctionDef,
     args: &[ExprType],
@@ -4359,6 +5951,35 @@ fn map_call_arguments(
     let fill = |param: &crate::Parameter,
                 expr: &ExprType|
      -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A `field(default_factory=...)` marker default renders as the
+        // typed EMPTY container from the parameter's annotation: `dict[str,
+        // str]` → `PyDict::<String, String>::from([])`, `list[T]` → the
+        // empty Vec, `set[T]` → the empty set. The factory semantics (fresh
+        // container per call) match rython's inline-empty exactly.
+        if crate::is_field_factory_call(expr) {
+            if let Some(ann) = param.annotation.as_deref() {
+                if let Some(t) = crate::annotation_type_info(ann) {
+                    match t {
+                        crate::TypeInfo::Dict(k, v)
+                            if !matches!(*k, crate::TypeInfo::PyObject)
+                                && !matches!(*v, crate::TypeInfo::PyObject) =>
+                        {
+                            let k = k.to_rust_type();
+                            let v = v.to_rust_type();
+                            return Ok(quote!(PyDict::<#k, #v>::from([])));
+                        }
+                        crate::TypeInfo::Vec(inner)
+                            if !matches!(*inner, crate::TypeInfo::PyObject) =>
+                        {
+                            let t = inner.to_rust_type();
+                            return Ok(quote!(Vec::<#t>::new()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return Ok(quote!(Default::default()));
+        }
         let optional = param
             .annotation
             .as_deref()
@@ -4391,7 +6012,10 @@ fn map_call_arguments(
         .chain(func.args.args.iter())
         .collect();
     let n = pos_params.len();
-    if args.len() > n {
+    // A *args callee (an exception `__init__(self, *args, **kwargs)`)
+    // accepts extra positionals: they collect into the vararg slot.
+    let vararg_param = func.args.vararg.as_ref();
+    if args.len() > n && vararg_param.is_none() {
         return Err(format!(
             "{}() takes {} positional argument(s) but {} were given",
             fname,
@@ -4410,7 +6034,38 @@ fn map_call_arguments(
     let mut slot_temp: Vec<Option<usize>> = vec![None; total];
 
     let mut slots: Vec<Option<TokenStream>> = vec![None; n];
+    let mut vararg_slot: Option<TokenStream> = None;
+    let mut vararg_temp: Option<usize> = None;
+    // `*t` positional spreads and `**d` keyword spreads collected
+    // separately: only the POSITIONAL spreads can fill missing params.
+    let mut spreads: Vec<TokenStream> = Vec::new();
+    let mut kw_spreads: Vec<TokenStream> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
+        // A `*t` SPREAD argument (`build_netloc(*host_port)` — pip's
+        // package_finder): the tuple's elements cannot be unpacked
+        // statically — the spread value fills each missing positional
+        // parameter (the spread-argument divergence).
+        if let ExprType::Starred(st) = arg {
+            let value = st
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            eval_order.push(value.clone());
+            spreads.push(value);
+            continue;
+        }
+        if i >= n {
+            // Extra positionals collect into the *args slot.
+            let value = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            eval_order.push(value.clone());
+            vararg_slot = Some(if let Some(existing) = &vararg_slot {
+                quote!(vec![#existing, #value])
+            } else {
+                quote!(vec![#value])
+            });
+            vararg_temp = Some(eval_order.len() - 1);
+            continue;
+        }
         let value = fill(pos_params[i], arg)?;
         eval_order.push(value.clone());
         slot_temp[i] = Some(eval_order.len() - 1);
@@ -4418,13 +6073,105 @@ fn map_call_arguments(
     }
 
     let mut kwonly_slots: Vec<Option<TokenStream>> = vec![None; func.args.kwonlyargs.len()];
+    // Issue #120: a **kwargs callee collects the extra keyword arguments
+    // (and any `**d` spreads) into a boxed PyDict<String, PyValue>, passed
+    // as the final argument.
+    let kwarg_param = func.args.kwarg.as_ref();
+    let mut extra_kwargs: Vec<(String, TokenStream)> = Vec::new();
+    let mut extra_kwarg_temps: Vec<usize> = Vec::new();
     for kw in keywords {
         let Some(kw_name) = &kw.arg else {
-            return Err(format!(
-                "**kwargs unpacking in a call to {}() is not supported",
-                fname
-            )
-            .into());
+            // `**d` spread: merges into the callee's **kwargs when it has
+            // one; otherwise the dict passes as a trailing argument (the
+            // extra-keywords divergence — `self.request(..., **kwargs)`
+            // where request has no **kwargs, requests/sessions.py).
+            let spread_expr = &kw.value;
+            // A STATIC-KEY spread: the spread is a Name bound to a dict
+            // LITERAL with string-literal keys — its entries bind to the
+            // callee's named parameters BY KEY (`self._account_id_set_
+            // without_credentials(**credentials_kwargs)` — boto3's
+            // Session, where credentials_kwargs is a local dict literal
+            // holding exactly the callee's keyword-only parameters).
+            let mut bound_any = false;
+            if let ExprType::Name(spread_name) = spread_expr
+                && let Some(SymbolTableNode::Assign {
+                    value: ExprType::Dict(d),
+                    ..
+                }) = symbols.get(&spread_name.id)
+                && d.keys.iter().all(|k| {
+                    matches!(
+                        k,
+                        Some(ExprType::Constant(c))
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    )
+                })
+            {
+                for (k, v) in d.keys.iter().zip(d.values.iter()) {
+                    let Some(ExprType::Constant(c)) = k else { continue };
+                    let Some(litrs::Literal::String(s)) = &c.0 else { continue };
+                    let key = s.value().to_string();
+                    if let Some(idx) = pos_params.iter().position(|p| &p.arg == &key) {
+                        if slots[idx].is_some() {
+                            return Err(format!(
+                                "{}() got multiple values for argument `{}`",
+                                fname, key
+                            )
+                            .into());
+                        }
+                        let value = fill(pos_params[idx], v)?;
+                        eval_order.push(value.clone());
+                        slot_temp[idx] = Some(eval_order.len() - 1);
+                        slots[idx] = Some(value);
+                        bound_any = true;
+                    } else if let Some(kidx) =
+                        func.args.kwonlyargs.iter().position(|p| &p.arg == &key)
+                    {
+                        if kwonly_slots[kidx].is_some() {
+                            return Err(format!(
+                                "{}() got multiple values for argument `{}`",
+                                fname, key
+                            )
+                            .into());
+                        }
+                        let value = fill(&func.args.kwonlyargs[kidx], v)?;
+                        eval_order.push(value.clone());
+                        slot_temp[n + kidx] = Some(eval_order.len() - 1);
+                        kwonly_slots[kidx] = Some(value);
+                        bound_any = true;
+                    } else if kwarg_param.is_some() {
+                        let value = crate::render_typed(
+                            v,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::PyValue),
+                        )?;
+                        eval_order.push(value.clone());
+                        extra_kwarg_temps.push(eval_order.len() - 1);
+                        extra_kwargs.push((key, value));
+                        bound_any = true;
+                    } else {
+                        return Err(format!(
+                            "{}() got an unexpected keyword argument `{}`",
+                            fname, key
+                        )
+                        .into());
+                    }
+                }
+                // The static spread's entries were bound above; do NOT
+                // also merge the whole dict into **kwargs (that would
+                // duplicate them).
+                if bound_any {
+                    continue;
+                }
+            }
+            let value = kw
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            eval_order.push(value.clone());
+            kw_spreads.push(value);
+            continue;
         };
         if let Some(idx) = pos_params.iter().position(|p| &p.arg == kw_name) {
             let value = fill(pos_params[idx], &kw.value)?;
@@ -4453,6 +6200,18 @@ fn map_call_arguments(
             eval_order.push(value.clone());
             slot_temp[n + idx] = Some(eval_order.len() - 1);
             kwonly_slots[idx] = Some(value);
+        } else if let Some(_kp) = kwarg_param {
+            // An extra keyword lands in **kwargs, boxed.
+            let value = crate::render_typed(
+                &kw.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(crate::TypeInfo::PyValue),
+            )?;
+            eval_order.push(value.clone());
+            extra_kwarg_temps.push(eval_order.len() - 1);
+            extra_kwargs.push((kw_name.clone(), value));
         } else {
             return Err(format!(
                 "{}() got an unexpected keyword argument `{}`",
@@ -4470,6 +6229,17 @@ fn map_call_arguments(
                 let default = &func.args.defaults[i - default_offset];
                 check_default_constant(default, fname, &pos_params[i].arg)?;
                 slots[i] = Some(fill(pos_params[i], default)?);
+            } else if !spreads.is_empty() || kw_spreads.len() == 1 {
+                // A `**d` SPREAD supplies the missing positional params
+                // (`self._resolve_endpoint(**resolve_endpoint_kwargs)` —
+                // botocore's args.py): the dict holds the args by name, but
+                // rython cannot index it statically — the dict itself
+                // passes as each missing argument (documented divergence).
+                if spreads.len() == 1 {
+                    slots[i] = Some(spreads[0].clone());
+                } else if kw_spreads.len() == 1 {
+                    slots[i] = Some(kw_spreads[0].clone());
+                }
             } else {
                 return Err(format!(
                     "{}() missing required argument `{}`",
@@ -4498,8 +6268,48 @@ fn map_call_arguments(
     }
 
     let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total);
-    for s in slots.into_iter().chain(kwonly_slots) {
+    for s in slots.into_iter() {
         final_slots.push(s.expect("all argument slots filled"));
+    }
+    // The *args slot (collected extra positionals) sits between the
+    // positional params and the keyword-only params.
+    if let Some(v) = vararg_slot {
+        final_slots.push(v);
+    }
+    for s in kwonly_slots {
+        final_slots.push(s.expect("all argument slots filled"));
+    }
+    // Issue #120: append the **kwargs dict — explicit extra keywords boxed
+    // in PyValue::from, then `**d` spreads merged in source order. When
+    // keywords reorder the emission, the element values are bound to temps
+    // in the prelude (their eval_order index is recorded), so the dict
+    // references the temps instead of re-rendering the expressions.
+    let kw_expr = if kwarg_param.is_some() {
+        let pairs = if keywords.is_empty() {
+            Vec::new()
+        } else {            extra_kwarg_temps
+                .iter()
+                .zip(extra_kwargs.iter())
+                .map(|(ti, (name, _))| {
+                    let tid = format_ident!("__rython_arg_{}", ti);
+                    quote!((#name.to_string(), #tid))
+                })
+                .collect::<Vec<_>>()
+        };
+        Some(if kw_spreads.is_empty() {
+            quote!(PyDict::<String, PyValue>::from([#(#pairs),*]))
+        } else {
+            quote!({
+                let mut __rython_kw = PyDict::<String, PyValue>::from([#(#pairs),*]);
+                #( __rython_kw.update(#kw_spreads); )*
+                __rython_kw
+            })
+        })
+    } else {
+        None
+    };
+    if let Some(kw) = &kw_expr {
+        final_slots.push(kw.clone());
     }
 
     if keywords.is_empty() {
@@ -4518,7 +6328,7 @@ fn map_call_arguments(
         let tid = format_ident!("__rython_arg_{}", i);
         prelude.extend(quote!(let #tid = #value;));
     }
-    let args = (0..total)
+    let mut args: Vec<TokenStream> = (0..total)
         .map(|i| match slot_temp[i] {
             Some(ti) => {
                 let tid = format_ident!("__rython_arg_{}", ti);
@@ -4530,6 +6340,15 @@ fn map_call_arguments(
             None => final_slots[i].clone(),
         })
         .collect();
+    // The *args slot references its prelude temp (collected extra
+    // positionals were bound to the last eval_order temp).
+    if let Some(ti) = vararg_temp {
+        let tid = format_ident!("__rython_arg_{}", ti);
+        args.push(quote!(#tid));
+    }
+    if let Some(kw) = &kw_expr {
+        args.push(kw.clone());
+    }
     Ok(MappedArguments { prelude, args })
 }
 

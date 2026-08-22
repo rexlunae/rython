@@ -197,6 +197,12 @@ pub struct PythonOptions {
     pub duck_methods_on_params:
         std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 
+    /// The CURRENT function's unannotated parameters (and loop elements)
+    /// CALLED as functions (`callback(...)` — s3transfer's
+    /// invoke_progress_callbacks): the callable-as-value divergence (#122) —
+    /// such calls lower to a dropped no-op at the call site.
+    pub called_params: std::rc::Rc<std::collections::HashSet<String>>,
+
     /// Emit #[deprecated] notes on generated items whose conversion was
     /// lossy (dropped parameter defaults, ignored return annotations, ...).
     /// On by default: silent semantic divergence from the Python source is
@@ -223,12 +229,28 @@ pub struct PythonOptions {
     /// Option's inner type. Threaded by the function body loop and by
     /// If::to_rust (the body narrows from the test).
     pub narrowed_names: std::rc::Rc<std::collections::HashMap<String, crate::TypeInfo>>,
+    /// Generator lowering (issue #122-family): when set, `yield x` in a
+    /// function body renders as `push(x)` on this collector and `yield
+    /// from xs` as `extend(xs)`; the function codegen emits the collector
+    /// Vec and returns it (a generator builds-and-returns its list).
+    pub generator_collector: std::rc::Rc<Option<String>>,
+    /// When rendering a dict literal, force its key/value types (issue
+    /// #121): a store into a `dict[str, Any]` name sets this to
+    /// (String, PyValue) so mixed values wrap per element, and a
+    /// `dict[str, str]` annotation pins the types of an all-spread
+    /// literal (`{**aliases, **{...}}`). None = infer from the literal.
+    pub dict_forced_kv: std::rc::Rc<Option<(crate::TypeInfo, crate::TypeInfo)>>,
 
     /// Whether the CURRENT function's return annotation is `str`: returning
     /// an attribute chain then clones the String field out of the shared
     /// receiver. Python strings are immutable, so the clone reproduces
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
+
+    /// The CURRENT function's resolved return type is the boxed PyValue:
+    /// `return None` lowers to `PyValue::None_` and other returns wrap in
+    /// `PyValue::from` (the None-mixing unification).
+    pub fn_return_is_pyvalue: bool,
 
     /// The current module's package path within the generated crate
     /// ("" for the crate root, "pkg" for pkg/__init__.py, "pkg.sub" for
@@ -383,12 +405,16 @@ impl Default for PythonOptions {
                 std::collections::HashSet::new(),
             )),
             duck_methods_on_params: std::rc::Rc::new(std::collections::HashMap::new()),
+            called_params: std::rc::Rc::new(std::collections::HashSet::new()),
             lossy_warnings: true,
             owned_str_literals: std::rc::Rc::new(std::collections::HashSet::new()),
             definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
+            dict_forced_kv: std::rc::Rc::new(None),
+            generator_collector: std::rc::Rc::new(None),
             clone_str_attribute_returns: false,
+            fn_return_is_pyvalue: false,
             module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,

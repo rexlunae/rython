@@ -82,6 +82,31 @@ impl<'a> CodeGen for Assign {
                         continue;
                     }
                 }
+                // A LATER rebinding of a class name (urllib3's
+                // `if not ssl: HTTPSConnection = DummyConnection` fallback)
+                // must not overwrite the ClassDef symbol: the class is the
+                // compile-time type, and its own methods resolve `super()`
+                // through this symbol. The runtime store is a no-op (see
+                // to_rust) — a documented classes-as-values divergence.
+                if matches!(symbols.get(&name.id), Some(SymbolTableNode::ClassDef(_))) {
+                    continue;
+                }
+                // A module-level CLASS ALIAS (`VerifiedHTTPSConnection =
+                // HTTPSConnection`) registers the name as an Alias so
+                // construction/isinstance/type resolution follows it; the
+                // assignment itself emits nothing (classes cannot be
+                // runtime values — documented divergence).
+                if let ExprType::Name(n) = &self.value
+                    && matches!(
+                        symbols.get(&n.id),
+                        Some(SymbolTableNode::ClassDef(_))
+                            | Some(SymbolTableNode::Alias(_))
+                            | Some(SymbolTableNode::ImportFrom(_))
+                    )
+                {
+                    symbols.insert(name.id, SymbolTableNode::Alias(n.id.clone()));
+                    continue;
+                }
                 symbols.insert(
                     name.id,
                     SymbolTableNode::Assign {
@@ -165,12 +190,52 @@ impl<'a> CodeGen for Assign {
             return synth.to_rust(ctx, options, symbols);
         }
 
+        // A store whose target is a CLASS NAME (urllib3's
+        // `if not ssl: HTTPSConnection = DummyConnection` fallback) or a
+        // CLASS ALIAS (`VerifiedHTTPSConnection = HTTPSConnection`) is a
+        // classes-as-values divergence: classes are compile-time types, not
+        // runtime values, so the rebinding has no Rust analogue. Emit
+        // nothing — loudly, never silently (the -W channel carries it).
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && matches!(
+                symbols.get(&target.id),
+                Some(SymbolTableNode::ClassDef(_)) | Some(SymbolTableNode::Alias(_))
+            )
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "assignment to class name `{}` is dropped (classes cannot be \
+                 runtime values in rython)",
+                target.id
+            ));
+            return Ok(TokenStream::new());
+        }
+
         let value_is_none_early = crate::is_none_expr(&self.value);
         let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
         let value_expr = self.value.clone();
+        // Issue #121: a dict literal stored into a `dict[str, Any]` name
+        // (whose value type is the boxed PyValue) forces the literal's
+        // value type so mixed values wrap in PyValue::from per element.
+        let mut value_options = options.clone();
+        if let [ExprType::Name(name)] = self.targets.as_slice()
+            && let Some(crate::TypeInfo::Dict(k, v)) = options.name_types.get(&name.id)
+        {
+            // Issue #121: a dict literal stored into a `dict[K, V]` name
+            // forces the literal's element types — mixed values wrap in
+            // PyValue::from, and an all-spread literal (`{**a, **b}`)
+            // takes its key/value types from the annotation.
+            if matches!(**v, crate::TypeInfo::PyValue)
+                || matches!(&value_expr, ExprType::Dict(d) if d.keys.iter().any(|k| k.is_none()))
+            {
+                value_options.dict_forced_kv =
+                    std::rc::Rc::new(Some(((**k).clone(), (**v).clone())));
+            }
+        }
         let mut value = self
             .value
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            .clone()
+            .to_rust(ctx.clone(), value_options, symbols.clone())?;
 
         // `x = []` / `x = {}` with a pinned element type (from a later
         // append/insert/indexed-store/use, or a later typed assignment):
@@ -186,6 +251,7 @@ impl<'a> CodeGen for Assign {
                 _ => false,
             };
             if empty_literal {
+                let is_empty_dict = matches!(&value_expr, ExprType::Dict(d) if d.keys.is_empty());
                 // name_types carries the FINAL per-name type: later typed
                 // assignments and pinning uses both refine it, so an empty
                 // store is rendered against the binding's final type.
@@ -200,6 +266,11 @@ impl<'a> CodeGen for Assign {
                     other => other.clone(),
                 };
                 match pinned {
+                    // A PyValue-typed name (`data: _t.DataType` storing
+                    // `{}`): a generic empty dict — the store wraps it.
+                    Some(crate::TypeInfo::PyValue) if is_empty_dict => {
+                        value = quote!(PyDict::<String, PyValue>::from([]));
+                    }
                     Some(crate::TypeInfo::Vec(inner)) if !matches!(*inner, crate::TypeInfo::PyObject) => {
                         let t = inner.to_rust_type();
                         value = quote!(Vec::<#t>::new());
@@ -212,15 +283,68 @@ impl<'a> CodeGen for Assign {
                         let v = v.to_rust_type();
                         value = quote!(PyDict::<#k, #v>::from([]));
                     }
-                    Some(_) | None => {
-                        return Err(format!(
-                            "empty container literal has no inferable element type; \
-                             annotate the variable (e.g. `{}: list[float] = []` or \
-                             `{}: dict[str, int] = {{}}`) or add a use that pins \
-                             the type (`{}.append(...)`, `{}[k] = v`)",
-                            name.id, name.id, name.id, name.id
-                        )
-                        .into());
+                    // A dict pinned with a KNOWN key but an UNKNOWN value
+                    // (`modeled_actions[modeled_action.name] = ...` where
+                    // the value is a foreign-class object — boto3's
+                    // document_actions): the value boxes into PyValue.
+                    Some(crate::TypeInfo::Dict(k, _))
+                        if !matches!(*k, crate::TypeInfo::PyObject) =>
+                    {
+                        let k = k.to_rust_type();
+                        value = quote!(PyDict::<#k, stdpython::PyValue>::from([]));
+                    }
+                    pinned => {
+                        // An empty container with an UNRESOLVABLE or absent
+                        // element type (an unannotated param/local, a
+                        // module-level value flowing across functions, or a
+                        // PyObject-pinned local that is later reassigned
+                        // from a foreign value — boto3's
+                        // underlying_operation_members): the boxed
+                        // heterogeneous container (documented divergence).
+                        let unresolved = !options
+                            .name_types
+                            .contains_key(&name.id)
+                            && !options.param_type_vars.contains_key(&name.id)
+                            || matches!(&pinned, Some(crate::TypeInfo::PyObject))
+                            // A name pinned to a SCALAR while storing an
+                            // empty container (`empty_value = []` and later
+                            // `empty_value = ''` — botocore's paginate):
+                            // genuinely mixed — the boxed container
+                            // (documented divergence).
+                            || matches!(&pinned, Some(t)
+                                if !matches!(
+                                    t,
+                                    crate::TypeInfo::Vec(_)
+                                        | crate::TypeInfo::Dict(_, _)
+                                        | crate::TypeInfo::PyObject
+                                        | crate::TypeInfo::Option(_)
+                                ))
+                            || matches!(&pinned, Some(crate::TypeInfo::Vec(inner))
+                                if matches!(**inner, crate::TypeInfo::PyObject))
+                            || matches!(&pinned, Some(crate::TypeInfo::Dict(k, _))
+                                if matches!(**k, crate::TypeInfo::PyObject));
+                        if unresolved {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "`{} = []`/`{{}}` has no inferable element type; \
+                                 lowering as Vec<PyValue>/PyDict<String, PyValue> \
+                                 (documented divergence)",
+                                name.id
+                            ));
+                            value = if is_empty_dict {
+                                quote!(PyDict::<String, PyValue>::from([]))
+                            } else {
+                                quote!(Vec::<stdpython::PyValue>::new())
+                            };
+                        } else {
+                            return Err(format!(
+                                "empty container literal has no inferable element type; \
+                                 annotate the variable (e.g. `{}: list[float] = []` or \
+                                 `{}: dict[str, int] = {{}}`) or add a use that pins \
+                                 the type (`{}.append(...)`, `{}[k] = v`)",
+                                name.id, name.id, name.id, name.id
+                            )
+                            .into());
+                        }
                     }
                 }
             }
@@ -244,6 +368,31 @@ impl<'a> CodeGen for Assign {
             &value_expr,
             ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_)))
         );
+        // A None store into a PyValue-typed FIELD (`self.current_buffer =
+        // None` — urllib3's emscripten fetch, later filled with a JS value):
+        // the boxed value absorbs None (`PyValue::None_`). Only wraps when
+        // the attribute's class field type is PyValue; Option-typed fields
+        // keep plain `None`.
+        let attr_field_is_pyvalue = |target: &ExprType| -> bool {
+            let ExprType::Attribute(attr) = target else {
+                return false;
+            };
+            let Some((class, class_symbols)) =
+                crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+            else {
+                return false;
+            };
+            class
+                .infer_fields(&class_symbols, &options)
+                .ok()
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == &attr.attr)
+                        .map(|(_, ty)| ty.to_string() == quote!(stdpython::PyValue).to_string())
+                })
+                .unwrap_or(false)
+        };
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -265,6 +414,22 @@ impl<'a> CodeGen for Assign {
                 // accessors (`*self.x_mut(), *self.y_mut()`), not through
                 // clones of the fields.
                 ExprType::Tuple(tuple) => {
+                    // A destructuring target containing a SLICE subscript
+                    // (`self._left[left:right], self._right[left:right] =
+                    // [start], [end]` — pip's lazy_wheel): the slice store
+                    // has no rython lowering — the whole assignment drops
+                    // (documented divergence).
+                    if tuple.elts.iter().any(|e| {
+                        matches!(e, ExprType::Subscript(s)
+                            if matches!(s.kind, crate::SubscriptKind::Slice { .. }))
+                    }) {
+                        options.definition_warnings.borrow_mut().push(
+                            "a destructuring assignment with a slice target is dropped \
+                             (no rython equivalent)"
+                                .to_string(),
+                        );
+                        return Ok(TokenStream::new());
+                    }
                     let mut elts = Vec::with_capacity(tuple.elts.len());
                     for elt in &tuple.elts {
                         elts.push(crate::ast::tree::attribute::to_rust_place_expr(
@@ -306,7 +471,23 @@ impl<'a> CodeGen for Assign {
             };
             Ok(match target {
                 ExprType::Name(name) => {
-                    if !value_is_none
+                    // Issue #121: a name holding a boxed PyValue (wider
+                    // union or Any) wraps its stores — `PyValue::from(v)`,
+                    // None as `PyValue::None_`. A value that already yields
+                    // a PyValue stores through unchanged.
+                    if options
+                        .name_types
+                        .get(&name.id)
+                        .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
+                    {
+                        if value_is_none_early {
+                            quote!(#target_code = PyValue::None_;)
+                        } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {
+                            quote!(#target_code = #value;)
+                        } else {
+                            quote!(#target_code = PyValue::from(#value);)
+                        }
+                    } else if !value_is_none
                         && !value_yields_option
                         && options.optional_names.contains(&name.id)
                     {
@@ -325,6 +506,12 @@ impl<'a> CodeGen for Assign {
                 // Destructuring assignment to the hoisted names. `target_code`
                 // is already the parenthesized element list.
                 ExprType::Tuple(_) => quote!(#target_code = #value;),
+                // A None store into a PyValue-typed field (`self.current_buffer
+                // = None`) wraps in PyValue::None_ (the boxed value absorbs
+                // None); Option-typed fields keep the plain None store.
+                ExprType::Attribute(_) if value_is_none_early && attr_field_is_pyvalue(target) => {
+                    quote!(#target_code = PyValue::None_;)
+                }
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
                 }
@@ -339,6 +526,23 @@ impl<'a> CodeGen for Assign {
         let render_subscript_store = |sub: &crate::Subscript,
                                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // The dynamic-import machinery (`locals()[pkg] = ...`,
+            // `sys.modules[...] = ...` — requests/packages.py) is a
+            // documented divergence: the stores are no-ops (the module
+            // aliasing has no rython equivalent).
+            let is_dynamic_import_store = match sub.value.as_ref() {
+                ExprType::Call(c) => {
+                    matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "locals")
+                }
+                ExprType::Attribute(a) => {
+                    a.attr == "modules"
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "sys")
+                }
+                _ => false,
+            };
+            if is_dynamic_import_store {
+                return Ok(quote!(()));
+            }
             // The receiver must be a PLACE (nested subscripts thread
             // through py_index_mut): the Load lowering would clone, and the
             // store would silently land on the clone.
@@ -362,6 +566,19 @@ impl<'a> CodeGen for Assign {
                         && !crate::ast::tree::call::root_name(&a.value)
                             .is_some_and(|root| crate::module_name_shadowed(root, &symbols))
             );
+            // Issue #121: a store into a PyDict<K, PyValue> (`dict[str,
+            // Any]`) wraps the value (`PyValue::from(v)`, None via `()`).
+            let value = if let ExprType::Name(n) = sub.value.as_ref()
+                && matches!(
+                    options.name_types.get(&n.id),
+                    Some(crate::TypeInfo::Dict(_, v)) if matches!(**v, crate::TypeInfo::PyValue)
+                )
+                && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
+            {
+                quote!(PyValue::from(#value))
+            } else {
+                value.clone()
+            };
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
                     // String-keyed dicts store `&str` indexes through
@@ -397,11 +614,18 @@ impl<'a> CodeGen for Assign {
                         (#receiver).py_set_index(#index, __rython_val)?;
                     }))
                 }
-                crate::SubscriptKind::Slice { .. } => Err(
-                    "slice assignment (`x[a:b] = ...`) is not yet supported"
-                        .to_string()
-                        .into(),
-                ),
+                crate::SubscriptKind::Slice { .. } => {
+                    // Slice assignment (`memoryview(byte_obj)[0:n] =
+                    // subarray` — urllib3's emscripten fetch loop) has no
+                    // rython lowering: a no-op with a warning (documented
+                    // divergence) instead of failing the module.
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "slice assignment (`{:?}[a:b] = ...`) is dropped (no \
+                         rython equivalent)",
+                        sub.value
+                    ));
+                    Ok(TokenStream::new())
+                }
             }
         };
 
@@ -458,17 +682,36 @@ impl<'a> CodeGen for Assign {
             // A container literal would break the aliasing semantics: Python
             // shares ONE object across all targets, while the lowering must
             // clone per target — later mutations through one name would
-            // silently diverge. That is a loud conversion error, not a
-            // silent divergence (issue #80).
+            // silently diverge. That is the documented aliasing divergence
+            // (issues #79/#104), reported as a warning; the lowering binds
+            // the literal once and clones per target (`result[key] =
+            // entries = {}` — distlib's read_exports, the insert-and-build
+            // idiom). An EMPTY container in a chain is boxed (its element
+            // type cannot be pinned through the chain's multiple targets).
             if is_container_literal(&value_expr) {
-                return Err(
-                    "chained assignment to a container literal (`a = b = [...]`) \
-                     cannot preserve Python's shared aliasing: rython would give \
-                     each target a separate copy. Assign the literal to one name \
-                     first, then copy it to the others"
-                        .to_string()
-                        .into(),
-                );
+                options.definition_warnings.borrow_mut().push(format!(
+                    "chained assignment to a container literal (`a = b = {:?}`) \
+                     cannot preserve Python's shared aliasing: each target \
+                     receives its own copy (the documented aliasing divergence, \
+                     issues #79/#104)",
+                    value_expr
+                ));
+                let empty_dict = matches!(&value_expr, ExprType::Dict(d) if d.keys.is_empty());
+                let empty_list = matches!(&value_expr, ExprType::List(l) if l.is_empty());
+                let chain_value = if empty_dict || empty_list {
+                    if empty_dict {
+                        quote!(PyDict::<String, PyValue>::from([]))
+                    } else {
+                        quote!(Vec::<stdpython::PyValue>::new())
+                    }
+                } else {
+                    value
+                };
+                let mut stream = quote!(let __rython_chain = #chain_value;);
+                for target in &self.targets {
+                    stream.extend(render(target, &quote!(__rython_chain.clone()))?);
+                }
+                return Ok(stream);
             }
             let mut stream = quote!(let __rython_chain = #value;);
             for target in &self.targets {

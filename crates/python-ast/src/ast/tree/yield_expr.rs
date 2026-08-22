@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
 };
+use quote::quote;
 
 /// Yield expression (yield value)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -99,12 +100,21 @@ impl CodeGen for Yield {
 
     fn to_rust(
         self,
-        _ctx: Self::Context,
-        _options: Self::Options,
-        _symbols: Self::SymbolTable,
+        ctx: Self::Context,
+        options: Self::Options,
+        symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // A generator silently becoming a plain function is exactly the kind
-        // of divergence that must fail loudly instead.
+        // Generator lowering: a `yield x` inside a function whose body the
+        // function codegen rewrote becomes `push(x)` on the collector Vec
+        // (issue #122-family — generators build-and-return a list).
+        if let Some(collector) = options.generator_collector.as_ref() {
+            let collector = proc_macro2::Ident::new(collector, proc_macro2::Span::call_site());
+            let value = match self.value.as_ref() {
+                Some(v) => v.clone().to_rust(ctx, options, symbols)?,
+                None => return Ok(quote!(#collector)),
+            };
+            return Ok(quote!(#collector . push (#value)));
+        }
         Err(
             "generators (`yield`) are not supported yet: the function would \
              silently evaluate a single value instead of producing a \
@@ -126,17 +136,26 @@ impl CodeGen for YieldFrom {
 
     fn to_rust(
         self,
-        _ctx: Self::Context,
-        _options: Self::Options,
-        _symbols: Self::SymbolTable,
+        ctx: Self::Context,
+        options: Self::Options,
+        symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        Err(
-            "generators (`yield from`) are not supported yet: the function \
-             would silently evaluate the iterable once instead of delegating \
-             to it. Rewrite it to build and return a list."
-                .to_string()
-                .into(),
-        )
+        // Generator lowering: `yield from xs` extends the collector Vec.
+        // Outside a generator (a `__iter__` that is ONLY `yield from xs`,
+        // charset_normalizer's CharsetMatches) it lowers to returning the
+        // collection directly.
+        if let Some(collector) = options.generator_collector.as_ref() {
+            let collector = proc_macro2::Ident::new(collector, proc_macro2::Span::call_site());
+            let value = self.value.to_rust(ctx, options.clone(), symbols)?;
+            return Ok(quote!(#collector . extend (#value)));
+        }
+        let value = self.value.to_rust(ctx, options, symbols)?;
+        Ok(proc_macro2::TokenStream::from_iter(
+            std::iter::once(proc_macro2::TokenTree::Ident(
+                proc_macro2::Ident::new("return", proc_macro2::Span::call_site()),
+            ))
+            .chain(value.into_iter()),
+        ))
     }
 }
 

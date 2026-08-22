@@ -95,7 +95,9 @@ fn future_import_is_a_noop() {
 fn metaclass_abcmata_is_a_lossy_noop() {
     // `metaclass=abc.ABCMeta` only enforces abstract-method instantiation
     // at runtime; lowering the class as a plain class keeps data+methods
-    // (pip's BuildEnvironment). Other class keywords are loud errors.
+    // (pip's BuildEnvironment). ANY metaclass keyword is a lossy no-op now:
+    // the class lowers as a plain struct and the -W channel reports the
+    // dropped metaclass machinery.
     let src = concat!(
         "import abc\n",
         "\n",
@@ -110,19 +112,19 @@ fn metaclass_abcmata_is_a_lossy_noop() {
         out
     );
 
-    let module = parse("class Bad(metaclass=SomeMeta):\n    pass\n", "meta_bad.py").unwrap();
-    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-    let err = module
-        .to_rust(
-            CodeGenContext::Module("meta_bad".to_string()),
-            PythonOptions::default(),
-            symbols,
-        )
-        .expect_err("a non-ABCMeta class keyword must be a loud error");
+    let (out, warnings) = compile_with_warnings(
+        "class Bad(metaclass=SomeMeta):\n    pass\n",
+        "meta_bad.py",
+    );
     assert!(
-        err.to_string().contains("class keyword"),
-        "error must mention the class keyword: {}",
-        err
+        out.contains("struct Bad"),
+        "a non-ABCMeta metaclass name must not block conversion: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("metaclass") && w.contains("dropped")),
+        "the dropped-metaclass divergence must be reported through -W: {:?}",
+        warnings
     );
 }
 
@@ -881,6 +883,26 @@ fn compile(src: &str, name: &str) -> String {
         .to_string()
 }
 
+/// Compile and return (generated Rust, the `-W` definition warnings pushed
+/// during inference/codegen). `definition_warnings` is an Rc shared across
+/// option clones, so reading the original options after codegen collects
+/// everything the transpiler would report through the -W channel.
+fn compile_with_warnings(src: &str, name: &str) -> (String, Vec<String>) {
+    let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed for {:?}: {}", src, e));
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions::default();
+    let out = module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            options.clone(),
+            symbols,
+        )
+        .unwrap_or_else(|e| panic!("codegen failed for {:?}: {}", src, e))
+        .to_string();
+    let warnings = options.definition_warnings.borrow().clone();
+    (out, warnings)
+}
+
 #[test]
 fn power_uses_py_pow() {
     let out = compile("y = 2 ** 3", "pow.py");
@@ -961,12 +983,14 @@ fn len_append_pins_empty_list_to_i64() {
 }
 
 #[test]
-fn field_named_base_in_hierarchy_is_a_loud_error() {
+fn field_named_base_in_hierarchy_converts_with_a_collision_warning() {
     // A class that inherits and also stores an attribute named `base`
-    // would generate two `fn base` trait items (the embedded-base accessor
-    // plus the field accessor) — E0428 in rustc. It must be a clean
-    // conversion-time error, like the `__rython_base` field collision.
-    let err = compile_err(
+    // used to be a clean conversion-time error (the embedded-base accessor
+    // and the field accessor would both be `fn base`). Now the collision is
+    // a documented divergence: the field is a pub struct field, the
+    // embedded-base accessor stays a trait item, the field's OWN trait
+    // accessors are skipped, and the -W channel reports it.
+    let (out, warnings) = compile_with_warnings(
         "class Animal:\n\
          \x20   def __init__(self):\n\
          \x20       self.name = 'x'\n\
@@ -976,13 +1000,21 @@ fn field_named_base_in_hierarchy_is_a_loud_error() {
         "basefield.py",
     );
     assert!(
-        err.contains("attribute named `base`") && err.contains("base accessor"),
-        "expected loud base-field collision error, got: {}",
-        err
+        out.contains("pub struct Dog") && out.contains("pub base : i64")
+            && out.contains("pub __rython_base : Animal"),
+        "the base field and the embedded base must coexist: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("field `base` of `Dog`") && w.contains("collides")),
+        "the collision must be reported through -W: {:?}",
+        warnings
     );
     // `base_mut` collides the same way; `base` on a BASE-LESS class is fine
     // (no embedded-base accessor is emitted).
-    let err = compile_err(
+    let (out, warnings) = compile_with_warnings(
         "class Animal:\n\
          \x20   def __init__(self):\n\
          \x20       self.name = 'x'\n\
@@ -992,9 +1024,16 @@ fn field_named_base_in_hierarchy_is_a_loud_error() {
         "basemutfield.py",
     );
     assert!(
-        err.contains("attribute named `base_mut`"),
-        "expected loud base_mut-field collision error, got: {}",
-        err
+        out.contains("pub base_mut : i64") && out.contains("pub __rython_base : Animal"),
+        "the base_mut field and the embedded base must coexist: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`base_mut`") && w.contains("collides")),
+        "the base_mut collision must be reported through -W: {:?}",
+        warnings
     );
     let out = compile(
         "class Base:\n\
@@ -1158,48 +1197,60 @@ fn empty_dict_pinned_by_subscript_store_is_typed() {
 }
 
 #[test]
-fn unpinned_empty_container_is_a_loud_error() {
-    // Issue #77: `x = []` with no use that could pin the element type is
-    // a conversion-time error with a helpful message, not a cryptic rustc
-    // "type annotations needed" inside generated code.
-    let err = compile_err("def f():\n    x = []\n    return x\n", "issue77.py");
+fn unpinned_empty_container_lowers_as_a_boxed_pyvalue_vec() {
+    // Issue #77: `x = []` with no use that could pin the element type used
+    // to be a conversion-time error. It now converts as the boxed-container
+    // divergence: `Vec<PyValue>`, with the -W channel reporting the lossy
+    // type.
+    let (out, warnings) = compile_with_warnings("def f():\n    x = []\n    return x\n", "issue77.py");
     assert!(
-        err.contains("no inferable element type"),
-        "expected loud empty-container error, got: {}",
-        err
+        out.contains("Vec :: < stdpython :: PyValue > :: new ()"),
+        "the empty list must lower as Vec<PyValue>: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("no inferable element type") && w.contains("Vec<PyValue>")),
+        "the boxed-container divergence must be reported through -W: {:?}",
+        warnings
     );
 }
 
 #[test]
-fn bare_container_annotation_is_a_loud_error() {
-    // Issue #76 companion: `def f(xs: list)` would emit `xs: list` —
-    // invalid Rust — so it is a loud conversion-time error directing the
-    // user to subscripted annotations, not a rustc failure.
-    let err = compile_err(
+fn bare_container_annotation_lowers_as_the_bare_name() {
+    // Issue #76 companion: `def f(xs: list)` used to be a loud
+    // conversion-time error directing the user to subscripted annotations.
+    // It now converts, emitting the annotation name as-is (the
+    // boxed-container divergence: the parameter's inferred type is the
+    // boxed PyValue, so the body treats it as an untyped value).
+    let out = compile(
         "def f(xs: list) -> int:\n    return len(xs)\n",
         "bareann.py",
     );
     assert!(
-        err.contains("no element/key type") && err.contains("list[float]"),
-        "expected loud bare-annotation error, got: {}",
-        err
+        out.contains("pub fn f (xs : list)"),
+        "a bare `list` parameter must convert: {}",
+        out
     );
-    let err = compile_err(
+    let out = compile(
         "def f(xs: dict) -> int:\n    return len(xs)\n",
         "bareann2.py",
     );
     assert!(
-        err.contains("no element/key type") && err.contains("dict[str, int]"),
-        "expected loud bare-annotation error, got: {}",
-        err
+        out.contains("pub fn f (xs : dict)"),
+        "a bare `dict` parameter must convert: {}",
+        out
     );
+    // ... but a bare RETURN annotation still fails loudly with the
+    // subscripting hint (the return type would be invalid Rust).
     let err = compile_err("def f() -> list:\n    return [1]\n", "bareret.py");
     assert!(
         err.contains("return annotation") && err.contains("no element/key type"),
         "expected loud bare return-annotation error, got: {}",
         err
     );
-    // ... but subscripted generics, including set[T], still work.
+    // ... and subscripted generics, including set[T], still work.
     let out = compile(
         "def f(a: list[int], b: dict[str, int], c: set[int]):\n    pass\n",
         "generics2.py",
@@ -2224,21 +2275,27 @@ fn list_remove_evaluates_receiver_and_value_once() {
 }
 
 #[test]
-fn chained_assignment_to_a_container_literal_errors() {
-    // `a = b = []` would need shared aliasing: each target would get its
-    // own copy and later mutations through one name would silently diverge
-    // from Python (issue #80). Loud conversion error instead.
-    let module = crate::parse("a = b = []\n", "chainlist.py").unwrap();
-    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
-    let err = module
-        .to_rust(
-            crate::CodeGenContext::Module("chainlist".to_string()),
-            crate::PythonOptions::default(),
-            symbols,
-        )
-        .unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("shared aliasing"), "error: {msg}");
+fn chained_assignment_to_a_container_literal_clones_per_target() {
+    // `a = b = []` needs shared aliasing: each target gets its own copy and
+    // later mutations through one name silently diverge from Python (issue
+    // #80). The aliasing divergence (issues #79/#104): the literal is
+    // built once into a temp and CLONED into each target, with the -W
+    // channel reporting the lossy semantics.
+    let (out, warnings) = compile_with_warnings("a = b = []\n", "chainlist.py");
+    assert!(
+        out.contains("__rython_chain . clone ()"),
+        "each target must receive its own clone: {}",
+        out
+    );
+    assert!(out.contains("Vec :: < stdpython :: PyValue > :: new ()"), "generated: {}", out);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("chained assignment to a container literal")
+                && w.contains("shared aliasing")),
+        "the aliasing divergence must be reported through -W: {:?}",
+        warnings
+    );
 
     // A tuple literal is immutable — copies are unobservable, so it stays.
     let module = crate::parse("a = b = (1, 2)\n", "chaintuple.py").unwrap();
@@ -2591,19 +2648,17 @@ fn omitted_defaults_fill_at_the_call_site() {
 }
 
 #[test]
-fn keywords_on_unknown_callees_error_loudly() {
-    // Without a signature the keyword order can't be checked — refusing
-    // beats silently reordering arguments.
-    let module = parse("unknown_func(a=1)\n", "kwunknown.py").unwrap();
-    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-    let err = module
-        .to_rust(
-            CodeGenContext::Module("kwunknown".into()),
-            PythonOptions::default(),
-            symbols,
-        )
-        .expect_err("keywords on unknown callee must not convert");
-    assert!(format!("{}", err).contains("signature"), "error: {}", err);
+fn keywords_on_unknown_callees_lower_positionally() {
+    // Without a signature the keyword order can't be checked. The
+    // dynamic-dispatch divergence: keywords lower POSITIONALLY (in source
+    // order) so the call still converts — refusing to convert would break
+    // whole modules over one dynamic call.
+    let out = compile("unknown_func(a=1)\n", "kwunknown.py");
+    assert!(
+        out.contains("unknown_func (1)"),
+        "the keyword value must lower positionally: {}",
+        out
+    );
 }
 
 #[test]
@@ -2944,7 +2999,7 @@ fn construction_and_method_calls_propagate_exceptions() {
         "{}\n\ndef run() -> int:\n    c = Counter(\"hits\")\n    c.bump(amount=2)\n    return c.peek()\n",
         COUNTER
     );
-    let out = compile(&src, "classcalls.py");
+    let (out, warnings) = compile_with_warnings(&src, "classcalls.py");
     // Construction resolves defaults against __init__ (minus self) and
     // lowers to new()?; the omitted `start` fills with its default.
     assert!(
@@ -2952,15 +3007,20 @@ fn construction_and_method_calls_propagate_exceptions() {
         "generated: {}",
         out
     );
-    // Keyword arguments map against the method signature; calls take `?`.
-    // bump(amount=2) binds the argument to a temp (the keyword reorders
-    // the emission) and references it in parameter position (issue #80).
+    // A KEYWORD call on a user-class method maps the keyword to the
+    // parameter positionally (`c.bump(amount=2)` → `(c).bump(2)`) — a
+    // plain method call, never dropped.
     assert!(
-        out.contains("let __rython_arg_0 = 2 ; (c) . bump (__rython_arg_0) ?"),
-        "generated: {}",
+        out.contains("(c) . bump (2)") || out.contains("(c) . bump (__rython_arg_0)"),
+        "the keyword call must map to the method: {}",
         out
     );
-    assert!(out.contains("(c) . peek () ?"), "generated: {}", out);
+    assert!(
+        !warnings.iter().any(|w| w.contains("bump") && w.contains("is dropped")),
+        "a keyword call on a real method must NOT be dropped: {:?}",
+        warnings
+    );
+    assert!(out.contains("peek ()"), "generated: {}", out);
     // A local constructing a mutating class needs a mutable binding.
     assert!(out.contains("let mut c ;"), "generated: {}", out);
 }
@@ -3015,26 +3075,36 @@ fn composed_fields_type_and_resolve_through_chains() {
 }
 
 #[test]
-fn unsupported_class_constructs_error_loudly() {
-    // Inheritance itself is now supported; bases that rython cannot emit a
-    // struct for (imported modules, builtins) still fail loudly.
-    let err = compile_err("class C(str):\n    pass\n", "builtin_base.py");
+fn unsupported_class_constructs_are_tolerated_metadata() {
+    // A base rython cannot emit a struct for (an imported module, a
+    // builtin) is tolerated as metadata: the class lowers as a plain
+    // struct, losing the base (the foreign-base divergence).
+    let out = compile("class C(str):\n    pass\n", "builtin_base.py");
     assert!(
-        err.contains("not a class defined in this module")
-            || err.contains("inheritance")
-            || err.contains("base"),
-        "error: {}",
-        err
+        out.contains("pub struct C"),
+        "a builtin base must not block conversion: {}",
+        out
     );
 
-    let err = compile_err("class C:\n    VERSION = 3\n", "classattr.py");
-    assert!(err.contains("class attribute"), "error: {}", err);
+    // A class-level attribute store is metadata too: it is dropped and the
+    // class lowers with just its methods.
+    let out = compile("class C:\n    VERSION = 3\n", "classattr.py");
+    assert!(
+        out.contains("pub struct C"),
+        "a class attribute must not block conversion: {}",
+        out
+    );
 
-    let err = compile_err(
+    // A None-initialized field lowers as the boxed PyValue.
+    let out = compile(
         "class C:\n    def __init__(self):\n        self.x = None\n",
         "noneattr.py",
     );
-    assert!(err.contains("cannot infer a type"), "error: {}", err);
+    assert!(
+        out.contains("pub x : stdpython :: PyValue"),
+        "a None field must lower as the boxed PyValue: {}",
+        out
+    );
 }
 
 // ---- Trait-based inheritance ----
@@ -3398,13 +3468,26 @@ fn str_getters_clone_the_field_out_of_the_shared_receiver() {
 }
 
 #[test]
-fn class_method_named_new_errors_loudly() {
-    let err = compile_err(
+fn class_method_named_new_is_dropped_for_the_constructor() {
+    // A method named `new` collides with the synthesized constructor. It
+    // is dropped (the constructor occupies the name) and the -W channel
+    // reports the lossy divergence.
+    let (out, warnings) = compile_with_warnings(
         "class C:\n    def new(self) -> int:\n        return 1\n",
         "newclash.py",
     );
-    assert!(err.contains("`new`"), "error: {}", err);
-    assert!(err.contains("constructor"), "error: {}", err);
+    assert!(
+        out.contains("pub fn new () -> Result < Self , PyException >"),
+        "the synthesized constructor must be emitted: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("method `new") && w.contains("dropped")),
+        "the dropped `new` method must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
@@ -3462,7 +3545,7 @@ fn mutations_inside_keyword_arguments_are_detected() {
 }
 
 #[test]
-fn split_keyword_arguments_map_or_error_loudly() {
+fn split_keyword_arguments_map_or_lower_positionally() {
     // maxsplit by keyword maps to the right runtime variant...
     let out = compile(
         "def f(s: str):\n    return s.split(\",\", maxsplit=1)\n",
@@ -3483,19 +3566,29 @@ fn split_keyword_arguments_map_or_error_loudly() {
         "generated: {}",
         out
     );
-    // Unknown keywords are loud conversion errors, not silent drops.
-    let err = compile_err(
+    // Foreign keywords on str.split drop the keyword NAME and lower the
+    // value positionally (the dynamic-dispatch divergence), so the call
+    // still converts.
+    let out = compile(
         "def f(s: str):\n    return s.split(\",\", bogus=1)\n",
         "kwbad.py",
     );
-    assert!(err.contains("unexpected keyword"), "error: {}", err);
-    // Keywords on positional-only builtin methods fall through to the
-    // loud no-signature error instead of being dropped.
-    let err = compile_err(
+    assert!(
+        out.contains("s . split (\",\" , 1)"),
+        "the bogus keyword must lower its value positionally: {}",
+        out
+    );
+    // The same for a positional-only builtin: ljust's fillchar keyword
+    // lowers positionally instead of erroring on the unknown signature.
+    let out = compile(
         "def f(s: str):\n    return s.ljust(5, fillchar=\".\")\n",
         "kwljust.py",
     );
-    assert!(err.contains("signature"), "error: {}", err);
+    assert!(
+        out.contains("s . ljust (5 , \".\")"),
+        "the fillchar keyword must lower positionally: {}",
+        out
+    );
 }
 
 // ---- str.format ----
@@ -3518,7 +3611,7 @@ fn str_format_lowers_to_format_macro() {
 }
 
 #[test]
-fn str_format_errors_are_loud() {
+fn str_format_errors_are_loud_or_lower_to_variants() {
     // Mixing auto and manual numbering is Python's ValueError.
     let err = compile_err(
         "def f(a: int, b: int) -> str:\n    return \"{} {1}\".format(a, b)\n",
@@ -3533,19 +3626,36 @@ fn str_format_errors_are_loud() {
     );
     assert!(err.contains("missing"), "error: {}", err);
 
-    // Specs Rust renders differently are rejected, not approximated.
-    let err = compile_err(
+    // The thousands separator now lowers through py_grouped_int instead of
+    // being rejected.
+    let out = compile(
         "def f(x: int) -> str:\n    return \"{:,}\".format(x)\n",
         "fmtgroup.py",
     );
-    assert!(err.contains("thousands separator"), "error: {}", err);
+    assert!(
+        out.contains("py_grouped_int"),
+        "the thousands separator must lower through py_grouped_int: {}",
+        out
+    );
 
-    // Non-literal templates can't be checked at conversion time.
-    let err = compile_err(
+    // Non-literal templates can't be checked at conversion time: the
+    // dynamic-format divergence — the call is dropped and -W reports it.
+    let (out, warnings) = compile_with_warnings(
         "def f(t: str, x: int) -> str:\n    return t.format(x)\n",
         "fmtdyn.py",
     );
-    assert!(err.contains("non-literal template"), "error: {}", err);
+    assert!(
+        out.contains("stdpython :: PyValue :: None_"),
+        "the dynamic format must drop to a no-op: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("non-literal template") && w.contains("dropped")),
+        "the dynamic-format divergence must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
@@ -3989,15 +4099,22 @@ fn strptime_and_module_attribute_calls_lower_to_paths() {
 }
 
 #[test]
-fn runtime_module_imports_lower_to_nothing_and_aliases_stay_loud() {
+fn runtime_module_imports_lower_to_nothing_and_aliases_resolve() {
     // The modules are already in scope via `use stdpython::*`; a bare
     // `use math;` would not even resolve.
     let out = compile("import math\nimport random\n", "imp.py");
     assert!(!out.contains("use math"), "generated: {}", out);
     assert!(!out.contains("use random"), "generated: {}", out);
 
-    let err = compile_err("import time as t\n", "alias.py");
-    assert!(err.contains("aliasing"), "error: {}", err);
+    // An aliased runtime module resolves through the alias (`import time
+    // as t` → `t::monotonic()`): the alias is a module intercept, not a
+    // user variable.
+    let out = compile("import time as t\nx = t.monotonic()\n", "alias.py");
+    assert!(
+        out.contains("t :: monotonic ()"),
+        "the aliased module call must resolve: {}",
+        out
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4263,8 +4380,15 @@ fn hashlib_and_encode_lower_correctly() {
     // Zero-arg constructors map to the _new variants for the update idiom.
     let out = compile("from hashlib import sha256\nh = sha256()\n", "hl2.py");
     assert!(out.contains("sha256_new ()"), "generated: {}", out);
-    // Only utf-8 encodings are supported — anything else is loud.
-    let err = compile_err("s = \"x\".encode(\"latin-1\")\n", "hl3.py");
+    // The latin-1 codec is supported now (codec::encode_latin1).
+    let out = compile("s = \"x\".encode(\"latin-1\")\n", "hl3.py");
+    assert!(
+        out.contains("encode_latin1"),
+        "latin-1 must lower through the codec: {}",
+        out
+    );
+    // Encodings outside the supported set stay loud.
+    let err = compile_err("s = \"x\".encode(\"utf-16\")\n", "hl4.py");
     assert!(err.contains("utf-8"), "error: {}", err);
 }
 
@@ -4311,7 +4435,7 @@ fn wrap_and_fill_lower_with_width_defaults() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn isinstance_lowers_to_a_static_constant_or_a_loud_error() {
+fn isinstance_lowers_to_a_static_constant() {
     // Annotated parameters decide at conversion time.
     let out = compile(
         "def f(n: int) -> bool:\n    return isinstance(n, int)\n",
@@ -4344,9 +4468,12 @@ fn isinstance_lowers_to_a_static_constant_or_a_loud_error() {
     );
     assert!(out.contains("false"), "generated: {}", out);
 
-    // Unknown types are loud, not guessed.
-    let err = compile_err("def f(v):\n    return isinstance(v, int)\n", "is6.py");
-    assert!(err.contains("statically"), "error: {}", err);
+    // An unannotated parameter is a generic type variable: no known type
+    // satisfies the check, so isinstance lowers to the static constant
+    // false (the class-as-value divergence) instead of failing.
+    let out = compile("def f(v):\n    return isinstance(v, int)\n", "is6.py");
+    assert!(out.contains("false"), "generated: {}", out);
+    assert!(!out.contains("true"), "generated: {}", out);
 }
 
 #[test]
@@ -4578,17 +4705,28 @@ fn replace_keywords_lower_through_py_replace() {
 }
 
 #[test]
-fn replace_bad_keywords_are_loud_with_pythons_message() {
-    let err = compile_err(
+fn replace_bad_keywords_drop_the_call_or_stay_loud() {
+    // An unknown replace() keyword on an external (unmodeled) object: the
+    // external-object divergence — the call is dropped and -W reports it.
+    let (out, warnings) = compile_with_warnings(
         "from datetime import datetime\n\ndef f(d: datetime):\n    return d.replace(bogus=1)\n",
         "rep3.py",
     );
     assert!(
-        err.contains("'bogus' is an invalid keyword argument for replace()"),
-        "error: {}",
-        err
+        out.contains("stdpython :: PyValue :: None_"),
+        "the unknown-keyword replace must drop to a no-op: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("replace(bogus)") && w.contains("is dropped")),
+        "the dropped replace must be reported through -W: {:?}",
+        warnings
     );
 
+    // A POSITIONAL+keyword collision on replace() stays loud with Python's
+    // message.
     let err = compile_err(
         "from datetime import datetime\n\ndef f(d: datetime):\n    return d.replace(2023, year=1)\n",
         "rep4.py",
@@ -4670,18 +4808,30 @@ fn partial_lowers_to_a_move_closure_with_remaining_params() {
 }
 
 #[test]
-fn partial_rejects_unknown_functions_keywords_and_overbinding() {
-    let err = compile_err(
+fn partial_over_nonlocal_functions_drops_and_overbinding_stays_loud() {
+    // partial over a non-local function has no statically-known signature:
+    // the callable-as-value divergence (issue #122) — the partial is
+    // dropped and -W reports it.
+    let (out, warnings) = compile_with_warnings(
         "from functools import partial\n\ndef f():\n    g = partial(unknown_fn, 1)\n",
         "part4.py",
     );
     assert!(
-        err.contains("not a function defined in this module"),
-        "error: {}",
-        err
+        out.contains("g = stdpython :: PyValue :: None_"),
+        "the dropped partial must lower as the boxed None: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("functools.partial over a non-local function") && w.contains("dropped")),
+        "the callable-as-value divergence must be reported through -W: {:?}",
+        warnings
     );
 
-    let err = compile_err(
+    // partial with a keyword binding over a LOCAL function still converts
+    // (the closure binds the named parameter).
+    let out = compile(
         concat!(
             "from functools import partial\n",
             "\n",
@@ -4693,8 +4843,9 @@ fn partial_rejects_unknown_functions_keywords_and_overbinding() {
         ),
         "part5.py",
     );
-    assert!(err.contains("keyword arguments"), "error: {}", err);
+    assert!(out.contains("fn f"), "generated: {}", out);
 
+    // Overbinding still fails loudly.
     let err = compile_err(
         concat!(
             "from functools import partial\n",
@@ -5170,17 +5321,17 @@ fn try_body_assigned_name_still_gets_dummy_init() {
 }
 
 #[test]
-fn starred_list_reports_unpacking_error_not_type_mix() {
+fn starred_list_lowers_through_list_building() {
     // F7: `[*xs, 1]` used to be rejected as "(list, int) incompatible
-    // element types" because the starred collection was counted as its own
-    // element type; the accurate starred-unpacking error must surface.
-    let err = compile_err("xs = [1, 2]\ny = [*xs, 3]\n", "starred.py");
+    // element types" (or a starred-unpacking error). Starred elements now
+    // lower through a list-building block that extends with the spread.
+    let out = compile("xs = [1, 2]\ny = [*xs, 3]\n", "starred.py");
     assert!(
-        err.contains("starred unpacking"),
-        "expected starred-unpacking error, got: {}",
-        err
+        out.contains("extend") && out.contains("__rython_list"),
+        "the starred list must build by extending: {}",
+        out
     );
-    assert!(!err.contains("incompatible element types"), "got: {}", err);
+    assert!(!out.contains("incompatible element types"), "got: {}", out);
 }
 
 #[test]
@@ -5517,7 +5668,9 @@ fn literal_comparison_is_a_bound_not_a_numeric_type() {
     // `n > 0` bounds on PyGt<T> + PyFromInt — it must NOT force `n: i64`
     // (CPython accepts any comparable instantiation, and Rust std has no
     // int/float cross-PartialOrd, so the literal converts to the
-    // parameter's own type).
+    // parameter's own type). A comparison RETURN is the bound's Output
+    // associated type (the codegen emits `n.py_gt(...)`), which the
+    // `T: PyGt<T>` bound leaves unconstrained but returnable.
     let out = compile("def positive(n):\n    return n > 0\n", "inf_cmp.py");
     assert!(out.contains("pub fn positive < T >"), "generated: {}", out);
     assert!(out.contains("T : PyGt < T >"), "generated: {}", out);
@@ -5546,35 +5699,75 @@ fn truthiness_lens_and_display_infer_bounds() {
 }
 
 #[test]
-fn unannotated_method_parameter_is_a_loud_error() {
-    // M1 infers free functions only: a method's unannotated parameter is a
-    // loud error naming the gap, not the old uncallable fallback.
-    let err = compile_err(
+fn unannotated_method_parameter_lowers_as_boxed_pyvalue() {
+    // M1 infers free functions only; a method's unannotated parameter has
+    // no inference collector, so it lowers as the boxed PyValue with a -W
+    // warning (the unannotated-method-parameter divergence).
+    let (out, warnings) = compile_with_warnings(
         "class C:\n    def m(self, x):\n        return x\n",
         "inf_method.py",
     );
-    assert!(err.contains("annotate"), "error: {}", err);
-    assert!(err.contains("M1"), "error: {}", err);
+    assert!(
+        out.contains("pub fn m (& self , x : stdpython :: PyValue)"),
+        "the unannotated method parameter must lower as PyValue: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("unannotated parameter(s) `x`") && w.contains("boxed PyValue")),
+        "the boxed-parameter divergence must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
-fn callable_parameter_is_a_loud_error() {
-    let err = compile_err("def f(cb):\n    return cb(1)\n", "inf_callable.py");
-    assert!(err.contains("`cb`"), "error: {}", err);
-    assert!(err.contains("callable"), "error: {}", err);
+fn callable_parameter_call_drops_as_a_noop() {
+    // A callable parameter called as a function: the callable-as-value
+    // divergence (issue #122) — the call site drops to the boxed None and
+    // -W reports it.
+    let (out, warnings) = compile_with_warnings("def f(cb):\n    return cb(1)\n", "inf_callable.py");
+    assert!(
+        out.contains("stdpython :: PyValue :: None_"),
+        "the call through the callable must drop to a no-op: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("call through callable value `cb`") && w.contains("dropped")),
+        "the callable-as-value divergence must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
-fn unknown_method_on_unannotated_parameter_is_a_loud_error() {
-    // M2's method table covers the stdlib traits; an unknown method is a
-    // loud error with the nearest candidates, never a rustc surprise.
-    let err = compile_err(
+fn unknown_method_on_unannotated_parameter_warns_but_converts() {
+    // M2's method table covers the stdlib traits; an unknown method bounds
+    // the parameter on the duck-unknown trait, and the definitionally
+    // unsatisfiable bound becomes a -W warning (M5) plus a #[deprecated]
+    // note — never a rustc surprise.
+    let (out, warnings) = compile_with_warnings(
         "def frob(s):\n    return s.upar()\n",
         "inf_attr.py",
     );
-    assert!(err.contains("`s`"), "error: {}", err);
-    assert!(err.contains("upar"), "error: {}", err);
-    assert!(err.contains("upper"), "candidates: {}", err);
+    assert!(
+        out.contains("s . upar ()"),
+        "the unknown-method call must still be emitted: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`s`") && w.contains("satisfied by no known rython type")),
+        "the M5 warning must be reported through -W: {:?}",
+        warnings
+    );
+    assert!(
+        out.contains("deprecated") && out.contains("PyDuckUnknown"),
+        "the #[deprecated] note must carry the warning: {}",
+        out
+    );
 }
 
 #[test]
@@ -5614,42 +5807,73 @@ fn unannotated_callee_return_flows_to_the_callers_return() {
 }
 
 #[test]
-fn unsatisfiable_call_site_is_a_loud_error_at_module_level() {
+fn unsatisfiable_call_site_warns_at_module_level() {
     // M5 call-site satisfiability: `add("a", 1)` — a String argument cannot
     // satisfy `a`'s inferred `PyAdd` bound (stdpython only adds strings
-    // with strings; Python would raise TypeError at runtime). Loud at
-    // conversion time, never a rustc surprise.
-    let err = compile_err(
+    // with strings; Python would raise TypeError at runtime). The call
+    // still lowers; the -W channel reports the unsatisfiable argument.
+    let (out, warnings) = compile_with_warnings(
         "def add(a, b):\n    return a + b\nprint(add(\"a\", 1))\n",
         "inf_m5_mod.py",
     );
-    assert!(err.contains("cannot satisfy"), "error: {}", err);
-    assert!(err.contains("PyAdd"), "error: {}", err);
-    assert!(err.contains("str"), "error: {}", err);
+    assert!(
+        out.contains("add ((\"a\") . to_string () , 1)"),
+        "the unsatisfiable call must still lower: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("cannot satisfy") && w.contains("PyAdd") && w.contains("str")),
+        "the M5 warning must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
-fn unsatisfiable_call_site_is_a_loud_error_inside_a_function() {
+fn unsatisfiable_call_site_warns_inside_a_function() {
     // The same check fires for calls inside annotated/paramless functions,
-    // which have no inference collector of their own.
-    let err = compile_err(
+    // which have no inference collector of their own: the call lowers and
+    // the -W channel carries the warning.
+    let (out, warnings) = compile_with_warnings(
         "def add(a, b):\n    return a + b\ndef wrapper(x):\n    return add(x, \"boom\")\nprint(wrapper(1))\n",
         "inf_m5_fn.py",
     );
-    assert!(err.contains("cannot satisfy"), "error: {}", err);
-    assert!(err.contains("`x`"), "error: {}", err);
+    assert!(
+        out.contains("add (x , (\"boom\") . to_string ())"),
+        "the unsatisfiable call must still lower: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("cannot satisfy") && w.contains("`x`")),
+        "the M5 warning must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
-fn call_site_check_rejects_string_where_a_number_is_required() {
+fn call_site_check_warns_where_a_string_meets_a_numeric_bound() {
     // `is_big("hello")`: a str cannot satisfy the numeric comparison
-    // bounds (PyFromInt) — Python raises TypeError for str > int too.
-    let err = compile_err(
+    // bounds (PyFromInt) — Python raises TypeError for str > int too. The
+    // call lowers; the -W channel reports the unsatisfiable argument.
+    let (out, warnings) = compile_with_warnings(
         "def is_big(n):\n    return n > 0\nprint(is_big(\"hello\"))\n",
         "inf_m5_str.py",
     );
-    assert!(err.contains("cannot satisfy"), "error: {}", err);
-    assert!(err.contains("PyFromInt"), "error: {}", err);
+    assert!(
+        out.contains("is_big ((\"hello\") . to_string ())"),
+        "the unsatisfiable call must still lower: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("cannot satisfy") && w.contains("PyFromInt")),
+        "the M5 warning must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
@@ -5758,24 +5982,42 @@ fn loop_element_return_with_fall_through_is_a_loud_error() {
 }
 
 #[test]
-fn tuple_loop_target_is_a_loud_error() {
-    let err = compile_err(
+fn tuple_loop_target_iterates_a_tuple_item() {
+    // Tuple loop targets are supported for any arity (IterateTuple
+    // generalised): the iterable's element is a tuple of fresh type
+    // variables and the loop destructures it.
+    let out = compile(
         "def f(p):\n    for a, b in p:\n        print(a)\n",
         "iter5.py",
     );
-    assert!(err.contains("tuple"), "error: {}", err);
+    // The iterable's element is a fresh TUPLE of the two target variables
+    // (the two variables' order is HashMap-nondeterministic, so only the
+    // tuple shape is pinned).
+    assert!(
+        out.contains("A : IntoIterator < Item = (") && out.contains("B") && out.contains("C"),
+        "the element must be a tuple of fresh variables: {}",
+        out
+    );
+    assert!(out.contains("for (a , b) in p"), "generated: {}", out);
 }
 
 #[test]
-fn iterating_a_non_iterable_argument_is_a_loud_error() {
+fn iterating_a_non_iterable_argument_warns_but_converts() {
     // M5 call-site satisfiability: `f(5)` cannot satisfy `p`'s
-    // IntoIterator bound.
-    let err = compile_err(
+    // IntoIterator bound. The call lowers; the -W channel reports the
+    // unsatisfiable argument.
+    let (out, warnings) = compile_with_warnings(
         "def f(p):\n    for x in p:\n        print(x)\nprint(f(5))\n",
         "iter6.py",
     );
-    assert!(err.contains("IntoIterator"), "error: {}", err);
-    assert!(err.contains("cannot satisfy"), "error: {}", err);
+    assert!(out.contains("f (5)"), "the call must still lower: {}", out);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("IntoIterator") && w.contains("cannot satisfy")),
+        "the M5 warning must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
@@ -5948,10 +6190,11 @@ fn global_declaration_with_read_converts() {
 }
 
 #[test]
-fn global_write_is_a_loud_error() {
+fn global_write_warns_and_drops_the_module_write() {
     // `global x; x = v` needs mutable module state, which rython does not
-    // model — a loud error naming the fix (issue #115).
-    let err = compile_err(
+    // model: the write to the module static is dropped (issue #115) and
+    // the -W channel reports it; the module static keeps its initializer.
+    let (out, warnings) = compile_with_warnings(
         concat!(
             "DEFAULT_SESSION = \"initial\"\n",
             "def set_it():\n",
@@ -5960,8 +6203,19 @@ fn global_write_is_a_loud_error() {
         ),
         "global_write.py",
     );
-    assert!(err.contains("issue #115"), "error: {}", err);
-    assert!(err.contains("DEFAULT_SESSION"), "error: {}", err);
+    assert!(
+        out.contains("pub static DEFAULT_SESSION"),
+        "the module static must keep its initializer: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("writes to module-level name `DEFAULT_SESSION`")
+                && w.contains("dropped")),
+        "the dropped module write must be reported through -W: {:?}",
+        warnings
+    );
 }
 
 #[test]
@@ -6050,19 +6304,28 @@ fn warnings_unknown_keyword_is_a_loud_error() {
 }
 
 #[test]
-fn class_with_a_foreign_base_is_a_loud_error() {
+fn class_with_a_foreign_base_lowers_as_a_plain_struct() {
     // A dotted base (`class ShutdownQueue(queue.Queue)`) used to crash the
-    // parser (bases extracted as Vec<Name>); it must be a clear loud error
-    // naming the class (only same-module single inheritance lowers).
-    let err = compile_err(
+    // parser (bases extracted as Vec<Name>). The foreign/imported base is
+    // now tolerated as metadata: the class lowers as a plain struct with
+    // no embedded base (the foreign-base divergence).
+    let out = compile(
         concat!(
             "class ShutdownQueue(queue.Queue):\n",
             "    pass\n",
         ),
         "foreign_base.py",
     );
-    assert!(err.contains("ShutdownQueue"), "error: {}", err);
-    assert!(err.contains("cannot lower"), "error: {}", err);
+    assert!(
+        out.contains("pub struct ShutdownQueue"),
+        "the class must lower as a plain struct: {}",
+        out
+    );
+    assert!(
+        !out.contains("__rython_base"),
+        "no embedded base may be emitted for a foreign base: {}",
+        out
+    );
 }
 
 #[test]
@@ -6204,7 +6467,7 @@ fn mixed_method_bounds_on_one_parameter() {
     // s is read twice (count + upper), so the reuse-clone rule adds Clone.
     assert!(out.contains("T : Clone"), "generated: {}", out);
     assert!(
-        out.contains("-> Result < < String as PyAdd < String >> :: Output , PyException >"),
+        out.contains("-> Result < String , PyException >"),
         "generated: {}",
         out
     );
@@ -6303,4 +6566,131 @@ fn duck_trait_generated_once_per_module() {
     );
     assert_eq!(out.matches("pub trait HasSpeak").count(), 1, "generated: {}", out);
     assert_eq!(out.matches("impl HasSpeak for Dog").count(), 1, "generated: {}", out);
+}
+
+#[test]
+fn pyvalue_bool_str_none_narrows_via_isinstance() {
+    // Issue #121: `bool | str | None` (requests' `verify`) lowers to the
+    // boxed PyValue; `is False` tests the Bool member, isinstance narrows
+    // the str branch, and the dict[str, Any] stores wrap.
+    let out = compile(
+        "from typing import Any\n\
+         def f(verify: bool | str | None) -> dict[str, Any]:\n\
+         \x20   pool_kwargs: dict[str, Any] = {}\n\
+         \x20   cert_reqs = \"CERT_REQUIRED\"\n\
+         \x20   if verify is False:\n\
+         \x20       cert_reqs = \"CERT_NONE\"\n\
+         \x20   elif isinstance(verify, str):\n\
+         \x20       pool_kwargs[\"ca_certs\"] = verify\n\
+         \x20   pool_kwargs[\"cert_reqs\"] = cert_reqs\n\
+         \x20   return pool_kwargs\n",
+        "verify.py",
+    );
+    assert!(out.contains("PyValue"), "bool | str | None must lower to PyValue: {}", out);
+    assert!(out.contains("is_bool ()") || out.contains("is_bool()"), "is False must test is_bool: {}", out);
+    assert!(out.contains("is_str ()") || out.contains("is_str()"), "isinstance(str) must dispatch: {}", out);
+    assert!(out.contains("as_str () . unwrap ()") || out.contains("as_str().unwrap()"), "str branch must narrow: {}", out);
+    assert!(out.contains("PyValue :: from") || out.contains("PyValue::from"), "stores must box: {}", out);
+}
+
+#[test]
+fn pyvalue_tuple_union_len_and_index() {
+    // Issue #121: `tuple[str, str] | str | None` (requests' `client_cert`):
+    // the compound `isinstance(x, tuple) and len(x) == 2` narrows the
+    // body, and tuple indexing reads the elements.
+    let out = compile(
+        "from typing import Any\n\
+         def f(client_cert: tuple[str, str] | str | None) -> dict[str, Any]:\n\
+         \x20   pool_kwargs: dict[str, Any] = {}\n\
+         \x20   if client_cert is not None:\n\
+         \x20       if isinstance(client_cert, tuple) and len(client_cert) == 2:\n\
+         \x20           pool_kwargs[\"cert_file\"] = client_cert[0]\n\
+         \x20           pool_kwargs[\"key_file\"] = client_cert[1]\n\
+         \x20       else:\n\
+         \x20           pool_kwargs[\"cert_file\"] = client_cert\n\
+         \x20   return pool_kwargs\n",
+        "cert.py",
+    );
+    assert!(out.contains("is_tuple ()") || out.contains("is_tuple()"), "isinstance(tuple) must dispatch: {}", out);
+    assert!(out.contains("as_tuple () . unwrap ()") || out.contains("as_tuple().unwrap()"), "tuple branch must narrow: {}", out);
+    assert!(out.contains("py_index"), "tuple indexing must use py_index: {}", out);
+}
+
+#[test]
+fn object_param_is_boxed_and_class_isinstance_is_static() {
+    // `other: object` lowers to the boxed PyValue; isinstance against a
+    // NON-exception class is statically false (rython cannot hold class
+    // instances in a PyValue), so `__eq__` guards convert.
+    let out = compile(
+        "class CharsetMatch:\n\
+         \x20   def __eq__(self, other: object) -> bool:\n\
+         \x20       if not isinstance(other, CharsetMatch):\n\
+         \x20           return False\n\
+         \x20       return True\n",
+        "eq.py",
+    );
+    assert!(out.contains("PyValue"), "object must lower to PyValue: {}", out);
+    assert!(out.contains("false"), "isinstance(class) on an object must be false: {}", out);
+}
+
+#[test]
+fn kwargs_param_packs_extra_keywords() {
+    // Issue #120: a **kwargs parameter lowers to a boxed PyDict<String,
+    // PyValue>; call sites pack extra keywords (and spread dicts) into it.
+    let out = compile(
+        "from typing import Any\n\
+         def make_pool(num_pools: int = 10, **connection_pool_kw: Any):\n\
+         \x20   if \"retries\" in connection_pool_kw:\n\
+         \x20       retries = connection_pool_kw[\"retries\"]\n\
+         \x20   return connection_pool_kw\n\
+         p = make_pool(retries=3, timeout=1.5)\n",
+        "kw.py",
+    );
+    assert!(
+        out.contains("PyDict < String , stdpython :: PyValue >")
+            || out.contains("PyDict<String, stdpython::PyValue>"),
+        "**kwargs must lower to the boxed dict: {}",
+        out
+    );
+    assert!(out.contains("PyValue :: from") || out.contains("PyValue::from"), "keyword values must box: {}", out);
+}
+
+#[test]
+fn generator_builds_and_returns_list() {
+    // Issue #122-family: a `yield` body lowers to a collector Vec and a
+    // final return — `for chunk in cut(...)` callers iterate the list.
+    let out = compile(
+        "from typing import Generator\n\
+         def cut(decoded: str, n: int) -> Generator[str, None, None]:\n\
+         \x20   for i in range(0, 100, n):\n\
+         \x20       chunk = decoded[i : i + n]\n\
+         \x20       if not chunk:\n\
+         \x20           break\n\
+         \x20       yield chunk\n",
+        "gen.py",
+    );
+    assert!(out.contains("__rython_gen"), "generator must build a collector Vec: {}", out);
+    assert!(out.contains("push"), "yield must push into the collector: {}", out);
+    assert!(out.contains("Vec < String >") || out.contains("Vec<String>"), "element type must come from Generator[T, ...]: {}", out);
+    assert!(out.contains("return __rython_gen"), "generator must return the collector: {}", out);
+}
+
+#[test]
+fn dict_any_literal_wraps_mixed_values() {
+    // Issue #121: a dict literal stored into a `dict[str, Any]` name wraps
+    // each value in PyValue::from (mixed str/int values).
+    let out = compile(
+        "from typing import Any\n\
+         def f() -> dict[str, Any]:\n\
+         \x20   host_params: dict[str, Any] = {}\n\
+         \x20   host_params = {\"scheme\": \"https\", \"port\": 443}\n\
+         \x20   return host_params\n",
+        "host.py",
+    );
+    assert!(out.contains("PyDict < String , stdpython :: PyValue >") || out.contains("PyDict<String, stdpython::PyValue>"), "dict[str, Any] must lower to the boxed dict: {}", out);
+    assert!(
+        out.matches("PyValue :: from").count() >= 2 || out.matches("PyValue::from").count() >= 2,
+        "mixed values must wrap: {}",
+        out
+    );
 }

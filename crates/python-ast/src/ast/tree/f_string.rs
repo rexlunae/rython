@@ -137,7 +137,8 @@ impl CodeGen for JoinedStr {
                     let expr = (*fv.value)
                         .clone()
                         .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    let (placeholder, expr) = fv.rust_placeholder(expr)?;
+                    let (placeholder, expr) =
+                        fv.rust_placeholder(expr, &ctx, &options, &symbols)?;
                     fmt.push_str(&placeholder);
                     args.push(expr);
                 }
@@ -183,6 +184,9 @@ impl FormattedValue {
     fn rust_placeholder(
         &self,
         value: TokenStream,
+        ctx: &CodeGenContext,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
     ) -> Result<(String, TokenStream), Box<dyn std::error::Error>> {
         // Python conversion codes are the ASCII values of 's', 'r', 'a'.
         let is_repr = matches!(self.conversion, Some(114) | Some(97));
@@ -191,12 +195,21 @@ impl FormattedValue {
             None => String::new(),
             Some(spec) => match static_spec_text(spec) {
                 None => {
-                    return Err(
-                        "f-string format specs that interpolate other values (e.g. \
-                         f\"{x:{width}}\") are not supported yet"
-                            .to_string()
-                            .into(),
-                    );
+                    // A DYNAMIC width spec (`f"{completed:{total_width}d}"`
+                    // — rich's MofNCompleteColumn): the width is a runtime
+                    // value, so the spec cannot be checked at conversion
+                    // time — the whole interpolation lowers through the
+                    // runtime dynamic-format helper (Python's right-align
+                    // integer-in-width semantics).
+                    let spec_tokens = (*spec).clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    return Ok((
+                        "{}".to_string(),
+                        quote!(py_dynamic_format(#value, #spec_tokens)),
+                    ));
                 }
                 Some(text) => text.trim().to_string(),
             },
@@ -255,6 +268,13 @@ impl FormattedValue {
                     #radix,
                 )),
             )),
+            // The `,` thousands separator (`f"{size:,}"` — rich's
+            // filesize): the runtime formatter groups the integer's
+            // digits.
+            SpecLowering::GroupedInt => Ok((
+                "{}".to_string(),
+                quote!(py_grouped_int(#value)),
+            )),
         }
     }
 }
@@ -298,8 +318,11 @@ impl CodeGen for FormattedValue {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value_tokens = (*self.value).clone().to_rust(ctx, options, symbols)?;
-        let (placeholder, value_tokens) = self.rust_placeholder(value_tokens)?;
+        let value_tokens = (*self.value)
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let (placeholder, value_tokens) =
+            self.rust_placeholder(value_tokens, &ctx, &options, &symbols)?;
         Ok(quote! {
             format!(#placeholder, #value_tokens)
         })

@@ -70,7 +70,7 @@ impl CodeGen for Statement {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
-        self.statement
+        let result = self.statement
             .clone()
             .to_rust(ctx, options, symbols)
             .map_err(|e| {
@@ -86,7 +86,8 @@ impl CodeGen for Statement {
                     crate::format_error_chain(e.as_ref()),
                     "",
                 ))
-            })
+            });
+        result
     }
 }
 
@@ -121,6 +122,11 @@ pub enum StatementType {
     /// the names resolve to module statics; WRITES from a function are a
     /// loud error (rython has no mutable module state).
     Global(Vec<String>),
+    /// `nonlocal a, b` — a nested-function binding directive (rich's
+    /// traceback IPython hooks). rython's closures do not capture outer
+    /// function scopes, so the declaration has no runtime effect — a
+    /// no-op (the closure-capture divergence).
+    Nonlocal(Vec<String>),
     /// A bare annotated declaration (`x: int` — no value). At module/class
     /// level this is a dataclass-style field declaration; inside functions
     /// it declares nothing at runtime (lowered as a no-op). Carried so
@@ -274,6 +280,14 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                     .extract()
                     .map_err(|e| extraction_failure("global names", &ob, e))?;
                 Ok(StatementType::Global(names))
+            }
+            "Nonlocal" => {
+                let names = ob
+                    .getattr("names")
+                    .map_err(|e| extraction_failure("nonlocal names", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("nonlocal names", &ob, e))?;
+                Ok(StatementType::Nonlocal(names))
             }
             "Delete" => {
                 let targets = ob
@@ -570,7 +584,21 @@ impl CodeGen for StatementType {
             StatementType::Return(None) => Ok(return_tokens(&ctx, quote!(()))),
             StatementType::Return(Some(e)) => {
                 let value = if matches!(e.value, ExprType::NoneType(_)) {
-                    quote!(())
+                    // A `return None` in a PyValue-returning function is
+                    // the boxed None (the None-mixing unification); a
+                    // plain-None function returns the unit value.
+                    if options.fn_return_is_pyvalue {
+                        quote!(PyValue::None_)
+                    } else {
+                        quote!(())
+                    }
+                } else if options.fn_return_is_pyvalue {
+                    // A PyValue-returning function wraps its other returns
+                    // (the identity From passes already-boxed values).
+                    let tokens = e
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    quote!(PyValue::from(#tokens))
                 } else {
                     let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
                     // A `-> str` function's return value must be an owned
@@ -613,6 +641,7 @@ impl CodeGen for StatementType {
             // resolve to the module statics, and writes are rejected at
             // conversion time (issue #115).
             StatementType::Global(_) => Ok(quote! {}),
+            StatementType::Nonlocal(_) => Ok(quote! {}),
             // A bare annotated declaration (`x: int`) declares nothing at
             // runtime: the annotation only types the name (dataclass-style
             // field declarations are consumed by the class codegen; inside
@@ -657,14 +686,29 @@ impl CodeGen for StatementType {
                                     // py_pop takes the index BY VALUE.
                                     stmts.push(quote!((#receiver).py_pop(#idx)?;));
                                 }
-                                crate::SubscriptKind::Slice { .. } => {
-                                    return Err(
-                                        "del with a slice target (`del xs[1:3]`) is not \
-                                         supported yet; use del with a single index, or pop \
-                                         the elements individually"
-                                            .to_string()
-                                            .into(),
-                                    );
+                                crate::SubscriptKind::Slice {
+                                    lower, upper, step, ..
+                                } => {
+                                    // `del xs[:]` — a FULL slice (all bounds
+                                    // None) clears the container in place
+                                    // (`del self._buffer[:]` — botocore's
+                                    // AWSConnection._send_output): the
+                                    // runtime's clear (Python's `xs[:] = []`).
+                                    if lower.is_none() && upper.is_none() && step.is_none() {
+                                        stmts.push(quote!((#receiver).clear();));
+                                    } else {
+                                        // A BOUNDED slice delete (`del
+                                        // self._writes[start:end]` —
+                                        // botocore's restdoc): removing a
+                                        // range is unmodeled — a no-op with
+                                        // a warning (documented divergence).
+                                        options.definition_warnings.borrow_mut().push(
+                                            "del with a bounded slice target is dropped \
+                                             (removing a range of elements is unmodeled; \
+                                             the elements stay in the container)"
+                                                .to_string(),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -675,13 +719,30 @@ impl CodeGen for StatementType {
                             // check_deleted_names pass enforces loudly
                             // (issue #112).
                         }
-                        ExprType::Attribute(_) => {
-                            return Err(format!(
-                                "del with an attribute target (removing a field) is not \
-                                 supported: class fields are struct members and cannot be \
-                                 removed (issue #112)"
-                            )
-                            .into());
+                        ExprType::Attribute(a) => {
+                            // `del obj.attr` on a NON-self object (`del
+                            // newmod.newmod, ...` — pygments' module
+                            // proxy cleanup, where newmod is a module
+                            // object from _automodule): dynamic module
+                            // machinery — a no-op with a warning (the
+                            // module-object / class-as-value divergence).
+                            // `del self.field` remains a loud error (a
+                            // real struct-member removal).
+                            if !matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "del of `{}` attribute is dropped (removing an \
+                                     attribute from a non-self object is unmodeled — \
+                                     the module-object/class-as-value divergence)",
+                                    a.attr
+                                ));
+                            } else {
+                                return Err(format!(
+                                    "del with an attribute target (removing a field) is not \
+                                     supported: class fields are struct members and cannot be \
+                                     removed (issue #112)"
+                                )
+                                .into());
+                            }
                         }
                         _ => {
                             return Err(

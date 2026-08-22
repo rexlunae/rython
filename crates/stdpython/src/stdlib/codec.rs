@@ -336,3 +336,20 @@ mod tests {
     }
 }
 
+
+/// Latin-1 (ISO-8859-1) encoding: each character maps to its code point
+/// (0-255); characters above U+00FF raise UnicodeEncodeError.
+pub fn encode_latin1<S: AsRef<str>>(s: S) -> Result<Vec<u8>, PyException> {
+    let mut out = Vec::with_capacity(s.as_ref().len());
+    for c in s.as_ref().chars() {
+        let cp = c as u32;
+        if cp > 0xFF {
+            return Err(PyException::new(
+                "UnicodeEncodeError",
+                "latin-1 codec can't encode character",
+            ));
+        }
+        out.push(cp as u8);
+    }
+    Ok(out)
+}

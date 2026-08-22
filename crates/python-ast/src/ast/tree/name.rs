@@ -109,6 +109,30 @@ impl CodeGen for Name {
                     crate::TypeInfo::Bytes => {
                         quote!((#name).as_bytes().unwrap().to_vec())
                     }
+                    // Issue #121: a boxed PyValue narrowed by isinstance
+                    // reads the concrete member via the PyValue accessors
+                    // (as_int/as_str/as_tuple...), a runtime conversion.
+                    crate::TypeInfo::PyValueMember(inner) => match inner.as_ref() {
+                        crate::TypeInfo::Int => quote!((#name).as_int().unwrap()),
+                        crate::TypeInfo::Float => quote!((#name).as_float().unwrap()),
+                        crate::TypeInfo::Bool => quote!((#name).as_bool().unwrap()),
+                        crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                            quote!((#name).as_str().unwrap().to_string())
+                        }
+                        crate::TypeInfo::Bytes => {
+                            quote!((#name).as_bytes().unwrap().to_vec())
+                        }
+                        // A narrowed tuple member (isinstance(x, tuple))
+                        // reads as the element vector; indexing and len
+                        // then operate on it.
+                        crate::TypeInfo::Vec(_) => {
+                            quote!((#name).as_tuple().unwrap().clone())
+                        }
+                        _ => quote!((#name)),
+                    },
+                    // A PyValue narrowed to itself (e.g. the else of a
+                    // compound `isinstance(x, T) and ...`) reads bare.
+                    crate::TypeInfo::PyValue => quote!((#name)),
                     _ => quote!((#name).clone().unwrap()),
                 });
             }

@@ -174,6 +174,58 @@ impl CodeGen for Compare {
                     }
                     continue;
                 }
+                // `x is False` / `x is True` on a boxed PyValue (issue
+                // #121): test the Bool member, not Rust reference equality
+                // (`&x == &false` would not type-check).
+                if matches!(op, Compares::Is | Compares::IsNot) {
+                    let bool_lit = |e: &ExprType| -> Option<bool> {
+                        match e {
+                            ExprType::Constant(c) => match &c.0 {
+                                Some(litrs::Literal::Bool(b)) => Some(b.value()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    };
+                    let pyvalue_operand = |e: &ExprType| -> Option<TokenStream> {
+                        if let ExprType::Name(n) = e
+                            && options
+                                .name_types
+                                .get(&n.id)
+                                .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
+                        {
+                            e.clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .ok()
+                        } else {
+                            None
+                        }
+                    };
+                    let (val, operand) = if let Some(b) = bool_lit(comparator_ast) {
+                        (b, pyvalue_operand(left_ast))
+                    } else if let Some(b) = bool_lit(left_ast) {
+                        (b, pyvalue_operand(comparator_ast))
+                    } else {
+                        (false, None)
+                    };
+                    if let Some(operand) = operand {
+                        let tokens = match op {
+                            Compares::Is => quote!(
+                                (#operand).is_bool() && (#operand).as_bool() == Some(#val)
+                            ),
+                            _ => quote!(
+                                !((#operand).is_bool() && (#operand).as_bool() == Some(#val))
+                            ),
+                        };
+                        index += 1;
+                        left = quote!(#operand);
+                        outer_ts.extend(tokens);
+                        if index < ops.len() {
+                            outer_ts.extend(quote!( && ));
+                        }
+                        continue;
+                    }
+                }
             }
             let comparator = comparator_ast
                 .clone()

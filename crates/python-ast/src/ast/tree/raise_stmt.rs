@@ -111,16 +111,20 @@ impl CodeGen for Raise {
             }
             None => {
                 // Bare `raise` re-raises the exception the enclosing except
-                // handler caught (a runtime error outside a handler, as in
-                // Python).
+                // handler caught. Outside a handler (`_onerror_reraise` —
+                // pip's misc, an rmtree onerror callback) the active
+                // exception is unknown: a generic re-raise (documented
+                // divergence).
                 if !ctx.in_except_handler() {
-                    return Err(
-                        "bare `raise` outside an except handler has no exception to re-raise"
-                            .to_string()
-                            .into(),
+                    options.definition_warnings.borrow_mut().push(
+                        "bare `raise` outside an except handler re-raises a generic \
+                         exception (the active exception is unmodeled)"
+                            .to_string(),
                     );
+                    quote!(PyException::new("RuntimeError", "bare raise"))
+                } else {
+                    quote!(__rython_exc.clone())
                 }
-                quote!(__rython_exc.clone())
             }
         };
 
@@ -185,6 +189,9 @@ pub fn is_exception_class_name(name: &str) -> bool {
     ) || name.ends_with("Error")
         || name.ends_with("Exception")
         || name.ends_with("Warning")
+        // The exception GROUP classes (`isinstance(exc_value,
+        // (BaseExceptionGroup, ExceptionGroup))` — rich's traceback).
+        || matches!(name, "BaseExceptionGroup" | "ExceptionGroup")
 }
 
 /// Lower the raised expression to a PyException value: `Name(...)` and bare

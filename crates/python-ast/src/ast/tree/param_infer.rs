@@ -80,6 +80,12 @@ pub enum ParamReq {
     /// Item = E>`, where the element name is a virtual parameter whose own
     /// requirements come from the loop body's uses of `x`.
     Iterate(String),
+    /// `for k, v in p` — a TUPLE loop target over an unannotated parameter
+    /// (`for key, value in pairs:` — botocore's compat.from_pairs; `for
+    /// base, suffix, dest in rules:` — distlib's get_resources_dests): the
+    /// element is an N-tuple — `T: IntoIterator<Item = (E1, ..., EN)>` —
+    /// with every element name as a virtual parameter.
+    IterateTuple(Vec<String>),
     /// An element of a `"sep".join(...)` argument (issue #116): the
     /// element must be `AsRef<str>` so `str::join`/PyStrOps::join accept it.
     AsRefStr,
@@ -197,6 +203,10 @@ pub struct InferredSignature {
     /// Parameters with duck-typed user-method requirements (M3): param →
     /// the method names whose generated Has* trait returns Result.
     pub duck_methods_on_params: HashMap<String, HashSet<String>>,
+    /// Parameters (and loop elements) CALLED as functions: the
+    /// callable-as-value divergence (#122) — the call sites lower to a
+    /// dropped no-op.
+    pub called_params: HashSet<String>,
     /// M5 definition-time warning: set when some parameter's bound set is
     /// satisfied by no known rython type (`p.upper()` + `p.pop()`). A
     /// well-formed definition in Python, so it never blocks conversion —
@@ -356,6 +366,50 @@ fn loop_element_names(body: &[Statement], unannotated: &HashSet<String>) -> Vec<
     out
 }
 
+/// Walk a body collecting the names called as functions that are loop
+/// elements over NON-parameter iterables (`for filter in self.X:
+/// filter(**kwargs)` — botocore's docs client, where the loop shadows the
+/// builtin): kwargs-only and annotated functions never run the full
+/// inference, but these calls must still lower as dropped no-ops
+/// (callable-as-value divergence, #122).
+pub fn collect_called_params(
+    body: &[Statement],
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> std::collections::HashSet<String> {
+    let info = crate::analyze_function_types(body, None, None);
+    let mut collector = Collector {
+        unannotated: &std::collections::HashSet::new(),
+        name_types: &info.name_types,
+        symbols,
+        options,
+        reqs: HashMap::new(),
+        alias: HashMap::new(),
+        returns: Vec::new(),
+        reassigned: HashSet::new(),
+        string_pinned: HashSet::new(),
+        value_pinned: HashSet::new(),
+        duck_returns: HashMap::new(),
+        duck_method_calls: HashMap::new(),
+        called_params: HashSet::new(),
+        error: None,
+        current_fn: None,
+        callee_cache: HashMap::new(),
+        visiting: HashSet::new(),
+        return_visiting: HashSet::new(),
+        loop_elements: HashMap::new(),
+    };
+    collector.walk(body);
+    collector.called_params
+}
+
+/// Whether a type token string is a BARE TYPE NAME — a single identifier
+/// with no generics/pointers (`V`, `String`, `bool`): used to detect a
+/// parameter's type variable in return unification.
+fn is_bare_type_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
 /// The per-function inference pass. `params` are the unannotated parameter
 /// names in declaration order (excluding `self`); `name_types` and
 /// `use_counts` come from the same `analyze_function_types` pass that
@@ -367,6 +421,7 @@ pub fn infer_unannotated_signature(
     use_counts: &HashMap<String, usize>,
     symbols: &SymbolTableScopes,
     options: &crate::PythonOptions,
+    fn_name: &str,
 ) -> Result<InferredSignature, String> {
     if params.is_empty() {
         return Ok(InferredSignature::default());
@@ -392,18 +447,55 @@ pub fn infer_unannotated_signature(
             .all_functions()
             .into_iter()
             .filter(|f| {
+                // None-DEFAULTED unannotated params are excluded from the
+                // inferred set (they become Option<()>), exactly as the
+                // caller computed `unannotated`.
+                let default_offset = f.args.args.len().saturating_sub(f.args.defaults.len());
+                let none_defaulted: HashSet<String> = f
+                    .args
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _p)| {
+                        *i >= default_offset
+                            && crate::is_none_expr(
+                                f.args.defaults[*i - default_offset].as_ref(),
+                            )
+                    })
+                    .map(|(_, p)| p.arg.clone())
+                    .collect();
                 let un: HashSet<String> = f
                     .args
                     .posonlyargs
                     .iter()
                     .chain(f.args.args.iter())
                     .chain(f.args.kwonlyargs.iter())
-                    .filter(|p| p.arg != "self" && p.annotation.is_none())
+                    .filter(|p| {
+                        p.arg != "self"
+                            && p.annotation.is_none()
+                            && !none_defaulted.contains(&p.arg)
+                    })
                     .map(|p| p.arg.clone())
                     .collect();
                 un == unannotated
             })
             .collect::<Vec<_>>();
+        // Two module functions may share an unannotated parameter list
+        // (`compat_shell_split(s, platform=None)` and `_windows_shell_split
+        // (s)` — botocore's compat): the function whose BODY is the one
+        // being inferred is the current function (used for self-recursion).
+        if fns.len() > 1
+            && let Some(exact) = fns.iter().find(|f| f.body == body)
+        {
+            fns = vec![exact.clone()];
+        }
+        // The body may have been preprocessed (effective_body); fall back
+        // to the function NAME.
+        if fns.len() > 1
+            && let Some(exact) = fns.iter().find(|f| f.name == fn_name)
+        {
+            fns = vec![exact.clone()];
+        }
         if fns.len() == 1 {
             fns.pop().map(|f| f.name)
         } else {
@@ -420,8 +512,11 @@ pub fn infer_unannotated_signature(
         alias: HashMap::new(),
         returns: Vec::new(),
         reassigned: HashSet::new(),
+        string_pinned: HashSet::new(),
+        value_pinned: HashSet::new(),
         duck_returns: HashMap::new(),
         duck_method_calls: HashMap::new(),
+        called_params: HashSet::new(),
         error: None,
         current_fn: current_fn.clone(),
         callee_cache: HashMap::new(),
@@ -451,6 +546,13 @@ pub fn infer_unannotated_signature(
                 && !all_params.contains(elt)
             {
                 all_params.push(elt.clone());
+            }
+            if let ParamReq::IterateTuple(elts) = req {
+                for e in elts {
+                    if !all_params.contains(e) {
+                        all_params.push(e.clone());
+                    }
+                }
             }
         }
     }
@@ -513,6 +615,11 @@ pub fn infer_unannotated_signature(
                 if let ParamReq::Iterate(elt) = req {
                     forced_elements.insert(elt.clone());
                 }
+                if let ParamReq::IterateTuple(elts) = req {
+                    for e in elts {
+                        forced_elements.insert(e.clone());
+                    }
+                }
             }
         }
     }
@@ -532,7 +639,17 @@ pub fn infer_unannotated_signature(
         }
     }
     for name in &all_params {
-        if let Some(ty) = identity_types.get(name) {
+        // A str-pinned param (`name = f"..."` — botocore's xform_name):
+        // reassigned with a string, so it takes the concrete String type.
+        if collector.string_pinned.contains(name) {
+            param_types.insert(name.clone(), quote!(String));
+        } else if collector.value_pinned.contains(name) {
+            // A value-pinned param (`stream = StringIO(data)` — distlib's
+            // read_exports): reassigned with a CALL RESULT (a construction
+            // or foreign-object call), so the parameter's concrete type is
+            // a boxed PyValue.
+            param_types.insert(name.clone(), quote!(stdpython::PyValue));
+        } else if let Some(ty) = identity_types.get(name) {
             param_types.insert(name.clone(), ty.clone());
         } else if let Some(tv) = tv_names.get(name) {
             let ident = quote::format_ident!("{}", tv);
@@ -598,6 +715,16 @@ pub fn infer_unannotated_signature(
                     let elt_ident = quote::format_ident!("{}", elt_tv);
                     quote!(#tv: IntoIterator<Item = #elt_ident>)
                 }
+                ParamReq::IterateTuple(elts) => {
+                    let mut idents = Vec::new();
+                    for e in elts {
+                        let e_tv = tv_names.get(e).ok_or_else(|| {
+                            format!("internal: loop element `{e}` has no type variable")
+                        })?;
+                        idents.push(quote::format_ident!("{}", e_tv));
+                    }
+                    quote!(#tv: IntoIterator<Item = (#(#idents),*)>)
+                }
                 ParamReq::AsRefStr => quote!(#tv: AsRef<str>),
                 ParamReq::Conversion(trait_name) => {
                     let t = quote::format_ident!("{}", trait_name);
@@ -610,6 +737,12 @@ pub fn infer_unannotated_signature(
                 ParamReq::Hash => quote!(#tv: PyHash),
                 ParamReq::IsNone => quote!(#tv: PyIsNone),
                 ParamReq::Index(idx) => {
+                    // An UNKNOWN index (`name[: -len(matched)]` where the
+                    // bound is a call — botocore's xform_name): a str-slice
+                    // needs no bound on the container; skip it.
+                    if matches!(idx, RhsType::Unknown) {
+                        continue;
+                    }
                     let idx = render_rhs(idx, &param_types, &quote!(#tv))?;
                     quote!(#tv: PyIndex<#idx>)
                 }
@@ -623,13 +756,20 @@ pub fn infer_unannotated_signature(
                     quote!(#tv: PyContains<#item>)
                 }
                 ParamReq::Method(trait_name, _, rhs) => {
-                    let t = quote::format_ident!("{}", trait_name);
-                    match rhs {
-                        Some(rhs) => {
-                            let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
-                            quote!(#tv: #t<#rhs>)
+                    // An UNKNOWN duck-typed member (`request.body` —
+                    // s3transfer's plugin hooks): no bound can be generated;
+                    // the parameter stays a boxed PyValue (divergence).
+                    if trait_name == "PyDuckUnknown" {
+                        quote!()
+                    } else {
+                        let t = quote::format_ident!("{}", trait_name);
+                        match rhs {
+                            Some(rhs) => {
+                                let rhs = render_rhs(rhs, &param_types, &quote!(#tv))?;
+                                quote!(#tv: #t<#rhs>)
+                            }
+                            None => quote!(#tv: #t),
                         }
-                        None => quote!(#tv: #t),
                     }
                 }
                 ParamReq::Identity(_) => unreachable!("skipped above"),
@@ -660,6 +800,7 @@ pub fn infer_unannotated_signature(
             duck_methods_on_params.insert(name.clone(), methods.clone());
         }
     }
+    let called_params: HashSet<String> = collector.called_params.clone();
 
     // Return type: every return value must unify to one type expression.
     let return_type = if collector.returns.is_empty() {
@@ -672,16 +813,57 @@ pub fn infer_unannotated_signature(
             match &inferred {
                 None => inferred = Some(ty),
                 Some(prev) if prev.to_string() == ty.to_string() => {}
+                // A boxed PyValue unifies with anything (it can hold any
+                // value): `fileobj.seekable()` (PyValue) vs `True`/`False`
+                // (bool) — s3transfer's seekable.
+                Some(prev)
+                    if prev.to_string() == "stdpython :: PyValue"
+                        || ty.to_string() == "stdpython :: PyValue" =>
+                {
+                    inferred = Some(quote!(stdpython::PyValue));
+                }
+                // A `return None` alongside a typed return (`return None`
+                // + `return service_name in ['s3']` — botocore's docs
+                // client): the function returns `T | None` — a boxed
+                // PyValue (the None-mixing unification; the codegen wraps
+                // the returns).
+                Some(prev) if prev.to_string() == "()" || ty.to_string() == "()" => {
+                    inferred = Some(quote!(stdpython::PyValue));
+                }
                 // Recursive fixpoint (M4): `<X as PyOp<X>>::Output` unifies
                 // with X — the recursive call returns the parameter's type
                 // (int/str/list all satisfy PyOp<Self>::Output == Self).
+                // Checked BEFORE the bare-type-name arm: fibonacci's
+                // `return n` (T) + `return fibonacci(n-1) +
+                // fibonacci(n-2)` (`<T as PyAdd<T>>::Output`) must keep
+                // the generic T, not box as PyValue.
                 Some(prev) if unifies_with_recursion(prev, &ty) => {}
-                _ => {
-                    return Err(format!(
-                        "return statements have different types; annotate the \
-                         function's return type (issue #109, M1)"
-                    ));
+                // A parameter's type variable on one path and a concrete
+                // type on another (`return val` + `return val.lower() ==
+                // 'true'` — botocore's ensure_boolean): the function
+                // returns `T | bool` — a boxed PyValue.
+                Some(prev)
+                    if is_bare_type_name(&prev.to_string())
+                        || is_bare_type_name(&ty.to_string()) =>
+                {
+                    inferred = Some(quote!(stdpython::PyValue));
                 }
+                // A TUPLE return with per-element unification
+                // (`return text, 'utf-8'` + `return text, prefencoding` —
+                // pygments' guess_decode, where prefencoding is a boxed
+                // PyValue): merge element-wise — a PyValue element absorbs
+                // the concrete one.
+                Some(prev) => {
+                    if let Some(merged) = unify_tuple_returns(prev, &ty) {
+                        inferred = Some(merged);
+                    } else {
+                            return Err(format!(
+                            "return statements have different types; annotate the \
+                             function's return type (issue #109, M1)"
+                        ));
+                    }
+                }
+                None => unreachable!("inferred is Some here"),
             }
         }
         inferred
@@ -717,6 +899,7 @@ pub fn infer_unannotated_signature(
         method_params,
         definition_warning,
         duck_methods_on_params,
+        called_params,
     })
 }
 
@@ -750,6 +933,43 @@ fn render_rhs(
     })
 }
 
+/// Whether the two type-token strings are Rust TUPLE types of the same
+/// arity; if so, merge them element-wise — a PyValue element absorbs the
+/// concrete element (`(String, String)` + `(String, PyValue)` →
+/// `(String, PyValue)` — pygments' guess_decode).
+fn unify_tuple_returns(a: &TokenStream, b: &TokenStream) -> Option<TokenStream> {
+    let parse = |t: &TokenStream| -> Option<Vec<String>> {
+        let s = t.to_string();
+        // `(String , String)`, `(String , stdpython :: PyValue)`.
+        let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+        let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.iter().map(|p| p.to_string()).collect())
+    };
+    let (pa, pb) = (parse(a)?, parse(b)?);
+    if pa.len() != pb.len() || pa.len() == 1 {
+        return None;
+    }
+    let mut merged: Vec<String> = Vec::with_capacity(pa.len());
+    for (x, y) in pa.iter().zip(pb.iter()) {
+        let elt = if x == y {
+            x.clone()
+        } else if x == "stdpython :: PyValue" || x == "stdpython::PyValue" {
+            x.clone()
+        } else if y == "stdpython :: PyValue" || y == "stdpython::PyValue" {
+            y.clone()
+        } else {
+            return None;
+        };
+        merged.push(elt);
+    }
+    let joined = merged.join(" , ");
+    let tokens: TokenStream = joined.parse().ok()?;
+    Some(quote!((#tokens)))
+}
+
 /// The return type expression for one return value, in terms of the type
 /// variables.
 fn return_type_of(
@@ -776,16 +996,79 @@ fn return_type_of(
             if let Some(tv) = param_tv(&n.id) {
                 Ok(tv)
             } else if let Some(t) = collector.name_types.get(&n.id) {
-                Ok(t.to_rust_type())
+                // An UNKNOWN local (`data = request.data` then returned —
+                // botocore's _get_body_as_dict): a boxed PyValue.
+                if matches!(t, crate::TypeInfo::PyObject) {
+                    Ok(quote!(stdpython::PyValue))
+                } else if matches!(t, crate::TypeInfo::Vec(inner)
+                    if matches!(**inner, crate::TypeInfo::PyObject))
+                {
+                    // A LIST local built by appends whose element type never
+                    // resolved (`components = []` then
+                    // `components.append(...)` — botocore's
+                    // _windows_shell_split): the boxed heterogeneous
+                    // container (the empty-pin divergence) — a `Vec<_>`
+                    // would not unify with the `Vec<PyValue>` of an
+                    // empty-list sibling return.
+                    Ok(quote!(Vec<stdpython::PyValue>))
+                } else {
+                    // A str-LITERAL local (`first = '/'`) is a &str in
+                    // Rust; a returned/operated value is an owned String.
+                    Ok(if matches!(t, crate::TypeInfo::StrRef) {
+                        quote!(String)
+                    } else {
+                        t.to_rust_type()
+                    })
+                }
+            } else if let Some(crate::SymbolTableNode::Assign { value, .. }) =
+                collector.symbols.get(&n.id)
+            {
+                // A local assigned a STRING literal (`first = '/'` —
+                // botocore's remove_dot_segments): an owned String.
+                match value {
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                    {
+                        Ok(quote!(String))
+                    }
+                    _ => Ok(quote!(stdpython::PyValue)),
+                }
             } else {
-                Err(err())
+                // A local whose type was never recorded (a foreign-assigned
+                // local returned directly): a boxed PyValue (documented
+                // divergence).
+                Ok(quote!(stdpython::PyValue))
             }
+        }
+        // `return None` — the NoneType node (s3transfer's
+        // set_default_checksum_algorithm) — the unit value.
+        ExprType::NoneType(_) => Ok(quote!(())),
+        // An empty list literal (`return []` — botocore's compat
+        // _windows_shell_split): a Vec whose element type is unknown —
+        // boxed PyValue elements (the empty-pin divergence).
+        ExprType::List(l) if l.is_empty() => Ok(quote!(Vec<stdpython::PyValue>)),
+        // A dict literal (`{'access_key': token['accessToken']
+        // ['accessKeyId'], ...}` — botocore's _token_to_credentials): a
+        // boxed PyDict<String, PyValue> (the boxed-dict divergence).
+        ExprType::Dict(_) => Ok(quote!(PyDict<String, stdpython::PyValue>)),
+        // A tuple literal (`return True, 0` — botocore's eventstream
+        // unpack_true): the tuple of the elements' types.
+        ExprType::Tuple(t) => {
+            let mut elts = Vec::new();
+            for e in &t.elts {
+                elts.push(return_type_of(e, collector, param_types)?);
+            }
+            Ok(quote!((#(#elts),*)))
         }
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Ok(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Ok(quote!(f64)),
             Some(litrs::Literal::String(_)) => Ok(quote!(String)),
             Some(litrs::Literal::Bool(_)) => Ok(quote!(bool)),
+            // `return None` — the None constant arrives with no literal
+            // payload (`Constant(None)`); the unit value (s3transfer's
+            // set_default_checksum_algorithm).
+            None => Ok(quote!(())),
             _ => Err(err()),
         },
         ExprType::Call(c) => {
@@ -825,6 +1108,130 @@ fn return_type_of(
                                 }
                             }
                         }
+                        // A VOID recursion: the function returns nothing on
+                        // its base path (`return set_value_from_jmespath(...)`
+                        // — botocore's utils, where the base path only
+                        // stores into the source): the recursive call
+                        // returns the unit too.
+                        fn returns_void(body: &[Statement], self_name: &str) -> bool {
+                            for s in body {
+                                match &s.statement {
+                                    crate::StatementType::Return(Some(e)) => {
+                                        let is_self = matches!(
+                                            &e.value,
+                                            ExprType::Call(rc)
+                                                if matches!(
+                                                    rc.func.as_ref(),
+                                                    ExprType::Name(n) if n.id == self_name
+                                                )
+                                        );
+                                        if !is_self {
+                                            return false;
+                                        }
+                                    }
+                                    crate::StatementType::If(i) => {
+                                        if !returns_void(&i.body, self_name)
+                                            || !returns_void(&i.orelse, self_name)
+                                        {
+                                            return false;
+                                        }
+                                    }
+                                    crate::StatementType::For(f) => {
+                                        if !returns_void(&f.body, self_name)
+                                            || !returns_void(&f.orelse, self_name)
+                                        {
+                                            return false;
+                                        }
+                                    }
+                                    crate::StatementType::While(w) => {
+                                        if !returns_void(&w.body, self_name)
+                                            || !returns_void(&w.orelse, self_name)
+                                        {
+                                            return false;
+                                        }
+                                    }
+                                    crate::StatementType::Try(t) => {
+                                        if !returns_void(&t.body, self_name)
+                                            || !returns_void(&t.orelse, self_name)
+                                            || !returns_void(&t.finalbody, self_name)
+                                        {
+                                            return false;
+                                        }
+                                        for h in &t.handlers {
+                                            if !returns_void(&h.body, self_name) {
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                    crate::StatementType::With(w) => {
+                                        if !returns_void(&w.body, self_name) {
+                                            return false;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            true
+                        }
+                        if returns_void(&callee.body, &callee.name) {
+                            return Ok(quote!(()));
+                        }
+                        // A recursion whose base path returns a CONCRETE
+                        // type (`''` / `open_paren + escape(first) +
+                        // close_paren` — pygments' regex_opt_inner, which
+                        // recurses on string slices): the recursive call
+                        // returns the base path's unified type — resolve
+                        // the non-self return expressions.
+                        let base_type = {
+                            let mut collected: Vec<ExprType> = Vec::new();
+                            collect_non_self_returns(&callee.body, &callee.name, &mut collected);
+                            let mut unified: Option<TokenStream> = None;
+                            let mut ok = true;
+                            for e in &collected {
+                                match return_type_of(e, collector, param_types) {
+                                    Ok(t) => match &unified {
+                                        None => unified = Some(t),
+                                        Some(prev) if prev.to_string() == t.to_string() => {}
+                                        _ => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    },
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            // A STRING recursion whose base returns mix the
+                            // string-typed shapes (`''`, a BinOp over the
+                            // string param `open_paren` — regex_opt_inner):
+                            // every base path builds a str in Python —
+                            // resolve String.
+                            if !ok {
+                                let all_string_like = !collected.is_empty()
+                                    && collected.iter().all(|e| {
+                                        matches!(
+                                            return_type_of(e, collector, param_types),
+                                            Ok(t) if !matches!(
+                                                t.to_string().as_str(),
+                                                "i64" | "f64" | "bool" | "()"
+                                                    | "Vec < i64 >" | "Vec < f64 >"
+                                                    | "Vec < bool >" | "Vec < String >"
+                                                    | "PyDict < String , stdpython :: PyValue >"
+                                            )
+                                        )
+                                    });
+                                if all_string_like {
+                                    ok = true;
+                                    unified = Some(quote!(String));
+                                }
+                            }
+                            if ok { unified } else { None }
+                        };
+                        if let Some(t) = base_type {
+                            return Ok(t);
+                        }
                         return Err(format!(
                             "recursive call to `{}` does not return one of its \
                              parameters; annotate `{}`'s return type (issue #109, M4)",
@@ -834,10 +1241,23 @@ fn return_type_of(
                     return callee_return_type(callee, &c.args, collector, param_types);
                 }
             }
-            // A method call on a parameter: the table's return type.
+            // A method call on a parameter (or a member chain rooted in a
+            // parameter — `request.url.endswith('?location')` — botocore's
+            // utils; `path[len(root):].lstrip('/')` — distlib's
+            // get_rel_path, where the receiver is a SUBSCRIPT of the
+            // parameter): the table's return type.
             if let ExprType::Attribute(a) = c.func.as_ref()
-                && let ExprType::Name(n) = a.value.as_ref()
-                && (param_types.contains_key(&n.id) || collector.alias.contains_key(&n.id))
+                && let Some(root) = crate::root_name(&a.value)
+                    .or_else(|| {
+                        // A Subscript receiver (`path[len(root):]`) roots
+                        // at the subscripted name.
+                        if let ExprType::Subscript(s) = a.value.as_ref() {
+                            crate::root_name(&s.value)
+                        } else {
+                            None
+                        }
+                    })
+                && (param_types.contains_key(root) || collector.alias.contains_key(root))
             {
                 // M3: a duck-typed user method's return comes from the
                 // unified class signature.
@@ -849,7 +1269,7 @@ fn return_type_of(
                 {
                     // pop() returns the element: `<T as PyPop<Idx>>::Output`.
                     if *ret == MethodReturn::Unknown && a.attr == "pop" {
-                        let tv = param_tv_of(&n.id, collector, param_types);
+                        let tv = param_tv_of(root, collector, param_types);
                         let idx = match c.args.first() {
                             Some(arg) => operand_type(arg, collector, param_types)?,
                             None => quote!(i64),
@@ -864,13 +1284,21 @@ fn return_type_of(
                         MethodReturn::TripleStr => quote!((String, String, String)),
                         MethodReturn::Unit => quote!(()),
                         MethodReturn::Unknown => {
-                            return Err(
-                                "cannot infer the type of this method call in a return; \
-                                 annotate the function's return type (issue #109)"
-                                    .to_string(),
-                            )
+                            // An unknown duck-typed method in a return
+                            // (`fileobj.seekable()` — s3transfer's
+                            // seekable): a boxed PyValue (the duck
+                            // dispatch return is untyped).
+                            return Ok(quote!(stdpython::PyValue));
                         }
                     });
+                }
+                // An UNKNOWN method call on an unannotated param in a
+                // return (`fileobj.seekable()` — s3transfer's seekable): a
+                // boxed PyValue (the duck dispatch return is untyped).
+                if STDLIB_METHOD_TABLE.iter().all(|(m, ..)| *m != a.attr)
+                    && collector.unannotated.contains(root)
+                {
+                    return Ok(quote!(stdpython::PyValue));
                 }
             }
             // `"sep".join(...)` on a string literal (or a String/&str
@@ -901,6 +1329,8 @@ fn return_type_of(
                     "bool" => return Ok(quote!(bool)),
                     "str" => return Ok(quote!(String)),
                     "len" => return Ok(quote!(i64)),
+                    "isinstance" => return Ok(quote!(bool)),
+                    "hasattr" => return Ok(quote!(bool)),
                     "abs" => {
                         if let Some(arg) = c.args.first()
                             && let ExprType::Name(n) = arg
@@ -912,16 +1342,264 @@ fn return_type_of(
                     _ => {}
                 }
             }
+            // A METHOD CALL on a SUBSCRIPTED receiver (`_pattern_cache[
+            // glob].match(fn)` — pygments' lexers, where _pattern_cache is
+            // a module-level dict of compiled regexes): the member of a
+            // dynamic container — a boxed PyValue.
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && matches!(a.value.as_ref(), ExprType::Subscript(_))
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A CALL THROUGH a SUBSCRIPTED callee (`_lexer_cache[name](
+            // **options)` — pygments' get_lexer_by_name, where the dict
+            // holds Lexer CLASSES and the call constructs one): a class
+            // held in a container — a boxed PyValue (the class-as-value
+            // divergence).
+            if matches!(c.func.as_ref(), ExprType::Subscript(_)) {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A CALL through a CALL RESULT (`matching_lexers.pop()(
+            // **options)` — pygments' guess_lexer_for_filename, where the
+            // set holds Lexer CLASSES): a class held in a container —
+            // boxed (the class-as-value divergence).
+            if matches!(c.func.as_ref(), ExprType::Call(_)) {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A `cls(...)` construction in a @classmethod factory
+            // (`return cls(f, start_byte, ...)` — s3transfer's
+            // ReadFileChunk.from_filename): the class instance is a boxed
+            // PyValue (documented divergence).
+            if let ExprType::Name(f) = c.func.as_ref()
+                && f.id == "cls"
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A class CONSTRUCTION (`return _Refresher(actual_refresh)` — a
+            // nested class, botocore's create_mfa_serial_refresher): the
+            // class's struct.
+            if let ExprType::Name(f) = c.func.as_ref()
+                && matches!(
+                    collector.symbols.get(&f.id),
+                    Some(crate::SymbolTableNode::ClassDef(_))
+                )
+            {
+                let ident = crate::safe_ident(&f.id);
+                return Ok(quote!(#ident));
+            }
+            // A method call on a DICT-LITERAL receiver
+            // (`{...}.get(type_name, type_name)` — botocore's docs
+            // py_type_name): all-str values → String; otherwise a boxed
+            // PyValue.
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && let ExprType::Dict(d) = a.value.as_ref()
+            {
+                let all_str = d.values.iter().all(|v| {
+                    matches!(v, ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_))))
+                });
+                if all_str {
+                    return Ok(quote!(String));
+                }
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A method call on a CONSTRUCTION receiver (`ResponseParserFactory
+            // ().create_parser(protocol)` — botocore's parsers): the
+            // method's return is not resolved here — a boxed PyValue.
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && matches!(a.value.as_ref(), ExprType::Call(_))
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A method call on an UNKNOWN-TYPED LOCAL receiver
+            // (`resolver.load_credentials()` where `resolver =
+            // create_credential_resolver(session)` — a call to an imported
+            // function — botocore's get_credentials; `algorithm_member_
+            // shape.serialization.get("name")` — botocore's httpchecksum):
+            // a boxed PyValue (cross-module return-typing divergence,
+            // #123).
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && let Some(root) = crate::root_name(&a.value)
+                && !param_types.contains_key(root)
+                && !collector.alias.contains_key(root)
+                && collector
+                    .name_types
+                    .get(root)
+                    .is_none_or(|t| matches!(t, crate::TypeInfo::PyObject))
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A call to an IMPORTED function (`seekable(download_target)` —
+            // s3transfer's DownloadSeekableOutputManager.is_compatible;
+            // `gzip_compress(...)` where `from gzip import compress as
+            // gzip_compress` — botocore's compress): the callee's return
+            // type lives in another module and is not resolved here — a
+            // boxed PyValue (cross-module return-typing divergence, #123).
+            if let ExprType::Name(f) = c.func.as_ref() {
+                let sym = collector.symbols.get(&f.id);
+                let sym = match sym {
+                    Some(crate::SymbolTableNode::Alias(canonical)) => {
+                        collector.symbols.get(canonical)
+                    }
+                    other => other,
+                };
+                if matches!(
+                    sym,
+                    Some(
+                        crate::SymbolTableNode::Import(_)
+                            | crate::SymbolTableNode::ImportFrom(_)
+                    )
+                ) {
+                    // `from re import escape` (pygments' regexopt): the
+                    // known re-function returns an owned String.
+                    if let Some(crate::SymbolTableNode::ImportFrom(i)) = sym
+                        && i.module == "re"
+                        && matches!(f.id.as_str(), "escape" | "sub" | "findall")
+                    {
+                        return Ok(quote!(String));
+                    }
+                    return Ok(quote!(stdpython::PyValue));
+                }
+            }
+            // A call through a CALLABLE PARAMETER (`exception_cls(*args,
+            // **kwargs)` — botocore's exceptions): the callable-as-value
+            // divergence (#122) — a boxed PyValue.
+            if let ExprType::Name(f) = c.func.as_ref()
+                && (param_types.contains_key(&f.id)
+                    || collector.unannotated.contains(&f.id))
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A call through an UNKNOWN name — an enclosing-scope callable
+            // value (`fn()` — s3transfer's
+            // ExecutorFuture.add_done_callback, where fn is the enclosing
+            // method's unannotated parameter, invisible to this nested
+            // function's inference): a boxed PyValue (callable-as-value
+            // divergence, issue #122). Also a LOCAL bound to a container
+            // read (`lexer_class = custom_namespace[lexername]` then
+            // `lexer_class(**options)` — pygments' load_lexer_from_file,
+            // where the dict holds CLASSES): a class held in a container —
+            // boxed (the class-as-value divergence).
+            if let ExprType::Name(f) = c.func.as_ref()
+                && !collector.alias.contains_key(&f.id)
+                && !param_types.contains_key(&f.id)
+                && !collector.name_types.contains_key(&f.id)
+                && (collector.symbols.get(&f.id).is_none()
+                    || matches!(
+                        collector.symbols.get(&f.id),
+                        Some(crate::SymbolTableNode::Assign { value, .. })
+                            if matches!(value, ExprType::Subscript(_) | ExprType::Call(_))
+                    ))
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
+            // A call on an EXTERNAL object (`parser.Parser().parse(...)` —
+            // jmespath's compile, where Parser is from an external module):
+            // the result is a boxed PyValue (documented divergence). The
+            // receiver chain roots in an import — possibly through a
+            // construction call (`parser.Parser()`).
+            if let ExprType::Attribute(a) = c.func.as_ref()
+                && {
+                    // Resolve the ROOT through nested attribute calls
+                    // (`parser.Parser().parse(...).search(...)` — jmespath's
+                    // search): each chain segment may be a Call.
+                    let mut root = None;
+                    let mut cur: &ExprType = a.value.as_ref();
+                    for _ in 0..6 {
+                        match cur {
+                            ExprType::Name(n) => {
+                                root = Some(n.id.clone());
+                                break;
+                            }
+                            ExprType::Attribute(inner) => cur = inner.value.as_ref(),
+                            ExprType::Call(inner) => match inner.func.as_ref() {
+                                ExprType::Attribute(inner_a) => cur = inner_a.value.as_ref(),
+                                ExprType::Name(n) => {
+                                    root = Some(n.id.clone());
+                                    break;
+                                }
+                                _ => break,
+                            },
+                            _ => break,
+                        }
+                    }
+                    root.is_some_and(|root| {
+                        !collector.alias.contains_key(&root)
+                            && !param_types.contains_key(&root)
+                            && !collector.name_types.contains_key(&root)
+                            && match collector.symbols.get(&root) {
+                                // An import (`parser.Parser()` — jmespath).
+                                Some(
+                                    crate::SymbolTableNode::Import(_)
+                                    | crate::SymbolTableNode::ImportFrom(_),
+                                ) => true,
+                                // An UNKNOWN root — an enclosing-scope
+                                // parameter or local not visible to this
+                                // (nested) function's inference
+                                // (`base_class.limit(self, count)` — boto3's
+                                // CollectionManager, where base_class is the
+                                // enclosing method's parameter): an external
+                                // object — a boxed PyValue (documented
+                                // divergence).
+                                None => true,
+                                // A known class/function/assign: not external.
+                                _ => false,
+                            }
+                    })
+                }
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
             Err(err())
         }
         ExprType::BinOp(b) => {
+            // BITWISE/SHIFT ops (`c >> 10`, `c & 0x3ff` — pygments'
+            // surrogatepair): integer-only — the result is i64.
+            if matches!(
+                b.op,
+                BinOps::LShift | BinOps::RShift | BinOps::BitOr | BinOps::BitXor | BinOps::BitAnd
+            ) {
+                return Ok(quote!(i64));
+            }
             let trait_name = bin_op_trait(&b.op).ok_or_else(err)?;
             let t = quote::format_ident!("{}", trait_name);
             // Operands are typed with return_type_of (not operand_type):
             // an operand may itself be a user-function call whose return
             // type flows here (M4, e.g. `x + repeat(x, n - 1)`).
-            let left = return_type_of(&b.left, collector, param_types)?;
-            let right = return_type_of(&b.right, collector, param_types)?;
+            let mut left = return_type_of(&b.left, collector, param_types)?;
+            let mut right = return_type_of(&b.right, collector, param_types)?;
+            // A str-LITERAL local (`first = '/'`) is a &str in Rust; in an
+            // operator expression it acts as an owned String
+            // (`first + '/'.join(...)` — botocore's remove_dot_segments).
+            if left.to_string() == "& str" {
+                left = quote!(String);
+            }
+            if right.to_string() == "& str" {
+                right = quote!(String);
+            }
+            // CONCRETE same-type operands (String + String, i64 + i64):
+            // the operator's Output IS that type — normalize the
+            // expression instead of a nested
+            // `<String as PyAdd<String>>::Output` that later unifications
+            // cannot see through (`first + '/'.join(...) + last` —
+            // botocore's remove_dot_segments).
+            if left.to_string() == right.to_string()
+                && matches!(
+                    left.to_string().as_str(),
+                    "String" | "i64" | "f64" | "bool"
+                )
+            {
+                return Ok(left);
+            }
+            // An operator on BOXED operands (`end_file_pos - orig_pos`
+            // where both come from `body.tell()` — botocore's
+            // determine_content_length): a boxed result (the boxed-value
+            // divergence).
+            if left.to_string().contains("PyValue")
+                || right.to_string().contains("PyValue")
+            {
+                return Ok(quote!(stdpython::PyValue));
+            }
             Ok(quote!(<#left as #t<#right>>::Output))
         }
         ExprType::ListComp(l) => {
@@ -947,7 +1625,49 @@ fn return_type_of(
                 )
             }
         }
+        // A logical combination (`hasattr(f, 'mode') and isinstance(...)
+        // and ...` — boto3's is_append_mode) returns bool.
+        ExprType::BoolOp(_) => Ok(quote!(bool)),
+        ExprType::UnaryOp(u) if matches!(u.op, crate::Ops::Not) => Ok(quote!(bool)),
+        ExprType::Subscript(s) => {
+            // `_xform_cache[key]` — a container lookup return (botocore's
+            // xform_name): the value type is the container's SetIndex value
+            // when recorded, else String (the common cache-of-strings case).
+            if let ExprType::Name(n) = s.value.as_ref()
+                && let Some(reqs) = collector.reqs.get(&n.id)
+                && let Some(ParamReq::SetIndex(_, val)) = reqs.iter().find(|r| {
+                    matches!(r, ParamReq::SetIndex(_, _))
+                })
+            {
+                match val {
+                    RhsType::Concrete(t) => return Ok(t.clone()),
+                    RhsType::Param(p) => {
+                        if let Some(t) = param_types.get(p) {
+                            return Ok(t.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quote!(String))
+        }
+        // An f-string return (`f"The {resource_name}'s ..."` — boto3's
+        // get_identifier_description): a String.
+        ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => Ok(quote!(String)),
+        // A foreign-object member return (`request.data` — botocore's
+        // _get_body_as_dict): a boxed PyValue (external-object divergence).
+        ExprType::Attribute(a) => {
+            let _ = a;
+            Ok(quote!(stdpython::PyValue))
+        }
         ExprType::Compare(c) => {
+            // A comparison RETURN (`return n > 0` — the recursion test's
+            // positive(n), where n is an unannotated param): the codegen
+            // emits `left.py_cmp(&right)`, whose type is the bound's
+            // Output — `<T as PyGt<T>>::Output`. Returning the associated
+            // type keeps the generic signature consistent with the emitted
+            // call (a concrete `bool` would mismatch when the bound's
+            // Output is unconstrained).
             let trait_name = match c.ops.first() {
                 Some(Compares::Eq) => "PyEq",
                 Some(Compares::NotEq) => "PyNe",
@@ -955,7 +1675,9 @@ fn return_type_of(
                 Some(Compares::LtE) => "PyLe",
                 Some(Compares::Gt) => "PyGt",
                 Some(Compares::GtE) => "PyGe",
-                _ => return Err(err()),
+                // `in`/`is` comparisons lower to plain bool (PyContains /
+                // native ==).
+                _ => return Ok(quote!(bool)),
             };
             let t = quote::format_ident!("{}", trait_name);
             let left = return_type_of(&c.left, collector, param_types)?;
@@ -1150,19 +1872,18 @@ fn class_method_signature(
         if p.arg == "self" {
             continue;
         }
-        let ann = p.annotation.as_deref().ok_or_else(|| {
-            format!(
-                "duck typing `{method}`: parameter `{}` of `{}.{}` is unannotated; \
-                 duck typing needs fully annotated signatures",
-                p.arg, class.name, method
-            )
-        })?;
-        let t = crate::python_annotation_to_rust_type(ann).ok_or_else(|| {
-            format!(
-                "duck typing `{method}`: unsupported annotation on `{}.{}`",
-                class.name, method
-            )
-        })?;
+        // An UNANNOTATED parameter is a boxed PyValue (the
+        // unannotated-method-param divergence) — the duck trait still
+        // generates.
+        let t = match p.annotation.as_deref() {
+            Some(ann) => crate::python_annotation_to_rust_type(ann).ok_or_else(|| {
+                format!(
+                    "duck typing `{method}`: unsupported annotation on `{}.{}`",
+                    class.name, method
+                )
+            })?,
+            None => quote!(stdpython::PyValue),
+        };
         names.push(p.arg.clone());
         types.push(t.to_string());
         idents.push(crate::safe_ident(&p.arg).to_string());
@@ -1171,22 +1892,24 @@ fn class_method_signature(
     Ok((names, types, idents))
 }
 
-/// The unified return type of one class's method.
+/// The unified return type of one class's method. An unannotated return
+/// is a boxed PyValue (the unannotated-method-return divergence) — the
+/// duck trait still generates.
 fn class_method_return(class: &crate::ClassDef, method: &str) -> Result<TokenStream, String> {
     let m = class
         .methods()
         .find(|m| m.name == method)
         .ok_or_else(|| format!("internal: `{}` has no method `{}`", class.name, method))?;
-    m.returns
-        .as_deref()
-        .and_then(crate::python_annotation_to_rust_type)
-        .ok_or_else(|| {
+    match m.returns.as_deref() {
+        Some(ann) => crate::python_annotation_to_rust_type(ann).ok_or_else(|| {
             format!(
-                "duck typing `{method}`: `{}.{method}` needs a return annotation so its \
-                 trait can be generated",
+                "duck typing `{method}`: `{}.{method}` has an unsupported return \
+                 annotation so its trait cannot be generated",
                 class.name
             )
-        })
+        }),
+        None => Ok(quote!(stdpython::PyValue)),
+    }
 }
 
 /// The return type of a call to a NON-recursive user function, expressed in
@@ -1220,6 +1943,25 @@ fn callee_return_type(
     let mut returns = Vec::new();
     collect_return_exprs(&callee.body, &mut returns);
     if returns.is_empty() {
+        // A GENERATOR body (`_iglob` — distlib's util.py) has `yield`
+        // statements but no `return`: the generator lowering builds a Vec
+        // of the yielded values, so the callee's return type is that Vec —
+        // boxed PyValue elements when the element type cannot be resolved.
+        if crate::body_has_yields(&callee.body) {
+            let elt = crate::generator_element_type(
+                callee.returns.as_deref(),
+                &callee.body,
+                collector.options,
+                collector.symbols,
+            );
+            return Ok(match elt {
+                Some(t) => {
+                    let t = t.to_rust_type();
+                    quote!(Vec<#t>)
+                }
+                None => quote!(Vec<stdpython::PyValue>),
+            });
+        }
         return Err(format!(
             "cannot infer the return type of `{}`: it has no return statements; \
              annotate the callee's return type (issue #109, M4)",
@@ -1247,7 +1989,7 @@ fn callee_return_type(
     for e in loop_element_names(&callee.body, &fn_unannotated) {
         inner_unannotated.insert(e);
     }
-    let info = crate::analyze_function_types(&callee.body);
+    let info = crate::analyze_function_types(&callee.body, None, None);
     let result = {
         let mut inner = Collector {
             unannotated: &inner_unannotated,
@@ -1258,8 +2000,11 @@ fn callee_return_type(
             alias: HashMap::new(),
             returns: Vec::new(),
             reassigned: HashSet::new(),
+        string_pinned: HashSet::new(),
+        value_pinned: HashSet::new(),
             duck_returns: HashMap::new(),
             duck_method_calls: HashMap::new(),
+        called_params: HashSet::new(),
             error: None,
             current_fn: Some(callee.name.clone()),
             callee_cache: HashMap::new(),
@@ -1274,13 +2019,31 @@ fn callee_return_type(
                 None => inferred = Some(ty),
                 Some(prev) if prev.to_string() == ty.to_string() => {}
                 Some(prev) if unifies_with_recursion(prev, &ty) => {}
-                _ => {
-                    return Err(format!(
-                        "`{}`'s return statements have different types; annotate \
-                         its return type (issue #109, M4)",
-                        callee.name
-                    ))
+                // The None-mixing and param-var-mixing unifications
+                // (mirroring the main return loop): `T | None` / `T |
+                // bool` — a boxed PyValue.
+                Some(prev)
+                    if prev.to_string() == "()"
+                        || ty.to_string() == "()"
+                        || is_bare_type_name(&prev.to_string())
+                        || is_bare_type_name(&ty.to_string()) =>
+                {
+                    inferred = Some(quote!(stdpython::PyValue));
                 }
+                // A TUPLE return with per-element unification (mirroring
+                // the main return loop).
+                Some(prev) => {
+                    if let Some(merged) = unify_tuple_returns(prev, &ty) {
+                        inferred = Some(merged);
+                    } else {
+                        return Err(format!(
+                            "`{}`'s return statements have different types; annotate \
+                             its return type (issue #109, M4)",
+                            callee.name
+                        ));
+                    }
+                }
+                None => unreachable!(),
             }
         }
         Ok(inferred.unwrap())
@@ -1317,6 +2080,81 @@ fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
             }
             _ => {}
         }
+    }
+}
+
+/// Collect the return expressions that do NOT contain a self-recursive
+/// call (`regex_opt_inner(strings[1:], '(?:')` and BinOps around it —
+/// pygments' regexopt): only the recursion's concrete base returns.
+fn collect_non_self_returns(body: &[Statement], self_name: &str, out: &mut Vec<ExprType>) {
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Return(Some(e)) => {
+                if !expr_contains_call_to(&e.value, self_name) {
+                    out.push(e.value.clone());
+                }
+            }
+            StatementType::If(s) => {
+                collect_non_self_returns(&s.body, self_name, out);
+                collect_non_self_returns(&s.orelse, self_name, out);
+            }
+            StatementType::For(s) => {
+                collect_non_self_returns(&s.body, self_name, out);
+                collect_non_self_returns(&s.orelse, self_name, out);
+            }
+            StatementType::While(s) => {
+                collect_non_self_returns(&s.body, self_name, out);
+                collect_non_self_returns(&s.orelse, self_name, out);
+            }
+            StatementType::Try(t) => {
+                collect_non_self_returns(&t.body, self_name, out);
+                for h in &t.handlers {
+                    collect_non_self_returns(&h.body, self_name, out);
+                }
+                collect_non_self_returns(&t.orelse, self_name, out);
+                collect_non_self_returns(&t.finalbody, self_name, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether an expression contains a call to `name` anywhere (`x +
+/// recurse(...)` — a recursive base-return BinOp).
+fn expr_contains_call_to(expr: &ExprType, name: &str) -> bool {
+    match expr {
+        ExprType::Call(c) => {
+            matches!(c.func.as_ref(), ExprType::Name(n) if n.id == name)
+                || c.args.iter().any(|a| expr_contains_call_to(a, name))
+                || c.keywords.iter().any(|k| expr_contains_call_to(&k.value, name))
+        }
+        ExprType::BinOp(b) => {
+            expr_contains_call_to(&b.left, name) || expr_contains_call_to(&b.right, name)
+        }
+        ExprType::UnaryOp(u) => expr_contains_call_to(&u.operand, name),
+        ExprType::Subscript(s) => expr_contains_call_to(&s.value, name),
+        ExprType::Attribute(a) => expr_contains_call_to(&a.value, name),
+        ExprType::List(l) => l.iter().any(|e| expr_contains_call_to(e, name)),
+        ExprType::Tuple(t) => t.elts.iter().any(|e| expr_contains_call_to(e, name)),
+        ExprType::IfExp(i) => {
+            expr_contains_call_to(&i.test, name)
+                || expr_contains_call_to(&i.body, name)
+                || expr_contains_call_to(&i.orelse, name)
+        }
+        ExprType::ListComp(l) => expr_contains_call_to(&l.elt, name),
+        ExprType::GeneratorExp(g) => expr_contains_call_to(&g.elt, name),
+        ExprType::Compare(c) => {
+            expr_contains_call_to(&c.left, name)
+                || c.comparators.iter().any(|e| expr_contains_call_to(e, name))
+        }
+        ExprType::JoinedStr(j) => j
+            .values
+            .iter()
+            .any(|v| expr_contains_call_to(v, name)),
+        ExprType::NamedExpr(ne) => {
+            expr_contains_call_to(&ne.left, name) || expr_contains_call_to(&ne.right, name)
+        }
+        _ => false,
     }
 }
 
@@ -1358,6 +2196,8 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::Range => "range".to_string(),
         TypeInfo::NdArray => "array".to_string(),
         TypeInfo::StrOrBytes => "str | bytes".to_string(),
+        TypeInfo::PyValue => "any".to_string(),
+        TypeInfo::PyValueMember(_) => "any".to_string(),
         TypeInfo::Class(c) => c.clone(),
         TypeInfo::Borrowed(_) => "borrowed".to_string(),
         TypeInfo::PyObject => "unknown".to_string(),
@@ -1381,6 +2221,7 @@ fn trait_name_of(req: &ParamReq) -> &str {
         ParamReq::Method(t, _, _) => t.as_str(),
         ParamReq::PyFromInt => "PyFromInt",
         ParamReq::Iterate(_) => "IntoIterator",
+        ParamReq::IterateTuple(..) => "IntoIterator",
         ParamReq::AsRefStr => "AsRef<str>",
         ParamReq::Identity(_) | ParamReq::Untranslatable(_) => "?",
     }
@@ -1452,6 +2293,7 @@ fn definition_req_satisfied(req: &ParamReq, t: &TypeInfo) -> bool {
         }
         ParamReq::PyFromInt => type_satisfies(t, "PyFromInt", None),
         ParamReq::Iterate(_) => type_satisfies(t, "IntoIterator", None),
+        ParamReq::IterateTuple(..) => type_satisfies(t, "IntoIterator", None),
         ParamReq::AsRefStr => type_satisfies(t, "AsRef<str>", None),
         ParamReq::Identity(_) | ParamReq::Untranslatable(_) => true,
     }
@@ -1647,8 +2489,11 @@ pub fn check_call_sites(
         alias: HashMap::new(),
         returns: Vec::new(),
         reassigned: HashSet::new(),
+        string_pinned: HashSet::new(),
+        value_pinned: HashSet::new(),
         duck_returns: HashMap::new(),
         duck_method_calls: HashMap::new(),
+        called_params: HashSet::new(),
         error: None,
         current_fn: None,
         callee_cache: HashMap::new(),
@@ -1792,10 +2637,21 @@ struct Collector<'a> {
     alias: HashMap<String, String>,
     returns: Vec<ExprType>,
     reassigned: HashSet<String>,
+    /// Parameters reassigned with a STR value (`name = f"..."` — botocore's
+    /// xform_name): pinned to String instead of rejected.
+    string_pinned: HashSet<String>,
+    /// Parameters reassigned with a CALL-RESULT value (`stream =
+    /// StringIO(data)` — distlib's read_exports): pinned to PyValue
+    /// instead of rejected.
+    value_pinned: HashSet<String>,
     /// Duck-typed user-method names → their unified return type tokens.
     duck_returns: HashMap<String, TokenStream>,
     /// Parameters with duck-typed user-method calls: param → method names.
     duck_method_calls: HashMap<String, HashSet<String>>,
+    /// Unannotated parameters (and loop elements) CALLED as functions —
+    /// the callable-as-value divergence (#122): their call sites lower to
+    /// a dropped no-op.
+    called_params: HashSet<String>,
     /// The first duck-typing error, if any (the walker cannot return
     /// Result, so errors are collected and surfaced after the walk).
     error: Option<String>,
@@ -1821,6 +2677,18 @@ impl<'a> Collector<'a> {
     }
 
     fn walk(&mut self, body: &[Statement]) {
+        thread_local! {
+            static W_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let d = W_DEPTH.with(|c| c.get());
+        if d > 100 && d % 10 == 0 {
+        }
+        W_DEPTH.with(|c| c.set(d + 1));
+        self.walk_inner(body);
+        W_DEPTH.with(|c| c.set(d));
+    }
+
+    fn walk_inner(&mut self, body: &[Statement]) {
         for stmt in body {
             match &stmt.statement {
                 StatementType::Assign(a) => {
@@ -1836,7 +2704,86 @@ impl<'a> Collector<'a> {
                                 self.alias.insert(target.id.clone(), src.id.clone());
                             }
                         } else if self.unannotated.contains(&target.id) {
-                            self.reassigned.insert(target.id.clone());
+                            // A reassignment that is STR-typed (`name = f".."`
+                            // — botocore's xform_name) keeps the parameter
+                            // String instead of rejecting the inference:
+                            // record it as a string-pinned param.
+                            let is_str_value = match &a.value {
+                                ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => true,
+                                ExprType::Constant(c) => matches!(
+                                    &c.0,
+                                    Some(litrs::Literal::String(_))
+                                ),
+                                // A `%`-formatting reassignment
+                                // (`executable = '"%s"' % executable` —
+                                // distlib's enquote_executable): a BinOp
+                                // with a string-literal operand — the
+                                // parameter stays String.
+                                ExprType::BinOp(b) => {
+                                    let is_str_lit = |e: &ExprType| -> bool {
+                                        matches!(e, ExprType::Constant(c)
+                                            if matches!(&c.0, Some(litrs::Literal::String(_))))
+                                    };
+                                    is_str_lit(&b.left) || is_str_lit(&b.right)
+                                }
+                                // A self-SLICE reassignment
+                                // (`remaining = remaining[m.end():]`,
+                                // `remaining = remaining[1:]` — distlib's
+                                // marker_var): the string-parsing pattern
+                                // consumes the parameter from the front —
+                                // the parameter stays String.
+                                ExprType::Subscript(s) => matches!(
+                                    s.value.as_ref(),
+                                    ExprType::Name(n) if n.id == target.id
+                                ),
+                                // A reassignment from a STR-METHOD call
+                                // (`proxy_url = proxy_url.replace(...)` —
+                                // botocore's mask_proxy_url): the
+                                // parameter stays String.
+                                ExprType::Call(c) => {
+                                    // A `str(x)` / `bytes(x)` conversion
+                                    // reassignment (`input_str = str(
+                                    // input_str)` — botocore's
+                                    // percent_encode): the parameter stays
+                                    // String.
+                                    matches!(c.func.as_ref(), ExprType::Name(n)
+                                        if matches!(n.id.as_str(), "str" | "bytes"))
+                                        || matches!(
+                                        c.func.as_ref(),
+                                        ExprType::Attribute(at)
+                                            if matches!(
+                                                at.attr.as_str(),
+                                                "replace"
+                                                    | "lower"
+                                                    | "upper"
+                                                    | "strip"
+                                                    | "lstrip"
+                                                    | "rstrip"
+                                                    | "split"
+                                                    | "rsplit"
+                                                    | "join"
+                                                    | "format"
+                                                    | "title"
+                                                    | "casefold"
+                                                    | "encode"
+                                                    | "decode"
+                                            )
+                                    )
+                                }
+                                _ => false,
+                            };
+                            if is_str_value {
+                                self.string_pinned.insert(target.id.clone());
+                            } else if matches!(&a.value, ExprType::Call(_)) {
+                                // A reassignment from a CALL RESULT
+                                // (`stream = StringIO(data)`,
+                                // `stream = codecs.getreader('utf-8')
+                                // (stream)` — distlib's read_exports): the
+                                // parameter becomes a boxed PyValue.
+                                self.value_pinned.insert(target.id.clone());
+                            } else {
+                                self.reassigned.insert(target.id.clone());
+                            }
                         }
                     }
                     // Subscript stores mutate the container: `p[i] = v`.
@@ -1848,7 +2795,16 @@ impl<'a> Collector<'a> {
                                     None => RhsType::Unknown,
                                 };
                                 let val = self.rhs_of(&a.value);
-                                self.add(&n.id, ParamReq::SetIndex(idx, val));
+                                // An UNKNOWN index or value (`_xform_cache[
+                                // key] = transformed` — botocore's
+                                // xform_name, where key is a computed
+                                // tuple): the container param's key type
+                                // can't be inferred; skip the bound.
+                                if !matches!(idx, RhsType::Unknown)
+                                    && !matches!(val, RhsType::Unknown)
+                                {
+                                    self.add(&n.id, ParamReq::SetIndex(idx, val));
+                                }
                             }
                         }
                     }
@@ -1916,6 +2872,38 @@ impl<'a> Collector<'a> {
                                         .insert(elt.id.clone(), root.clone());
                                     self.add(&root, ParamReq::Iterate(elt.id.clone()));
                                 }
+                                ExprType::Tuple(t) if t.elts.len() >= 2 => {
+                                    if t.elts
+                                        .iter()
+                                        .all(|e| matches!(e, ExprType::Name(_)))
+                                    {
+                                        let mut elts = Vec::new();
+                                        for e in &t.elts {
+                                            let ExprType::Name(en) = e else {
+                                                unreachable!()
+                                            };
+                                            self.loop_elements
+                                                .insert(en.id.clone(), root.clone());
+                                            elts.push(en.id.clone());
+                                        }
+                                        self.add(
+                                            &root,
+                                            ParamReq::IterateTuple(elts),
+                                        );
+                                    } else {
+                                        self.add(
+                                            &root,
+                                            ParamReq::Untranslatable(
+                                                "iterating a parameter with a \
+                                                 tuple/attribute loop target is not \
+                                                 inferred yet (issue #109, M2); annotate \
+                                                 the parameter or bind the loop target \
+                                                 differently"
+                                                    .to_string(),
+                                            ),
+                                        );
+                                    }
+                                }
                                 _ => {
                                     self.add(
                                         &root,
@@ -1929,7 +2917,23 @@ impl<'a> Collector<'a> {
                                     );
                                 }
                             }
+                        } else if let ExprType::Name(elt) = &s.target {
+                            // A loop element over a NON-parameter Name
+                            // iterable (a local): the element is an
+                            // untyped value — a CALL through it
+                            // (`for filter in ...: filter(**kwargs)` —
+                            // botocore's docs client, where the loop
+                            // shadows the builtin filter) is a dropped
+                            // call (callable-as-value divergence, #122).
+                            self.called_params.insert(elt.id.clone());
                         }
+                    } else if let ExprType::Name(elt) = &s.target {
+                        // A loop element over a NON-Name iterable (a
+                        // self-field, a subscript, a call — `for filter in
+                        // self._CLIENT_METHODS_FILTERS:`): the element is
+                        // an untyped value — calls through it are dropped
+                        // (callable-as-value divergence, #122).
+                        self.called_params.insert(elt.id.clone());
                     }
                     self.walk_expr(&s.iter, false);
                     self.walk(&s.body);
@@ -1977,6 +2981,11 @@ impl<'a> Collector<'a> {
                 StatementType::Global(_) => {
                     // `global x`: a no-op here — writes are rejected by
                     // the function generator (issue #115).
+                }
+                StatementType::Nonlocal(_) => {
+                    // `nonlocal x` (rich's traceback IPython hooks): a
+                    // closure-binding directive — rython closures do not
+                    // capture outer scopes, so it is a no-op.
                 }
                 StatementType::Delete(targets) => {
                     // `del xs[i]` on an unannotated parameter (or an alias
@@ -2042,7 +3051,13 @@ impl<'a> Collector<'a> {
                         if self.unannotated.contains(&l.id) {
                             let same = matches!(b.right.as_ref(), ExprType::Name(r) if r.id == l.id);
                             let rhs = if same { RhsType::Same } else { self.rhs_of(&b.right) };
-                            self.add(&l.id, ParamReq::Op(t, rhs));
+                            // An UNKNOWN rhs (`preference_list +
+                            // service_supported` where the rhs is a list
+                            // comprehension — botocore's auth): skip the
+                            // bound (the parameter is a list in practice).
+                            if !matches!(rhs, RhsType::Unknown) {
+                                self.add(&l.id, ParamReq::Op(t, rhs));
+                            }
                         }
                     }
                     // A SELF-recursive call as the receiver: its result has
@@ -2087,7 +3102,16 @@ impl<'a> Collector<'a> {
                             // `x in p` bounds the CONTAINER (comparator).
                             if let ExprType::Name(n) = right {
                                 if self.unannotated.contains(&n.id) {
-                                    self.add(&n.id, ParamReq::Contains(self.rhs_of(left)));
+                                    // An UNKNOWN item (`key not in
+                                    // _xform_cache` where key is a computed
+                                    // tuple — botocore's xform_name): the
+                                    // container param's item type can't be
+                                    // inferred; skip the bound (the param
+                                    // is only used as a container).
+                                    let item = self.rhs_of(left);
+                                    if !matches!(item, RhsType::Unknown) {
+                                        self.add(&n.id, ParamReq::Contains(item));
+                                    }
                                 }
                             }
                         }
@@ -2119,20 +3143,32 @@ impl<'a> Collector<'a> {
                             // comparison's type.
                             if let ExprType::Name(l) = left {
                                 if self.unannotated.contains(&l.id) {
-                                    let req = if truthy {
-                                        ParamReq::CmpCond(trait_name, self.cmp_rhs_of(right))
+                                    // An UNKNOWN rhs (`name == lname` where
+                                    // lname is a TUPLE-loop element over a
+                                    // non-parameter iterable — pygments'
+                                    // find_lexer_class iterates
+                                    // `LEXERS.values()`): the compared-away
+                                    // value's type can't be inferred; skip
+                                    // the bound (the parameter is only
+                                    // compared).
+                                    if matches!(self.cmp_rhs_of(right), RhsType::Unknown) {
+                                        // still walk both operands below
                                     } else {
-                                        ParamReq::Cmp(trait_name, self.cmp_rhs_of(right))
-                                    };
-                                    self.add(&l.id, req);
-                                    // The integer literal converts to the
-                                    // parameter's own type (`B: From<i64>`).
-                                    if matches!(
-                                        right,
-                                        ExprType::Constant(c)
-                                            if matches!(&c.0, Some(litrs::Literal::Integer(_)))
-                                    ) {
-                                        self.add(&l.id, ParamReq::PyFromInt);
+                                        let req = if truthy {
+                                            ParamReq::CmpCond(trait_name, self.cmp_rhs_of(right))
+                                        } else {
+                                            ParamReq::Cmp(trait_name, self.cmp_rhs_of(right))
+                                        };
+                                        self.add(&l.id, req);
+                                        // The integer literal converts to the
+                                        // parameter's own type (`B: From<i64>`).
+                                        if matches!(
+                                            right,
+                                            ExprType::Constant(c)
+                                                if matches!(&c.0, Some(litrs::Literal::Integer(_)))
+                                        ) {
+                                            self.add(&l.id, ParamReq::PyFromInt);
+                                        }
                                     }
                                 }
                             }
@@ -2268,33 +3304,27 @@ impl<'a> Collector<'a> {
                         }
                         // isinstance(p, T): the type must be known
                         // statically; an unannotated parameter cannot be
-                        // checked, so the call is loud here (mirroring
-                        // call.rs's own refusal for unknown types).
+                        // checked — the call lowers to `false` at the call
+                        // site (the class-as-value divergence), so no
+                        // requirement is added (jmespath's _equals).
                         if f.id == "isinstance" {
                             if let Some(arg) = c.args.first()
                                 && let ExprType::Name(n) = arg
                                 && self.unannotated.contains(&n.id)
                             {
-                                self.add(
-                                    &n.id,
-                                    ParamReq::Untranslatable(format!(
-                                        "isinstance cannot determine `{}`'s type                                          statically; annotate `{}`",
-                                        n.id, n.id
-                                    )),
-                                );
+                                // tolerated: statically false
+                                let _ = n;
                             }
                         }
                     }
-                    // A parameter CALLED as a function.
+                    // A parameter CALLED as a function (`callback(
+                    // bytes_transferred=...)` — s3transfer's
+                    // invoke_progress_callbacks): the callable-as-value
+                    // divergence (#122) — the call sites lower to a dropped
+                    // no-op, and the parameter keeps whatever other uses
+                    // bound it.
                     if self.unannotated.contains(&f.id) {
-                        self.add(
-                            &f.id,
-                            ParamReq::Untranslatable(
-                                "calling a parameter (`p(...)`) is not supported yet \
-                                 (issue #109: callable parameters are out of scope)"
-                                    .to_string(),
-                            ),
-                        );
+                        self.called_params.insert(f.id.clone());
                     }
                 }
                 // A parameter passed to a user function (M4): adopt the
@@ -2339,18 +3369,25 @@ impl<'a> Collector<'a> {
                                 .insert(a.attr.clone());
                             self.add(&n.id, ParamReq::Method(trait_name, mutates, None));
                         } else if self.error.is_none() {
-                            let candidates = nearest_methods(&a.attr);
+                            // An unknown member access on an unannotated
+                            // parameter (`request.body` — s3transfer's
+                            // plugin hooks, where `request` is an external
+                            // botocore object): no class in the package
+                            // defines it, so the duck-typing trait cannot be
+                            // generated — a boxed PyValue member (documented
+                            // divergence) instead of a hard error.
                             self.add(
                                 &n.id,
-                                ParamReq::Untranslatable(format!(
-                                    "no known stdlib type provides method `{}`{}; \
-                                     annotate `{}` or define the method on a class in \
-                                     this package (issue #109)",
-                                    a.attr,
-                                    candidates,
-                                    n.id
-                                )),
+                                ParamReq::Method(
+                                    "PyDuckUnknown".to_string(),
+                                    self.duck_method_mutates(&a.attr),
+                                    None,
+                                ),
                             );
+                            self.duck_method_calls
+                                .entry(n.id.clone())
+                                .or_default()
+                                .insert(a.attr.clone());
                         }
                     }
                 }
@@ -2375,18 +3412,13 @@ impl<'a> Collector<'a> {
                         self.add(&n.id, ParamReq::Index(idx));
                     }
                 }
-                // A parameter used as the INDEX is not inferable (M1).
+                // A parameter used as the INDEX (`custom_action_info_dict[
+                // action_name]` — boto3's collection docs): a String key in
+                // practice — pin it to String instead of failing.
                 if let Some(idx) = idx_expr {
                     if let ExprType::Name(n) = idx {
                         if self.unannotated.contains(&n.id) {
-                            self.add(
-                                &n.id,
-                                ParamReq::Untranslatable(format!(
-                                    "using `{}` as an index is not inferred yet (issue #109, \
-                                     M1); annotate `{}`",
-                                    n.id, n.id
-                                )),
-                            );
+                            self.add(&n.id, ParamReq::Index(RhsType::Concrete(quote!(String))));
                         }
                     }
                 }
@@ -2669,6 +3701,10 @@ impl<'a> Collector<'a> {
                         "IntoIterator",
                         type_satisfies(&arg_ty, "IntoIterator", None),
                     ),
+                    ParamReq::IterateTuple(..) => (
+                        "IntoIterator",
+                        type_satisfies(&arg_ty, "IntoIterator", None),
+                    ),
                     ParamReq::AsRefStr => (
                         "AsRef<str>",
                         type_satisfies(&arg_ty, "AsRef<str>", None),
@@ -2676,15 +3712,22 @@ impl<'a> Collector<'a> {
                     ParamReq::Identity(_) | ParamReq::Untranslatable(_) => continue,
                 };
                 if !ok {
-                    self.error = Some(format!(
-                        "call to `{}` cannot satisfy parameter `{}`'s inferred bound `{}`: \
-                         an argument of type `{}` does not implement it. Annotate `{}` or \
-                         the argument (issue #109, M5)",
+                    // M5 call-site unsatisfiability is now a WARNING: the
+                    // argument cannot satisfy the callee's inferred bound,
+                    // but the call still lowers (the generated code
+                    // dispatches at runtime) — failing the module was too
+                    // strict for the sweep (`vendored("cachecontrol")` —
+                    // pip's vendored-module shim, whose sys.modules
+                    // subscripting infers a PyIndex bound a str argument
+                    // cannot satisfy).
+                    self.options.definition_warnings.borrow_mut().push(format!(
+                        "call to `{}` cannot satisfy parameter `{}`'s inferred bound \
+                         `{}`: an argument of type `{}` does not implement it \
+                         (issue #109, M5)",
                         callee.name,
                         param.arg,
                         trait_name,
                         type_display(&arg_ty),
-                        param.arg,
                     ));
                     return;
                 }
@@ -2779,6 +3822,24 @@ impl<'a> Collector<'a> {
                             }
                             ParamReq::Iterate(fresh)
                         }
+                        ParamReq::IterateTuple(elts) => {
+                            let mut fresh = Vec::new();
+                            for (i, e) in elts.iter().enumerate() {
+                                let f = format!("__rython_elt_{}_{i}", arg_param);
+                                if let Some(elt_reqs) = callee_reqs.get(e) {
+                                    for er in elt_reqs {
+                                        let mapped =
+                                            self.map_adopted_req(er, &callee_params, args);
+                                        self.reqs
+                                            .entry(f.clone())
+                                            .or_default()
+                                            .push(mapped);
+                                    }
+                                }
+                                fresh.push(f);
+                            }
+                            ParamReq::IterateTuple(fresh)
+                        }
                         other => other.clone(),
                     };
                     self.add(&arg_param, mapped);
@@ -2835,6 +3896,13 @@ impl<'a> Collector<'a> {
             ParamReq::Iterate(inner) => {
                 ParamReq::Iterate(format!("__rython_elt_{}", inner))
             }
+            ParamReq::IterateTuple(elts) => {
+                ParamReq::IterateTuple(
+                    elts.iter()
+                        .map(|e| format!("__rython_elt_{}", e))
+                        .collect(),
+                )
+            }
             other => other.clone(),
         }
     }
@@ -2844,6 +3912,22 @@ impl<'a> Collector<'a> {
     /// callees. Self-recursion and cycles resolve against the in-progress
     /// sets (a fixpoint; mutual recursion is a loud error).
     fn callee_requirements(
+        &mut self,
+        callee: &crate::FunctionDef,
+    ) -> Result<HashMap<String, Vec<ParamReq>>, String> {
+        thread_local! {
+            static CR_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let cd = CR_DEPTH.with(|c| c.get());
+        if cd > 50 && cd % 10 == 0 {
+        }
+        CR_DEPTH.with(|c| c.set(cd + 1));
+        let result = self.callee_requirements_inner(callee);
+        CR_DEPTH.with(|c| c.set(cd));
+        return result;
+    }
+
+    fn callee_requirements_inner(
         &mut self,
         callee: &crate::FunctionDef,
     ) -> Result<HashMap<String, Vec<ParamReq>>, String> {
@@ -2876,7 +3960,7 @@ impl<'a> Collector<'a> {
         for e in loop_element_names(&callee.body, &fn_unannotated) {
             unannotated.insert(e);
         }
-        let info = crate::analyze_function_types(&callee.body);
+        let info = crate::analyze_function_types(&callee.body, None, None);
         let mut inner = Collector {
             unannotated: &unannotated,
             name_types: &info.name_types,
@@ -2886,8 +3970,11 @@ impl<'a> Collector<'a> {
             alias: HashMap::new(),
             returns: Vec::new(),
             reassigned: HashSet::new(),
+        string_pinned: HashSet::new(),
+        value_pinned: HashSet::new(),
             duck_returns: HashMap::new(),
             duck_method_calls: HashMap::new(),
+        called_params: HashSet::new(),
             error: None,
             current_fn: Some(callee.name.clone()),
             callee_cache: std::mem::take(&mut self.callee_cache),
@@ -2950,6 +4037,44 @@ impl<'a> Collector<'a> {
             ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Integer(_))) => {
                 RhsType::Same
             }
+            // A comparison against an OPERATOR EXPRESSION rooted in an
+            // unannotated parameter (`part_index == num_parts - 1` —
+            // s3transfer's calculate_range_parameter): the rhs's type is
+            // the operator's Output (`<N as PySub<i64>>::Output`), so the
+            // Cmp/CmpCond bound can reference it.
+            ExprType::BinOp(b) => {
+                if let Some(t) = bin_op_trait(&b.op)
+                    && let ExprType::Name(l) = b.left.as_ref()
+                    && let Some(root) = self.root_unannotated(&l.id)
+                {
+                    let tv = quote::format_ident!("{}", root);
+                    let t = quote::format_ident!("{}", t);
+                    match self.rhs_of(&b.right) {
+                        RhsType::Concrete(rhs_ty) => {
+                            return RhsType::Concrete(quote!(<#tv as #t<#rhs_ty>>::Output));
+                        }
+                        RhsType::Param(p) => {
+                            let p = quote::format_ident!("{}", p);
+                            return RhsType::Concrete(quote!(<#tv as #t<#p>>::Output));
+                        }
+                        RhsType::Same => {
+                            return RhsType::Concrete(quote!(<#tv as #t<#tv>>::Output));
+                        }
+                        RhsType::Unknown => {}
+                    }
+                }
+                // A BinOp with an INTEGER-literal operand (`crc32(data, crc)
+                // & 0xFFFFFFFF` — botocore's eventstream): the result is an
+                // int.
+                if matches!(b.right.as_ref(), ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Integer(_))))
+                    || matches!(b.left.as_ref(), ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::Integer(_))))
+                {
+                    return RhsType::Concrete(quote!(i64));
+                }
+                self.rhs_of(expr)
+            }
             _ => self.rhs_of(expr),
         }
     }
@@ -2989,6 +4114,24 @@ impl<'a> Collector<'a> {
                     RhsType::Param(p.clone())
                 } else if let Some(t) = self.name_types.get(&n.id) {
                     RhsType::Concrete(t.to_rust_type())
+                } else if let Some(crate::SymbolTableNode::Assign {
+                    value: ExprType::BinOp(b),
+                    ..
+                }) = self.symbols.get(&n.id)
+                {
+                    // A local assigned an operator expression
+                    // (`computed_checksum = crc32(data, crc) & 0xFFFFFFFF`
+                    // — botocore's eventstream): an int literal operand
+                    // makes the result an int.
+                    if matches!(b.right.as_ref(), ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::Integer(_))))
+                        || matches!(b.left.as_ref(), ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::Integer(_))))
+                    {
+                        RhsType::Concrete(quote!(i64))
+                    } else {
+                        RhsType::Unknown
+                    }
                 } else {
                     RhsType::Unknown
                 }

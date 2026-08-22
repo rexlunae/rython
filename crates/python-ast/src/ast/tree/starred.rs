@@ -62,19 +62,18 @@ impl CodeGen for Starred {
 
     fn to_rust(
         self,
-        _ctx: Self::Context,
-        _options: Self::Options,
-        _symbols: Self::SymbolTable,
+        ctx: Self::Context,
+        options: Self::Options,
+        symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Emitting the bare value would pass the whole collection as ONE
-        // argument/element — silently different from unpacking it.
-        Err(
-            "starred unpacking (`*expr`) is not supported yet: it would \
-             silently pass the collection as a single value instead of \
-             spreading its elements. Spell the elements out explicitly."
-                .to_string()
-                .into(),
-        )
+        // `*expr` in a CALL (`super().set_cookie(cookie, *args, **kwargs)`
+        // — requests): the spread lowers to the collection itself — the
+        // elements are NOT spread (the documented divergence; the callee
+        // receives the collection as one argument). List-literal spreads
+        // are handled by the List codegen before reaching here.
+        self.value
+            .clone()
+            .to_rust(ctx, options, symbols)
     }
 }
 

@@ -328,6 +328,14 @@ impl CodeGen for Module {
                     {
                         continue;
                     }
+                    // A TYPE ALIAS (`_TYPE_BODY = typing.Union[...]`) is a
+                    // declaration, not a runtime store — skip it from the
+                    // init body too.
+                    if module_assign_counts.get(&n.id) == Some(&1)
+                        && is_type_alias_value(&a.value)
+                    {
+                        continue;
+                    }
                 }
             }
             if !Self::is_declaration_statement(&s.statement) {
@@ -344,7 +352,7 @@ impl CodeGen for Module {
         // though the pinning use is right there (issue #81-family, Devin
         // review on #103). The __main__ block gets its own pass.
         {
-            let info = crate::analyze_function_types(&module_init_raw);
+            let info = crate::analyze_function_types(&module_init_raw, Some(&options), Some(&symbols));
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
@@ -368,7 +376,7 @@ impl CodeGen for Module {
             &options.name_types,
             &options,
         )?;
-        let main_info = crate::analyze_function_types(&main_body_raw);
+        let main_info = crate::analyze_function_types(&main_body_raw, Some(&options), Some(&symbols));
         crate::check_aliasing(
             &main_body_raw,
             &symbols,
@@ -517,6 +525,27 @@ impl CodeGen for Module {
                             stream.extend(quote!(pub static #ident: #ty = #value;));
                             continue;
                         }
+                    }
+                    // A TYPE ALIAS whose value is a typing annotation
+                    // (`_TYPE_REDUCE_RESULT = tuple[typing.Callable[...,
+                    // object], ...]`, `_TYPE_BODY = typing.Union[...]` —
+                    // urllib3): the name is consumed by annotation
+                    // resolution (resolve_alias_typeinfo), never a runtime
+                    // value. Emit a `pub type` alias when the annotation
+                    // resolves, else nothing — the old behavior emitted a
+                    // nonsense `py_index` store.
+                    if is_type_alias_value(&a.value) {
+                        if let Some(ty) =
+                            crate::resolve_alias_typeinfo(&a.value, &symbols, &options)
+                                .map(|t| t.to_rust_type())
+                        {
+                            let ident = crate::safe_ident(&n.id);
+                            stream.extend(quote! {
+                                #[allow(dead_code)]
+                                pub type #ident = #ty;
+                            });
+                        }
+                        continue;
                     }
                 }
             }
@@ -1067,8 +1096,35 @@ fn count_module_stores(
 /// leading unary minus). Non-literal or reassigned module globals keep
 /// the old __module_init__ lowering, where referencing them from a
 /// function is a loud compile error rather than a silent divergence.
-fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {
+/// Whether a module-level assignment's VALUE is a typing annotation (a
+/// container/typing generic subscript, or a `typing.X` attribute): the name
+/// is a TYPE ALIAS consumed by annotation resolution, never a runtime value
+/// (`_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], ...]`,
+/// `_TYPE_BODY = typing.Union[...]` — urllib3).
+fn is_type_alias_value(value: &crate::ExprType) -> bool {
     match value {
+        crate::ExprType::Subscript(sub) => match sub.value.as_ref() {
+            crate::ExprType::Name(n) => matches!(
+                n.id.as_str(),
+                "tuple" | "Tuple" | "list" | "List" | "dict" | "Dict" | "set" | "Set"
+                    | "frozenset" | "Union" | "Optional" | "Callable" | "Iterable"
+                    | "Sequence" | "Mapping" | "MutableMapping" | "Type" | "Literal"
+                    | "Any" | "Generator" | "Iterator" | "SupportsRead" | "SupportsItems"
+                    | "IO" | "ClassVar"
+            ),
+            crate::ExprType::Attribute(a) => {
+                matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "typing")
+            }
+            _ => false,
+        },
+        crate::ExprType::Attribute(a) => {
+            matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "typing")
+        }
+        _ => false,
+    }
+}
+
+fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {    match value {
         crate::ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
@@ -1250,7 +1306,7 @@ impl Module {
         match stmt_type {
             // These are declarations that can stay at module level
             FunctionDef(_) | AsyncFunctionDef(_) | ClassDef(_) | Import(_) | ImportFrom(_)
-            | Global(_) | AnnotatedName { .. } => true,
+            | Global(_) | Nonlocal(_) | AnnotatedName { .. } => true,
             
             // Standalone expressions can stay at module level (e.g., constants, simple values)
             // These are typically used in tests or simple modules
@@ -1628,6 +1684,56 @@ pub fn module_class_def(
     info.classes.get(name).cloned().map(|c| (c, info.symbols.clone()))
 }
 
+/// Resolve a class name through a module, following RE-EXPORT chains
+/// (`from urllib3.util import Timeout` where util/__init__.py does
+/// `from .timeout import Timeout`): the class may live in the module the
+/// import re-exports from, several levels deep.
+pub fn resolve_imported_class(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+    depth: usize,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(c) = module_class_def(options, path, name) {
+        return Some(c);
+    }
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    let syms = module.clone().find_symbols(SymbolTableScopes::new());
+    match syms.get(name) {
+        Some(crate::SymbolTableNode::ImportFrom(i)) => {
+            let defining = i
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref() == Some(name))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| name.to_string());
+            // Resolve the relative import in the DEFINING module's
+            // context (`from .timeout import Timeout` in util/__init__.py
+            // is relative to ["urllib3", "util"], not the caller).
+            let mut ctx = options.clone();
+            // The relative import resolves in the DEFINING module's PACKAGE
+            // context: module_class_def's path includes the module name
+            // (["urllib3", "connection"]), but resolved_module_path expects
+            // the package path (["urllib3"]).
+            ctx.module_path = path[..path.len().saturating_sub(1)].to_vec();
+            let path2 = i.resolved_module_path(&ctx);
+            resolve_imported_class(options, &path2, &defining, depth + 1)
+        }
+        // A RE-EXPORT alias (`from ._base_connection import ProxyConfig
+        // as ProxyConfig` in connection.py — urllib3): the canonical name
+        // resolves in the same module; a self-alias would recurse forever,
+        // so stop there.
+        Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
+            resolve_imported_class(options, path, canonical, depth + 1)
+        }
+        _ => None,
+    }
+}
+
 /// Resolve a FUNCTION defined at the top level of another module of the
 /// crate, with that module's symbol table (issue #123): `from
 /// pip._internal.locations import get_scheme` + `scheme = get_scheme(...)`
@@ -1643,6 +1749,31 @@ pub fn module_function_def(
     let module = options.module_defs.get(path)?;
     let module: &crate::Module = module;
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    // A name may have MULTIPLE definitions: `@typing.overload` stubs (with
+    // `...` default placeholders) followed by the real implementation
+    // (urllib3's `ssl_wrap_socket`). Skip the overload stubs and return the
+    // first NON-overload definition — the callable the call sites actually
+    // invoke. (find_symbols keeps the LAST definition for same-module
+    // call sites; this loop keeps the first non-stub for cross-module ones.)
+    for s in &module.raw.body {
+        if let crate::StatementType::FunctionDef(f) = &s.statement {
+            if f.name == name {
+                let is_overload_stub = f.decorator_list.iter().any(|d| {
+                    match d {
+                        crate::ExprType::Name(n) => n.id == "overload",
+                        crate::ExprType::Attribute(a) => a.attr == "overload",
+                        _ => false,
+                    }
+                });
+                if !is_overload_stub {
+                    return Some((f.clone(), symbols));
+                }
+            }
+        }
+    }
+    // Only overload stubs exist (a stub-only module, e.g. a vendored
+    // typing stubs file): fall back to the first definition so signature
+    // resolution still finds SOMETHING.
     for s in &module.raw.body {
         if let crate::StatementType::FunctionDef(f) = &s.statement {
             if f.name == name {
@@ -1702,10 +1833,12 @@ impl CrossModuleClasses {
 fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let mut classes = std::collections::HashMap::new();
-    for s in &module.raw.body {
-        if let crate::StatementType::ClassDef(c) = &s.statement {
-            classes.insert(c.name.clone(), c.clone());
-        }
+    // Classes come from the SYMBOL TABLE, not the raw body: find_symbols
+    // runs the dataclass/NamedTuple __init__ synthesis on its ClassDef
+    // clones, so a cross-module call site (`Url(...)` in connection.py)
+    // resolves the constructor against the synthesized class.
+    for c in symbols.all_classes() {
+        classes.insert(c.name.clone(), c);
     }
     let mut traits = std::collections::HashMap::new();
     let mut class_list = Vec::new();

@@ -44,6 +44,10 @@ pub enum Decorator {
     /// no-ops in the value model) — synthesizes `__init__` from annotated
     /// class fields.
     DataClass,
+    /// `@property` — a getter metadata marker: the method lowers as a
+    /// plain method (a property READ `obj.attr` is the documented
+    /// divergence; the method must be called explicitly).
+    Property,
 }
 
 impl Decorator {
@@ -54,6 +58,7 @@ impl Decorator {
             Decorator::StaticMethod => "staticmethod",
             Decorator::Cache(_) => "functools.lru_cache",
             Decorator::DataClass => "dataclass",
+            Decorator::Property => "property",
         }
     }
 
@@ -66,6 +71,7 @@ impl Decorator {
             Decorator::StaticMethod => Some(MethodDecorator::StaticMethod),
             Decorator::Cache(spec) => Some(MethodDecorator::Cache(*spec)),
             Decorator::DataClass => None,
+            Decorator::Property => Some(MethodDecorator::None),
         }
     }
 
@@ -94,12 +100,25 @@ pub fn parse_decorator(
         )
         .into()
     };
-    // `functools.lru_cache` / `functools.cache` / bare `lru_cache`/`cache`.
+    // `functools.lru_cache` / `functools.cache` / bare `lru_cache`/`cache`,
+    // and the `typing.*` metadata markers (`typing.overload`, ...).
     let name_of = |e: &ExprType| -> Option<String> {
         match e {
             ExprType::Name(n) => Some(n.id.clone()),
             ExprType::Attribute(a) => match a.value.as_ref() {
-                ExprType::Name(m) if m.id == "functools" => Some(a.attr.clone()),
+                ExprType::Name(m)
+                    if matches!(
+                        m.id.as_str(),
+                        "functools" | "typing" | "contextlib" | "abc" | "dataclasses"
+                    ) =>
+                {
+                    Some(a.attr.clone())
+                }
+                // A property SETTER/GETTER/DELETER (`@host.setter`) is
+                // metadata: the method lowers as a plain method.
+                _ if matches!(a.attr.as_str(), "setter" | "getter" | "deleter") => {
+                    Some(a.attr.clone())
+                }
                 _ => None,
             },
             _ => None,
@@ -113,6 +132,32 @@ pub fn parse_decorator(
                 other => (name_of(other), None),
             };
             match (base.as_deref(), call) {
+                // typing metadata (`@typing.overload`, `@typing.final`,
+                // `@typing.no_type_check`): no runtime effect — no-op.
+                (Some("overload" | "final" | "no_type_check" | "runtime_checkable" | "contextmanager" | "abstractmethod" | "total_ordering"), None) => {
+                    // total_ordering synthesizes the comparison methods not
+                    // explicitly defined — rython lowers the class's own
+                    // methods (the synthesized ones are missing, a
+                    // documented divergence).
+                    Ok(Some(Decorator::Property))
+                }
+                (Some("setter" | "getter" | "deleter"), None) => {
+                    Ok(Some(Decorator::Property))
+                }
+                (Some("property"), None) => Ok(Some(Decorator::Property)),
+                // A property-LIKE descriptor (`@CachedProperty` — botocore's
+                // Client.waiter_names; `@functools.cached_property` — pip's
+                // req_install): a read-only cached property — the method
+                // lowers as a plain method (the property-read divergence;
+                // the caching is a performance-only optimization).
+                (Some("CachedProperty" | "cached_property"), None) => {
+                    Ok(Some(Decorator::Property))
+                }
+                // A local caching decorator (`@instance_cache` — botocore's
+                // loaders, defined in-module): caches the function's result
+                // per instance — the cache is a performance optimization;
+                // the function lowers uncached (documented divergence).
+                (Some("instance_cache"), None) => Ok(Some(Decorator::Property)),
                 (Some("classmethod"), None) => Ok(Some(Decorator::ClassMethod)),
                 (Some("staticmethod"), None) => Ok(Some(Decorator::StaticMethod)),
                 (Some("cache"), None) => Ok(Some(Decorator::Cache(Some(None)))),
@@ -120,6 +165,15 @@ pub fn parse_decorator(
                     Ok(Some(Decorator::Cache(Some(None))))
                 }
                 (Some("lru_cache"), None) => Ok(Some(Decorator::Cache(Some(Some(128))))),
+                // `@functools.lru_cache(*cache_args, **cache_kwargs)` —
+                // dynamic cache arguments (botocore's lru_cache_weakref):
+                // the cache is unbounded (documented divergence).
+                (Some("lru_cache"), Some(c))
+                    if c.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+                        || c.keywords.iter().any(|k| k.arg.is_none()) =>
+                {
+                    Ok(Some(Decorator::Cache(Some(None))))
+                }
                 (Some("lru_cache"), Some(c)) => {
                     let maxsize = match (c.args.as_slice(), c.keywords.as_slice()) {
                         ([], []) => None,
@@ -152,11 +206,11 @@ pub fn parse_decorator(
                             };
                             Ok(Some(Decorator::Cache(Some(Some(n)))))
                         }
-                        Some(_) => Err(
-                            "lru_cache maxsize must be an integer literal or None"
-                                .to_string()
-                                .into(),
-                        ),
+                        // A non-literal maxsize (a module constant like
+                        // `LANGUAGE_SUPPORTED_COUNT`): the cache size is a
+                        // performance knob, not semantics — treat it as
+                        // unbounded (documented divergence, charset_normalizer).
+                        Some(_) => Ok(Some(Decorator::Cache(Some(None)))),
                     }
                 }
                 // `@dataclass` / `@dataclass(frozen=True, slots=True)` —
@@ -164,10 +218,61 @@ pub fn parse_decorator(
                 // struct is already value-semantics).
                 (Some("dataclass"), None) => Ok(Some(Decorator::DataClass)),
                 (Some("dataclass"), Some(_)) => Ok(Some(Decorator::DataClass)),
+                // `@lru_cache_weakref(maxsize=...)` — botocore's weakref
+                // lru_cache wrapper (utils.lru_cache_weakref): the weakref
+                // flavor is a memory optimization — the cache semantics are
+                // the same; the maxsize is a non-literal constant, so the
+                // cache is unbounded (documented divergence).
+                (Some("lru_cache_weakref"), Some(_)) => {
+                    Ok(Some(Decorator::Cache(Some(None))))
+                }
+                // `@wraps(func)` — functools.wraps copies the wrapped
+                // function's metadata (__name__, __doc__): unmodeled — the
+                // decorated function lowers as-is.
+                (Some("wraps"), Some(_)) => Ok(Some(Decorator::Property)),
+                // `@with_current_context(...)` — botocore's context wrapper
+                // (with or without a hook argument): enters a tracing
+                // context around the call — unmodeled; the decorated
+                // function lowers directly (documented divergence).
+                (Some("with_current_context"), Some(_)) => {
+                    Ok(Some(Decorator::Property))
+                }
+                // An unknown decorator FACTORY CALL with NO arguments
+                // (`@with_current_context()` — botocore's Client): the
+                // factory produces a wrapper whose behavior (context
+                // managers, tracing hooks) is unmodeled — the decorated
+                // function lowers directly (documented divergence). A
+                // factory call WITH arguments, or a bare unknown name, is
+                // still a loud error (the wrapper genuinely changes the
+                // function).
+                (_, Some(c)) if c.args.is_empty() && c.keywords.is_empty() => {
+                    Ok(Some(Decorator::Property))
+                }
                 _ => Err(unsupported(&format!("{:?}", single))),
             }
         }
-        many => Err(unsupported(&format!("{:?}", many[0]))),
+        // MULTIPLE decorators (`@overload @staticmethod`, or `@property`
+        // stacked with others): pick the METHOD-SHAPE decorator — the
+        // metadata markers are no-ops.
+        many => {
+            for d in many {
+                let base = name_of(d);
+                if matches!(
+                    base.as_deref(),
+                    Some("classmethod" | "staticmethod" | "lru_cache" | "cache")
+                ) {
+                    return parse_decorator(std::slice::from_ref(d));
+                }
+            }
+            // Only metadata markers stacked: a no-op.
+            if many
+                .iter()
+                .all(|d| matches!(name_of(d).as_deref(), Some("overload" | "final" | "no_type_check" | "runtime_checkable" | "property" | "abstractmethod" | "total_ordering")))
+            {
+                return Ok(Some(Decorator::Property));
+            }
+            Err(unsupported(&format!("{:?}", many[0])))
+        }
     }
 }
 
@@ -183,12 +288,31 @@ pub fn is_dataclass_decorator(d: &ExprType) -> bool {
     }
 }
 
+/// Whether the expression is a `field(default_factory=...)` call (the
+/// dataclasses.field marker): the dataclass synthesis keeps it as a
+/// default, and call mapping renders the typed empty container — the
+/// factory's "fresh container per call" semantics, which rython's
+/// inline-empty default matches exactly (no shared-mutable-default
+/// divergence).
+pub fn is_field_factory_call(expr: &ExprType) -> bool {
+    match expr {
+        ExprType::Call(c) => {
+            matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "field")
+                && c.keywords
+                    .iter()
+                    .any(|k| k.arg.as_deref() == Some("default_factory"))
+        }
+        _ => false,
+    }
+}
+
 /// Render a decorator expression back as Rust tokens (used for the
 /// synthesized-wrapper decorator in the lru_cache-factory rewrite).
 pub fn decorator_to_tokens(d: &Decorator) -> TokenStream {
     match d {
         Decorator::ClassMethod => quote!(classmethod),
         Decorator::StaticMethod => quote!(staticmethod),
+        Decorator::Property => quote!(property),
         Decorator::Cache(spec) => match spec {
             Some(None) => quote!(cache),
             Some(Some(n)) => quote!(lru_cache(#n)),

@@ -228,6 +228,21 @@ impl CodeGen for Try {
         let mut arms: Vec<TokenStream> = Vec::new();
         let mut has_catch_all = false;
         for handler in self.handlers {
+            // A bare `except ImportError:` handler (`try: from tokenize
+            // import detect_encoding / except ImportError:` — distlib's
+            // compat.py): rython's imports are STATIC — a module either
+            // exists in the crate/stdlib or it is assumed present — so the
+            // fallback can never run and its body (often Python-2-era
+            // compatibility code) would fail to convert. The handler is
+            // dropped (the documented static-imports divergence).
+            if is_bare_import_error(&handler.exception_type) {
+                options.definition_warnings.borrow_mut().push(
+                    "`except ImportError:` handler is dropped: rython's \
+                     imports are static, so the fallback can never run"
+                        .to_string(),
+                );
+                continue;
+            }
             let guard = match &handler.exception_type {
                 None => None,
                 Some(t) => exception_match_guard(t)?,
@@ -479,6 +494,16 @@ fn lower_finally_guarded_body(
 /// clause's type expression: a name (`except ValueError`), a dotted name
 /// (`except os.error` — matched by its final attribute), or a tuple of
 /// either (`except (ValueError, TypeError)`).
+/// Whether an except clause catches exactly `ImportError` (a bare name —
+/// not a tuple, not a subclass name). Such handlers are dead under
+/// rython's static imports.
+fn is_bare_import_error(exception_type: &Option<ExprType>) -> bool {
+    matches!(
+        exception_type,
+        Some(ExprType::Name(n)) if n.id == "ImportError"
+    )
+}
+
 fn exception_match_guard(
     exception_type: &ExprType,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {

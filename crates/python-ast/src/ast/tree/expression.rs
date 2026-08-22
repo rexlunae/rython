@@ -146,6 +146,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExprType {
                 let name = ob.extract().map_err(|e| extraction_failure("parsing Name expression", &ob, e))?;
                 Ok(Self::Name(name))
             }
+            // The walrus operator (`if (x := f()) is not None:`): a
+            // NamedExpr assigns its target and evaluates to it.
+            "NamedExpr" => {
+                let ne = ob.extract().map_err(|e| extraction_failure("extracting NamedExpr in expression", &ob, e))?;
+                Ok(Self::NamedExpr(ne))
+            }
             "UnaryOp" => {
                 let c = ob.extract().map_err(|e| extraction_failure("extracting UnaryOp in expression", &ob, e))?;
                 Ok(Self::UnaryOp(c))
@@ -224,6 +230,26 @@ impl<'a> CodeGen for ExprType {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        thread_local! {
+            static E_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let d = E_DEPTH.with(|c| c.get());
+        if d > 100 && d % 20 == 0 {
+        }
+        E_DEPTH.with(|c| c.set(d + 1));
+        let result = self.to_rust_inner(ctx, options, symbols);
+        E_DEPTH.with(|c| c.set(d));
+        return result;
+    }
+}
+
+impl ExprType {
+    fn to_rust_inner(
+        self,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self {
             ExprType::Attribute(attribute) => attribute.to_rust(ctx, options, symbols),
             ExprType::Await(func) => func.to_rust(ctx, options, symbols),
@@ -247,6 +273,7 @@ impl<'a> CodeGen for ExprType {
             ExprType::YieldFrom(yf) => yf.to_rust(ctx, options, symbols),
             ExprType::JoinedStr(js) => js.to_rust(ctx, options, symbols),
             ExprType::FormattedValue(fv) => fv.to_rust(ctx, options, symbols),
+            ExprType::NamedExpr(ne) => ne.to_rust(ctx, options, symbols),
             ExprType::List(l) => {
                 // Type-aware list lowering: infer the element type across
                 // the literal, then coerce each element to it —
@@ -280,17 +307,58 @@ impl<'a> CodeGen for ExprType {
                     expected = crate::unify(expected, t.clone());
                 }
                 if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {
-                    let kinds = distinct
-                        .iter()
-                        .map(|d| d.display())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(format!(
-                        "list literal mixes incompatible element types ({kinds}); \
-                         elements must share a common type (or annotate the \
-                         variable, e.g. `xs: list[float] = [...]`)"
-                    )
-                    .into());
+                    // A list of DIFFERENT class instances (`[d_sp, d_ta,
+                    // ...]` — charset_normalizer's debug plugin list) has
+                    // no single Rust element type. That is a documented
+                    // divergence (heterogeneous class lists cannot build in
+                    // rython; rustc reports the Vec element mismatch), but
+                    // the conversion itself proceeds — primitive mixes
+                    // ([1, "a"]) stay a loud error.
+                    if !distinct.iter().all(|t| matches!(t, crate::TypeInfo::Class(_))) {
+                        // A HETEROGENEOUS list involving a TUPLE
+                        // (`['s3_use_arn_region', ('s3',
+                        // 'use_arn_region')]` — botocore's
+                        // configprovider): a structured config list — box
+                        // the elements as PyValue (documented divergence).
+                        // A list mixing an OPTIONAL element (`["--username",
+                        // username]` where username is `str | None` — pip's
+                        // subversion) boxes the same way. Primitive mixes
+                        // without tuples/optionals ([1, 'a']) stay a loud
+                        // error.
+                        if distinct.iter().any(|t| {
+                            matches!(
+                                t,
+                                crate::TypeInfo::Tuple(_)
+                                    | crate::TypeInfo::Option(_)
+                                    // A NESTED list mixing (`[["apple",
+                                    // ...], 1.123]` — rich's logging demo):
+                                    // a list-of-container element boxes
+                                    // (documented divergence).
+                                    | crate::TypeInfo::Vec(_)
+                            )
+                        })
+                            // A WIDE primitive mix (`[1, 2, 3, None, 4,
+                            // True, False, "Hello World"]` — rich's scope
+                            // demo): three or more distinct scalar kinds —
+                            // boxed PyValue (the boxed-container
+                            // divergence, #130).
+                            || distinct.len() >= 3
+                        {
+                            expected = crate::TypeInfo::PyValue;
+                        } else {
+                            let kinds = distinct
+                                .iter()
+                                .map(|d| d.display())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(format!(
+                                "list literal mixes incompatible element types ({kinds}); \
+                                 elements must share a common type (or annotate the \
+                                 variable, e.g. `xs: list[float] = [...]`)"
+                            )
+                            .into());
+                        }
+                    }
                 }
                 let expected_elt = if matches!(expected, crate::TypeInfo::PyObject) {
                     None
@@ -299,33 +367,27 @@ impl<'a> CodeGen for ExprType {
                 };
 
                 let mut elements = Vec::new();
+                let mut starred_vals: Vec<TokenStream> = Vec::new();
                 for li in l {
-                    let code = if matches!(li, ExprType::Starred(_)) {
-                        li.clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
-                    } else {
-                        crate::render_typed(
-                            &li,
+                    if let ExprType::Starred(starred) = li {
+                        // `[*xs]` — the spread's collection extends the
+                        // list (`[key, *val]` — urllib3).
+                        let inner = starred.value.clone().to_rust(
                             ctx.clone(),
                             options.clone(),
                             symbols.clone(),
-                            expected_elt.clone(),
-                        )?
-                    };
-
-                    // Check if this is a starred expression
-                    if matches!(li, ExprType::Starred(_)) {
-                        let code_str = code.to_string();
-                        // Special handling for sys::argv unpacking
-                        if code_str.contains("sys :: argv") {
-                            // Mark that we need special sys::argv handling with a unique marker
-                            elements.push(quote! { __STARRED_ARGV_MARKER__ });
-                        } else {
-                            elements.push(code);
-                        }
-                    } else {
-                        elements.push(code);
+                        )?;
+                        starred_vals.push(inner);
+                        continue;
                     }
+                    let code = crate::render_typed(
+                        &li,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        expected_elt.clone(),
+                    )?;
+                    elements.push(code);
                 }
                 
                 // If we have starred expressions, handle them specially
@@ -363,9 +425,19 @@ impl<'a> CodeGen for ExprType {
                             })
                         }
                     } else {
-                        // Other starred expressions (not sys::argv)
+                        // Other starred expressions (not sys::argv):
+                        // `[a, *xs]` pushes a and extends xs.
+                        let elt_ty = expected_elt
+                            .as_ref()
+                            .map(|t| t.to_rust_type())
+                            .unwrap_or_else(|| quote!(_));
                         Ok(quote! {
-                            vec![#(#final_elements),*]
+                            {
+                                let mut __rython_list: Vec<#elt_ty> = Vec::new();
+                                #( __rython_list.push(#final_elements); )*
+                                #( __rython_list.extend(#starred_vals); )*
+                                __rython_list
+                            }
                         })
                     }
                 } else {
@@ -786,9 +858,13 @@ pub fn narrowing_from_test(
 }
 
 /// Issue #121: `if isinstance(x, (bytes, bytearray)):` (or
-/// `if not isinstance(...)`) narrows a `str | bytes` union: the tested
-/// branch becomes the concrete bytes type, the other branch becomes
-/// String. Returns (name, body_type, else_type). None for any other test.
+/// `if not isinstance(...)`) narrows a `str | bytes` union or a boxed
+/// PyValue union: the tested branch becomes the concrete member type, the
+/// other branch becomes the complement (String for StrOrBytes, the boxed
+/// PyValue for PyValue). A compound test — `if isinstance(x, tuple) and
+/// len(x) == 2:` — narrows only the body (the `and` could fail on the
+/// other conjunct, so the else stays the original type). Returns
+/// (name, body_type, else_type). None for any other test.
 pub fn isinstance_narrowing(
     test: &ExprType,
     options: &PythonOptions,
@@ -799,6 +875,25 @@ pub fn isinstance_narrowing(
     let (negated, inner) = match test {
         ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::Not) => {
             (true, u.operand.as_ref())
+        }
+        // A compound `isinstance(x, T) and <rest>` narrows the body only.
+        ExprType::BoolOp(op) if matches!(op.op, crate::BoolOps::And) => {
+            for value in &op.values {
+                if let Some((name, body_ty, _)) =
+                    isinstance_narrowing(value, options, symbols)
+                {
+                    // The else branch keeps the ORIGINAL type: the `and`
+                    // may have failed on the other conjunct, so the
+                    // complement narrowing does not apply.
+                    let original = options
+                        .name_types
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(crate::TypeInfo::StrOrBytes);
+                    return Some((name, body_ty, original));
+                }
+            }
+            return None;
         }
         other => (false, other),
     };
@@ -814,29 +909,40 @@ pub fn isinstance_narrowing(
     let ExprType::Name(n) = &call.args[0] else {
         return None;
     };
-    // The name must be a str|bytes union.
-    if !options
+    // The name must be a str|bytes union or a boxed PyValue union.
+    let is_union = options
         .name_types
         .get(&n.id)
-        .is_some_and(|t| matches!(t, crate::TypeInfo::StrOrBytes))
-    {
+        .is_some_and(|t| matches!(t, crate::TypeInfo::StrOrBytes | crate::TypeInfo::PyValue));
+    if !is_union {
         return None;
     }
-    // The second argument: a tuple of (bytes, bytearray) or a single
-    // bytes/bytearray name (narrows to bytes); or str (narrows to String).
-    // Aliased type names (`builtin_str = str`) and imported aliases
-    // (`from .compat import builtin_str`) resolve through symbols.
+    // The second argument: a tuple of type names or a single type name
+    // (str narrows to String, bytes/bytearray to Bytes, int/float/bool/
+    // tuple to the PyValue members). Aliased type names (`builtin_str =
+    // str`) and imported aliases resolve through symbols.
     fn resolve_type_name(
         id: &str,
         options: &PythonOptions,
         symbols: &SymbolTableScopes,
     ) -> Option<String> {
+        resolve_type_name_depth(id, options, symbols, 0)
+    }
+    fn resolve_type_name_depth(
+        id: &str,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 16 {
+            return None;
+        }
         match symbols.get(id) {
             Some(crate::SymbolTableNode::Assign { value, .. }) => match value {
                 ExprType::Name(n)
                     if matches!(
                         n.id.as_str(),
-                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
+                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "tuple"
                     ) =>
                 {
                     Some(n.id.clone())
@@ -844,7 +950,14 @@ pub fn isinstance_narrowing(
                 _ => None,
             },
             Some(crate::SymbolTableNode::Alias(canonical)) => {
-                resolve_type_name(canonical, options, symbols)
+                // A self-aliasing re-export (`from .connection import
+                // ProxyConfig as ProxyConfig` — urllib3) would recurse
+                // forever; the alias is a no-op.
+                if canonical == id {
+                    None
+                } else {
+                    resolve_type_name_depth(canonical, options, symbols, depth + 1)
+                }
             }
             Some(crate::SymbolTableNode::ImportFrom(i)) => {
                 let path = i.resolved_module_path(options);
@@ -854,7 +967,7 @@ pub fn isinstance_narrowing(
                     let syms = module
                         .clone()
                         .find_symbols(SymbolTableScopes::new());
-                    resolve_type_name(id, options, &syms)
+                    resolve_type_name_depth(id, options, &syms, depth + 1)
                 } else {
                     None
                 }
@@ -862,40 +975,89 @@ pub fn isinstance_narrowing(
             _ => None,
         }
     }
-    let targets_bytes = match &call.args[1] {
+    // Collect the resolved target type names (deduplicated, in order).
+    let mut targets: Vec<String> = Vec::new();
+    match &call.args[1] {
         ExprType::Name(t) => {
-            let id = resolve_type_name(&t.id, options, symbols)
-                .unwrap_or_else(|| t.id.clone());
-            crate::is_bytes_annotation(&ExprType::Name(crate::ast::tree::name::Name { id }))
+            let id = resolve_type_name(&t.id, options, symbols).unwrap_or_else(|| t.id.clone());
+            targets.push(id);
         }
         ExprType::Tuple(tup) => {
-            !tup.elts.is_empty()
-                && tup.elts.iter().all(|e| match e {
-                    ExprType::Name(t) => {
-                        let id = resolve_type_name(&t.id, options, symbols)
-                            .unwrap_or_else(|| t.id.clone());
-                        crate::is_bytes_annotation(&ExprType::Name(
-                            crate::ast::tree::name::Name { id },
-                        ))
-                    }
-                    _ => false,
-                })
+            for elt in &tup.elts {
+                let ExprType::Name(t) = elt else {
+                    return None;
+                };
+                let id = resolve_type_name(&t.id, options, symbols)
+                    .unwrap_or_else(|| t.id.clone());
+                targets.push(id);
+            }
         }
-        _ => false,
+        _ => return None,
+    }
+    let known = |id: &str| {
+        matches!(
+            id,
+            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "tuple"
+        )
     };
-    let targets_str = match &call.args[1] {
-        ExprType::Name(t) => {
-            let id = resolve_type_name(&t.id, options, symbols)
-                .unwrap_or_else(|| t.id.clone());
-            crate::is_str_annotation(&ExprType::Name(crate::ast::tree::name::Name { id }))
+    if targets.is_empty() || targets.iter().any(|t| !known(t)) {
+        return None;
+    }
+    // Map each resolved target to the member TypeInfo it narrows to.
+    let member_of = |id: &str| -> Option<crate::TypeInfo> {
+        match id {
+            "str" => Some(crate::TypeInfo::String),
+            "bytes" | "bytearray" => Some(crate::TypeInfo::Bytes),
+            "int" => Some(crate::TypeInfo::Int),
+            "float" => Some(crate::TypeInfo::Float),
+            "bool" => Some(crate::TypeInfo::Bool),
+            // A tuple member is read as its element vector
+            // (PyValue::as_tuple().unwrap().clone()).
+            "tuple" => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
+            _ => None,
         }
-        _ => false,
     };
-    let (tested, other) = if targets_bytes {
-        (crate::TypeInfo::Bytes, crate::TypeInfo::String)
-    } else if targets_str {
-        (crate::TypeInfo::String, crate::TypeInfo::Bytes)
+    let members: Vec<crate::TypeInfo> = targets
+        .iter()
+        .filter_map(|t| member_of(t))
+        .collect();
+    // Deduplicate: (bytes, bytearray) both narrow to Bytes.
+    let mut distinct: Vec<crate::TypeInfo> = Vec::new();
+    for m in members {
+        if !distinct.contains(&m) {
+            distinct.push(m);
+        }
+    }
+    if distinct.is_empty() {
+        return None;
+    }
+    let original_is_pyvalue = options
+        .name_types
+        .get(&n.id)
+        .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue));
+    let (tested, other) = if distinct.len() == 1 {
+        let member = distinct.pop().unwrap();
+        if original_is_pyvalue {
+            (
+                crate::TypeInfo::PyValueMember(Box::new(member.clone())),
+                crate::TypeInfo::PyValue,
+            )
+        } else {
+            // StrOrBytes: bytes → Bytes, str → String; the complement is
+            // the other branch.
+            match member {
+                crate::TypeInfo::Bytes => {
+                    (crate::TypeInfo::Bytes, crate::TypeInfo::String)
+                }
+                crate::TypeInfo::String => {
+                    (crate::TypeInfo::String, crate::TypeInfo::Bytes)
+                }
+                _ => return None,
+            }
+        }
     } else {
+        // Several DISTINCT member targets on a PyValue narrow nothing
+        // (the test itself still dispatches at runtime via call.rs).
         return None;
     };
     let (body_ty, else_ty) = if negated {

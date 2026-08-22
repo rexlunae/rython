@@ -215,18 +215,16 @@ impl CodeGen for Import {
                 // root), so the import lowers to nothing — a bare
                 // `use math;` would not even resolve.
                 name if is_stdpython_module(name) => {
-                    if let Some(asname) = &alias.asname {
+                    if let Some(_asname) = &alias.asname {
                         // The module can't be re-bound with `use` (it's a
-                        // glob-imported name, not a path), so aliasing
-                        // would silently leave the alias undefined.
-                        return Err(format!(
-                            "`import {} as {}`: aliasing runtime modules is not \
-                             supported yet; use `import {}`",
-                            name, asname, name
-                        )
-                        .into());
+                        // glob-imported name, not a path), so the alias
+                        // resolves through the symbol table: the runtime
+                        // dispatch follows `_json` → Alias("json") to the
+                        // same module (urllib3's `import json as _json`).
+                        quote! {}
+                    } else {
+                        quote! {}
                     }
-                    quote! {}
                 }
                 // Python stdlib modules that don't have direct Rust equivalents
                 "urllib" | "xml" => {
@@ -352,9 +350,15 @@ impl CodeGen for ImportFrom {
             );
             // `from pylev import wf as w`: the alias resolves to the
             // canonical name so call lowering propagates exceptions and
-            // attribute access treats it as the imported value.
+            // attribute access treats it as the imported value. A SELF-alias
+            // (`from ._base_connection import ProxyConfig as ProxyConfig` —
+            // urllib3's re-export) must NOT overwrite the ImportFrom symbol:
+            // resolve_imported_class follows the chain through ImportFrom,
+            // and an Alias-to-self would loop.
             if let Some(asname) = &alias.asname {
-                symbols.insert(asname.clone(), SymbolTableNode::Alias(alias.name.clone()));
+                if asname != &alias.name {
+                    symbols.insert(asname.clone(), SymbolTableNode::Alias(alias.name.clone()));
+                }
             }
         }
         symbols

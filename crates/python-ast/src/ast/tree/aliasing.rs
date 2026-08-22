@@ -53,16 +53,23 @@ pub fn check_aliasing(
             .map(|(n, _)| n.clone())
             .collect(),
         aliases: Vec::new(),
-        mutated: HashSet::new(),
+        mutated: HashMap::new(),
         alias_calls: Vec::new(),
+        pos: 0,
     };
     guard.walk(body);
 
     // Shape 1: `b = a` on a container where either name is later mutated.
     // CPython shows the mutation through both names; rython's copy would
     // not.
-    for (target, source, lineno) in &guard.aliases {
-        if guard.mutated.contains(target) || guard.mutated.contains(source) {
+    for (target, source, lineno, pos) in &guard.aliases {
+        let mutated_after = |name: &str| -> bool {
+            guard
+                .mutated
+                .get(name)
+                .is_some_and(|positions| positions.iter().any(|p| p > pos))
+        };
+        if mutated_after(target) || mutated_after(source) {
             return Err(alias_error(
                 &format!(
                     "`{target} = {source}` shares one container between two names, and the \
@@ -113,21 +120,33 @@ struct AliasingGuard<'a> {
     /// source and target of every alias (an alias target's own type is not
     /// inferred — `b = a` has no syntactic type — but it IS a container).
     containers: HashSet<String>,
-    aliases: Vec<(String, String, Option<usize>)>,
-    mutated: HashSet<String>,
+    /// `(target, source, lineno, position)` — the position is the
+    /// statement counter at the alias, so a mutation that happens BEFORE
+    /// the alias is not a conflict (`chunks.append(...)` then `chunks =
+    /// new_chunks` — botocore's calculate_tree_hash: the append touched
+    /// the list the name no longer references after the rebind).
+    aliases: Vec<(String, String, Option<usize>, usize)>,
+    /// Container mutations by name, with their statement positions.
+    mutated: HashMap<String, Vec<usize>>,
     alias_calls: Vec<(String, Option<usize>)>,
+    /// Monotonic statement counter (shared across nested walks).
+    pos: usize,
 }
 
 impl<'a> AliasingGuard<'a> {
     fn walk(&mut self, body: &[Statement]) {
         for stmt in body {
+            self.pos += 1;
             let lineno = stmt.lineno;
             match &stmt.statement {
                 StatementType::Assign(a) => self.visit_assign(a, lineno),
                 StatementType::AugAssign(a) => {
                     // `a += v` / `a[i] += v` mutate the container.
                     if let Some(name) = root_name_of(&a.target) {
-                        self.mutated.insert(name.to_string());
+                        self.mutated
+                            .entry(name.to_string())
+                            .or_default()
+                            .push(self.pos);
                     }
                     self.visit_expr(&a.value);
                 }
@@ -171,13 +190,17 @@ impl<'a> AliasingGuard<'a> {
                     }
                 }
                 StatementType::Global(_) => {}
+                StatementType::Nonlocal(_) => {}
                 StatementType::Delete(targets) => {
                     // `del xs[i]` mutates the container.
                     for target in targets {
                         if let ExprType::Subscript(s) = target
                             && let Some(name) = root_name_of(&s.value)
                         {
-                            self.mutated.insert(name.to_string());
+                            self.mutated
+                                .entry(name.to_string())
+                                .or_default()
+                                .push(self.pos);
                         }
                     }
                 }
@@ -214,8 +237,12 @@ impl<'a> AliasingGuard<'a> {
                         // `a = a` is not an alias.
                         if t.id != source.id {
                             self.containers.insert(t.id.clone());
-                            self.aliases
-                                .push((t.id.clone(), source.id.clone(), lineno));
+                            self.aliases.push((
+                                t.id.clone(),
+                                source.id.clone(),
+                                lineno,
+                                self.pos,
+                            ));
                         }
                     }
                 }
@@ -226,8 +253,25 @@ impl<'a> AliasingGuard<'a> {
         for target in &a.targets {
             if let ExprType::Subscript(_) = target {
                 if let Some(name) = root_name_of(target) {
-                    self.mutated.insert(name.to_string());
+                    self.mutated
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(self.pos);
                 }
+            }
+        }
+        // A REBINDING (`response = []`) severs any alias: the name now
+        // points to a fresh object, so later mutations through it no longer
+        // alias the old container (`raw_response = response` then `response
+        // = []` then `response.append(...)` — boto3's
+        // ResourceHandler.__call__, where Python's rebind makes the append
+        // invisible to `raw_response`).
+        for target in &a.targets {
+            if let ExprType::Name(t) = target
+                && !matches!(&a.value, ExprType::Name(_))
+            {
+                self.aliases
+                    .retain(|(tg, src, _, _)| tg != &t.id && src != &t.id);
             }
         }
         self.visit_expr(&a.value);
@@ -241,7 +285,10 @@ impl<'a> AliasingGuard<'a> {
                 if MUTATING_METHODS.contains(&attr.attr.as_str())
                     && self.containers.contains(receiver)
                 {
-                    self.mutated.insert(receiver.to_string());
+                    self.mutated
+                        .entry(receiver.to_string())
+                        .or_default()
+                        .push(self.pos);
                 }
             }
         }

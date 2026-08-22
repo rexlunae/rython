@@ -45,6 +45,11 @@ use std::collections::{HashMap, HashSet};
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use hashbrown::{HashMap, HashSet};
 
+#[cfg(feature = "std")]
+use std::rc::Rc;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::rc::Rc;
+
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
 
@@ -2263,6 +2268,169 @@ impl Len for StrOrBytes {
     }
 }
 
+/// A boxed heterogeneous Python value (issue #121): the runtime
+/// representation of wider unions that have no single concrete Rust type —
+/// `bool | str | None`, `tuple[str, str] | str | None`, `int | str | None`,
+/// `Any`, `Literal[False] | str | None`, ... Every member keeps its concrete
+/// type; isinstance checks dispatch at runtime (`is_str()`, `as_int()`, ...)
+/// and narrow the value in the branch, mirroring StrOrBytes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PyValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Bytes(Vec<u8>),
+    Tuple(Rc<Vec<PyValue>>),
+    None_,
+}
+
+impl PyValue {
+    pub fn is_int(&self) -> bool {
+        matches!(self, PyValue::Int(_))
+    }
+    pub fn is_float(&self) -> bool {
+        matches!(self, PyValue::Float(_))
+    }
+    pub fn is_bool(&self) -> bool {
+        matches!(self, PyValue::Bool(_))
+    }
+    pub fn is_str(&self) -> bool {
+        matches!(self, PyValue::Str(_))
+    }
+    pub fn is_bytes(&self) -> bool {
+        matches!(self, PyValue::Bytes(_))
+    }
+    pub fn is_tuple(&self) -> bool {
+        matches!(self, PyValue::Tuple(_))
+    }
+    pub fn is_none(&self) -> bool {
+        matches!(self, PyValue::None_)
+    }
+    /// Python len(): characters for a str, octets for bytes, elements for a
+    /// tuple. Only valid on members that have a length (the code paths that
+    /// call it are the ones Python would execute).
+    pub fn len(&self) -> usize {
+        match self {
+            PyValue::Str(s) => s.chars().count(),
+            PyValue::Bytes(b) => b.len(),
+            PyValue::Tuple(t) => t.len(),
+            other => panic!("len() of non-sized PyValue {other:?}"),
+        }
+    }
+    /// The member views; only valid after isinstance narrowing (Python
+    /// raises TypeError if the member does not match).
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            PyValue::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            PyValue::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            PyValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PyValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            PyValue::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+    pub fn as_tuple(&self) -> Option<&Vec<PyValue>> {
+        match self {
+            PyValue::Tuple(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+impl AsStrLike for PyValue {
+    fn as_str_like(&self) -> &str {
+        match self {
+            PyValue::Str(s) => s.as_str(),
+            other => panic!("expected a str in this context, got {other:?}"),
+        }
+    }
+}
+
+impl Truthy for PyValue {
+    fn is_truthy(&self) -> bool {
+        match self {
+            PyValue::Int(v) => *v != 0,
+            PyValue::Float(v) => *v != 0.0,
+            PyValue::Bool(v) => *v,
+            PyValue::Str(s) => !s.is_empty(),
+            PyValue::Bytes(b) => !b.is_empty(),
+            PyValue::Tuple(t) => !t.is_empty(),
+            PyValue::None_ => false,
+        }
+    }
+}
+
+impl Len for PyValue {
+    fn len(&self) -> usize {
+        PyValue::len(self)
+    }
+}
+
+impl PyIsNone for PyValue {
+    fn py_is_none(&self) -> bool {
+        self.is_none()
+    }
+}
+
+macro_rules! pyvalue_from {
+    ($($t:ty => $v:ident),* $(,)?) => {
+        $(impl From<$t> for PyValue {
+            fn from(value: $t) -> Self {
+                PyValue::$v(value)
+            }
+        })*
+    };
+}
+pyvalue_from!(i64 => Int, f64 => Float, bool => Bool, String => Str, Vec<u8> => Bytes);
+
+impl From<&str> for PyValue {
+    fn from(value: &str) -> Self {
+        PyValue::Str(value.to_string())
+    }
+}
+
+impl From<&[u8]> for PyValue {
+    fn from(value: &[u8]) -> Self {
+        PyValue::Bytes(value.to_vec())
+    }
+}
+
+impl From<StrOrBytes> for PyValue {
+    fn from(value: StrOrBytes) -> Self {
+        match value {
+            StrOrBytes::Str(s) => PyValue::Str(s),
+            StrOrBytes::Bytes(b) => PyValue::Bytes(b),
+        }
+    }
+}
+
+impl From<()> for PyValue {
+    fn from(_: ()) -> Self {
+        PyValue::None_
+    }
+}
+
 /// `bytes(x)` lowering: the byte representation of a str (UTF-8), a
 /// str|bytes union (the bytes branch), or bytes themselves (identity).
 pub trait IntoBytesLike {
@@ -3129,6 +3297,42 @@ pub fn py_int_radix_format(
         // '>' and the default: numbers right-align.
         _ => format!("{}{}", filler.repeat(pad), body),
     }
+}
+
+/// The `,` thousands separator (Python's `f"{size:,}"`): the integer's
+/// digits group in threes from the right, preserving the sign
+/// (format(-1234567, ',') == "-1,234,567").
+pub fn py_grouped_int(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let mag = v.unsigned_abs().to_string();
+    let mut out = String::new();
+    let chars: Vec<char> = mag.chars().collect();
+    let first_group = chars.len() % 3;
+    let mut i = 0;
+    if first_group > 0 {
+        out.extend(chars[..first_group].iter());
+        i = first_group;
+        if i < chars.len() {
+            out.push(',');
+        }
+    }
+    while i < chars.len() {
+        out.extend(chars[i..i + 3].iter());
+        i += 3;
+        if i < chars.len() {
+            out.push(',');
+        }
+    }
+    format!("{}{}", sign, out)
+}
+
+/// A DYNAMIC-width format spec (`f"{completed:{total_width}d}"` — rich's
+/// progress column): the width is a runtime value, so the interpolation
+/// routes here. Python's spec semantics for the supported subset: an
+/// integer right-aligned in the width with space fill (the dynamic-format
+/// divergence — only the `{value:{width}d}` shape lowers).
+pub fn py_dynamic_format(value: i64, width: i64) -> String {
+    format!("{:>width$}", value, width = width.max(0) as usize)
 }
 
 /// Python requires ljust/rjust fill arguments to be exactly one
