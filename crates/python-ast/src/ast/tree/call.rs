@@ -4394,6 +4394,13 @@ impl<'a> CodeGen for Call {
                     .keywords
                     .iter()
                     .any(|k| !matches!(k.arg.as_deref(), Some("sep" | "maxsplit")))
+                // A MODULE-PATH receiver (`os.path.split(...)` — the
+                // runtime module function, not a str method): skip the
+                // rewrite so the module-path call renders.
+                && !crate::ast::tree::attribute::is_module_path_chain(
+                    &attr.value,
+                    &symbols,
+                )
             {
                 if self.args.len() > 2 {
                     return Err(format!(

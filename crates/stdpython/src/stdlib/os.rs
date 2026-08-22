@@ -11,6 +11,27 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 python_function! {
+    /// os.fstat - file status (requests' utils, `os.fstat(f).st_size` for
+    /// the total content length). Models the st_size member; the rest of
+    /// the stat_result is unmodeled (a boxed-nothing divergence).
+    pub fn fstat(fd: i64) -> StatResult
+    [signature: (fd)]
+    [concrete_types: (i64) -> StatResult]
+    {
+        let meta = std::fs::metadata(format!("/proc/self/fd/{}", fd)).ok();
+        StatResult {
+            st_size: meta.map(|m| m.len() as i64).unwrap_or(0),
+        }
+    }
+}
+
+/// os.stat_result — the size member of a stat call. Only `st_size` is
+/// modeled (requests' `os.fstat(...).st_size`).
+pub struct StatResult {
+    pub st_size: i64,
+}
+
+python_function! {
     /// os.urandom - cryptographically secure random bytes (requests' digest
     /// auth nonce). Falls back to a std RNG when the OS source fails.
     pub fn urandom(size: i64) -> Vec<u8>
@@ -467,6 +488,46 @@ pub mod path {
         }
     }
     
+    python_function! {
+        /// os.path.split - split a path into (head, tail): everything
+        /// before the final separator and the final component
+        /// (posixpath.split semantics — requests' utils).
+        pub fn split<P>(path: P) -> (String, String)
+        where [P: AsRef<str>]
+        [signature: (path)]
+        [concrete_types: (String) -> (String, String)]
+        {
+            let s = path.as_ref();
+            match s.rfind('/') {
+                Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
+                None => ("".to_string(), s.to_string()),
+            }
+        }
+    }
+
+    python_function! {
+        /// os.path.splitext - split a path into (root, ext) at the last
+        /// extension dot (posixpath.splitext semantics — requests' utils).
+        pub fn splitext<P>(path: P) -> (String, String)
+        where [P: AsRef<str>]
+        [signature: (path)]
+        [concrete_types: (String) -> (String, String)]
+        {
+            let s = path.as_ref();
+            let base = match s.rfind('/') {
+                Some(i) => &s[i + 1..],
+                None => s,
+            };
+            match base.rfind('.') {
+                Some(i) if i > 0 => (
+                    s[..s.len() - base.len() + i].to_string(),
+                    base[i..].to_string(),
+                ),
+                _ => (s.to_string(), "".to_string()),
+            }
+        }
+    }
+
     python_function! {
         /// os.path.abspath - normpath(join(cwd, path)), purely LEXICAL as
         /// in Python: the path need not exist and symlinks are not
