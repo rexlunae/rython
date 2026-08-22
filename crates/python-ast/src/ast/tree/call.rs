@@ -66,12 +66,164 @@ pub(crate) const RUNTIME_KEYWORD_SIGNATURES: &[(&str, &str, &[&str])] = &[
 /// can be re-applied AFTER an `.await`: an async function call renders with
 /// `?` (exceptions propagate), but the operator must unwrap the awaited
 /// Result, not the future. Mirrors the Await node's reordering.
-fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
     let rendered = tokens.to_string();
     match rendered.trim_end().strip_suffix('?') {
         Some(inner) => inner.parse().unwrap_or_else(|_| tokens.clone()),
         None => tokens.clone(),
     }
+}
+
+/// datetime constructors: `date` / `datetime` / `timedelta`. Shared by the
+/// `from datetime import ...` Name path (`date(2025, 1, 1)`) and the
+/// module-qualified attribute path (`datetime.date(...)` — urllib3's
+/// connection module). Arguments map against the Python signatures and lower
+/// to the runtime `::new` constructors (Option-typed defaulted parameters);
+/// `date`/`datetime` validate and propagate with `?`. Returns Ok(None) when
+/// `name` is not one of the three constructors.
+fn render_datetime_ctor(
+    name: &str,
+    args: &[crate::ExprType],
+    keywords: &[crate::Keyword],
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    if !matches!(name, "date" | "datetime" | "timedelta") {
+        return Ok(None);
+    }
+    let (params, required): (&[&str], usize) = match name {
+        "date" => (&["year", "month", "day"], 3),
+        "datetime" => (
+            &[
+                "year",
+                "month",
+                "day",
+                "hour",
+                "minute",
+                "second",
+                "microsecond",
+            ],
+            3,
+        ),
+        _ => (
+            &[
+                "days",
+                "seconds",
+                "microseconds",
+                "milliseconds",
+                "minutes",
+                "hours",
+                "weeks",
+            ],
+            0,
+        ),
+    };
+    if args.len() > params.len() {
+        return Err(format!(
+            "{}() takes at most {} arguments ({} given)",
+            name,
+            params.len(),
+            args.len()
+        )
+        .into());
+    }
+    let mut slots: Vec<Option<crate::ExprType>> = vec![None; params.len()];
+    for (i, arg) in args.iter().enumerate() {
+        slots[i] = Some(arg.clone());
+    }
+    // A `*spread` positional (`datetime(*date[:6],
+    // tzinfo=timezone.utc)` — pip's vendored cachecontrol
+    // heuristics): the spread's element types are dynamic (the
+    // spreaded value is a boxed PyValue), so the constructor
+    // cannot be statically decomposed. The whole construction
+    // is dropped and replaced with now() — the call site's
+    // surrounding logic (a cache-expiry heuristic) still works
+    // off a plausible date (the spread-argument divergence).
+    if args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+        || keywords.iter().any(|kw| kw.arg.is_none())
+    {
+        options.definition_warnings.borrow_mut().push(format!(
+            "{}() with a `*spread`/`**spread` argument is dropped; the \
+             construction lowers to now()/today()/zero (the spread's \
+             element types are dynamic, issue #130)",
+            name
+        ));
+        return Ok(Some(match name {
+            "datetime" => quote!(stdpython::datetime::datetime::now()),
+            "date" => quote!(stdpython::datetime::date::today()),
+            _ => quote!(stdpython::datetime::timedelta::new(
+                None, None, None, None, None, None, None
+            )),
+        }));
+    }
+    for kw in keywords {
+        // `tzinfo=` (e.g. `datetime(*date[:6],
+        // tzinfo=timezone.utc)` — pip's vendored
+        // cachecontrol) is dropped: rython's datetime is
+        // naive, so attaching a timezone is a no-op (the same
+        // model as the `replace(tzinfo=None)` tolerance).
+        if kw.arg.as_deref() == Some("tzinfo") {
+            options.definition_warnings.borrow_mut().push(
+                "datetime(...) `tzinfo=` keyword is dropped \
+                 (rython's datetime is naive)"
+                    .to_string(),
+            );
+            continue;
+        }
+        let idx = kw
+            .arg
+            .as_deref()
+            .and_then(|k| params.iter().position(|p| *p == k));
+        match idx {
+            Some(i) if slots[i].is_none() => slots[i] = Some(kw.value.clone()),
+            Some(i) => {
+                return Err(format!(
+                    "{}() got multiple values for argument '{}'",
+                    name, params[i]
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "{}() got an unexpected keyword argument '{}'",
+                    name,
+                    kw.arg.as_deref().unwrap_or("**kwargs")
+                )
+                .into());
+            }
+        }
+    }
+    let mut rendered = Vec::new();
+    for (i, slot) in slots.iter().enumerate() {
+        let tok = match slot {
+            Some(e) => {
+                let v = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                if i < required {
+                    v
+                } else {
+                    quote!(Some(#v))
+                }
+            }
+            None if i < required => {
+                return Err(format!(
+                    "{}() missing required argument: '{}'",
+                    name, params[i]
+                )
+                .into());
+            }
+            None => quote!(None),
+        };
+        rendered.push(tok);
+    }
+    let ident = crate::safe_ident(name);
+    let call = quote!(stdpython::datetime::#ident::new(#(#rendered),*));
+    // timedelta::new is infallible; date/datetime validate.
+    Ok(Some(if name == "timedelta" {
+        call
+    } else {
+        quote!(#call?)
+    }))
 }
 
 impl Call {
@@ -2254,151 +2406,50 @@ impl<'a> CodeGen for Call {
             }
         }
 
-        // datetime constructors imported via `from datetime import ...`:
-        // date/datetime/timedelta calls resolve their positional and
-        // keyword arguments against the Python signatures and lower to the
-        // runtime ::new constructors (Option-typed for the defaulted
-        // parameters). date/datetime validate and propagate with `?`.
-        if let ExprType::Name(n) = self.func.as_ref() {
-            let from_datetime = matches!(
-                symbols.get(&n.id),
-                Some(SymbolTableNode::ImportFrom(import))
-                    if import.module == "datetime"
-            );
-            if from_datetime && matches!(n.id.as_str(), "date" | "datetime" | "timedelta") {
-                let (params, required): (&[&str], usize) = match n.id.as_str() {
-                    "date" => (&["year", "month", "day"], 3),
-                    "datetime" => (
-                        &[
-                            "year",
-                            "month",
-                            "day",
-                            "hour",
-                            "minute",
-                            "second",
-                            "microsecond",
-                        ],
-                        3,
-                    ),
-                    _ => (
-                        &[
-                            "days",
-                            "seconds",
-                            "microseconds",
-                            "milliseconds",
-                            "minutes",
-                            "hours",
-                            "weeks",
-                        ],
-                        0,
-                    ),
-                };
-                if self.args.len() > params.len() {
-                    return Err(format!(
-                        "{}() takes at most {} arguments ({} given)",
-                        n.id,
-                        params.len(),
-                        self.args.len()
-                    )
-                    .into());
-                }
-                let mut slots: Vec<Option<crate::ExprType>> = vec![None; params.len()];
-                for (i, arg) in self.args.iter().enumerate() {
-                    slots[i] = Some(arg.clone());
-                }
-                // A `*spread` positional (`datetime(*date[:6],
-                // tzinfo=timezone.utc)` — pip's vendored cachecontrol
-                // heuristics): the spread's element types are dynamic (the
-                // spreaded value is a boxed PyValue), so the constructor
-                // cannot be statically decomposed. The whole construction
-                // is dropped and replaced with now() — the call site's
-                // surrounding logic (a cache-expiry heuristic) still works
-                // off a plausible date (the spread-argument divergence).
-                if self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
-                    || self
-                        .keywords
-                        .iter()
-                        .any(|kw| kw.arg.is_none())
-                {
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "{}() with a `*spread`/`**spread` argument is dropped; the \
-                         construction lowers to now()/today()/zero (the spread's \
-                         element types are dynamic, issue #130)",
-                        n.id
-                    ));
-                    return Ok(match n.id.as_str() {
-                        "datetime" => quote!(stdpython::datetime::datetime::now()),
-                        "date" => quote!(stdpython::datetime::date::today()),
-                        _ => quote!(stdpython::datetime::timedelta::new(
-                            None, None, None, None, None, None, None
-                        )),
-                    });
-                }
-                for kw in &self.keywords {
-                    // `tzinfo=` (e.g. `datetime(*date[:6],
-                    // tzinfo=timezone.utc)` — pip's vendored
-                    // cachecontrol) is dropped: rython's datetime is
-                    // naive, so attaching a timezone is a no-op (the same
-                    // model as the `replace(tzinfo=None)` tolerance).
-                    if kw.arg.as_deref() == Some("tzinfo") {
-                        options.definition_warnings.borrow_mut().push(
-                            "datetime(...) `tzinfo=` keyword is dropped \
-                             (rython's datetime is naive)"
-                                .to_string(),
-                        );
-                        continue;
-                    }
-                    let idx = kw
-                        .arg
-                        .as_deref()
-                        .and_then(|k| params.iter().position(|p| *p == k));
-                    match idx {
-                        Some(i) if slots[i].is_none() => slots[i] = Some(kw.value.clone()),
-                        Some(i) => {
-                            return Err(format!(
-                                "{}() got multiple values for argument '{}'",
-                                n.id, params[i]
-                            )
-                            .into());
-                        }
-                        None => {
-                            return Err(format!(
-                                "{}() got an unexpected keyword argument '{}'",
-                                n.id,
-                                kw.arg.as_deref().unwrap_or("**kwargs")
-                            )
-                            .into());
-                        }
-                    }
-                }
-                let mut rendered = Vec::new();
-                for (i, slot) in slots.iter().enumerate() {
-                    let tok = match slot {
-                        Some(e) => {
-                            let v =
-                                e.clone()
-                                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                            if i < required { v } else { quote!(Some(#v)) }
-                        }
-                        None if i < required => {
-                            return Err(format!(
-                                "{}() missing required argument: '{}'",
-                                n.id, params[i]
-                            )
-                            .into());
-                        }
-                        None => quote!(None),
-                    };
-                    rendered.push(tok);
-                }
-                let ty = crate::safe_ident(&n.id);
-                let call = quote!(#ty::new(#(#rendered),*));
-                // timedelta::new is infallible; date/datetime validate.
-                return Ok(if n.id == "timedelta" {
-                    call
+        // datetime constructors imported via `from datetime import ...`, or
+        // module-qualified (`datetime.date(...)` / `datetime.datetime(...)` /
+        // `datetime.timedelta(...)` — urllib3's connection module): calls
+        // resolve their positional and keyword arguments against the Python
+        // signatures and lower to the runtime ::new constructors
+        // (Option-typed for the defaulted parameters). date/datetime
+        // validate and propagate with `?`.
+        let datetime_name: Option<&str> = match self.func.as_ref() {
+            ExprType::Name(n) => {
+                let from_datetime = matches!(
+                    symbols.get(&n.id),
+                    Some(SymbolTableNode::ImportFrom(import))
+                        if import.module == "datetime"
+                );
+                if from_datetime {
+                    Some(n.id.as_str())
                 } else {
-                    quote!(#call?)
-                });
+                    None
+                }
+            }
+            ExprType::Attribute(a) => {
+                // `datetime.date(...)`: the receiver is the stdlib module,
+                // not shadowed by a user binding.
+                let is_datetime_module =
+                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "datetime")
+                        && !crate::module_name_shadowed("datetime", &symbols);
+                if is_datetime_module {
+                    Some(a.attr.as_str())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(name) = datetime_name {
+            if let Some(tokens) = render_datetime_ctor(
+                name,
+                &self.args,
+                &self.keywords,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )? {
+                return Ok(tokens);
             }
         }
 

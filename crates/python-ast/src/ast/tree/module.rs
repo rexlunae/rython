@@ -342,8 +342,61 @@ impl CodeGen for Module {
                 module_init_raw.push(s.clone());
             }
         }
+
+        // Module-level values assigned from NON-constant expressions that
+        // functions read are promoted to LazyLock statics (a `let` inside
+        // __module_init__ is invisible to functions — E0425). Constrained to
+        // a single top-level store (reassignment/conditional stores keep the
+        // __module_init__ lowering: a static would freeze the first value),
+        // a non-const value, and NOT a typing alias or the builtin-alias
+        // declaration shape.
+        let function_free_reads = module_function_free_reads(&self.raw.body);
+        let mut promoted_statics: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for s in &self.raw.body {
+            if let crate::StatementType::If(if_stmt) = &s.statement {
+                if Self::is_type_checking_test(&if_stmt.test) {
+                    continue;
+                }
+                let test_str = format!("{:?}", if_stmt.test);
+                if test_str.contains("__name__") && test_str.contains("__main__") {
+                    continue;
+                }
+            }
+            if let crate::StatementType::Assign(a) = &s.statement {
+                if crate::try_lru_cache_factory(a, Some(&options), &symbols).is_some() {
+                    continue;
+                }
+                if let [crate::ExprType::Name(_)] = a.targets.as_slice()
+                    && let crate::ExprType::Name(n) = &a.value
+                    && matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                    )
+                {
+                    continue;
+                }
+                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
+                    if module_assign_counts.get(&n.id) == Some(&1)
+                        && const_static_type(&a.value).is_none()
+                        && !is_type_alias_value(&a.value)
+                        // rust.bind / rust.c_bind declarations are
+                        // compile-time bindings, not runtime stores: the
+                        // Assign codegen handles them (issue #79 family).
+                        && !crate::is_rust_bind_call(&a.value)
+                        && function_free_reads.contains(&n.id)
+                    {
+                        promoted_statics.insert(n.id.clone());
+                    }
+                }
+            }
+        }
         let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols, &options);
         let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols, &options);
+        // Name reads of promoted statics render as `(*name).clone()` (name.rs);
+        // every scope rendered below (module init, __main__, functions) sees
+        // the set through the cloned options.
+        options.promoted_statics = std::rc::Rc::new(promoted_statics.clone());
 
         // Module-level code gets no per-function analysis pass, so run the
         // same type inference / empty-container pinning here: without it,
@@ -462,9 +515,51 @@ impl CodeGen for Module {
                     // Skip generating this if statement - we've processed its contents
                     continue;
                 }
-                // `if TYPE_CHECKING:` never runs at runtime: skip the whole
-                // block (imports, type-only classes).
+                // `if TYPE_CHECKING:` never runs at runtime — the whole
+                // block is skipped — EXCEPT its imports of REAL
+                // sibling-module names, which still emit `use` statements:
+                // annotations reference those names and find_symbols already
+                // registered the imports (requests/adapters.py imports
+                // PreparedRequest under TYPE_CHECKING and uses it in
+                // signatures; urllib3/util/connection.py imports
+                // BaseHTTPConnection the same way). typing /
+                // typing_extensions and external-module imports lower to
+                // nothing — their annotations resolve to the boxed PyValue.
                 if Self::is_type_checking_test(&if_stmt.test) {
+                    for body_stmt in &if_stmt.body {
+                        let render_import = match &body_stmt.statement {
+                            crate::StatementType::ImportFrom(i) => {
+                                let root = i.module.split('.').next().unwrap_or("");
+                                if matches!(root, "typing" | "typing_extensions") {
+                                    false
+                                } else if crate::ast::tree::import::is_stdpython_module(root) {
+                                    true
+                                } else {
+                                    // Only sibling-module imports whose
+                                    // names are actually GENERATED (not
+                                    // TYPE_CHECKING stubs) emit `use`s.
+                                    let path = i.resolved_module_path(&options);
+                                    i.names.iter().all(|a| {
+                                        crate::ast::tree::module::module_def_has_runtime_item(
+                                            &options,
+                                            &path,
+                                            &a.name,
+                                        )
+                                    })
+                                }
+                            }
+                            _ => false,
+                        };
+                        if render_import {
+                            let stmt_token = body_stmt
+                                .clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .map_err(|e| wrap_module_error(&module_filename, e))?;
+                            if !stmt_token.to_string().trim().is_empty() {
+                                stream.extend(stmt_token);
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -569,6 +664,59 @@ impl CodeGen for Module {
                 }
             }
 
+            // A module-level value that functions read (promoted_statics):
+            // emit a LazyLock static whose closure holds the initializer,
+            // and a TOUCH (`let _ = &*name;`) in __module_init__ at the
+            // store's position, so initialization still happens at import
+            // time, in order. Function reads deref the static automatically
+            // (LazyLock: Deref). A fallible initializer (rendered with a
+            // trailing `?`) unwraps inside the closure, panicking on
+            // failure — the import-time raise becomes an abort (divergence).
+            if let crate::StatementType::Assign(a) = &s.statement
+                && let [crate::ExprType::Name(n)] = a.targets.as_slice()
+                && promoted_statics.contains(&n.id)
+            {
+                let ident = crate::safe_ident(&n.id);
+                let rhs = a
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                let stripped = crate::ast::tree::call::strip_trailing_question(&rhs);
+                let is_fallible = stripped.to_string() != rhs.to_string();
+                let value_tokens = if is_fallible {
+                    quote!(match #stripped {
+                        Ok(__rython_v) => __rython_v,
+                        Err(__rython_e) => panic!(
+                            "module-level `{}` initialization failed: {}",
+                            stringify!(#ident),
+                            __rython_e
+                        ),
+                    })
+                } else {
+                    stripped
+                };
+                // The static's type: the codegen's inferred type when known,
+                // a few recognized stdlib constructors, else the boxed
+                // PyValue (the value model's dynamic fallback). Boxed values
+                // wrap in PyValue::from so the closure's type matches.
+                let (ty, wrapped) =
+                    match module_init_static_ty(&n.id, &a.value, &options) {
+                        Some(ty) => (ty, value_tokens),
+                        None => (
+                            quote!(stdpython::PyValue),
+                            quote!(stdpython::PyValue::from(#value_tokens)),
+                        ),
+                    };
+                stream.extend(quote! {
+                    pub static #ident: std::sync::LazyLock<#ty> =
+                        std::sync::LazyLock::new(|| #wrapped);
+                });
+                module_init_stmts.push(quote!(let _ = &*#ident;));
+                has_module_init_code = true;
+                continue;
+            }
+
             // Categorize statements into declarations vs executable code
             let is_declaration = Self::is_declaration_statement(&s.statement);
 
@@ -596,12 +744,20 @@ impl CodeGen for Module {
         }
 
         // Hoist assigned names to declarations at the top of each generated
-        // scope (assignments themselves lower to plain stores).
-        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols, &options);
+        // scope (assignments themselves lower to plain stores). Promoted
+        // LazyLock statics are excluded — they have no `let` in the body.
+        let init_decls = hoisted_declarations(
+            &module_init_raw,
+            &ctx,
+            &symbols,
+            &options,
+            &promoted_statics,
+        );
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
-        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols, &options);
+        let main_decls =
+            hoisted_declarations(&main_body_raw, &ctx, &symbols, &options, &Default::default());
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -1120,6 +1276,475 @@ fn count_module_stores(
 /// is a TYPE ALIAS consumed by annotation resolution, never a runtime value
 /// (`_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], ...]`,
 /// `_TYPE_BODY = typing.Union[...]` — urllib3).
+/// Names READ as free variables inside function bodies anywhere in the
+/// module (top-level and nested): every Name that appears in a function
+/// body and is not bound there (param, assignment target, def/class name,
+/// loop/with target, walrus target, comprehension target). Module-level
+/// values assigned from non-constant expressions are promoted to LazyLock
+/// statics when a function reads them — the old lowering hid the value
+/// inside __module_init__, where functions cannot see it (issue #137
+/// cluster: `log = logging.getLogger(...)` in urllib3 / charset_normalizer).
+fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::HashSet<String> {
+    use crate::StatementType as ST;
+    let mut all_names = std::collections::HashSet::new();
+    let mut bound = std::collections::HashSet::new();
+
+    // Collect every Name AND every bound target inside an expression. The
+    // free reads are all_names minus bound; a name that is both read and
+    // bound (a local, a def name) cancels out.
+    fn walk_expr(
+        expr: &crate::ExprType,
+        all: &mut std::collections::HashSet<String>,
+        bound: &mut std::collections::HashSet<String>,
+    ) {
+        match expr {
+            crate::ExprType::Name(n) => {
+                all.insert(n.id.clone());
+            }
+            crate::ExprType::Call(c) => {
+                walk_expr(&c.func, all, bound);
+                for a in &c.args {
+                    walk_expr(a, all, bound);
+                }
+                for kw in &c.keywords {
+                    walk_expr(&kw.value, all, bound);
+                }
+            }
+            crate::ExprType::BinOp(op) => {
+                walk_expr(&op.left, all, bound);
+                walk_expr(&op.right, all, bound);
+            }
+            crate::ExprType::BoolOp(op) => {
+                for v in &op.values {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::UnaryOp(op) => walk_expr(&op.operand, all, bound),
+            crate::ExprType::Compare(cmp) => {
+                walk_expr(&cmp.left, all, bound);
+                for c in &cmp.comparators {
+                    walk_expr(c, all, bound);
+                }
+            }
+            crate::ExprType::IfExp(e) => {
+                walk_expr(&e.test, all, bound);
+                walk_expr(&e.body, all, bound);
+                walk_expr(&e.orelse, all, bound);
+            }
+            crate::ExprType::NamedExpr(e) => {
+                bind_target(&e.left, bound);
+                walk_expr(&e.right, all, bound);
+            }
+            crate::ExprType::Dict(d) => {
+                for k in d.keys.iter().flatten() {
+                    walk_expr(k, all, bound);
+                }
+                for v in &d.values {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::Set(s) => {
+                for e in &s.elts {
+                    walk_expr(e, all, bound);
+                }
+            }
+            crate::ExprType::List(elts) => {
+                for e in elts {
+                    walk_expr(e, all, bound);
+                }
+            }
+            crate::ExprType::Tuple(t) => {
+                for e in &t.elts {
+                    walk_expr(e, all, bound);
+                }
+            }
+            crate::ExprType::Attribute(a) => walk_expr(&a.value, all, bound),
+            crate::ExprType::Subscript(sub) => {
+                walk_expr(&sub.value, all, bound);
+                match &sub.kind {
+                    crate::SubscriptKind::Index(i) => walk_expr(i, all, bound),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        for o in [lower, upper, step].into_iter().flatten() {
+                            walk_expr(o, all, bound);
+                        }
+                    }
+                }
+            }
+            crate::ExprType::Starred(s) => walk_expr(&s.value, all, bound),
+            crate::ExprType::Await(e) => walk_expr(&e.value, all, bound),
+            crate::ExprType::Yield(y) => {
+                if let Some(v) = &y.value {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::YieldFrom(y) => walk_expr(&y.value, all, bound),
+            crate::ExprType::FormattedValue(f) => walk_expr(&f.value, all, bound),
+            crate::ExprType::JoinedStr(j) => {
+                for v in &j.values {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::Lambda(l) => {
+                for p in &l.args.args {
+                    bound.insert(p.arg.clone());
+                }
+                for p in &l.args.posonlyargs {
+                    bound.insert(p.arg.clone());
+                }
+                for p in &l.args.kwonlyargs {
+                    bound.insert(p.arg.clone());
+                }
+                if let Some(p) = &l.args.vararg {
+                    bound.insert(p.arg.clone());
+                }
+                if let Some(p) = &l.args.kwarg {
+                    bound.insert(p.arg.clone());
+                }
+                walk_expr(&l.body, all, bound);
+            }
+            crate::ExprType::ListComp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.elt, all, bound);
+            }
+            crate::ExprType::SetComp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.elt, all, bound);
+            }
+            crate::ExprType::GeneratorExp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.elt, all, bound);
+            }
+            crate::ExprType::DictComp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.key, all, bound);
+                walk_expr(&c.value, all, bound);
+            }
+            _ => {}
+        }
+    }
+
+    // A Name/Tuple/Starred assignment target binds its Names.
+    fn bind_target(target: &crate::ExprType, bound: &mut std::collections::HashSet<String>) {
+        match target {
+            crate::ExprType::Name(n) => {
+                bound.insert(n.id.clone());
+            }
+            crate::ExprType::Tuple(t) => {
+                for e in &t.elts {
+                    bind_target(e, bound);
+                }
+            }
+            crate::ExprType::Starred(s) => bind_target(&s.value, bound),
+            _ => {}
+        }
+    }
+
+    fn param_names(args: &crate::Arguments, bound: &mut std::collections::HashSet<String>) {
+        for p in args.posonlyargs.iter().chain(args.args.iter()).chain(args.kwonlyargs.iter()) {
+            bound.insert(p.arg.clone());
+        }
+        if let Some(p) = &args.vararg {
+            bound.insert(p.arg.clone());
+        }
+        if let Some(p) = &args.kwarg {
+            bound.insert(p.arg.clone());
+        }
+    }
+
+    fn walk_stmt(
+        stmt: &crate::Statement,
+        all: &mut std::collections::HashSet<String>,
+        bound: &mut std::collections::HashSet<String>,
+    ) {
+        match &stmt.statement {
+            ST::Assign(a) => {
+                for t in &a.targets {
+                    bind_target(t, bound);
+                }
+                if let Some(ann) = &a.annotation {
+                    walk_expr(ann, all, bound);
+                }
+                walk_expr(&a.value, all, bound);
+            }
+            ST::AugAssign(a) => {
+                bind_target(&a.target, bound);
+                walk_expr(&a.target, all, bound);
+                walk_expr(&a.value, all, bound);
+            }
+            ST::AnnotatedName { name, annotation } => {
+                bound.insert(name.clone());
+                walk_expr(annotation, all, bound);
+            }
+            ST::For(f) => {
+                bind_target(&f.target, bound);
+                walk_expr(&f.iter, all, bound);
+                for s in f.body.iter().chain(f.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::AsyncFor(f) => {
+                bind_target(&f.target, bound);
+                walk_expr(&f.iter, all, bound);
+                for s in f.body.iter().chain(f.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::While(w) => {
+                walk_expr(&w.test, all, bound);
+                for s in w.body.iter().chain(w.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::If(i) => {
+                walk_expr(&i.test, all, bound);
+                for s in i.body.iter().chain(i.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::With(w) => {
+                for item in &w.items {
+                    walk_expr(&item.context_expr, all, bound);
+                    if let Some(v) = &item.optional_vars {
+                        bind_target(v, bound);
+                    }
+                }
+                for s in &w.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::AsyncWith(w) => {
+                for item in &w.items {
+                    walk_expr(&item.context_expr, all, bound);
+                    if let Some(v) = &item.optional_vars {
+                        bind_target(v, bound);
+                    }
+                }
+                for s in &w.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::Try(t) => {
+                for s in &t.body {
+                    walk_stmt(s, all, bound);
+                }
+                for h in &t.handlers {
+                    if let Some(e) = &h.exception_type {
+                        walk_expr(e, all, bound);
+                    }
+                    if let Some(n) = &h.name {
+                        bound.insert(n.clone());
+                    }
+                    for s in &h.body {
+                        walk_stmt(s, all, bound);
+                    }
+                }
+                for s in t.orelse.iter().chain(t.finalbody.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                bound.insert(f.name.clone());
+                param_names(&f.args, bound);
+                for s in &f.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::ClassDef(c) => {
+                bound.insert(c.name.clone());
+                // Class METHOD bodies read module values; the class body's
+                // own assignments bind class attrs (method reads of a bare
+                // name resolve to module scope in Python, but over-binding
+                // only skips a promotion — never mis-promotes).
+                for s in &c.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::Expr(e) => walk_expr(&e.value, all, bound),
+            ST::Return(Some(e)) => walk_expr(&e.value, all, bound),
+            ST::Call(c) => walk_expr(
+                &crate::ExprType::Call(c.clone()),
+                all,
+                bound,
+            ),
+            ST::Assert { test, msg, .. } => {
+                walk_expr(test, all, bound);
+                if let Some(m) = msg {
+                    walk_expr(m, all, bound);
+                }
+            }
+            ST::Raise(r) => {
+                if let Some(e) = &r.exc {
+                    walk_expr(e, all, bound);
+                }
+                if let Some(c) = &r.cause {
+                    walk_expr(c, all, bound);
+                }
+            }
+            ST::Delete(targets) => {
+                for t in targets {
+                    walk_expr(t, all, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for s in body {
+        match &s.statement {
+            // Function bodies (top-level or nested under module-level
+            // control flow) and class METHOD bodies read module values;
+            // walk_stmt recurses through If/While/For/With/Try and through
+            // class bodies, binding each scope's own names along the way.
+            ST::FunctionDef(_) | ST::AsyncFunctionDef(_) | ST::ClassDef(_) => {
+                walk_stmt(s, &mut all_names, &mut bound);
+            }
+            ST::If(i) => {
+                // `if TYPE_CHECKING:` is compile-time-only (type imports,
+                // stub classes); its bodies never run, so their reads are
+                // not function reads.
+                let is_type_checking = matches!(
+                    &i.test,
+                    crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                ) || matches!(
+                    &i.test,
+                    crate::ExprType::Attribute(a) if a.attr == "TYPE_CHECKING"
+                );
+                if !is_type_checking {
+                    walk_stmt(s, &mut all_names, &mut bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    all_names
+        .difference(&bound)
+        .cloned()
+        .collect()
+}
+
+/// Does `name` have a runtime item in the module at `path` — i.e. is it
+/// GENERATED, not a TYPE_CHECKING-only stub (`if TYPE_CHECKING: class
+/// BaseHTTPConnection(Protocol)` — urllib3's _base_connection)? TYPE_CHECKING
+/// imports of such names must NOT emit `use` statements (the item does not
+/// exist in the generated crate), and annotations referencing them resolve
+/// to the boxed PyValue instead of a bare struct name (type_ctx.rs).
+pub(crate) fn module_def_has_runtime_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    fn scan(body: &[crate::Statement], name: &str, in_type_checking: bool) -> bool {
+        use crate::StatementType as ST;
+        for s in body {
+            match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                    if !in_type_checking && f.name == name {
+                        return true;
+                    }
+                }
+                ST::ClassDef(c) => {
+                    if !in_type_checking && c.name == name {
+                        return true;
+                    }
+                }
+                ST::Assign(a) => {
+                    if !in_type_checking
+                        && a.targets.iter().any(|t| {
+                            matches!(t, crate::ExprType::Name(n) if n.id == name)
+                        })
+                    {
+                        return true;
+                    }
+                }
+                ST::If(i) => {
+                    // `if TYPE_CHECKING:` (bare) or `if typing.TYPE_CHECKING:`
+                    // (attribute) marks a compile-time-only block.
+                    let tc = in_type_checking
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                        )
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Attribute(a)
+                                if a.attr == "TYPE_CHECKING"
+                                    && matches!(
+                                        a.value.as_ref(),
+                                        crate::ExprType::Name(m) if m.id == "typing"
+                                    )
+                        );
+                    if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
+                        return true;
+                    }
+                }
+                ST::While(w) => {
+                    if scan(&w.body, name, in_type_checking)
+                        || scan(&w.orelse, name, in_type_checking)
+                    {
+                        return true;
+                    }
+                }
+                ST::For(f) => {
+                    if scan(&f.body, name, in_type_checking)
+                        || scan(&f.orelse, name, in_type_checking)
+                    {
+                        return true;
+                    }
+                }
+                ST::With(w) => {
+                    if scan(&w.body, name, in_type_checking) {
+                        return true;
+                    }
+                }
+                ST::Try(t) => {
+                    for part in [&t.body, &t.orelse, &t.finalbody] {
+                        if scan(part, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                    for h in &t.handlers {
+                        if scan(&h.body, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    scan(&module.raw.body, name, false)
+}
+
 fn is_type_alias_value(value: &crate::ExprType) -> bool {
     match value {
         crate::ExprType::Subscript(sub) => match sub.value.as_ref() {
@@ -1164,6 +1789,32 @@ fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {    match 
     }
 }
 
+/// The Rust type for a promoted module-level static: the codegen's inferred
+/// type when it has one (`options.name_types`), else a few recognized
+/// stdlib constructors (`datetime.date(...)` — urllib3's RECENT_DATE), else
+/// None (the caller boxes the value into PyValue).
+fn module_init_static_ty(
+    name: &str,
+    value: &crate::ExprType,
+    options: &crate::PythonOptions,
+) -> Option<TokenStream> {
+    if let Some(t) = options.name_types.get(name) {
+        return Some(t.to_rust_type());
+    }
+    if let crate::ExprType::Call(c) = value
+        && let crate::ExprType::Attribute(a) = c.func.as_ref()
+        && let crate::ExprType::Name(n) = a.value.as_ref()
+    {
+        match (n.id.as_str(), a.attr.as_str()) {
+            ("datetime", "date") => return Some(quote!(stdpython::datetime::date)),
+            ("datetime", "datetime") => return Some(quote!(stdpython::datetime::datetime)),
+            ("datetime", "timedelta") => return Some(quote!(stdpython::datetime::timedelta)),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Declarations for every name assigned in a statement list, so
 /// nested-block assignments store into scope-level variables instead of
 /// creating shadowing bindings. Scope analysis decides which need `mut`.
@@ -1196,6 +1847,7 @@ fn hoisted_declarations(
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
+    skip: &std::collections::HashSet<String>,
 ) -> TokenStream {
     // Class-aware mutation facts need the block's own assignments in the
     // symbol table (`c = Counter(...)` then `c.bump()` needs `c` mutable).
@@ -1211,6 +1863,10 @@ fn hoisted_declarations(
         // assignment lowers to nothing, so there is no runtime binding to
         // hoist — declaring one would be a dead variable.
         if matches!(symbols.get(name), Some(SymbolTableNode::RustBinding(_))) {
+            continue;
+        }
+        // Promoted LazyLock statics have no `let` binding in the init body.
+        if skip.contains(name) {
             continue;
         }
         let ident = crate::safe_ident(name);

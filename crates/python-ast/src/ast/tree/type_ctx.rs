@@ -1670,9 +1670,22 @@ fn resolve_alias_typeinfo_inner(
                         resolve_alias_typeinfo(value, &syms, options)
                     }
                     // An imported class (`from urllib3.util.retry import
-                    // Retry`): the struct ident.
+                    // Retry`): the struct ident. A class that is only a
+                    // TYPE_CHECKING stub in its own module (`if TYPE_CHECKING:
+                    // class BaseHTTPConnection(Protocol)` — urllib3's
+                    // _base_connection) is never generated: the annotation
+                    // resolves to the boxed PyValue instead of a bare name
+                    // that would not exist in the crate.
                     Some(SymbolTableNode::ClassDef(_)) => {
-                        Some(TypeInfo::Class(n.id.clone()))
+                        if crate::ast::tree::module::module_def_has_runtime_item(
+                            options,
+                            &path,
+                            &n.id,
+                        ) {
+                            Some(TypeInfo::Class(n.id.clone()))
+                        } else {
+                            Some(TypeInfo::PyValue)
+                        }
                     }
                     // A RE-EXPORT (`from .connection import ProxyConfig`
                     // where connection.py does `from ._base_connection

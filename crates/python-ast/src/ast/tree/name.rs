@@ -136,6 +136,12 @@ impl CodeGen for Name {
                     _ => quote!((#name).clone().unwrap()),
                 });
             }
+            // A module-level value promoted to a LazyLock static (module.rs):
+            // a static does not auto-deref in value/borrow position (only as
+            // a method receiver), so every READ clones the deref'd value.
+            if options.promoted_statics.contains(&self.id) {
+                return Ok(quote!((*#name).clone()));
+            }
             Ok(quote!(#name))
         }
     }

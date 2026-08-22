@@ -46,9 +46,9 @@ use std::collections::{HashMap, HashSet};
 use hashbrown::{HashMap, HashSet};
 
 #[cfg(feature = "std")]
-use std::rc::Rc;
+use std::sync::Arc;
 #[cfg(all(feature = "alloc", not(feature = "std")))]
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
@@ -2281,7 +2281,7 @@ pub enum PyValue {
     Bool(bool),
     Str(String),
     Bytes(Vec<u8>),
-    Tuple(Rc<Vec<PyValue>>),
+    Tuple(Arc<Vec<PyValue>>),
     None_,
 }
 
