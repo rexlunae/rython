@@ -571,7 +571,23 @@ impl CodeGen for StatementType {
                 }
             }
             StatementType::Pass => Ok(quote! {}),
-            StatementType::FunctionDef(s) => s.to_rust(ctx, options, symbols),
+            StatementType::FunctionDef(s) => {
+                if ctx.is_function_body() {
+                    // A NESTED function definition (a closure in Python):
+                    // rython's closures do not capture the enclosing
+                    // function's scope (the closure-capture divergence), so
+                    // the definition is a no-op — calls through the name
+                    // drop (function_def.rs adds it to called_params).
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "nested function `{}` is dropped: rython's closures do not \
+                         capture the enclosing scope (the closure-capture divergence)",
+                        s.name
+                    ));
+                    Ok(TokenStream::new())
+                } else {
+                    s.to_rust(ctx, options, symbols)
+                }
+            }
             StatementType::Import(s) => s.to_rust(ctx, options, symbols),
             StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols),
             StatementType::Expr(s) => s.to_rust(ctx, options, symbols),

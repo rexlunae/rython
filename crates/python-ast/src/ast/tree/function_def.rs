@@ -1162,7 +1162,7 @@ impl FunctionDef {
             })
             .map(|p| p.arg.clone())
             .collect();
-        let inferred_signature = {
+        let mut inferred_signature = {
             // @classmethod/@staticmethod are associated functions (no
             // receiver, class ref dropped) — NOT methods, so unannotated
             // parameters are inferred like free functions (issue #117).
@@ -1280,6 +1280,14 @@ impl FunctionDef {
             std::rc::Rc::new(inferred_signature.method_params.clone());
         options.duck_methods_on_params =
             std::rc::Rc::new(inferred_signature.duck_methods_on_params.clone());
+        // A nested function name (`def KD(s, d)` inside __init__ —
+        // requests' auth) is a CLOSURE in Python; rython's closures do not
+        // capture the enclosing scope, so the definition drops (statement.rs)
+        // and CALLS through the name drop too — add the names to
+        // called_params so the call sites lower as no-ops.
+        for nested in crate::nested_function_names(&self.body) {
+            inferred_signature.called_params.insert(nested);
+        }
         options.called_params =
             std::rc::Rc::new(inferred_signature.called_params.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
@@ -1756,9 +1764,54 @@ fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>
     }
 }
 
+/// The names of NESTED function definitions inside a statement list
+/// (recursing through control-flow bodies but not into nested defs/classes).
+/// These are CLOSURES in Python; rython's closures do not capture the
+/// enclosing scope (the closure-capture divergence), so the definitions
+/// drop (statement.rs) and calls through the names drop too.
+pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
+    use crate::StatementType as ST;
+    fn scan(stmts: &[crate::Statement], out: &mut Vec<String>) {
+        for s in stmts {
+            match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => out.push(f.name.clone()),
+                ST::If(i) => {
+                    scan(&i.body, out);
+                    scan(&i.orelse, out);
+                }
+                ST::While(w) => {
+                    scan(&w.body, out);
+                    scan(&w.orelse, out);
+                }
+                ST::For(f) => {
+                    scan(&f.body, out);
+                    scan(&f.orelse, out);
+                }
+                ST::AsyncFor(f) => {
+                    scan(&f.body, out);
+                    scan(&f.orelse, out);
+                }
+                ST::With(w) => scan(&w.body, out),
+                ST::AsyncWith(w) => scan(&w.body, out),
+                ST::Try(t) => {
+                    scan(&t.body, out);
+                    scan(&t.orelse, out);
+                    scan(&t.finalbody, out);
+                    for h in &t.handlers {
+                        scan(&h.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    scan(body, &mut out);
+    out
+}
+
 /// Map an expression to an obviously-inferable Rust type, if any.
-pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
-    match expr {
+pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
