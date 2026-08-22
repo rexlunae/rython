@@ -712,6 +712,15 @@ fn walk_expr(expr: &ExprType, a: &mut Analysis<'_>) {
             walk_expr(&e.orelse, a);
         }
         ExprType::NamedExpr(e) => {
+            // The walrus target binds in the ENCLOSING scope (Python
+            // semantics): `if (x := f()) is not None:` reads x in the body.
+            // Record it as a store so it hoists to the function's
+            // declarations and the walrus renders as a store into the
+            // hoisted binding (issue #137 cluster — urllib3's http2
+            // `if data_to_send := conn.data_to_send():`).
+            if let ExprType::Name(n) = e.left.as_ref() {
+                a.record_store(&n.id, false);
+            }
             walk_expr(&e.left, a);
             walk_expr(&e.right, a);
         }

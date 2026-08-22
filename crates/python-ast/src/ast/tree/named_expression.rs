@@ -39,12 +39,29 @@ impl CodeGen for NamedExpr {
         // `(x := value)` — the walrus: bind the target, then evaluate to
         // it, as a block so the assignment is legal in expression
         // position (`if (seek := getattr(...)) is not None:`).
+        //
+        // When the target is HOISTED (a function/module scope recorded it
+        // as a store — scope.rs), the walrus renders as a STORE into the
+        // hoisted binding so the value stays visible to the enclosing
+        // scope (`if data_to_send := conn.data_to_send():` reads
+        // data_to_send in the if body — urllib3's http2). In a scope that
+        // did not hoist it, the old block-let form is kept (a local).
         let target = self
             .left
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // Hoisted check uses the PLAIN python name (the rendered form may
+        // be keyword-escaped, e.g. `r#match`).
+        let hoisted = match self.left.as_ref() {
+            ExprType::Name(n) => options.hoisted_names.contains(&n.id),
+            _ => false,
+        };
         let right = self.right.clone().to_rust(ctx, options, symbols)?;
-        Ok(quote!({ let #target = #right; #target }))
+        Ok(if hoisted {
+            quote!({ #target = #right; #target })
+        } else {
+            quote!({ let #target = #right; #target })
+        })
     }
 }
 
