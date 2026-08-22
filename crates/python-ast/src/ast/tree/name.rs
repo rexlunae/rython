@@ -142,6 +142,19 @@ impl CodeGen for Name {
             if options.promoted_statics.contains(&self.id) {
                 return Ok(quote!((*#name).clone()));
             }
+            // A CALLABLE name read as a VALUE (`hash_utf8 = sha256_utf8` —
+            // requests' auth, where sha256_utf8 is a dropped nested
+            // function): the callable-as-value divergence — the read lowers
+            // to the boxed None.
+            if options.value_callables.contains(&self.id)
+            {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "callable `{}` read as a value lowers to the boxed None \
+                     (the callable-as-value divergence, issue #122)",
+                    self.id
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             Ok(quote!(#name))
         }
     }

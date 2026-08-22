@@ -331,6 +331,11 @@ pub struct PythonOptions {
     /// Name reads of these render as `(*name).clone()` — a static does not
     /// auto-deref in value/borrow position, only as a method receiver.
     pub promoted_statics: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Callable names whose VALUE reads box to the boxed None: dropped
+    /// nested functions (`hash_utf8 = sha256_utf8` — requests' auth) and
+    /// `type`-annotated callable parameters. Distinct from `called_params`
+    /// (loop elements there only DROP calls, their value reads stay real).
+    pub value_callables: std::rc::Rc<std::collections::HashSet<String>>,
     /// Locals in the current function whose only known type is a string
     /// literal (`label = "fine"`), so they lower to `&'static str`. A
     /// `-> str` function returning one must own the string (`to_string`)
@@ -432,6 +437,7 @@ impl Default for PythonOptions {
             hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
             promoted_statics: std::rc::Rc::new(std::collections::HashSet::new()),
+            value_callables: std::rc::Rc::new(std::collections::HashSet::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),

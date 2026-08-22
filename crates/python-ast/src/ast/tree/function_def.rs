@@ -1284,10 +1284,31 @@ impl FunctionDef {
         // requests' auth) is a CLOSURE in Python; rython's closures do not
         // capture the enclosing scope, so the definition drops (statement.rs)
         // and CALLS through the name drop too — add the names to
-        // called_params so the call sites lower as no-ops.
+        // called_params so the call sites lower as no-ops. Their VALUE
+        // reads (`hash_utf8 = sha256_utf8`) box to the boxed None
+        // (value_callables).
+        let mut value_callables = std::collections::HashSet::new();
         for nested in crate::nested_function_names(&self.body) {
-            inferred_signature.called_params.insert(nested);
+            inferred_signature.called_params.insert(nested.clone());
+            value_callables.insert(nested);
         }
+        // A `type`-annotated callable parameter is the same: calls drop
+        // (called_params) and value reads box.
+        for p in self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+        {
+            if p.annotation
+                .as_deref()
+                .is_some_and(crate::ast::tree::arguments::is_type_annotation)
+            {
+                value_callables.insert(p.arg.clone());
+            }
+        }
+        options.value_callables = std::rc::Rc::new(value_callables);
         options.called_params =
             std::rc::Rc::new(inferred_signature.called_params.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
