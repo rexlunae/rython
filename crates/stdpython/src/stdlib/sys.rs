@@ -137,6 +137,19 @@ where
 }
 
 python_function! {
+    /// sys.exc_info(): the active exception as (type, value, traceback).
+    /// rython's exceptions are string-tagged PyException values with no
+    /// traceback object — the tuple lowers to a boxed value whose members
+    /// are None (the traceback divergence).
+    pub fn exc_info() -> crate::PyValue
+    [signature: ()]
+    [concrete_types: () -> crate::PyValue]
+    {
+        crate::PyValue::None_
+    }
+}
+
+python_function! {
     /// sys.platform - platform identifier
     pub fn platform() -> &'static str
     [signature: ()]
