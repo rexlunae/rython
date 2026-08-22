@@ -1466,6 +1466,7 @@ impl<'a> CodeGen for Call {
         // sibling-module imports are untouched.
         if let ExprType::Name(n) = self.func.as_ref()
             && !crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+            && !crate::ast::tree::import::import_from_python_module(&n.id, &symbols, &options)
             && (crate::ast::tree::attribute::external_module_root(
                 &ExprType::Name(crate::ast::tree::name::Name {
                     id: n.id.clone(),

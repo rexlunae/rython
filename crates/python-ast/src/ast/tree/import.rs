@@ -48,6 +48,21 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
 /// re-export chain ending in `from urllib.parse import urlparse` — requests'
 /// compat, where urllib is external): no runtime item exists behind the
 /// chain, so the use drops.
+/// Whether a name is imported (directly or through a chain) from a
+/// vendored `[python-modules]` dependency — such names are NOT external
+/// (the dep is compiled into the crate).
+pub(crate) fn import_from_python_module(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let Some(SymbolTableNode::ImportFrom(ifm)) = symbols.get(name) else {
+        return false;
+    };
+    let root = ifm.module.split('.').next().unwrap_or("");
+    options.python_modules.contains(root)
+}
+
 pub(crate) fn resolves_to_external_import(
     name: &str,
     options: &PythonOptions,
@@ -60,15 +75,30 @@ pub(crate) fn resolves_to_external_import(
     }
     let mut current = name.to_string();
     let mut syms = symbols.clone();
+    // The package path of the CURRENT module in the chain, so its RELATIVE
+    // imports resolve against the right context (resolve_imported_class's
+    // model): options.module_path for the caller, then the defining
+    // module's package path at each hop.
+    let mut module_path = options.module_path.clone();
     for _ in 0..16 {
         match syms.get(&current) {
             Some(SymbolTableNode::Alias(canonical)) => {
                 current = canonical.clone();
             }
             Some(SymbolTableNode::ImportFrom(ifm)) => {
-                let path = ifm.resolved_module_path(options);
+                let mut ctx = options.clone();
+                ctx.module_path = module_path.clone();
+                let path = ifm.resolved_module_path(&ctx);
                 if options.module_defs.contains_key(&path) {
                     // A re-export chain: hop into the defining module.
+                    let is_package = options.module_defs.keys().any(|k| {
+                        k.len() > path.len() && k[..path.len()] == path[..]
+                    });
+                    module_path = if is_package {
+                        path.clone()
+                    } else {
+                        path[..path.len().saturating_sub(1)].to_vec()
+                    };
                     let defining = ifm
                         .names
                         .iter()
@@ -81,8 +111,10 @@ pub(crate) fn resolves_to_external_import(
                     current = defining;
                 } else {
                     // The terminal hop: external when the module is neither
-                    // stdpython nor generated.
-                    return !is_stdpython_module(ifm.module.split('.').next().unwrap_or(""));
+                    // stdpython nor a vendored python-module dep.
+                    let root = ifm.module.split('.').next().unwrap_or("");
+                    return !is_stdpython_module(root)
+                        && !options.python_modules.contains(root);
                 }
             }
             _ => return false,
