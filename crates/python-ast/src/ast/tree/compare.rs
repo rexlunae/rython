@@ -225,6 +225,30 @@ impl CodeGen for Compare {
                         }
                         continue;
                     }
+                    // `x is SomeClass` / `x is not SomeClass`
+                    // (`self.ConnectionCls is DummyConnection` — urllib3's
+                    // connectionpool): classes cannot be runtime values (the
+                    // classes-as-values divergence) — the identity check is
+                    // statically false/true.
+                    let class_operand = if crate::is_class_value_expr(comparator_ast, &symbols) {
+                        Some(left_ast)
+                    } else if crate::is_class_value_expr(left_ast, &symbols) {
+                        Some(comparator_ast)
+                    } else {
+                        None
+                    };
+                    if class_operand.is_some() {
+                        let tokens = match op {
+                            Compares::Is => quote!(false),
+                            _ => quote!(true),
+                        };
+                        index += 1;
+                        outer_ts.extend(tokens);
+                        if index < ops.len() {
+                            outer_ts.extend(quote!( && ));
+                        }
+                        continue;
+                    }
                 }
             }
             let comparator = comparator_ast
