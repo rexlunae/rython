@@ -1269,6 +1269,48 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // Calls into an EXTERNAL module (`ssl.SSLContext(...)`,
+        // `socket.socket(...)`, `logging.getLogger(...)` — stdlib rython
+        // does not model, or a non-vendored dependency) lower to the boxed
+        // None with a warning (documented divergence: the module has no
+        // runtime in the generated crate). Calls into generated sibling
+        // modules and stdpython are untouched.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let Some(root) =
+                crate::ast::tree::attribute::external_module_root(&attr.value, &symbols, &options)
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "`{}.{}(...)` is dropped: the module `{}` is external to the generated \
+                 crate (external-module divergence)",
+                root, attr.attr, root
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+        // A name imported from an external module via `from X import name`
+        // (`from logging import getLogger`, `from zlib import ...`): the
+        // call drops the same way. Exception-class names and stdpython /
+        // sibling-module imports are untouched.
+        if let ExprType::Name(n) = self.func.as_ref()
+            && let Some(crate::SymbolTableNode::ImportFrom(ifm)) = symbols.get(&n.id)
+            && ifm.level == 0
+            && !crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+            && crate::ast::tree::attribute::external_module_root(
+                &ExprType::Name(crate::ast::tree::name::Name {
+                    id: n.id.clone(),
+                }),
+                &symbols,
+                &options,
+            )
+            .is_some()
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "`{}(...)` is dropped: `{}` is imported from `{}`, which is external to \
+                 the generated crate (external-module divergence)",
+                n.id, n.id, ifm.module
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+
         // The I/O builtins have no no_std lowering (stdpython gates them
         // behind std): fail at conversion time with the reason, rather than
         // let the generated crate fail with a bare unresolved-name error. A

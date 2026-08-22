@@ -240,24 +240,55 @@ impl CodeGen for Import {
                     }
                 }
                 _ => {
-                    // Handle other imports normally
-                    let names = if alias.name.contains('.') {
-                        let parts: Vec<&str> = alias.name.split('.').collect();
-                        let idents: Vec<_> =
-                            parts.iter().map(|part| crate::safe_ident(part)).collect();
-                        quote!(#(#idents)::*)
+                    // A sibling module of the generated crate resolves via
+                    // `use crate::...`; an EXTERNAL module (stdlib rython
+                    // does not model — ssl, socket, logging, http, typing,
+                    // codecs, types, ... — or a third-party dep that is not
+                    // vendored) has no generated item, so the import lowers
+                    // to nothing with a warning (documented divergence:
+                    // the module's runtime functionality is unavailable;
+                    // uses of its names become loud errors or boxed drops).
+                    let path: Vec<String> =
+                        alias.name.split('.').map(|s| s.to_string()).collect();
+                    let is_sibling = options
+                        .module_defs
+                        .contains_key(&path)
+                        || options.python_modules.contains(
+                            &path.first().cloned().unwrap_or_default(),
+                        )
+                        // Single-module conversions only know the module
+                        // itself (module_defs.len() == 1): assume any other
+                        // non-stdpython import is a crate sibling (the
+                        // module_defs check is authoritative only when the
+                        // whole crate is known).
+                        || options.module_defs.len() <= 1;
+                    if !is_sibling {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "import `{}` is dropped: the module is not part of the \
+                             generated crate nor the stdpython runtime \
+                             (external-module divergence)",
+                            alias.name
+                        ));
+                        quote! {}
                     } else {
-                        let single_name = crate::safe_ident(&alias.name);
-                        quote!(#single_name)
-                    };
+                        let names = if alias.name.contains('.') {
+                            let parts: Vec<&str> = alias.name.split('.').collect();
+                            let idents: Vec<_> =
+                                parts.iter().map(|part| crate::safe_ident(part)).collect();
+                            quote!(#(#idents)::*)
+                        } else {
+                            let single_name = crate::safe_ident(&alias.name);
+                            quote!(#single_name)
+                        };
 
-                    match &alias.asname {
-                        None => {
-                            quote! {use #names;}
-                        }
-                        Some(n) => {
-                            let name = crate::safe_ident(n);
-                            quote! {use #names as #name;}
+                        match &alias.asname {
+                            None => {
+                                quote! {use crate::#names;}
+                            }
+                            Some(n) => {
+                                let name = crate::safe_ident(n);
+                                quote! {use crate::#names as #name;}
+                            }
                         }
                     }
                 }
@@ -513,6 +544,37 @@ impl CodeGen for ImportFrom {
         } else {
             quote!(crate)
         };
+
+        // An EXTERNAL module (stdlib rython does not model — logging, ssl,
+        // socket, http, codecs, types, importlib, ... — or a non-vendored
+        // dependency) has no generated items: the import lowers to nothing
+        // with a warning (documented divergence). Its names still resolve in
+        // the symbol table, so annotations map them to the boxed PyValue and
+        // runtime calls drop. `collections.abc` is the typing-abstraction
+        // submodule (Mapping, Iterable, ...): also compile-time-only.
+        // Relative imports always target sibling modules of the crate.
+        let resolved_path = self.resolved_module_path(&options);
+        let first_part = parts.first().copied();
+        // The external check is only meaningful when the whole crate is
+        // known (multi-module conversions populate module_defs): a
+        // single-module conversion (len == 1) only knows the module itself,
+        // so any absolute non-stdpython import is assumed to be a crate
+        // sibling (`from helpers import util`).
+        let external = self.level == 0
+            && options.module_defs.len() > 1
+            && !matches!(first_part, Some(p) if is_stdpython_module(p))
+            && !options.module_defs.contains_key(&resolved_path)
+            && !options
+                .python_modules
+                .contains(&first_part.unwrap_or("").to_string());
+        if external || self.module == "collections.abc" {            options.definition_warnings.borrow_mut().push(format!(
+                "`from {} import ...` is dropped: the module is not part of the \
+                 generated crate nor the stdpython runtime \
+                 (external-module divergence)",
+                self.module
+            ));
+            return Ok(TokenStream::new());
+        }
 
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {

@@ -102,6 +102,11 @@ impl<'a> CodeGen for Attribute {
         // chain (`textlib.core.double`) must NOT be re-prefixed. Checked
         // before `self.value` is moved.
         let single_segment_chain = matches!(self.value.as_ref(), ExprType::Name(_));
+        // An EXTERNAL module root (ssl, socket, zlib, logging, ...) — no
+        // generated items exist, so the attribute lowers to the boxed None
+        // (computed before `self.value`/`symbols` are moved below).
+        let external_root = external_module_root(&self.value, &symbols, &options);
+        let warnings = options.definition_warnings.clone();
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
@@ -132,6 +137,18 @@ impl<'a> CodeGen for Attribute {
             ) || module_chain);
 
         if is_module_access {
+            // An EXTERNAL module (ssl, socket, zlib, logging, ...) has no
+            // generated items: the attribute read lowers to the boxed None
+            // with a warning (documented divergence — the external object's
+            // attribute is unmodeled, the same model getattr uses).
+            if let Some(root) = &external_root {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the module `{}` is external to the generated \
+                     crate (external-module divergence)",
+                    root, self.attr, root
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             // Use :: for module access (Python's sys.executable becomes sys::executable)
             // Special handling for LazyLock static variables that need
             // dereferencing. os::environ is NOT here: it is a live-view
@@ -436,4 +453,63 @@ pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes)
         ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols),
         _ => false,
     }
+}
+
+/// The root name of a module-path chain whose module is EXTERNAL — stdlib
+/// rython does not model (ssl, socket, logging, http, zlib, threading,
+/// codecs, ...) or a non-vendored dependency (socks) — resolved through the
+/// symbol table to its module path and checked against the generated crate.
+/// None when the chain is not a module path, is shadowed, or the module is
+/// part of the crate / stdpython / a vendored dependency. Only meaningful
+/// when the whole crate is known (multi-module conversion); single-module
+/// conversions return None (any import may be a sibling).
+pub(crate) fn external_module_root(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<String> {
+    // Only meaningful when the whole crate is known (multi-module
+    // conversion); a single-module conversion (len == 1) only knows the
+    // module itself, so any import may be a sibling.
+    if options.module_defs.len() <= 1 {
+        return None;
+    }
+    let root = match expr {
+        ExprType::Name(n) => n.id.clone(),
+        ExprType::Attribute(a) => return external_module_root(&a.value, symbols, options),
+        _ => return None,
+    };
+    if crate::module_name_shadowed(&root, symbols) {
+        return None;
+    }
+    let module_path: Option<Vec<String>> = match symbols.get(&root) {
+        Some(SymbolTableNode::Import(im)) => im
+            .names
+            .first()
+            .map(|al| al.name.split('.').map(|s| s.to_string()).collect()),
+        Some(SymbolTableNode::Alias(canonical)) => match symbols.get(canonical) {
+            Some(SymbolTableNode::Import(im)) => im
+                .names
+                .first()
+                .map(|al| al.name.split('.').map(|s| s.to_string()).collect()),
+            Some(SymbolTableNode::ImportFrom(ifm)) => Some(ifm.resolved_module_path(options)),
+            _ => None,
+        },
+        Some(SymbolTableNode::ImportFrom(ifm)) => Some(ifm.resolved_module_path(options)),
+        _ => None,
+    };
+    let Some(path) = module_path else {
+        return None;
+    };
+    let first = path.first().map(|s| s.as_str()).unwrap_or("");
+    if crate::ast::tree::import::is_stdpython_module(first) {
+        return None;
+    }
+    if options.module_defs.contains_key(&path) {
+        return None;
+    }
+    if options.python_modules.contains(first) {
+        return None;
+    }
+    Some(root)
 }
