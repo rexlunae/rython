@@ -1370,6 +1370,28 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // A method call on a receiver that is a BOXED-PyValue FIELD CHAIN
+        // (`(self._response_mut().body).close()` — the emscripten response
+        // where `body` is a PyValue field): the method has no static shape —
+        // the call lowers to the boxed None (dynamic-method divergence).
+        // Plain PyValue-typed NAMES are exempt — their dynamic protocol
+        // methods (is_truthy, py_get, as_*, ...) resolve normally.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && matches!(attr.value.as_ref(), ExprType::Attribute(_))
+            && crate::ast::tree::attribute::receiver_is_pyvalue(
+                &attr.value,
+                &ctx,
+                &symbols,
+                &options,
+            )
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "`{:?}.{}(...)` is dropped: the receiver is a boxed PyValue \
+                 (dynamic-method divergence)",
+                attr.value, attr.attr
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
         // Calls into an EXTERNAL module (`ssl.SSLContext(...)`,
         // `socket.socket(...)`, `logging.getLogger(...)` — stdlib rython
         // does not model, or a non-vendored dependency) lower to the boxed

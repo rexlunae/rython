@@ -129,10 +129,20 @@ impl<'a> CodeGen for Attribute {
         // generated items exist, so the attribute lowers to the boxed None
         // (computed before `self.value`/`symbols` are moved below).
         let external_root = external_module_root(&self.value, &symbols, &options);
+        // A BOXED-PyValue receiver (`self._response().body.closed` — the
+        // emscripten response where `body` is a PyValue field): the
+        // attribute read has no static shape — it lowers to the boxed None
+        // (dynamic-attribute divergence, the same model getattr uses).
+        // Computed before `self.value`/`symbols` are moved below.
+        let pyvalue_receiver = receiver_is_pyvalue(&self.value, &ctx, &symbols, &options);
+        let receiver_is_field_chain = matches!(self.value.as_ref(), ExprType::Attribute(_));
         let warnings = options.definition_warnings.clone();
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
+        // Debug-form of the receiver for -W messages (captured before the
+        // move above).
+        let value_debug = format!("{:?}", value_str);
 
         // Determine if this is a module access or a field/method access
         // Module names are typically lowercase and match Python stdlib modules
@@ -207,6 +217,25 @@ impl<'a> CodeGen for Attribute {
                 Ok(quote!(#value_tokens::#attr))
             }
         } else {
+            // A read on a BOXED-PyValue receiver (`self._response().body
+            // .closed` — the emscripten response's `body` field is PyValue):
+            // the attribute has no static shape — the boxed None (the
+            // dynamic-attribute divergence).
+            // A read on a BOXED-PyValue receiver (`self._response().body
+            // .closed` — the emscripten response's `body` field is PyValue):
+            // the attribute has no static shape — the boxed None (the
+            // dynamic-attribute divergence). Only FIELD-CHAIN receivers
+            // qualify: a plain Name receiver may be a CALLEE being rendered
+            // (`b.lower()` renders its func through this path), and its
+            // dynamic protocol methods must not be boxed away.
+            if pyvalue_receiver && receiver_is_field_chain {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the receiver is a boxed PyValue \
+                     (dynamic-attribute divergence)",
+                    value_debug, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             // A class-constant read (`GzipDecoderState.SWALLOW_DATA`):
             // `X::NAME` — the const lives on the class's impl block.
             if let Some(receiver) = &class_const_read {
@@ -480,6 +509,94 @@ pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes)
             }
         }
         ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols),
+        _ => false,
+    }
+}
+
+/// The class of a receiver expression, resolving through `self.field()`
+/// accessor CALLS (`self._response().body` — the receiver of `.body` is
+/// the `_response()` accessor, whose class is the `_response` field's
+/// class). The `_mut` accessor spelling (`self._response_mut()`) strips
+/// back to the field name.
+fn receiver_class_deep(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    match expr {
+        ExprType::Call(c) => {
+            let ExprType::Attribute(a) = c.func.as_ref() else {
+                return None;
+            };
+            if let Some(r) = crate::receiver_class(&ExprType::Attribute(a.clone()), ctx, symbols, options) {
+                return Some(r);
+            }
+            if let Some(stripped) = a.attr.strip_suffix("_mut") {
+                let mut a2 = a.clone();
+                a2.attr = stripped.to_string();
+                return crate::receiver_class(&ExprType::Attribute(a2), ctx, symbols, options);
+            }
+            None
+        }
+        _ => crate::receiver_class(expr, ctx, symbols, options),
+    }
+}
+
+/// Whether an ATTRIBUTE chain ends at a PyValue-typed class field
+/// (`self._response().body` — `body` is `pub body: PyValue` on the
+/// emscripten response). Reads THROUGH such a chain are dynamic.
+fn field_chain_ends_in_pyvalue(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Attribute(a) = expr else {
+        return false;
+    };
+    let Some((class, class_symbols)) =
+        receiver_class_deep(&a.value, ctx, symbols, options)
+    else {
+        return false;
+    };
+    let Ok(fields) = class.infer_fields(&class_symbols, options) else {
+        return false;
+    };
+    fields
+        .iter()
+        .find(|(name, _)| name == &a.attr)
+        .is_some_and(|(_, ty)| ty.to_string().contains("PyValue"))
+}
+
+/// Whether an expression is a BOXED PyValue at runtime: a name with an
+/// unknown/boxed type (but never `self`), a call with a known boxed return,
+/// or a field chain ending at a PyValue-typed field. Attribute reads and
+/// method calls ON such a receiver have no static shape — the
+/// dynamic-attribute divergence.
+pub(crate) fn receiver_is_pyvalue(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    match expr {
+        ExprType::Name(n) => {
+            if n.id == "self" {
+                return false;
+            }
+            matches!(
+                crate::infer_type(expr, options, symbols),
+                crate::TypeInfo::PyValue
+                    | crate::TypeInfo::PyObject
+                    | crate::TypeInfo::PyValueMember(_)
+            )
+        }
+        ExprType::Attribute(_) => field_chain_ends_in_pyvalue(expr, ctx, symbols, options),
+        ExprType::Call(c) => matches!(
+            crate::call_return_typeinfo(c, Some(symbols), Some(options)),
+            Some(crate::TypeInfo::PyValue | crate::TypeInfo::PyObject)
+        ),
         _ => false,
     }
 }
