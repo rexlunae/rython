@@ -1459,14 +1459,14 @@ impl<'a> CodeGen for Call {
             return Ok(quote!(stdpython::PyValue::None_));
         }
         // A name imported from an external module via `from X import name`
-        // (`from logging import getLogger`, `from zlib import ...`): the
+        // (`from logging import getLogger`, `from zlib import ...`), or
+        // re-exported through a sibling chain (`from .compat import
+        // urlparse` where compat re-exports urllib.parse — requests): the
         // call drops the same way. Exception-class names and stdpython /
         // sibling-module imports are untouched.
         if let ExprType::Name(n) = self.func.as_ref()
-            && let Some(crate::SymbolTableNode::ImportFrom(ifm)) = symbols.get(&n.id)
-            && ifm.level == 0
             && !crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
-            && crate::ast::tree::attribute::external_module_root(
+            && (crate::ast::tree::attribute::external_module_root(
                 &ExprType::Name(crate::ast::tree::name::Name {
                     id: n.id.clone(),
                 }),
@@ -1474,11 +1474,16 @@ impl<'a> CodeGen for Call {
                 &options,
             )
             .is_some()
+                || crate::ast::tree::import::resolves_to_external_import(
+                    &n.id,
+                    &options,
+                    &symbols,
+                ))
         {
             options.definition_warnings.borrow_mut().push(format!(
-                "`{}(...)` is dropped: `{}` is imported from `{}`, which is external to \
-                 the generated crate (external-module divergence)",
-                n.id, n.id, ifm.module
+                "`{}(...)` is dropped: `{}` is imported from a module that is \
+                 external to the generated crate (external-module divergence)",
+                n.id, n.id
             ));
             return Ok(quote!(stdpython::PyValue::None_));
         }

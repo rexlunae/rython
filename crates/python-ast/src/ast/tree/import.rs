@@ -44,6 +44,97 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
     )
 }
 
+/// Whether an imported name RESOLVES to an EXTERNAL module's item (a
+/// re-export chain ending in `from urllib.parse import urlparse` — requests'
+/// compat, where urllib is external): no runtime item exists behind the
+/// chain, so the use drops.
+pub(crate) fn resolves_to_external_import(
+    name: &str,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    // Only meaningful when the whole crate is known (multi-module
+    // conversion): a single-module conversion may import any sibling.
+    if options.module_defs.len() <= 1 {
+        return false;
+    }
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..16 {
+        match syms.get(&current) {
+            Some(SymbolTableNode::Alias(canonical)) => {
+                current = canonical.clone();
+            }
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let path = ifm.resolved_module_path(options);
+                if options.module_defs.contains_key(&path) {
+                    // A re-export chain: hop into the defining module.
+                    let defining = ifm
+                        .names
+                        .iter()
+                        .find(|a| a.asname.as_deref() == Some(&current))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| current.clone());
+                    let module = &options.module_defs[&path];
+                    let module: &crate::Module = module;
+                    syms = module.clone().find_symbols(SymbolTableScopes::new());
+                    current = defining;
+                } else {
+                    // The terminal hop: external when the module is neither
+                    // stdpython nor generated.
+                    return !is_stdpython_module(ifm.module.split('.').next().unwrap_or(""));
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether an imported name is a TYPE-NAME TUPLE alias (`basestring =
+/// (str, bytes)` — requests' compat): consumed by isinstance resolution at
+/// conversion time, never a runtime value. Follows ImportFrom re-export
+/// chains through the generated crate.
+fn is_type_name_tuple_alias(
+    name: &str,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..16 {
+        match syms.get(&current) {
+            Some(SymbolTableNode::Assign { value, .. }) => {
+                let crate::ExprType::Tuple(t) = value else {
+                    return false;
+                };
+                return t.elts.iter().all(|e| matches!(e, crate::ExprType::Name(_)));
+            }
+            Some(SymbolTableNode::Alias(canonical)) => {
+                current = canonical.clone();
+            }
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let path = ifm.resolved_module_path(options);
+                if !options.module_defs.contains_key(&path) {
+                    return false;
+                }
+                let defining = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let module = &options.module_defs[&path];
+                let module: &crate::Module = module;
+                syms = module.clone().find_symbols(SymbolTableScopes::new());
+                current = defining;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Runtime modules that only exist on stdpython's std tier: they touch the
 /// OS (or, for math, std's float intrinsics), so the no_std profile has
 /// nothing to lower them to. json/string/collections/itertools live on the
@@ -600,6 +691,31 @@ impl CodeGen for ImportFrom {
             if self.module == "functools"
                 && matches!(alias.name.as_str(), "partial" | "lru_cache" | "cache")
             {
+                continue;
+            }
+            // A TYPE-NAME TUPLE alias (`basestring = (str, bytes)` —
+            // requests' compat): consumed by isinstance resolution at
+            // conversion time, never a runtime value — the import emits
+            // nothing (a `pub use crate::...::basestring` would fail: the
+            // value is a module-init local, not a static).
+            if is_type_name_tuple_alias(&alias.name, &options, &symbols) {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`from {} import {}`: `{}` is a type-name tuple alias \
+                     (typing-only; consumed by isinstance resolution)",
+                    self.module, alias.name, alias.name
+                ));
+                continue;
+            }
+            // A name that RE-EXPORTS from an EXTERNAL module (`from
+            // urllib.parse import urlparse` in requests' compat — urllib is
+            // external): no runtime item exists behind the chain, so the
+            // use drops (calls through the name lower to the boxed None).
+            if resolves_to_external_import(&alias.name, &options, &symbols) {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`from {} import {}`: `{}` re-exports from an external module \
+                     (no runtime item; the import is dropped)",
+                    self.module, alias.name, alias.name
+                ));
                 continue;
             }
             if alias.name == "*" {
