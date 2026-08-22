@@ -391,6 +391,53 @@ impl CodeGen for Module {
                 }
             }
         }
+        // A DEFINITE if/else module value (`if sys.platform == "win32":
+        // preferred_clock = time.perf_counter else: preferred_clock =
+        // time.time` — requests' sessions): both branches assign the SAME
+        // name exactly once, so the value is definitely set — promote to a
+        // LazyLock static whose closure is the conditional expression (the
+        // multi-store exclusion is only about UNDEFINITE stores; a static
+        // here cannot freeze a stale value).
+        let mut promoted_conditional: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, s) in self.raw.body.iter().enumerate() {
+            if let crate::StatementType::If(if_stmt) = &s.statement {
+                if if_stmt.orelse.is_empty() {
+                    continue;
+                }
+                let branch_name = |stmts: &[crate::Statement]| -> Option<String> {
+                    if stmts.len() != 1 {
+                        return None;
+                    }
+                    match &stmts[0].statement {
+                        crate::StatementType::Assign(a) if a.targets.len() == 1 => {
+                            match &a.targets[0] {
+                                crate::ExprType::Name(n) => Some(n.id.clone()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let (Some(b1), Some(b2)) =
+                    (branch_name(&if_stmt.body), branch_name(&if_stmt.orelse))
+                {
+
+                }
+                if let (Some(b1), Some(b2)) =
+                    (branch_name(&if_stmt.body), branch_name(&if_stmt.orelse))
+                    && b1 == b2
+                    // The two branches alone give a count of 4 (each
+                    // nested store counts ×2); anything else (a top-level
+                    // store, another conditional) makes it 5+.
+                    && module_assign_counts.get(&b1) == Some(&4)
+                    && function_free_reads.contains(&b1)
+                {
+                    promoted_conditional.insert(b1.clone(), i);
+                    promoted_statics.insert(b1.clone());
+                }
+            }
+        }
         let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols, &options);
         let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols, &options);
         // Name reads of promoted statics render as `(*name).clone()` (name.rs);
@@ -712,6 +759,79 @@ impl CodeGen for Module {
                     pub static #ident: std::sync::LazyLock<#ty> =
                         std::sync::LazyLock::new(|| #wrapped);
                 });
+                module_init_stmts.push(quote!(let _ = &*#ident;));
+                has_module_init_code = true;
+                continue;
+            }
+
+            // A DEFINITE if/else module value (promoted_conditional): the If
+            // statement itself becomes the static's conditional initializer
+            // (`if sys.platform == "win32": preferred_clock =
+            // time.perf_counter else: ...` → `static preferred_clock:
+            // LazyLock<fn() -> f64> = LazyLock::new(|| if ... { ... } else
+            // { ... })`). The branch values are stdpython module functions
+            // (fn items); the fn-pointer type keeps the call sites
+            // (`preferred_clock()`) compiling.
+            if let crate::StatementType::If(if_stmt) = &s.statement
+                && if_stmt.body.len() == 1
+                && if_stmt.orelse.len() == 1
+                && let crate::StatementType::Assign(b1) = &if_stmt.body[0].statement
+                && let crate::StatementType::Assign(b2) = &if_stmt.orelse[0].statement
+                && let [crate::ExprType::Name(n1)] = b1.targets.as_slice()
+                && let [crate::ExprType::Name(n2)] = b2.targets.as_slice()
+                && n1.id == n2.id
+                && promoted_conditional.contains_key(&n1.id)
+            {
+                let ident = crate::safe_ident(&n1.id);
+                let test = if_stmt
+                    .test
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                let v1 = b1
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                let v2 = b2
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                // Both branch values are stdpython module FUNCTION reads
+                // (`time.perf_counter` / `time.time`): the static is a
+                // fn-pointer; anything else falls back to the boxed None
+                // initializer (the values are dropped).
+                let is_fn_attr = |v: &crate::ExprType| -> bool {
+                    matches!(
+                        v,
+                        crate::ExprType::Attribute(a)
+                            if matches!(a.value.as_ref(), crate::ExprType::Name(_))
+                    )
+                };
+                if is_fn_attr(&b1.value) && is_fn_attr(&b2.value) {
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<fn() -> f64> =
+                            std::sync::LazyLock::new(|| {
+                                if #test {
+                                    #v1
+                                } else {
+                                    #v2
+                                }
+                            });
+                    });
+                } else {
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| {
+                                if #test {
+                                    stdpython::PyValue::None_
+                                } else {
+                                    stdpython::PyValue::None_
+                                }
+                            });
+                    });
+                }
                 module_init_stmts.push(quote!(let _ = &*#ident;));
                 has_module_init_code = true;
                 continue;
@@ -1613,33 +1733,77 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
         }
     }
 
-    for s in body {
-        match &s.statement {
-            // Function bodies (top-level or nested under module-level
-            // control flow) and class METHOD bodies read module values;
-            // walk_stmt recurses through If/While/For/With/Try and through
-            // class bodies, binding each scope's own names along the way.
-            ST::FunctionDef(_) | ST::AsyncFunctionDef(_) | ST::ClassDef(_) => {
-                walk_stmt(s, &mut all_names, &mut bound);
-            }
-            ST::If(i) => {
-                // `if TYPE_CHECKING:` is compile-time-only (type imports,
-                // stub classes); its bodies never run, so their reads are
-                // not function reads.
-                let is_type_checking = matches!(
-                    &i.test,
-                    crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
-                ) || matches!(
-                    &i.test,
-                    crate::ExprType::Attribute(a) if a.attr == "TYPE_CHECKING"
-                );
-                if !is_type_checking {
-                    walk_stmt(s, &mut all_names, &mut bound);
+    fn walk_module_defs(
+            stmt: &crate::Statement,
+            all: &mut std::collections::HashSet<String>,
+            bound: &mut std::collections::HashSet<String>,
+        ) {
+            use crate::StatementType as ST2;
+            match &stmt.statement {
+                // A def/class body anywhere under module-level control flow
+                // reads module values; walk it with the full walker (which
+                // binds the def's own scope).
+                ST2::FunctionDef(_) | ST2::AsyncFunctionDef(_) | ST2::ClassDef(_) => {
+                    walk_stmt(stmt, all, bound);
                 }
+                // Control-flow shells only HOST defs — their own
+                // assignments bind MODULE scope, not a function's locals,
+                // so they must not enter the bound set.
+                ST2::If(i) => {
+                    let is_type_checking = matches!(
+                        &i.test,
+                        crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                    ) || matches!(
+                        &i.test,
+                        crate::ExprType::Attribute(a) if a.attr == "TYPE_CHECKING"
+                    );
+                    if !is_type_checking {
+                        for s in i.body.iter().chain(i.orelse.iter()) {
+                            walk_module_defs(s, all, bound);
+                        }
+                    }
+                }
+                ST2::While(w) => {
+                    for s in w.body.iter().chain(w.orelse.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::For(f) => {
+                    for s in f.body.iter().chain(f.orelse.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::AsyncFor(f) => {
+                    for s in f.body.iter().chain(f.orelse.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::With(w) => {
+                    for s in &w.body {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::AsyncWith(w) => {
+                    for s in &w.body {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::Try(t) => {
+                    for s in t.body.iter().chain(t.orelse.iter()).chain(t.finalbody.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                    for h in &t.handlers {
+                        for s in &h.body {
+                            walk_module_defs(s, all, bound);
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
+        for s in body {
+            walk_module_defs(s, &mut all_names, &mut bound);
+        }
 
     all_names
         .difference(&bound)
