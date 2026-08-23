@@ -575,6 +575,20 @@ pub fn render_typed_reused(
     symbols: SymbolTableScopes,
     expected: Option<TypeInfo>,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A CLASS NAME read as a VALUE (a class passed to a callable/PyValue
+    // parameter — `merge_setting(..., CaseInsensitiveDict)` in requests'
+    // sessions.py, where dict_class: type maps to the boxed PyValue):
+    // classes cannot be runtime values — the boxed None (the
+    // callables-as-data divergence). A construction (`CaseInsensitiveDict(
+    // ...)`) is a Call, not this Name — untouched.
+    if let ExprType::Name(n) = expr && crate::is_class_value_expr(expr, &symbols) {
+        options.definition_warnings.borrow_mut().push(format!(
+            "callable value `{}` (a class name read as a value) lowers to the \
+             boxed None (callables cannot be runtime values in rython)",
+            n.id
+        ));
+        return Ok(quote!(stdpython::PyValue::None_));
+    }
     let tokens = render_typed(expr, ctx, options.clone(), symbols.clone(), expected)?;
     if let ExprType::Name(n) = expr {
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
