@@ -236,6 +236,17 @@ python_function! {
     }
 }
 
+/// os.setenv with an OPTIONAL value (requests' set_environ generator —
+/// `os.environ[name] = value` where the value is a narrowed
+/// `Option<String>`): the Option is unwrapped; a None is a no-op.
+pub fn setenv_opt<K: AsStrLike>(key: K, value: Option<String>) -> () {
+    if let Some(v) = value {
+        unsafe {
+            std::env::set_var(key.as_str_like(), v);
+        }
+    }
+}
+
 python_function! {
     /// os.getcwd - get current working directory
     pub fn getcwd() -> Result<String, PyException>
@@ -294,6 +305,16 @@ impl Environ {
 
     pub fn py_contains(&self, key: &str) -> bool {
         std::env::var(key).is_ok()
+    }
+
+    /// dict.pop semantics: remove and return the value, or None when the
+    /// key is absent (requests' set_environ — `os.environ.pop(name)`).
+    pub fn py_pop(&self, key: &str) -> Option<String> {
+        let v = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        v
     }
 
     pub fn py_keys(&self) -> Vec<String> {
