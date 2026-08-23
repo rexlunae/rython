@@ -142,6 +142,44 @@ impl CodeGen for Name {
             if options.promoted_statics.contains(&self.id) {
                 return Ok(quote!((*#name).clone()));
             }
+            // A name IMPORTED from a sibling module where it is a promoted
+            // static (`from .constant import _THAI` — the import brings the
+            // LazyLock static into scope): reads deref-clone the same way.
+            // Resolve the ImportFrom to its defining module and consult the
+            // shared promotion map (module.rs's `module_promoted_static_names`)
+            // so the read matches the static the defining module emitted.
+            // Follows alias chains (`from .constant import _THAI as T` —
+            // the symbol for T is Alias("_THAI"), which resolves to the
+            // ImportFrom).
+            let mut sym = symbols.get(&self.id).cloned();
+            let mut hops = 0;
+            while let Some(crate::SymbolTableNode::Alias(target)) = &sym {
+                if hops > 16 {
+                    break;
+                }
+                sym = symbols.get(target).cloned();
+                hops += 1;
+            }
+            if let Some(crate::SymbolTableNode::ImportFrom(ifm)) = sym {
+                let path = ifm.resolved_module_path(&options);
+                if options.module_defs.contains_key(&path) {
+                    // The canonical name in the defining module (the alias
+                    // target when this name is an asname binding).
+                    let canonical = ifm
+                        .names
+                        .iter()
+                        .find(|a| a.asname.as_deref() == Some(self.id.as_str()))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| self.id.clone());
+                    if crate::ast::tree::module::module_promoted_static_names(
+                        &options, &path,
+                    )
+                    .contains(&canonical)
+                    {
+                        return Ok(quote!((*#name).clone()));
+                    }
+                }
+            }
             // A CALLABLE name read as a VALUE (`hash_utf8 = sha256_utf8` —
             // requests' auth, where sha256_utf8 is a dropped nested
             // function): the callable-as-value divergence — the read lowers

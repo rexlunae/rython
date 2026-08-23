@@ -3836,6 +3836,84 @@ fn conditionally_reassigned_module_names_are_not_constants() {
     assert!(!out.contains("pub static MODE"), "generated: {}", out);
 }
 
+#[test]
+fn sibling_imported_module_values_promote_to_statics() {
+    // charset_normalizer/constant.py: `TOO_BIG_SEQUENCE = int(10e6)` (a
+    // NON-const value, so it needs the LazyLock promotion, not the
+    // literal-static path) is imported by sibling modules. The DEFINING
+    // module must promote it to a `pub static` LazyLock (a module-init
+    // local is invisible to other modules — E0432), and the IMPORTING
+    // module's reads must deref-clone (`(*TOO_BIG_SEQUENCE).clone()`).
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["pkg".to_string(), "constant".to_string()],
+        std::rc::Rc::new(
+            parse("TOO_BIG_SEQUENCE = int(10e6)\n", "constant.py").unwrap(),
+        ),
+    );
+    defs.insert(
+        vec!["pkg".to_string(), "utils".to_string()],
+        std::rc::Rc::new(
+            parse(
+                "from .constant import TOO_BIG_SEQUENCE\n\ndef f() -> int:\n    return TOO_BIG_SEQUENCE\n",
+                "utils.py",
+            )
+            .unwrap(),
+        ),
+    );
+    let mut options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        module_path: vec!["pkg".to_string()],
+        ..Default::default()
+    };
+    // Convert the DEFINING module first: the promotion pass records the
+    // promoted set into the shared cache that the importing module consults.
+    options.this_module_path = vec!["pkg".to_string(), "constant".to_string()];
+    let constant_out = compile_with_options(
+        "TOO_BIG_SEQUENCE = int(10e6)\n",
+        "constant.py",
+        options.clone(),
+    )
+    .expect("constant module converts");
+    assert!(
+        constant_out.contains("pub static TOO_BIG_SEQUENCE"),
+        "sibling-imported value must be a static in the defining module: {}",
+        constant_out
+    );
+
+    options.this_module_path = vec!["pkg".to_string(), "utils".to_string()];
+    let utils_out = compile_with_options(
+        "from .constant import TOO_BIG_SEQUENCE\n\ndef f() -> int:\n    return TOO_BIG_SEQUENCE\n",
+        "utils.py",
+        options,
+    )
+    .expect("utils module converts");
+    assert!(
+        utils_out.contains("use crate :: pkg :: constant :: TOO_BIG_SEQUENCE"),
+        "import must resolve to the static: {}",
+        utils_out
+    );
+    assert!(
+        utils_out.contains("(* TOO_BIG_SEQUENCE) . clone ()"),
+        "read of the imported static must deref-clone: {}",
+        utils_out
+    );
+}
+
+#[test]
+fn bitwise_module_constant_binop_lowers_to_plain_static() {
+    // `_THAI = 1 << 6` is a constant expression: it lowers to a plain
+    // `pub static` (importable directly, no LazyLock needed) — the
+    // charset_normalizer flag constants.
+    let out = compile("_THAI = 1 << 6\n", "flags.py");
+    assert!(
+        out.contains("pub static _THAI : i64 = (1) << (6)"),
+        "generated: {}",
+        out
+    );
+}
+
+
 // ---------------------------------------------------------------------------
 // no_std profile: OS-facing constructs fail at conversion time
 // ---------------------------------------------------------------------------

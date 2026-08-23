@@ -349,10 +349,27 @@ impl CodeGen for Module {
         // a single top-level store (reassignment/conditional stores keep the
         // __module_init__ lowering: a static would freeze the first value),
         // a non-const value, and NOT a typing alias or the builtin-alias
-        // declaration shape.
+        // declaration shape. A value that a SIBLING module imports
+        // (`from .constant import _THAI` — charset_normalizer's utils) is
+        // promoted the same way: without a `pub static`, the importing
+        // module's `use crate::charset_normalizer::constant::_THAI;` fails
+        // with E0432 (a module-init local is invisible to other modules).
         let function_free_reads = module_function_free_reads(&self.raw.body);
         let mut promoted_statics: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // In a multi-module conversion, the promotion decision comes from the
+        // SHARED computation (`module_promoted_static_names`) so the DEFINING
+        // module and every IMPORTING module agree on which names are statics
+        // (an importing module renders reads of them as `(*name).clone()`).
+        // The inline loop below is the fallback for library/single-module
+        // use, where `this_module_path` is empty and there are no siblings.
+        if !options.this_module_path.is_empty()
+            && options.module_defs.contains_key(&options.this_module_path)
+        {
+            promoted_statics = module_promoted_static_names(&options, &options.this_module_path)
+                .as_ref()
+                .clone();
+        } else {
         for s in &self.raw.body {
             if let crate::StatementType::If(if_stmt) = &s.statement {
                 if Self::is_type_checking_test(&if_stmt.test) {
@@ -390,6 +407,7 @@ impl CodeGen for Module {
                     }
                 }
             }
+        }
         }
         // A DEFINITE if/else module value (`if sys.platform == "win32":
         // preferred_clock = time.perf_counter else: preferred_clock =
@@ -1396,6 +1414,127 @@ fn count_module_stores(
 /// is a TYPE ALIAS consumed by annotation resolution, never a runtime value
 /// (`_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], ...]`,
 /// `_TYPE_BODY = typing.Union[...]` — urllib3).
+/// Names that SIBLING modules of the crate import FROM this module
+/// (`from .constant import _THAI` in charset_normalizer's utils, where
+/// `_THAI = 1 << 6` is a module-level value). Such names must be promoted
+/// to `pub static` (LazyLock) items in THIS module, or the importing
+/// module's `use crate::charset_normalizer::constant::_THAI;` fails with
+/// E0432 — a module-init local is invisible to other modules. Only
+/// meaningful in multi-module conversions (module_defs populated); a
+/// single-module conversion has no siblings and returns empty.
+fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<String> {
+    use crate::StatementType as ST;
+    let mut names = std::collections::HashSet::new();
+    if options.module_defs.len() <= 1 || options.this_module_path.is_empty() {
+        return names;
+    }
+    let this_path = &options.this_module_path;
+    for (path, module) in options.module_defs.iter() {
+        if *path == *this_path {
+            continue;
+        }
+        // The sibling's own package path: relative imports inside it
+        // resolve against ITS path, not this module's.
+        let mut sibling_options = options.clone();
+        sibling_options.module_path = module_package_path_from_defs(path, &options);
+        for stmt in &module.raw.body {
+            if let ST::ImportFrom(ifm) = &stmt.statement {
+                if ifm.resolved_module_path(&sibling_options) == *this_path {
+                    for alias in &ifm.names {
+                        names.insert(alias.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The promotion decision for the module at `path` in the generated crate:
+/// the names that WILL be emitted as `pub static` LazyLock statics there.
+/// Computed on demand from the module's AST (module_defs), then cached in
+/// `options.module_promoted_statics` so the DEFINING module's promotion
+/// pass and every IMPORTING module's read lowering agree (name.rs renders
+/// `(*name).clone()` for such names). Mirrors the promotion loop in
+/// `Module::to_rust` exactly.
+pub(crate) fn module_promoted_static_names(
+    options: &PythonOptions,
+    path: &[String],
+) -> std::rc::Rc<std::collections::HashSet<String>> {
+    if let Some(cached) = options.module_promoted_statics.borrow().get(path) {
+        return cached.clone();
+    }
+    let Some(module) = options.module_defs.get(path) else {
+        return std::rc::Rc::new(std::collections::HashSet::new());
+    };
+    let mut target = options.clone();
+    target.this_module_path = path.to_vec();
+    let mut counts = std::collections::HashMap::new();
+    count_module_stores(&module.raw.body, &mut counts);
+    let free_reads = module_function_free_reads(&module.raw.body);
+    let sibling = sibling_imported_names(&target);
+    let symbols = (**module).clone().find_symbols(crate::SymbolTableScopes::new());
+    let mut names = std::collections::HashSet::new();
+    for stmt in &module.raw.body {
+        if let crate::StatementType::If(if_stmt) = &stmt.statement {
+            if Module::is_type_checking_test(&if_stmt.test) {
+                continue;
+            }
+            let test_str = format!("{:?}", if_stmt.test);
+            if test_str.contains("__name__") && test_str.contains("__main__") {
+                continue;
+            }
+        }
+        if let crate::StatementType::Assign(a) = &stmt.statement {
+            if crate::try_lru_cache_factory(a, Some(&target), &symbols).is_some() {
+                continue;
+            }
+            if let [crate::ExprType::Name(_)] = a.targets.as_slice()
+                && let crate::ExprType::Name(n) = &a.value
+                && matches!(
+                    n.id.as_str(),
+                    "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                )
+            {
+                continue;
+            }
+            if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
+                if counts.get(&n.id) == Some(&1)
+                    && const_static_type(&a.value).is_none()
+                    && !is_type_alias_value(&a.value)
+                    && !crate::is_rust_bind_call(&a.value)
+                    && (free_reads.contains(&n.id) || sibling.contains(&n.id))
+                {
+                    names.insert(n.id.clone());
+                }
+            }
+        }
+    }
+    let rc = std::rc::Rc::new(names);
+    options
+        .module_promoted_statics
+        .borrow_mut()
+        .insert(path.to_vec(), rc.clone());
+    rc
+}
+
+/// The package path of a module at `path` within module_defs: the parent
+/// directory, unless the module IS a package (`__init__.py` — its path is
+/// the package dir itself, and no other module has it as a strict prefix).
+fn module_package_path_from_defs(
+    path: &[String],
+    options: &PythonOptions,
+) -> Vec<String> {
+    let is_package = options.module_defs.keys().any(|k| {
+        k.len() > path.len() && k[..path.len()] == path[..]
+    });
+    if is_package {
+        path.to_vec()
+    } else {
+        path[..path.len().saturating_sub(1)].to_vec()
+    }
+}
+
 /// Names READ as free variables inside function bodies anywhere in the
 /// module (top-level and nested): every Name that appears in a function
 /// body and is not bound there (param, assignment target, def/class name,
@@ -1946,6 +2085,35 @@ pub(crate) fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> 
             }
             match const_static_type(&op.operand) {
                 Some(ty) if ty.to_string() == "i64" || ty.to_string() == "f64" => Some(ty),
+                _ => None,
+            }
+        }
+        // Integer bitwise/shift expressions (`1 << 6`, `1 | 2`) are
+        // constant: they render as plain Rust operators (bin_ops
+        // `generate_rust_code`), so the module-level constant machinery
+        // can emit `pub static X: i64 = (1) << (6);` (charset_normalizer's
+        // `_THAI = 1 << 6` flags). Only the bitwise/shift family is safe:
+        // Add/Sub/Mult route through py_add/py_sub/py_mul (not static
+        // initializers), and Div/FloorDiv/Mod/Pow have Python-specific
+        // semantics that the plain operator would not reproduce.
+        crate::ExprType::BinOp(op) => {
+            if !matches!(
+                op.op,
+                crate::ast::tree::bin_ops::BinOps::LShift
+                    | crate::ast::tree::bin_ops::BinOps::RShift
+                    | crate::ast::tree::bin_ops::BinOps::BitOr
+                    | crate::ast::tree::bin_ops::BinOps::BitXor
+                    | crate::ast::tree::bin_ops::BinOps::BitAnd
+            ) {
+                return None;
+            }
+            match (
+                const_static_type(&op.left),
+                const_static_type(&op.right),
+            ) {
+                (Some(l), Some(r)) if l.to_string() == "i64" && r.to_string() == "i64" => {
+                    Some(quote!(i64))
+                }
                 _ => None,
             }
         }

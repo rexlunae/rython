@@ -2896,6 +2896,11 @@ fn transpile(
     // Relative imports resolve against the current module's package path;
     // empty at the crate root (the default when unset).
     options.module_path = module_package_path(module);
+    // The module's OWN path (module_path is the package path): the
+    // promotion pass uses it to learn which names sibling modules import
+    // from this module (`from .constant import _THAI`), so cross-module
+    // constants are promoted to importable statics.
+    options.this_module_path = module.path.clone();
     // Register rust-module imports in the shared symbol table so call
     // lowering can resolve them (Import::to_rust only sees a clone).
     let mut symbols = symbols;

@@ -260,6 +260,16 @@ pub struct PythonOptions {
     /// set it.
     pub module_path: Vec<String>,
 
+    /// The current module's OWN path within the generated crate (module_path
+    /// is the package path; this is the full path including the module's own
+    /// name, e.g. ["charset_normalizer", "constant"]). Set per module in the
+    /// converter; empty in single-module/library use. The module-promotion
+    /// pass consults it to learn which names sibling modules import from
+    /// this module (`from .constant import _THAI` — a module-init local is
+    /// invisible to other modules), so cross-module constants become
+    /// importable `pub static`s.
+    pub this_module_path: Vec<String>,
+
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
     /// names ("int", "float", "str", "bool"). Set per function; consumed
@@ -389,6 +399,17 @@ pub struct PythonOptions {
     /// conversions (empty `module_defs`) never touch it.
     pub cross_module_classes:
         std::rc::Rc<std::cell::RefCell<CrossModuleClasses>>,
+
+    /// Lazily-computed per-module sets of names promoted to `pub static`
+    /// LazyLock statics (module.rs's promotion pass), keyed by module path.
+    /// A name imported from a sibling module (`from .constant import _THAI`)
+    /// is a promoted static in the DEFINING module; reads in the importing
+    /// module must render `(*name).clone()` (name.rs consults this map) and
+    /// the defining module's own promotion must include sibling-imported
+    /// names (module.rs consults it too, so both sides agree). Per-module
+    /// conversions (empty `module_defs`) never touch it.
+    pub module_promoted_statics:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<std::collections::HashSet<String>>>>>,
 }
 
 impl Default for PythonOptions {
@@ -426,6 +447,7 @@ impl Default for PythonOptions {
             clone_str_attribute_returns: false,
             fn_return_is_pyvalue: false,
             module_path: Vec::new(),
+            this_module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             numpy_backend: None,
@@ -447,6 +469,9 @@ impl Default for PythonOptions {
             )),
             cross_module_classes: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleClasses::Uncomputed,
+            )),
+            module_promoted_statics: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
             )),
         }
     }
