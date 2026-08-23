@@ -133,6 +133,17 @@ impl CodeGen for Try {
         // Process body, handlers, orelse, and finalbody
         let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
         let symbols = self.handlers.into_iter().fold(symbols, |acc, handler| {
+            // A bare `except ImportError:` handler is DROPPED at render
+            // time (rython's imports are static — the fallback can never
+            // run): its body must not register symbols either. urllib3's
+            // ssl_.py has `try: from ssl import PROTOCOL_TLS ... except
+            // ImportError: PROTOCOL_TLS = 2` — if the fallback's Assign
+            // registered, it would shadow the try body's ImportFrom and
+            // the name would render as a bare value instead of the
+            // external-import boxed None.
+            if is_bare_import_error(&handler.exception_type) {
+                return acc;
+            }
             // The except-bound name (`except IncompleteRead as e:`) is a
             // runtime PyException object; mark it so attribute reads on it
             // can lower to the boxed None (dynamic-attribute divergence)
