@@ -3996,6 +3996,46 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // `module.Class(args)` where `module` is a SIBLING module and
+        // `Class` is a class it defines (`sessions.Session()` — requests'
+        // api.py, `from . import sessions`): the module-path call must
+        // lower to the class constructor `Session::new(args)?`, not
+        // `sessions::Session(args)` (E0423 — a struct used as a value).
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let ExprType::Name(receiver) = attr.value.as_ref()
+            && !crate::module_name_shadowed(&receiver.id, &symbols)
+            && let Some(crate::SymbolTableNode::ImportFrom(ifm)) = symbols.get(&receiver.id)
+            && ifm.level > 0
+        {
+            let mut mod_path = ifm.resolved_module_path(&options);
+            mod_path.push(receiver.id.clone());
+            if options.module_defs.contains_key(&mod_path)
+                && let Some((_class, _cs)) =
+                    crate::module_class_def(&options, &mod_path, &attr.attr)
+            {
+                let cname = crate::safe_ident(&attr.attr);
+                let mut args = Vec::new();
+                for arg in &self.args {
+                    args.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                for kw in &self.keywords {
+                    args.push(kw.value.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                if args.is_empty() {
+                    return Ok(quote!(#cname::new()?));
+                }
+                return Ok(quote!(#cname::new(#(#args),*)?));
+            }
+        }
+
         // `Class.method(args)` where `method` is a @classmethod/
         // @staticmethod (issue #117): an ASSOCIATED call — the class name
         // is a type, so the call lowers to `Class::method(args)` with the
