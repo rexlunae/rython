@@ -405,6 +405,56 @@ pub mod path {
     pub static sep: &str = if cfg!(target_os = "windows") { "\\" } else { "/" };
 
     python_function! {
+    /// os.path.expandvars - expand `$VAR` and `${VAR}` from the
+    /// environment (urllib3's SSLKEYLOGFILE handling). Unknown variables
+    /// stay literal, matching CPython.
+    pub fn expandvars<P>(path: P) -> String
+    where [P: AsPathLike]
+    [signature: (path)]
+    [concrete_types: (String) -> String]
+    {
+        let s = path.as_path_like().to_string();
+        let bytes: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != '$' {
+                out.push(bytes[i]);
+                i += 1;
+                continue;
+            }
+            // `$${VAR}` braced form or `$$NAME` bare form.
+            if i + 1 < bytes.len() && bytes[i + 1] == '{' {
+                if let Some(close) = bytes[i + 2..].iter().position(|&c| c == '}') {
+                    let name: String = bytes[i + 2..i + 2 + close].iter().collect();
+                    if let Ok(val) = std::env::var(&name) {
+                        out.push_str(&val);
+                    }
+                    i += close + 3;
+                    continue;
+                }
+            }
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_alphanumeric() || bytes[j] == '_') {
+                j += 1;
+            }
+            if j > i + 1 {
+                let name: String = bytes[i + 1..j].iter().collect();
+                if let Ok(val) = std::env::var(&name) {
+                    out.push_str(&val);
+                    i = j;
+                    continue;
+                }
+            }
+            // Unknown/empty name stays literal ($ itself).
+            out.push('$');
+            i += 1;
+        }
+        out
+    }
+    }
+
+    python_function! {
         /// os.path.expanduser - expand `~` to the current user's home
         /// directory (urllib3's ca-cert resolution). A leading `~/` (or
         /// bare `~`) expands via $HOME; other paths pass through.

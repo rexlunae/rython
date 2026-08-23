@@ -2579,3 +2579,23 @@ mod cpython_numeric_and_stdlib_fixes {
         );
     }
 }
+
+#[test]
+fn os_path_expandvars_matches_python() {
+    // Verified against python3:
+    //   os.environ['RY_TEST_V']='hello'
+    //   os.path.expandvars('$RY_TEST_V/x')   -> 'hello/x'
+    //   os.path.expandvars('${RY_TEST_V}-t') -> 'hello-t'
+    //   os.path.expandvars('no$UNSET var')   -> 'no$UNSET var'
+    //   os.path.expandvars('plain')          -> 'plain'
+    unsafe {
+        std::env::set_var("RY_TEST_V", "hello");
+    }
+    use stdpython::stdlib::os::path::expandvars;
+    assert_eq!(expandvars("$RY_TEST_V/x"), "hello/x");
+    assert_eq!(expandvars("${RY_TEST_V}-tail"), "hello-tail");
+    // Unknown variables stay literal.
+    assert_eq!(expandvars("no$RY_UNSET_X var"), "no$RY_UNSET_X var");
+    assert_eq!(expandvars("plain"), "plain");
+    assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
+}
