@@ -6935,7 +6935,7 @@ fn tuple_builtin_boxes_its_argument() {
     // — the tuple constructor lowers to the boxed argument (values are already
     // boxed; tuple() on a boxed iterable is identity in rython's model).
     let out = compile(
-        "def f(socket_opts: list) -> list:\n    return tuple(socket_opts)\n",
+        "def f(socket_opts: list[bytes]) -> list[bytes]:\n    return tuple(socket_opts)\n",
         "tupleb.py",
     );
     assert!(
