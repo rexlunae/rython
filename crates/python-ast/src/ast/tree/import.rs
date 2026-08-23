@@ -730,6 +730,13 @@ impl CodeGen for ImportFrom {
         }
 
         let mut tokens = TokenStream::new();
+        // Deduplicate trait imports across the aliases of ONE ImportFrom:
+        // `from .connectionpool import HTTPConnectionPool,
+        // HTTPSConnectionPool` — both classes share the ancestor trait
+        // `ConnectionPoolTrait`, so the bring-along would emit it twice
+        // (E0252 — duplicate import).
+        let mut seen_traits: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for alias in self.names.iter() {
             // functools.partial/lru_cache/cache have no runtime symbols:
             // partial lowers to a closure at each call site, and the
@@ -849,6 +856,9 @@ impl CodeGen for ImportFrom {
                     crate::module_class_traits(&options, &import_module_path).get(&alias.name)
             {
                 for trait_name in traits {
+                    if !seen_traits.insert(trait_name.clone()) {
+                        continue;
+                    }
                     let t = crate::safe_ident(trait_name);
                     tokens.extend(quote! {
                         #[allow(unused_imports)]

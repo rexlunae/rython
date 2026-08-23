@@ -7244,3 +7244,45 @@ fn definite_try_except_module_value_promotes_to_static() {
         out
     );
 }
+
+#[test]
+fn trait_imports_dedupe_across_class_aliases() {
+    // urllib3/__init__.py: `from .connectionpool import HTTPConnectionPool,
+    // HTTPSConnectionPool` — both classes share the ancestor trait
+    // ConnectionPoolTrait; the bring-along must emit it ONCE (E0252
+    // duplicate import otherwise).
+    let a = parse(
+        "class ConnectionPool:\n    pass\nclass HTTPConnectionPool(ConnectionPool):\n    pass\nclass HTTPSConnectionPool(ConnectionPool):\n    pass\n",
+        "connectionpool.py",
+    )
+    .unwrap();
+    let b = parse(
+        "from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool\n",
+        "pkg.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["connectionpool".to_string()], std::rc::Rc::new(a));
+    defs.insert(vec!["pkg".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        "from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool\n",
+        "pkg.py",
+        options,
+    )
+    .expect("converts");
+    // Count the EXACT ancestor-trait import (the subclass traits
+    // HTTPConnectionPoolTrait/HTTPSConnectionPoolTrait contain the token
+    // as a substring, so match the `:: Name` form).
+    let needle = ":: ConnectionPoolTrait";
+    let count = out.split(needle).count() - 1;
+    assert!(
+        count == 1,
+        "ancestor trait must be imported exactly once: {} ({} mentions)",
+        out,
+        count
+    );
+}
