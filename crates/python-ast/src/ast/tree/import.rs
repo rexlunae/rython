@@ -44,6 +44,46 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
     )
 }
 
+/// Whether a TYPE-CHECKING import of `name` from the stdpython module
+/// `module` can emit a `use`: the item must have a KNOWN runtime
+/// counterpart in stdpython's module (an `if TYPE_CHECKING:` import of
+/// `io.BufferedWriter` — requests' utils.py — is only an annotation; the
+/// runtime `io` has no BufferedWriter, so the use would fail E0432).
+pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
+    match module {
+        "io" => matches!(name, "StringIO" | "BytesIO"),
+        "collections" => {
+            matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
+        }
+        "re" => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch"),
+        "itertools" => matches!(
+            name,
+            "accumulate"
+                | "product"
+                | "takewhile"
+                | "dropwhile"
+                | "filterfalse"
+                | "zip_longest"
+                | "chain"
+                | "groupby"
+                | "islice"
+        ),
+        "functools" => matches!(name, "reduce" | "partial" | "lru_cache" | "cache"),
+        "hashlib" => {
+            matches!(name, "md5" | "sha1" | "sha256" | "sha512" | "new")
+        }
+        "json" => matches!(name, "dumps" | "loads" | "load" | "dump"),
+        "datetime" => matches!(
+            name,
+            "datetime" | "date" | "time" | "timedelta" | "timezone"
+        ),
+        "os" | "sys" | "time" | "math" | "random" | "warnings" | "tempfile"
+        | "textwrap" | "heapq" | "copy" | "string" | "glob" | "pathlib"
+        | "csv" | "subprocess" | "sysconfig" | "argparse" | "venv" => true,
+        _ => false,
+    }
+}
+
 /// Whether an imported name RESOLVES to an EXTERNAL module's item (a
 /// re-export chain ending in `from urllib.parse import urlparse` — requests'
 /// compat, where urllib is external): no runtime item exists behind the
@@ -769,6 +809,28 @@ impl CodeGen for ImportFrom {
                 options.definition_warnings.borrow_mut().push(format!(
                     "`from {} import {}`: `{}` re-exports from an external module \
                      (no runtime item; the import is dropped)",
+                    self.module, alias.name, alias.name
+                ));
+                continue;
+            }
+            // A name the module ALSO defines LOCALLY (`from .compat import
+            // proxy_bypass` then a later `def proxy_bypass` — requests'
+            // utils.py): Python's LAST binding wins, so the local
+            // definition overrides the import — the import is dead and
+            // must not emit a `use` for a name the sibling never exports.
+            // (find_symbols keeps the LAST binding, so a FunctionDef /
+            // ClassDef / Assign symbol here means the local def won.)
+            if matches!(
+                symbols.get(&alias.name),
+                Some(
+                    crate::SymbolTableNode::FunctionDef(_)
+                        | crate::SymbolTableNode::ClassDef(_)
+                        | crate::SymbolTableNode::Assign { .. }
+                )
+            ) {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`from {} import {}` is dropped: the module defines `{}` \
+                     locally, and Python's later definition wins",
                     self.module, alias.name, alias.name
                 ));
                 continue;

@@ -662,7 +662,21 @@ impl CodeGen for Module {
                                 if matches!(root, "typing" | "typing_extensions") {
                                     false
                                 } else if crate::ast::tree::import::is_stdpython_module(root) {
-                                    true
+                                    // A stdpython-module import whose ITEM
+                                    // may not exist in the runtime module
+                                    // (`from io import BufferedWriter` —
+                                    // requests' utils.py, only used as an
+                                    // annotation; stdpython::io has
+                                    // StringIO but no BufferedWriter): emit
+                                    // the `use` only for names with a
+                                    // known runtime counterpart, else the
+                                    // generated build fails E0432.
+                                    i.names
+                                        .iter()
+                                        .all(|a| crate::ast::tree::import::stdpython_module_item(
+                                            root,
+                                            &a.name,
+                                        ))
                                 } else {
                                     // Only sibling-module imports whose
                                     // names are actually GENERATED (not
@@ -1072,7 +1086,8 @@ impl CodeGen for Module {
                     && t.handlers
                         .iter()
                         .all(|h| single_assign_name(&h.body) == Some(name.clone()))
-                    && promoted_conditional.contains_key(&name)
+                    && (promoted_conditional.contains_key(&name)
+                        || promoted_statics.contains(&name))
                 {
                     let ident = crate::safe_ident(&name);
                     let body_assign = match &t.body[0].statement {
@@ -1795,6 +1810,22 @@ pub(crate) fn module_promoted_static_names(
             let test_str = format!("{:?}", if_stmt.test);
             if test_str.contains("__name__") && test_str.contains("__main__") {
                 continue;
+            }
+        }
+        // A DEFINITE try/except module value (requests' compat.py
+        // is_urllib3_1 — same name stored once in the try body and once in
+        // a handler, so the value is definitely set): promote like the
+        // if/else case, including for SIBLING-imported names.
+        if let crate::StatementType::Try(t) = &stmt.statement {
+            let body_name = single_assign_name(&t.body);
+            if let Some(name) = body_name
+                && t.handlers
+                    .iter()
+                    .all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                && counts.get(&name) == Some(&4)
+                && (free_reads.contains(&name) || sibling.contains(&name))
+            {
+                names.insert(name.clone());
             }
         }
         if let crate::StatementType::Assign(a) = &stmt.statement {
