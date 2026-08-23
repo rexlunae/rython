@@ -594,8 +594,15 @@ impl FunctionDef {
         // it's private. Otherwise, it's public. We formalize that by default.
         // Trait items carry no visibility modifier at all (they are public
         // through the trait); only inherent methods get one.
+        // A MODULE-level `_name` function (`_wrap_proxy_error` — urllib3's
+        // connection.py) is still imported by SIBLING modules
+        // (`use crate::urllib3::connection::_wrap_proxy_error`), so it must
+        // be crate-visible; a class method's underscore-prefix privacy
+        // stays (methods are reached through the trait or the receiver).
         let visibility = if matches!(&ctx, CodeGenContext::Trait { .. }) {
             quote!()
+        } else if matches!(&ctx, CodeGenContext::Function { class: None }) {
+            quote!(pub(crate))  // module-level: sibling modules import it
         } else if self.name.starts_with("_") && !self.name.starts_with("__") {
             quote!()  // private, no visibility modifier
         } else if self.name.starts_with("__") && self.name.ends_with("__") {
