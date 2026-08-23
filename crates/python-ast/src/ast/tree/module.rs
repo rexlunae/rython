@@ -2893,6 +2893,43 @@ pub fn resolve_imported_class(
     }
 }
 
+/// Resolve a class REFERENCED BY NAME in the current scope to its
+/// ClassDef, following imports into sibling modules (`from
+/// urllib3.util.retry import Retry` — requests' adapters.py) and re-export
+/// chains. Unlike [`resolve_imported_class`] this starts from the CALLER's
+/// symbol table: the name may be a local ClassDef or an imported one.
+/// Used to render class-body constants through the LOCAL name (the
+/// import's `use` brings it into scope), so `Retry::DEFAULT_ALLOWED_METHODS`
+/// works from a caller that only imported Retry.
+pub fn resolve_class_referenced(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<crate::ClassDef> {
+    match symbols.get(name) {
+        Some(crate::SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+        Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
+            resolve_class_referenced(canonical, symbols, options)
+        }
+        Some(crate::SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            if options.module_defs.contains_key(&path) {
+                let canonical = i
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(name))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| name.to_string());
+                resolve_imported_class(options, &path, &canonical, 0)
+                    .map(|(c, _)| c)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Resolve a FUNCTION defined at the top level of another module of the
 /// crate, with that module's symbol table (issue #123): `from
 /// pip._internal.locations import get_scheme` + `scheme = get_scheme(...)`

@@ -1611,6 +1611,7 @@ impl<'a> CodeGen for Call {
                     | "bytearray"
                     | "iter"
                     | "tuple"
+                    | "next"
             ) && symbols.get(bname).is_none()
                 // A loop element shadowing the builtin (`for filter in ...:
                 // filter(**kwargs)` — botocore's docs client): the call
@@ -6587,11 +6588,20 @@ fn map_call_arguments_inner(
         // symbol table (class bodies register only the class), so resolve
         // through the ENCLOSING class's ClassDef — or the class being
         // CONSTRUCTED (a module-level `Retry.DEFAULT = Retry(...)` call).
+        // The class may be IMPORTED into the caller (`from
+        // urllib3.util.retry import Retry` — requests' adapters.py): its
+        // ClassDef lives in the defining module, but the import's `use`
+        // brings the class name into scope, so the static renders through
+        // the LOCAL name (`Retry::DEFAULT_ALLOWED_METHODS`).
         if let ExprType::Name(n) = expr
             && let Some(class_name) = ctx
                 .enclosing_class_name()
                 .or(constructed_class)
-            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+            && let Some(class) = crate::resolve_class_referenced(
+                &class_name,
+                &symbols,
+                &options,
+            )
             && class.body.iter().any(|bs| {
                 matches!(&bs.statement, crate::StatementType::Assign(a)
                     if a.targets.len() == 1
@@ -6600,14 +6610,18 @@ fn map_call_arguments_inner(
             })
         {
             let ident = crate::safe_ident(&n.id);
-            let class_ident = crate::safe_ident(class_name);
+            let class_ident = crate::safe_ident(&class_name);
             return Ok(quote!((*#class_ident::#ident).clone()));
         }
         if let ExprType::Name(n) = expr
             && let Some(class_name) = ctx
                 .enclosing_class_name()
                 .or(constructed_class)
-            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+            && let Some(class) = crate::resolve_class_referenced(
+                &class_name,
+                &symbols,
+                &options,
+            )
             && class.body.iter().any(|bs| {
                 matches!(&bs.statement, crate::StatementType::Assign(a)
                     if a.targets.len() == 1
@@ -6617,7 +6631,7 @@ fn map_call_arguments_inner(
             })
         {
             let ident = crate::safe_ident(&n.id);
-            let class_ident = crate::safe_ident(class_name);
+            let class_ident = crate::safe_ident(&class_name);
             return Ok(quote!((*#class_ident::#ident).clone()));
         }
         // A CALLABLE parameter (`dict_class: type = OrderedDict` —

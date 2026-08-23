@@ -6888,6 +6888,42 @@ fn class_body_computed_constant_promotes_to_lazylock() {
 }
 
 #[test]
+fn imported_class_constant_default_resolves_through_import() {
+    // requests' adapters.py: `from urllib3.util.retry import Retry` then
+    // `Retry(total=0, connect=None, ...)` — the call inlines Retry.__init__'s
+    // dropped defaults, which reference Retry's CLASS-BODY constants
+    // (`allowed_methods=DEFAULT_ALLOWED_METHODS`). The caller only imported
+    // the class, so the default must render through the imported LOCAL name
+    // (`Retry::DEFAULT_ALLOWED_METHODS`), not a bare undefined identifier.
+    // Two-module conversion: retry.py defines the class, adapters.py imports
+    // and constructs it.
+    let retry_src =
+        "class Retry:\n    DEFAULT_ALLOWED_METHODS = frozenset([\"HEAD\", \"GET\"])\n    def __init__(self, allowed_methods=DEFAULT_ALLOWED_METHODS, backoff_max=120) -> None:\n        self.allowed = allowed_methods\n        self.backoff = backoff_max\n";
+    let retry_mod = parse(retry_src, "retry.py").unwrap();
+    let adapters_src =
+        "from retry import Retry\ndef make() -> Retry:\n    return Retry()\n";
+    let adapters_mod = parse(adapters_src, "adapters.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["retry".to_string()], std::rc::Rc::new(retry_mod));
+    defs.insert(vec!["adapters".to_string()], std::rc::Rc::new(adapters_mod));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(adapters_src, "adapters.py", options).expect("converts");
+    assert!(
+        out.contains("Retry :: DEFAULT_ALLOWED_METHODS") || out.contains("Retry::DEFAULT_ALLOWED_METHODS"),
+        "dropped default must render through the imported class name: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some (DEFAULT_ALLOWED_METHODS)") && !out.contains("Some(DEFAULT_ALLOWED_METHODS)"),
+        "bare DEFAULT_ALLOWED_METHODS must not leak: {}",
+        out
+    );
+}
+
+#[test]
 fn itertools_takewhile_swaps_predicate_and_iterable() {
     // urllib3's retry.get_backoff_time: `takewhile(lambda x: ..., reversed(
     // self.history))` — Python (predicate, iterable) maps to the runtime
