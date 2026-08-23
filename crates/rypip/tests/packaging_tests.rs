@@ -53,6 +53,13 @@ fn version_comparison_follows_pep440() {
     // dev sorts before everything of its base
     assert_eq!(version_cmp(&v("1.0.dev1"), &v("1.0a1")), Ordering::Less);
     assert_eq!(version_cmp(&v("1.0.dev2"), &v("1.0.dev1")), Ordering::Greater);
+    // a .devN release sorts BEFORE its own base (PEP 440)
+    assert_eq!(version_cmp(&v("1.0.dev1"), &v("1.0")), Ordering::Less);
+    assert_eq!(version_cmp(&v("1.0a1.dev1"), &v("1.0a1")), Ordering::Less);
+    assert_eq!(
+        version_cmp(&v("1.0.post1.dev1"), &v("1.0.post1")),
+        Ordering::Less
+    );
     // epochs
     assert_eq!(version_cmp(&v("2!1.0"), &v("1!9.9")), Ordering::Greater);
 }

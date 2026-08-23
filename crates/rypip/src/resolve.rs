@@ -287,17 +287,20 @@ fn cmp_key(v: &Version) -> (u64, Vec<u64>, (u8, u64, u64), u64, u64) {
         None if v.dev.is_some() => (0, 0, 0),
         None => (2, 0, 0),
     };
-    let dev = match v.dev {
-        Some(n) => (1u8, n),
-        None => (0u8, 0),
+    // PEP 440: a `.devN` release sorts BEFORE its base (`1.0.dev1 < 1.0`,
+    // `1.0a1.dev1 < 1.0a1`). At this point every earlier key component is
+    // equal, so an ABSENT dev must sort after any PRESENT dev — encode
+    // absent as the u64 sentinel (a real dev number never reaches it).
+    let dev_key = match v.dev {
+        Some(n) => n,
+        None => u64::MAX,
     };
     (
         v.epoch,
         release,
         pre,
         v.post.unwrap_or(0),
-        // dev is the last key; fold it in as a 6th tuple element.
-        dev.1,
+        dev_key,
     )
 }
 
