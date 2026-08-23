@@ -3048,11 +3048,50 @@ impl<'a> CodeGen for Call {
                     .into());
                 }
                 let mut bound = Vec::new();
-                for arg in &self.args[1..] {
-                    bound.push(
-                        arg.clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
-                    );
+                for (bi, arg) in self.args[1..].iter().enumerate() {
+                    // A CLASS bound to a `type[...]`-annotated parameter
+                    // (`functools.partial(_default_key_normalizer,
+                    // PoolKey)` — urllib3's poolmanager, where key_class:
+                    // type[PoolKey]): classes cannot be runtime values —
+                    // the boxed None (the callables-as-data divergence).
+                    let param = params.get(bi).and_then(|p| {
+                        fdef.args
+                            .posonlyargs
+                            .iter()
+                            .chain(fdef.args.args.iter())
+                            .find(|pp| &pp.arg == p)
+                    });
+                    let is_type_param = param.is_some_and(|p| {
+                        p.annotation.as_deref().is_some_and(|a| {
+                            crate::ast::tree::arguments::is_type_annotation(a)
+                                || matches!(
+                                    a,
+                                    crate::ExprType::Subscript(s)
+                                        if matches!(s.value.as_ref(), crate::ExprType::Name(n) if n.id == "type")
+                                )
+                        })
+                    });
+                    if is_type_param && crate::is_class_value_expr(arg, &symbols) {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "functools.partial: class `{}` bound to a `type`-annotated \
+                             parameter lowers to the boxed None (classes cannot be \
+                             runtime values in rython)",
+                            arg.clone()
+                                .to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|_| "<arg>".to_string())
+                        ));
+                        bound.push(quote!(stdpython::PyValue::None_));
+                    } else {
+                        bound.push(
+                            arg.clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                        );
+                    }
                 }
                 // Keyword bindings (`partial(f, a, k=v)`): bind the named
                 // parameters too. They must be in the tail (a Rust call
