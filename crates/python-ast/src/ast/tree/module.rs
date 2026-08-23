@@ -1057,6 +1057,27 @@ impl CodeGen for Module {
             };
             if flattenable_try {
                 if let crate::StatementType::Try(t) = &s.statement {
+                    // A try/except-ImportError whose HANDLER ASSIGNS a name
+                    // the try body IMPORTS (`try: from charset_normalizer
+                    // import __version__ as charset_normalizer_version
+                    // except ImportError: charset_normalizer_version =
+                    // None` — requests/__init__.py): rython's imports are
+                    // static, so the import always succeeds and the
+                    // fallback never runs — but the fallback's Assign still
+                    // makes the name a MODULE-INIT local (hoisted `let`),
+                    // which would collide with the flattened import's `use`
+                    // alias of a static (E0530). Drop the import: the name
+                    // lowers to the module-init local (None in practice).
+                    let handler_assigned: std::collections::HashSet<String> = t
+                        .handlers
+                        .iter()
+                        .flat_map(|h| h.body.iter())
+                        .filter_map(|bs| match &bs.statement {
+                            crate::StatementType::Assign(a) => assign_name_targets(a),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect();
                     for body_stmt in &t.body {
                         let body_is_decl =
                             Self::is_declaration_statement(&body_stmt.statement);
@@ -1065,11 +1086,25 @@ impl CodeGen for Module {
                             .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
                         if body_tokens.to_string() != "" {
-                            if body_is_decl {
-                                stream.extend(body_tokens);
+                            // The IMPORTED name is reassigned in a handler:
+                            // drop the emitted `use` (see above).
+                            let import_dropped = if let crate::StatementType::ImportFrom(i) =
+                                &body_stmt.statement
+                            {
+                                i.names.iter().any(|a| {
+                                    let bound = a.asname.as_deref().unwrap_or(&a.name);
+                                    handler_assigned.contains(bound)
+                                })
                             } else {
-                                module_init_stmts.push(body_tokens);
-                                has_module_init_code = true;
+                                false
+                            };
+                            if !import_dropped {
+                                if body_is_decl {
+                                    stream.extend(body_tokens);
+                                } else {
+                                    module_init_stmts.push(body_tokens);
+                                    has_module_init_code = true;
+                                }
                             }
                         }
                     }

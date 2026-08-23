@@ -957,14 +957,25 @@ impl CodeGen for ImportFrom {
                     quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
                 }
             };
-            tokens.extend(import);
-
-            for variant in variants {
-                let v = crate::safe_ident(variant);
-                tokens.extend(quote! {
-                    #[allow(unused_imports)]
-                    use #root #(::#base_parts)* #(::#module_path)*::#v;
-                });
+            // A SELF-referential import (`from . import packages, utils`
+            // inside requests/__init__.py — the resolved module path IS
+            // the current module): the names are the package's OWN
+            // submodules, already declared by `pub mod`; the emitted
+            // `pub use crate::requests::packages;` would re-import the
+            // sibling into itself (E0255 — defined multiple times).
+            let self_resolved = self.level > 0
+                && options.this_module_path == self.resolved_module_path(&options);
+            if !self_resolved {
+                tokens.extend(import);
+            }
+            if !self_resolved {
+                for variant in variants {
+                    let v = crate::safe_ident(variant);
+                    tokens.extend(quote! {
+                        #[allow(unused_imports)]
+                        use #root #(::#base_parts)* #(::#module_path)*::#v;
+                    });
+                }
             }
 
             // A hierarchy class imported from another module of the
