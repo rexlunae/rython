@@ -5589,6 +5589,25 @@ impl<'a> CodeGen for Call {
                         param.arg
                     ));
                     quote!(stdpython::PyValue::None_)
+                } else if crate::is_class_value_expr(&arg, &symbols)
+                    && param.annotation.as_deref().and_then(crate::call_arg_expected_type)
+                        .is_some_and(|t| {
+                            let s = t.to_rust_type().to_string();
+                            s == "stdpython :: PyValue" || s == "PyValue"
+                        })
+                {
+                    // A CLASS passed to a PyValue-typed parameter
+                    // (`merge_setting(..., CaseInsensitiveDict)` — requests'
+                    // sessions.py, where dict_class: type maps to the boxed
+                    // PyValue): a class as a VALUE is unrepresentable — the
+                    // boxed None (the callables-as-data divergence).
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "callable argument for `{}` (a class name passed to a \
+                         PyValue parameter) lowers to the boxed None (callables \
+                         cannot be runtime values in rython)",
+                        param.arg
+                    ));
+                    quote!(stdpython::PyValue::None_)
                 } else {
                     let expected = param
                         .annotation
