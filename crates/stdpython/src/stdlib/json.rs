@@ -818,3 +818,9 @@ impl crate::PyDisplay for JSONValue {
         self.to_string()
     }
 }
+
+/// json.JSONDecodeError — the exception raised by JSON decoding. rython's
+/// exceptions are string-tagged PyException values (the codegen matches
+/// `except JSONDecodeError` by name), so the class is a marker with no
+/// runtime shape — imported for the name to resolve.
+pub struct JSONDecodeError;

@@ -32,3 +32,9 @@ pub fn StringIO() -> PyFile {
 pub fn StringIO_seeded<S: AsRef<str> + ?Sized>(initial: &S) -> PyFile {
     PyFile::new_buffer(initial.as_ref())
 }
+
+/// io.UnsupportedOperation — the exception for unsupported file
+/// operations. rython's exceptions are string-tagged PyException values
+/// (the codegen matches `except UnsupportedOperation` by name), so the
+/// class is a marker with no runtime shape.
+pub struct UnsupportedOperation;

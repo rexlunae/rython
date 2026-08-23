@@ -873,6 +873,29 @@ impl CodeGen for ImportFrom {
             };
 
             let name = crate::safe_ident(&alias.name);
+            // A sibling-module import whose defining module was NOT
+            // generated (`from urllib3.contrib import pyopenssl` — the
+            // contrib/pyopenssl.py module fails conversion, so no
+            // pyopenssl.rs exists; requests' __init__.py imports it inside
+            // a dead try): the use would fail E0432. Drop it — the module
+            // has no runtime item.
+            let import_module_path = self.resolved_module_path(&options);
+            if options.module_defs.len() > 1
+                && options.module_defs.contains_key(&import_module_path)
+                && !crate::ast::tree::module::module_def_has_runtime_item(
+                    &options,
+                    &import_module_path,
+                    &alias.name,
+                )
+            {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`from {} import {}` is dropped: the defining module has no \
+                     generated runtime item for `{}` (the module may have failed \
+                     conversion)",
+                    self.module, alias.name, alias.name
+                ));
+                continue;
+            }
             // Relative imports re-export from a sibling module: Python
             // treats imported names as module attributes (the package
             // `__init__.py` re-export pattern), so they lower to `pub use`
