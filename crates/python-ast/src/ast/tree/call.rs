@@ -1612,6 +1612,7 @@ impl<'a> CodeGen for Call {
                     | "iter"
                     | "tuple"
                     | "next"
+                    | "id"
             ) && symbols.get(bname).is_none()
                 // A loop element shadowing the builtin (`for filter in ...:
                 // filter(**kwargs)` — botocore's docs client): the call
@@ -2353,6 +2354,29 @@ impl<'a> CodeGen for Call {
                             return Ok(quote!(#f(&(#a)) as i64));
                         }
                         return Ok(quote!(#f(&(#a))));
+                    }
+                    // iter(x): Python's iterator factory. rython's value
+                    // model makes every value already iterable at its
+                    // natural position (a for-loop over the value), so the
+                    // factory is the identity — the argument boxes to a
+                    // PyValue (urllib3's `chunks = iter(body)` in
+                    // request.py's body_to_chunks).
+                    "id" => {
+                        // id(x): Python's object identity. rython's values
+                        // are owned Rust structs with no stable CPython-like
+                        // address; the identity lowers to the value's
+                        // address cast to i64 — unique per value while it
+                        // lives, matching the repr uses (urllib3's
+                        // `f"<{self} at {id(self):#x}>"`). The exact number
+                        // is not CPython's — the identity divergence.
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err("id() takes exactly one argument".to_string().into());
+                        }
+                        let a = &rendered[0];
+                        return Ok(quote!((&(#a)) as *const _ as i64));
                     }
                     // iter(x): Python's iterator factory. rython's value
                     // model makes every value already iterable at its

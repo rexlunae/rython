@@ -223,3 +223,17 @@ python_function! {
         platform()
     }
 }
+
+python_function! {
+    /// sys.audit - fire an audit event (urllib3's connection.py,
+    /// `sys.audit("http.client.connect", self, self.host, self.port)`).
+    /// rython has no audit-hook framework — the event is dropped (the
+    /// audit divergence: CPython's audit hooks observe the event; rython
+    /// programs cannot register hooks, so nothing is lost at runtime).
+    pub fn audit(event: String, args: Vec<crate::PyValue>) -> ()
+    [signature: (event, args)]
+    [concrete_types: (String, Vec<crate::PyValue>) -> ()]
+    {
+        let _ = (event, args);
+    }
+}

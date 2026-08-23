@@ -6,7 +6,7 @@
 //! Note: This module is only available with the `std` feature enabled,
 //! as it requires operating system functionality.
 
-use crate::{PyException, AsStrLike, AsPathLike, python_function};
+use crate::{PyException, PyValue, AsStrLike, AsPathLike, python_function};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -129,6 +129,86 @@ pub fn execv<P: AsRef<str>, A: AsRef<str>>(program: P, args: Vec<A>) -> Result<(
             std::process::exit(status.code().unwrap_or(1));
         }
         Err(e) => Err(crate::runtime_error(format!("Failed to execute program {}: {}", program.as_ref(), e)))
+    }
+}
+
+python_function! {
+    /// os.write - write bytes to a file descriptor (requests' utils,
+    /// `os.write(fd, zip_file.read(member))`).
+    pub fn write(fd: i64, data: Vec<u8>) -> i64
+    [signature: (fd, data)]
+    [concrete_types: (i64, Vec<u8>) -> i64]
+    {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::io::FromRawFd;
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd as std::os::raw::c_int) };
+            let n = file.write(&data).unwrap_or(0) as i64;
+            std::mem::forget(file); // the fd stays open (os.close closes it)
+            n
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (fd, data);
+            0
+        }
+    }
+}
+
+python_function! {
+    /// os.close - close a file descriptor (requests' utils, `os.close(fd)`).
+    pub fn close(fd: i64) -> ()
+    [signature: (fd)]
+    [concrete_types: (i64) -> ()]
+    {
+        #[cfg(unix)]
+        {
+            unsafe { libc::close(fd as std::os::raw::c_int); }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+        }
+    }
+}
+
+python_function! {
+    /// os.replace - atomically rename a file (requests' utils,
+    /// `os.replace(tmp_name, filename)`).
+    pub fn replace(src: String, dst: String) -> Result<(), PyException>
+    [signature: (src, dst)]
+    [concrete_types: (String, String) -> Result<(), crate::PyException>]
+    {
+        std::fs::rename(&src, &dst).map_err(|e| {
+            crate::PyException::new("OSError", format!("rename {} -> {}: {}", src, dst, e))
+        })
+    }
+}
+
+python_function! {
+    /// os.remove - delete a file (requests' utils, `os.remove(tmp_name)`).
+    pub fn remove(path: String) -> Result<(), PyException>
+    [signature: (path)]
+    [concrete_types: (String) -> Result<(), crate::PyException>]
+    {
+        std::fs::remove_file(&path).map_err(|e| {
+            crate::PyException::new("OSError", format!("remove {}: {}", path, e))
+        })
+    }
+}
+
+python_function! {
+    /// os.fdopen - wrap a file descriptor in a file object (requests' utils,
+    /// `with os.fdopen(tmp_descriptor, "wb") as tmp_handler:`). The
+    /// file-object protocol (context manager, write, close) is unmodeled —
+    /// the call lowers to the boxed PyValue (the file-object divergence).
+    pub fn fdopen(fd: i64, mode: String) -> PyValue
+    [signature: (fd, mode)]
+    [concrete_types: (i64, String) -> PyValue]
+    {
+        let _ = (fd, mode);
+        PyValue::None_
     }
 }
 

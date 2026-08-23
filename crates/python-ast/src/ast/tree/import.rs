@@ -140,7 +140,17 @@ fn is_type_name_tuple_alias(
                 let crate::ExprType::Tuple(t) = value else {
                     return false;
                 };
-                return t.elts.iter().all(|e| matches!(e, crate::ExprType::Name(_)));
+                // Every element must be a TYPE NAME (basestring = (str,
+                // bytes)) — not an arbitrary runtime name: requests'
+                // `_HEADER_VALIDATORS_STR = (_VALID_HEADER_NAME_RE_STR,
+                // _VALID_HEADER_VALUE_RE_STR)` is a runtime tuple of
+                // compiled-regex statics, imported and indexed at runtime.
+                return t.elts.iter().all(|e| matches!(e, crate::ExprType::Name(n)
+                    if matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                            | "object" | "None" | "Any" | "Union"
+                    )));
             }
             Some(SymbolTableNode::Alias(canonical)) => {
                 current = canonical.clone();

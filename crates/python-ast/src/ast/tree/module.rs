@@ -698,25 +698,60 @@ impl CodeGen for Module {
                 // A module-level assign to a name the module ALSO imports
                 // (`SSLTransport = None` then `from .ssltransport import
                 // SSLTransport` — urllib3's ssl_.py): Python's LAST binding
-                // wins, so the import overrides the assign — the store is
-                // dead. Drop it: emitting it would collide with the
-                // import's `use` (E0252) or render the imported class
-                // unusable (E0433). Checked before any static promotion.
-                if let Some(names) = assign_name_targets(a)
-                    && names.iter().any(|n| {
-                        matches!(
-                            symbols.get(n),
+                // wins, so the import overrides the assign.
+                //
+                // A SIBLING import emits a real `use` binding the name — the
+                // store is dead; emitting it would collide (E0252) or render
+                // the imported class unusable (E0433). Drop it.
+                //
+                // An EXTERNAL import emits nothing (external-module
+                // divergence), so the name must still resolve for siblings
+                // that read it (`ssl_::HAS_NEVER_CHECK_COMMON_NAME` from
+                // connection.rs): emit a boxed-None static — the external
+                // value is unmodeled.
+                if let Some(names) = assign_name_targets(a) {
+                    let mut sibling_owned = false;
+                    let mut external_owned = false;
+                    for n in &names {
+                        match symbols.get(n) {
                             Some(crate::SymbolTableNode::ImportFrom(_))
-                                | Some(crate::SymbolTableNode::Import(_))
-                        )
-                    })
-                {
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "module-level assignment to `{}` is dropped: the name is also \
-                         imported, and Python's later import binding wins",
-                        names.join(", ")
-                    ));
-                    continue;
+                            | Some(crate::SymbolTableNode::Import(_)) => {
+                                if crate::ast::tree::import::resolves_to_external_import(
+                                    n, &options, &symbols,
+                                ) {
+                                    external_owned = true;
+                                } else {
+                                    sibling_owned = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if sibling_owned {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "module-level assignment to `{}` is dropped: the name is also \
+                             imported from a sibling module, and Python's later import \
+                             binding wins",
+                            names.join(", ")
+                        ));
+                        continue;
+                    }
+                    if external_owned {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "module-level assignment to `{}` is dropped: the name is also \
+                             imported from a module external to the generated crate; the \
+                             name lowers to the boxed None (external-module divergence)",
+                            names.join(", ")
+                        ));
+                        for n in &names {
+                            let ident = crate::safe_ident(n);
+                            stream.extend(quote! {
+                                pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                                    std::sync::LazyLock::new(|| stdpython::PyValue::None_);
+                            });
+                        }
+                        continue;
+                    }
                 }
                 // A type alias (`builtin_str = str`): emit the pub type at
                 // module level so re-exports resolve; Assign::to_rust also
@@ -977,7 +1012,12 @@ impl CodeGen for Module {
                         && t.handlers.iter().all(|h| {
                             crate::ast::tree::try_stmt::is_bare_import_error(
                                 &h.exception_type,
-                            )
+                            ) && (matches!(
+                                h.exception_type,
+                                Some(crate::ExprType::Name(_))
+                            ) || crate::ast::tree::try_stmt::try_body_contains_import(
+                                &t.body,
+                            ))
                         })
                 }
                 _ => false,

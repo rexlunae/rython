@@ -7143,3 +7143,53 @@ fn aliased_external_import_field_call_boxes_field() {
         out
     );
 }
+
+#[test]
+fn id_builtin_lowers_to_address_cast() {
+    // urllib3's connection.py: `f"<{self} at {id(self):#x}>"` — id(x)
+    // lowers to the value's address cast to i64 (identity divergence:
+    // the exact number is not CPython's, but the repr shape is).
+    let out = compile(
+        "class C:\n    def __repr__(self) -> str:\n        return f'<C at {id(self):#x}>'\n",
+        "idtest.py",
+    );
+    assert!(
+        out.contains("as * const _ as i64") || out.contains("as *const _ as i64"),
+        "id(x) must cast the value's address to i64: {}",
+        out
+    );
+    assert!(
+        !out.contains("id (self)"),
+        "bare id(self) must not leak: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_import_error_handler_drops_with_import_body() {
+    // urllib3's connection.py: `try: import ssl; BaseSSLError =
+    // ssl.SSLError except (ImportError, AttributeError): ssl = None` — the
+    // tuple handler is the dead fallback of an import attempt (dropped),
+    // so its `ssl = None` must not shadow the try body's import symbol.
+    let src = "try:\n    import ssl\nexcept (ImportError, AttributeError):\n    ssl = None\n\ndef f() -> object:\n    return ssl.CERT_NONE\n";
+    let m = parse(src, "ssltry.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["ssltry".to_string()], std::rc::Rc::new(m));
+    let other = parse("x = 1\n", "other.py").unwrap();
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(src, "ssltry.py", options).expect("converts");
+    assert!(
+        !out.contains("ssl = None"),
+        "the dropped fallback's ssl = None must not leak: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: PyValue :: None_") || out.contains("stdpython::PyValue::None_"),
+        "ssl.CERT_NONE (external module) must box to None: {}",
+        out
+    );
+}
