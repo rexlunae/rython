@@ -644,6 +644,39 @@ impl<'a> CodeGen for Assign {
         let render = |target: &ExprType,
                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // A store into a CLASS attribute (`HTTPSConnectionPool.
+            // ConnectionCls = HTTP2Connection` — urllib3's http2
+            // injection) or a MODULE attribute (`urllib3_connection.
+            // HTTPSConnection = ...`): rython classes are structs and
+            // modules are paths — neither holds mutable class/module
+            // state, so the store is dropped (the class/module-attribute
+            // mutation divergence).
+            if let ExprType::Attribute(attr) = target {
+                let recv_name = crate::ast::tree::call::root_name(&attr.value);
+                if let Some(root) = &recv_name {
+                    let class_receiver = matches!(
+                        symbols.get(root),
+                        Some(crate::SymbolTableNode::ClassDef(_))
+                    );
+                    let module_receiver =
+                        crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value,
+                            &symbols,
+                            &options,
+                        );
+                    if class_receiver || module_receiver {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "`{}.{} = ...` is dropped: {} attributes are not \
+                             mutable in rython (the class/module-attribute \
+                             mutation divergence)",
+                            root,
+                            attr.attr,
+                            if class_receiver { "class" } else { "module" }
+                        ));
+                        return Ok(TokenStream::new());
+                    }
+                }
+            }
             // A PROPERTY SETTER store (`self.url = v` where url is
             // `@property def url` + `@url.setter def url`): Python's
             // property assignment invokes the SETTER method. rython lowers
