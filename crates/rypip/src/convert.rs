@@ -3529,7 +3529,7 @@ fn reachable_module_paths(
     package: &PyPackage,
     deps: &[(String, PyPackage)],
 ) -> std::collections::HashSet<Vec<String>> {
-    use python_ast::ast::tree::StatementType;
+    
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let mut by_path: HashMap<Vec<String>, &PyModule> = HashMap::new();

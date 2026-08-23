@@ -151,7 +151,7 @@ pub fn encode_punycode<S: AsRef<str>>(input: S) -> Vec<u8> {
         output.push(chars[i] as u8);
     }
     let mut h = basic.len();
-    let mut b = basic.len();
+    let b = basic.len();
     if b > 0 {
         output.push(b'-');
     }

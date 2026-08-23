@@ -3334,7 +3334,7 @@ fn infer_field_type(
                         // A FIELD read on the construction (`TempDirectory(
                         // ...).path` — pip's VenvBuildEnvironment): the
                         // class's annotated field type.
-                        if let Some(class) = (match symbols.get(&cn.id) {
+                        if let Some(class) = match symbols.get(&cn.id) {
                             Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
                             Some(SymbolTableNode::ImportFrom(i)) => {
                                 let path = i.resolved_module_path(options);
@@ -3346,7 +3346,7 @@ fn infer_field_type(
                                     })
                             }
                             _ => None,
-                        }) {
+                        } {
                             if let Some(field_ty) = class.body.iter().find_map(|s| {
                                 match &s.statement {
                                     crate::StatementType::AnnotatedName {
@@ -4007,17 +4007,6 @@ fn is_typing_base(b: &ExprType) -> bool {
         {
             true
         }
-        // A builtin-container base (`set[tuple[str, str]]` — urllib3's
-        // HTTPHeaderDictItemView) is also metadata: the class lowers as a
-        // plain struct, not a container subclass.
-        ExprType::Subscript(sub) => match sub.value.as_ref() {
-            ExprType::Name(n)
-                if matches!(n.id.as_str(), "set" | "frozenset" | "list" | "dict" | "tuple") =>
-            {
-                true
-            }
-            other => is_typing_base(other),
-        },
         _ => false,
     }
 }

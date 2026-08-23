@@ -4659,7 +4659,7 @@ fn definition_time_unsatisfiable_bounds_report_and_deny() {
 
     // -W warn (default): converts; the generated fn carries the
     // #[deprecated] note naming the contradiction.
-    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let _krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
     let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
     assert!(
         src.contains("satisfied by no known rython type"),

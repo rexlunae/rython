@@ -484,11 +484,6 @@ impl CodeGen for Module {
                 };
                 if let (Some(b1), Some(b2)) =
                     (branch_name(&if_stmt.body), branch_name(&if_stmt.orelse))
-                {
-
-                }
-                if let (Some(b1), Some(b2)) =
-                    (branch_name(&if_stmt.body), branch_name(&if_stmt.orelse))
                     && b1 == b2
                     // The two branches alone give a count of 4 (each
                     // nested store counts ×2); anything else (a top-level

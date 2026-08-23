@@ -65,7 +65,7 @@ impl Decorator {
     /// The `@classmethod`/`@staticmethod`/cache shape a FUNCTION definition
     /// takes, for the function codegen. `None` for decorators that do not
     /// apply to functions.
-    pub fn as_method_decorator(&self) -> Option<MethodDecorator> {
+    pub(crate) fn as_method_decorator(&self) -> Option<MethodDecorator> {
         match self {
             Decorator::ClassMethod => Some(MethodDecorator::ClassMethod),
             Decorator::StaticMethod => Some(MethodDecorator::StaticMethod),

@@ -1824,16 +1824,6 @@ fn resolve_alias_typeinfo_inner(
                         None => return annotation_type_info(ann),
                     }
                 }
-                // Bare `Union[A, B]` / `IO[Any]` / `Iterable[...]` names.
-                ExprType::Name(n)
-                    if matches!(
-                        n.id.as_str(),
-                        "Union" | "IO" | "Iterable" | "Callable" | "SupportsRead"
-                            | "SupportsItems"
-                    ) =>
-                {
-                    return Some(TypeInfo::PyValue);
-                }
                 _ => return annotation_type_info(ann),
             };
             match (container, &sub.kind) {

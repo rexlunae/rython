@@ -863,7 +863,6 @@ pub fn infer_unannotated_signature(
                         ));
                     }
                 }
-                None => unreachable!("inferred is Some here"),
             }
         }
         inferred
@@ -1817,43 +1816,7 @@ fn operand_type(
     })
 }
 
-/// Suggest the closest known stdlib methods for an unknown one, for the
-/// loud-error message ("did you mean ...?").
-fn nearest_methods(method: &str) -> String {
-    let known: Vec<&str> = STDLIB_METHOD_TABLE.iter().map(|(m, ..)| *m).collect();
-    let mut scored: Vec<(usize, &str)> = known
-        .iter()
-        .map(|m| (levenshtein(method, m), *m))
-        .collect();
-    scored.sort_by_key(|(d, _)| *d);
-    let close: Vec<&str> = scored
-        .iter()
-        .take(3)
-        .filter(|(d, _)| *d <= 3)
-        .map(|(_, m)| *m)
-        .collect();
-    if close.is_empty() {
-        String::new()
-    } else {
-        format!(" (did you mean {})", close.join(", "))
-    }
-}
 
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for i in 1..=a.len() {
-        cur[0] = i;
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
-}
 
 /// The unified duck-typing signature of one class's method: (param names,
 /// param type strings, param name idents), all annotated.
@@ -2043,7 +2006,6 @@ fn callee_return_type(
                         ));
                     }
                 }
-                None => unreachable!(),
             }
         }
         Ok(inferred.unwrap())

@@ -154,7 +154,6 @@ impl CodeGen for Dict {
                     .into());
                 }
                 v_expected = crate::TypeInfo::PyValue;
-                v_distinct = vec![crate::TypeInfo::PyValue];
             }
         }
         let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {

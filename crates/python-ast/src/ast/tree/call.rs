@@ -1967,8 +1967,8 @@ impl<'a> CodeGen for Call {
                                                 n.id.as_str(),
                                                 "int" | "float" | "str" | "bool" | "bytes"
                                                     | "bytearray" | "PathLike" | "BinaryIO" | "tuple"
-                                                    | "dict" | "list" | "set" | "Mapping" | "Iterable"
-                                                    | "Sequence" | "PathLike" | "BinaryIO"
+                                                    | "dict" | "list" | "set"
+                                                    | "Mapping" | "Iterable" | "Sequence"
                                             ) =>
                                         {
                                             Some(n.id.clone())
@@ -2088,8 +2088,7 @@ impl<'a> CodeGen for Call {
                                                 "int" | "float" | "str" | "bool" | "bytes"
                                                     | "bytearray" | "PathLike" | "BinaryIO" | "tuple"
                                                     | "dict" | "list" | "set" | "frozenset"
-                                                    | "Mapping" | "Iterable"
-                                                    | "Sequence" | "PathLike" | "BinaryIO"
+                                                    | "Mapping" | "Iterable" | "Sequence"
                                             ) {
                                                 names.push(id);
                                             } else if is_class_target(&t.id, &symbols, &options, 0)
@@ -4097,7 +4096,7 @@ impl<'a> CodeGen for Call {
                 }
                 _ => resolve_construction_class(&receiver.id, &symbols, &options),
             };
-            let mut is_associated = false;
+
             if let Some((class, class_symbols)) = resolved
                 && let Some(method) = class.method_on_mro(&attr.attr, &class_symbols)
                 && (matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
@@ -4121,7 +4120,6 @@ impl<'a> CodeGen for Call {
                     &options,
                     &symbols,
                 )?;
-                is_associated = true;
                 let cname = crate::safe_ident(&receiver.id);
                 let method_name = crate::safe_ident(&attr.attr);
                 return Ok(quote!({ #prelude #cname::#method_name(#(#args),*)? }));
@@ -4137,8 +4135,7 @@ impl<'a> CodeGen for Call {
             // positionally works. Re-resolves the class (the first arm
             // moved `resolved`); only when the first arm's classmethod/
             // staticmethod guard did NOT match (it returns on success).
-            if !is_associated
-                && let Some((class, class_symbols)) = (match symbols.get(&receiver.id) {
+            if let Some((class, class_symbols)) = (match symbols.get(&receiver.id) {
                     Some(crate::SymbolTableNode::ClassDef(c)) => {
                         Some((c.clone(), symbols.clone()))
                     }
@@ -6655,6 +6652,19 @@ fn check_default_constant(
         // defaults are still a divergence only for the mutable-container
         // arms below (issue #80).
         ExprType::Name(_) => Ok(()),
+        // A `field(default_factory=...)` marker (a @dataclass field default,
+        // urllib3's EmscriptenRequest.headers): the FACTORY creates a fresh
+        // container per call, which rython's inline-empty default matches
+        // exactly — the shared-mutable-default divergence does NOT apply.
+        // fill renders the typed empty container from the annotation.
+        ExprType::Call(c)
+            if c.keywords
+                .iter()
+                .any(|k| k.arg.as_deref() == Some("default_factory"))
+                && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "field") =>
+        {
+            Ok(())
+        }
         // A CLASS-CONSTRUCTION default (`highlighter=ReprHighlighter()` —
         // rich's Console, pip's vendored console): the default is a fresh
         // construction per call site, so the shared-mutable-default
@@ -6687,19 +6697,6 @@ fn check_default_constant(
              Pass the container explicitly at every call site instead"
         )
         .into()),
-        // A `field(default_factory=...)` marker (a @dataclass field default,
-        // urllib3's EmscriptenRequest.headers): the FACTORY creates a fresh
-        // container per call, which rython's inline-empty default matches
-        // exactly — the shared-mutable-default divergence does NOT apply.
-        // fill renders the typed empty container from the annotation.
-        ExprType::Call(c)
-            if c.keywords
-                .iter()
-                .any(|k| k.arg.as_deref() == Some("default_factory"))
-                && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "field") =>
-        {
-            Ok(())
-        }
         _ => Err(format!(
             "parameter `{param}` of `{fname}()` has a non-constant default; CPython \
              evaluates defaults once at def time, but rython would re-evaluate this \

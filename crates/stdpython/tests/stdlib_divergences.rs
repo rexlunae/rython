@@ -1,5 +1,10 @@
 //! Regression tests for the verified CPython divergences fixed in issue
 //! #82. Every expected value here was checked against CPython 3.11+.
+//!
+//! The std tier only: the pinned modules (datetime, glob, pathlib) are
+//! `#[cfg(feature = "std")]` — under the alloc tier this file compiles to
+//! nothing.
+#![cfg(feature = "std")]
 
 use stdpython::*;
 use stdpython::stdlib::datetime::{date, datetime, time};
