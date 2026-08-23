@@ -22,6 +22,8 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "loads",
     // glob: filesystem access can fail.
     "glob", "rglob", "iglob",
+    // os: entropy source can fail (os.urandom raises OSError).
+    "urandom",
 ];
 
 /// Issue #111: keyword-argument signatures of stdpython runtime functions

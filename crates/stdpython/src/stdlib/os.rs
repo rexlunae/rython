@@ -33,25 +33,21 @@ pub struct StatResult {
 
 python_function! {
     /// os.urandom - cryptographically secure random bytes (requests' digest
-    /// auth nonce). Falls back to a std RNG when the OS source fails.
-    pub fn urandom(size: i64) -> Vec<u8>
+    /// auth nonce). Raises OSError when the OS entropy source fails —
+    /// CPython never substitutes a weaker generator (the predictable-fallback
+    /// divergence was rejected in review).
+    pub fn urandom(size: i64) -> Result<Vec<u8>, PyException>
     [signature: (size)]
-    [concrete_types: (i64) -> Vec<u8>]
+    [concrete_types: (i64) -> Result<Vec<u8>, crate::PyException>]
     {
         let mut out = vec![0u8; size.max(0) as usize];
-        getrandom::fill(&mut out).unwrap_or_else(|_| {
-            // std fallback: not cryptographically strong, but the digest
-            // auth nonce only needs uniqueness.
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-            let seed = t.as_nanos() as u64;
-            let mut s = seed;
-            for b in out.iter_mut() {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                *b = (s >> 33) as u8;
-            }
-        });
-        out
+        match getrandom::fill(&mut out) {
+            Ok(()) => Ok(out),
+            Err(e) => Err(PyException::new(
+                "OSError",
+                format!("os.urandom: OS entropy source failed: {}", e),
+            )),
+        }
     }
 }
 

@@ -146,13 +146,18 @@ pub fn read_project_metadata(root: &Path) -> Result<ProjectMetadata> {
         }
     }
 
-    // setup.py: pip-style execution through a python3 shim, with a static
-    // fallback when no interpreter is available or the file fails to exec.
+    // setup.py: the STATIC parse runs FIRST — executing a downloaded
+    // sdist's setup.py is arbitrary third-party code at conversion time
+    // (the supply-chain vector flagged in review). The python3 shim (which
+    // stubs setuptools/distutils but still execs the file) only runs when
+    // the static parse yields nothing — matching pip's own ordering, where
+    // static metadata wins and setup.py execution is the legacy fallback.
     let setup_py = root.join("setup.py");
     if setup_py.is_file() {
-        let captured = run_setup_py_shim(&setup_py).unwrap_or_else(|| {
-            statically_parse_setup_py(&setup_py).unwrap_or_default()
-        });
+        let captured = statically_parse_setup_py(&setup_py)
+            .ok()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| run_setup_py_shim(&setup_py).unwrap_or_default());
         if meta.name.is_none() {
             meta.name = captured.get("name").cloned();
         }

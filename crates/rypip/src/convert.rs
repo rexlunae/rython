@@ -2867,7 +2867,6 @@ fn transpile(
     warnings: &mut Vec<String>,
     base_options: &PythonOptions,
 ) -> Result<String> {
-    eprintln!("TRANSPILE {}", module.file.display());
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
 
@@ -2884,9 +2883,7 @@ fn transpile(
         }
     }
 
-    eprintln!("PHASE parse-ok");
     let symbols = ast.clone().find_symbols(SymbolTableScopes::new());
-    eprintln!("PHASE find_symbols-ok");
     let module_name = module
         .path
         .last()
@@ -2904,10 +2901,8 @@ fn transpile(
     // Register rust-module imports in the shared symbol table so call
     // lowering can resolve them (Import::to_rust only sees a clone).
     let mut symbols = symbols;
-    eprintln!("PHASE register-ok");
     python_ast::register_rust_module_imports(&ast.raw.body, &options, &mut symbols)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    eprintln!("PHASE about-to-to_rust");
     let tokens = ast
         .to_rust(CodeGenContext::Module(module_name), options, symbols)
         .map_err(|e| {
