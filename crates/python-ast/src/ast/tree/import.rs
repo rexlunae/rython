@@ -67,6 +67,15 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "chain"
                 | "groupby"
                 | "islice"
+                | "count"
+                | "cycle"
+                | "repeat"
+                | "combinations"
+                | "combinations_with_replacement"
+                | "permutations"
+                | "pairwise"
+                | "starmap"
+                | "compress"
         ),
         "functools" => matches!(name, "reduce" | "partial" | "lru_cache" | "cache"),
         "hashlib" => {
