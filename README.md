@@ -287,6 +287,38 @@ change:
   `yield` divergence); `self.bit = 1 << bit_no` fields infer i64;
   `re.UNICODE` is a no-op (rython's regex is already Unicode).
 
+### Rounds 9–13: requests/urllib3 build chase (145 → 134 errors)
+
+The BUILD phase drives the remaining rustc errors in the generated
+requests crate down by fixing systemic codegen bugs, with the full
+workspace suite (31 targets, 315 codegen_semantics + 78 convert_tests)
+green at every step. The rounds fixed, among others:
+
+- **Call-site scope on imported-class methods** — keyword-VALUE
+  arguments of a call on an imported class's method now render in the
+  caller's symbol scope (dropped-DEFAULT constants still resolve in the
+  defining module's scope). requests' `p.prepare(headers=merge_setting(
+  ..., dict_class=CaseInsensitiveDict))` no longer emits E0423.
+- **The sibling-import drop is now re-export- and submodule-aware** —
+  `module_def_has_runtime_item` follows a module's own ImportFrom
+  re-export chains (SKIP_HEADER through util/__init__.py), recognizes
+  package submodules (`from .util import connection, ssl_`), and routes
+  stdpython-module re-exports (`from .compat import json as
+  complexjson`) to `use <stdpython>::json as complexjson;`.
+- **Submodule imports are reachable** — `from .http2 import probe as
+  http2_probe` enqueues `http2/probe.py` so it is transpiled.
+- **Dynamic-module-member divergences** — a read of a module member the
+  generated module has no item for (`util.ssl_.PROTOCOL_TLS`) lowers to
+  the boxed `None` with a warning; a call through a member that is not a
+  module-level function/class (`probe.acquire_and_get`) drops with the
+  callable-as-value warning (§12.3 ledger).
+- **Static types never leak `_`** — a promoted static whose inferred
+  type contains the uninferred placeholder (`PyDict<_, _>` from external
+  None values) falls back to the boxed `PyValue`.
+- **Version-gated module functions** — `def where` under `if
+  sys.version_info >= (3, 11):` (certifi) counts as a runtime item for
+  sibling imports.
+
 ## Roadmap
 
 The previously tracked stdlib/feature backlog ([#19](https://github.com/rexlunae/rython/issues/19),
