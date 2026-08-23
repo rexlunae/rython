@@ -3633,6 +3633,20 @@ fn reachable_walk_imports(
                         break;
                     }
                 }
+                // `from .http2 import probe as http2_probe` — the imported
+                // NAMES may be SUBMODULES of the resolved package
+                // (http2/probe.py), not just items of its __init__: enqueue
+                // each `base + name` that is a module (urllib3's
+                // connection.py uses probe's acquire_and_get). Without
+                // this, probe.py is never transpiled and the call fails
+                // E0433.
+                for alias in &i.names {
+                    let mut cand = base.clone();
+                    cand.push(alias.name.clone());
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                    }
+                }
             }
         }
         _ => {}

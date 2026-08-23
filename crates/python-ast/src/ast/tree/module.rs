@@ -2579,6 +2579,151 @@ pub(crate) fn module_def_has_runtime_item(
         }
         false
     }
+    if scan(&module.raw.body, name, false) {
+        return true;
+    }
+    // The name may be a SUBMODULE of the package (`from .util import
+    // connection, ssl_` — urllib3's connection.py, where connection and
+    // ssl_ are util/connection.rs / util/ssl_.rs): the defining module's
+    // body has no item of that name, but the generated crate has a module
+    // at `path + [name]`, so the import (`pub use crate::urllib3::util::
+    // connection;`) resolves.
+    let mut submodule = path.to_vec();
+    submodule.push(name.to_string());
+    if options.module_defs.contains_key(&submodule) {
+        return true;
+    }
+    // The name may be RE-EXPORTED by the defining module via its own
+    // ImportFrom (`from .request import SKIP_HEADER, SKIPPABLE_HEADERS` —
+    // urllib3's util/__init__.py): the generated util/mod.rs carries the
+    // `pub use crate::urllib3::util::request::SKIP_HEADER;` chain, so an
+    // importer's `from .util import SKIP_HEADER` resolves. Follow the
+    // chain to the defining module's item.
+    module_reexports_item(options, path, name, &mut std::collections::HashSet::new())
+}
+
+/// Whether the module at `path` RE-EXPORTS `name` through one of its own
+/// ImportFrom statements (`from .request import SKIP_HEADER` in urllib3's
+/// util/__init__.py): the generated module re-exports the name, so a
+/// sibling importing `from .util import SKIP_HEADER` resolves. The chain
+/// is followed depth-first with a visited set (a cycle of re-exports is
+/// not a runtime item).
+fn module_reexports_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+    visited: &mut std::collections::HashSet<Vec<String>>,
+) -> bool {
+    if !visited.insert(path.to_vec()) {
+        return false;
+    }
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    use crate::StatementType as ST;
+    for s in &module.raw.body {
+        // A plain `import json` binding the name (requests' compat.py
+        // re-exports stdlib json): the name resolves through the
+        // stdpython glob, so the re-export has a runtime item.
+        if let ST::Import(im) = &s.statement {
+            if im.names.iter().any(|a| {
+                a.asname.as_deref() == Some(name)
+                    || (a.asname.is_none()
+                        && a.name.split('.').next() == Some(name))
+            }) && im
+                .names
+                .iter()
+                .any(|a| a.name.split('.').next().is_some_and(crate::is_stdpython_module))
+            {
+                return true;
+            }
+            continue;
+        }
+        let ST::ImportFrom(i) = &s.statement else { continue };
+        // The import must bind OUR name (as itself or with an asname).
+        if !i.names.iter().any(|a| {
+            a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name)
+        }) {
+            continue;
+        }
+        // Resolve the re-export's defining module in THIS module's package
+        // context (options.module_path is the caller's context; set it to
+        // the defining module's package path, like ImportFrom::to_rust's
+        // caller does). An __init__ module's path IS its package path;
+        // otherwise the package is the parent.
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+        let mut ctx = options.clone();
+        ctx.module_path = if is_package {
+            path.to_vec()
+        } else {
+            path[..path.len().saturating_sub(1)].to_vec()
+        };
+        let target = i.resolved_module_path(&ctx);
+        // The re-export target may itself be a module of the crate whose
+        // item exists, or another re-export chain.
+        let defining = i
+            .names
+            .iter()
+            .find(|a| a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name))
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| name.to_string());
+        if !target.is_empty() && options.module_defs.contains_key(&target) {
+            let mut sub = target.clone();
+            sub.push(defining.clone());
+            if options.module_defs.contains_key(&sub)
+                || module_reexports_item(options, &target, &defining, visited)
+                || scan_module_body_for_item(options, &target, &defining)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the module at `path` directly defines `name` (a function, class,
+/// or assignment) OUTSIDE of TYPE_CHECKING — the leaf of a re-export chain.
+fn scan_module_body_for_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    fn scan(body: &[crate::Statement], name: &str, in_type_checking: bool) -> bool {
+        use crate::StatementType as ST;
+        for s in body {
+            match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                    if !in_type_checking && f.name == name {
+                        return true;
+                    }
+                }
+                ST::ClassDef(c) => {
+                    if !in_type_checking && c.name == name {
+                        return true;
+                    }
+                }
+                ST::Assign(a) => {
+                    if !in_type_checking
+                        && a.targets.iter().any(|t| {
+                            matches!(t, crate::ExprType::Name(n) if n.id == name)
+                        })
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
     scan(&module.raw.body, name, false)
 }
 

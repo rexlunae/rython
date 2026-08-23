@@ -7286,3 +7286,222 @@ fn trait_imports_dedupe_across_class_aliases() {
         count
     );
 }
+
+#[test]
+fn imported_class_method_keyword_values_resolve_in_caller_scope() {
+    // requests' sessions.py: `p.prepare(headers=merge_setting(request.
+    // headers, self.headers, dict_class=CaseInsensitiveDict))` where p is a
+    // models.py PreparedRequest. The keyword VALUE (a call into the CALLER's
+    // module) must resolve its callee in the caller's scope — passing the
+    // defining module's symbols made merge_setting unknown, so the keyword
+    // lowered positionally and the class arg rendered raw (E0423).
+    let a = parse(
+        "class OrderedDict:\n    pass\n\nclass PreparedRequest:\n    def prepare(self, method, url, headers, params, auth, cookies, hooks, json):\n        return headers\n",
+        "models.py",
+    )
+    .unwrap();
+    let b = parse(
+        concat!(
+            "from .models import PreparedRequest, OrderedDict\n",
+            "\n",
+            "def merge_setting(request_setting, session_setting, dict_class: type = OrderedDict):\n",
+            "    return dict_class\n",
+            "\n",
+            "class Session:\n",
+            "    def __init__(self):\n",
+            "        self.headers = None\n",
+            "\n",
+            "    def prepare_request(self, request):\n",
+            "        p = PreparedRequest()\n",
+            "        return p.prepare(\n",
+            "            method=\"GET\",\n",
+            "            url=\"u\",\n",
+            "            headers=merge_setting(request.headers, self.headers, dict_class=OrderedDict),\n",
+            "            params=None,\n",
+            "            auth=None,\n",
+            "            cookies=None,\n",
+            "            hooks=None,\n",
+            "            json=None,\n",
+            "        )\n",
+        ),
+        "sessions.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["models".to_string()], std::rc::Rc::new(a));
+    defs.insert(vec!["sessions".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        concat!(
+            "from .models import PreparedRequest, OrderedDict\n",
+            "\n",
+            "def merge_setting(request_setting, session_setting, dict_class: type = OrderedDict):\n",
+            "    return dict_class\n",
+            "\n",
+            "class Session:\n",
+            "    def __init__(self):\n",
+            "        self.headers = None\n",
+            "\n",
+            "    def prepare_request(self, request):\n",
+            "        p = PreparedRequest()\n",
+            "        return p.prepare(\n",
+            "            method=\"GET\",\n",
+            "            url=\"u\",\n",
+            "            headers=merge_setting(request.headers, self.headers, dict_class=OrderedDict),\n",
+            "            params=None,\n",
+            "            auth=None,\n",
+            "            cookies=None,\n",
+            "            hooks=None,\n",
+            "            json=None,\n",
+            "        )\n",
+        ),
+        "sessions.py",
+        options,
+    )
+    .expect("converts");
+    // The merge_setting call's third argument (dict_class=OrderedDict) must
+    // lower to the boxed None — the class-as-value divergence — not a raw
+    // class-name token (E0423 `expected value, found struct`). The temp
+    // prelude binds it as __rython_arg_2 before the call.
+    let call_idx = out.find("merge_setting (").expect("call present");
+    let prelude_start = out[..call_idx].rfind("let __rython_arg_").map(|i| i).unwrap_or(0);
+    let block = &out[prelude_start..call_idx + 200];
+    assert!(
+        block.contains("stdpython :: PyValue :: None_") || block.contains("PyValue::None_"),
+        "class-value arg for dict_class must box to None, got: {}",
+        block
+    );
+    assert!(
+        !block.contains("OrderedDict"),
+        "class name must not render raw as an argument: {}",
+        block
+    );
+}
+
+#[test]
+fn sibling_import_of_reexported_and_submodule_names_is_kept() {
+    // urllib3's connection.py: `from .util import SKIP_HEADER,
+    // SKIPPABLE_HEADERS, connection, ssl_` — SKIP_HEADER/SKIPPABLE_HEADERS
+    // are RE-EXPORTED by util/__init__.py (`from .request import ...`),
+    // and connection/ssl_ are SUBMODULES (util/connection.rs,
+    // util/ssl_.rs). The f103e59 "drop ungenerated sibling imports" check
+    // must NOT drop them (E0425/E0433 otherwise).
+    let a = parse(
+        concat!(
+            "def make_headers():
+",
+            "    return {}
+",
+            "SKIP_HEADER = \"@@@SKIP_HEADER@@@\"
+",
+            "SKIPPABLE_HEADERS = [SKIP_HEADER]
+",
+        ),
+        "request.py",
+    )
+    .unwrap();
+    let b = parse(
+        concat!(
+            "from .request import SKIP_HEADER, SKIPPABLE_HEADERS, make_headers
+",
+        ),
+        "util/__init__.py",
+    )
+    .unwrap();
+    // The SUBMODULES the `from .util import connection, ssl_` names
+    // resolve to (urllib3's util/connection.py, util/ssl_.py).
+    let conn_sub = parse("def create_connection(addr):\n    return addr\n", "util/connection.py").unwrap();
+    let ssl_sub = parse("ALPN_PROTOCOLS = [\"h2\"]\n", "util/ssl_.py").unwrap();
+    let c = parse(
+        concat!(
+            "from .util import SKIP_HEADER, SKIPPABLE_HEADERS, connection, ssl_
+",
+            "
+",
+            "def f(headers):
+",
+            "    return SKIP_HEADER
+",
+        ),
+        "connection.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["util".to_string(), "request".to_string()], std::rc::Rc::new(a));
+    defs.insert(vec!["util".to_string()], std::rc::Rc::new(b));
+    defs.insert(
+        vec!["util".to_string(), "connection".to_string()],
+        std::rc::Rc::new(conn_sub),
+    );
+    defs.insert(vec!["util".to_string(), "ssl_".to_string()], std::rc::Rc::new(ssl_sub));
+    defs.insert(vec!["connection".to_string()], std::rc::Rc::new(c));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        concat!(
+            "from .util import SKIP_HEADER, SKIPPABLE_HEADERS, connection, ssl_\n",
+            "\n",
+            "def f(headers):\n",
+            "    return SKIP_HEADER\n",
+        ),
+        "connection.py",
+        options,
+    )
+    .expect("converts");
+    // The SKIP_HEADER re-export import must be KEPT (its use chain
+    // resolves), and the submodule imports too.
+    assert!(
+        out.contains(":: util :: SKIP_HEADER"),
+        "re-exported SKIP_HEADER import must be kept: {}",
+        out
+    );
+    assert!(
+        out.contains(":: util :: connection") && out.contains(":: util :: ssl_"),
+        "submodule imports must be kept: {}",
+        out
+    );
+    assert!(
+        out.contains("SKIP_HEADER"),
+        "SKIP_HEADER must resolve at the use site: {}",
+        out
+    );
+}
+
+
+#[test]
+fn import_reexport_of_stdpython_module_is_kept() {
+    // requests' models.py: `from .compat import json as complexjson` where
+    // compat.py does `import json` (stdlib). The f103e59 sibling-import
+    // drop must not drop the re-exported stdpython-module name (E0425
+    // `cannot find value complexjson` otherwise).
+    let a = parse("import json\n", "compat.py").unwrap();
+    let b = parse(
+        "from .compat import json as complexjson\n\ndef f():\n    return complexjson.loads(\"{}\")\n",
+        "models.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["compat".to_string()], std::rc::Rc::new(a));
+    defs.insert(vec!["models".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        "from .compat import json as complexjson\n\ndef f():\n    return complexjson.loads(\"{}\")\n",
+        "models.py",
+        options,
+    )
+    .expect("converts");
+    // The import must be kept and the alias must resolve.
+    assert!(
+        out.contains("complexjson"),
+        "aliased stdpython re-export import must be kept: {}",
+        out
+    );
+}

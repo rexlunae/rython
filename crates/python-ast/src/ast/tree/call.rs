@@ -3883,8 +3883,12 @@ impl<'a> CodeGen for Call {
                             &self.keywords,
                             &ctx,
                             &options,
-                            &class_symbols,
+                            // Argument expressions render in the caller's
+                            // scope; dropped-default constants resolve in
+                            // the defining module's scope.
+                            &symbols,
                             Some(&class.name),
+                            Some(&class_symbols),
                         );
                         let MappedArguments { prelude, args } = match mapped {
                             Ok(m) => m,
@@ -4366,13 +4370,24 @@ impl<'a> CodeGen for Call {
                         ));
                         return Ok(quote!(stdpython::PyValue::None_));
                     }
-                    let MappedArguments { prelude, args } = map_call_arguments(
+                    let MappedArguments { prelude, args } = map_call_arguments_inner(
                         &sig,
                         &self.args,
                         &self.keywords,
                         &ctx,
                         &options,
-                        &class_symbols,
+                        // ARGUMENT expressions render in the CALLER's scope
+                        // (an argument can be a call into the caller's
+                        // module — `merge_setting(request.headers,
+                        // self.headers, dict_class=CaseInsensitiveDict)` in
+                        // requests' prepare_request, where p is a models.py
+                        // PreparedRequest): the inner callee resolves in
+                        // sessions.py, not models.py.
+                        &symbols,
+                        None,
+                        // Dropped DEFAULT constants resolve in the defining
+                        // module's scope.
+                        Some(&class_symbols),
                     )?;
                     // A field receiver (`self.inner`, `self.items`) renders
                     // in place flavor when the callee mutates the receiver
@@ -5385,7 +5400,8 @@ impl<'a> CodeGen for Call {
         }
 
         let callee = match self.func.as_ref() {
-            ExprType::Name(n) => match symbols.get(&n.id) {
+            ExprType::Name(n) => {
+                match symbols.get(&n.id) {
                 Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),
                 // Issue #123: an IMPORTED function (`from pip._internal.
                 // locations import get_scheme`) resolves through the
@@ -5402,6 +5418,7 @@ impl<'a> CodeGen for Call {
                     }
                 }
                 _ => None,
+                }
             },
             _ => None,
         };
@@ -5535,6 +5552,34 @@ impl<'a> CodeGen for Call {
                 "call through callable value `{}` is dropped (the \
                  callable-as-value divergence, issue #122)",
                 callee_name.id
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+
+        // A call through a SIBLING-MODULE member that is NOT a module-level
+        // function (`http2_probe.acquire_and_get(...)` — urllib3's
+        // connection.py, where probe.py's acquire_and_get is a module-level
+        // BOUND-METHOD alias `acquire_and_get = _HTTP2_PROBE_CACHE.
+        // acquire_and_get`, not a `def`): the member is a callable VALUE —
+        // rython cannot hold it, so the generated module has no `pub fn`
+        // for it (E0425). Drop the call (the callable-as-value divergence).
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && crate::ast::tree::attribute::is_module_path_chain(
+                &attr.value,
+                &symbols,
+                &options,
+            )
+            && let Some(module_path) = crate::ast::tree::call::module_path_of(&attr.value, &symbols, &options)
+            && options.module_defs.contains_key(&module_path)
+            && crate::module_function_def(&options, &module_path, &attr.attr).is_none()
+            && crate::module_class_def(&options, &module_path, &attr.attr).is_none()
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "call through module member `{}.{}` is dropped (the member is a \
+                 callable VALUE — a bound method or alias, not a module-level \
+                 function; the callable-as-value divergence, issue #122)",
+                module_path.last().map(|s| s.as_str()).unwrap_or(""),
+                attr.attr
             ));
             return Ok(quote!(stdpython::PyValue::None_));
         }
@@ -6666,6 +6711,46 @@ pub(crate) fn root_name(expr: &ExprType) -> Option<&str> {
     }
 }
 
+/// The CRATE module path a receiver name resolves to (`http2_probe` from
+/// `from .http2 import probe as http2_probe` → ["urllib3", "http2",
+/// "probe"]), for the module-member-call drop: a call through a member
+/// that is not a module-level function/class cannot render. None when the
+/// name is not a sibling submodule import.
+pub(crate) fn module_path_of(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<Vec<String>> {
+    let ExprType::Name(n) = expr else { return None };
+    if crate::module_name_shadowed(&n.id, symbols) {
+        return None;
+    }
+    // Follow alias chains (`from .http2 import probe as http2_probe`
+    // registers "http2_probe" as Alias("probe")).
+    let mut current = n.id.clone();
+    for _ in 0..16 {
+        match symbols.get(&current) {
+            Some(crate::SymbolTableNode::Alias(canonical)) => {
+                current = canonical.clone();
+            }
+            Some(crate::SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                let mut path = ifm.resolved_module_path(options);
+                // The canonical (unaliased) name is the actual module.
+                path.push(
+                    ifm.names
+                        .iter()
+                        .find(|a| a.asname.as_deref() == Some(&current))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| current.clone()),
+                );
+                return Some(path);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// The MODULE path a dotted chain names (`botocore.httpsession` →
 /// ["botocore", "httpsession"]), for in-crate module member resolution.
 pub(crate) fn dotted_module_path(expr: &ExprType) -> Option<Vec<String>> {
@@ -6696,7 +6781,7 @@ fn map_call_arguments(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<MappedArguments, Box<dyn std::error::Error>> {
-    map_call_arguments_inner(func, args, keywords, ctx, options, symbols, None)
+    map_call_arguments_inner(func, args, keywords, ctx, options, symbols, None, None)
 }
 
 /// [`map_call_arguments`] with the CONSTRUCTED class's name (when the call
@@ -6704,6 +6789,15 @@ fn map_call_arguments(
 /// defaults that reference CLASS-BODY constants (`DEFAULT_ALLOWED_METHODS`
 /// — urllib3's Retry) resolve through the class, even at module level
 /// where there is no enclosing-class context.
+///
+/// `default_symbols` is the DEFINING module's symbol scope for a call on an
+/// IMPORTED class's method/constructor (`p.prepare(...)` — requests'
+/// sessions.py, where p is a models.py PreparedRequest): dropped-DEFAULT
+/// constants resolve there, while the ARGUMENT expressions render in the
+/// caller's `symbols` scope (an argument can itself be a call into the
+/// caller's module — `merge_setting(request.headers, self.headers,
+/// dict_class=CaseInsensitiveDict)` — which must resolve its callee in the
+/// caller's scope).
 fn map_call_arguments_inner(
     func: &crate::FunctionDef,
     args: &[ExprType],
@@ -6712,6 +6806,7 @@ fn map_call_arguments_inner(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
     constructed_class: Option<&str>,
+    default_symbols: Option<&SymbolTableScopes>,
 ) -> Result<MappedArguments, Box<dyn std::error::Error>> {
     let fname = &func.name;
     // Optional-annotated parameters take Option values: the Option-slot
@@ -6758,9 +6853,15 @@ fn map_call_arguments_inner(
         // A cross-module constant name used as a dropped DEFAULT
         // (`HTTPAdapter()` — sessions.py, whose __init__ defaults reference
         // adapters.py's `DEFAULT_POOLSIZE = 10`): the call site does not
-        // import the name, so inline the constant's VALUE.
+        // import the name, so inline the constant's VALUE. Resolve in the
+        // DEFINING module's scope when the callee is an imported class's
+        // method (the caller may not even bind the constant).
         if let ExprType::Name(n) = expr
-            && let Some(v) = resolve_constant_name(&n.id, &symbols, &options)
+            && let Some(v) = resolve_constant_name(
+                &n.id,
+                default_symbols.unwrap_or(symbols),
+                &options,
+            )
         {
             return Ok(v);
         }
@@ -6780,7 +6881,7 @@ fn map_call_arguments_inner(
                 .or(ctx.enclosing_class_name())
             && let Some(class) = crate::resolve_class_referenced(
                 &class_name,
-                &symbols,
+                default_symbols.unwrap_or(symbols),
                 &options,
             )
             && class.body.iter().any(|bs| {
@@ -6799,7 +6900,7 @@ fn map_call_arguments_inner(
                 .or(ctx.enclosing_class_name())
             && let Some(class) = crate::resolve_class_referenced(
                 &class_name,
-                &symbols,
+                default_symbols.unwrap_or(symbols),
                 &options,
             )
             && class.body.iter().any(|bs| {
