@@ -500,6 +500,25 @@ impl CodeGen for Module {
                     promoted_statics.insert(b1.clone());
                 }
             }
+            // A DEFINITE try/except module value (`try: is_urllib3_1 =
+            // int(...) == 1 except (TypeError, AttributeError):
+            // is_urllib3_1 = True` — requests' compat.py): the SAME name
+            // is stored once in the try body and once in a handler — a
+            // definite value (the try either completes or raises into the
+            // handler), so it can be promoted to a LazyLock static without
+            // freezing a stale value. Same count shape as the if/else case
+            // (each nested store ×2 → 4).
+            if let crate::StatementType::Try(t) = &s.statement {
+                let body_name = single_assign_name(&t.body);
+                if let Some(name) = body_name
+                    && t.handlers.iter().all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                    && module_assign_counts.get(&name) == Some(&4)
+                    && function_free_reads.contains(&name)
+                {
+                    promoted_conditional.insert(name.clone(), i);
+                    promoted_statics.insert(name.clone());
+                }
+            }
         }
         let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols, &options);
         let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols, &options);
@@ -1043,6 +1062,56 @@ impl CodeGen for Module {
                     continue;
                 }
             }
+            // A DEFINITE try/except module value (promoted_conditional —
+            // requests' compat.py is_urllib3_1): the try either completes
+            // or raises into the handler, and BOTH store the same name —
+            // the value is definitely set. Emit the LazyLock static whose
+            // closure runs the try and falls back to the handler's value.
+            if let crate::StatementType::Try(t) = &s.statement {
+                if let Some(name) = single_assign_name(&t.body)
+                    && t.handlers
+                        .iter()
+                        .all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                    && promoted_conditional.contains_key(&name)
+                {
+                    let ident = crate::safe_ident(&name);
+                    let body_assign = match &t.body[0].statement {
+                        crate::StatementType::Assign(a) => a.clone(),
+                        _ => unreachable!("single_assign_name matched"),
+                    };
+                    let handler_assign = match &t.handlers[0].body[0].statement {
+                        crate::StatementType::Assign(a) => a.clone(),
+                        _ => unreachable!("single_assign_name matched"),
+                    };
+                    let body_val = body_assign
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    let handler_val = handler_assign
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    let body_val = crate::ast::tree::call::strip_trailing_question(&body_val);
+                    // The try body runs first; on error the handler's value
+                    // applies. The handler may itself fail — propagate.
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| {
+                                match (|| -> Result<_, PyException> {
+                                    Ok(stdpython::PyValue::from(#body_val))
+                                })() {
+                                    Ok(__rython_v) => __rython_v,
+                                    Err(_) => stdpython::PyValue::from(#handler_val),
+                                }
+                            });
+                    });
+                    module_init_stmts.push(quote!(let _ = &*#ident;));
+                    has_module_init_code = true;
+                    continue;
+                }
+            }
             let statement = s
                 .clone()
                 .to_rust(ctx.clone(), init_options, symbols.clone())
@@ -1502,8 +1571,7 @@ pub fn module_imports_asyncio(body: &[crate::Statement]) -> bool {
 /// `__version__ = version = '2.7.0'` in _version.py). Returns None when any
 /// target is a subscript/attribute/tuple (mixed targets cannot all be
 /// promoted as statics).
-fn assign_name_targets(a: &crate::Assign) -> Option<Vec<String>> {
-    if a.targets.is_empty() {
+fn assign_name_targets(a: &crate::Assign) -> Option<Vec<String>> {    if a.targets.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(a.targets.len());
@@ -1514,6 +1582,24 @@ fn assign_name_targets(a: &crate::Assign) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+/// The single plain-Name target of a one-assignment statement list, or
+/// None when the list is not exactly one `x = ...` (used by the definite
+/// try/except module-value promotion — requests' compat.py is_urllib3_1).
+fn single_assign_name(stmts: &[crate::Statement]) -> Option<String> {
+    if stmts.len() != 1 {
+        return None;
+    }
+    match &stmts[0].statement {
+        crate::StatementType::Assign(a) if a.targets.len() == 1 => {
+            match &a.targets[0] {
+                crate::ExprType::Name(n) => Some(n.id.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Count stores to each name across MODULE scope: top-level assignments

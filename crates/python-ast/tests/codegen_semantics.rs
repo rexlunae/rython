@@ -7221,3 +7221,26 @@ fn property_getter_setter_pair_renames_setter_and_routes_access() {
         out
     );
 }
+
+#[test]
+fn definite_try_except_module_value_promotes_to_static() {
+    // requests' compat.py: `try: is_urllib3_1 = int(...) == 1 except
+    // (TypeError, AttributeError): is_urllib3_1 = True` — the SAME name is
+    // stored once in the try body and once in the handler, so the value is
+    // definitely set. It must promote to a LazyLock static (functions read
+    // it — E0425 otherwise), with the handler value as the fallback.
+    let out = compile(
+        "try:\n    is_urllib3_1 = int('2'.split('.')[0]) == 1\nexcept (TypeError, AttributeError):\n    is_urllib3_1 = True\n\ndef f() -> bool:\n    return not is_urllib3_1\n",
+        "trydef.py",
+    );
+    assert!(
+        out.contains("pub static is_urllib3_1"),
+        "definite try/except value must promote to a static: {}",
+        out
+    );
+    assert!(
+        out.contains("(* is_urllib3_1) . clone ()") || out.contains("(*is_urllib3_1).clone()"),
+        "function reads must deref-clone the static: {}",
+        out
+    );
+}

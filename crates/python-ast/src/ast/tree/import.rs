@@ -113,6 +113,12 @@ pub(crate) fn resolves_to_external_import(
                     // The terminal hop: external when the module is neither
                     // stdpython nor a vendored python-module dep.
                     let root = ifm.module.split('.').next().unwrap_or("");
+                    // `collections.abc` is the compile-time-only typing
+                    // abstraction (Mapping, Iterable, ...): its names have
+                    // no runtime items anywhere — external.
+                    if ifm.module == "collections.abc" {
+                        return true;
+                    }
                     return !is_stdpython_module(root)
                         && !options.python_modules.contains(root);
                 }
