@@ -657,7 +657,7 @@ impl<'a> CodeGen for Assign {
                     let class_receiver = matches!(
                         symbols.get(root),
                         Some(crate::SymbolTableNode::ClassDef(_))
-                    );
+                    ) || crate::resolve_class_referenced(root, &symbols, &options).is_some();
                     let module_receiver =
                         crate::ast::tree::attribute::is_module_path_chain(
                             &attr.value,
@@ -671,7 +671,15 @@ impl<'a> CodeGen for Assign {
                              mutation divergence)",
                             root,
                             attr.attr,
-                            if class_receiver { "class" } else { "module" }
+                            if matches!(
+                                symbols.get(root),
+                                Some(crate::SymbolTableNode::ClassDef(_))
+                            ) || crate::resolve_class_referenced(root, &symbols, &options).is_some()
+                            {
+                                "class"
+                            } else {
+                                "module"
+                            }
                         ));
                         return Ok(TokenStream::new());
                     }
