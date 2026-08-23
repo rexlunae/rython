@@ -3631,7 +3631,16 @@ impl<'a> CodeGen for Call {
             if n.id == "RLResolver" {
             }
             if let Some((class, class_symbols)) = resolved {
-                let cname = crate::safe_ident(&n.id);
+                // The CONSTRUCTED type's Rust name: for a @classmethod's
+                // `cls(...)` the receiver identifier `cls` is not a Rust
+                // type in scope — the class's OWN name is (urllib3's
+                // Retry.from_int).
+                let cname = match symbols.get(&n.id) {
+                    Some(crate::SymbolTableNode::ClassDef(c)) => {
+                        crate::safe_ident(&c.name)
+                    }
+                    _ => crate::safe_ident(&n.id),
+                };
                 // An EXCEPTION class (`SSLError(e)` — urllib3's
                 // connectionpool): exceptions are string-tagged PyException
                 // values, not structs. Lower exactly like a `raise`

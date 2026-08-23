@@ -2294,6 +2294,17 @@ pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {
         ExprType::FormattedValue(fv) => expr_references(&fv.value, name),
         ExprType::Lambda(l) => expr_references(&l.body, name),
         ExprType::Starred(s) => expr_references(&s.value, name),
+        // `yield x` / `yield from xs` / `await f(x)` — the yielded or
+        // awaited expression is a real reference (a loop index used only
+        // in a yield body must not lower to `_`; response.py's `for x in
+        // chunks[1:-1]: yield x + b"\n"`).
+        ExprType::Yield(y) => y
+            .value
+            .as_ref()
+            .map(|v| expr_references(v, name))
+            .unwrap_or(false),
+        ExprType::YieldFrom(yf) => expr_references(&yf.value, name),
+        ExprType::Await(a) => expr_references(&a.value, name),
         _ => false,
     }
 }

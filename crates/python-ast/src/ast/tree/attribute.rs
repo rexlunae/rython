@@ -94,6 +94,10 @@ impl<'a> CodeGen for Attribute {
         // response decoders): literal class-level constants emit as
         // `impl X { pub const NAME: T = v; }` (class_def.rs), so the read
         // renders `X::NAME`, not `X.NAME`. Computed before moves below.
+        // The rendered path is the CLASS's name, not the receiver's
+        // identifier: a @classmethod body reads `cls.DEFAULT` where `cls`
+        // is bound to the enclosing ClassDef — the constant lives on the
+        // class (urllib3's Retry.from_int).
         let class_const_read: Option<String> = match self.value.as_ref() {
             ExprType::Name(receiver) => symbols
                 .get(&receiver.id)
@@ -110,7 +114,33 @@ impl<'a> CodeGen for Attribute {
                     }),
                     _ => false,
                 })
-                .then(|| receiver.id.clone()),
+                .then(|| {
+                    // The class's OWN name (for `cls`, the receiver
+                    // identifier is not a Rust type in scope).
+                    match symbols.get(&receiver.id) {
+                        Some(crate::SymbolTableNode::ClassDef(c)) => c.name.clone(),
+                        _ => receiver.id.clone(),
+                    }
+                }),
+            _ => None,
+        };
+        // A receiver that IS a class (a @classmethod's `cls`, or a bare
+        // class name read as a value): an attribute on it that is NOT a
+        // class-body constant (`cls.DEFAULT` where `Retry.DEFAULT =
+        // Retry(3)` is assigned at MODULE level after the class — urllib3's
+        // Retry.from_int) has no static item — the module-level
+        // class-attribute divergence: the read boxes to None.
+        let class_value_receiver: Option<String> = match self.value.as_ref() {
+            ExprType::Name(receiver) => match symbols.get(&receiver.id) {
+                Some(crate::SymbolTableNode::ClassDef(_)) => {
+                    if class_const_read.is_some() {
+                        None
+                    } else {
+                        Some(receiver.id.clone())
+                    }
+                }
+                _ => None,
+            },
             _ => None,
         };
         let module_chain = is_module_path_chain(&self.value, &symbols, &options);
@@ -260,6 +290,19 @@ impl<'a> CodeGen for Attribute {
             if let Some(receiver) = &class_const_read {
                 let receiver = crate::safe_ident(receiver);
                 return Ok(quote!(#receiver::#attr));
+            }
+            // A CLASS receiver read as a value with a non-const attribute
+            // (`cls.DEFAULT` — module-level class attribute): no static
+            // item — the boxed None (module-level class-attribute
+            // divergence).
+            if let Some(receiver) = &class_value_receiver {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` (a module-level class attribute) lowers to the boxed \
+                     None (the class-attribute divergence; class attributes \
+                     assigned outside the class body are not importable)",
+                    receiver, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
             }
             // Use . for field/method access (Python's obj.field becomes obj.field).
             // A class field owned by an ancestor of the receiver's class is

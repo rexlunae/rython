@@ -1411,6 +1411,32 @@ fn plain_for_has_no_break_flag() {
 }
 
 #[test]
+fn loop_index_read_in_yield_body_is_not_unused() {    // `for x in chunks[1:-1]: yield x + b"\n"` (urllib3's response
+    // __iter__): the index is used ONLY in the yield expression, which the
+    // unused-index walker must still see — otherwise `x` lowers to `_`
+    // while the body references it (E0425).
+    let out = compile(
+        "def gen(chunks: list[bytes]) -> None:\n    for x in chunks[1:-1]:\n        yield x + b\"\\n\"\n",
+        "genyield.py",
+    );
+    assert!(
+        out.contains("for x in"),
+        "index used in yield must bind, not lower to _: {}",
+        out
+    );
+    assert!(
+        !out.contains("for _ in"),
+        "index used in yield must bind, not lower to _: {}",
+        out
+    );
+    assert!(
+        out.contains("(x) . py_add"),
+        "yield body must reference x: {}",
+        out
+    );
+}
+
+#[test]
 fn while_else_tracks_break() {
     let src = "while cond:\n    break\nelse:\n    done()\n";
     let out = compile(src, "whileelse.py");
@@ -6810,6 +6836,34 @@ fn dict_any_literal_wraps_mixed_values() {
     assert!(
         out.matches("PyValue :: from").count() >= 2 || out.matches("PyValue::from").count() >= 2,
         "mixed values must wrap: {}",
+        out
+    );
+}
+
+#[test]
+fn classmethod_cls_reference_resolves_to_class() {
+    // urllib3's Retry.from_int: `@classmethod def from_int(cls, ...)` —
+    // the class parameter is dropped from the signature, but the body
+    // references it (`cls.DEFAULT`, `cls(...)`). `cls` must resolve to the
+    // enclosing class: constant reads render `Retry::DEFAULT` and calls
+    // render `Retry::new(...)`.
+    let out = compile(
+        "class Retry:\n    DEFAULT = 3\n    @classmethod\n    def from_int(cls, retries: int) -> int:\n        if retries is None:\n            retries = cls.DEFAULT\n        return cls(retries)\n",
+        "retry.py",
+    );
+    assert!(
+        out.contains("Retry :: DEFAULT"),
+        "cls.DEFAULT must render the class constant: {}",
+        out
+    );
+    assert!(
+        out.contains("Retry :: new"),
+        "cls(...) must render the class constructor: {}",
+        out
+    );
+    assert!(
+        !out.contains("cls . DEFAULT"),
+        "cls must not leak as a bare receiver: {}",
         out
     );
 }

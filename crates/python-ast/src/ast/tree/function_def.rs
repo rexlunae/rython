@@ -622,6 +622,22 @@ impl FunctionDef {
             symbols = s.clone().find_symbols(symbols);
         }
 
+        // A @classmethod's body references the dropped class parameter
+        // (`cls.DEFAULT`, `cls(...)` — urllib3's Retry.from_int): bind `cls`
+        // to the enclosing class's ClassDef so attribute reads resolve to
+        // class constants and calls resolve to construction — the class
+        // reference is a compile-time value (issue #117).
+        if matches!(decorator, MethodDecorator::ClassMethod)
+            && let Some(class_name) = ctx.enclosing_class_name()
+            && let Some(crate::SymbolTableNode::ClassDef(class)) =
+                symbols.get(class_name)
+        {
+            symbols.insert(
+                "cls".to_string(),
+                crate::SymbolTableNode::ClassDef((*class).clone()),
+            );
+        }
+
         // A `def` in a class body is an instance method: its first
         // positional parameter is the RECEIVER — `self` becomes the Rust
         // receiver instead of a parameter, `&mut self` when the method
