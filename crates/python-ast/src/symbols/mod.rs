@@ -109,6 +109,11 @@ pub enum SymbolTableNode {
     Import(Import),
     ImportFrom(ImportFrom),
     Alias(String),
+    /// A name bound by an `except ... as name:` clause: a runtime
+    /// PyException object with no static fields. Attribute reads on it have
+    /// no shape — they lower to the boxed None (the dynamic-attribute
+    /// divergence; rython models exceptions as name + message only).
+    ExceptBinding,
     /// A name bound to a `rust.bind(...)` / `rust.c_bind(...)` declaration:
     /// a compile-time symbol. Call sites lower to direct calls into the
     /// bound crate; the name never exists as a runtime value.

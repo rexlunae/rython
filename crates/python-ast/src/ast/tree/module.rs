@@ -400,6 +400,14 @@ impl CodeGen for Module {
                             // Assign codegen handles them (issue #79 family).
                             && !crate::is_rust_bind_call(&a.value)
                             && function_free_reads.contains(n)
+                            // A name ALSO bound by an import (see
+                            // module_promoted_static_names): the import owns
+                            // the name — a promoted static would collide.
+                            && !matches!(
+                                symbols.get(n),
+                                Some(crate::SymbolTableNode::ImportFrom(_))
+                                    | Some(crate::SymbolTableNode::Import(_))
+                            )
                         {
                             promoted_statics.insert(n.clone());
                         }
@@ -649,6 +657,29 @@ impl CodeGen for Module {
             // Module-level constants become static items visible to every
             // function in the module.
             if let crate::StatementType::Assign(a) = &s.statement {
+                // A module-level assign to a name the module ALSO imports
+                // (`SSLTransport = None` then `from .ssltransport import
+                // SSLTransport` — urllib3's ssl_.py): Python's LAST binding
+                // wins, so the import overrides the assign — the store is
+                // dead. Drop it: emitting it would collide with the
+                // import's `use` (E0252) or render the imported class
+                // unusable (E0433). Checked before any static promotion.
+                if let Some(names) = assign_name_targets(a)
+                    && names.iter().any(|n| {
+                        matches!(
+                            symbols.get(n),
+                            Some(crate::SymbolTableNode::ImportFrom(_))
+                                | Some(crate::SymbolTableNode::Import(_))
+                        )
+                    })
+                {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "module-level assignment to `{}` is dropped: the name is also \
+                         imported, and Python's later import binding wins",
+                        names.join(", ")
+                    ));
+                    continue;
+                }
                 // A type alias (`builtin_str = str`): emit the pub type at
                 // module level so re-exports resolve; Assign::to_rust also
                 // knows this shape, but the module path must place it as a
@@ -890,6 +921,50 @@ impl CodeGen for Module {
                 o.leaked_loop_targets = std::rc::Rc::new(init_leaked.clone());
                 o
             };
+            // A module-level `try: <imports> except ImportError: <fallback>`
+            // (`from urllib3.contrib.socks import SOCKSProxyManager` —
+            // requests' adapters.py; `from .ssltransport import
+            // SSLTransport` — urllib3's ssl_.py): rython's imports are
+            // STATIC, so the try body always succeeds and the ImportError
+            // fallback (dropped in try_stmt.rs) never runs. The try wrapper
+            // is meaningless — flatten its body to MODULE level so import
+            // statements emit their `use` at module scope (where call sites
+            // outside the wrapper can see them) instead of inside the
+            // lowered try closure.
+            let flattenable_try = match &s.statement {
+                crate::StatementType::Try(t) => {
+                    !t.handlers.is_empty()
+                        && t.orelse.is_empty()
+                        && t.finalbody.is_empty()
+                        && t.handlers.iter().all(|h| {
+                            crate::ast::tree::try_stmt::is_bare_import_error(
+                                &h.exception_type,
+                            )
+                        })
+                }
+                _ => false,
+            };
+            if flattenable_try {
+                if let crate::StatementType::Try(t) = &s.statement {
+                    for body_stmt in &t.body {
+                        let body_is_decl =
+                            Self::is_declaration_statement(&body_stmt.statement);
+                        let body_tokens = body_stmt
+                            .clone()
+                            .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
+                            .map_err(|e| wrap_module_error(&module_filename, e))?;
+                        if body_tokens.to_string() != "" {
+                            if body_is_decl {
+                                stream.extend(body_tokens);
+                            } else {
+                                module_init_stmts.push(body_tokens);
+                                has_module_init_code = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             let statement = s
                 .clone()
                 .to_rust(ctx.clone(), init_options, symbols.clone())
@@ -1555,6 +1630,19 @@ pub(crate) fn module_promoted_static_names(
                         && !is_type_alias_value(&a.value)
                         && !crate::is_rust_bind_call(&a.value)
                         && (free_reads.contains(n) || sibling.contains(n))
+                        // A name ALSO bound by an import (`SSLTransport =
+                        // None` then `from .ssltransport import
+                        // SSLTransport` — urllib3's ssl_.py): Python's
+                        // LAST binding wins, so the import overrides the
+                        // assign; a promoted static would collide with
+                        // the import's `use` (E0252) and render the
+                        // imported class unusable (E0433). The import
+                        // owns the name.
+                        && !matches!(
+                            symbols.get(n),
+                            Some(crate::SymbolTableNode::ImportFrom(_))
+                                | Some(crate::SymbolTableNode::Import(_))
+                        )
                     {
                         names.insert(n.clone());
                     }

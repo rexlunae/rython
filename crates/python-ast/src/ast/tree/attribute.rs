@@ -144,6 +144,21 @@ impl<'a> CodeGen for Attribute {
             _ => None,
         };
         let module_chain = is_module_path_chain(&self.value, &symbols, &options);
+        // An attribute read on an except-bound name (`e.expected` —
+        // urllib3's _error_catcher reading IncompleteRead's dynamic
+        // fields): the exception object has no static fields (rython
+        // models exceptions as name + message), so the read lowers to
+        // the boxed None (the dynamic-attribute divergence). Computed
+        // before `self.value`/`symbols` are moved below.
+        let except_binding_receiver: Option<String> = match self.value.as_ref() {
+            ExprType::Name(receiver) => match symbols.get(&receiver.id) {
+                Some(crate::SymbolTableNode::ExceptBinding) => {
+                    Some(receiver.id.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         // True when the chain's root is a vendored `[python-modules]`
         // dependency — those lower to `crate::<dep>::<attr>` paths (see
         // the emission below). Computed before `self.value` is moved.
@@ -300,6 +315,20 @@ impl<'a> CodeGen for Attribute {
                     "`{}.{}` (a module-level class attribute) lowers to the boxed \
                      None (the class-attribute divergence; class attributes \
                      assigned outside the class body are not importable)",
+                    receiver, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // An attribute read on an except-bound name (`e.expected` —
+            // urllib3's _error_catcher reading IncompleteRead's dynamic
+            // fields): the exception object has no static fields (rython
+            // models exceptions as name + message), so the read lowers to
+            // the boxed None (the dynamic-attribute divergence).
+            if let Some(receiver) = &except_binding_receiver {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the receiver is an exception object \
+                     bound by `except ... as`, and rython models exceptions \
+                     as name + message (the dynamic-attribute divergence)",
                     receiver, self.attr
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));

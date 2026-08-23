@@ -133,6 +133,14 @@ impl CodeGen for Try {
         // Process body, handlers, orelse, and finalbody
         let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
         let symbols = self.handlers.into_iter().fold(symbols, |acc, handler| {
+            // The except-bound name (`except IncompleteRead as e:`) is a
+            // runtime PyException object; mark it so attribute reads on it
+            // can lower to the boxed None (dynamic-attribute divergence)
+            // instead of emitting a field that does not exist.
+            let mut acc = acc;
+            if let Some(name) = &handler.name {
+                acc.insert(name.clone(), crate::SymbolTableNode::ExceptBinding);
+            }
             let symbols = handler.body.into_iter().fold(acc, |acc, stmt| stmt.find_symbols(acc));
             if let Some(exception_type) = handler.exception_type {
                 exception_type.find_symbols(symbols)
@@ -497,7 +505,7 @@ fn lower_finally_guarded_body(
 /// Whether an except clause catches exactly `ImportError` (a bare name —
 /// not a tuple, not a subclass name). Such handlers are dead under
 /// rython's static imports.
-fn is_bare_import_error(exception_type: &Option<ExprType>) -> bool {
+pub(crate) fn is_bare_import_error(exception_type: &Option<ExprType>) -> bool {
     matches!(
         exception_type,
         Some(ExprType::Name(n)) if n.id == "ImportError"

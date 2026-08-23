@@ -2393,6 +2393,37 @@ impl PyIsNone for PyValue {
     }
 }
 
+impl PyValue {
+    /// Python's unary `-` on a boxed value: negates the numeric members
+    /// (bool negates to int, as in CPython). Unmodeled operands panic
+    /// with a TypeError naming the operand type — the same contract
+    /// PySub's Option impl uses.
+    pub fn py_neg(&self) -> PyValue {
+        let type_name = |v: &PyValue| match v {
+            PyValue::Str(_) => "str",
+            PyValue::Bytes(_) => "bytes",
+            PyValue::Tuple(_) => "tuple",
+            PyValue::None_ => "NoneType",
+            _ => "object",
+        };
+        match self {
+            PyValue::Int(v) => PyValue::Int(-v),
+            PyValue::Float(v) => PyValue::Float(-v),
+            PyValue::Bool(v) => PyValue::Int(if *v { -1 } else { 0 }),
+            other => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    format!(
+                        "bad operand type for unary -: '{}'",
+                        type_name(other)
+                    )
+                )
+            ),
+        }
+    }
+}
+
 macro_rules! pyvalue_from {
     ($($t:ty => $v:ident),* $(,)?) => {
         $(impl From<$t> for PyValue {

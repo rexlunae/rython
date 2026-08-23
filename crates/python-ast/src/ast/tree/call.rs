@@ -2591,6 +2591,44 @@ impl<'a> CodeGen for Call {
                         let a = &rendered[0];
                         return Ok(quote!(PyValue::from(#a)));
                     }
+                    // next(iterable[, default]): Python's iterator advance.
+                    // rython's eager generator model collects a generator
+                    // body into a Vec, so next(vec) returns the FIRST
+                    // element (the first yield) — or raises StopIteration
+                    // when the generator produced nothing (requests'
+                    // sessions.py: `r._next = next(self.resolve_redirects(
+                    // ..., yield_requests=True))` inside try/except
+                    // StopIteration). A default argument lowers to the
+                    // default value instead of raising.
+                    "next" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() < 1 || rendered.len() > 2 {
+                            return Err("next() takes 1 or 2 arguments (iterator[, default])"
+                                .to_string()
+                                .into());
+                        }
+                        let a = &rendered[0];
+                        let default = rendered.get(1);
+                        return Ok(match default {
+                            Some(d) => quote!({
+                                let mut __rython_next_iter = (#a).into_iter();
+                                match __rython_next_iter.next() {
+                                    Some(__rython_next_v) => __rython_next_v,
+                                    None => (#d),
+                                }
+                            }),
+                            None => quote!({
+                                let mut __rython_next_iter = (#a).into_iter();
+                                __rython_next_iter
+                                    .next()
+                                    .ok_or_else(|| {
+                                        PyException::new("StopIteration", String::new())
+                                    })?
+                            }),
+                        });
+                    }
                     // bytes(x): the byte representation. On a str|bytes
                     // union this extracts the bytes branch (idna's
                     // `label_bytes = bytes(label)` after the isinstance

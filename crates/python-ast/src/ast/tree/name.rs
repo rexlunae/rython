@@ -201,6 +201,23 @@ impl CodeGen for Name {
             if self.id == "NotImplemented" && symbols.get("NotImplemented").is_none() {
                 return Ok(quote!(stdpython::PyValue::None_));
             }
+            // A name imported from an EXTERNAL module (`from ssl import
+            // CERT_REQUIRED` — urllib3's ssl_.py) read as a VALUE: the
+            // import has no runtime item, so the read lowers to the boxed
+            // None (external-module divergence, the same model call.rs and
+            // attribute.rs use for external imports).
+            if crate::ast::tree::import::resolves_to_external_import(
+                &self.id,
+                &options,
+                &symbols,
+            ) {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`{}` is dropped: it is imported from a module that is \
+                     external to the generated crate (external-module divergence)",
+                    self.id
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             Ok(quote!(#name))
         }
     }

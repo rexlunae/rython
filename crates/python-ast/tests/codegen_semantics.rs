@@ -6949,3 +6949,120 @@ fn tuple_builtin_boxes_its_argument() {
         out
     );
 }
+
+#[test]
+fn except_binding_attribute_read_boxes_to_none() {
+    // urllib3's response.py _error_catcher: `except IncompleteRead as e:` then
+    // `e.expected` / `e.partial` — the exception object has no static fields
+    // (rython models exceptions as name + message), so the attribute read
+    // lowers to the boxed None with a warning (dynamic-attribute divergence).
+    // The bare name read (`raise ProtocolError(arg, e) from e`) still renders
+    // the bound PyException.
+    let out = compile(
+        "def f() -> None:\n    try:\n        g()\n    except IncompleteRead as e:\n        if e.expected is not None:\n            h(e)\n",
+        "excattr.py",
+    );
+    assert!(
+        out.contains("stdpython :: PyValue :: None_") || out.contains("stdpython::PyValue::None_"),
+        "e.expected must lower to the boxed None: {}",
+        out
+    );
+    assert!(
+        !out.contains("e . expected") && !out.contains("e.expected"),
+        "e.expected must not emit a field read: {}",
+        out
+    );
+    assert!(
+        out.contains("let mut e = __rython_exc . clone ()") || out.contains("let mut e = __rython_exc.clone()"),
+        "the except binding must still bind the PyException: {}",
+        out
+    );
+    let (_out, warnings) = compile_with_warnings(
+        "def f() -> None:\n    try:\n        g()\n    except IncompleteRead as e:\n        if e.expected is not None:\n            h(e)\n",
+        "excattr.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("e.expected") && w.contains("dynamic-attribute divergence")),
+        "must warn about the dropped attribute read: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn next_builtin_returns_first_element_or_stopiteration() {
+    // requests' sessions.py: `r._next = next(self.resolve_redirects(
+    // ..., yield_requests=True))` inside try/except StopIteration —
+    // rython's eager generator model collects the body into a Vec, so
+    // next(vec) is the FIRST element, raising StopIteration when empty.
+    let out = compile(
+        "def f(gen: list[bytes]) -> bytes:\n    try:\n        return next(gen)\n    except StopIteration:\n        return b''\n",
+        "nextb.py",
+    );
+    assert!(
+        out.contains("StopIteration"),
+        "next() on an empty generator must raise StopIteration: {}",
+        out
+    );
+    assert!(
+        !out.contains("next (gen)"),
+        "bare next(gen) must not leak: {}",
+        out
+    );
+}
+
+#[test]
+fn external_import_value_read_boxes_to_none() {
+    // urllib3's ssl_.py: `from ssl import CERT_REQUIRED, PROTOCOL_TLS,
+    // OP_NO_SSLv2, ...` — the names are read as VALUES in function
+    // bodies. The import is external, so the reads lower to the boxed
+    // None with a warning (external-module divergence), not a bare
+    // unresolved identifier. Needs a multi-module conversion (an empty
+    // module_defs assumes any import may be a sibling).
+    let src = "from ssl import CERT_REQUIRED\ndef f() -> object:\n    return CERT_REQUIRED\n";
+    let m = parse(src, "sslread.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["sslread".to_string()], std::rc::Rc::new(m));
+    // A second module makes this a multi-module conversion, so the
+    // external-import analysis is active (a lone module assumes any
+    // import may be a sibling).
+    let other = parse("x = 1\n", "other.py").unwrap();
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(src, "sslread.py", options).expect("converts");
+    assert!(
+        out.contains("stdpython :: PyValue :: None_") || out.contains("stdpython::PyValue::None_"),
+        "external-import value read must box to None: {}",
+        out
+    );
+    assert!(
+        !out.contains("CERT_REQUIRED"),
+        "bare CERT_REQUIRED must not leak: {}",
+        out
+    );
+}
+
+#[test]
+fn module_level_try_import_error_flattens_imports_to_module_scope() {
+    // requests' adapters.py: `try: from urllib3.contrib.socks import
+    // SOCKSProxyManager except ImportError: ...` at module level — the
+    // ImportError fallback is dropped (static imports), so the import's
+    // `use` must land at MODULE scope where call sites outside the
+    // wrapper can see it, not inside the lowered try closure.
+    let out = compile(
+        "try:\n    from socks import SOCKSProxyManager\nexcept ImportError:\n    pass\n\ndef f() -> object:\n    return SOCKSProxyManager\n",
+        "tryimp.py",
+    );
+    assert!(
+        out.contains("use crate :: socks :: SOCKSProxyManager") || out.contains("use crate::socks::SOCKSProxyManager"),
+        "the import must lower to a module-scope use: {}",
+        out
+    );
+    assert!(
+        !out.contains("__rython_try_result"),
+        "the dead try wrapper must not lower: {}",
+        out
+    );
+}
