@@ -55,7 +55,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         "collections" => {
             matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
         }
-        "re" => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch"),
+        "re" => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "IGNORECASE"),
         "itertools" => matches!(
             name,
             "accumulate"
@@ -767,6 +767,52 @@ impl CodeGen for ImportFrom {
                 self.module
             ));
             return Ok(TokenStream::new());
+        }
+
+        // A STDPYTHON-module import with SOME names lacking a runtime
+        // counterpart (`from io import BytesIO, IOBase` — urllib3's
+        // emscripten response, where BytesIO exists in stdpython but
+        // IOBase does not; `from os import PathLike` — charset_normalizer's
+        // api.py): a use for a missing item would fail E0432. Drop ONLY
+        // the missing names (annotation-only ones map to the boxed
+        // PyValue); the present ones still emit their use.
+        let first_part = parts.first().copied().unwrap_or("");
+        if is_stdpython_module(first_part)
+            && self.names.iter().any(|a| !stdpython_module_item(first_part, &a.name))
+        {
+            let present: Vec<crate::Alias> = self
+                .names
+                .iter()
+                .filter(|a| stdpython_module_item(first_part, &a.name))
+                .cloned()
+                .collect();
+            for alias in &self.names {
+                if !stdpython_module_item(first_part, &alias.name) {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "`from {} import {}` is dropped: stdpython has no runtime \
+                         item for `{}` (annotation-only names map to the boxed \
+                         PyValue)",
+                        self.module, alias.name, alias.name
+                    ));
+                }
+            }
+            if present.is_empty() {
+                return Ok(TokenStream::new());
+            }
+            // Re-emit the import with only the present names.
+            let mut present_tokens = TokenStream::new();
+            for alias in &present {
+                let name = crate::safe_ident(&alias.name);
+                let import = match &alias.asname {
+                    Some(asname) => {
+                        let asname = crate::safe_ident(asname);
+                        quote! { use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
+                    }
+                    None => quote! { use #root #(::#base_parts)* #(::#module_path)*::#name; },
+                };
+                present_tokens.extend(import);
+            }
+            return Ok(present_tokens);
         }
 
         let mut tokens = TokenStream::new();
