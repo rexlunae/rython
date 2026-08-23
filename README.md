@@ -287,7 +287,7 @@ change:
   `yield` divergence); `self.bit = 1 << bit_no` fields infer i64;
   `re.UNICODE` is a no-op (rython's regex is already Unicode).
 
-### Rounds 9–13: requests/urllib3 build chase (145 → 134 errors)
+### Rounds 9–13: requests/urllib3 build chase (145 → 117 errors)
 
 The BUILD phase drives the remaining rustc errors in the generated
 requests crate down by fixing systemic codegen bugs, with the full
@@ -318,6 +318,16 @@ green at every step. The rounds fixed, among others:
 - **Version-gated module functions** — `def where` under `if
   sys.version_info >= (3, 11):` (certifi) counts as a runtime item for
   sibling imports.
+- **Self-referential and try/except imports** — `from . import packages,
+  utils` in a package's own `__init__` emits no redundant `pub use`
+  (the `pub mod` declarations already expose the submodules); a
+  try/except-ImportError whose handler assigns a name the try body
+  imports drops the import (the fallback assign makes it a module-init
+  local). Module-level underscore functions are `pub(crate)` under the
+  module context, and sibling imports re-export them as `pub(crate)
+  use`.
+- **Partial-bound class args** — a class bound to a `type[...]`
+  parameter of `functools.partial` boxes to `None` (callables-as-data).
 
 ## Roadmap
 
