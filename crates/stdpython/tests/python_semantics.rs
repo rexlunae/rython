@@ -2594,8 +2594,11 @@ fn os_path_expandvars_matches_python() {
     use stdpython::stdlib::os::path::expandvars;
     assert_eq!(expandvars("$RY_TEST_V/x"), "hello/x");
     assert_eq!(expandvars("${RY_TEST_V}-tail"), "hello-tail");
-    // Unknown variables stay literal.
+    // Unknown variables stay literal — bare AND braced forms
+    // (CPython: os.path.expandvars('${RY_UNSET_X}/log') keeps the text).
     assert_eq!(expandvars("no$RY_UNSET_X var"), "no$RY_UNSET_X var");
+    assert_eq!(expandvars("${RY_UNSET_X}/log"), "${RY_UNSET_X}/log");
+    assert_eq!(expandvars("a${RY_UNSET_X}b"), "a${RY_UNSET_X}b");
     assert_eq!(expandvars("plain"), "plain");
     assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
 }

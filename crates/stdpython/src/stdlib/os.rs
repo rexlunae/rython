@@ -423,15 +423,17 @@ pub mod path {
                 i += 1;
                 continue;
             }
-            // `$${VAR}` braced form or `$$NAME` bare form.
+            // `${VAR}` braced form: expands only when VAR is set — an
+            // unknown braced reference stays LITERAL (`${UNSET}/log`),
+            // matching CPython (Devin round-1 review on PR #140).
             if i + 1 < bytes.len() && bytes[i + 1] == '{' {
                 if let Some(close) = bytes[i + 2..].iter().position(|&c| c == '}') {
                     let name: String = bytes[i + 2..i + 2 + close].iter().collect();
                     if let Ok(val) = std::env::var(&name) {
                         out.push_str(&val);
+                        i += close + 3;
+                        continue;
                     }
-                    i += close + 3;
-                    continue;
                 }
             }
             let mut j = i + 1;
