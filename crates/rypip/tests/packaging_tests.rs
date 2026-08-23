@@ -244,6 +244,13 @@ fn setup_cfg_metadata_and_install_requires() {
 
 #[test]
 fn setup_py_shim_extracts_metadata() {
+    // The shim is OPT-IN (RYPIP_ALLOW_SETUP_PY_EXEC=1): executing a
+    // downloaded sdist's setup.py runs third-party code on this host, so
+    // the default path must never fire. This test exercises the opt-in.
+    // SAFETY: single-threaded test body; no other thread reads the env.
+    unsafe {
+        std::env::set_var("RYPIP_ALLOW_SETUP_PY_EXEC", "1");
+    }
     if std::process::Command::new("python3")
         .arg("--version")
         .output()

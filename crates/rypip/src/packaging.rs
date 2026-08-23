@@ -316,7 +316,19 @@ fn collect_find(root: &Path, dir: &Path, found: &mut Vec<String>) -> Result<()> 
 /// Run setup.py under a python3 shim that records the setup() call without
 /// executing any real setuptools code. Returns the captured kwargs, or None
 /// when python3 is unavailable or the file cannot be executed.
+///
+/// EXECUTION IS OPT-IN: the shim runs the sdist's own top-level code on
+/// this host, so it only fires when `RYPIP_ALLOW_SETUP_PY_EXEC=1` is set.
+/// Without it the call is skipped with a loud note and resolution falls
+/// back to whatever the static parse produced (correct-or-loud).
 fn run_setup_py_shim(setup_py: &Path) -> Option<HashMap<String, String>> {
+    if std::env::var("RYPIP_ALLOW_SETUP_PY_EXEC").ok().as_deref() != Some("1") {
+        eprintln!(
+            "note: skipping setup.py execution for `{}` (set RYPIP_ALLOW_SETUP_PY_EXEC=1              to allow running legacy sdists' setup.py during metadata resolution)",
+            setup_py.display()
+        );
+        return None;
+    }
     let shim = r#"
 import json, sys, types
 captured = {}
