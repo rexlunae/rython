@@ -402,77 +402,76 @@ fn lower_parse_args(
 /// bare @lru_cache default is 128). ANY other decorator is a loud
 /// error: silently ignoring a decorator converts a program into a
 /// different one.
-fn parse_cache_decorator(
+/// What a function's decorators ask for, parsed through the systematic
+/// decorator registry (decorator.rs): `@classmethod`/`@staticmethod`
+/// (issue #117) make the method an ASSOCIATED function — no receiver; a
+/// classmethod additionally drops its first parameter (cls/self — the
+/// class reference). Anything else is a loud error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MethodDecorator {
+    None,
+    Cache(Option<Option<i64>>),
+    ClassMethod,
+    StaticMethod,
+}
+
+/// Parse a FUNCTION's decorator list through the one registry. Only the
+/// method-shape and cache decorators apply to functions; a `@dataclass`
+/// (or anything unknown) is a loud error here (class codegen handles
+/// `@dataclass`).
+fn parse_method_decorator(
     decorators: &[ExprType],
-) -> Result<Option<Option<i64>>, Box<dyn std::error::Error>> {
-    let unsupported = |what: &str| -> Box<dyn std::error::Error> {
-        format!(
-            "decorator `{}` is not supported yet (only functools.lru_cache and \
-             functools.cache are); rython refuses to silently ignore it",
-            what
-        )
-        .into()
-    };
-    let name_of = |e: &ExprType| -> Option<String> {
-        match e {
-            ExprType::Name(n) => Some(n.id.clone()),
-            ExprType::Attribute(a) => match a.value.as_ref() {
-                ExprType::Name(m) if m.id == "functools" => Some(a.attr.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
-    };
-    match decorators {
-        [] => Ok(None),
-        [single] => {
-            let (base, call) = match single {
-                ExprType::Call(c) => (name_of(c.func.as_ref()), Some(c)),
-                other => (name_of(other), None),
-            };
-            match (base.as_deref(), call) {
-                (Some("cache"), None) => Ok(Some(None)),
-                (Some("cache"), Some(c)) if c.args.is_empty() && c.keywords.is_empty() => {
-                    Ok(Some(None))
-                }
-                (Some("lru_cache"), None) => Ok(Some(Some(128))),
-                (Some("lru_cache"), Some(c)) => {
-                    let maxsize = match (c.args.as_slice(), c.keywords.as_slice()) {
-                        ([], []) => return Ok(Some(Some(128))),
-                        ([e], []) => e.clone(),
-                        ([], [kw]) if kw.arg.as_deref() == Some("maxsize") => {
-                            kw.value.clone()
-                        }
-                        _ => {
-                            return Err(
-                                "lru_cache() takes at most a single maxsize argument"
-                                    .to_string()
-                                    .into(),
-                            )
-                        }
-                    };
-                    if crate::is_none_expr(&maxsize) {
-                        return Ok(Some(None));
-                    }
-                    match &maxsize {
-                        ExprType::Constant(c) => match &c.0 {
-                            Some(litrs::Literal::Integer(i)) => {
-                                let n: i64 = i.value().ok_or("maxsize out of range")?;
-                                Ok(Some(Some(n)))
-                            }
-                            _ => Err("lru_cache maxsize must be an integer literal or None"
-                                .to_string()
-                                .into()),
-                        },
-                        _ => Err("lru_cache maxsize must be an integer literal or None"
-                            .to_string()
-                            .into()),
-                    }
-                }
-                _ => Err(unsupported(&format!("{:?}", single))),
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Result<MethodDecorator, Box<dyn std::error::Error>> {
+    // A bare-Name decorator bound to a LOCAL FunctionDef (same module or
+    // imported from a sibling module of the crate — `@_text_content`,
+    // `@instance_cache` — botocore, `@with_cleanup` — pip): a hand-rolled
+    // wrapper (caching, text extraction, cleanup) — unmodeled; the
+    // decorated function lowers directly (documented divergence).
+    let is_local_fn = |name: &str| -> bool {
+        match symbols.get(name) {
+            Some(SymbolTableNode::FunctionDef(_)) => true,
+            Some(SymbolTableNode::ImportFrom(i)) => {
+                let path = i.resolved_module_path(options);
+                options.module_defs.get(&path).is_some_and(|m| {
+                    let m: &crate::Module = m;
+                    m.raw.body.iter().any(|s| {
+                        matches!(
+                            &s.statement,
+                            crate::StatementType::FunctionDef(f) if f.name == name
+                        )
+                    })
+                })
             }
+            _ => false,
         }
-        many => Err(unsupported(&format!("{:?}", many[0]))),
+    };
+    if decorators.iter().any(|d| {
+        match d {
+            ExprType::Name(n) => is_local_fn(&n.id),
+            // A CALL to a local decorator factory (`@retry(stop_after_delay
+            // =3, wait=0.5)` — pip's misc): the factory's wrapper is
+            // unmodeled — the decorated function lowers directly.
+            ExprType::Call(c) => match c.func.as_ref() {
+                ExprType::Name(n) => is_local_fn(&n.id),
+                _ => false,
+            },
+            _ => false,
+        }
+    }) {
+        return Ok(MethodDecorator::None);
+    }
+    match crate::parse_decorator(decorators)? {
+        None => Ok(MethodDecorator::None),
+        Some(d) => d.as_method_decorator().ok_or_else(|| {
+            format!(
+                "decorator `{}` does not apply to a function definition (only \
+                 functools.lru_cache, functools.cache, classmethod, and staticmethod do)",
+                d.describe()
+            )
+            .into()
+        }),
     }
 }
 
@@ -496,8 +495,63 @@ impl CodeGen for FunctionDef {
         options: Self::Options,
         symbols: SymbolTableScopes,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        thread_local! {
+            static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let depth = FN_DEPTH.with(|d| d.get());
+        if depth > 50 && depth % 10 == 0 {
+        }
+        FN_DEPTH.with(|d| d.set(depth + 1));
+        let result = self.to_rust_inner(ctx, options, symbols);
+        FN_DEPTH.with(|d| d.set(depth));
+        return result;
+    }
+}
+
+impl FunctionDef {
+    fn to_rust_inner(
+        self,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
+
+        // A `@typing.overload` STUB (`def f(x: int = ...) -> int: ...`) is
+        // compile-time metadata: its `...` defaults and `...` body are
+        // placeholders, never runtime code. Skip it entirely — call sites
+        // resolve the real implementation below the stubs (see
+        // module_function_def), and emitting the stub would fail on the
+        // Ellipsis defaults.
+        if self.decorator_list.iter().any(|d| match d {
+            crate::ExprType::Name(n) => n.id == "overload",
+            crate::ExprType::Attribute(a) => a.attr == "overload",
+            _ => false,
+        }) {
+            return Ok(TokenStream::new());
+        }
+
+        // Issue #115: `global x` declares module scope. Reads resolve to
+        // the module statics; WRITES need mutable module state, which
+        // rython does not model (module-level reassignment lowers to
+        // __module_init__ locals invisible to functions) — the writes are
+        // no-ops, surfaced through the -W channel (issue #115, a documented
+        // divergence; the read side still resolves the module static).
+        if let Some(name) = global_write_error(&self.body) {
+            options.definition_warnings.borrow_mut().push(format!(
+                "function `{}` writes to module-level name `{name}`: the write is \
+                 dropped (issue #115 — rython has no mutable module state visible \
+                 to functions)",
+                self.name
+            ));
+        }
+        // Issue #112: `del name` lowers to a no-op, which is faithful ONLY
+        // while the name is never referenced afterwards — this pass makes
+        // any such use a loud error (and a reassignment/import clears the
+        // deletion, like Python's `del x; x = 1`).
+        check_deleted_names(&self.body)
+            .map_err(|e| format!("function `{}`: {}", self.name, e))?;
 
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
@@ -520,8 +574,13 @@ impl CodeGen for FunctionDef {
         });
 
         // functools cache decorators rewrite the whole definition below;
-        // any OTHER decorator is a loud error (see parse_cache_decorator).
-        let cache_spec = parse_cache_decorator(&self.decorator_list)?;
+        // @classmethod/@staticmethod change the method shape; any OTHER
+        // decorator is a loud error (see parse_method_decorator).
+        let decorator = parse_method_decorator(&self.decorator_list, &symbols, &options)?;
+        let mut cache_spec = match decorator {
+            MethodDecorator::Cache(spec) => spec,
+            _ => None,
+        };
         if cache_spec.is_some() && options.no_std {
             return Err(format!(
                 "@lru_cache on `{}` needs a global Mutex, which the no_std \
@@ -535,8 +594,27 @@ impl CodeGen for FunctionDef {
         // it's private. Otherwise, it's public. We formalize that by default.
         // Trait items carry no visibility modifier at all (they are public
         // through the trait); only inherent methods get one.
+        // A MODULE-level `_name` function (`_wrap_proxy_error` — urllib3's
+        // connection.py) is still imported by SIBLING modules
+        // (`use crate::urllib3::connection::_wrap_proxy_error`), so it must
+        // be crate-visible; a class method's underscore-prefix privacy
+        // stays (methods are reached through the trait or the receiver).
+        // The module's own context reaches module-level functions as
+        // Module (or Async(Module)) — not `Function { class: None }` —
+        // so those contexts take the same module-level path.
+        let is_module_level = matches!(&ctx, CodeGenContext::Function { class: None })
+            || matches!(&ctx, CodeGenContext::Module(_))
+            || matches!(
+                &ctx,
+                CodeGenContext::Async(inner)
+                    if matches!(inner.as_ref(), CodeGenContext::Module(_))
+            );
         let visibility = if matches!(&ctx, CodeGenContext::Trait { .. }) {
             quote!()
+        } else if is_module_level && self.name.starts_with("_") && !self.name.starts_with("__") {
+            quote!(pub(crate))  // module-level: sibling modules import it
+        } else if is_module_level {
+            quote!(pub)
         } else if self.name.starts_with("_") && !self.name.starts_with("__") {
             quote!()  // private, no visibility modifier
         } else if self.name.starts_with("__") && self.name.ends_with("__") {
@@ -563,22 +641,54 @@ impl CodeGen for FunctionDef {
             symbols = s.clone().find_symbols(symbols);
         }
 
-        // A `def` in a class body whose first parameter is `self` is a
-        // method: `self` becomes the Rust receiver instead of a parameter —
-        // `&mut self` when the method stores through `self`, directly or by
-        // calling another method of the class that does. In a Trait context
-        // the method is emitted as a trait item (a default in the class's
-        // trait, or an override in an ancestor's trait's impl).
-        let is_method = matches!(
-            &ctx,
-            CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
-        ) && self
-            .args
-            .posonlyargs
-            .first()
-            .or(self.args.args.first())
-            .is_some_and(|p| p.arg == "self");
+        // A @classmethod's body references the dropped class parameter
+        // (`cls.DEFAULT`, `cls(...)` — urllib3's Retry.from_int): bind `cls`
+        // to the enclosing class's ClassDef so attribute reads resolve to
+        // class constants and calls resolve to construction — the class
+        // reference is a compile-time value (issue #117).
+        if matches!(decorator, MethodDecorator::ClassMethod)
+            && let Some(class_name) = ctx.enclosing_class_name()
+            && let Some(crate::SymbolTableNode::ClassDef(class)) =
+                symbols.get(class_name)
+        {
+            symbols.insert(
+                "cls".to_string(),
+                crate::SymbolTableNode::ClassDef((*class).clone()),
+            );
+        }
+
+        // A `def` in a class body is an instance method: its first
+        // positional parameter is the RECEIVER — `self` becomes the Rust
+        // receiver instead of a parameter, `&mut self` when the method
+        // stores through `self`, directly or by calling another method of
+        // the class that does. Python binds the instance to the first
+        // parameter whatever its name (boto3's `factory_self`), so ANY
+        // leading positional parameter counts; a method with no parameters
+        // is a static-style function callable via `self` (a silent
+        // divergence). In a Trait context the method is emitted as a trait
+        // item (a default in the class's trait, or an override in an
+        // ancestor's trait's impl).
+        let is_class_method = matches!(decorator, MethodDecorator::ClassMethod);
+        let is_static_method = matches!(decorator, MethodDecorator::StaticMethod);
+        // @classmethod/@staticmethod are ASSOCIATED functions: no receiver
+        // (issue #117). A classmethod's first parameter is the class
+        // reference (cls/self) and is dropped.
+        let is_method = !is_class_method
+            && !is_static_method
+            && matches!(
+                &ctx,
+                CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+            )
+            && (self.args.posonlyargs.first().is_some() || self.args.args.first().is_some());
         let mut render_args = self.args.clone();
+        if is_class_method {
+            // Drop the class-reference parameter.
+            if !render_args.posonlyargs.is_empty() {
+                render_args.posonlyargs.remove(0);
+            } else if !render_args.args.is_empty() {
+                render_args.args.remove(0);
+            }
+        }
         let method_mutates_self = is_method
             && match &ctx {
                 CodeGenContext::Class(class_name)
@@ -596,55 +706,88 @@ impl CodeGen for FunctionDef {
             crate::strip_self(&mut render_args);
         }
 
-        let parameters = render_args
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-
         // A cached function's arguments form the cache KEY, so every
         // parameter needs a hashable, nameable type: int, bool, or str
         // (floats are not hashable in Rust — Python would cache them,
         // which rython cannot reproduce, so it refuses loudly).
-        let cache_key: Option<Vec<(proc_macro2::Ident, TokenStream)>> = match cache_spec {
+        let mut cache_key: Option<Vec<(proc_macro2::Ident, TokenStream)>> = match cache_spec {
             None => None,
             Some(_) => {
+                // A cached METHOD (`@lru_cache_weakref(maxsize=...)` on
+                // `_resolve_endpoint` — botocore's EndpointProvider): the
+                // cache is a performance optimization — the method lowers
+                // UNCACHED with a warning (documented divergence).
                 if is_method {
-                    return Err(format!(
-                        "@lru_cache on method `{}` is not supported yet",
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "@lru_cache on method `{}` is dropped (caching is a \
+                         performance optimization; the method lowers uncached)",
                         self.name
-                    )
-                    .into());
+                    ));
+                    None
+                } else {
+                    if !self.args.posonlyargs.is_empty()
+                        || !self.args.kwonlyargs.is_empty()
+                        || self.args.vararg.is_some()
+                        || self.args.kwarg.is_some()
+                    {
+                        // A cached function with *args/**kwargs
+                        // (`func_with_weakref(weakref_to_self, *args,
+                        // **kwargs)` — botocore's lru_cache_weakref): the
+                        // varargs cannot form the cache key — the cache is
+                        // dropped (the function lowers uncached;
+                        // documented divergence).
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "@lru_cache on `{}` with varargs is dropped (the cache \
+                             cannot key on varargs; the function lowers uncached)",
+                            self.name
+                        ));
+                        None
+                    } else {
+                        let mut key = Vec::new();
+                        let mut key_ok = true;
+                        for p in &self.args.args {
+                        let ty = match p.annotation.as_deref() {
+                            Some(ExprType::Name(n)) if n.id == "int" => quote!(i64),
+                            Some(ExprType::Name(n)) if n.id == "bool" => quote!(bool),
+                            Some(ExprType::Name(n)) if n.id == "str" => quote!(String),
+                            // float keys use the PyFloatKey wrapper: Python
+                            // semantics (-0.0 == 0.0, NaN never hits) differ
+                            // from Rust's f64 Hash/Eq.
+                            Some(ExprType::Name(n)) if n.id == "float" => {
+                                quote!(stdpython::stdlib::functools::PyFloatKey)
+                            }
+                            // Optional keys: `x: str | None` caches on the
+                            // Option (charset_normalizer's lg_inclusion).
+                            Some(ann)
+                                if crate::is_optional_annotation(ann) =>
+                            {
+                                let inner = crate::python_annotation_to_rust_type(ann)
+                                    .unwrap_or_else(|| quote!(String));
+                                quote!(Option<#inner>)
+                            }
+                            _ => {
+                                // A cache key of an unsupported type
+                                // (`cacheable_page: CacheablePageContent` —
+                                // pip's with_cached_index_content): the
+                                // cache cannot key on it — dropped (the
+                                // function lowers uncached; documented
+                                // divergence).
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "@lru_cache on `{}`: parameter `{}` is not a valid \
+                                     cache key (must be int, bool, str, float, or \
+                                     Optional); the cache is dropped",
+                                    self.name, p.arg
+                                ));
+                                key_ok = false;
+                                break;
+                            }
+                        };
+                        key.push((crate::safe_ident(&p.arg), ty));
+                    }
+                    if key_ok { Some(key) } else { None }
                 }
-                if !self.args.posonlyargs.is_empty()
-                    || !self.args.kwonlyargs.is_empty()
-                    || self.args.vararg.is_some()
-                    || self.args.kwarg.is_some()
-                {
-                    return Err(format!(
-                        "@lru_cache on `{}`: only plain positional parameters are \
-                         supported",
-                        self.name
-                    )
-                    .into());
-                }
-                let mut key = Vec::new();
-                for p in &self.args.args {
-                    let ty = match p.annotation.as_deref() {
-                        Some(ExprType::Name(n)) if n.id == "int" => quote!(i64),
-                        Some(ExprType::Name(n)) if n.id == "bool" => quote!(bool),
-                        Some(ExprType::Name(n)) if n.id == "str" => quote!(String),
-                        _ => {
-                            return Err(format!(
-                                "@lru_cache on `{}`: parameter `{}` must be annotated \
-                                 int, bool, or str (the arguments form the cache key)",
-                                self.name, p.arg
-                            )
-                            .into());
-                        }
-                    };
-                    key.push((crate::safe_ident(&p.arg), ty));
-                }
-                Some(key)
             }
+        }
         };
 
         // Python variables are function-scoped: hoist every assigned name to
@@ -751,6 +894,23 @@ impl CodeGen for FunctionDef {
                         .collect(),
                 );
             }
+            // Issue #110: a name bound to a string literal and later
+            // REBOUND by a String-producing expression (`out = ""; out +=
+            // "x"`) must be owned from the first assignment
+            // (`out = "".to_string()`), or the binding stays &'static str
+            // and the String rebind mismatches at build time.
+            let mut literal_bindings: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            let mut rebound: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            scan_str_rebindings(&effective_body, &mut literal_bindings, &mut rebound);
+            options.owned_str_literals = std::rc::Rc::new(
+                literal_bindings
+                    .into_iter()
+                    .filter(|(name, _)| rebound.contains(name))
+                    .map(|(name, _)| name)
+                    .collect(),
+            );
         }
         // Statically-known local types for isinstance(): parameter
         // annotations plus literal assignments, as Python type names.
@@ -765,8 +925,29 @@ impl CodeGen for FunctionDef {
                 .chain(self.args.kwonlyargs.iter())
             {
                 if let Some(ExprType::Name(ann)) = param.annotation.as_deref() {
-                    if matches!(ann.id.as_str(), "int" | "float" | "str" | "bool") {
+                    if matches!(
+                        ann.id.as_str(),
+                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
+                    ) {
                         known.insert(param.arg.clone(), ann.id.clone());
+                    }
+                }
+                // `bytes | bytearray` (a same-Rust-type union) is the "raw
+                // sequence" idiom: record it as bytes so isinstance checks
+                // against either name decide true (charset_normalizer).
+                if let Some(ExprType::BinOp(op)) = param.annotation.as_deref()
+                    && matches!(op.op, crate::BinOps::BitOr)
+                {
+                    let mut names = Vec::new();
+                    for side in [&op.left, &op.right] {
+                        if let ExprType::Name(n) = side.as_ref()
+                            && matches!(n.id.as_str(), "bytes" | "bytearray")
+                        {
+                            names.push(n.id.clone());
+                        }
+                    }
+                    if names.len() == 2 {
+                        known.insert(param.arg.clone(), "bytes".to_string());
                     }
                 }
             }
@@ -777,6 +958,7 @@ impl CodeGen for FunctionDef {
                     "i64" => "int",
                     "f64" => "float",
                     "bool" => "bool",
+                    "Vec < u8 >" => "bytes",
                     s if s.contains("str") || s.contains("String") => "str",
                     _ => continue,
                 };
@@ -790,7 +972,7 @@ impl CodeGen for FunctionDef {
         // pinned by later use. Annotation-derived types win over
         // assignment-inferred ones, matching local_types above.
         {
-            let mut info = crate::analyze_function_types(&effective_body);
+            let mut info = crate::analyze_function_types(&effective_body, Some(&options), Some(&symbols));
             for p in self
                 .args
                 .args
@@ -819,25 +1001,111 @@ impl CodeGen for FunctionDef {
                             "bytes" => {
                                 info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bytes);
                             }
+                            // `object` — a value of unknown type: the boxed
+                            // heterogeneous value.
+                            "object" | "Any" => {
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                            }
                             // A bare `list`/`dict`/... annotation has no
-                            // element/key type: the generated Rust would be
-                            // `xs: list` — invalid — so fail loudly at
-                            // conversion time instead of at rustc.
+                            // element/key type (`properties: dict` — a
+                            // NamedTuple field, botocore's
+                            // RuleSetEndpoint): the parameter lowers as a
+                            // boxed PyValue (the unannotated fallback) —
+                            // the field inference matches.
                             "list" | "List" | "dict" | "Dict" | "tuple" | "Tuple" | "set"
                             | "Set" | "Optional" => {
-                                return Err(format!(
-                                    "parameter `{}` is annotated `{}`, which has no element/\
-                                     key type; use a subscripted annotation like \
-                                     `list[float]` or `dict[str, int]`",
-                                    p.arg, n.id
-                                )
-                                .into());
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
                             }
-                            _ => {}
+                            // A CLASS-typed parameter (`def f(c: C)` —
+                            // requests' sessions): record the class so
+                            // receiver resolution (property reads/setter
+                            // stores on the parameter) can route to the
+                            // class's methods.
+                            _ => {
+                                let cname = n.id.clone();
+                                if symbols.get(&cname).is_some() {
+                                    info.name_types.insert(
+                                        p.arg.clone(),
+                                        crate::TypeInfo::Class(cname),
+                                    );
+                                }
+                            }
                         },
                         other => {
-                            if let Some(t) = crate::annotation_type_info(other) {
+                            if crate::is_none_expr(other) {
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)));
+                            } else if matches!(other, ExprType::Subscript(sub)
+                                if matches!(sub.value.as_ref(), ExprType::Name(n)
+                                    if matches!(n.id.as_str(), "type" | "Type")))
+                            {
+                                // `type[X]` / `Type[X]` — a CLASS held as a
+                                // value (`expected_type: type[_T]` — pip's
+                                // direct_url): no rython value equivalent —
+                                // a boxed PyValue (the class-as-value
+                                // divergence).
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                            } else if let Some(t) = crate::annotation_type_info(other) {
                                 info.name_types.insert(p.arg.clone(), t);
+                            } else if crate::is_str_bytes_union(other) {
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::StrOrBytes);
+                            } else if let Some(t) =
+                                crate::resolve_alias_typeinfo(other, &symbols, &options)
+                            {
+                                // A module-level TYPE ALIAS
+                                // (`list[CoherenceMatches]`, charset_normalizer).
+                                info.name_types.insert(p.arg.clone(), t);
+                            } else if matches!(other, ExprType::BinOp(op)
+                                if matches!(op.op, crate::BinOps::BitOr))
+                            {
+                                // An unresolvable UNION (`exc_info: ExcInfo |
+                                // BaseException` — pip's misc): the
+                                // parameter is a boxed PyValue.
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                            } else if crate::is_optional_annotation(other) {
+                                // `T | None` with an unresolvable inner
+                                // (`load_only: Kind | None` where Kind is a
+                                // NewType — pip's Configuration): the
+                                // parameter is a boxed PyValue.
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                            } else if matches!(other, ExprType::Attribute(_))
+                                && !crate::resolve_alias_typeinfo(other, &symbols, &options)
+                                    .is_some()
+                            {
+                                // An EXTERNAL-MODULE dotted annotation
+                                // (`std_handle: wintypes.HANDLE` — rich's
+                                // _win32_console, a Windows-only ctypes
+                                // module): a foreign object type — the
+                                // parameter is a boxed PyValue (the
+                                // external-type divergence).
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                            } else if matches!(other, ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(_))))
+                            {
+                                // A STRING-LITERAL annotation (`"IO[str]"` —
+                                // rich's _win32_console, a forward
+                                // reference): unresolvable at conversion
+                                // time — the parameter is a boxed PyValue
+                                // (the external-type divergence).
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                            } else if matches!(other, ExprType::Subscript(sub)
+                                if matches!(sub.value.as_ref(), ExprType::Name(n)
+                                    if matches!(n.id.as_str(), "dict" | "Dict")))
+                            {
+                                // A dict-generic annotation with an
+                                // unresolvable element (`Dict[int, None]` —
+                                // rich's control.py): a boxed
+                                // PyDict<String, PyValue>.
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::PyValue);
                             } else if crate::python_annotation_to_rust_type(other).is_none() {
                                 // The annotation is genuinely unsupported
                                 // (e.g. a custom type): fail loudly at
@@ -854,6 +1122,17 @@ impl CodeGen for FunctionDef {
                     }
                 }
             }
+            // Issue #120: the **kwargs parameter is a boxed heterogeneous
+            // dict (`PyDict<String, PyValue>`): extra keyword arguments
+            // pack into it at call sites, and the body reads/contains/
+            // copies it like any dict.
+            if let Some(kwarg) = &self.args.kwarg {
+                info.name_types
+                    .insert(kwarg.arg.clone(), crate::TypeInfo::Dict(
+                        Box::new(crate::TypeInfo::String),
+                        Box::new(crate::TypeInfo::PyValue),
+                    ));
+            }
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
@@ -867,12 +1146,219 @@ impl CodeGen for FunctionDef {
                 use_counts: options.use_counts.as_ref().clone(),
                 name_types: options.name_types.as_ref().clone(),
                 empty_pinned: options.empty_pinned.as_ref().clone(),
+                annotated_names: std::collections::HashSet::new(),
             };
-            crate::pin_empty_containers(&effective_body, &mut info);
+            crate::pin_empty_containers(&effective_body, &mut info, Some(&symbols), Some(&options));
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
+        // Issue #79's cheap guard: reject aliasing shapes rython cannot
+        // model (`b = a` on a container that is later mutated, and passing
+        // a container to a function that mutates it) at conversion time
+        // instead of silently diverging or leaving the report to rustc.
+        crate::check_aliasing(
+            &effective_body,
+            &symbols,
+            &options.name_types,
+            &options.use_counts,
+        )?;
+        // Issue #109, M1: parameter type inference. Unannotated parameters
+        // (other than `self`) get trait-bound generic signatures derived
+        // from their uses — `def add(a, b): return a + b` becomes
+        // `fn add<A, B>(a: A, b: B) -> Result<<A as PyAdd<B>>::Output, ...>
+        // where A: PyAdd<B>`. The `impl Into<PyObject>` dead end is gone:
+        // an unannotated parameter either infers or fails loudly here.
+        // A None-defaulted unannotated parameter can only ever hold None
+        // (its generic type variable would be un-inferable from None at
+        // call sites) — it gets the concrete Option<()> type and takes no
+        // part in inference (issue #117).
+        let none_defaulted: std::collections::HashSet<String> = self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+            .filter(|p| p.annotation.is_none())
+            .filter(|p| {
+                let pos = self
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(self.args.args.iter())
+                    .position(|q| q.arg == p.arg);
+                let from = self.args.posonlyargs.len() + self.args.args.len()
+                    - self.args.defaults.len();
+                match pos {
+                    Some(i) if i >= from => self
+                        .args
+                        .defaults
+                        .get(i - from)
+                        .is_some_and(|d| crate::is_none_expr(d)),
+                    _ => {
+                        let kw = self
+                            .args
+                            .kwonlyargs
+                            .iter()
+                            .zip(self.args.kw_defaults.iter())
+                            .find(|(q, _)| q.arg == p.arg);
+                        kw.is_some_and(|(_, d)| {
+                            d.as_deref().is_some_and(crate::is_none_expr)
+                        })
+                    }
+                }
+            })
+            .map(|p| p.arg.clone())
+            .collect();
+        let mut inferred_signature = {
+            // @classmethod/@staticmethod are associated functions (no
+            // receiver, class ref dropped) — NOT methods, so unannotated
+            // parameters are inferred like free functions (issue #117).
+            let is_method = matches!(
+                &ctx,
+                CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+            ) && !is_class_method
+                && !is_static_method
+                && (self.args.posonlyargs.first().is_some()
+                    || self.args.args.first().is_some());
+            let unannotated: Vec<String> = self
+                .args
+                .posonlyargs
+                .iter()
+                .chain(self.args.args.iter())
+                .chain(self.args.kwonlyargs.iter())
+                // A classmethod's first parameter is the class reference
+                // (cls/self) — dropped from the signature, so it takes no
+                // part in inference (issue #117). An instance method's
+                // first parameter is the RECEIVER — also dropped, whatever
+                // its name (boto3's `factory_self`).
+                .enumerate()
+                .filter(|(i, p)| {
+                    !(is_class_method && *i == 0)
+                        && !(is_method && *i == 0)
+                        && p.arg != "self"
+                        && p.annotation.is_none()
+                        && !none_defaulted.contains(&p.arg)
+                })
+                .map(|(_, p)| p.arg.clone())
+                .collect();
+            if unannotated.is_empty() {
+                // No inferred parameters: the body's calls are still
+                // checked against callee bounds (M5, call-site
+                // satisfiability) — the inference collector only walks
+                // functions with unannotated parameters.
+                crate::check_call_sites(
+                    &effective_body,
+                    &symbols,
+                    &options.name_types,
+                    &options,
+                )
+                .map_err(|e| format!("function `{}`: {}", self.name, e))?;
+                // A kwargs-only (or fully-annotated) function still calls
+                // through loop elements over non-param iterables
+                // (`for filter in self.X: filter(**kwargs)` — botocore's
+                // docs client): collect those called-param names so the
+                // call sites lower as dropped no-ops.
+                let mut sig = crate::InferredSignature::default();
+                sig.called_params =
+                    crate::collect_called_params(&effective_body, &symbols, &options);
+                // A parameter annotated bare `type` (`dict_class: type =
+                // OrderedDict` — requests' sessions) is a CALLABLE: calls
+                // through it drop (the callable-as-value divergence) — the
+                // codegen cannot hold a class/function as a value.
+                for p in self
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(self.args.args.iter())
+                    .chain(self.args.kwonlyargs.iter())
+                {
+                    if p.annotation
+                        .as_deref()
+                        .is_some_and(crate::ast::tree::arguments::is_type_annotation)
+                    {
+                        sig.called_params.insert(p.arg.clone());
+                    }
+                }
+                sig
+            } else if is_method {
+                // An unannotated method parameter lowers as boxed PyValue
+                // (with a warning) instead of failing: __init__ fields are
+                // typed by the class field inference, and other methods'
+                // unannotated params are duck-typed values (boto3's
+                // document_actions(section), s3transfer's ReadFileChunk).
+                options.definition_warnings.borrow_mut().push(format!(
+                    "method `{}` has unannotated parameter(s) `{}`; they lower as \
+                     boxed PyValue",
+                    self.name,
+                    unannotated.join("`, `")
+                ));
+                let mut sig = crate::InferredSignature::default();
+                for p in unannotated {
+                    sig.param_types.insert(p, quote!(stdpython::PyValue));
+                }
+                sig
+            } else {
+                crate::infer_unannotated_signature(
+                    &effective_body,
+                    &unannotated,
+                    &options.name_types,
+                    &options.use_counts,
+                    &symbols,
+                    &options,
+                    &self.name,
+                )
+                .map_err(|e| {
+                    format!("function `{}`: {}", self.name, e)
+                })?
+            }
+        };
+        // Thread the inferred type variables into parameter rendering
+        // (Parameter::to_rust emits `a: A` instead of the dead
+        // `impl Into<PyObject>`), and the stdlib-method-bound parameters
+        // into method-call dispatch (M2).
+        // None-defaulted unannotated parameters are concrete Option<()> —
+        // nothing but None can ever be stored in them (issue #117).
+        let mut final_param_types = inferred_signature.param_types.clone();
+        for name in &none_defaulted {
+            final_param_types.insert(name.clone(), quote!(Option<()>));
+        }
+        options.param_type_vars = std::rc::Rc::new(final_param_types);
+        options.param_method_params =
+            std::rc::Rc::new(inferred_signature.method_params.clone());
+        options.duck_methods_on_params =
+            std::rc::Rc::new(inferred_signature.duck_methods_on_params.clone());
+        // A nested function name (`def KD(s, d)` inside __init__ —
+        // requests' auth) is a CLOSURE in Python; rython's closures do not
+        // capture the enclosing scope, so the definition drops (statement.rs)
+        // and CALLS through the name drop too — add the names to
+        // called_params so the call sites lower as no-ops. Their VALUE
+        // reads (`hash_utf8 = sha256_utf8`) box to the boxed None
+        // (value_callables).
+        let mut value_callables = std::collections::HashSet::new();
+        for nested in crate::nested_function_names(&self.body) {
+            inferred_signature.called_params.insert(nested.clone());
+            value_callables.insert(nested);
+        }
+        // A `type`-annotated callable parameter is the same: calls drop
+        // (called_params) and value reads box.
+        for p in self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+        {
+            if p.annotation
+                .as_deref()
+                .is_some_and(crate::ast::tree::arguments::is_type_annotation)
+            {
+                value_callables.insert(p.arg.clone());
+            }
+        }
+        options.value_callables = std::rc::Rc::new(value_callables);
+        options.called_params =
+            std::rc::Rc::new(inferred_signature.called_params.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self
@@ -903,6 +1389,12 @@ impl CodeGen for FunctionDef {
             }
         }
         for name in &scope.assigned {
+            // Python's `_` discard target (`(scheme, _, host, port, _) =
+            // parse_url(...)` — idna/urllib3): a wildcard, never a hoisted
+            // binding — `let mut _;` is not legal Rust.
+            if name == "_" {
+                continue;
+            }
             let ident = crate::safe_ident(name);
             if scope.needs_mut.contains(name) {
                 if scope.closure_captured_uninit.contains(name) {
@@ -920,6 +1412,26 @@ impl CodeGen for FunctionDef {
             }
         }
         streams.extend(streams_prologue);
+
+        // Generator lowering (issue #122-family): a body with `yield`
+        // builds a Vec and returns it — the closest rython can get to a
+        // generator (Python's `for chunk in cut_sequence_chunks(...)`
+        // iterates the returned list just the same). The element type
+        // comes from the `Generator[T, ...]` return annotation or the
+        // first yielded value.
+        let gen_elt = if crate::body_has_yields(&effective_body) {
+            // Even when the element type cannot be resolved (a
+            // `typing.Iterator[str]` annotation), the generator must still
+            // lower — Vec<_> infers from the pushes.
+            generator_element_type(self.returns.as_deref(), &effective_body, &options, &symbols)
+                .or(Some(crate::TypeInfo::PyObject))
+        } else {
+            None
+        };
+        if let Some(elt) = &gen_elt {
+            let t = elt.to_rust_type();
+            streams.extend(quote!(let mut __rython_gen: Vec<#t> = Vec::new();));
+        }
 
         // A leading docstring is emitted as doc comments below; skip it here
         // so it isn't also emitted as a statement.
@@ -948,6 +1460,24 @@ impl CodeGen for FunctionDef {
                 class: ctx.enclosing_class_name().map(str::to_string),
             },
         };
+        // A function whose resolved return type is the boxed PyValue:
+        // `return None` lowers to `PyValue::None_` and other returns wrap
+        // in PyValue::from (the None-mixing unification — botocore's
+        // docs.client._allowlist_generate_presigned_url). Set BEFORE the
+        // body statements render (they clone options per statement).
+        options.fn_return_is_pyvalue = matches!(
+            self.resolved_return_type(&symbols, &options),
+            Some(ref ty) if ty.to_string() == "stdpython :: PyValue"
+        );
+
+        // Issue #125: thread narrowed-Option state through the body. After
+        // `if x is not None: <body> else: <else>` where BOTH branches leave
+        // x holding a non-None value, x is non-None for the rest of the
+        // function (Python narrows it; the hoisted binding stays Option, so
+        // every later read must unwrap). A name assigned None on some path
+        // drops out of the narrowed set again.
+        let mut narrowed: std::collections::HashMap<String, crate::TypeInfo> =
+            std::collections::HashMap::new();
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
@@ -960,11 +1490,18 @@ impl CodeGen for FunctionDef {
                 streams.extend(quote!(;));
                 continue;
             }
+            let mut stmt_options = options.clone();
+            stmt_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
+            if gen_elt.is_some() {
+                stmt_options.generator_collector =
+                    std::rc::Rc::new(Some("__rython_gen".to_string()));
+            }
             streams.extend(
                 s.clone()
-                    .to_rust(body_ctx.clone(), options.clone(), symbols.clone())?,
+                    .to_rust(body_ctx.clone(), stmt_options, symbols.clone())?,
             );
             streams.extend(quote!(;));
+            crate::update_narrowed_after_statement(s, &mut narrowed, &options);
         }
 
         // Every generated function returns Result<T, PyException> so raised
@@ -989,16 +1526,90 @@ impl CodeGen for FunctionDef {
             )
             .into());
         }
-        let return_type = match self.resolved_return_type() {
-            Some(ty) => quote!(-> Result<#ty, PyException>),
-            None => quote!(-> Result<(), PyException>),
+        // A GENERATOR returns its collected list (`Generator[str, ...]`
+        // → Vec<String>), overriding any other inference.
+        let return_type = if let Some(elt) = &gen_elt {
+            let t = elt.to_rust_type();
+            quote!(-> Result<Vec<#t>, PyException>)
+        } else if inferred_signature.is_generic() && self.returns.is_none() {
+            // The inferred generic return (issue #109, M1): a parameter's
+            // variable, a conversion result, or an associated Output. Only
+            // when every path returns — a fall-through body returns unit.
+            // An explicit return annotation always wins.
+            if guarantees_return(&self.body) {
+                match &inferred_signature.return_type {
+                    Some(ty) => quote!(-> Result<#ty, PyException>),
+                    None => {
+                        // A raise-only stub (`raise NotImplementedError`
+                        // — a base-class method that subclasses override,
+                        // s3transfer's DownloadOutputManager): the return
+                        // is a boxed PyValue (the override's type is
+                        // unknown).
+                        if self.body.iter().any(|s| {
+                            matches!(&s.statement, crate::StatementType::Raise(_))
+                        }) {
+                            quote!(-> Result<stdpython::PyValue, PyException>)
+                        } else {
+                            return Err(
+                                "could not infer this function's return type from its \
+                                 unannotated parameters; add a return annotation \
+                                 (issue #109, M1)"
+                                    .to_string()
+                                    .into(),
+                            )
+                        }
+                    }
+                }
+            } else if inferred_signature.return_type.as_ref().is_some_and(|ty| {
+                // A return type that references a type variable (a loop
+                // element, an associated Output) cannot coexist with a
+                // fall-through path (Python returns None there) — loud,
+                // never a rustc mismatch at build time. A CONCRETE partial
+                // return (e.g. `if c: return 1`) keeps the old Result<()>
+                // shape.
+                let s = ty.to_string();
+                let tokens: Vec<&str> = s
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                inferred_signature.type_params.iter().any(|p| {
+                    let p = p.to_string();
+                    tokens.iter().any(|t| *t == p)
+                })
+            }) {
+                // Some path returns an inferred generic value while
+                // another can fall through (Python returns None there) —
+                // the value cannot be both that type and unit. Loud,
+                // never a rustc mismatch at build time (issue #109, M2).
+                return Err(
+                    "this function returns an inferred value on some path but can \
+                     fall through without one (Python would return None); annotate \
+                     its return type (issue #109, M2)"
+                        .to_string()
+                        .into(),
+                );
+            } else {
+                quote!(-> Result<(), PyException>)
+            }
+        } else {
+            match self.resolved_return_type(&symbols, &options) {
+                Some(ty) => quote!(-> Result<#ty, PyException>),
+                None => quote!(-> Result<(), PyException>),
+            }
         };
 
         // A body that can fall off the end implicitly returns None: give the
         // generated block an Ok(()) tail. Bodies that return (or raise) on
         // every path end with `return`/`return Err`, which need no tail.
-        if !guarantees_return(&self.body) {
-            streams.extend(quote!(Ok(())));
+        // A GENERATOR ends by returning its collected list.
+        if gen_elt.is_some() {
+            streams.extend(quote!(return __rython_gen;));
+        } else if !guarantees_return(&self.body) {
+            if options.fn_return_is_pyvalue {
+                streams.extend(quote!(Ok(PyValue::None_)));
+            } else {
+                streams.extend(quote!(Ok(())));
+            }
         }
 
         // A cached function wraps its ORIGINAL body in an inner fn: the
@@ -1006,6 +1617,24 @@ impl CodeGen for FunctionDef {
         // computes through the inner fn on a miss, and stores the clone.
         // Recursive calls in the body resolve to the OUTER item, so
         // recursion hits the cache, exactly like Python's wrapper.
+        // @lru_cache keys must stay concrete (int/bool/str): an inferred
+        // generic parameter cannot be hashed into a static key, so it is a
+        // loud error (issue #109).
+        if cache_spec.is_some() && inferred_signature.is_generic() {
+            // A cached function with GENERIC (unannotated) parameters
+            // (`func_with_weakref(weakref_to_self, *args, **kwargs)` under
+            // `@functools.lru_cache(...)` — botocore's lru_cache_weakref):
+            // the cache cannot key on the inferred types — the cache is
+            // dropped (the function lowers uncached; documented
+            // divergence).
+            options.definition_warnings.borrow_mut().push(format!(
+                "functools.lru_cache on `{}` with generic parameters is dropped (the \
+                 cache cannot key on inferred types; the function lowers uncached)",
+                self.name
+            ));
+            cache_spec = None;
+            cache_key = None;
+        }
         let streams = if let (Some(maxsize), Some(key)) = (cache_spec, cache_key.as_ref()) {
             let maxsize_tokens = match maxsize {
                 None => quote!(None),
@@ -1013,7 +1642,43 @@ impl CodeGen for FunctionDef {
             };
             let key_types: Vec<&TokenStream> = key.iter().map(|(_, t)| t).collect();
             let key_names: Vec<&proc_macro2::Ident> = key.iter().map(|(n, _)| n).collect();
-            let ret = match self.resolved_return_type() {
+            // The __lru_uncached fn takes the RAW parameter types (float
+            // stays f64 for the wrapped call); only the cache KEY tuple
+            // wraps floats in PyFloatKey.
+            let uncached_types: Vec<TokenStream> = key
+                .iter()
+                .zip(self.args.args.iter())
+                .map(|((_, ty), p)| {
+                    if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "float")
+                        && ty.to_string().contains("PyFloatKey")
+                    {
+                        crate::python_annotation_to_rust_type(
+                            p.annotation.as_deref().expect("float annotated"),
+                        )
+                        .unwrap_or_else(|| quote!(f64))
+                    } else {
+                        quote!(#ty)
+                    }
+                })
+                .collect();
+            // The cache KEY tuple: floats wrap in PyFloatKey (Python float
+            // semantics); everything else is the raw value cloned. The
+            // __lru_uncached call always passes the raw values.
+            let key_vals: Vec<TokenStream> = key
+                .iter()
+                .zip(self.args.args.iter())
+                .map(|((name, ty), p)| {
+                    let ident = name;
+                    if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "float")
+                        && ty.to_string().contains("PyFloatKey")
+                    {
+                        quote!(stdpython::stdlib::functools::PyFloatKey(#ident))
+                    } else {
+                        quote!(#ident.clone())
+                    }
+                })
+                .collect();
+            let ret = match self.resolved_return_type(&symbols, &options) {
                 Some(ty) => quote!(#ty),
                 None => quote!(()),
             };
@@ -1036,32 +1701,44 @@ impl CodeGen for FunctionDef {
                 if let Some(__hit) = __LRU_CACHE
                     .lock()
                     .expect("lru_cache mutex poisoned")
-                    .get(&(#((#key_names).clone(),)*))
+                    .get(&(#(#key_vals,)*))
                 {
                     return Ok(__hit);
                 }
                 #[allow(non_snake_case)]
-                fn __lru_uncached(#(#key_names: #key_types),*) -> Result<#ret, PyException> {
+                fn __lru_uncached(#(#key_names: #uncached_types),*) -> Result<#ret, PyException> {
                     #streams
                 }
                 let __lru_value = __lru_uncached(#((#key_names).clone()),*)?;
                 __LRU_CACHE
                     .lock()
                     .expect("lru_cache mutex poisoned")
-                    .put((#((#key_names).clone(),)*), __lru_value.clone());
+                    .put((#(#key_vals,)*), __lru_value.clone());
                 Ok(__lru_value)
             }
         } else {
             streams
         };
 
+        // A definition-time unsatisfiability warning (M5) never blocks
+        // conversion; report it through the -W channel (drained by the
+        // transpiler) and fold it into the #[deprecated] note.
+        if let Some(dw) = &inferred_signature.definition_warning {
+            options
+                .definition_warnings
+                .borrow_mut()
+                .push(format!("function `{}`: {}", self.name, dw));
+        }
         // Lossy conversions are silent semantic changes callers may not want
         // — surface them as a compiler warning at every call site outside the
         // generated crate via a single #[deprecated] note (the standard
         // mechanism for user-defined warnings). An item can carry only one
         // #[deprecated] attribute, so all notes are folded into it.
         let lossy_warning = if options.lossy_warnings {
-            let notes = self.lossy_conversion_notes();
+            let mut notes = self.lossy_conversion_notes();
+            if let Some(dw) = &inferred_signature.definition_warning {
+                notes.push(dw.clone());
+            }
             if notes.is_empty() {
                 quote!()
             } else {
@@ -1071,6 +1748,16 @@ impl CodeGen for FunctionDef {
         } else {
             quote!()
         };
+
+        let generic_header = inferred_signature.generic_header();
+        let where_clause = inferred_signature.where_clause();
+
+        // Render the parameter list now: the inference pass has populated
+        // options.param_type_vars, so unannotated parameters render as
+        // their inferred type variables (`a: A`).
+        let parameters = render_args
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
@@ -1089,14 +1776,14 @@ impl CodeGen for FunctionDef {
             quote! {
                 #(#doc_lines)*
                 #lossy_warning
-                #visibility #is_async fn #fn_name(#receiver #parameters) #return_type {
+                #visibility #is_async fn #fn_name #generic_header(#receiver #parameters) #return_type #where_clause {
                     #streams
                 }
             }
         } else {
             quote! {
                 #lossy_warning
-                #visibility #is_async fn #fn_name(#receiver #parameters) #return_type {
+                #visibility #is_async fn #fn_name #generic_header(#receiver #parameters) #return_type #where_clause {
                     #streams
                 }
             }
@@ -1146,24 +1833,349 @@ fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>
     }
 }
 
+/// The names of NESTED function definitions inside a statement list
+/// (recursing through control-flow bodies but not into nested defs/classes).
+/// These are CLOSURES in Python; rython's closures do not capture the
+/// enclosing scope (the closure-capture divergence), so the definitions
+/// drop (statement.rs) and calls through the names drop too.
+pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
+    use crate::StatementType as ST;
+    fn scan(stmts: &[crate::Statement], out: &mut Vec<String>) {
+        for s in stmts {
+            match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => out.push(f.name.clone()),
+                ST::If(i) => {
+                    scan(&i.body, out);
+                    scan(&i.orelse, out);
+                }
+                ST::While(w) => {
+                    scan(&w.body, out);
+                    scan(&w.orelse, out);
+                }
+                ST::For(f) => {
+                    scan(&f.body, out);
+                    scan(&f.orelse, out);
+                }
+                ST::AsyncFor(f) => {
+                    scan(&f.body, out);
+                    scan(&f.orelse, out);
+                }
+                ST::With(w) => scan(&w.body, out),
+                ST::AsyncWith(w) => scan(&w.body, out),
+                ST::Try(t) => {
+                    scan(&t.body, out);
+                    scan(&t.orelse, out);
+                    scan(&t.finalbody, out);
+                    for h in &t.handlers {
+                        scan(&h.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    scan(body, &mut out);
+    out
+}
+
 /// Map an expression to an obviously-inferable Rust type, if any.
-pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
-    match expr {
+pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
             // A string constant lowers to a &'static str literal.
             Some(litrs::Literal::String(_)) => Some(quote!(&'static str)),
+            // A bytes literal (`b""`, `b"x"` — urllib3's
+            // `self._first_try_data = b""`) lowers to Vec<u8>.
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                Some(quote!(Vec<u8>))
+            }
             _ => None,
         },
         ExprType::JoinedStr(_) => Some(quote!(String)),
+        // `"sep".join(iterable)` — and join on any string literal — yields
+        // an owned String (str::join / PyStrOps::join). Common idiom
+        // (version strings, path joining); the method table omits join for
+        // the unannotated-parameter bound, but concrete receivers work.
+        ExprType::Call(call) => {
+            if let ExprType::Attribute(a) = call.func.as_ref()
+                && a.attr == "join"
+                && matches!(
+                    a.value.as_ref(),
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                )
+            {
+                Some(quote!(String))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
+/// Issue #110: names bound to a string literal and later rebound by a
+/// non-literal (an aug-assign target, or a second assignment whose value
+/// is not a string literal). `literal_bindings` maps name → whether the
+/// (first) binding was a bare string literal; `rebound` collects names
+/// stored to by an aug-assign or a non-literal assignment.
+pub(crate) fn scan_str_rebindings(
+    body: &[Statement],
+    literal_bindings: &mut std::collections::HashMap<String, bool>,
+    rebound: &mut std::collections::HashSet<String>,
+) {
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Assign(a) => {
+                if let [ExprType::Name(name)] = a.targets.as_slice() {
+                    let is_literal = matches!(
+                        &a.value,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    );
+                    literal_bindings
+                        .entry(name.id.clone())
+                        .and_modify(|first| *first |= is_literal)
+                        .or_insert(is_literal);
+                    if !is_literal {
+                        rebound.insert(name.id.clone());
+                    }
+                }
+            }
+            StatementType::AugAssign(a) => {
+                if let ExprType::Name(name) = &a.target {
+                    rebound.insert(name.id.clone());
+                }
+            }
+            StatementType::If(s) => {
+                scan_str_rebindings(&s.body, literal_bindings, rebound);
+                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
+            }
+            StatementType::For(s) => {
+                scan_str_rebindings(&s.body, literal_bindings, rebound);
+                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
+            }
+            StatementType::While(s) => {
+                scan_str_rebindings(&s.body, literal_bindings, rebound);
+                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
+            }
+            StatementType::Try(t) => {
+                scan_str_rebindings(&t.body, literal_bindings, rebound);
+                for h in &t.handlers {
+                    scan_str_rebindings(&h.body, literal_bindings, rebound);
+                }
+                scan_str_rebindings(&t.orelse, literal_bindings, rebound);
+                scan_str_rebindings(&t.finalbody, literal_bindings, rebound);
+            }
+            StatementType::With(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
+            StatementType::AsyncWith(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
+            _ => {}
+        }
+    }
+}
+
+/// Issue #112: a `del name` whose name is referenced afterwards (or whose
+/// deletion is conditional) cannot lower to a no-op — the value would
+/// still be readable where Python raises NameError. Loud error; a
+/// reassignment or import clears the deletion (Python rebinds).
+pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
+    let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let check = |stmt: &Statement, deleted: &mut std::collections::HashSet<String>| -> Result<(), String> {
+        let walk_expr = |expr: &ExprType, deleted: &std::collections::HashSet<String>| -> Result<(), String> {
+            for name in deleted {
+                if crate::expr_references(expr, name) {
+                    return Err(format!(
+                        "`del {name}` then a use of `{name}`: rython cannot unbind a \
+                         binding (the value would still be readable where Python raises \
+                         NameError). Remove the del, or reassign `{name}` first (issue \
+                         #112)"
+                    ));
+                }
+            }
+            Ok(())
+        };
+        match &stmt.statement {
+            StatementType::Delete(targets) => {
+                for target in targets {
+                    if let ExprType::Name(n) = target {
+                        deleted.insert(n.id.clone());
+                    }
+                }
+                Ok(())
+            }
+            StatementType::Assign(a) => {
+                for target in &a.targets {
+                    if let ExprType::Name(n) = target {
+                        deleted.remove(&n.id);
+                    }
+                }
+                walk_expr(&a.value, deleted)?;
+                for target in &a.targets {
+                    walk_expr(target, deleted)?;
+                }
+                Ok(())
+            }
+            StatementType::AugAssign(a) => {
+                if let ExprType::Name(n) = &a.target {
+                    deleted.remove(&n.id);
+                }
+                walk_expr(&a.target, deleted)?;
+                walk_expr(&a.value, deleted)
+            }
+            StatementType::Import(i) => {
+                for alias in &i.names {
+                    deleted.remove(&alias.name);
+                }
+                Ok(())
+            }
+            StatementType::ImportFrom(i) => {
+                for alias in &i.names {
+                    deleted.remove(&alias.name);
+                    if let Some(asname) = &alias.asname {
+                        deleted.remove(asname);
+                    }
+                }
+                Ok(())
+            }
+            StatementType::For(f) => {
+                // The loop target rebinds each iteration.
+                deleted.remove(&loop_target_name(&f.target));
+                walk_expr(&f.iter, deleted)?;
+                walk_expr(&f.target, deleted)?;
+                check_deleted_names(&f.body)?;
+                check_deleted_names(&f.orelse)?;
+                Ok(())
+            }
+            StatementType::If(s) => {
+                walk_expr(&s.test, deleted)?;
+                check_deleted_names(&s.body)?;
+                check_deleted_names(&s.orelse)?;
+                Ok(())
+            }
+            StatementType::While(s) => {
+                walk_expr(&s.test, deleted)?;
+                check_deleted_names(&s.body)?;
+                check_deleted_names(&s.orelse)?;
+                Ok(())
+            }
+            StatementType::Try(t) => {
+                check_deleted_names(&t.body)?;
+                for h in &t.handlers {
+                    check_deleted_names(&h.body)?;
+                }
+                check_deleted_names(&t.orelse)?;
+                check_deleted_names(&t.finalbody)?;
+                Ok(())
+            }
+            StatementType::With(w) => check_deleted_names(&w.body),
+            StatementType::AsyncWith(w) => check_deleted_names(&w.body),
+            StatementType::AsyncFor(f) => {
+                deleted.remove(&loop_target_name(&f.target));
+                walk_expr(&f.iter, deleted)?;
+                walk_expr(&f.target, deleted)?;
+                check_deleted_names(&f.body)?;
+                check_deleted_names(&f.orelse)?;
+                Ok(())
+            }
+            StatementType::Expr(e) => walk_expr(&e.value, deleted),
+            StatementType::Return(Some(e)) => walk_expr(&e.value, deleted),
+            StatementType::Return(None) => Ok(()),
+            StatementType::Call(c) => {
+                walk_expr(&c.func, deleted)?;
+                for arg in &c.args {
+                    walk_expr(arg, deleted)?;
+                }
+                for kw in &c.keywords {
+                    walk_expr(&kw.value, deleted)?;
+                }
+                Ok(())
+            }
+            StatementType::Assert { test, msg } => {
+                walk_expr(test, deleted)?;
+                if let Some(m) = msg {
+                    walk_expr(m, deleted)?;
+                }
+                Ok(())
+            }
+            StatementType::Raise(r) => {
+                if let Some(exc) = &r.exc {
+                    walk_expr(exc, deleted)?;
+                }
+                if let Some(cause) = &r.cause {
+                    walk_expr(cause, deleted)?;
+                }
+                Ok(())
+            }
+            // Nested functions/classes have their own scope.
+            StatementType::FunctionDef(_)
+            | StatementType::AsyncFunctionDef(_)
+            | StatementType::ClassDef(_)
+            | StatementType::Global(_)
+            | StatementType::Nonlocal(_)
+            | StatementType::AnnotatedName { .. }
+            | StatementType::Pass
+            | StatementType::Break
+            | StatementType::Continue
+            | StatementType::Unimplemented(_) => Ok(()),
+        }
+    };
+    for stmt in body {
+        check(stmt, &mut deleted)?;
+    }
+    Ok(())
+}
+
+/// The name bound by a for-loop target (single-name targets only).
+fn loop_target_name(target: &ExprType) -> String {
+    match target {
+        ExprType::Name(n) => n.id.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Issue #115: a module-level name WRITTEN from this function — a `global
+/// x` declaration whose name is an Assign/AugAssign target in the same
+/// body. Returns the offending name.
+fn global_write_error(body: &[Statement]) -> Option<String> {
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Global(names) => {
+                declared.extend(names.iter().cloned());
+            }
+            StatementType::Assign(a) => {
+                for target in &a.targets {
+                    if let ExprType::Name(n) = target {
+                        written.insert(n.id.clone());
+                    }
+                }
+            }
+            StatementType::AugAssign(a) => {
+                if let ExprType::Name(n) = &a.target {
+                    written.insert(n.id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    // `global __doc__` + docstring mutation (requests' status_codes._init)
+    // is metadata — tolerated.
+    declared
+        .into_iter()
+        .find(|n| written.contains(n) && n != "__doc__")
+}
+
 /// Collect `name = <simply-typed constant>` assignments (recursing into
 /// control-flow bodies) so returns of those names can be inferred too.
+/// Collect the types of local names assigned in a statement list: annotated
+/// locals and simple-literal locals. `symbols`/`options` enable CALL-return
+/// resolution (`proxy = parse_url(...)` → the callee's `-> Url`), so a
+/// field stored from the local (`self.proxy = proxy` — urllib3's
+/// ProxyManager) gets the class struct type.
 pub(crate) fn collect_local_types(
     body: &[Statement],
     out: &mut std::collections::HashMap<String, TokenStream>,
@@ -1172,10 +2184,54 @@ pub(crate) fn collect_local_types(
         match &stmt.statement {
             StatementType::Assign(assign) => {
                 if let [ExprType::Name(name)] = assign.targets.as_slice() {
-                    if let Some(ty) = simple_expr_type(&assign.value) {
+                    // An annotated local (`flags: int = _character_flags(c)`)
+                    // types from the annotation.
+                    if let Some(ann) = assign.annotation.as_ref()
+                        && let Some(t) = crate::annotation_type_info(ann)
+                    {
+                        out.insert(name.id.clone(), t.to_rust_type());
+                    } else if let Some(ty) = simple_expr_type(&assign.value) {
                         out.insert(name.id.clone(), ty);
+                    } else {
+                        // An EMPTY container local (`allowed = {}` then
+                        // `allowed[alg] = ...` — pip's Hashes): the boxed
+                        // heterogeneous container (the element types are
+                        // unknowable at the store).
+                        match &assign.value {
+                            ExprType::Dict(d) if d.keys.is_empty() => {
+                                out.insert(name.id.clone(), quote!(PyDict<String, stdpython::PyValue>));
+                            }
+                            ExprType::List(l) if l.is_empty() => {
+                                out.insert(name.id.clone(), quote!(Vec<stdpython::PyValue>));
+                            }
+                            _ => {}
+                        }
                     }
                 }
+            }
+            // A local IMPORT (`import keyring` inside __init__, then
+            // `self.keyring = keyring` — pip's KeyRingPythonProvider): a
+            // module object — a boxed value.
+            StatementType::Import(im) => {
+                for a in &im.names {
+                    out.insert(a.name.clone(), quote!(stdpython::PyValue));
+                }
+            }
+            // A bare annotated local (`key: str` / `value: str` — urllib3's
+            // ssl_match_hostname): types the name for downstream use
+            // (dnsnames.append(value) pins Vec<String>).
+            StatementType::AnnotatedName { name, annotation } => {
+                if let Some(t) = crate::annotation_type_info(annotation) {
+                    out.insert(name.clone(), t.to_rust_type());
+                }
+            }
+            StatementType::Try(s) => {
+                collect_local_types(&s.body, out);
+                for h in &s.handlers {
+                    collect_local_types(&h.body, out);
+                }
+                collect_local_types(&s.orelse, out);
+                collect_local_types(&s.finalbody, out);
             }
             StatementType::If(s) => {
                 collect_local_types(&s.body, out);
@@ -1249,6 +2305,136 @@ pub(crate) fn expr_yields_option(
     }
 }
 
+/// Whether an expression already yields a boxed PyValue (issue #121): a
+/// PyValue-annotated name or a call returning one. Such values store into
+/// PyValue slots through unchanged — wrapping again would nest PyValue
+/// inside PyValue.
+pub(crate) fn expr_yields_pyvalue(
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    match expr {
+        ExprType::Name(name) => {
+            // A narrowed read converts to the member type (String, i64,
+            // ...) — no longer a PyValue. A name narrowed back to PyValue
+            // itself (the else of a compound isinstance test) still is.
+            match options.narrowed_names.get(&name.id) {
+                Some(t) => matches!(t, crate::TypeInfo::PyValue),
+                None => options
+                    .name_types
+                    .get(&name.id)
+                    .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue)),
+            }
+        }
+        ExprType::Call(call) => match call.func.as_ref() {
+            ExprType::Name(name) => match symbols.get(&name.id) {
+                Some(SymbolTableNode::FunctionDef(f)) => f.returns.as_deref().is_some_and(|r| {
+                    crate::annotation_type_info(r)
+                        .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
+                }),
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a function body contains a `yield`/`yield from` anywhere
+/// (control-flow nested included): the body is a GENERATOR and lowers to
+/// build-and-return-a-list (issue #122-family).
+pub(crate) fn body_has_yields(body: &[Statement]) -> bool {
+    body.iter().any(|s| match &s.statement {
+        StatementType::Expr(e) => matches!(
+            e.value,
+            ExprType::Yield(_) | ExprType::YieldFrom(_)
+        ),
+        StatementType::If(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
+        StatementType::While(s) => body_has_yields(&s.body),
+        StatementType::For(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
+        StatementType::With(s) => body_has_yields(&s.body),
+        StatementType::Try(s) => {
+            body_has_yields(&s.body)
+                || s.handlers.iter().any(|h| body_has_yields(&h.body))
+                || body_has_yields(&s.orelse)
+                || body_has_yields(&s.finalbody)
+        }
+        _ => false,
+    })
+}
+
+/// The element type of a generator body: from the `Generator[T, ...]` /
+/// `Iterator[T]` return annotation (Python's convention), else the first
+/// yielded value's inferred type.
+pub(crate) fn generator_element_type(
+    returns: Option<&ExprType>,
+    body: &[Statement],
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<crate::TypeInfo> {
+    if let Some(ann) = returns
+        && let ExprType::Subscript(sub) = ann
+        && matches!(
+            sub.value.as_ref(),
+            ExprType::Name(n) if matches!(n.id.as_str(), "Generator" | "Iterator")
+        )
+        && let crate::SubscriptKind::Index(elt) = &sub.kind
+        && let ExprType::Tuple(t) = elt.as_ref()
+        && let Some(first) = t.elts.first()
+    {
+        if let Some(t) = crate::resolve_alias_typeinfo(first, symbols, options) {
+            return Some(t);
+        }
+        if let Some(t) = crate::annotation_type_info(first) {
+            return Some(t);
+        }
+    }
+    first_yield_type(body, options, symbols)
+}
+
+/// The inferred type of the first `yield <value>` in a body.
+fn first_yield_type(
+    body: &[Statement],
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<crate::TypeInfo> {
+    for s in body {
+        match &s.statement {
+            StatementType::Expr(e) => {
+                if let ExprType::Yield(y) = &e.value
+                    && let Some(v) = y.value.as_ref()
+                {
+                    let t = crate::infer_type(v, options, symbols);
+                    if !matches!(t, crate::TypeInfo::PyObject) {
+                        return Some(t);
+                    }
+                }
+            }
+            StatementType::If(s) => {
+                if let Some(t) = first_yield_type(&s.body, options, symbols) {
+                    return Some(t);
+                }
+                if let Some(t) = first_yield_type(&s.orelse, options, symbols) {
+                    return Some(t);
+                }
+            }
+            StatementType::For(f) => {
+                if let Some(t) = first_yield_type(&f.body, options, symbols) {
+                    return Some(t);
+                }
+            }
+            StatementType::While(w) => {
+                if let Some(t) = first_yield_type(&w.body, options, symbols) {
+                    return Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Lower an expression destined for an Option slot (a store into an
 /// optional-tracked name, or an Optional-annotated parameter): values that
 /// already yield an Option (and None itself) pass through, plain values
@@ -1319,6 +2505,20 @@ pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
 }
 
 impl FunctionDef {
+    /// Whether this method is a property SETTER (`@x.setter def x(...)` —
+    /// the `setter` decorator spelling). Only the setter half of a
+    /// getter/setter pair gets the distinct Rust name `{name}_set`; the
+    /// getter (`@property def x`) keeps its name.
+    pub fn is_property_setter(&self) -> bool {
+        self.decorator_list.iter().any(|d| match d {
+            ExprType::Attribute(a) => {
+                a.attr == "setter"
+                    && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == self.name)
+            }
+            _ => false,
+        })
+    }
+
     /// The return type the generated Rust function actually carries, if any.
     ///
     /// Inference from the body comes first (it reflects the type the body
@@ -1331,7 +2531,11 @@ impl FunctionDef {
     ///
     /// Tools generating call-through code (e.g. PyO3 wrappers) must use this
     /// same method so their signatures match the generated function.
-    pub fn resolved_return_type(&self) -> Option<TokenStream> {
+    pub fn resolved_return_type(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
         // A bare `str` annotation is authoritative: the inferred type for a
         // literal-returning body (`&'static str`) is a Rust literal artifact,
         // not the Python type, and the mismatch breaks every call site
@@ -1350,7 +2554,53 @@ impl FunctionDef {
                 if is_none_expr(ann) {
                     None
                 } else {
-                    crate::python_annotation_to_rust_type(ann)
+                    crate::python_annotation_to_rust_type(ann).or_else(|| {
+                        // A user-class annotation (`-> Scheme`): the type is
+                        // the class name rendered as a Rust ident — the same
+                        // path parameters use. A bare Name that is NOT a
+                        // class would fail loudly later at the call site;
+                        // mapping it here makes `-> Scheme` + `return
+                        // Scheme::new(...)` line up.
+                        match ann {
+                            ExprType::Name(n)
+                                if !matches!(n.id.as_str(), "int" | "float" | "str" | "bool" | "bytes" | "bytearray") =>
+                            {
+                                if n.id == "Self" {
+                                    // typing.Self (`def __enter__(self) ->
+                                    // Self` — requests' models): the
+                                    // enclosing class — the Rust `Self`
+                                    // impl-keyword is exactly that (the
+                                    // safe_ident `Self_` escaping is wrong
+                                    // inside an impl block).
+                                    Some(quote!(Self))
+                                } else if let Some(SymbolTableNode::ImportFrom(ifm)) =
+                                    symbols.get(&n.id)
+                                {
+                                    let runtime_item =
+                                        crate::ast::tree::module::module_def_has_runtime_item(
+                                            options,
+                                            &ifm.resolved_module_path(options),
+                                            &n.id,
+                                        );
+                                    if runtime_item {
+                                        let ident = crate::safe_ident(&n.id);
+                                        Some(quote!(#ident))
+                                    } else {
+                                        // An imported name with NO runtime item
+                                        // (`-> BaseHTTPConnection` — a
+                                        // TYPE_CHECKING-only Protocol stub in
+                                        // urllib3's _base_connection): the boxed
+                                        // PyValue.
+                                        Some(quote!(stdpython::PyValue))
+                                    }
+                                } else {
+                                    let ident = crate::safe_ident(&n.id);
+                                    Some(quote!(#ident))
+                                }
+                            }
+                            _ => None,
+                        }
+                    })
                 }
             })
         } else {
@@ -1438,12 +2688,28 @@ impl FunctionDef {
 
         let mut locals = std::collections::HashMap::new();
         collect_local_types(&self.body, &mut locals);
+        // Issue #110: a string-literal local that is later REBOUND by a
+        // String (`out = ""; out += "x"`) is owned from its first
+        // assignment, so its type is String, not &'static str.
+        let mut literal_bindings: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
+        scan_str_rebindings(&self.body, &mut literal_bindings, &mut rebound);
 
         let mut inferred: Option<TokenStream> = None;
         for ret in &returns {
             let value = (*ret)?; // a bare `return` means the type is unit
             let ty = match value {
-                ExprType::Name(name) => locals.get(&name.id)?.clone(),
+                ExprType::Name(name) => {
+                    let t = locals.get(&name.id)?.clone();
+                    if t.to_string() == quote!(&'static str).to_string()
+                        && rebound.contains(&name.id)
+                    {
+                        quote!(String)
+                    } else {
+                        t
+                    }
+                }
                 other => simple_expr_type(other)?,
             };
             match &inferred {
@@ -1466,6 +2732,15 @@ impl FunctionDef {
         match expr.statement {
             StatementType::Expr(e) => match e.value {
                 ExprType::Constant(c) => {
+                    // The Ellipsis sentinel is NOT a docstring: a Protocol
+                    // stub `def f(...) -> None: ...` must not get a bogus
+                    // `#![doc = "\0RYTHON_ELLIPSIS"]` from its `...` body.
+                    if c.0
+                        .as_ref()
+                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                    {
+                        return None;
+                    }
                     let raw_string = c.to_string();
                     // Clean up the docstring for Rust documentation
                     Some(self.format_docstring(&raw_string))

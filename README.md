@@ -96,6 +96,11 @@ program either converts and behaves like CPython, or conversion fails with
 a message saying exactly what isn't supported. Nothing silently diverges.
 
 What works today (all CPython-verified): functions with type annotations,
+parameter type inference for unannotated parameters (trait-bound generic
+signatures derived from how the parameter is used — `def add(a, b): return
+a + b` works for ints, floats, strings, and lists; `for x in p` infers
+`IntoIterator` with element propagation; unannotated parameters either
+infer or fail loudly at conversion time),
 classes (struct-based), control flow including `try`/`except`/`finally` and
 loop `else`, comprehensions, f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus
@@ -121,15 +126,97 @@ Known gaps:
   reassigning a name to a different type don't convert.
 - **Language features**: generators/`yield`, `async`/`await`,
   `eval`/`exec`, `*args`/`**kwargs`, multiple inheritance and dunder
-  protocols are not supported yet. Decorators other than
-  `functools.lru_cache`/`cache` are a loud conversion error (never
-  silently ignored).
-- **`lru_cache` keys** must be `int`/`bool`/`str`-annotated parameters
-  — floats are not hashable in Rust, so Python's float-key caching is
-  refused rather than approximated.
+  protocols are not supported yet. Decorators are handled through a
+  single systematic registry (decorator.rs) — like Rust's built-in
+  attributes, rython consumes the decorator expression at conversion
+  time and rewrites the definition. The supported set is
+  `functools.lru_cache`/`cache`, `classmethod`, `staticmethod`, and
+  `@dataclass` (which synthesizes `__init__` from annotated fields,
+  defaults kept; `frozen`/`slots` are no-ops since the Rust struct is
+  already value-semantics). The decorator-FACTORY expression
+  `alias = lru_cache(maxsize=N)(fn)` lowers to the same synthesized
+  cached function. Any other decorator is a loud conversion error from
+  the registry (never silently ignored); arbitrary user decorators
+  (functions applied to definitions) are the function-as-value
+  divergence (issue #122).
+- **`lru_cache` keys** must be `int`/`bool`/`str`/`float`-annotated
+  parameters. Floats use the `PyFloatKey` wrapper with Python's exact
+  semantics: `-0.0 == 0.0` (they share a cache entry) and `NaN != NaN`
+  (a NaN key never hits, so the wrapped function is called every time —
+  exactly CPython's dict behavior).
 - **File objects** cover text modes (`r`/`w`/`a`) and `io.StringIO`;
   binary modes, `BytesIO`, `seek`/`tell`, and file-based `json`
   (`dump`/`load`) are not supported yet.
+
+## Documented divergences from CPython
+
+Determined by converting the top-5 most-downloaded PyPI packages
+(urllib3, requests, botocore, boto3, pip) and recording the blockers.
+Each is a deliberate boundary of rython's static, value-semantics model —
+a loud conversion error or build-time type error at the exact Python
+line, never a silent behaviour change:
+
+- **`*args`/`**kwargs` (variadic parameters)** — `def __init__(self,
+  num_pools=10, **connection_pool_kwargs)` is a loud error. Blocks
+  urllib3's `PoolManager` (and everything that depends on urllib3,
+  including botocore/boto3) and s3transfer's callback helpers.
+- **Heterogeneous unions** — a parameter/field annotated with a union
+  whose members map to different Rust types (`str | bytes`,
+  `str | bytes | int | float`) has no single Rust type. The common
+  two-member `str | bytes` (and `str | bytes | bytearray`) lowers to the
+  `StrOrBytes` runtime union, narrowed by `isinstance(x, (bytes,
+  bytearray))` checks into the concrete branch; `T | None` →
+  `Option<T>`; same-Rust-type unions (`bytes | bytearray` → `Vec<u8>`).
+  Wider unions (`bool | str | None` in requests' `verify`, `str | bytes
+  | int | float` in `UriType`) remain a loud error. `from typing import
+  ...` names (TypeVar/Protocol/TypeAlias/cast) and `if TYPE_CHECKING:`
+  blocks are compile-time-only and lower to nothing; module-level
+  `name = str` type aliases emit a `pub type`.
+- **Callables in containers** — a list/dict whose elements are function
+  objects (`botocore._INITIALIZERS`, populated by
+  `register_initializer(callback)` and invoked via
+  `for initializer in _INITIALIZERS: initializer(session)`) has no
+  representable element type and no call-through-container lowering.
+  Same family as "classes as values": function objects are not
+  first-class values. Blocks botocore (#3 PyPI) at its first statement.
+- **Dynamic imports and the import machinery** — `importlib`,
+  `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
+  modeled: rython compiles imports statically. Blocks pip's
+  `__pip-runner__.py` import-redirection bootstrapper.
+- **Runtime `argparse` objects** — the conversion-time typed-namespace
+  `argparse` works for the entry module; `argparse.ArgumentParser()`
+  with `add_argument(..., action=, help=, ...)`/`parse_args()` in
+  non-entry modules (certifi's `__main__.py`, idna's `cli.py`) is a
+  loud error.
+- **Classes as values** — a class object cannot be passed, stored, or
+  returned (`category: type[Warning]` defaults to a class, duck-typed
+  module `__getattr__` returning `importlib.import_module(...)`).
+  `type[X]` annotations are tolerated as an opaque `Option<()>` so
+  definitions compile; any call that actually passes a class is a type
+  error. Blocks dateutil's lazy submodule loading (and thereby
+  botocore/boto3's shared first module) and urllib3's
+  `disable_warnings(category=...)`.
+- **Attribute reads on unannotated parameters** — `p.attr` where `attr`
+  is neither a known method nor a field of a known class is a loud
+  error (s3transfer's `request.body.disable_callback()`).
+- **Attribute reads on call results** — a field typed from
+  `self.x = call(...).attr` needs the callee's return type
+  (`get_scheme(...) -> Scheme`, then the dataclass field annotation).
+  rython resolves imported functions' SIGNATURES cross-module (keyword
+  arguments and omitted defaults on `from x import f` calls work), but
+  does not yet propagate a function's `-> T` return annotation into
+  `name = call(...)` typing, so `Prefix.bin_dir = scheme.scripts` in
+  pip's `_internal` is a loud error (blocks pip — #5 PyPI). The same
+  gap shows as "cannot infer the return value" for functions whose
+  result comes from dict reads or method chains (jmespath's `compile`).
+- **`is not None` narrowing** — `if x is not None:` narrows an
+  `Option<T>`-typed name to `T` for reads/iteration in the body, and an
+  if/else whose branches both leave x non-None keeps it narrowed for the
+  rest of the function (charset_normalizer's `cp_isolation` guards).
+- **Codecs** — `str.encode`/`bytes.decode` support `utf-8`, `ascii`, and
+  `punycode` (RFC 3492, CPython-verified); other codec names are a loud
+  error. `bytes.decode("utf-8")` etc. work through the stdpython codec
+  layer.
 - **`argparse`** supports literal specs only (the parser is evaluated at
   conversion time): `str`/`int`/`float` positionals, `--long` options
   with `default=`, `store_true`, `help=`, `prog=`, `description=`.
@@ -142,6 +229,105 @@ Known gaps:
   typed container (a non-participating regex group in `split`,
   `groupdict` of an unmatched group) fail loudly instead; sorting
   `NaN` panics, since Python's `NaN` ordering is not reproducible.
+
+### Round 8: the top-5 PyPI sweep (all five convert)
+
+All five target packages (urllib3, requests, botocore, boto3, pip) now
+convert end-to-end. Getting the last one (pip, with its deep vendored
+tree: distlib, pygments, rich, packaging, cachecontrol, resolvelib)
+through required a second family of documented divergences — each one a
+loud `-W` warning at the exact Python line, never a silent behaviour
+change:
+
+- **Static imports and dead fallbacks** — `try: from tokenize import
+  detect_encoding / except ImportError:` fallbacks are dropped: rython's
+  imports are static, so an ImportError handler around an import can
+  never run. Python-2-era gates (`if sys.version_info[0] < 3:`) are
+  evaluated at conversion time (rython is Python 3.11) and the dead
+  branch is dropped.
+- **`*`/`**` spreads into typed constructors** — `datetime(*date[:6],
+  tzinfo=timezone.utc)` (cachecontrol's expiry heuristic) and
+  `timedelta(**kw)` lower to `now()` / zero: the spread's element types
+  are dynamic. `csv.reader(**dialect)` and `hashlib.md5(*args,
+  **kwargs)` spreads are dropped (the defaults are the excel dialect /
+  empty in practice).
+- **Boxed containers** — empty lists/dicts/sets whose element type is
+  unknowable at the store (`result: list[float] = []` pins fine; a
+  PyValue-poisoned `1 + len(archive)` field, `{**a, **b}` all-spread
+  dicts, `[1, 2, 3, None, 4, True, False, "Hello World"]` demo mixes)
+  lower as `Vec<PyValue>` / `PyDict<String, PyValue>`.
+- **Aliasing at the boundary** — a chained assignment to a container
+  literal (`result[key] = entries = {}` — distlib's read_exports) clones
+  per target: Python shares ONE dict, rython's value semantics give each
+  target a copy (issues #79/#104). `del obj.attr` on a non-self object
+  (pygments' module-proxy cleanup) is dropped.
+- **Callables held as data** — `self.get = self._entries[-1].get`, a
+  `lambda x: x` default, `@rich_repr`/`@auto` local wrapper decorators,
+  and `_lexer_cache[name](**options)` (a class stored in a dict and
+  constructed) all lower as boxed PyValue or drop the call (issue #122
+  family).
+- **Typing metadata** — `metaclass=AnyName`, TypedDict's `total=`,
+  `type[X]` annotations, string-literal forward references (`"IO[str]"`),
+  external dotted annotations (`wintypes.HANDLE`), `Dict[int, None]`,
+  `cast(List[str], ...)[:]`, and `nonlocal` declarations are all
+  conversion-time no-ops (the class lowers as a plain struct; the
+  parameter boxes as PyValue).
+- **String formatting edges** — `f"{size:,}"` (thousands separator) and
+  `f"{x:{width}}"` (dynamic width) route through runtime formatters;
+  `str.format` on a template that cannot be resolved at conversion time
+  (a parameter-stored field) is dropped.
+- **Recursion fixpoint** — a self-recursive function whose base returns
+  build strings (`regex_opt_inner` — pygments' regexopt, recursing on
+  string slices) resolves its recursive calls to String.
+- **Miscellaneous** — tuple loop targets now support any arity
+  (`for base, suffix, dest in rules:`); a conditional re-flags argument
+  (`0 if case_sensitive else re.IGNORECASE`) resolves statically;
+  `isinstance(value, expected_type)` with a `type[T]` parameter is
+  statically true; generators return a Vec of yielded values (the
+  `yield` divergence); `self.bit = 1 << bit_no` fields infer i64;
+  `re.UNICODE` is a no-op (rython's regex is already Unicode).
+
+### Rounds 9–13: requests/urllib3 build chase (145 → 117 errors)
+
+The BUILD phase drives the remaining rustc errors in the generated
+requests crate down by fixing systemic codegen bugs, with the full
+workspace suite (31 targets, 315 codegen_semantics + 78 convert_tests)
+green at every step. The rounds fixed, among others:
+
+- **Call-site scope on imported-class methods** — keyword-VALUE
+  arguments of a call on an imported class's method now render in the
+  caller's symbol scope (dropped-DEFAULT constants still resolve in the
+  defining module's scope). requests' `p.prepare(headers=merge_setting(
+  ..., dict_class=CaseInsensitiveDict))` no longer emits E0423.
+- **The sibling-import drop is now re-export- and submodule-aware** —
+  `module_def_has_runtime_item` follows a module's own ImportFrom
+  re-export chains (SKIP_HEADER through util/__init__.py), recognizes
+  package submodules (`from .util import connection, ssl_`), and routes
+  stdpython-module re-exports (`from .compat import json as
+  complexjson`) to `use <stdpython>::json as complexjson;`.
+- **Submodule imports are reachable** — `from .http2 import probe as
+  http2_probe` enqueues `http2/probe.py` so it is transpiled.
+- **Dynamic-module-member divergences** — a read of a module member the
+  generated module has no item for (`util.ssl_.PROTOCOL_TLS`) lowers to
+  the boxed `None` with a warning; a call through a member that is not a
+  module-level function/class (`probe.acquire_and_get`) drops with the
+  callable-as-value warning (§12.3 ledger).
+- **Static types never leak `_`** — a promoted static whose inferred
+  type contains the uninferred placeholder (`PyDict<_, _>` from external
+  None values) falls back to the boxed `PyValue`.
+- **Version-gated module functions** — `def where` under `if
+  sys.version_info >= (3, 11):` (certifi) counts as a runtime item for
+  sibling imports.
+- **Self-referential and try/except imports** — `from . import packages,
+  utils` in a package's own `__init__` emits no redundant `pub use`
+  (the `pub mod` declarations already expose the submodules); a
+  try/except-ImportError whose handler assigns a name the try body
+  imports drops the import (the fallback assign makes it a module-init
+  local). Module-level underscore functions are `pub(crate)` under the
+  module context, and sibling imports re-export them as `pub(crate)
+  use`.
+- **Partial-bound class args** — a class bound to a `type[...]`
+  parameter of `functools.partial` boxes to `None` (callables-as-data).
 
 ## Roadmap
 

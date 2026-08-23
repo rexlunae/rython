@@ -81,8 +81,8 @@ impl CodeGen for Name {
     fn to_rust(
         self,
         _ctx: Self::Context,
-        _options: Self::Options,
-        _symbols: Self::SymbolTable,
+        options: Self::Options,
+        symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         // Handle dotted names (like "os.path") by converting them to Rust module paths
         if self.id.contains('.') {
@@ -91,6 +91,133 @@ impl CodeGen for Name {
             Ok(quote!(#(#idents)::*))
         } else {
             let name = crate::safe_ident(&self.id);
+            // Issue #125: a name narrowed by `if x is not None:` (or by an
+            // if/else whose branches both leave x non-None) still holds an
+            // Option at runtime — the binding is hoisted once. Every READ
+            // must unwrap it: Python's value IS the inner value in the
+            // narrowed region. clone() keeps the read non-consuming so the
+            // name stays usable (the hoisted binding is reused).
+            // Issue #121: a `str | bytes` union narrowed by isinstance
+            // reads the concrete branch (String via as_str, Vec<u8> via
+            // as_bytes) — a runtime conversion, not an unwrap.
+            if let Some(target) = options.narrowed_names.get(&self.id) {
+                return Ok(match target {
+                    crate::TypeInfo::StrOrBytes => quote!((#name)),
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                        quote!((#name).as_str().unwrap().to_string())
+                    }
+                    crate::TypeInfo::Bytes => {
+                        quote!((#name).as_bytes().unwrap().to_vec())
+                    }
+                    // Issue #121: a boxed PyValue narrowed by isinstance
+                    // reads the concrete member via the PyValue accessors
+                    // (as_int/as_str/as_tuple...), a runtime conversion.
+                    crate::TypeInfo::PyValueMember(inner) => match inner.as_ref() {
+                        crate::TypeInfo::Int => quote!((#name).as_int().unwrap()),
+                        crate::TypeInfo::Float => quote!((#name).as_float().unwrap()),
+                        crate::TypeInfo::Bool => quote!((#name).as_bool().unwrap()),
+                        crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                            quote!((#name).as_str().unwrap().to_string())
+                        }
+                        crate::TypeInfo::Bytes => {
+                            quote!((#name).as_bytes().unwrap().to_vec())
+                        }
+                        // A narrowed tuple member (isinstance(x, tuple))
+                        // reads as the element vector; indexing and len
+                        // then operate on it.
+                        crate::TypeInfo::Vec(_) => {
+                            quote!((#name).as_tuple().unwrap().clone())
+                        }
+                        _ => quote!((#name)),
+                    },
+                    // A PyValue narrowed to itself (e.g. the else of a
+                    // compound `isinstance(x, T) and ...`) reads bare.
+                    crate::TypeInfo::PyValue => quote!((#name)),
+                    _ => quote!((#name).clone().unwrap()),
+                });
+            }
+            // A module-level value promoted to a LazyLock static (module.rs):
+            // a static does not auto-deref in value/borrow position (only as
+            // a method receiver), so every READ clones the deref'd value.
+            if options.promoted_statics.contains(&self.id) {
+                return Ok(quote!((*#name).clone()));
+            }
+            // A name IMPORTED from a sibling module where it is a promoted
+            // static (`from .constant import _THAI` — the import brings the
+            // LazyLock static into scope): reads deref-clone the same way.
+            // Resolve the ImportFrom to its defining module and consult the
+            // shared promotion map (module.rs's `module_promoted_static_names`)
+            // so the read matches the static the defining module emitted.
+            // Follows alias chains (`from .constant import _THAI as T` —
+            // the symbol for T is Alias("_THAI"), which resolves to the
+            // ImportFrom).
+            let mut sym = symbols.get(&self.id).cloned();
+            let mut hops = 0;
+            while let Some(crate::SymbolTableNode::Alias(target)) = &sym {
+                if hops > 16 {
+                    break;
+                }
+                sym = symbols.get(target).cloned();
+                hops += 1;
+            }
+            if let Some(crate::SymbolTableNode::ImportFrom(ifm)) = sym {
+                let path = ifm.resolved_module_path(&options);
+                if options.module_defs.contains_key(&path) {
+                    // The canonical name in the defining module (the alias
+                    // target when this name is an asname binding).
+                    let canonical = ifm
+                        .names
+                        .iter()
+                        .find(|a| a.asname.as_deref() == Some(self.id.as_str()))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| self.id.clone());
+                    if crate::ast::tree::module::module_promoted_static_names(
+                        &options, &path,
+                    )
+                    .contains(&canonical)
+                    {
+                        return Ok(quote!((*#name).clone()));
+                    }
+                }
+            }
+            // A CALLABLE name read as a VALUE (`hash_utf8 = sha256_utf8` —
+            // requests' auth, where sha256_utf8 is a dropped nested
+            // function): the callable-as-value divergence — the read lowers
+            // to the boxed None.
+            if options.value_callables.contains(&self.id)
+            {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "callable `{}` read as a value lowers to the boxed None \
+                     (the callable-as-value divergence, issue #122)",
+                    self.id
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // The builtin `NotImplemented` singleton (`return NotImplemented`
+            // in `__eq__` fallbacks — requests' structures, urllib3's
+            // collections): the comparison sentinel — a boxed None
+            // (rython's comparisons return bool; the sentinel has no
+            // analogue — documented divergence).
+            if self.id == "NotImplemented" && symbols.get("NotImplemented").is_none() {
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A name imported from an EXTERNAL module (`from ssl import
+            // CERT_REQUIRED` — urllib3's ssl_.py) read as a VALUE: the
+            // import has no runtime item, so the read lowers to the boxed
+            // None (external-module divergence, the same model call.rs and
+            // attribute.rs use for external imports).
+            if crate::ast::tree::import::resolves_to_external_import(
+                &self.id,
+                &options,
+                &symbols,
+            ) {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`{}` is dropped: it is imported from a module that is \
+                     external to the generated crate (external-module divergence)",
+                    self.id
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             Ok(quote!(#name))
         }
     }

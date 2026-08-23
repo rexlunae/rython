@@ -163,10 +163,13 @@ fn handle_long_word(
         }
     }
     let end = end.min(chunk.len());
-    if end > 0 {
-        cur_line.push(chunk[..end].iter().collect());
-        *rest.last_mut().unwrap() = chunk[end..].to_vec();
-    }
+    // CPython's _handle_long_word appends chunk[:end] UNCONDITIONALLY (an
+    // empty string when space_left == 0); that empty push shields the
+    // preceding whitespace chunk from the trailing-whitespace drop. The
+    // old `if end > 0` guard skipped it and let the whitespace chunk be
+    // popped instead, dropping the trailing space CPython keeps (issue #82).
+    cur_line.push(chunk[..end].iter().collect());
+    *rest.last_mut().unwrap() = chunk[end..].to_vec();
 }
 
 /// textwrap.wrap(text, width=70), default settings. Raises ValueError on

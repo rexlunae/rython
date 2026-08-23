@@ -42,6 +42,12 @@ pub mod datetime;
 #[cfg(feature = "std")]
 pub mod time;
 
+/// Python asyncio module - a thin mapping onto the tokio runtime
+/// (asyncio.run / asyncio.sleep). Feature-gated: only generated async
+/// binaries enable `async-tokio`.
+#[cfg(feature = "async-tokio")]
+pub mod asyncio;
+
 /// Python string module - string constants and classes
 pub mod string;
 
@@ -65,6 +71,12 @@ pub mod tempfile;
 /// Python glob module - Unix shell-style pathname pattern expansion
 #[cfg(feature = "std")]
 pub mod glob;
+
+/// Python warnings module - diagnostics (issue #111). The HOOKS (filter
+/// action, warn) live on every tier; the stderr OUTPUT is std-only, and
+/// the alloc tier simply has no default output (warn is a no-op there,
+/// like `log` with no logger).
+pub mod warnings;
 
 /// Python functools module - higher-order functions (reduce)
 pub mod functools;
@@ -95,6 +107,11 @@ pub mod hashlib;
 
 /// Python csv module - CSV reading over line lists
 pub mod csv;
+
+/// Python codec layer: str.encode / bytes.decode for ascii and punycode
+/// (RFC 3492), with CPython's error classes. Pure data transformation —
+/// no OS, so it lives on every tier.
+pub mod codec;
 
 /// Python numpy subset — dense N-dimensional arrays with broadcasting,
 /// ufuncs, reductions, and a small linalg module. Optional feature

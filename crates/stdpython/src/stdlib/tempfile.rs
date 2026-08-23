@@ -360,10 +360,32 @@ impl SpooledTemporaryFile {
             return file.seek(offset, whence);
         }
         
+        // A negative absolute offset must raise ValueError, not clamp to 0
+        // via an `as usize` wrap (issue #82).
         let new_position = match whence {
-            0 => offset as usize,
-            1 => (self.position as i64 + offset) as usize,
-            2 => (self.data.len() as i64 + offset) as usize,
+            0 => {
+                if offset < 0 {
+                    return Err(crate::value_error(format!(
+                        "negative seek value {}",
+                        offset
+                    )));
+                }
+                offset as usize
+            }
+            1 => {
+                let p = self.position as i64 + offset;
+                if p < 0 {
+                    return Err(crate::value_error(format!("negative seek value {}", p)));
+                }
+                p as usize
+            }
+            2 => {
+                let p = self.data.len() as i64 + offset;
+                if p < 0 {
+                    return Err(crate::value_error(format!("negative seek value {}", p)));
+                }
+                p as usize
+            }
             _ => return Err(crate::value_error("Invalid whence value")),
         };
         

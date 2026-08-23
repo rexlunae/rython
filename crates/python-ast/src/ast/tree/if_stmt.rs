@@ -63,14 +63,72 @@ impl CodeGen for If {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A VERSION-GATED branch (`if sys.version_info[0] < 3:` —
+        // distlib's compat.py): rython targets Python 3, so the gate is
+        // evaluated at conversion time and the dead branch is dropped.
+        // The test never lowers to runtime code.
+        if let Some(taken) = version_gate_taken(&self.test) {
+            let (branch, label) = if taken {
+                (&self.body, "true")
+            } else {
+                (&self.orelse, "false")
+            };
+            options.definition_warnings.borrow_mut().push(format!(
+                "`if sys.version_info...` version gate evaluates to {label}; \
+                 the other branch is dropped at conversion time"
+            ));
+            let stmts: Result<Vec<_>, _> = branch
+                .iter()
+                .cloned()
+                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+                .collect();
+            let stmts = stmts?;
+            return Ok(quote! { #(#stmts;)* });
+        }
+
         // Regular if statement handling; the test is a condition position,
         // so Python truthiness applies.
         let test =
             crate::condition_to_rust(&self.test, ctx.clone(), options.clone(), symbols.clone())?;
-        
-        let body_stmts: Result<Vec<_>, _> = self.body
+
+        // Issue #125: `if x is not None:` narrows x to its inner type inside
+        // the body — reads unwrap (Name::to_rust consults narrowed_names),
+        // and the comprehension/iteration over x sees the inner element
+        // type. Any other test narrows nothing.
+        let mut body_options = options.clone();
+        let mut else_options = options.clone();
+        if let Some((narrowed, inner)) = crate::narrowing_from_test(&self.test, &options) {
+            let mut narrowed_names = options.narrowed_names.as_ref().clone();
+            // The narrowed type: the Option's inner type, or for a
+            // str|bytes union narrowed by isinstance, the concrete branch
+            // type carried in the map value (String/Bytes).
+            let target = inner.clone().unwrap_or(crate::TypeInfo::StrOrBytes);
+            narrowed_names.insert(narrowed.clone(), target);
+            body_options.narrowed_names = std::rc::Rc::new(narrowed_names);
+            if let Some(inner) = inner {
+                let mut name_types = options.name_types.as_ref().clone();
+                name_types.insert(narrowed.clone(), inner);
+                body_options.name_types = std::rc::Rc::new(name_types);
+            }
+        }
+        // Issue #121: `if isinstance(x, (bytes, bytearray)):` (or its
+        // negation) narrows a str|bytes union to the CONCRETE branch in the
+        // body AND the complementary branch in the else.
+        if let Some((name, body_ty, else_ty)) =
+            crate::isinstance_narrowing(&self.test, &options, &symbols)
+        {
+            let mut body_n = options.narrowed_names.as_ref().clone();
+            body_n.insert(name.clone(), body_ty);
+            body_options.narrowed_names = std::rc::Rc::new(body_n);
+            let mut else_n = options.narrowed_names.as_ref().clone();
+            else_n.insert(name.clone(), else_ty);
+            else_options.narrowed_names = std::rc::Rc::new(else_n);
+        }
+
+        let body_stmts: Result<Vec<_>, _> = self
+            .body
             .into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
         
@@ -83,7 +141,7 @@ impl CodeGen for If {
         } else {
             let else_stmts: Result<Vec<_>, _> = self.orelse
                 .into_iter()
-                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+                .map(|stmt| stmt.to_rust(ctx.clone(), else_options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
             
@@ -95,6 +153,132 @@ impl CodeGen for If {
                 }
             })
         }
+    }
+}
+
+/// Statically evaluate a `sys.version_info` version gate
+/// (`sys.version_info[0] < 3`, `sys.version_info >= (3,)`...): rython
+/// targets Python 3, so the gate's truth value is known at conversion
+/// time. Returns `Some(taken)` when the test is a recognized version
+/// gate (whether the guarded branch is the one that runs), `None` when
+/// the test is not one.
+fn version_gate_taken(test: &ExprType) -> Option<bool> {
+    // The simulated version rython reports (Python 3.11.0).
+    const VERSION: [i64; 3] = [3, 11, 0];
+
+    let ExprType::Compare(c) = test else {
+        return None;
+    };
+    if c.ops.len() != 1 || c.comparators.len() != 1 {
+        return None;
+    }
+    // Left side: `sys.version_info` (optionally subscripted, e.g. `[0]`).
+    let (left_is_sys_version, left_index): (bool, Option<i64>) = match &*c.left {
+        ExprType::Attribute(a) => {
+            let root = is_sys_version_info(&a.value);
+            (root, None)
+        }
+        ExprType::Subscript(s) => {
+            if !is_sys_version_info(&s.value) {
+                return None;
+            }
+            match &s.kind {
+                crate::SubscriptKind::Index(i) => (
+                    true,
+                    int_literal(i).or_else(|| {
+                        // `sys.version_info[0]` — a bare int index.
+                        None
+                    }),
+                ),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if !left_is_sys_version {
+        return None;
+    }
+
+    // Right side: an int literal (comparisons like `sys.version_info[0]
+    // < 3`), or a tuple expression (`sys.version_info >= (3,)`).
+    let right: Option<Vec<i64>> = match &c.comparators[0] {
+        ExprType::Constant(cn) => match &cn.0 {
+            Some(litrs::Literal::Integer(i)) => {
+                Some(vec![i.value()?])
+            }
+            _ => return None,
+        },
+        ExprType::Tuple(t) => {
+            let mut out = Vec::new();
+            for e in &t.elts {
+                let ExprType::Constant(cn) = e else {
+                    return None;
+                };
+                let Some(litrs::Literal::Integer(i)) = &cn.0 else {
+                    return None;
+                };
+                out.push(i.value()?);
+            }
+            Some(out)
+        }
+        _ => return None,
+    };
+    let right = right?;
+
+    // Build the left-hand version vector: full `sys.version_info`, or a
+    // slice of it from the subscript (only index 0 is statically common;
+    // any other index falls back to the whole tuple comparison semantics
+    // of `sys.version_info[0]` -> [major]).
+    let left: Vec<i64> = match left_index {
+        Some(0) => vec![VERSION[0]],
+        Some(_) => return None,
+        None => VERSION.to_vec(),
+    };
+
+    // Zip-compare, Python tuple semantics: the first differing element
+    // decides. rython's [3, 11, 0] vs the gate's constants.
+    let result = match c.ops[0] {
+        crate::Compares::Lt => version_cmp(&left, &right) == std::cmp::Ordering::Less,
+        crate::Compares::LtE => version_cmp(&left, &right) != std::cmp::Ordering::Greater,
+        crate::Compares::Gt => version_cmp(&left, &right) == std::cmp::Ordering::Greater,
+        crate::Compares::GtE => version_cmp(&left, &right) != std::cmp::Ordering::Less,
+        crate::Compares::Eq => version_cmp(&left, &right) == std::cmp::Ordering::Equal,
+        crate::Compares::NotEq => version_cmp(&left, &right) != std::cmp::Ordering::Equal,
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Python tuple comparison: element-wise until one differs; a prefix is
+/// less than a longer tuple.
+fn version_cmp(left: &[i64], right: &[i64]) -> std::cmp::Ordering {
+    for (a, b) in left.iter().zip(right.iter()) {
+        match a.cmp(b) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+/// Whether an expression is `sys.version_info`.
+fn is_sys_version_info(expr: &ExprType) -> bool {
+    matches!(
+        expr,
+        ExprType::Attribute(a)
+            if a.attr == "version_info"
+                && matches!(&*a.value, ExprType::Name(n) if n.id == "sys")
+    )
+}
+
+/// The integer value of a constant int expression, if it is one.
+fn int_literal(expr: &ExprType) -> Option<i64> {
+    match expr {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(i)) => i.value(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

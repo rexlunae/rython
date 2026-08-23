@@ -67,6 +67,10 @@ enum Cmd {
         /// rust-for-linux toolchain, instead of raw-FFI entry points.
         #[arg(long, requires = "kernel_module")]
         rust_for_linux: bool,
+        /// Skip resolving the packaging metadata's dependencies
+        /// ([project] dependencies / install_requires) against PyPI.
+        #[arg(long)]
+        no_deps: bool,
     },
     /// Convert and compile a Python package (release profile).
     Build {
@@ -81,6 +85,10 @@ enum Cmd {
         /// How to treat lossy-conversion warnings: warn, deny, or allow.
         #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
         warnings: WarningMode,
+        /// Skip resolving the packaging metadata's dependencies against
+        /// PyPI.
+        #[arg(long)]
+        no_deps: bool,
     },
     /// Build a Python package as a native binary and install it where cargo
     /// installs binaries (~/.cargo/bin unless --root is given).
@@ -95,6 +103,10 @@ enum Cmd {
         /// How to treat lossy-conversion warnings: warn, deny, or allow.
         #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
         warnings: WarningMode,
+        /// Skip resolving the packaging metadata's dependencies against
+        /// PyPI.
+        #[arg(long)]
+        no_deps: bool,
     },
 }
 
@@ -110,6 +122,7 @@ fn main() -> Result<()> {
             kernel_module,
             driver,
             rust_for_linux,
+            no_deps,
         } => {
             let pkg = rypip::discover(&package)?;
             let krate = rypip::convert(
@@ -123,6 +136,7 @@ fn main() -> Result<()> {
                     kernel_module,
                     driver,
                     rust_for_linux,
+                    no_deps,
                 },
             )?;
             report_warnings(&krate);
@@ -142,6 +156,7 @@ fn main() -> Result<()> {
             out,
             stdpython,
             warnings,
+            no_deps,
         } => {
             let pkg = rypip::discover(&package)?;
             let out = out.unwrap_or_else(|| work_dir(&pkg.name));
@@ -156,6 +171,7 @@ fn main() -> Result<()> {
                     kernel_module: false,
                     driver: false,
                     rust_for_linux: false,
+                    no_deps,
                 },
             )?;
             report_warnings(&krate);
@@ -167,6 +183,7 @@ fn main() -> Result<()> {
             root,
             stdpython,
             warnings,
+            no_deps,
         } => {
             let pkg = rypip::discover(&package)?;
             let out = work_dir(&pkg.name);
@@ -181,6 +198,7 @@ fn main() -> Result<()> {
                     kernel_module: false,
                     driver: false,
                     rust_for_linux: false,
+                    no_deps,
                 },
             )?;
             report_warnings(&krate);

@@ -80,6 +80,16 @@ impl CodeGen for UnaryOp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A BOXED-PyValue operand (`-e.partial` — urllib3's response.py
+        // _error_catcher, where `e.partial` is an exception attribute
+        // boxed to None by the dynamic-attribute divergence): Rust has no
+        // unary minus on PyValue — USub routes through py_neg (a TypeError
+        // panic for unmodeled operands, matching the PySub contract).
+        // Computed before `options`/`symbols` are moved below.
+        let operand_is_boxed = matches!(
+            crate::infer_type(&self.operand, &options, &symbols),
+            crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+        );
         let operand = self.operand.clone().to_rust(ctx, options, symbols)?;
         match self.op {
             // `~x` is Rust's bitwise complement, but `not x` is a
@@ -89,7 +99,13 @@ impl CodeGen for UnaryOp {
             // Rust has no unary plus; Python's `+x` is the identity for
             // numbers, so emit the operand alone (parenthesized).
             Ops::UAdd => Ok(quote!((#operand))),
-            Ops::USub => Ok(quote!(-#operand)),
+            Ops::USub => {
+                if operand_is_boxed {
+                    Ok(quote!((#operand).py_neg()))
+                } else {
+                    Ok(quote!(-#operand))
+                }
+            }
             _ => Err(err_from(UnaryOpNotYetImplemented(self)).into())
         }
     }

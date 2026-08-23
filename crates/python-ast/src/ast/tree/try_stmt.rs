@@ -131,8 +131,34 @@ impl CodeGen for Try {
 
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         // Process body, handlers, orelse, and finalbody
+        let body_has_import = try_body_contains_import(&self.body);
         let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
         let symbols = self.handlers.into_iter().fold(symbols, |acc, handler| {
+            // A bare `except ImportError:` handler is DROPPED at render
+            // time (rython's imports are static — the fallback can never
+            // run): its body must not register symbols either. urllib3's
+            // ssl_.py has `try: from ssl import PROTOCOL_TLS ... except
+            // ImportError: PROTOCOL_TLS = 2` — if the fallback's Assign
+            // registered, it would shadow the try body's ImportFrom and
+            // the name would render as a bare value instead of the
+            // external-import boxed None. The ImportError-family TUPLE
+            // spelling drops the same way for an import-attempt body.
+            if is_bare_import_error(&handler.exception_type)
+                && (matches!(
+                    handler.exception_type,
+                    Some(ExprType::Name(_))
+                ) || body_has_import)
+            {
+                return acc;
+            }
+            // The except-bound name (`except IncompleteRead as e:`) is a
+            // runtime PyException object; mark it so attribute reads on it
+            // can lower to the boxed None (dynamic-attribute divergence)
+            // instead of emitting a field that does not exist.
+            let mut acc = acc;
+            if let Some(name) = &handler.name {
+                acc.insert(name.clone(), crate::SymbolTableNode::ExceptBinding);
+            }
             let symbols = handler.body.into_iter().fold(acc, |acc, stmt| stmt.find_symbols(acc));
             if let Some(exception_type) = handler.exception_type {
                 exception_type.find_symbols(symbols)
@@ -183,6 +209,7 @@ impl CodeGen for Try {
             }
         }
         let body_for_guarantee = self.body.clone();
+        let body_has_import = try_body_contains_import(&self.body);
         let body_ctx = CodeGenContext::TryBlock {
             parent: Box::new(ctx.clone()),
         };
@@ -228,6 +255,30 @@ impl CodeGen for Try {
         let mut arms: Vec<TokenStream> = Vec::new();
         let mut has_catch_all = false;
         for handler in self.handlers {
+            // A bare `except ImportError:` handler (`try: from tokenize
+            // import detect_encoding / except ImportError:` — distlib's
+            // compat.py): rython's imports are STATIC — a module either
+            // exists in the crate/stdlib or it is assumed present — so the
+            // fallback can never run and its body (often Python-2-era
+            // compatibility code) would fail to convert. The handler is
+            // dropped (the documented static-imports divergence). The
+            // ImportError-family TUPLE spelling (`except (ImportError,
+            // AttributeError): ssl = None` — urllib3's connection.py)
+            // drops the same way, but only when the try body is actually
+            // an import attempt.
+            if is_bare_import_error(&handler.exception_type)
+                && (matches!(
+                    handler.exception_type,
+                    Some(ExprType::Name(_))
+                ) || body_has_import)
+            {
+                options.definition_warnings.borrow_mut().push(
+                    "`except ImportError:` handler is dropped: rython's \
+                     imports are static, so the fallback can never run"
+                        .to_string(),
+                );
+                continue;
+            }
             let guard = match &handler.exception_type {
                 None => None,
                 Some(t) => exception_match_guard(t)?,
@@ -479,6 +530,40 @@ fn lower_finally_guarded_body(
 /// clause's type expression: a name (`except ValueError`), a dotted name
 /// (`except os.error` — matched by its final attribute), or a tuple of
 /// either (`except (ValueError, TypeError)`).
+/// Whether an except clause is the dead fallback of an import attempt —
+/// catching `ImportError` (urllib3's `except ImportError: brotli = None`)
+/// or an ImportError-family tuple (`except (ImportError, AttributeError):
+/// ssl = None` — connection.py, where a missing ssl module raises either).
+/// Such handlers are dead under rython's static imports: the import either
+/// resolves statically or the name is unmodeled, never raised at runtime.
+/// The bare `ImportError` spelling is dropped unconditionally (the
+/// established divergence); the TUPLE spelling only when the try body
+/// actually contains an import (so a runtime `except AttributeError`
+/// fallback elsewhere is never dropped).
+pub(crate) fn is_bare_import_error(exception_type: &Option<ExprType>) -> bool {
+    match exception_type {
+        Some(ExprType::Name(n)) if n.id == "ImportError" => true,
+        Some(ExprType::Tuple(t)) => {
+            !t.elts.is_empty()
+                && t.elts.iter().all(|e| matches!(e, ExprType::Name(n)
+                    if matches!(n.id.as_str(), "ImportError" | "AttributeError")))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the try body's statements contain an import (the import-attempt
+/// pattern that an ImportError-family handler guards).
+pub(crate) fn try_body_contains_import(body: &[crate::Statement]) -> bool {
+    body.iter().any(|s| {
+        matches!(
+            s.statement,
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+        ) || matches!(&s.statement, crate::StatementType::Try(t)
+            if try_body_contains_import(&t.body))
+    })
+}
+
 fn exception_match_guard(
     exception_type: &ExprType,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {

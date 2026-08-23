@@ -5,9 +5,20 @@
 //! to memory instead, exactly as in Python. The cursor semantics are
 //! Python's: read/readline advance it, write OVERWRITES at it, and
 //! getvalue() returns the whole buffer regardless of it. BytesIO and
-//! the wrapper classes are not implemented yet.
+//! the wrapper classes are not implemented yet — the BytesIO NAME exists
+//! so `from io import BytesIO` imports resolve (constructions lower to
+//! the boxed PyValue, the file-object divergence), and IOBase is the
+//! abstract stream base — a typing marker, never constructed.
 
 use crate::PyFile;
+
+/// io.BytesIO — no binary in-memory buffer in rython (constructions lower
+/// to the boxed PyValue); the item exists so imports resolve.
+#[allow(non_snake_case)]
+pub struct BytesIO;
+
+/// io.IOBase — the abstract base of the io stream types; a typing marker.
+pub struct IOBase;
 
 /// io.StringIO(): an empty in-memory text buffer.
 #[allow(non_snake_case)]
@@ -21,3 +32,9 @@ pub fn StringIO() -> PyFile {
 pub fn StringIO_seeded<S: AsRef<str> + ?Sized>(initial: &S) -> PyFile {
     PyFile::new_buffer(initial.as_ref())
 }
+
+/// io.UnsupportedOperation — the exception for unsupported file
+/// operations. rython's exceptions are string-tagged PyException values
+/// (the codegen matches `except UnsupportedOperation` by name), so the
+/// class is a marker with no runtime shape.
+pub struct UnsupportedOperation;

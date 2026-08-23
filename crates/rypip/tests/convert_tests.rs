@@ -534,6 +534,158 @@ fn exceptions_propagate_across_functions_at_runtime() {
 }
 
 #[test]
+fn true_division_by_zero_raises_catchable_zero_division_error_at_runtime() {
+    // Issue #107: `/` used to lower to an infallible py_div, so `1 / 0`
+    // silently printed `inf` where CPython raises ZeroDivisionError —
+    // wrong output with no conversion error, no exception, no panic. The
+    // division now goes through the Result-returning helper, so a zero
+    // divisor raises the same catchable error as `//`/`%` (#75), with
+    // CPython's exact messages.
+    let scratch = Scratch::new("true-div-zero");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def try_int() -> str:\n",
+            "    try:\n",
+            "        x = 1 / 0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "def try_float() -> str:\n",
+            "    try:\n",
+            "        x = 1.0 / 0.0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "def try_mixed() -> str:\n",
+            "    try:\n",
+            "        x = 1 / 0.0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "def try_aug() -> str:\n",
+            "    y = 1.0\n",
+            "    try:\n",
+            "        y /= 0.0\n",
+            "        return \"no error\"\n",
+            "    except ZeroDivisionError as e:\n",
+            "        return str(e)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(try_int())\n",
+            "    print(try_float())\n",
+            "    print(try_mixed())\n",
+            "    print(try_aug())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "division by zero",
+            "float division by zero",
+            "float division by zero",
+            "float division by zero",
+        ],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "all divisions were caught");
+}
+
+#[test]
+fn stdlib_divergence_fixes_match_cpython_at_runtime() {
+    // Issue #82 end-to-end: math (IEEE remainder, ldexp, pow domain
+    // errors) and json (insertion order, exact big integers) must behave
+    // like CPython from transpiled Python. This also proves the codegen
+    // threads `?` through Result-returning stdlib module calls (math.sqrt,
+    // math.pow, json.loads — previously rustc type errors).
+    let scratch = Scratch::new("stdlib-divergences");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import math\n",
+            "import json\n",
+            "\n",
+            "def math_checks() -> str:\n",
+            "    out = []\n",
+            "    out.append(str(math.sqrt(144.0)))\n",
+            "    out.append(str(math.remainder(1e17, 3.0)))\n",
+            "    out.append(str(math.remainder(10.0, 0.1)))\n",
+            "    out.append(str(math.ldexp(1e-300, 1074)))\n",
+            "    out.append(str(math.fmod(9.5, 3.0)))\n",
+            "    out.append(str(math.pow(-8.0, 3.0)))\n",
+            "    try:\n",
+            "        x = math.pow(0.0, -1.0)\n",
+            "        out.append(str(\"no error\"))\n",
+            "    except ValueError as e:\n",
+            "        out.append(\"caught \" + str(e))\n",
+            "    try:\n",
+            "        x = math.ldexp(1.0, 2000)\n",
+            "        out.append(str(\"no error\"))\n",
+            "    except OverflowError as e:\n",
+            "        out.append(\"caught \" + str(e))\n",
+            "    return \" | \".join(out)\n",
+            "\n",
+            "def json_checks() -> str:\n",
+            "    parsed = json.loads('{\"b\": 1, \"a\": 2, \"c\": 3}')\n",
+            "    out = [json.dumps(parsed, None)]\n",
+            "    big = json.loads('123456789012345678901234567890')\n",
+            "    out.append(json.dumps(big, None))\n",
+            "    return \" | \".join(out)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(math_checks())\n",
+            "    print(json_checks())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "12.0 | 1.0 | -5.551115123125783e-16 | 2.0240225330731062e+23 | 0.5 | -512.0 | caught math domain error | caught math range error",
+            r#"{"b": 1, "a": 2, "c": 3} | 123456789012345678901234567890"#,
+        ],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn dict_methods_match_python_at_runtime() {
     let scratch = Scratch::new("dicts");
     let file = scratch.path().join("dicts.py");
@@ -3663,6 +3815,218 @@ fn kernel_device_mode_uses_manifest_defaults() {
 }
 
 #[test]
+fn pyproject_dependencies_vendored_end_to_end_at_runtime() {
+    // A pyproject.toml project declaring `dependencies`, satisfied by a
+    // vendored rython.toml [python-modules] copy: the resolved dependency
+    // is transpiled beside the package and callable from the generated
+    // binary — the pip-style wiring, verified at runtime.
+    let scratch = Scratch::new("pyproject-deps");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        concat!(
+            "[project]\n",
+            "name = \"depapp\"\n",
+            "version = \"0.1.0\"\n",
+            "dependencies = [\"pylev>=1.3\"]\n",
+            "\n",
+            "[tool.setuptools]\n",
+            "packages = [\"depapp\"]\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("depapp")).unwrap();
+    fs::write(scratch.path().join("depapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("depapp/main.py"),
+        concat!(
+            "import pylev\n",
+            "\n",
+            "def dist(a: str, b: str) -> int:\n",
+            "    return pylev.wf_levenshtein(a, b)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(dist(\"kitten\", \"sitting\"))\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/pylev.py"),
+        concat!(
+            "def wf_levenshtein(a: str, b: str) -> int:\n",
+            "    n = len(a)\n",
+            "    m = len(b)\n",
+            "    if n == 0:\n",
+            "        return m\n",
+            "    if m == 0:\n",
+            "        return n\n",
+            "    prev = [0] * (m + 1)\n",
+            "    for j in range(m + 1):\n",
+            "        prev[j] = j\n",
+            "    for i in range(1, n + 1):\n",
+            "        cur = [0] * (m + 1)\n",
+            "        cur[0] = i\n",
+            "        for j in range(1, m + 1):\n",
+            "            cost = 0 if a[i - 1] == b[j - 1] else 1\n",
+            "            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)\n",
+            "        prev = cur\n",
+            "    return prev[m]\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\npylev = { path = \"vendor/pylev.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/depapp"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "3", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn async_binary_builds_and_runs_on_the_tokio_runtime() {
+    // Python async/await end-to-end: `async def`/`await` transpile to Rust
+    // async fns, asyncio.sleep maps onto tokio's timer, asyncio.run drives
+    // the coroutine, and the generated BINARY crate declares tokio behind a
+    // default-on `async-tokio` feature (the entry carries the feature-gated
+    // #[tokio::main] attribute).
+    let scratch = Scratch::new("async-bin");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import asyncio\n",
+            "\n",
+            "async def fetch(name: str) -> str:\n",
+            "    await asyncio.sleep(0.001)\n",
+            "    return \"hello \" + name\n",
+            "\n",
+            "async def main() -> None:\n",
+            "    result = await fetch(\"world\")\n",
+            "    print(result)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    asyncio.run(main())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    // The generated binary crate declares tokio behind the default-on
+    // feature and stdpython with the tokio-backed asyncio module.
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(toml.contains("tokio"), "Cargo.toml: {}", toml);
+    assert!(toml.contains("async-tokio"), "Cargo.toml: {}", toml);
+    assert!(toml.contains("default = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
+    assert!(toml.contains("features = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
+    // The entry module's code is feature-gated.
+    let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("cfg_attr(feature = \"async-tokio\", tokio::main)"),
+        "main.rs: {}",
+        main
+    );
+    assert!(
+        main.contains("compile_error!"),
+        "feature-off build must name the fix: {}",
+        main
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "async binary failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "hello world", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn async_binary_without_feature_fails_with_compile_error() {
+    // --no-default-features drops tokio; the generated entry's compile_error
+    // names the fix instead of a bare "no main function".
+    let scratch = Scratch::new("async-nofeature");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import asyncio\n",
+            "async def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "if __name__ == \"__main__\":\n",
+            "    asyncio.run(main())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--no-default-features")
+        .env_remove("RUSTFLAGS")
+        .current_dir(&krate.root)
+        .output()
+        .expect("cargo build");
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("async-tokio"),
+        "compile_error must name the feature: {}",
+        stderr
+    );
+    assert!(!status.status.success(), "feature-off build must fail");
+}
+
+#[test]
+fn async_library_conversion_gets_no_runtime_dependency() {
+    // A library crate with async functions transpiles them to plain async
+    // fns; the generated Cargo.toml has NO tokio dependency and no feature
+    // (the consumer brings the executor), and the code has no runtime
+    // import or entry attribute.
+    let scratch = Scratch::new("async-lib");
+    let file = scratch.path().join("libmod.py");
+    fs::write(
+        &file,
+        "async def compute(x: int) -> int:\n    return x * 2\n",
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let toml = fs::read_to_string(out.join("Cargo.toml")).unwrap();
+    assert!(
+        !toml.contains("tokio"),
+        "library conversions must not link tokio: {}",
+        toml
+    );
+    let lib = fs::read_to_string(out.join("src/libmod.rs")).unwrap();
+    assert!(lib.contains("pub async fn compute"), "libmod.rs: {}", lib);
+    assert!(!lib.contains("use tokio"), "no runtime import: {}", lib);
+    assert!(!lib.contains("compile_error"), "no feature error: {}", lib);
+    assert!(!lib.contains("cfg_attr"), "no entry attribute: {}", lib);
+
+    // The library builds (async fns are just async fns).
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "async library failed to compile");
+}
+
+#[test]
 fn kernel_device_mode_rejects_module_init_conflict() {
     // The generated device owns the entry points; a Python module_init
     // would be silently dropped — loud error instead.
@@ -3745,4 +4109,778 @@ fn kernel_device_mode_rejects_bad_device_name() {
         "{}",
         err
     );
+}
+
+#[test]
+fn kernel_device_mode_rejects_floating_point_loudly() {
+    // Issue #108: the device-manifest sub-mode used to return before the
+    // module-wide float scan (issue #87's FPU lazy-save guard), leaving the
+    // one path where user Python grows — ioctl handlers, buffer logic —
+    // unguarded. Every FP shape must fail the conversion exactly as in the
+    // plain kernel path.
+    let scratch = Scratch::new("kernel-device-fp");
+    let cases: &[(&str, &str)] = &[
+        (
+            "device_float_return.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    return 1\n",
+                "\n",
+                "def handle(line: str) -> str:\n",
+                "    return str(1.5)\n",
+            ),
+        ),
+        (
+            "device_float_assign.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    ratio = 2.5\n",
+                "    return 0\n",
+            ),
+        ),
+        (
+            "device_float_call.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    x = float(\"1.5\")\n",
+                "    return 0\n",
+            ),
+        ),
+        (
+            "device_import_math.py",
+            concat!(
+                "__device_name__ = \"rython0\"\n",
+                "\n",
+                "import math\n",
+                "\n",
+                "def module_init() -> int:\n",
+                "    return 0\n",
+            ),
+        ),
+    ];
+    for (name, src) in cases {
+        let file = scratch.path().join(name);
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join(format!("crate-{}", name.replace('.', "-")));
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(
+            &pkg,
+            &out,
+            &ConvertOptions {
+                kernel_module: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("floating-point device-manifest code must fail the conversion");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("floating-point"), "{}: {}", name, msg);
+        assert!(
+            msg.contains("kernel_fpu_begin"),
+            "{}: error must mention the FPU guard workaround: {}",
+            name,
+            msg
+        );
+    }
+}
+
+#[test]
+fn unannotated_params_infer_generics_matching_python_transcript() {
+    // Issue #109, M1 acceptance: `def add(a, b): return a + b` becomes ONE
+    // generic function (not the dead impl Into<PyObject>) that monomorphizes
+    // per call site; the compiled binary's output is diffed against a
+    // pinned `// Verified against python3.` transcript.
+    let scratch = Scratch::new("param-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def add(a, b):\n",
+            "    return a + b\n",
+            "\n",
+            "def to_int(x):\n",
+            "    return int(x)\n",
+            "\n",
+            "def positive(n):\n",
+            "    return n > 0\n",
+            "\n",
+            "def describe(x):\n",
+            "    return \"val=\" + str(x)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(add(1, 2))\n",
+            "    print(add(1.5, 2.5))\n",
+            "    print(add(\"ab\", \"cd\"))\n",
+            "    print(add([1], [2]))\n",
+            "    print(to_int(\"42\"))\n",
+            "    print(positive(3))\n",
+            "    print(positive(-1))\n",
+            "    print(describe(7))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+
+    // The generated source uses trait-bound generics, never the dead
+    // fallback.
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        src.contains("pub fn add<A, B>(a: A, b: B)"),
+        "generic signature: {}",
+        src
+    );
+    assert!(src.contains("A: PyAdd<B>"), "bound: {}", src);
+    assert!(
+        src.contains("<A as PyAdd<B>>::Output"),
+        "associated return: {}",
+        src
+    );
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "3",
+            "4.0",
+            "abcd",
+            "[1, 2]",
+            "42",
+            "True",
+            "False",
+            "val=7",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn stdlib_method_inference_matches_python_transcript() {
+    // Issue #109, M2: method calls on unannotated parameters infer the
+    // stdlib trait bound (PyStrOps/PyPop), the String receiver satisfies
+    // it via the owned-type impl, and the compiled binary's output diffs
+    // against a pinned `// Verified against python3.` transcript.
+    let scratch = Scratch::new("method-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def shout(s):\n",
+            "    return s.upper()\n",
+            "\n",
+            "def words(s):\n",
+            "    return s.split(\" \")\n",
+            "\n",
+            "def position(s):\n",
+            "    return s.find(\"x\")\n",
+            "\n",
+            "def last(xs):\n",
+            "    return xs.pop()\n",
+            "\n",
+            "def count_letters(s):\n",
+            "    return s.count(\"a\")\n",
+            "\n",
+            "def strip_it(s):\n",
+            "    return s.strip()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(shout(\"hi\"))\n",
+            "    print(words(\"a b c\"))\n",
+            "    print(position(\"xyz\"))\n",
+            "    print(last([1, 2, 3]))\n",
+            "    print(count_letters(\"banana\"))\n",
+            "    print(strip_it(\"  x  \"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(src.contains("T: PyStrOps"), "bound: {}", src);
+    assert!(src.contains("T: PyPop<i64>"), "bound: {}", src);
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["HI", "['a', 'b', 'c']", "0", "3", "3", "x"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn duck_typing_hear_example_matches_python_transcript() {
+    // Issue #109, M3 acceptance: `def hear(animal): return animal.speak()`
+    // becomes `fn hear<T: HasSpeak>(animal: T)`, one impl per defining
+    // class, and the compiled binary's output diffs against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("duck-hear");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Dog:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "class Cat:\n",
+            "    def speak(self) -> str:\n",
+            "        return \"meow\"\n",
+            "\n",
+            "def hear(animal):\n",
+            "    return animal.speak()\n",
+            "\n",
+            "def praise(animal):\n",
+            "    return \"nice \" + animal.speak()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(hear(Dog()))\n",
+            "    print(hear(Cat()))\n",
+            "    print(praise(Dog()))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(src.contains("pub trait HasSpeak"), "generated: {}", src);
+    assert!(src.contains("impl HasSpeak for Dog"), "generated: {}", src);
+    assert!(src.contains("impl HasSpeak for Cat"), "generated: {}", src);
+    assert!(
+        src.contains("pub fn hear<T>(animal: T)"),
+        "generic param: {}",
+        src
+    );
+    assert!(src.contains("T: HasSpeak"), "generic bound: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["woof", "meow", "nice woof"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn recursion_and_flows_to_inference_match_python_transcript() {
+    // Issue #109, M4 acceptance: interprocedural FlowsTo. `repeat` is
+    // SELF-recursive — the fixpoint gives `x` the recursion's type
+    // (`A: PyAdd<A, Output = A>`) and `n` a generic that accepts both int
+    // and float calls (`B: PyLe<B, Output = bool> + PyFromInt +
+    // PySub<i64, Output = B>`, per the issue's `repeat(x, 2.5)`). The
+    // 2-deep helper chain flows the callee's return type through the
+    // caller. Output is diffed against a pinned `// Verified against
+    // python3.` transcript.
+    let scratch = Scratch::new("recursion-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def repeat(x, n):\n",
+            "    return x if n <= 0 else x + repeat(x, n - 1)\n",
+            "\n",
+            "def helper(x):\n",
+            "    return x * 2\n",
+            "\n",
+            "def caller(v):\n",
+            "    return helper(v)\n",
+            "\n",
+            "def positive(n):\n",
+            "    return n > 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(repeat(2, 3))\n",
+            "    print(repeat(2.5, 3))\n",
+            "    print(repeat(\"a\", 3))\n",
+            "    print(repeat(2, 2.5))\n",
+            "    print(repeat(\"a\", 2.5))\n",
+            "    print(caller(21))\n",
+            "    print(caller(1.5))\n",
+            "    print(positive(3))\n",
+            "    print(positive(-1))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    // The recursive fixpoint: x adds with itself (the recursion returns
+    // x's type) — `A: PyAdd<A, Output = A>`.
+    assert!(src.contains("A: PyAdd<A, Output = A>"), "repeat bounds: {}", src);
+    // The count accepts int AND float call sites: comparison with the
+    // literal converts via PyFromInt, and the decrement's Output must be
+    // the parameter again.
+    assert!(src.contains("B: PyLe<B, Output = bool>"), "repeat bounds: {}", src);
+    assert!(src.contains("B: PyFromInt"), "repeat bounds: {}", src);
+    assert!(src.contains("B: PySub<i64, Output = B>"), "repeat bounds: {}", src);
+    assert!(
+        src.contains("pub fn repeat<A, B>(x: A, n: B)"),
+        "repeat signature: {}",
+        src
+    );
+    // The 2-deep helper chain flows the callee's return through the
+    // caller: `caller` returns `<T as PyMul<i64>>::Output` like `helper`.
+    assert!(
+        src.contains("pub fn caller<T>(v: T) -> Result<<T as PyMul<i64>>::Output"),
+        "caller signature: {}",
+        src
+    );
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "8", "10.0", "aaaa", "8", "aaaa", "42", "3.0", "True", "False",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn iteration_inference_matches_python_transcript() {
+    // Issue #109, M2 iteration: `for w in words` over an unannotated
+    // parameter bounds it `A: IntoIterator<Item = B>` and threads the
+    // element type into the loop variable (`B: PyStrOps` / `B: Len`); a
+    // caller passing its own parameter adopts both the Iterate bound and
+    // the element requirements. Output is diffed against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("iteration-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def shout_all(words):\n",
+            "    result: list[str] = []\n",
+            "    for w in words:\n",
+            "        result.append(w.upper())\n",
+            "    return result\n",
+            "\n",
+            "def total_len(words):\n",
+            "    n = 0\n",
+            "    for w in words:\n",
+            "        n += len(w)\n",
+            "    return n\n",
+            "\n",
+            "def caller(v):\n",
+            "    return shout_all(v)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(shout_all([\"hi\", \"there\"]))\n",
+            "    print(total_len([\"ab\", \"cde\"]))\n",
+            "    print(caller([\"x\", \"y\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        src.contains("A: IntoIterator<Item = B>"),
+        "iteration bound: {}",
+        src
+    );
+    assert!(src.contains("B: PyStrOps"), "element bound: {}", src);
+    assert!(src.contains("B: Len"), "element bound: {}", src);
+    // The caller adopts both the iterable and the element bounds.
+    assert!(
+        src.contains("pub fn caller<A, B>(v: A)"),
+        "caller signature: {}",
+        src
+    );
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["['HI', 'THERE']", "5", "['X', 'Y']"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn stdlib_method_table_honesty_transcript() {
+    // Issue #109, M2: the STDLIB_METHOD_TABLE can never drift from the
+    // runtime — every exerciseable row (one function per entry, bound on
+    // the table's trait) converts, builds, and diffs against a pinned
+    // `// Verified against python3.` transcript. The two rows skipped are
+    // documented gaps, not coverage holes: `insert` (PyListOps<T> needs
+    // the element type the inference does not express yet) and the LIST
+    // `count` (the name is dual-str/list; the first table match wins, so
+    // the str row below is the exercised one).
+    let scratch = Scratch::new("method-table-honesty");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def f_upper(s): return s.upper()\n",
+            "def f_lower(s): return s.lower()\n",
+            "def f_strip(s): return s.strip()\n",
+            "def f_lstrip(s): return s.lstrip()\n",
+            "def f_rstrip(s): return s.rstrip()\n",
+            "def f_capitalize(s): return s.capitalize()\n",
+            "def f_title(s): return s.title()\n",
+            "def f_splitlines(s): return s.splitlines()\n",
+            "def f_find(s): return s.find(\"x\")\n",
+            "def f_count(s): return s.count(\"a\")\n",
+            "def f_split(s): return s.split(\" \")\n",
+            "def f_rsplit(s): return s.rsplit(\" \")\n",
+            "def f_partition(s): return s.partition(\" \")\n",
+            "def f_rpartition(s): return s.rpartition(\" \")\n",
+            "def f_zfill(s): return s.zfill(5)\n",
+            "def f_ljust(s): return s.ljust(5)\n",
+            "def f_rjust(s): return s.rjust(5)\n",
+            "def f_pop(xs): return xs.pop()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(f_upper(\"Hi\"))\n",
+            "    print(f_lower(\"Hi\"))\n",
+            "    print(f_strip(\"  x  \"))\n",
+            "    print(f_lstrip(\"  x\"))\n",
+            "    print(f_rstrip(\"x  \"))\n",
+            "    print(f_capitalize(\"hi\"))\n",
+            "    print(f_title(\"hello world\"))\n",
+            "    print(f_splitlines(\"a\\nb\"))\n",
+            "    print(f_find(\"xyz\"))\n",
+            "    print(f_count(\"banana\"))\n",
+            "    print(f_split(\"a b c\"))\n",
+            "    print(f_rsplit(\"a b c\"))\n",
+            "    print(f_partition(\"a b c\"))\n",
+            "    print(f_rpartition(\"a b c\"))\n",
+            "    print(f_zfill(\"42\"))\n",
+            "    print(f_ljust(\"ab\"))\n",
+            "    print(f_rjust(\"ab\"))\n",
+            "    print(f_pop([\"a\", \"b\", \"c\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    // Every str row bounds on PyStrOps; pop bounds on PyPop<i64>.
+    assert!(src.matches("T: PyStrOps").count() >= 17, "bounds: {}", src);
+    assert!(src.contains("T: PyPop<i64>"), "pop bound: {}", src);
+    assert!(!src.contains("Into < PyObject >"), "no dead fallback: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "HI", "hi", "x", "x", "x", "Hi", "Hello World", "['a', 'b']", "0", "3",
+            "['a', 'b', 'c']", "['a', 'b', 'c']", "('a', ' ', 'b c')", "('a b', ' ', 'c')",
+            "00042", "ab   ", "   ab", "c",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn definition_time_unsatisfiable_bounds_report_and_deny() {
+    // Issue #109, M5: a parameter whose inferred bound set no known type
+    // satisfies (`p.upper()` + `p.pop()` → PyStrOps + PyPop) is a
+    // well-formed Python definition — it converts with a warning at -W
+    // warn, and -W deny promotes it to a conversion failure.
+    let scratch = Scratch::new("def-unsat");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def bad(p):\n",
+            "    p.upper()\n",
+            "    p.pop()\n",
+            "\n",
+            "def good(s):\n",
+            "    return s.upper()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+
+    // -W warn (default): converts; the generated fn carries the
+    // #[deprecated] note naming the contradiction.
+    let _krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(
+        src.contains("satisfied by no known rython type"),
+        "deprecated note: {}",
+        src
+    );
+    let good_fn = src.split("pub fn good").nth(1).unwrap_or_default();
+    assert!(
+        !good_fn.contains("satisfied by no known"),
+        "good() carries a spurious note: {}",
+        good_fn
+    );
+
+    // -W deny: the warning becomes a conversion error.
+    let out2 = scratch.path().join("crate-deny");
+    let err = rypip::convert(
+        &pkg,
+        &out2,
+        &ConvertOptions {
+            warnings: rypip::convert::WarningMode::Deny,
+            ..Default::default()
+        },
+    )
+    .expect_err("deny must fail on the definition-time warning");
+    let msg = format!("{}", err);
+    assert!(msg.contains("bad"), "error should name the function: {}", msg);
+    assert!(msg.contains("PyStrOps"), "error should list bounds: {}", msg);
+}
+
+#[test]
+fn join_and_comprehension_inference_match_python_transcript() {
+    // Issue #116 (the pip version_str pattern): `",".join(parts)` and
+    // `".".join(str(v) for v in version)` infer String returns with
+    // IntoIterator/AsRef<str> bounds, and list comprehensions over
+    // parameters infer Vec returns. Output diffed against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("join-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def join_all(parts):\n",
+            "    return \",\".join(parts)\n",
+            "\n",
+            "def version_str(version):\n",
+            "    return \".\".join(str(v) for v in version)\n",
+            "\n",
+            "def upper_all(words):\n",
+            "    return [w.upper() for w in words]\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(join_all([\"a\", \"b\", \"c\"]))\n",
+            "    print(version_str([1, 2, 3]))\n",
+            "    print(upper_all([\"hi\", \"there\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    assert!(src.contains("B: AsRef<str>"), "join bound: {}", src);
+    assert!(src.contains("Result<String, PyException>"), "return: {}", src);
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["a,b,c", "1.2.3", "['HI', 'THERE']"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn string_aug_assign_accumulation_matches_python_transcript() {
+    // Issue #110: `out = ""; out += ...` — the string-literal binding is
+    // owned so the String rebind compiles; the accumulated value diffs
+    // against a pinned `// Verified against python3.` transcript.
+    let scratch = Scratch::new("str-aug");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def accumulate():\n",
+            "    out = \"\"\n",
+            "    for i in range(3):\n",
+            "        out += str(i)\n",
+            "    return out\n",
+            "\n",
+            "def rebind():\n",
+            "    s = \"a\"\n",
+            "    s = s + \"b\"\n",
+            "    return s\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(accumulate())\n",
+            "    print(rebind())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["012", "ab"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn del_statement_matches_python_transcript() {
+    // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
+    // (string-keyed dict) lower through py_pop and diff against a pinned
+    // `// Verified against python3.` transcript.
+    let scratch = Scratch::new("del-infer");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def remove_second(xs):\n",
+            "    del xs[1]\n",
+            "    return xs\n",
+            "\n",
+            "def remove_negative(xs):\n",
+            "    del xs[-1]\n",
+            "    return xs\n",
+            "\n",
+            "def remove_key(d):\n",
+            "    del d[\"b\"]\n",
+            "    return d\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(remove_second([\"a\", \"b\", \"c\"]))\n",
+            "    print(remove_negative([1, 2, 3]))\n",
+            "    print(remove_key({\"a\": 1, \"b\": 2, \"c\": 3}))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["['a', 'c']", "[1, 2]", "{'a': 1, 'c': 3}"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn warnings_module_matches_python_transcript() {
+    // Issue #111: `warnings.warn(...)` and `warnings.simplefilter(..., 
+    // append=True)` (keyword args to a runtime fn) convert, build, and the
+    // stdout diffs against a pinned `// Verified against python3.`
+    // transcript (warnings go to stderr in both).
+    let scratch = Scratch::new("warnings");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import warnings\n",
+            "\n",
+            "def check(x):\n",
+            "    if x < 0:\n",
+            "        warnings.warn(\"negative value\")\n",
+            "    return x\n",
+            "\n",
+            "def setup():\n",
+            "    warnings.simplefilter(\"ignore\")\n",
+            "    warnings.simplefilter(\"default\", append=True)\n",
+            "    warnings.warn(\"hello\", stacklevel=2)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    setup()\n",
+            "    print(check(5))\n",
+            "    print(check(-1))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["5", "-1"],
+        "stdout: {}",
+        stdout
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("negative value"), "stderr: {}", stderr);
+    assert_eq!(output.status.code(), Some(0));
 }

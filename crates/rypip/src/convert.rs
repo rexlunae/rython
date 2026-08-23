@@ -2,9 +2,7 @@
 //! module per Python module, an optional binary entry point, and optional
 //! PyO3 bindings so the crate can be imported from Python again.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -105,6 +103,10 @@ pub struct ConvertOptions {
     /// rust-for-linux toolchain inside a rust-for-linux kernel tree.
     /// Requires `kernel_module`; overrides the raw-FFI output.
     pub rust_for_linux: bool,
+    /// Skip resolving the packaging metadata's dependencies (`[project]
+    /// dependencies` / install_requires) against PyPI. Vendored
+    /// `[python-modules]` entries always win either way.
+    pub no_deps: bool,
 }
 
 /// A converted crate on disk.
@@ -232,14 +234,17 @@ fn generate_kernel_lib_rs(
     let ast =
         parse_enhanced(source, "<kernel>".to_string()).map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // The kernel runs with the FPU in a lazy-save state: reject
+    // floating-point usage loudly instead of emitting code that can corrupt
+    // userspace state (issue #87). Unconditional — the device-manifest
+    // sub-mode (ioctl handlers, buffer logic) must not be an unguarded path
+    // (issue #108). The scan is target-independent, so run it before the
+    // has_device early return.
+    check_kernel_no_floats(&ast)?;
+
     if manifest.has_device {
         return generate_kernel_device(&ast, manifest, target, package_name);
     }
-
-    // The kernel runs with the FPU in a lazy-save state: reject
-    // floating-point usage loudly instead of emitting code that can corrupt
-    // userspace state (issue #87).
-    check_kernel_no_floats(&ast)?;
 
     let mut init_body = String::new();
     let mut exit_body = String::new();
@@ -612,6 +617,16 @@ fn check_kernel_stmt_no_floats(stmt: &python_ast::Statement) -> Result<()> {
             check_kernel_expr_no_floats(test, line)?;
             if let Some(m) = msg {
                 check_kernel_expr_no_floats(m, line)?;
+            }
+            Ok(())
+        }
+        S::Global(_) => Ok(()),
+        S::Nonlocal(_) => Ok(()),
+        // A bare annotated declaration (`x: int`) has no value to scan.
+        S::AnnotatedName { .. } => Ok(()),
+        S::Delete(targets) => {
+            for t in targets {
+                check_kernel_expr_no_floats(t, line)?;
             }
             Ok(())
         }
@@ -1805,6 +1820,27 @@ pub fn convert(
 
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
+    // Async usage across the package: any async construct (async def/await/
+    // async for/async with) needs an executor, and any `import asyncio`
+    // needs the tokio-backed stdpython module. Binary conversions link the
+    // runtime themselves (tokio behind the `async-tokio` feature); library
+    // conversions expose plain async fns and only pull stdpython's
+    // asyncio module when they import it.
+    let (package_uses_async, package_imports_asyncio) = package_async_flags(package);
+    if opts.kernel_module && package_uses_async {
+        bail!(
+            "kernel modules cannot use async/await: the kernel has no user-space \
+             executor, and the generated entry points are synchronous"
+        );
+    }
+    if opts.no_std && (package_uses_async || package_imports_asyncio) {
+        bail!(
+            "async/await (and asyncio) require the tokio runtime, which the no_std \
+             profile does not provide; convert without --no-std"
+        );
+    }
+    let async_runtime_dep = entry_file.is_some() && package_uses_async;
+
     // `[python-modules]` vendors Python libraries into the generated crate
     // as a module tree; kernel modules compile a single entry file with no
     // tree, so a manifest that declares any is a loud error up front.
@@ -1815,6 +1851,22 @@ pub fn convert(
              compile a single entry file with no module tree"
         );
     }
+
+    // The packaging metadata's own dependencies ([project] dependencies,
+    // install_requires) are resolved pip-style — a PyPI fetch when they are
+    // not already vendored via [python-modules] — so a pyproject.toml
+    // project converts with its libraries wired in the same way Python
+    // would install them. Explicit manifest entries override the fetch.
+    // Kernel modules compile a single entry file and reject all python
+    // modules, so they never resolve dependencies.
+    let python_manifest = if opts.no_deps
+        || opts.kernel_module
+        || package.dependencies.is_empty()
+    {
+        python_manifest
+    } else {
+        resolve_packaging_dependencies(package, python_manifest)?
+    };
 
     // Kernel modules use a dedicated lowering path: no stdpython, no alloc,
     // raw FFI entry points with printk and module metadata.
@@ -1887,6 +1939,11 @@ pub fn convert(
         python_deps.iter().map(|(name, _)| name.clone()).collect();
     // ASTs of every module of the generated crate (vendored deps + the
     // package itself), keyed by module path.
+    // Reachability-based module selection: a module outside the
+    // import-reachable set (a CLI helper like idna/cli.py, a __main__
+    // block, test utilities) is SKIPPED, so a divergent module the program
+    // never imports no longer blocks conversion.
+    let reachable = reachable_module_paths(package, &python_deps);
     let module_defs = module_def_map(
         python_deps
             .iter()
@@ -1896,16 +1953,28 @@ pub fn convert(
     // One options object per conversion: the shared `module_defs` and the
     // cross-module trait-mut cache (computed once, reused by every module's
     // transpile via the Rc clone).
-    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
+    let base_options = conversion_base_options(
+        opts,
+        &rust_modules,
+        &python_module_names,
+        &module_defs,
+        async_runtime_dep,
+    );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
+            if !reachable.contains(&module.path) {
+                continue;
+            }
             let code = transpile(module, &mut warnings, &base_options)?;
             transpiled.push((module, code));
         }
     }
     for module in &package.modules {
+        if !reachable.contains(&module.path) {
+            continue;
+        }
         let code = transpile(module, &mut warnings, &base_options)?;
         transpiled.push((module, code));
     }
@@ -2316,18 +2385,33 @@ fn convert_driver(
     let rust_modules = rust_module_registry(package, &rust_manifest)?;
     // Driver mode still vendors python-modules deps as siblings; give the
     // same cross-module knowledge as the plain package path.
+    // Reachability-based module selection: a module outside the
+    // import-reachable set (a CLI helper like idna/cli.py, a __main__
+    // block, test utilities) is SKIPPED, so a divergent module the program
+    // never imports no longer blocks conversion.
+    let reachable = reachable_module_paths(package, &python_deps);
     let module_defs = module_def_map(
         python_deps
             .iter()
             .flat_map(|(_, dep)| dep.modules.iter())
             .chain(package.modules.iter()),
     );
-    let base_options = conversion_base_options(opts, &rust_modules, &python_module_names, &module_defs);
+    let (package_uses_async, _) = package_async_flags(package);
+    let base_options = conversion_base_options(
+        opts,
+        &rust_modules,
+        &python_module_names,
+        &module_defs,
+        package_uses_async,
+    );
     let code = transpile(module, &mut warnings, &base_options)?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
         for dep_module in &dep.modules {
+            if !reachable.contains(&dep_module.path) {
+                continue;
+            }
             let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
             dep_transpiled.push((dep_module, dep_code));
         }
@@ -2809,6 +2893,11 @@ fn transpile(
     // Relative imports resolve against the current module's package path;
     // empty at the crate root (the default when unset).
     options.module_path = module_package_path(module);
+    // The module's OWN path (module_path is the package path): the
+    // promotion pass uses it to learn which names sibling modules import
+    // from this module (`from .constant import _THAI`), so cross-module
+    // constants are promoted to importable statics.
+    options.this_module_path = module.path.clone();
     // Register rust-module imports in the shared symbol table so call
     // lowering can resolve them (Import::to_rust only sees a clone).
     let mut symbols = symbols;
@@ -2823,7 +2912,35 @@ fn transpile(
                 python_ast::format_error_chain(e.as_ref())
             )
         })?;
+    // M5 definition-time warnings collected during inference (a bound set
+    // no known type satisfies) — reported like any lossy-conversion
+    // warning: reported at -W warn, fatal at -W deny, suppressed at allow.
+    for w in std::mem::take(&mut *base_options.definition_warnings.borrow_mut()) {
+        warnings.push(format!("{}: {}", parse_filename(module), w));
+    }
     Ok(tokens.to_string())
+}
+
+/// Whether any module of the package contains async constructs (async def/
+/// await/async for/async with) and whether any imports `asyncio`. Parse
+/// failures are ignored — the transpile pass reports them with context.
+fn package_async_flags(package: &PyPackage) -> (bool, bool) {
+    let mut uses_async = false;
+    let mut imports_asyncio = false;
+    for module in &package.modules {
+        if uses_async && imports_asyncio {
+            break;
+        }
+        if let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) {
+            if !uses_async && python_ast::module_contains_async(&ast.raw.body) {
+                uses_async = true;
+            }
+            if !imports_asyncio && python_ast::module_imports_asyncio(&ast.raw.body) {
+                imports_asyncio = true;
+            }
+        }
+    }
+    (uses_async, imports_asyncio)
 }
 
 /// Conversion-level PythonOptions shared by every module of one conversion
@@ -2834,6 +2951,7 @@ fn conversion_base_options(
     rust_modules: &HashMap<String, python_ast::RustModuleSpec>,
     python_module_names: &std::collections::HashSet<String>,
     module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
+    async_runtime_dep: bool,
 ) -> PythonOptions {
     PythonOptions {
         lossy_warnings: opts.warnings != WarningMode::Allow,
@@ -2841,6 +2959,7 @@ fn conversion_base_options(
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
         python_modules: std::rc::Rc::new(python_module_names.clone()),
         module_defs: std::rc::Rc::new(module_defs.clone()),
+        async_runtime_dep,
         ..Default::default()
     }
 }
@@ -3049,7 +3168,10 @@ fn bindable_signature(
     // carries — resolved_return_type is the single source of truth (it gates
     // annotations on all-paths-return, so a function that can fall through
     // binds as returning unit, matching the generated `()`).
-    let ret = func.resolved_return_type();
+    let ret = func.resolved_return_type(
+        &python_ast::SymbolTableScopes::new(),
+        &python_ast::PythonOptions::default(),
+    );
     Some((params, names, ret))
 }
 
@@ -3057,14 +3179,36 @@ fn bindable_signature(
 /// manifest: kernel device generation swaps the stdpython dependency for
 /// the rykernel-shim crate (the device code links it directly) and takes
 /// its crate name from `__module_name__` when declared.
+/// Normalize a Python package version into a valid Cargo semver:
+/// pyproject "0.1" (valid for Python) becomes "0.1.0".
+fn cargo_version(v: &str) -> String {
+    let parts: Vec<&str> = v.trim().split('.').collect();
+    let mut out = parts[..parts.len().min(3)].to_vec();
+    while out.len() < 3 {
+        out.push("0");
+    }
+    out.join(".")
+}
+
 fn write_cargo_toml(
     package: &PyPackage,
     out_dir: &Path,
     opts: &ConvertOptions,
-    _has_binary: bool,
+    has_binary: bool,
     manifest: &DeviceManifest,
     uses_shim: bool,
 ) -> Result<()> {
+    // Async usage drives two Cargo.toml decisions: a BINARY crate with async
+    // code links tokio behind a default-on `async-tokio` feature (the codegen
+    // gates its entry attribute and `use tokio;` on that feature), and any
+    // crate that imports asyncio enables stdpython's tokio-backed asyncio
+    // module.
+    let (uses_async, imports_asyncio) = package_async_flags(package);
+    let async_binary = has_binary && uses_async;
+    // stdpython's tokio-backed asyncio module is only needed when the code
+    // actually imports asyncio (plain async fns need no runtime module).
+    let needs_async_stdpython = imports_asyncio;
+
     let crate_name = if opts.kernel_module {
         // Kernel modules take their name from the kernel manifest; the
         // userspace driver keeps the package name (the glue and the
@@ -3112,21 +3256,36 @@ fn write_cargo_toml(
             ),
         }
     } else {
+        // The std tier of stdpython, with the tokio-backed asyncio module
+        // when the package uses it (async code or `import asyncio`).
+        let async_feature = if needs_async_stdpython {
+            ", features = [\"async-tokio\"]"
+        } else {
+            ""
+        };
         match (&stdpython_source, opts.no_std) {
             (StdpythonSource::Path(path), true) => format!(
                 "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
                 path.display().to_string().replace('\\', "/"),
             ),
             (StdpythonSource::Path(path), false) => format!(
-                "stdpython = {{ path = \"{}\" }}",
+                "stdpython = {{ path = \"{}\"{} }}",
                 path.display().to_string().replace('\\', "/"),
+                async_feature,
             ),
             (StdpythonSource::Registry(version), true) => format!(
                 "stdpython = {{ version = \"{}\", default-features = false, features = [\"alloc\"] }}",
                 version,
             ),
             (StdpythonSource::Registry(version), false) => {
-                format!("stdpython = \"{}\"", version)
+                if needs_async_stdpython {
+                    format!(
+                        "stdpython = {{ version = \"{}\", features = [\"async-tokio\"] }}",
+                        version
+                    )
+                } else {
+                    format!("stdpython = \"{}\"", version)
+                }
             }
         }
     };
@@ -3139,7 +3298,7 @@ fn write_cargo_toml(
          [dependencies]\n\
          {stdpython_dep}\n",
         name = crate_name,
-        version = package.version,
+        version = cargo_version(&package.version),
     );
     // Userspace drivers link libc for their generated syscall glue.
     if opts.driver {
@@ -3185,6 +3344,21 @@ fn write_cargo_toml(
     }
     if opts.kernel_module {
         toml.push_str("\n[lib]\ncrate-type = [\"staticlib\"]\n");
+    }
+    // Async BINARY crates link the runtime (tokio) behind a default-on
+    // `async-tokio` feature: the generated entry point carries
+    // `#[cfg_attr(feature = "async-tokio", tokio::main)]` and a
+    // compile_error that names the feature when it is off
+    // (`--no-default-features`). Library conversions never declare tokio:
+    // their async functions are plain async fns, driven by the consumer's
+    // executor.
+    if async_binary {
+        toml.push_str(
+            "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"], optional = true }\n\n\
+             [features]\n\
+             default = [\"async-tokio\"]\n\
+             async-tokio = [\"dep:tokio\"]\n\n",
+        );
     }
     fs::write(out_dir.join("Cargo.toml"), toml)?;
     // Keep the generated crate out of any enclosing workspace.
@@ -3280,13 +3454,14 @@ fn read_rust_module_manifest(package: &PyPackage) -> Result<HashMap<String, Mani
     Ok(out)
 }
 
-/// A manifest entry from `rython.toml` `[python-modules]`: a vendored
-/// PyPI-style Python library, compiled into the generated crate.
+/// A manifest entry from `rython.toml` `[python-modules]` (or a resolved
+/// PyPI dependency): a vendored PyPI-style Python library, compiled into
+/// the generated crate.
 #[derive(Clone, Debug)]
-struct ManifestPythonModule {
+pub(crate) struct ManifestPythonModule {
     /// Path to a single .py file or a package directory, relative to the
     /// package root (where the manifest lives).
-    path: String,
+    pub(crate) path: String,
 }
 
 /// Read `rython.toml` `[python-modules]`, keyed by the Python import name
@@ -3334,6 +3509,213 @@ fn read_python_module_manifest(
     Ok(out)
 }
 
+/// Resolve the packaging metadata's declared dependencies (pyproject
+/// `[project] dependencies` / setup.cfg `install_requires` / setup.py) into
+/// `[python-modules]`-style entries, fetching from PyPI unless the
+/// dependency is already vendored explicitly (explicit entries win) or
+/// `RYPIP_OFFLINE=1` is set (then a missing dep is a loud error).
+/// The module paths reachable from the program's roots (the package's own
+/// modules) by following `import`/`from ... import` statements across the
+/// package and its dependencies — absolute and relative. Unreachable
+/// modules (CLI helpers, `__main__` blocks, test utilities) are skipped by
+/// the converter, so a divergent module the program never imports cannot
+/// block conversion.
+fn reachable_module_paths(
+    package: &PyPackage,
+    deps: &[(String, PyPackage)],
+) -> std::collections::HashSet<Vec<String>> {
+    
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut by_path: HashMap<Vec<String>, &PyModule> = HashMap::new();
+    for (_, dep) in deps {
+        for m in &dep.modules {
+            by_path.insert(m.path.clone(), m);
+        }
+    }
+    for m in &package.modules {
+        by_path.insert(m.path.clone(), m);
+    }
+
+    let mut reachable: HashSet<Vec<String>> = HashSet::new();
+    let mut queue: VecDeque<Vec<String>> = VecDeque::new();
+    for m in &package.modules {
+        queue.push_back(m.path.clone());
+    }
+
+    while let Some(path) = queue.pop_front() {
+        if !reachable.insert(path.clone()) {
+            continue;
+        }
+        let Some(module) = by_path.get(&path) else { continue };
+        // Parse with the RELATIVE module filename (like `transpile` does):
+        // parse_enhanced derives the module name from the filename, and an
+        // absolute path produces an invalid identifier (`__home__tserica__...`)
+        // which fails parsing and silently drops every import of the module.
+        let Ok(ast) = python_ast::parse_enhanced(&module.source, parse_filename(module)) else {
+            continue;
+        };
+        for stmt in &ast.raw.body {
+            reachable_walk_imports(stmt, module, &path, &by_path, &mut queue);
+        }
+    }
+    reachable
+}
+
+/// Walk one statement for imports to enqueue, recursing into nested
+/// statement lists (if/while/for/with/try bodies) AND function bodies:
+/// `from pip._internal.utils.entrypoints import _wrapper` inside `main()`
+/// (a function-local import) still makes `pip._internal...` reachable.
+/// Function bodies are walked with the function's own package path — a
+/// function-local import is relative to the module's package, not to the
+/// function.
+fn reachable_walk_imports(
+    stmt: &python_ast::ast::tree::Statement,
+    module: &PyModule,
+    path: &[String],
+    by_path: &HashMap<Vec<String>, &PyModule>,
+    queue: &mut VecDeque<Vec<String>>,
+) {
+    use python_ast::ast::tree::StatementType;
+
+    match &stmt.statement {
+        StatementType::Import(i) => {
+            for alias in &i.names {
+                let parts: Vec<&str> = alias.name.split('.').collect();
+                for len in (1..=parts.len()).rev() {
+                    let cand: Vec<String> =
+                        parts[..len].iter().map(|s| s.to_string()).collect();
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                        break;
+                    }
+                }
+            }
+        }
+        StatementType::ImportFrom(i) => {
+            let package_path: Vec<String> = if module.is_init {
+                path.to_vec()
+            } else {
+                path[..path.len().saturating_sub(1)].to_vec()
+            };
+            // Absolute imports (level == 0) resolve from the crate
+            // root; relative imports walk up `level` packages from
+            // the current package path.
+            let mut base: Vec<String> = if i.level == 0 {
+                Vec::new()
+            } else {
+                let cut = (package_path.len() + 1).saturating_sub(i.level);
+                package_path[..cut.min(package_path.len())].to_vec()
+            };
+            if i.module.is_empty() {
+                // `from . import utils` — the names are sibling
+                // modules of the resolved package.
+                for alias in &i.names {
+                    let mut cand = base.clone();
+                    cand.push(alias.name.clone());
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                    }
+                }
+            } else {
+                base.extend(
+                    i.module.split('.').filter(|p| !p.is_empty()).map(|s| s.to_string()),
+                );
+                for len in (1..=base.len()).rev() {
+                    let cand = base[..len].to_vec();
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                        break;
+                    }
+                }
+                // `from .http2 import probe as http2_probe` — the imported
+                // NAMES may be SUBMODULES of the resolved package
+                // (http2/probe.py), not just items of its __init__: enqueue
+                // each `base + name` that is a module (urllib3's
+                // connection.py uses probe's acquire_and_get). Without
+                // this, probe.py is never transpiled and the call fails
+                // E0433.
+                for alias in &i.names {
+                    let mut cand = base.clone();
+                    cand.push(alias.name.clone());
+                    if by_path.contains_key(&cand) {
+                        queue.push_back(cand);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    // Recurse into nested statement lists and function bodies.
+    match &stmt.statement {
+        StatementType::FunctionDef(f) => {
+            for b in &f.body {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::If(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::While(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::For(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::With(s) => {
+            for b in &s.body {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        StatementType::Try(s) => {
+            for b in s.body.iter().chain(s.orelse.iter()).chain(s.finalbody.iter()) {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+            for h in &s.handlers {
+                for b in &h.body {
+                    reachable_walk_imports(b, module, path, by_path, queue);
+                }
+            }
+        }
+        StatementType::ClassDef(c) => {
+            for b in &c.body {
+                reachable_walk_imports(b, module, path, by_path, queue);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_packaging_dependencies(
+    package: &PyPackage,
+    explicit: HashMap<String, ManifestPythonModule>,
+) -> Result<HashMap<String, ManifestPythonModule>> {
+    let requirements = crate::resolve::parse_requirements(&package.dependencies);
+    if requirements.is_empty() {
+        return Ok(explicit);
+    }
+    let offline = std::env::var_os("RYPIP_OFFLINE").is_some();
+    let mut resolved = Vec::new();
+    for req in &requirements {
+        if explicit.contains_key(&req.name) {
+            continue;
+        }
+        // Issue #113: resolve the dependency AND its transitive
+        // requirements (pip-style), so `requests` brings in urllib3,
+        // certifi, idna, charset-normalizer, ...
+        let tree = crate::resolve::resolve_dependency_tree(req, offline)
+            .with_context(|| format!("resolving dependency `{}`", req.name))?;
+        resolved.extend(tree);
+    }
+    Ok(crate::resolve::merge_python_modules(explicit, resolved))
+}
+
 /// Load every `[python-modules]` dependency into an in-memory `PyPackage`,
 /// with module paths remapped under the import name: a single file
 /// `vendor/pylev/wf.py` becomes the one module `pylev`; a package directory
@@ -3372,6 +3754,7 @@ fn python_module_deps(
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from(".")),
                 modules: vec![module],
+                dependencies: Vec::new(),
             };
             deps.push((import_name.clone(), pkg));
         } else if abs.is_dir() {

@@ -45,6 +45,11 @@ use std::collections::{HashMap, HashSet};
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use hashbrown::{HashMap, HashSet};
 
+#[cfg(feature = "std")]
+use std::sync::Arc;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::sync::Arc;
+
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
 
@@ -702,10 +707,12 @@ pub trait PyMod<R: ?Sized> {
 }
 
 /// Trait backing Python's `/` true division (always float) — generic so
-/// `NdArray` (numpy `divide`) can participate.
+/// `NdArray` (numpy `divide`) can participate. Returns a Result so a zero
+/// divisor raises a catchable ZeroDivisionError instead of silently
+/// yielding inf/nan (issue #107, the `/` counterpart of #75's `//`/`%`).
 pub trait PyDiv<R: ?Sized> {
     type Output;
-    fn py_div(&self, rhs: &R) -> Self::Output;
+    fn py_div(&self, rhs: &R) -> Result<Self::Output, PyException>;
 }
 
 /// Trait backing Python's `@` matrix multiplication operator.
@@ -811,12 +818,36 @@ impl PyMod<i64> for f64 {
     }
 }
 
+/// Zero test that works across the numeric operand types of the division
+/// helpers (Rust will not coerce an integer literal through `==` on `f64`).
+trait IsZero {
+    fn is_zero(&self) -> bool;
+}
+impl IsZero for i64 {
+    fn is_zero(&self) -> bool {
+        *self == 0
+    }
+}
+impl IsZero for f64 {
+    fn is_zero(&self) -> bool {
+        *self == 0.0
+    }
+}
+impl IsZero for bool {
+    fn is_zero(&self) -> bool {
+        !*self
+    }
+}
+
 macro_rules! numeric_div {
-    ($($l:ty, $r:ty => $out:ty),* $(,)?) => {
+    ($msg:expr; $($l:ty, $r:ty => $out:ty),* $(,)?) => {
         $(impl PyDiv<$r> for $l {
             type Output = $out;
-            fn py_div(&self, rhs: &$r) -> $out {
-                (*self as f64) / (*rhs as f64)
+            fn py_div(&self, rhs: &$r) -> Result<$out, PyException> {
+                if rhs.is_zero() {
+                    return Err(PyException::new("ZeroDivisionError", $msg));
+                }
+                Ok((*self as f64) / (*rhs as f64))
             }
         })*
     };
@@ -824,37 +855,49 @@ macro_rules! numeric_div {
 
 // bool operands promote through the numeric path (True → 1.0) like numpy.
 macro_rules! bool_div {
-    ($($r:ty),* $(,)?) => {
+    ($msg:expr; $($r:ty),* $(,)?) => {
         $(
             impl PyDiv<$r> for bool {
                 type Output = f64;
-                fn py_div(&self, rhs: &$r) -> f64 {
-                    (if *self { 1.0 } else { 0.0 }) / (*rhs as f64)
+                fn py_div(&self, rhs: &$r) -> Result<f64, PyException> {
+                    if rhs.is_zero() {
+                        return Err(PyException::new("ZeroDivisionError", $msg));
+                    }
+                    Ok((if *self { 1.0 } else { 0.0 }) / (*rhs as f64))
                 }
             }
             impl PyDiv<bool> for $r {
                 type Output = f64;
-                fn py_div(&self, rhs: &bool) -> f64 {
-                    (*self as f64) / if *rhs { 1.0 } else { 0.0 }
+                fn py_div(&self, rhs: &bool) -> Result<f64, PyException> {
+                    if rhs.is_zero() {
+                        return Err(PyException::new("ZeroDivisionError", $msg));
+                    }
+                    Ok((*self as f64) / if *rhs { 1.0 } else { 0.0 })
                 }
             }
         )*
     };
 }
 
-numeric_div!(
-    i64, i64 => f64,
-    i64, f64 => f64,
-    f64, i64 => f64,
-    f64, f64 => f64,
-);
+// CPython's messages: int/int (and bool, an int subclass) true division by
+// zero raises "division by zero"; any float operand raises "float division
+// by zero".
+numeric_div!("division by zero"; i64, i64 => f64);
+numeric_div!("float division by zero"; i64, f64 => f64, f64, i64 => f64, f64, f64 => f64);
 
-bool_div!(i64, f64);
+bool_div!("division by zero"; i64);
+bool_div!("float division by zero"; f64);
 
 impl PyDiv<bool> for bool {
     type Output = f64;
-    fn py_div(&self, rhs: &bool) -> f64 {
-        (if *self { 1.0 } else { 0.0 }) / if *rhs { 1.0 } else { 0.0 }
+    fn py_div(&self, rhs: &bool) -> Result<f64, PyException> {
+        if rhs.is_zero() {
+            return Err(PyException::new(
+                "ZeroDivisionError",
+                "division by zero",
+            ));
+        }
+        Ok((if *self { 1.0 } else { 0.0 }) / if *rhs { 1.0 } else { 0.0 })
     }
 }
 
@@ -870,8 +913,10 @@ pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_mod(&b)
 }
 
-/// Python `/` (true division): `py_div(3, 2) == 1.5`.
-pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> L::Output {
+/// Python `/` (true division): `py_div(3, 2) == 1.5`. Raises a catchable
+/// ZeroDivisionError on a zero divisor ("division by zero" for int operands,
+/// "float division by zero" when either operand is a float — issue #107).
+pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_div(&b)
 }
 
@@ -2023,6 +2068,16 @@ impl PyToString for String {
     }
 }
 
+// CPython's str(exc) is the exception's args rendered as a string — for a
+// `ZeroDivisionError("division by zero")` that is just "division by zero",
+// not "Type: message" (that is Display's job for the uncaught-exception
+// report).
+impl PyToString for PyException {
+    fn py_str(self) -> String {
+        self.message
+    }
+}
+
 // ============================================================================
 // PYTHON BUILT-IN TYPES AND TRAITS
 // ============================================================================
@@ -2155,6 +2210,313 @@ impl Len for PyStr {
 impl Truthy for PyStr {
     fn is_truthy(&self) -> bool {
         !self.inner.is_empty()
+    }
+}
+
+/// The `str | bytes` (and `str | bytes | bytearray`) heterogeneous union:
+/// a value that is either a Python str or raw bytes. This is the bounded
+/// slice of the boxed-heterogeneous-value divergence (issue #121) that
+/// real libraries need (idna's labels, requests' `to_native_string`).
+/// Codegen narrows it through `isinstance(x, (bytes, bytearray))` checks
+/// into the concrete String/Vec<u8> branch; the union itself only needs
+/// len, truthiness, and the isinstance/bytes/str dispatch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StrOrBytes {
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+impl StrOrBytes {
+    pub fn is_str(&self) -> bool {
+        matches!(self, StrOrBytes::Str(_))
+    }
+    pub fn is_bytes(&self) -> bool {
+        matches!(self, StrOrBytes::Bytes(_))
+    }
+    /// Python len(): characters for a str, octets for bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            StrOrBytes::Str(s) => s.chars().count(),
+            StrOrBytes::Bytes(b) => b.len(),
+        }
+    }
+    /// The str view; only valid after isinstance narrowing (Python has no
+    /// str(bytes) without an encoding).
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            StrOrBytes::Str(s) => Some(s.as_str()),
+            StrOrBytes::Bytes(_) => None,
+        }
+    }
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            StrOrBytes::Bytes(b) => Some(b.as_slice()),
+            StrOrBytes::Str(_) => None,
+        }
+    }
+}
+
+impl Truthy for StrOrBytes {
+    fn is_truthy(&self) -> bool {
+        self.len() != 0
+    }
+}
+
+impl Len for StrOrBytes {
+    fn len(&self) -> usize {
+        StrOrBytes::len(self)
+    }
+}
+
+/// A boxed heterogeneous Python value (issue #121): the runtime
+/// representation of wider unions that have no single concrete Rust type —
+/// `bool | str | None`, `tuple[str, str] | str | None`, `int | str | None`,
+/// `Any`, `Literal[False] | str | None`, ... Every member keeps its concrete
+/// type; isinstance checks dispatch at runtime (`is_str()`, `as_int()`, ...)
+/// and narrow the value in the branch, mirroring StrOrBytes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PyValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Bytes(Vec<u8>),
+    Tuple(Arc<Vec<PyValue>>),
+    None_,
+}
+
+impl PyValue {
+    pub fn is_int(&self) -> bool {
+        matches!(self, PyValue::Int(_))
+    }
+    pub fn is_float(&self) -> bool {
+        matches!(self, PyValue::Float(_))
+    }
+    pub fn is_bool(&self) -> bool {
+        matches!(self, PyValue::Bool(_))
+    }
+    pub fn is_str(&self) -> bool {
+        matches!(self, PyValue::Str(_))
+    }
+    pub fn is_bytes(&self) -> bool {
+        matches!(self, PyValue::Bytes(_))
+    }
+    pub fn is_tuple(&self) -> bool {
+        matches!(self, PyValue::Tuple(_))
+    }
+    pub fn is_none(&self) -> bool {
+        matches!(self, PyValue::None_)
+    }
+    /// Python len(): characters for a str, octets for bytes, elements for a
+    /// tuple. Only valid on members that have a length (the code paths that
+    /// call it are the ones Python would execute).
+    pub fn len(&self) -> usize {
+        match self {
+            PyValue::Str(s) => s.chars().count(),
+            PyValue::Bytes(b) => b.len(),
+            PyValue::Tuple(t) => t.len(),
+            other => panic!("len() of non-sized PyValue {other:?}"),
+        }
+    }
+    /// The member views; only valid after isinstance narrowing (Python
+    /// raises TypeError if the member does not match).
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            PyValue::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            PyValue::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            PyValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PyValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            PyValue::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+    pub fn as_tuple(&self) -> Option<&Vec<PyValue>> {
+        match self {
+            PyValue::Tuple(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+impl AsStrLike for PyValue {
+    fn as_str_like(&self) -> &str {
+        match self {
+            PyValue::Str(s) => s.as_str(),
+            other => panic!("expected a str in this context, got {other:?}"),
+        }
+    }
+}
+
+impl Truthy for PyValue {
+    fn is_truthy(&self) -> bool {
+        match self {
+            PyValue::Int(v) => *v != 0,
+            PyValue::Float(v) => *v != 0.0,
+            PyValue::Bool(v) => *v,
+            PyValue::Str(s) => !s.is_empty(),
+            PyValue::Bytes(b) => !b.is_empty(),
+            PyValue::Tuple(t) => !t.is_empty(),
+            PyValue::None_ => false,
+        }
+    }
+}
+
+impl Len for PyValue {
+    fn len(&self) -> usize {
+        PyValue::len(self)
+    }
+}
+
+impl PyIsNone for PyValue {
+    fn py_is_none(&self) -> bool {
+        self.is_none()
+    }
+}
+
+impl PyValue {
+    /// Python's unary `-` on a boxed value: negates the numeric members
+    /// (bool negates to int, as in CPython). Unmodeled operands panic
+    /// with a TypeError naming the operand type — the same contract
+    /// PySub's Option impl uses.
+    pub fn py_neg(&self) -> PyValue {
+        let type_name = |v: &PyValue| match v {
+            PyValue::Str(_) => "str",
+            PyValue::Bytes(_) => "bytes",
+            PyValue::Tuple(_) => "tuple",
+            PyValue::None_ => "NoneType",
+            _ => "object",
+        };
+        match self {
+            PyValue::Int(v) => PyValue::Int(-v),
+            PyValue::Float(v) => PyValue::Float(-v),
+            PyValue::Bool(v) => PyValue::Int(if *v { -1 } else { 0 }),
+            other => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    format!(
+                        "bad operand type for unary -: '{}'",
+                        type_name(other)
+                    )
+                )
+            ),
+        }
+    }
+}
+
+macro_rules! pyvalue_from {
+    ($($t:ty => $v:ident),* $(,)?) => {
+        $(impl From<$t> for PyValue {
+            fn from(value: $t) -> Self {
+                PyValue::$v(value)
+            }
+        })*
+    };
+}
+pyvalue_from!(i64 => Int, f64 => Float, bool => Bool, String => Str, Vec<u8> => Bytes);
+
+impl From<&str> for PyValue {
+    fn from(value: &str) -> Self {
+        PyValue::Str(value.to_string())
+    }
+}
+
+impl From<&[u8]> for PyValue {
+    fn from(value: &[u8]) -> Self {
+        PyValue::Bytes(value.to_vec())
+    }
+}
+
+impl From<StrOrBytes> for PyValue {
+    fn from(value: StrOrBytes) -> Self {
+        match value {
+            StrOrBytes::Str(s) => PyValue::Str(s),
+            StrOrBytes::Bytes(b) => PyValue::Bytes(b),
+        }
+    }
+}
+
+impl From<()> for PyValue {
+    fn from(_: ()) -> Self {
+        PyValue::None_
+    }
+}
+
+/// `bytes(x)` lowering: the byte representation of a str (UTF-8), a
+/// str|bytes union (the bytes branch), or bytes themselves (identity).
+pub trait IntoBytesLike {
+    fn into_bytes_like(self) -> Vec<u8>;
+}
+impl IntoBytesLike for String {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self.into_bytes()
+    }
+}
+impl IntoBytesLike for &str {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+impl IntoBytesLike for Vec<u8> {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self
+    }
+}
+impl IntoBytesLike for &[u8] {
+    fn into_bytes_like(self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+impl IntoBytesLike for StrOrBytes {
+    fn into_bytes_like(self) -> Vec<u8> {
+        match self {
+            StrOrBytes::Str(s) => s.into_bytes(),
+            StrOrBytes::Bytes(b) => b,
+        }
+    }
+}
+
+/// Python bytes methods that a narrowed `str | bytes` union exercises
+/// (idna's A-label handling: lower/startswith/endswith/isascii). ASCII
+/// byte-wise semantics, matching Python's bytes methods.
+pub trait PyBytesOps {
+    fn lower(&self) -> Vec<u8>;
+    fn startswith(&self, prefix: &[u8]) -> bool;
+    fn endswith(&self, suffix: &[u8]) -> bool;
+    fn isascii(&self) -> bool;
+}
+impl PyBytesOps for Vec<u8> {
+    fn lower(&self) -> Vec<u8> {
+        self.iter().map(|b| b.to_ascii_lowercase()).collect()
+    }
+    fn startswith(&self, prefix: &[u8]) -> bool {
+        self.starts_with(prefix)
+    }
+    fn endswith(&self, suffix: &[u8]) -> bool {
+        self.ends_with(suffix)
+    }
+    fn isascii(&self) -> bool {
+        self.iter().all(|b| b.is_ascii())
     }
 }
 
@@ -2867,8 +3229,9 @@ pub trait PyListOps<T> {
         T: PartialEq;
     /// list.insert(i, x) with Python index rules: negative indices count
     /// from the end, and out-of-range indices clamp (insert past the end
-    /// appends, before the start prepends) — never a panic.
-    fn py_insert(&mut self, index: i64, item: T);
+    /// appends, before the start prepends) — never a panic. Result so a
+    /// bounded deque can raise IndexError at its maximum size (issue #82).
+    fn py_insert(&mut self, index: i64, item: T) -> Result<(), PyException>;
 }
 
 impl<T> PyListOps<T> for Vec<T> {
@@ -2878,7 +3241,7 @@ impl<T> PyListOps<T> for Vec<T> {
     {
         self.iter().filter(|e| *e == item).count() as i64
     }
-    fn py_insert(&mut self, index: i64, item: T) {
+    fn py_insert(&mut self, index: i64, item: T) -> Result<(), PyException> {
         let len = self.len() as i64;
         let idx = if index < 0 {
             // len + i64::MIN overflows; Python prepends for any index with
@@ -2889,6 +3252,7 @@ impl<T> PyListOps<T> for Vec<T> {
             index.min(len)
         } as usize;
         self.insert(idx, item);
+        Ok(())
     }
 }
 
@@ -2966,6 +3330,42 @@ pub fn py_int_radix_format(
     }
 }
 
+/// The `,` thousands separator (Python's `f"{size:,}"`): the integer's
+/// digits group in threes from the right, preserving the sign
+/// (format(-1234567, ',') == "-1,234,567").
+pub fn py_grouped_int(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let mag = v.unsigned_abs().to_string();
+    let mut out = String::new();
+    let chars: Vec<char> = mag.chars().collect();
+    let first_group = chars.len() % 3;
+    let mut i = 0;
+    if first_group > 0 {
+        out.extend(chars[..first_group].iter());
+        i = first_group;
+        if i < chars.len() {
+            out.push(',');
+        }
+    }
+    while i < chars.len() {
+        out.extend(chars[i..i + 3].iter());
+        i += 3;
+        if i < chars.len() {
+            out.push(',');
+        }
+    }
+    format!("{}{}", sign, out)
+}
+
+/// A DYNAMIC-width format spec (`f"{completed:{total_width}d}"` — rich's
+/// progress column): the width is a runtime value, so the interpolation
+/// routes here. Python's spec semantics for the supported subset: an
+/// integer right-aligned in the width with space fill (the dynamic-format
+/// divergence — only the `{value:{width}d}` shape lowers).
+pub fn py_dynamic_format(value: i64, width: i64) -> String {
+    format!("{:>width$}", value, width = width.max(0) as usize)
+}
+
 /// Python requires ljust/rjust fill arguments to be exactly one
 /// character: "hi".ljust(5, "ab") raises TypeError.
 fn single_fill_char(fill: &str) -> Result<char, PyException> {
@@ -3036,79 +3436,79 @@ pub trait PyStrOps {
         S: AsRef<str>;
 }
 
-impl PyStrOps for str {
+impl<T: AsRef<str> + ?Sized> PyStrOps for T {
     fn upper(&self) -> String {
-        self.to_uppercase()
+        self.as_ref().to_uppercase()
     }
     fn lower(&self) -> String {
-        self.to_lowercase()
+        self.as_ref().to_lowercase()
     }
     fn strip(&self) -> String {
-        self.trim_matches(py_is_whitespace).to_string()
+        self.as_ref().trim_matches(py_is_whitespace).to_string()
     }
     fn lstrip(&self) -> String {
-        self.trim_start_matches(py_is_whitespace).to_string()
+        self.as_ref().trim_start_matches(py_is_whitespace).to_string()
     }
     fn rstrip(&self) -> String {
-        self.trim_end_matches(py_is_whitespace).to_string()
+        self.as_ref().trim_end_matches(py_is_whitespace).to_string()
     }
     fn capitalize(&self) -> String {
         // Python titlecases the first char (uppercase where the two differ:
         // "ﬁle" -> "File", "ß" -> "Ss") and lowercases the rest.
-        let mut chars = self.chars();
+        let mut chars = self.as_ref().chars();
         match chars.next() {
             Some(first) => py_to_titlecase(first) + &chars.as_str().to_lowercase(),
             None => String::new(),
         }
     }
     fn startswith(&self, prefix: &str) -> bool {
-        self.starts_with(prefix)
+        self.as_ref().starts_with(prefix)
     }
     fn endswith(&self, suffix: &str) -> bool {
-        self.ends_with(suffix)
+        self.as_ref().ends_with(suffix)
     }
     fn py_find(&self, needle: &str) -> i64 {
-        match self.find(needle) {
-            Some(byte_idx) => self[..byte_idx].chars().count() as i64,
+        match self.as_ref().find(needle) {
+            Some(byte_idx) => self.as_ref()[..byte_idx].chars().count() as i64,
             None => -1,
         }
     }
     fn count<S: AsRef<str>>(&self, sub: S) -> i64 {
-        self.matches(sub.as_ref()).count() as i64
+        self.as_ref().matches(sub.as_ref()).count() as i64
     }
     fn py_split(&self, sep: &str) -> Result<Vec<String>, PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
-        Ok(self.split(sep).map(str::to_string).collect())
+        Ok(self.as_ref().split(sep).map(str::to_string).collect())
     }
     fn py_split_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
         if maxsplit < 0 {
-            return self.py_split(sep);
+            return self.as_ref().py_split(sep);
         }
-        Ok(self
+        Ok(self.as_ref()
             .splitn(maxsplit as usize + 1, sep)
             .map(str::to_string)
             .collect())
     }
     fn py_split_whitespace(&self) -> Vec<String> {
-        self.split(py_is_whitespace)
+        self.as_ref().split(py_is_whitespace)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect()
     }
     fn py_split_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
         if maxsplit < 0 {
-            return self.py_split_whitespace();
+            return self.as_ref().py_split_whitespace();
         }
         // Python: leading whitespace is consumed, at most maxsplit splits
         // are made, and the remainder keeps its internal/trailing
         // whitespace: " a b  c ".split(None, 1) == ["a", "b  c "].
         let mut out = Vec::new();
-        let mut rest = self.trim_start_matches(py_is_whitespace);
+        let mut rest = self.as_ref().trim_start_matches(py_is_whitespace);
         let mut splits = 0;
         while !rest.is_empty() && splits < maxsplit {
             match rest.find(py_is_whitespace) {
@@ -3127,13 +3527,13 @@ impl PyStrOps for str {
     }
     fn py_rsplit_whitespace_maxsplit(&self, maxsplit: i64) -> Vec<String> {
         if maxsplit < 0 {
-            return self.py_split_whitespace();
+            return self.as_ref().py_split_whitespace();
         }
         // Mirror image: trailing whitespace is consumed, splits count from
         // the right, and the remainder keeps its LEADING whitespace:
         // " a b  c ".rsplit(None, 2) == [" a", "b", "c"].
         let mut tail = Vec::new();
-        let mut rest = self.trim_end_matches(py_is_whitespace);
+        let mut rest = self.as_ref().trim_end_matches(py_is_whitespace);
         let mut splits = 0;
         while !rest.is_empty() && splits < maxsplit {
             match rest.rfind(py_is_whitespace) {
@@ -3154,16 +3554,16 @@ impl PyStrOps for str {
         out
     }
     fn py_rsplit(&self, sep: &str) -> Result<Vec<String>, PyException> {
-        self.py_split(sep)
+        self.as_ref().py_split(sep)
     }
     fn py_rsplit_maxsplit(&self, sep: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
         if maxsplit < 0 {
-            return self.py_split(sep);
+            return self.as_ref().py_split(sep);
         }
-        let mut parts: Vec<String> = self
+        let mut parts: Vec<String> = self.as_ref()
             .rsplitn(maxsplit as usize + 1, sep)
             .map(str::to_string)
             .collect();
@@ -3174,47 +3574,47 @@ impl PyStrOps for str {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
-        match self.find(sep) {
+        match self.as_ref().find(sep) {
             Some(i) => Ok((
-                self[..i].to_string(),
+                self.as_ref()[..i].to_string(),
                 sep.to_string(),
-                self[i + sep.len()..].to_string(),
+                self.as_ref()[i + sep.len()..].to_string(),
             )),
-            None => Ok((self.to_string(), String::new(), String::new())),
+            None => Ok((self.as_ref().to_string(), String::new(), String::new())),
         }
     }
     fn rpartition(&self, sep: &str) -> Result<(String, String, String), PyException> {
         if sep.is_empty() {
             return Err(PyException::new("ValueError", "empty separator"));
         }
-        match self.rfind(sep) {
+        match self.as_ref().rfind(sep) {
             Some(i) => Ok((
-                self[..i].to_string(),
+                self.as_ref()[..i].to_string(),
                 sep.to_string(),
-                self[i + sep.len()..].to_string(),
+                self.as_ref()[i + sep.len()..].to_string(),
             )),
-            None => Ok((String::new(), String::new(), self.to_string())),
+            None => Ok((String::new(), String::new(), self.as_ref().to_string())),
         }
     }
     fn py_strip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.trim_matches(|c| set.contains(&c)).to_string()
+        self.as_ref().trim_matches(|c| set.contains(&c)).to_string()
     }
     fn py_lstrip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.trim_start_matches(|c| set.contains(&c)).to_string()
+        self.as_ref().trim_start_matches(|c| set.contains(&c)).to_string()
     }
     fn py_rstrip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.trim_end_matches(|c| set.contains(&c)).to_string()
+        self.as_ref().trim_end_matches(|c| set.contains(&c)).to_string()
     }
     fn title(&self) -> String {
         // Python: the first letter after any non-alphabetic character is
         // titlecased, the rest lowercased ("3rd" becomes "3Rd"; "ǳ" ->
         // "ǲ" where titlecase and uppercase differ).
-        let mut out = String::with_capacity(self.len());
+        let mut out = String::with_capacity(self.as_ref().len());
         let mut prev_alpha = false;
-        for c in self.chars() {
+        for c in self.as_ref().chars() {
             if c.is_alphabetic() {
                 if prev_alpha {
                     out.extend(c.to_lowercase());
@@ -3231,34 +3631,34 @@ impl PyStrOps for str {
     }
     fn zfill(&self, width: i64) -> String {
         let width = width.max(0) as usize;
-        let count = self.chars().count();
+        let count = self.as_ref().chars().count();
         if count >= width {
-            return self.to_string();
+            return self.as_ref().to_string();
         }
         let zeros = "0".repeat(width - count);
-        if let Some(rest) = self.strip_prefix(['+', '-']) {
-            format!("{}{}{}", &self[..1], zeros, rest)
+        if let Some(rest) = self.as_ref().strip_prefix(['+', '-']) {
+            format!("{}{}{}", &self.as_ref()[..1], zeros, rest)
         } else {
-            format!("{}{}", zeros, self)
+            format!("{}{}", zeros, self.as_ref())
         }
     }
     fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
         let width = width.max(0) as usize;
-        let count = self.chars().count();
+        let count = self.as_ref().chars().count();
         if count >= width {
-            return Ok(self.to_string());
+            return Ok(self.as_ref().to_string());
         }
-        Ok(format!("{}{}", self, fill_char.to_string().repeat(width - count)))
+        Ok(format!("{}{}", self.as_ref(), fill_char.to_string().repeat(width - count)))
     }
     fn py_rjust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
         let width = width.max(0) as usize;
-        let count = self.chars().count();
+        let count = self.as_ref().chars().count();
         if count >= width {
-            return Ok(self.to_string());
+            return Ok(self.as_ref().to_string());
         }
-        Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self))
+        Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self.as_ref()))
     }
     fn splitlines(&self) -> Vec<String> {
         // Python's boundary set, not just \n/\r\n: classic-Mac \r,
@@ -3266,14 +3666,14 @@ impl PyStrOps for str {
         // as ONE boundary. A trailing boundary does not produce a trailing
         // empty line; consecutive boundaries produce empty lines between
         // them ("a\n\n".splitlines() == ["a", ""]).
-        let bytes = self.as_bytes();
+        let bytes = self.as_ref().as_bytes();
         let mut out = Vec::new();
         let mut start = 0;
         let mut i = 0;
         while i < bytes.len() {
-            let c = self[i..].chars().next().expect("valid UTF-8");
+            let c = self.as_ref()[i..].chars().next().expect("valid UTF-8");
             if is_py_line_boundary(c) {
-                out.push(self[start..i].to_string());
+                out.push(self.as_ref()[start..i].to_string());
                 i += c.len_utf8();
                 if c == '\r' && i < bytes.len() && bytes[i] == b'\n' {
                     i += 1; // \r\n is one boundary
@@ -3284,7 +3684,7 @@ impl PyStrOps for str {
             }
         }
         if start < bytes.len() {
-            out.push(self[start..].to_string());
+            out.push(self.as_ref()[start..].to_string());
         }
         out
     }
@@ -3297,7 +3697,7 @@ impl PyStrOps for str {
             .into_iter()
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>()
-            .join(self)
+            .join(self.as_ref())
     }
 }
 
@@ -3515,6 +3915,25 @@ impl<K: Eq + Hash, V> Len for PyDict<K, V> {
     }
 }
 
+/// Convert an integer literal to a parameter's own type (M4): Rust std has
+/// no `From<i64>` for `f64` and no int/float cross-PartialOrd, so a generic
+/// parameter compared with an integer literal (`n <= 0`) gets
+/// `T: PyFromInt` and the literal is converted through this trait —
+/// identity for i64, float promotion for f64, exactly Python's semantics.
+pub trait PyFromInt {
+    fn py_from_int(value: i64) -> Self;
+}
+impl PyFromInt for i64 {
+    fn py_from_int(value: i64) -> Self {
+        value
+    }
+}
+impl PyFromInt for f64 {
+    fn py_from_int(value: i64) -> Self {
+        value as f64
+    }
+}
+
 // ============================================================================
 // PYTHON `+`: numeric addition, string and list concatenation
 // ============================================================================
@@ -3603,6 +4022,7 @@ impl<L: PartialOrd<R>, R: ?Sized> PyGe<R> for L {
         self >= rhs
     }
 }
+
 
 // ============================================================================
 // `-` and `*` (PySub / PyMul)
@@ -4237,6 +4657,10 @@ pub use stdlib::datetime;
 // dt.replace(hour=...) to resolve in generated code.
 #[cfg(feature = "std")]
 pub use stdlib::datetime::{PyReplace, ReplaceArgs};
+/// Python asyncio module (tokio-backed; gated on the async-tokio feature,
+/// which implies std).
+#[cfg(feature = "async-tokio")]
+pub use stdlib::asyncio;
 #[cfg(feature = "std")]
 pub use stdlib::time;
 #[cfg(feature = "std")]
@@ -4267,6 +4691,7 @@ pub use stdlib::pathlib;
 pub use stdlib::tempfile;
 #[cfg(feature = "std")]
 pub use stdlib::glob;
+pub use stdlib::warnings;
 #[cfg(feature = "std")]
 pub use stdlib::numpy;
 

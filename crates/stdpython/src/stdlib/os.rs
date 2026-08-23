@@ -6,9 +6,50 @@
 //! Note: This module is only available with the `std` feature enabled,
 //! as it requires operating system functionality.
 
-use crate::{PyException, AsStrLike, AsPathLike, python_function};
+use crate::{PyException, PyValue, AsStrLike, AsPathLike, python_function};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+python_function! {
+    /// os.fstat - file status (requests' utils, `os.fstat(f).st_size` for
+    /// the total content length). Models the st_size member; the rest of
+    /// the stat_result is unmodeled (a boxed-nothing divergence).
+    pub fn fstat(fd: i64) -> StatResult
+    [signature: (fd)]
+    [concrete_types: (i64) -> StatResult]
+    {
+        let meta = std::fs::metadata(format!("/proc/self/fd/{}", fd)).ok();
+        StatResult {
+            st_size: meta.map(|m| m.len() as i64).unwrap_or(0),
+        }
+    }
+}
+
+/// os.stat_result — the size member of a stat call. Only `st_size` is
+/// modeled (requests' `os.fstat(...).st_size`).
+pub struct StatResult {
+    pub st_size: i64,
+}
+
+python_function! {
+    /// os.urandom - cryptographically secure random bytes (requests' digest
+    /// auth nonce). Raises OSError when the OS entropy source fails —
+    /// CPython never substitutes a weaker generator (the predictable-fallback
+    /// divergence was rejected in review).
+    pub fn urandom(size: i64) -> Result<Vec<u8>, PyException>
+    [signature: (size)]
+    [concrete_types: (i64) -> Result<Vec<u8>, crate::PyException>]
+    {
+        let mut out = vec![0u8; size.max(0) as usize];
+        match getrandom::fill(&mut out) {
+            Ok(()) => Ok(out),
+            Err(e) => Err(PyException::new(
+                "OSError",
+                format!("os.urandom: OS entropy source failed: {}", e),
+            )),
+        }
+    }
+}
 
 python_function! {
     /// os.execv - execute a program (generic version using traits)
@@ -88,6 +129,86 @@ pub fn execv<P: AsRef<str>, A: AsRef<str>>(program: P, args: Vec<A>) -> Result<(
 }
 
 python_function! {
+    /// os.write - write bytes to a file descriptor (requests' utils,
+    /// `os.write(fd, zip_file.read(member))`).
+    pub fn write(fd: i64, data: Vec<u8>) -> i64
+    [signature: (fd, data)]
+    [concrete_types: (i64, Vec<u8>) -> i64]
+    {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::io::FromRawFd;
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd as std::os::raw::c_int) };
+            let n = file.write(&data).unwrap_or(0) as i64;
+            std::mem::forget(file); // the fd stays open (os.close closes it)
+            n
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (fd, data);
+            0
+        }
+    }
+}
+
+python_function! {
+    /// os.close - close a file descriptor (requests' utils, `os.close(fd)`).
+    pub fn close(fd: i64) -> ()
+    [signature: (fd)]
+    [concrete_types: (i64) -> ()]
+    {
+        #[cfg(unix)]
+        {
+            unsafe { libc::close(fd as std::os::raw::c_int); }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+        }
+    }
+}
+
+python_function! {
+    /// os.replace - atomically rename a file (requests' utils,
+    /// `os.replace(tmp_name, filename)`).
+    pub fn replace(src: String, dst: String) -> Result<(), PyException>
+    [signature: (src, dst)]
+    [concrete_types: (String, String) -> Result<(), crate::PyException>]
+    {
+        std::fs::rename(&src, &dst).map_err(|e| {
+            crate::PyException::new("OSError", format!("rename {} -> {}: {}", src, dst, e))
+        })
+    }
+}
+
+python_function! {
+    /// os.remove - delete a file (requests' utils, `os.remove(tmp_name)`).
+    pub fn remove(path: String) -> Result<(), PyException>
+    [signature: (path)]
+    [concrete_types: (String) -> Result<(), crate::PyException>]
+    {
+        std::fs::remove_file(&path).map_err(|e| {
+            crate::PyException::new("OSError", format!("remove {}: {}", path, e))
+        })
+    }
+}
+
+python_function! {
+    /// os.fdopen - wrap a file descriptor in a file object (requests' utils,
+    /// `with os.fdopen(tmp_descriptor, "wb") as tmp_handler:`). The
+    /// file-object protocol (context manager, write, close) is unmodeled —
+    /// the call lowers to the boxed PyValue (the file-object divergence).
+    pub fn fdopen(fd: i64, mode: String) -> PyValue
+    [signature: (fd, mode)]
+    [concrete_types: (i64, String) -> PyValue]
+    {
+        let _ = (fd, mode);
+        PyValue::None_
+    }
+}
+
+python_function! {
     /// os.getenv - get environment variable
     pub fn getenv<K>(key: K) -> Option<String>
     where [K: AsStrLike]
@@ -108,6 +229,27 @@ python_function! {
         unsafe {
             std::env::set_var(key.as_str_like(), value.as_str_like());
         }
+    }
+}
+
+/// os.setenv with an OPTIONAL value (requests' set_environ generator —
+/// `os.environ[name] = value` where the value is a narrowed
+/// `Option<String>`): the Option is unwrapped; a None is a no-op. A plain
+/// String value (direct `os.setenv(k, v)` with a non-Option argument)
+/// passes through unchanged.
+pub fn setenv_opt<K: AsStrLike>(key: K, value: Option<String>) -> () {
+    if let Some(v) = value {
+        unsafe {
+            std::env::set_var(key.as_str_like(), v);
+        }
+    }
+}
+
+/// Non-Option variant for setenv_opt call sites where the value is a
+/// plain String (the codegen routes both shapes to setenv_opt).
+pub fn setenv_opt_str<K: AsStrLike>(key: K, value: String) -> () {
+    unsafe {
+        std::env::set_var(key.as_str_like(), value);
     }
 }
 
@@ -169,6 +311,16 @@ impl Environ {
 
     pub fn py_contains(&self, key: &str) -> bool {
         std::env::var(key).is_ok()
+    }
+
+    /// dict.pop semantics: remove and return the value, or None when the
+    /// key is absent (requests' set_environ — `os.environ.pop(name)`).
+    pub fn py_pop(&self, key: &str) -> Option<String> {
+        let v = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        v
     }
 
     pub fn py_keys(&self) -> Vec<String> {
@@ -251,6 +403,25 @@ pub mod path {
     
     /// os.path.sep - path separator for the current platform
     pub static sep: &str = if cfg!(target_os = "windows") { "\\" } else { "/" };
+
+    python_function! {
+        /// os.path.expanduser - expand `~` to the current user's home
+        /// directory (urllib3's ca-cert resolution). A leading `~/` (or
+        /// bare `~`) expands via $HOME; other paths pass through.
+        pub fn expanduser<P>(path: P) -> String
+        where [P: AsPathLike]
+        [signature: (path)]
+        [concrete_types: (String) -> String]
+        {
+            let s = path.as_path_like().to_string();
+            if s == "~" || s.starts_with("~/") || s.starts_with("~\\") {
+                if let Ok(home) = std::env::var("HOME") {
+                    return format!("{}{}", home, &s[1..]);
+                }
+            }
+            s
+        }
+    }
 
     python_function! {
         /// os.path.dirname - everything before the final slash, following
@@ -424,6 +595,46 @@ pub mod path {
         }
     }
     
+    python_function! {
+        /// os.path.split - split a path into (head, tail): everything
+        /// before the final separator and the final component
+        /// (posixpath.split semantics — requests' utils).
+        pub fn split<P>(path: P) -> (String, String)
+        where [P: AsRef<str>]
+        [signature: (path)]
+        [concrete_types: (String) -> (String, String)]
+        {
+            let s = path.as_ref();
+            match s.rfind('/') {
+                Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
+                None => ("".to_string(), s.to_string()),
+            }
+        }
+    }
+
+    python_function! {
+        /// os.path.splitext - split a path into (root, ext) at the last
+        /// extension dot (posixpath.splitext semantics — requests' utils).
+        pub fn splitext<P>(path: P) -> (String, String)
+        where [P: AsRef<str>]
+        [signature: (path)]
+        [concrete_types: (String) -> (String, String)]
+        {
+            let s = path.as_ref();
+            let base = match s.rfind('/') {
+                Some(i) => &s[i + 1..],
+                None => s,
+            };
+            match base.rfind('.') {
+                Some(i) if i > 0 => (
+                    s[..s.len() - base.len() + i].to_string(),
+                    base[i..].to_string(),
+                ),
+                _ => (s.to_string(), "".to_string()),
+            }
+        }
+    }
+
     python_function! {
         /// os.path.abspath - normpath(join(cwd, path)), purely LEXICAL as
         /// in Python: the path need not exist and symlinks are not

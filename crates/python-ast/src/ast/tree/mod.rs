@@ -78,6 +78,9 @@ pub use if_exp::*;
 pub mod dict;
 pub use dict::*;
 
+pub mod decorator;
+pub use decorator::*;
+
 pub mod set;
 pub use set::*;
 
@@ -122,3 +125,9 @@ pub use f_string::*;
 
 pub mod with_stmt;
 pub use with_stmt::*;
+
+pub mod aliasing;
+pub use aliasing::*;
+
+pub mod param_infer;
+pub use param_infer::*;

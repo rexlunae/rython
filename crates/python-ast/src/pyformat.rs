@@ -157,6 +157,9 @@ pub(crate) enum SpecLowering {
         width: usize,
         radix: char,
     },
+    /// The `,` thousands separator (`f"{size:,}"` — rich's filesize): the
+    /// grouped integer renders through the stdpython runtime formatter.
+    GroupedInt,
 }
 
 
@@ -215,8 +218,13 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
         i += 1;
     }
 
+    // The `,` thousands separator (`f"{size:,}"` — rich's filesize):
+    // groups the integer's digits in threes. Only valid with the integer
+    // types (d or empty); floats reject it in Python too.
+    let mut grouped = false;
     if i < chars.len() && chars[i] == ',' {
-        return Err("the ',' thousands separator is not supported yet".into());
+        grouped = true;
+        i += 1;
     }
 
     let mut precision = String::new();
@@ -259,7 +267,16 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
 
     let mut cast_f64 = false;
     match ty {
-        None | Some('d') | Some('s') => {}
+        None | Some('d') | Some('s') => {
+            // The `,` separator applies to integers only (d or empty).
+            if grouped && ty == Some('s') {
+                return Err(
+                    "the ',' thousands separator is not supported with the 's' \
+                     presentation type"
+                        .into(),
+                );
+            }
+        }
         Some('f') | Some('F') => {
             cast_f64 = true;
             // Python's default 'f' precision is 6; Rust's is shortest.
@@ -288,6 +305,15 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
                 other
             ));
         }
+    }
+
+    // A `,`-grouped integer: the stdpython runtime formatter applies the
+    // separator (Python's exact grouping, sign, and width behavior).
+    if grouped {
+        if !precision.is_empty() {
+            return Err("precision not allowed with the ',' thousands separator".into());
+        }
+        return Ok(SpecLowering::GroupedInt);
     }
 
     let mut out = String::new();
@@ -342,7 +368,12 @@ mod tests {
         // Bare precision is Python's general float format — ambiguous
         // without the operand type, so it is loud.
         assert!(translate_format_spec(".3").is_err());
-        assert!(translate_format_spec(",").is_err());
+        // The `,` thousands separator routes through the runtime grouping
+        // formatter (py_grouped_int).
+        assert!(matches!(
+            translate_format_spec(",").unwrap(),
+            SpecLowering::GroupedInt
+        ));
         assert!(translate_format_spec("e").is_err());
         assert!(translate_format_spec("=10").is_err());
     }

@@ -127,13 +127,20 @@ pub(crate) fn subscript_receiver_place(
                 false,
             )
         }
-        other => Err(format!(
-            "cannot assign into a subscript of this expression: {:?} (only \
-             variables, attributes, and nested subscripts can be stored \
-             through)",
-            other
-        )
-        .into()),
+        other => {
+            // A store through a CALL receiver (`memoryview(byte_obj)[0:n] =
+            // subarray` — urllib3's emscripten fetch loop) has no rython
+            // equivalent: the receiver is a temporary object with no
+            // persistent place. Emit a no-op with a warning (the
+            // documented class-as-value / foreign-object divergence)
+            // instead of failing the whole module.
+            options.definition_warnings.borrow_mut().push(format!(
+                "store into `{:?}[...]` is dropped (the receiver is a call \
+                 result, which has no rython place)",
+                other
+            ));
+            Ok(TokenStream::new())
+        }
     }
 }
 

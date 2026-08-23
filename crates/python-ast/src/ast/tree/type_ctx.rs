@@ -23,7 +23,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     CodeGen, CodeGenContext, ExprType, PythonOptions, Statement, StatementType,
@@ -59,6 +59,19 @@ pub enum TypeInfo {
     /// `numpy::NdArray`
     /// `numpy::NdArray`
     NdArray,
+    /// `stdpython::StrOrBytes` — the `str | bytes` heterogeneous union
+    /// (issue #121): a value that is either a String or Vec<u8>, narrowed
+    /// by isinstance checks.
+    StrOrBytes,
+    /// `stdpython::PyValue` — the boxed heterogeneous value (issue #121):
+    /// any wider union (`bool | str | None`, `tuple[...] | str | None`,
+    /// `int | str | None`, ...) or `Any`. isinstance checks dispatch at
+    /// runtime and narrow the branch to a concrete member.
+    PyValue,
+    /// A PyValue narrowed by isinstance to one of its member types. Only
+    /// ever appears as a narrowed_names target: reads convert via the
+    /// PyValue accessors (`as_int().unwrap()`, `as_str().unwrap()`, ...).
+    PyValueMember(Box<TypeInfo>),
     /// an instance of a class defined in this module (by class name); not
     /// Copy, so reused values must be cloned at each move-prone use
     Class(String),
@@ -107,6 +120,11 @@ impl TypeInfo {
             }
             TypeInfo::Range => quote!(PyRange),
             TypeInfo::NdArray => quote!(numpy::NdArray),
+            TypeInfo::StrOrBytes => quote!(stdpython::StrOrBytes),
+            TypeInfo::PyValue => quote!(stdpython::PyValue),
+            // A narrowed PyValue member still holds the boxed value at
+            // runtime; only reads convert.
+            TypeInfo::PyValueMember(_) => quote!(stdpython::PyValue),
             TypeInfo::Class(name) => {
                 let ident = crate::safe_ident(name);
                 quote!(#ident)
@@ -133,6 +151,9 @@ impl TypeInfo {
             TypeInfo::Option(_) => "Optional".into(),
             TypeInfo::Range => "range".into(),
             TypeInfo::NdArray => "ndarray".into(),
+            TypeInfo::StrOrBytes => "str | bytes".into(),
+            TypeInfo::PyValue => "any".into(),
+            TypeInfo::PyValueMember(_) => "any member".into(),
             TypeInfo::Class(name) => name.clone(),
             TypeInfo::Borrowed(_) => "borrowed".into(),
             TypeInfo::PyObject => "unknown".into(),
@@ -164,6 +185,9 @@ pub fn coerce_tokens(
         // only way to compile them at all, and the alternative (rustc
         // error) is no more informative.
         (TypeInfo::Int, TypeInfo::Float) => Some(quote!((#tokens) as f64)),
+        // Anything → PyValue (issue #121): a value stored into a boxed
+        // union / Any slot wraps in PyValue::from (None via From<()>).
+        (_, TypeInfo::PyValue) => Some(quote!(PyValue::from((#tokens)))),
         _ => None,
     }
 }
@@ -175,13 +199,36 @@ pub fn infer_type(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> TypeInfo {
+    // Cycle guard: a name whose recorded assignment references itself
+    // (`label_bytes = label_bytes[lo:]`) would recurse forever through
+    // Name → Assign value → Subscript → value Name → ... (idna/core.py).
+    thread_local! {
+        static INFER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let d = INFER_DEPTH.with(|c| c.get());
+    if d > 64 {
+        return TypeInfo::PyObject;
+    }
+    INFER_DEPTH.with(|c| c.set(d + 1));
+    let result = infer_type_inner(expr, options, symbols);
+    INFER_DEPTH.with(|c| c.set(d));
+    return result;
+}
+
+fn infer_type_inner(
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> TypeInfo {
     match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
             Some(litrs::Literal::Float(_)) => TypeInfo::Float,
             Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
             Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
-            Some(litrs::Literal::Byte(_)) => TypeInfo::Bytes,
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                TypeInfo::Bytes
+            }
             None => TypeInfo::PyObject, // None literal
             _ => TypeInfo::PyObject,
         },
@@ -406,6 +453,15 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
             if is_stringy(&a) && is_stringy(&b) {
                 return TypeInfo::String;
             }
+            // A boxed PyValue absorbs any other type (it can hold any of
+            // them): `dict[str, Any]` pinned against a str-valued store
+            // stays PyValue-valued instead of degrading to PyObject.
+            if matches!(a, TypeInfo::PyValue) {
+                return TypeInfo::PyValue;
+            }
+            if matches!(b, TypeInfo::PyValue) {
+                return TypeInfo::PyValue;
+            }
             if matches!(a, TypeInfo::PyObject) {
                 return b;
             }
@@ -434,6 +490,30 @@ pub fn render_typed(
     symbols: SymbolTableScopes,
     expected: Option<TypeInfo>,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A class name used as a VALUE (`merge_setting(..., dict_class=OrderedDict)`
+    // — requests' sessions): classes are compile-time types, not runtime
+    // values (the classes-as-values divergence), so the value lowers to the
+    // boxed None. This is a value-position renderer — callees and type
+    // positions never come through here.
+    if let ExprType::Name(n) = expr
+        && (matches!(symbols.get(&n.id), Some(SymbolTableNode::ClassDef(_)))
+            || matches!(
+                symbols.get(&n.id),
+                Some(SymbolTableNode::Alias(c))
+                    if matches!(symbols.get(c), Some(SymbolTableNode::ClassDef(_)))
+            )
+            // An IMPORTED class (`from .structures import
+            // CaseInsensitiveDict` — a class used as a value argument):
+            // resolve through the defining module.
+            || crate::ast::tree::call::resolve_construction_class(&n.id, &symbols, &options).is_some())
+    {
+        options.definition_warnings.borrow_mut().push(format!(
+            "class `{}` used as a value lowers to the boxed None (classes cannot be \
+             runtime values in rython)",
+            n.id
+        ));
+        return Ok(quote!(stdpython::PyValue::None_));
+    }
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
@@ -472,7 +552,12 @@ pub fn render_reused(
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
-            if !t.is_copy() && !matches!(t, TypeInfo::PyObject) {
+            // An inferred (unannotated) parameter is not statically Copy —
+            // the reuse-clone rule adds `T: Clone` for it, so clone it
+            // here too (a generic value would otherwise be moved into the
+            // call while still being used).
+            let inferred_param = options.param_type_vars.contains_key(&n.id);
+            if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
                 return Ok(quote!((#tokens).clone()));
             }
         }
@@ -495,7 +580,11 @@ pub fn render_typed_reused(
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
-            if !t.is_copy() && !matches!(t, TypeInfo::PyObject) {
+            // See render_reused: an inferred parameter is not statically
+            // Copy, so clone it at the call site (its `T: Clone` bound is
+            // the reuse-clone rule's).
+            let inferred_param = options.param_type_vars.contains_key(&n.id);
+            if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
                 return Ok(quote!((#tokens).clone()));
             }
         }
@@ -522,6 +611,48 @@ pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
 /// type codegen produces for it. Used to derive the expected type of a
 /// call argument from the callee's parameter annotation.
 pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
+    // `T | None` (and `None | T`) is Option<T>; the inner type resolves
+    // through the same mapping. A union of two non-None members that map
+    // to the same TypeInfo (bytes | bytearray) is that type. `str | bytes`
+    // is the StrOrBytes heterogeneous union; any other union whose members
+    // are all boxable (int/float/bool/str/bytes/tuple/Literal/Any/None) is
+    // the boxed PyValue (issue #121).
+    if let ExprType::BinOp(op) = ann
+        && matches!(op.op, crate::BinOps::BitOr)
+    {
+        if crate::is_str_bytes_union(ann) {
+            return Some(TypeInfo::StrOrBytes);
+        }
+        let members = crate::union_members(ann);
+        if crate::is_none_expr(&op.left) {
+            if let Some(t) = annotation_type_info(&op.right) {
+                // A boxed PyValue already contains None (`bool | str |
+                // None` is PyValue, not Option<PyValue>).
+                if matches!(t, TypeInfo::PyValue) {
+                    return Some(t);
+                }
+                return Some(TypeInfo::Option(Box::new(t)));
+            }
+            return boxable_union(members);
+        }
+        if crate::is_none_expr(&op.right) {
+            if let Some(t) = annotation_type_info(&op.left) {
+                if matches!(t, TypeInfo::PyValue) {
+                    return Some(t);
+                }
+                return Some(TypeInfo::Option(Box::new(t)));
+            }
+            return boxable_union(members);
+        }
+        let l = annotation_type_info(&op.left);
+        let r = annotation_type_info(&op.right);
+        if let (Some(l), Some(r)) = (l, r)
+            && l == r
+        {
+            return Some(l);
+        }
+        return boxable_union(members);
+    }
     match ann {
         ExprType::Name(n) => match n.id.as_str() {
             "int" => Some(TypeInfo::Int),
@@ -529,10 +660,30 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             "bool" => Some(TypeInfo::Bool),
             "str" => Some(TypeInfo::String),
             "bytes" => Some(TypeInfo::Bytes),
+            // `Any` (typing.Any) and `object`: a value of unknown type —
+            // the boxed heterogeneous value.
+            "Any" | "object" => Some(TypeInfo::PyValue),
+            // Builtin exception names (`BaseException | None` — the
+            // context-manager protocol): exceptions are boxed values.
+            "BaseException" | "Exception" | "ValueError" | "TypeError"
+            | "RuntimeError" | "KeyError" | "IndexError" | "AttributeError"
+            | "OSError" | "IOError" | "StopIteration" | "ArithmeticError"
+            | "LookupError" | "EnvironmentError" | "SyntaxError" | "NameError"
+            | "ImportError" | "NotImplementedError" | "ZeroDivisionError"
+            | "OverflowError" | "RecursionError" | "MemoryError" | "EOFError"
+            | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+            | "Warning" | "UserWarning" | "DeprecationWarning" | "FutureWarning"
+            | "PendingDeprecationWarning" | "RuntimeWarning" | "ResourceWarning"
+            | "TracebackType" | "FrameType" | "CodeType"
+            // `memoryview` — a builtin buffer class (urllib3's
+            // `readinto(b: bytearray | memoryview[int])`): a boxed value.
+            | "memoryview" => Some(TypeInfo::PyValue),
             _ => None,
         },
         ExprType::Subscript(sub) => match sub.value.as_ref() {
             ExprType::Name(n) => match n.id.as_str() {
+                // `memoryview[int]` — the builtin buffer class subscript.
+                "memoryview" => Some(TypeInfo::PyValue),
                 "list" | "List" => {
                     if let crate::SubscriptKind::Index(elt) = &sub.kind {
                         Some(TypeInfo::Vec(Box::new(annotation_type_info(elt)?)))
@@ -540,13 +691,69 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                         None
                     }
                 }
-                "Optional" => {
+                "set" | "Set" | "frozenset" => {
+                    // A `set[T]` annotation in the syntax-only pass: the
+                    // element resolves in the symbols-aware pass.
                     if let crate::SubscriptKind::Index(elt) = &sub.kind {
-                        Some(TypeInfo::Option(Box::new(annotation_type_info(elt)?)))
+                        Some(TypeInfo::Vec(Box::new(annotation_type_info(elt)?)))
                     } else {
                         None
                     }
                 }
+                "Mapping" => {
+                    if let crate::SubscriptKind::Index(kv) = &sub.kind
+                        && let ExprType::Tuple(t) = kv.as_ref()
+                        && let [k, v] = t.elts.as_slice()
+                    {
+                        Some(TypeInfo::Dict(
+                            Box::new(annotation_type_info(k)?),
+                            Box::new(annotation_type_info(v)?),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                "Optional" => {
+                    if let crate::SubscriptKind::Index(elt) = &sub.kind {
+                        let inner = annotation_type_info(elt)?;
+                        // Optional[bool | str] is the boxed PyValue (which
+                        // already contains None), not Option<PyValue>.
+                        if matches!(inner, TypeInfo::PyValue) {
+                            Some(inner)
+                        } else {
+                            Some(TypeInfo::Option(Box::new(inner)))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                "tuple" | "Tuple" => {
+                    if let crate::SubscriptKind::Index(elt) = &sub.kind
+                        && let ExprType::Tuple(t) = elt.as_ref()
+                    {
+                        // `tuple[T, ...]` — a variadic tuple → Vec<T>.
+                        if t.elts.len() == 2
+                            && matches!(
+                                &t.elts[1],
+                                ExprType::Constant(c)
+                                    if c.0
+                                        .as_ref()
+                                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                            )
+                        {
+                            let inner = annotation_type_info(&t.elts[0])?;
+                            return Some(TypeInfo::Vec(Box::new(inner)));
+                        }
+                        let mut infos = Vec::with_capacity(t.elts.len());
+                        for e in &t.elts {
+                            infos.push(annotation_type_info(e)?);
+                        }
+                        Some(TypeInfo::Tuple(infos))
+                    } else {
+                        None
+                    }
+                }
+                "Literal" => Some(TypeInfo::PyValue),
                 "dict" | "Dict" => {
                     if let crate::SubscriptKind::Index(kv) = &sub.kind
                         && let ExprType::Tuple(t) = kv.as_ref()
@@ -561,9 +768,95 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                 }
                 _ => None,
             },
+            // `typing.Mapping[K, V]` lowers like the bare name.
+            ExprType::Attribute(a)
+                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                    && a.attr == "Mapping" =>
+            {
+                if let crate::SubscriptKind::Index(kv) = &sub.kind
+                    && let ExprType::Tuple(t) = kv.as_ref()
+                    && let [k, v] = t.elts.as_slice()
+                {
+                    Some(TypeInfo::Dict(
+                        Box::new(annotation_type_info(k)?),
+                        Box::new(annotation_type_info(v)?),
+                    ))
+                } else {
+                    None
+                }
+            }
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether a union member can live inside the boxed PyValue: the primitive
+/// value types, tuples of them, Literal constants, Any, or None.
+fn is_boxable_member(ann: &ExprType) -> bool {
+    if crate::is_none_expr(ann) {
+        return true;
+    }
+    match ann {
+        ExprType::Name(n) => matches!(
+            n.id.as_str(),
+            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "Any" | "memoryview"
+                | "PathLike"
+                | "BinaryIO"
+                // Builtin exception names (`BaseException | None` — the
+                // context-manager protocol in urllib3's ConnectionPool):
+                // exceptions are boxed values (PyException), so a union
+                // with one is the boxed PyValue.
+                | "BaseException" | "Exception" | "ValueError" | "TypeError"
+                | "RuntimeError" | "KeyError" | "IndexError" | "AttributeError"
+                | "OSError" | "IOError" | "StopIteration" | "ArithmeticError"
+                | "LookupError" | "EnvironmentError" | "SyntaxError" | "NameError"
+                | "ImportError" | "NotImplementedError" | "ZeroDivisionError"
+                | "OverflowError" | "RecursionError" | "MemoryError" | "EOFError"
+                | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+                | "Warning" | "UserWarning" | "DeprecationWarning" | "FutureWarning"
+                | "PendingDeprecationWarning" | "RuntimeWarning" | "ResourceWarning"
+                | "TracebackType" | "FrameType" | "CodeType"
+        ),
+        ExprType::Subscript(sub) => {
+            match sub.value.as_ref() {
+                ExprType::Name(n) => matches!(
+                    n.id.as_str(),
+                    "tuple" | "Tuple" | "Literal" | "list" | "List" | "IO" | "Iterable"
+                        | "Union" | "Callable" | "SupportsRead" | "SupportsItems"
+                        | "Mapping" | "Dict" | "Set" | "Sequence" | "MutableMapping" | "Collection" | "Container"
+                        | "Generator" | "Iterator" | "Type" | "Optional" | "Any"
+                ),
+                // `typing.Sequence[...]` etc. (urllib3's `dict[str, T] |
+                // typing.Sequence[tuple[str, T]]`).
+                ExprType::Attribute(a) => {
+                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                        && matches!(
+                            a.attr.as_str(),
+                            "Tuple" | "List" | "Dict" | "Set" | "Sequence" | "Iterable"
+                                | "Iterator" | "Generator" | "Mapping" | "MutableMapping"
+                                | "Callable" | "Union" | "Optional" | "Literal" | "Any"
+                                | "IO" | "SupportsRead" | "SupportsItems" | "Type" | "Collection" | "Container"
+                        )
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// A union of boxable members with no single Rust type becomes the boxed
+/// PyValue. Returns None when a member is not boxable.
+fn boxable_union(members: Option<Vec<&ExprType>>) -> Option<TypeInfo> {
+    let members = members?;
+    if members.len() < 2 {
+        return None;
+    }
+    if members.iter().all(|m| is_boxable_member(m)) {
+        Some(TypeInfo::PyValue)
+    } else {
+        None
     }
 }
 
@@ -576,6 +869,11 @@ pub struct FunctionTypeInfo {
     /// Inferred type of each local name (annotations win; then the type of
     /// the last literal/container assignment).
     pub name_types: HashMap<String, TypeInfo>,
+    /// Names whose type came from an EXPLICIT annotation: a later plain
+    /// assignment must not downgrade the annotated type (`host_params:
+    /// dict[str, Any] = {}` then `host_params = {...}` keeps the boxed
+    /// PyValue value type, issue #121).
+    pub annotated_names: HashSet<String>,
     /// Names assigned an empty `[]`/`{}` literal whose element type was
     /// pinned by a later use; maps to the pinned container type.
     pub empty_pinned: HashMap<String, TypeInfo>,
@@ -583,18 +881,39 @@ pub struct FunctionTypeInfo {
 
 /// Walk a statement list, counting reads and collecting `name = expr`
 /// assignments with inferable types, then pin empty-container types from
-/// later use.
-pub fn analyze_function_types(body: &[Statement]) -> FunctionTypeInfo {
+/// later use. `options` lets the pin resolve decorator-factory callables
+/// (`cached_mess_ratio = lru_cache(...)(mess_ratio)`) to their return type
+/// (issue #127).
+pub fn analyze_function_types(
+    body: &[Statement],
+    options: Option<&PythonOptions>,
+    symbols: Option<&SymbolTableScopes>,
+) -> FunctionTypeInfo {
     let mut info = FunctionTypeInfo::default();
     for stmt in body {
-        analyze_statement_types(stmt, &mut info);
+        analyze_statement_types(stmt, &mut info, options, symbols);
     }
-    pin_empty_containers(body, &mut info);
+    pin_empty_containers(body, &mut info, symbols, options);
     info
 }
 
-fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
+fn analyze_statement_types(
+    stmt: &Statement,
+    info: &mut FunctionTypeInfo,
+    options: Option<&PythonOptions>,
+    symbols: Option<&SymbolTableScopes>,
+) {
     match &stmt.statement {
+        // A bare annotated local (`key: str` — urllib3's
+        // ssl_match_hostname): the annotation types the name.
+        StatementType::AnnotatedName { name, annotation } => {
+            if let Some(t) = crate::annotation_type_info(annotation)
+                .or_else(|| crate::resolve_alias_typeinfo(annotation, symbols?, options?))
+            {
+                info.name_types.insert(name.clone(), t);
+                info.annotated_names.insert(name.clone());
+            }
+        }
         StatementType::Assign(assign) => {
             // Record `name = <inferable expr>` (syntactic only, unless an
             // annotation pins it — an annotated assignment's annotation
@@ -604,12 +923,36 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
                     .annotation
                     .as_ref()
                     .and_then(crate::annotation_type_info)
+                    .or_else(|| {
+                        assign
+                            .annotation
+                            .as_ref()
+                            .and_then(|a| crate::resolve_alias_typeinfo(a, symbols?, options?))
+                    })
+                    .or_else(|| {
+                        // A module-level TYPE ALIAS annotation
+                        // (`filtered_results: CoherenceMatches = []` —
+                        // charset_normalizer): resolve through symbols.
+                        assign
+                            .annotation
+                            .as_ref()
+                            .and_then(|a| crate::resolve_alias_typeinfo(a, symbols?, options?))
+                    })
                 {
                     // An annotation pins the type outright.
                     Some(ann) => ann,
-                    // Unparseable annotation: fall back to the value's
-                    // syntactic type (still pinable by later use).
-                    None => syntactic_type(&assign.value),
+                    // Unparseable annotation: a call to a known function
+                    // resolves through its (alias-aware) return type
+                    // (`chunk_languages = cached_coherence_ratio(...)` →
+                    // Vec<(String, f64)>), else the value's syntactic type
+                    // (still pinable by later use).
+                    None => match &assign.value {
+                        ExprType::Call(c) => {
+                            call_return_typeinfo(c, symbols, options)
+                                .unwrap_or_else(|| syntactic_type(&assign.value))
+                        }
+                        _ => syntactic_type(&assign.value),
+                    },
                 };
                 // Dict keys normalize to String (matches literal lowering
                 // and `dict[str, V]` annotations); empty dicts and lists
@@ -620,7 +963,15 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
                     }
                     other => other,
                 };
-                if !matches!(t, TypeInfo::PyObject) {
+                let annotated = assign.annotation.is_some();
+                if annotated {
+                    info.annotated_names.insert(name.id.clone());
+                }
+                // Annotations win: a plain assignment must not downgrade a
+                // name whose type an annotation pinned.
+                if !matches!(t, TypeInfo::PyObject)
+                    && (annotated || !info.annotated_names.contains(&name.id))
+                {
                     info.name_types.insert(name.id.clone(), t.clone());
                     // Empty container: remember it to pin from later use.
                     if is_empty_container(&assign.value) {
@@ -643,29 +994,29 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
         StatementType::If(s) => {
             count_expr_reads(&s.test, info);
             for b in &s.body {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
         }
         StatementType::While(s) => {
             count_expr_reads(&s.test, info);
             for b in &s.body {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
         }
         StatementType::For(s) => {
             count_expr_reads(&s.iter, info);
             count_target_reads(&s.target, info);
             for b in &s.body {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
         }
         StatementType::With(s) => {
@@ -676,12 +1027,12 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
                 }
             }
             for b in &s.body {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
         }
         StatementType::Try(s) => {
             for b in &s.body {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
             for handler in &s.handlers {
                 if let Some(t) = &handler.exception_type {
@@ -691,20 +1042,40 @@ fn analyze_statement_types(stmt: &Statement, info: &mut FunctionTypeInfo) {
                     info.use_counts.remove(name); // bound by except, not read
                 }
                 for b in &handler.body {
-                    analyze_statement_types(b, info);
+                    analyze_statement_types(b, info, options, symbols);
                 }
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
             for b in &s.finalbody {
-                analyze_statement_types(b, info);
+                analyze_statement_types(b, info, options, symbols);
             }
         }
-        StatementType::FunctionDef(_) => {
+        StatementType::FunctionDef(f) => {
             // A nested function is a new scope: its locals do not belong to
-            // the enclosing function's type analysis. (Captured reads of
-            // outer names are rare and would only tune clone-on-reuse.)
+            // the enclosing function's type analysis. BUT its ANNOTATED
+            // parameter types are usable for empty-container pinning — a
+            // nested closure `def inner(x: float): md_ratios.append(x)`
+            // pins the outer `md_ratios = []` to Vec<f64> (charset_
+            // normalizer's from_bytes). Record them and recurse the body
+            // so captured uses of enclosing empty containers resolve.
+            for p in f
+                .args
+                .posonlyargs
+                .iter()
+                .chain(f.args.args.iter())
+                .chain(f.args.kwonlyargs.iter())
+            {
+                if let Some(ann) = p.annotation.as_deref()
+                    && let Some(t) = crate::annotation_type_info(ann)
+                {
+                    info.name_types.insert(p.arg.clone(), t);
+                }
+            }
+            for b in &f.body {
+                analyze_statement_types(b, info, options, symbols);
+            }
         }
         _ => {}
     }
@@ -724,7 +1095,9 @@ fn syntactic_type(expr: &ExprType) -> TypeInfo {
             Some(litrs::Literal::Float(_)) => TypeInfo::Float,
             Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
             Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
-            Some(litrs::Literal::Byte(_)) => TypeInfo::Bytes,
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                TypeInfo::Bytes
+            }
             _ => TypeInfo::PyObject,
         },
         ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => TypeInfo::String,
@@ -775,15 +1148,27 @@ fn syntactic_type(expr: &ExprType) -> TypeInfo {
 /// Pin the element/key types of empty containers from a later use. Called
 /// with the full statement list AFTER `name_types` is populated so that
 /// `append(d[k])` can resolve `d`'s type too.
-pub fn pin_empty_containers(body: &[Statement], info: &mut FunctionTypeInfo) {
+pub fn pin_empty_containers(
+    body: &[Statement],
+    info: &mut FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+) {
     let mut suggested: HashMap<String, TypeInfo> = HashMap::new();
     for stmt in body {
-        collect_use_suggestions(stmt, info, &mut suggested);
+        collect_use_suggestions(stmt, info, symbols, options, &mut suggested);
     }
     for (name, t) in suggested {
         if info.empty_pinned.contains_key(&name) {
-            info.name_types.insert(name.clone(), t.clone());
-            info.empty_pinned.insert(name, t);
+            // Unify with any existing (annotated) type: an annotated
+            // `result: list[str] = []` must not be clobbered by a use
+            // suggestion whose element type is still unknown.
+            let final_t = match info.name_types.get(&name) {
+                Some(existing) => unify(existing.clone(), t),
+                None => t,
+            };
+            info.name_types.insert(name.clone(), final_t.clone());
+            info.empty_pinned.insert(name, final_t);
         }
     }
 }
@@ -791,6 +1176,8 @@ pub fn pin_empty_containers(body: &[Statement], info: &mut FunctionTypeInfo) {
 fn collect_use_suggestions(
     stmt: &Statement,
     info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
     out: &mut HashMap<String, TypeInfo>,
 ) {
     match &stmt.statement {
@@ -805,7 +1192,21 @@ fn collect_use_suggestions(
                 match attr.attr.as_str() {
                     "append" | "push" => {
                         if let Some(arg) = call.args.first() {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols, options);
+                            // An UNKNOWN element (`parts.append(part)` where
+                            // part is an external call result — s3transfer):
+                            // box it (Vec<PyValue> divergence) — but only
+                            // when the name has NO annotated/existing type,
+                            // which must win over the unknown suggestion
+                            // (`result: list[float] = []` then
+                            // `result.append(x[j])` keeps Vec<f64>).
+                            let t = if matches!(t, TypeInfo::PyObject)
+                                && !info.name_types.contains_key(&recv.id)
+                            {
+                                TypeInfo::PyValue
+                            } else {
+                                t
+                            };
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), t.clone()))
                                 .or_insert(TypeInfo::Vec(Box::new(t)));
@@ -813,7 +1214,7 @@ fn collect_use_suggestions(
                     }
                     "insert" => {
                         if let Some(arg) = call.args.get(1) {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols, options);
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), t.clone()))
                                 .or_insert(TypeInfo::Vec(Box::new(t)));
@@ -828,15 +1229,30 @@ fn collect_use_suggestions(
                     && let ExprType::Name(recv) = sub.value.as_ref()
                     && info.empty_pinned.contains_key(&recv.id)
                 {
-                    let v = resolve_type(&assign.value, info);
+                    let v = resolve_type(&assign.value, info, symbols, options);
                     if let crate::SubscriptKind::Index(idx) = &sub.kind {
                         // Keys normalize to String, matching dict literals
-                        // and `dict[str, V]` annotations.
-                        let k = match resolve_type(idx, info) {
-                            TypeInfo::StrRef => TypeInfo::String,
+                        // and `dict[str, V]` annotations. An UNKNOWN key
+                        // (`modeled_action.name` — an attribute on a foreign
+                        // object, boto3's document_actions) is a String in
+                        // practice.
+                        let k = match resolve_type(idx, info, symbols, options) {
+                            TypeInfo::StrRef | TypeInfo::PyObject => TypeInfo::String,
                             other => other,
                         };
                         let ty = TypeInfo::Dict(Box::new(k), Box::new(v));
+                        // An UNKNOWN value type (`modeled_actions[
+                        // modeled_action.name] = modeled_action` where the
+                        // value is a foreign object — boto3's
+                        // document_actions): box the value.
+                        let ty = match ty {
+                            TypeInfo::Dict(k, v)
+                                if matches!(*v, TypeInfo::PyObject) =>
+                            {
+                                TypeInfo::Dict(k, Box::new(TypeInfo::PyValue))
+                            }
+                            other => other,
+                        };
                         out.entry(recv.id.clone())
                             .and_modify(|e| *e = unify(e.clone(), ty.clone()))
                             .or_insert(ty);
@@ -845,6 +1261,20 @@ fn collect_use_suggestions(
             }
         }
         StatementType::Expr(e) => {
+            // `"; ".join(parts)` — a str join pins its ARGUMENT (the list)
+            // to Vec<String>, even when the receiver is a literal.
+            if let ExprType::Call(call) = &e.value
+                && let ExprType::Attribute(attr) = call.func.as_ref()
+                && attr.attr == "join"
+                && let Some(arg) = call.args.first()
+                && let ExprType::Name(arg_name) = arg
+                && info.empty_pinned.contains_key(&arg_name.id)
+            {
+                let suggestion = TypeInfo::Vec(Box::new(TypeInfo::String));
+                out.entry(arg_name.id.clone())
+                    .and_modify(|t| *t = unify(t.clone(), suggestion.clone()))
+                    .or_insert(suggestion);
+            }
             if let ExprType::Call(call) = &e.value
                 && let ExprType::Attribute(attr) = call.func.as_ref()
                 && let ExprType::Name(recv) = attr.value.as_ref()
@@ -854,7 +1284,7 @@ fn collect_use_suggestions(
                     // d.get(k) read pins the key type.
                     "get" => {
                         if let Some(arg) = call.args.first() {
-                            let k = match resolve_type(arg, info) {
+                            let k = match resolve_type(arg, info, symbols, options) {
                                 TypeInfo::StrRef => TypeInfo::String,
                                 other => other,
                             };
@@ -871,7 +1301,18 @@ fn collect_use_suggestions(
                     // `xs.append(v)` pins xs's element type.
                     "append" | "push" => {
                         if let Some(arg) = call.args.first() {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols, options);
+                            // An UNKNOWN element (`parts.append(part)` where
+                            // part is an external call result): box it — but
+                            // only when the name has no annotated/existing
+                            // type (which must win).
+                            let t = if matches!(t, TypeInfo::PyObject)
+                                && !info.name_types.contains_key(&recv.id)
+                            {
+                                TypeInfo::PyValue
+                            } else {
+                                t
+                            };
                             let suggestion = TypeInfo::Vec(Box::new(t));
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
@@ -881,7 +1322,7 @@ fn collect_use_suggestions(
                     // `xs.extend(ys)` pins xs's element type to ys's.
                     "extend" => {
                         if let Some(arg) = call.args.first() {
-                            let t = match resolve_type(arg, info) {
+                            let t = match resolve_type(arg, info, symbols, options) {
                                 TypeInfo::Vec(e) => *e,
                                 other => other,
                             };
@@ -893,7 +1334,7 @@ fn collect_use_suggestions(
                     }
                     "insert" => {
                         if let Some(arg) = call.args.get(1) {
-                            let t = resolve_type(arg, info);
+                            let t = resolve_type(arg, info, symbols, options);
                             let suggestion = TypeInfo::Vec(Box::new(t));
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
@@ -910,35 +1351,62 @@ fn collect_use_suggestions(
     match &stmt.statement {
         StatementType::If(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, options, out);
             }
             for b in &s.orelse {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, options, out);
             }
         }
         StatementType::While(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, options, out);
             }
         }
         StatementType::For(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, options, out);
             }
         }
         StatementType::With(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, options, out);
+            }
+        }
+        // `return "; ".join(parts)` — a str join in return position pins its
+        // list argument to Vec<String> (urllib3's fields.py `_render_parts`).
+        StatementType::Return(Some(e)) => {
+            if let ExprType::Call(call) = &e.value
+                && let ExprType::Attribute(attr) = call.func.as_ref()
+                && attr.attr == "join"
+                && let Some(arg) = call.args.first()
+                && let ExprType::Name(arg_name) = arg
+                && info.empty_pinned.contains_key(&arg_name.id)
+            {
+                let suggestion = TypeInfo::Vec(Box::new(TypeInfo::String));
+                out.entry(arg_name.id.clone())
+                    .and_modify(|t| *t = unify(t.clone(), suggestion.clone()))
+                    .or_insert(suggestion);
             }
         }
         StatementType::Try(s) => {
             for b in &s.body {
-                collect_use_suggestions(b, info, out);
+                collect_use_suggestions(b, info, symbols, options, out);
             }
             for h in &s.handlers {
                 for b in &h.body {
-                    collect_use_suggestions(b, info, out);
+                    collect_use_suggestions(b, info, symbols, options, out);
                 }
+            }
+        }
+        // A NESTED function captures enclosing names (Python closure
+        // semantics): `md_ratios.append(x)` inside a nested def pins the
+        // outer `md_ratios = []` (charset_normalizer's from_bytes). The
+        // nested function's OWN locals must not pollute the enclosing
+        // analysis, but a use of an enclosing empty container is exactly
+        // the pin we want.
+        StatementType::FunctionDef(f) => {
+            for b in &f.body {
+                collect_use_suggestions(b, info, symbols, options, out);
             }
         }
         _ => {}
@@ -947,13 +1415,575 @@ fn collect_use_suggestions(
 
 /// Resolve a name's type through the name_types map (falling back to
 /// syntactic inference for expressions that don't need the map).
-fn resolve_type(expr: &ExprType, info: &FunctionTypeInfo) -> TypeInfo {
+/// Resolve a function's return annotation to a TypeInfo, following
+/// module-level TYPE ALIASES (`CoherenceMatches = List[CoherenceMatch]` in
+/// models.py) and imported aliases — `cached_coherence_ratio(...) ->
+/// CoherenceMatches` must pin `cd_ratios` to Vec<Vec<(String, f64)>>, not
+/// stay an opaque class-name ident (charset_normalizer).
+pub fn resolve_alias_typeinfo(
+    ann: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
+    thread_local! {
+        static RA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let d = RA_DEPTH.with(|c| c.get());
+    // A self-referential alias (`JsonType = ... | Sequence["JsonType"]`)
+    // recurses through the chain; the boxed PyValue is the correct
+    // resolution for the cycle.
+    if d > 64 {
+        return Some(TypeInfo::PyValue);
+    }
+    RA_DEPTH.with(|c| c.set(d + 1));
+    let result = resolve_alias_typeinfo_inner(ann, symbols, options);
+    RA_DEPTH.with(|c| c.set(d));
+    return result;
+}
+
+fn resolve_alias_typeinfo_inner(
+    ann: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
+    match ann {
+        // `T | None`: Option of the alias-resolved inner type
+        // (`list[CharsetMatch] | None`). A boxed PyValue already contains
+        // None (`CertType = ... | None` → PyValue, not Option<PyValue>).
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            if crate::is_none_expr(&op.left) {
+                if let Some(t) = resolve_alias_typeinfo(&op.right, symbols, options) {
+                    if matches!(t, TypeInfo::PyValue) {
+                        return Some(t);
+                    }
+                    return Some(TypeInfo::Option(Box::new(t)));
+                }
+                return None;
+            }
+            if crate::is_none_expr(&op.right) {
+                if let Some(t) = resolve_alias_typeinfo(&op.left, symbols, options) {
+                    if matches!(t, TypeInfo::PyValue) {
+                        return Some(t);
+                    }
+                    return Some(TypeInfo::Option(Box::new(t)));
+                }
+                return None;
+            }
+            // A general union with a class member (`int | Retry`): resolve
+            // both sides; distinct members box into PyValue.
+            let l = resolve_alias_typeinfo(&op.left, symbols, options);
+            let r = resolve_alias_typeinfo(&op.right, symbols, options);
+            if let (Some(l), Some(r)) = (l, r) {
+                if l == r {
+                    return Some(l);
+                }
+                return Some(TypeInfo::PyValue);
+            }
+            annotation_type_info(ann)
+        }
+        // `_t.TimeoutType` — a module-path attribute (`import requests.
+        // _types as _t`): resolve the alias name in the imported module's
+        // scope (requests/_types.py defines its TypeAliases under
+        // `if TYPE_CHECKING:`, which the emitter skips but find_symbols
+        // still records).
+        ExprType::Attribute(attr) => {
+            // `typing.Any` — the typing module is never in module_defs;
+            // Any is the boxed value directly.
+            if attr.attr == "Any"
+                && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+            {
+                return Some(TypeInfo::PyValue);
+            }
+            let ExprType::Name(module) = attr.value.as_ref() else {
+                // A NESTED module chain (`OpenSSL.SSL.Connection` — a
+                // pyOpenSSL class annotation, urllib3's WrappedSocket): the
+                // root is an external import — a boxed value.
+                if crate::root_name(&attr.value)
+                    .is_some_and(|r| r != "typing")
+                {
+                    return Some(TypeInfo::PyValue);
+                }
+                return annotation_type_info(ann);
+            };
+            // A SELF-module reference (`connection._TYPE_SOCKET_OPTIONS`
+            // inside urllib3/connection.py): the attribute is a name in the
+            // CURRENT module's symbols — resolve it there. An Import symbol
+            // (`socket.socket` — `import socket` registers `socket`) is NOT
+            // a local type name: the module-name loop below resolves it
+            // (external module → PyValue).
+            if symbols.get(&attr.attr).is_some()
+                && !symbols.get(&attr.attr).is_some_and(|s| {
+                    matches!(
+                        s,
+                        crate::SymbolTableNode::ImportFrom(_)
+                            | crate::SymbolTableNode::Import(_)
+                    )
+                })
+            {
+                return resolve_alias_typeinfo(
+                    &ExprType::Name(crate::ast::tree::name::Name {
+                        id: attr.attr.clone(),
+                    }),
+                    symbols,
+                    options,
+                );
+            }
+            // The module name may itself be an ALIAS (`from . import
+            // _types as _t` registers `_t` → Alias("_types")): follow the
+            // chain to the Import/ImportFrom, then resolve the attribute
+            // name in the imported module's scope.
+            let mut module_name = module.id.clone();
+            let mut hops = 0;
+            let path: Vec<String> = loop {
+                if hops > 16 {
+                    return None;
+                }
+                hops += 1;
+                match symbols.get(&module_name) {
+                    // A name shadowed by a try/except fallback
+                    // (`ssl = None` after `import ssl` — urllib3): the
+                    // module is external — a boxed value.
+                    Some(SymbolTableNode::Assign { value, .. })
+                        if crate::is_none_expr(value) =>
+                    {
+                        return Some(TypeInfo::PyValue);
+                    }
+                    Some(SymbolTableNode::Alias(canonical)) => {
+                        module_name = canonical.clone();
+                    }
+                    // An import from a module outside the crate
+                    // (`ssl.SSLContext` — urllib3): an external class — a
+                    // boxed value.
+                    Some(SymbolTableNode::Import(i))
+                        if !options.module_defs.contains_key(
+                            &i.names
+                                .first()
+                                .map(|a| {
+                                    a.name
+                                        .split('.')
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                        ) =>
+                    {
+                        return Some(TypeInfo::PyValue);
+                    }
+                    Some(SymbolTableNode::Import(i)) => {
+                        let name = i.names.first()?.name.clone();
+                        break name.split('.').map(|s| s.to_string()).collect();
+                    }
+                    Some(SymbolTableNode::ImportFrom(i)) => {
+                        let mut path = i.resolved_module_path(options);
+                        // `from . import X` — the name is an alias, not
+                        // part of the module path (`from . import _types
+                        // as _t` → requests/_types.py); `from .util
+                        // import connection` — the imported name IS the
+                        // submodule (`connection._TYPE_SOCKET_OPTIONS` →
+                        // urllib3/util/connection.py).
+                        if let Some(alias) = i.names.iter().find(|a| {
+                            a.name == module_name
+                                || a.asname.as_deref() == Some(module_name.as_str())
+                        }) {
+                            path.push(alias.name.clone());
+                        } else if i.module.is_empty() && i.names.len() == 1 {
+                            path.push(i.names[0].name.clone());
+                        }
+                        break path;
+                    }
+                    _ => return annotation_type_info(ann),
+                }
+            };
+            let module = options.module_defs.get(&path)?;
+            let module: &crate::Module = module;
+            let syms = module.clone().find_symbols(SymbolTableScopes::new());
+            let r = resolve_alias_typeinfo(
+                &ExprType::Name(crate::ast::tree::name::Name {
+                    id: attr.attr.clone(),
+                }),
+                &syms,
+                options,
+            );
+            r
+        }
+        // A STRING annotation (`Sequence["JsonType"]` — a forward
+        // reference): resolve it as the name (requests/_types.py).
+        ExprType::Constant(c) => {
+            if let Some(litrs::Literal::String(s)) = &c.0 {
+                let text = s.value().to_string();
+                if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+                    return resolve_alias_typeinfo(
+                        &ExprType::Name(crate::ast::tree::name::Name { id: text }),
+                        symbols,
+                        options,
+                    );
+                }
+            }
+            annotation_type_info(ann)
+        }
+        // A bare name: a builtin scalar, or an alias/import chain.
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            // An ALIAS (`from ._base_connection import ProxyConfig as
+            // ProxyConfig` — a self-aliasing re-export): follow to the
+            // canonical name (the depth guard breaks cycles).
+            Some(SymbolTableNode::Alias(canonical)) => {
+                resolve_alias_typeinfo(
+                    &ExprType::Name(crate::ast::tree::name::Name {
+                        id: canonical.clone(),
+                    }),
+                    symbols,
+                    options,
+                )
+            }
+            Some(SymbolTableNode::Assign { value, .. }) => {
+                // A TypeVar (`_DT = TypeVar("_DT")`) is a compile-time
+                // generic — boxed when it appears in a union.
+                if let ExprType::Call(c) = value
+                    && (matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "TypeVar")
+                        || matches!(c.func.as_ref(), ExprType::Attribute(a)
+                            if a.attr == "TypeVar"))
+                {
+                    return Some(TypeInfo::PyValue);
+                }
+                // A NewType alias (`RecordPath = NewType("RecordPath",
+                // str)` — pip's wheel): the str base.
+                if let ExprType::Call(c) = value
+                    && matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "NewType")
+                {
+                    return Some(TypeInfo::String);
+                }
+                resolve_alias_typeinfo(value, symbols, options)
+            }
+            // An import from the `typing`/`typing_extensions` modules
+            // (`from typing_extensions import Buffer` — requests/_types.py)
+            // is a boxed value.
+            Some(SymbolTableNode::ImportFrom(i))
+                if matches!(i.module.as_str(), "typing" | "typing_extensions") =>
+            {
+                Some(TypeInfo::PyValue)
+            }
+            // An import from a module outside the crate (`CookieJar` from
+            // http.cookiejar): an external class — a boxed value.
+            Some(SymbolTableNode::ImportFrom(i))
+                if !options.module_defs.contains_key(&i.resolved_module_path(options)) =>
+            {
+                Some(TypeInfo::PyValue)
+            }
+            Some(SymbolTableNode::ImportFrom(i)) => {
+                let path = i.resolved_module_path(options);
+                let module = options.module_defs.get(&path)?;
+                let module: &crate::Module = module;
+                let syms = module.clone().find_symbols(SymbolTableScopes::new());
+                match syms.get(&n.id) {
+                    Some(SymbolTableNode::Assign { value, .. }) => {
+                        if let ExprType::Call(c) = value
+                            && (matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "TypeVar")
+                                || matches!(c.func.as_ref(), ExprType::Attribute(a)
+                                    if a.attr == "TypeVar"))
+                        {
+                            return Some(TypeInfo::PyValue);
+                        }
+                        // A NewType alias (`NormalizedName =
+                        // NewType("NormalizedName", str)` — pip's
+                        // packaging): the str base.
+                        if let ExprType::Call(c) = value
+                            && matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "NewType")
+                        {
+                            return Some(TypeInfo::String);
+                        }
+                        resolve_alias_typeinfo(value, &syms, options)
+                    }
+                    // An imported class (`from urllib3.util.retry import
+                    // Retry`): the struct ident. A class that is only a
+                    // TYPE_CHECKING stub in its own module (`if TYPE_CHECKING:
+                    // class BaseHTTPConnection(Protocol)` — urllib3's
+                    // _base_connection) is never generated: the annotation
+                    // resolves to the boxed PyValue instead of a bare name
+                    // that would not exist in the crate.
+                    Some(SymbolTableNode::ClassDef(_)) => {
+                        if crate::ast::tree::module::module_def_has_runtime_item(
+                            options,
+                            &path,
+                            &n.id,
+                        ) {
+                            Some(TypeInfo::Class(n.id.clone()))
+                        } else {
+                            Some(TypeInfo::PyValue)
+                        }
+                    }
+                    // A RE-EXPORT (`from .connection import ProxyConfig`
+                    // where connection.py does `from ._base_connection
+                    // import ProxyConfig` — urllib3): follow the chain in
+                    // the DEFINING module's scope.
+                    Some(SymbolTableNode::ImportFrom(_)) | Some(SymbolTableNode::Alias(_)) => {
+                        resolve_alias_typeinfo(
+                            &ExprType::Name(crate::ast::tree::name::Name {
+                                id: n.id.clone(),
+                            }),
+                            &syms,
+                            options,
+                        )
+                    }
+                    _ => None,
+                }
+            }
+            // A user-defined class name (`list[CharsetMatch]`): the struct
+            // ident, the same path parameters use.
+            Some(SymbolTableNode::ClassDef(_)) => {
+                Some(TypeInfo::Class(n.id.clone()))
+            }
+            _ => annotation_type_info(ann),
+        },
+        // A container generic whose ELEMENT may be an alias: rebuild with
+        // the resolved element type.
+        ExprType::Subscript(sub) => {
+            let container = match sub.value.as_ref() {
+                // Bare `Iterable[...]` / `IO[Any]` / `Sequence[...]` etc. —
+                // typing generics tolerated inside a boxed PyValue union.
+                ExprType::Name(n)
+                    if matches!(
+                        n.id.as_str(),
+                        "Union" | "IO" | "Iterable" | "Sequence" | "Iterator" | "Generator"
+                            | "Callable" | "SupportsRead" | "SupportsItems" | "Mapping"
+                            | "MutableMapping" | "Type" | "Optional" | "Literal" | "Any"
+                    ) =>
+                {
+                    return Some(TypeInfo::PyValue);
+                }
+                // A subscripted name that is a real symbol (`Morsel[
+                // dict[str, str]]` — an imported class generic from
+                // http.cookiejar) is a boxed value — except the container
+                // generics, which resolve through the second match below.
+                ExprType::Name(n)
+                    if symbols.get(&n.id).is_some()
+                        && !matches!(
+                            n.id.as_str(),
+                            "list" | "List" | "tuple" | "Tuple" | "dict" | "Dict" | "set"
+                                | "Set" | "Optional"
+                        ) =>
+                {
+                    return Some(TypeInfo::PyValue);
+                }
+                ExprType::Name(n) => n.id.as_str(),
+                ExprType::Attribute(a)
+                    if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+                {
+                    match a.attr.as_str() {
+                        "List" => "list",
+                        "Tuple" => "tuple",
+                        "Dict" => "dict",
+                        "Set" => "set",
+                        // Other typing generics (`IO[Any]`,
+                        // `Iterable[bytes | str]`, `Union[...]`,
+                        // `Callable[...]`) are tolerated inside a boxed
+                        // PyValue union (urllib3's `_TYPE_BODY`).
+                        "Union" | "IO" | "Iterable" | "Callable" | "SupportsRead"
+                        | "SupportsItems" | "Mapping" | "MutableMapping" | "Optional"
+                        | "Literal" | "Any" | "Sequence" | "Iterator" | "Generator"
+                        | "Type" | "ClassVar" | "Collection" | "Container" => {
+                            return Some(TypeInfo::PyValue);
+                        }
+                        _ => return annotation_type_info(ann),
+                    }
+                }
+                // A MODULE-PATH attribute container (`_t.SupportsRead[
+                // str | bytes]`, `_t.DataType` — requests/_types.py
+                // aliases): resolve through the module.
+                ExprType::Attribute(a) => {
+                    let ExprType::Name(module) = a.value.as_ref() else {
+                        return annotation_type_info(ann);
+                    };
+                    // An EXTERNAL module (`queue.LifoQueue[typing.Any]` —
+                    // urllib3's ConnectionPool.pool): a boxed value.
+                    if let Some(crate::SymbolTableNode::Import(i)) = symbols.get(&module.id)
+                        && !options.module_defs.contains_key(
+                            &i.names
+                                .first()
+                                .map(|al| {
+                                    al.name
+                                        .split('.')
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                        )
+                    {
+                        return Some(TypeInfo::PyValue);
+                    }
+                    let resolved_attr = resolve_alias_typeinfo(
+                        &ExprType::Name(crate::ast::tree::name::Name {
+                            id: a.attr.clone(),
+                        }),
+                        symbols,
+                        options,
+                    );
+                    match resolved_attr {
+                        // A container-typed alias: rebuild the container
+                        // (the resolved TypeInfo's rust type).
+                        Some(t) => return Some(t),
+                        None => return annotation_type_info(ann),
+                    }
+                }
+                _ => return annotation_type_info(ann),
+            };
+            match (container, &sub.kind) {
+                ("list" | "List", crate::SubscriptKind::Index(elt)) => Some(TypeInfo::Vec(
+                    Box::new(resolve_alias_typeinfo(elt, symbols, options)?),
+                )),
+                ("tuple" | "Tuple", crate::SubscriptKind::Index(elt)) => {
+                    if let ExprType::Tuple(t) = elt.as_ref() {
+                        let mut infos = Vec::with_capacity(t.elts.len());
+                        for e in &t.elts {
+                            infos.push(resolve_alias_typeinfo(e, symbols, options)?);
+                        }
+                        Some(TypeInfo::Tuple(infos))
+                    } else {
+                        annotation_type_info(ann)
+                    }
+                }
+                ("dict" | "Dict", crate::SubscriptKind::Index(kv)) => {
+                    if let ExprType::Tuple(t) = kv.as_ref()
+                        && let [k, v] = t.elts.as_slice()
+                    {
+                        Some(TypeInfo::Dict(
+                            Box::new(resolve_alias_typeinfo(k, symbols, options)?),
+                            Box::new(resolve_alias_typeinfo(v, symbols, options)?),
+                        ))
+                    } else {
+                        annotation_type_info(ann)
+                    }
+                }
+                // A `set[T]` annotation (`would_be_installed:
+                // set[NormalizedName]` — pip's check): the set lowers as a
+                // Vec of the element type (set-ops on Vecs compile; the
+                // set semantics are the documented divergence).
+                ("set" | "Set" | "frozenset", crate::SubscriptKind::Index(elt)) => {
+                    Some(TypeInfo::Vec(Box::new(resolve_alias_typeinfo(
+                        elt, symbols, options,
+                    )?)))
+                }
+                _ => annotation_type_info(ann),
+            }
+        }
+        _ => annotation_type_info(ann),
+    }
+}
+
+/// Resolve a Call expression's return TypeInfo through the callee's
+/// (alias-aware) return annotation: a FunctionDef (`mess_ratio -> float`)
+/// or a decorator-factory assignment (`cached_coherence_ratio =
+/// lru_cache(...)(coherence_ratio)`). Cross-module callees resolve their
+/// annotation in the DEFINING module's scope, so `-> CoherenceMatches`
+/// follows the alias chain where it was written (charset_normalizer).
+/// Returns None for unknown callees.
+pub fn call_return_typeinfo(
+    call: &crate::Call,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+) -> Option<TypeInfo> {
+    let ExprType::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    let symbols = symbols?;
+    let options = options?;
+    // Resolve the callee to (FunctionDef, its defining module's symbols):
+    // same module, cross-module via ImportFrom, or the function behind a
+    // decorator-factory assignment.
+    let fn_name = match symbols.get(&callee.id) {
+        Some(SymbolTableNode::FunctionDef(_)) => callee.id.clone(),
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            let (f, _) = crate::module_function_def(options, &path, &callee.id)?;
+            let ann = f.returns.as_deref()?;
+            return resolve_alias_typeinfo(ann, &module_symbols(options, &path), options);
+        }
+        Some(SymbolTableNode::Assign { value, .. }) => {
+            // `cached_mess_ratio = lru_cache(...)(mess_ratio)`: resolve the
+            // underlying fn's name.
+            let ExprType::Call(outer) = value else {
+                return None;
+            };
+            let ExprType::Name(fn_name) = outer.args.first()? else {
+                return None;
+            };
+            fn_name.id.clone()
+        }
+        _ => return None,
+    };
+    match symbols.get(&fn_name) {
+        Some(SymbolTableNode::FunctionDef(f)) => {
+            let ann = f.returns.as_deref()?;
+            resolve_alias_typeinfo(ann, symbols, options)
+        }
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            let (f, _) = crate::module_function_def(options, &path, &fn_name)?;
+            let ann = f.returns.as_deref()?;
+            resolve_alias_typeinfo(ann, &module_symbols(options, &path), options)
+        }
+        _ => None,
+    }
+}
+
+/// The symbol table of a module in options.module_defs ("" root).
+fn module_symbols(options: &PythonOptions, path: &[String]) -> SymbolTableScopes {
+    match options.module_defs.get(path) {
+        Some(module) => {
+            let module: &crate::Module = module;
+            module.clone().find_symbols(SymbolTableScopes::new())
+        }
+        None => SymbolTableScopes::new(),
+    }
+}
+
+fn resolve_type(
+    expr: &ExprType,
+    info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+) -> TypeInfo {
+    thread_local! {
+        static RT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let d = RT_DEPTH.with(|c| c.get());
+    if d > 200 && d % 50 == 0 {
+    }
+    RT_DEPTH.with(|c| c.set(d + 1));
+    let result = resolve_type_inner(expr, info, symbols, options);
+    RT_DEPTH.with(|c| c.set(d));
+    return result;
+}
+
+fn resolve_type_inner(
+    expr: &ExprType,
+    info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+) -> TypeInfo {
     match expr {
         ExprType::Name(n) => info
             .name_types
             .get(&n.id)
             .cloned()
             .unwrap_or_else(|| syntactic_type(expr)),
+        // A call to a known function resolves through its return
+        // annotation: `md_ratios.append(cached_mess_ratio(...))` pins the
+        // element type from the cached fn's `-> float` (charset_normalizer).
+        ExprType::Call(call) => {
+            if let Some(t) = crate::call_return_typeinfo(call, symbols, options) {
+                return t;
+            }
+            // Fall back to the plain (non-alias) return-annotation path
+            // for functions whose annotation maps directly.
+            if let ExprType::Name(callee) = call.func.as_ref()
+                && let (Some(symbols), Some(options)) = (symbols, options)
+                && let Some(SymbolTableNode::FunctionDef(f)) = symbols.get(&callee.id)
+                && let Some(ty) = f.resolved_return_type(symbols, options)
+            {
+                return ty_to_typeinfo(&ty);
+            }
+            syntactic_type(expr)
+        }
         // `xs[i]` resolves through the receiver's recorded type so
         // `out.append(xs[0])` pins `out`'s element type from a
         // `list[float]` parameter.
@@ -970,6 +2000,25 @@ fn resolve_type(expr: &ExprType, info: &FunctionTypeInfo) -> TypeInfo {
             syntactic_type(expr)
         }
         _ => syntactic_type(expr),
+    }
+}
+
+/// Map a resolved Rust type token (from a function's return annotation) to
+/// a TypeInfo.
+fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
+    let s = ty.to_string();
+    if s.contains("i64") {
+        TypeInfo::Int
+    } else if s.contains("f64") {
+        TypeInfo::Float
+    } else if s.contains("bool") {
+        TypeInfo::Bool
+    } else if s.contains("String") || s.contains("str") {
+        TypeInfo::String
+    } else if s.contains("Vec < u8 >") || s.contains("Vec<u8>") {
+        TypeInfo::Bytes
+    } else {
+        TypeInfo::PyObject
     }
 }
 
@@ -1235,6 +2284,17 @@ pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {
         ExprType::FormattedValue(fv) => expr_references(&fv.value, name),
         ExprType::Lambda(l) => expr_references(&l.body, name),
         ExprType::Starred(s) => expr_references(&s.value, name),
+        // `yield x` / `yield from xs` / `await f(x)` — the yielded or
+        // awaited expression is a real reference (a loop index used only
+        // in a yield body must not lower to `_`; response.py's `for x in
+        // chunks[1:-1]: yield x + b"\n"`).
+        ExprType::Yield(y) => y
+            .value
+            .as_ref()
+            .map(|v| expr_references(v, name))
+            .unwrap_or(false),
+        ExprType::YieldFrom(yf) => expr_references(&yf.value, name),
+        ExprType::Await(a) => expr_references(&a.value, name),
         _ => false,
     }
 }

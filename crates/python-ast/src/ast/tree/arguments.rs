@@ -157,24 +157,179 @@ pub(crate) fn is_optional_annotation(ann: &ExprType) -> bool {
     }
 }
 
+/// Whether an annotation is the Python `str` type name.
+pub fn is_str_annotation(ann: &ExprType) -> bool {
+    matches!(ann, ExprType::Name(n) if n.id == "str")
+}
+
+/// Whether an annotation is a bytes-like type name (`bytes`/`bytearray`).
+pub fn is_bytes_annotation(ann: &ExprType) -> bool {
+    matches!(ann, ExprType::Name(n) if matches!(n.id.as_str(), "bytes" | "bytearray"))
+}
+
+/// Collect every member of a `|` union chain (left-associative in the
+/// Python AST: `str | bytes | bytearray` is `(str | bytes) | bytearray`).
+/// Returns the leaf members in order, or None when the expression is not a
+/// union.
+pub fn union_members(ann: &ExprType) -> Option<Vec<&ExprType>> {
+    match ann {
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            let mut members = union_members(&op.left)?;
+            members.push(&op.right);
+            Some(members)
+        }
+        _ => Some(vec![ann]),
+    }
+}
+
+/// Whether a union annotation is exactly the supported StrOrBytes pair:
+/// one `str` member and one-or-more bytes-like members (`str | bytes`,
+/// `str | bytes | bytearray`), with no None (None makes it Optional).
+pub fn is_str_bytes_union(ann: &ExprType) -> bool {
+    let members = match union_members(ann) {
+        Some(m) if m.len() >= 2 => m,
+        _ => return false,
+    };
+    if members.iter().any(|m| crate::is_none_expr(m)) {
+        return false;
+    }
+    let has_str = members.iter().any(|m| is_str_annotation(m));
+    let has_bytes = members.iter().any(|m| is_bytes_annotation(m));
+    let all_known = members.iter().all(|m| is_str_annotation(m) || is_bytes_annotation(m));
+    has_str && has_bytes && all_known
+}
+
+/// Whether a union member can live inside the boxed PyValue: the primitive
+/// value types, tuples of them, Literal constants, Any, or None. Used by
+/// `python_annotation_to_rust_type` to decide when a wider union maps to
+/// the boxed heterogeneous value.
+pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
+    if crate::is_none_expr(ann) {
+        return true;
+    }
+    match ann {
+        ExprType::Name(n) => matches!(
+            n.id.as_str(),
+            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "Any" | "memoryview"
+                // PathLike (os.PathLike) unions like `str | bytes |
+                // PathLike`: only the str/bytes members are real values in
+                // rython; the member is tolerated so file paths flow
+                // through the boxed PyValue (AsStrLike).
+                | "PathLike"
+                | "BinaryIO"
+        ),
+        ExprType::Subscript(sub) => {
+            match sub.value.as_ref() {
+                ExprType::Name(n) => matches!(
+                    n.id.as_str(),
+                    "tuple" | "Tuple" | "Literal" | "list" | "List" | "IO" | "Iterable"
+                        | "Union" | "Callable" | "SupportsRead" | "SupportsItems"
+                        | "Mapping" | "Dict" | "Set" | "Sequence" | "MutableMapping" | "Collection" | "Container"
+                        | "Generator" | "Iterator" | "Type" | "Optional" | "Any"
+                        | "memoryview"
+                ),
+                // `typing.Sequence[...]` / `typing.Iterable[...]` — the
+                // typing-module spelling of the same generics (urllib3's
+                // `dict[str, T] | typing.Sequence[tuple[str, T]]`).
+                ExprType::Attribute(a) => {
+                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                        && matches!(
+                            a.attr.as_str(),
+                            "Tuple" | "List" | "Dict" | "Set" | "Sequence" | "Iterable"
+                                | "Iterator" | "Generator" | "Mapping" | "MutableMapping"
+                                | "Callable" | "Union" | "Optional" | "Literal" | "Any"
+                                | "IO" | "SupportsRead" | "SupportsItems" | "Type" | "Collection" | "Container"
+                        )
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Map a Python type annotation to a Rust type, when the mapping is known.
 /// `int`/`float`/`str`/`bool`/`bytes` map to concrete Rust types, and
 /// `list[T]`/`dict[K, V]`/`set[T]` map to the corresponding std containers
 /// when their element annotations map too. `Optional[T]` / `T | None` map
 /// to `Option<T>`.
-pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
-    match annotation {
-        // T | None (and None | T) is Option<T>.
+/// Whether an annotation is the bare `type` marker — a CALLABLE/class
+/// parameter (`dict_class: type = OrderedDict` — requests' sessions).
+/// rython cannot hold callables as values (the callables-as-data
+/// divergence): the parameter lowers to a boxed PyValue, its arguments
+/// lower to the boxed None, and calls through it drop (function_def.rs /
+/// map_call_arguments / Parameter::to_rust).
+pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
+    matches!(annotation, ExprType::Name(n) if n.id == "type")
+}
+
+pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {    match annotation {
+        // T | None (and None | T) is Option<T>; a union whose members map
+        // to the SAME Rust type (`bytes | bytearray` → Vec<u8>) is that
+        // type. `str | bytes` (and `str | bytes | bytearray`) is the
+        // StrOrBytes heterogeneous union (issue #121). Any other union has
+        // no single Rust type — the caller reports the unsupported
+        // annotation.
         ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
             let inner = if crate::is_none_expr(&op.left) {
                 op.right.as_ref()
             } else if crate::is_none_expr(&op.right) {
                 op.left.as_ref()
             } else {
+                // All members map to the same Rust type?
+                let members = crate::union_members(annotation).unwrap_or_default();
+                let mut all_same: Option<TokenStream> = None;
+                let mut same = true;
+                for m in &members {
+                    match python_annotation_to_rust_type(m) {
+                        Some(t) if all_same.is_none() => all_same = Some(t),
+                        Some(t) if all_same.as_ref().is_some_and(|p| p.to_string() == t.to_string()) => {}
+                        _ => {
+                            same = false;
+                            break;
+                        }
+                    }
+                }
+                if same && let Some(t) = all_same {
+                    return Some(t);
+                }
+                // str | bytes — the StrOrBytes heterogeneous union.
+                if crate::is_str_bytes_union(annotation) {
+                    return Some(quote!(stdpython::StrOrBytes));
+                }
+                // Any other union whose members are all boxable (issue
+                // #121: `bool | str | None`, `tuple[str, str] | str |
+                // None`, `int | str | None`, ...) is the boxed
+                // heterogeneous value; isinstance narrows at runtime.
+                if members
+                    .iter()
+                    .all(|m| crate::is_pyvalue_boxable_member(m))
+                {
+                    return Some(quote!(stdpython::PyValue));
+                }
                 return None;
             };
-            let inner = python_annotation_to_rust_type(inner)?;
-            return Some(quote!(Option<#inner>));
+            // `T | None` where the inner union maps to one type is
+            // Option<T>. A wider inner union maps to the boxed PyValue,
+            // which ALREADY contains None (`bool | str | None` is PyValue,
+            // not Option<PyValue>).
+            let inner_tokens = python_annotation_to_rust_type(inner);
+            if let Some(t) = inner_tokens {
+                if t.to_string() == quote!(stdpython::PyValue).to_string() {
+                    return Some(t);
+                }
+                return Some(quote!(Option<#t>));
+            }
+            // `str | bytes | None` → Option<StrOrBytes>.
+            if crate::is_str_bytes_union(inner) {
+                return Some(quote!(Option<stdpython::StrOrBytes>));
+            }
+            if crate::union_members(inner).is_some_and(|ms| {
+                !ms.is_empty() && ms.iter().all(|m| crate::is_pyvalue_boxable_member(m))
+            }) {
+                return Some(quote!(stdpython::PyValue));
+            }
+            return None;
         }
         _ => {}
     }
@@ -184,7 +339,10 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
             "float" => Some(quote!(f64)),
             "str" => Some(quote!(String)),
             "bool" => Some(quote!(bool)),
-            "bytes" => Some(quote!(Vec<u8>)),
+            "bytes" | "bytearray" => Some(quote!(Vec<u8>)),
+            // `Any` (typing.Any) and `object`: a value of unknown type —
+            // the boxed heterogeneous value.
+            "Any" | "object" => Some(quote!(stdpython::PyValue)),
             _ => None,
         },
         // numpy scalar type annotations: np.float64 → f64, np.int32 → i32,
@@ -210,13 +368,75 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
         ExprType::Subscript(sub) => {
             let container = match sub.value.as_ref() {
                 ExprType::Name(n) => n.id.as_str(),
+                // `typing.Mapping[K, V]` — the typing-prefixed generic
+                // lowers like the bare name.
+                ExprType::Attribute(a)
+                    if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+                {
+                    match a.attr.as_str() {
+                        "Mapping" => "Mapping",
+                        "Dict" => "dict",
+                        "List" => "list",
+                        "Set" => "set",
+                        "Optional" => "Optional",
+                        "Tuple" => "tuple",
+                        "Literal" => "Literal",
+                        _ => return None,
+                    }
+                }
                 _ => return None,
             };
             match (&sub.kind, container) {
+                // `type[X]` / `Type[X]` is a CLASS, which rython cannot
+                // pass as a value — tolerated as an opaque Option<()> so
+                // the definition compiles (a call passing an actual class
+                // is the documented class-as-value divergence).
+                (crate::SubscriptKind::Index(_), "type" | "Type") => {
+                    Some(quote!(Option<()>))
+                }
                 (crate::SubscriptKind::Index(elt), "Optional") => {
                     let inner = python_annotation_to_rust_type(elt)?;
+                    // Optional[bool | str] is the boxed PyValue (which
+                    // already contains None), not Option<PyValue>.
+                    if inner.to_string() == quote!(stdpython::PyValue).to_string() {
+                        return Some(inner);
+                    }
                     Some(quote!(Option<#inner>))
                 }
+                // `tuple[T1, T2, ...]` maps to a Rust tuple; `tuple[T, ...]`
+                // (a variadic tuple) maps to Vec<T>; `Literal[X]` (a
+                // constant union member) is a boxed PyValue.
+                (crate::SubscriptKind::Index(elt), "tuple" | "Tuple") => {
+                    if let ExprType::Tuple(t) = elt.as_ref() {
+                        // `tuple[int, ...]`: one element + Ellipsis = a
+                        // variadic tuple → Vec<T>.
+                        if t.elts.len() == 2
+                            && matches!(
+                                &t.elts[1],
+                                ExprType::Constant(c)
+                                    if c.0
+                                        .as_ref()
+                                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                            )
+                        {
+                            let inner = python_annotation_to_rust_type(&t.elts[0])?;
+                            return Some(quote!(Vec<#inner>));
+                        }
+                        let mut tys = Vec::with_capacity(t.elts.len());
+                        for e in &t.elts {
+                            tys.push(python_annotation_to_rust_type(e)?);
+                        }
+                        if tys.len() == 1 {
+                            let only = &tys[0];
+                            Some(quote!((#only,)))
+                        } else {
+                            Some(quote!((#(#tys),*)))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                (_, "Literal") => Some(quote!(stdpython::PyValue)),
                 (crate::SubscriptKind::Index(elt), "list") => {
                     let inner = python_annotation_to_rust_type(elt)?;
                     Some(quote!(Vec<#inner>))
@@ -229,6 +449,19 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                     // dict[K, V] parses as a subscript with a tuple index.
                     // PyDict is the insertion-ordered map dict literals
                     // lower to.
+                    if let ExprType::Tuple(t) = kv.as_ref() {
+                        if let [k, v] = t.elts.as_slice() {
+                            let k = python_annotation_to_rust_type(k)?;
+                            let v = python_annotation_to_rust_type(v)?;
+                            return Some(quote!(PyDict<#k, #v>));
+                        }
+                    }
+                    None
+                }
+                // `typing.Mapping[K, V]` / `Mapping[K, V]` (a read-only
+                // dict view in Python) lowers to PyDict — dict literals and
+                // dict.get/contains all work unchanged.
+                (crate::SubscriptKind::Index(kv), "Mapping") => {
                     if let ExprType::Tuple(t) = kv.as_ref() {
                         if let [k, v] = t.elts.as_slice() {
                             let k = python_annotation_to_rust_type(k)?;
@@ -267,17 +500,51 @@ impl CodeGen for Parameter {
             if matches!(&*annotation, ExprType::Name(n) if n.id == "str") {
                 return Ok(quote!(#param_name: impl Into<String>));
             }
-            // Known Python types map to concrete Rust types; anything else
-            // falls back to rendering the annotation expression (e.g. a
-            // user-defined class name).
+            // A bare `type` annotation (`dict_class: type = OrderedDict` —
+            // requests' sessions): a callable/class — rython cannot hold
+            // callables as values (the callables-as-data divergence), so
+            // the parameter is a boxed PyValue.
+            if crate::ast::tree::arguments::is_type_annotation(&annotation) {
+                return Ok(quote!(#param_name: stdpython::PyValue));
+            }
+            // A `None`-only annotation (`cookiejar: None = None`): nothing
+            // but None can ever be stored.
+            if crate::is_none_expr(&annotation) {
+                return Ok(quote!(#param_name: Option<()>));
+            }
+            // Known Python types map to concrete Rust types; a module-level
+            // TYPE ALIAS (`CoherenceMatches = List[CoherenceMatch]`) or an
+            // alias in another module resolves through symbols
+            // (charset_normalizer). Anything else falls back to rendering
+            // the annotation expression (e.g. a user-defined class name).
             let rust_type = match python_annotation_to_rust_type(&annotation) {
                 Some(mapped) => mapped,
-                None => annotation.to_rust(ctx, options, symbols)?,
+                None => {
+                    if let Some(t) = crate::resolve_alias_typeinfo(&annotation, &symbols, &options)
+                    {
+                        t.to_rust_type()
+                    } else {
+                        annotation.to_rust(ctx, options, symbols)?
+                    }
+                }
             };
             Ok(quote!(#param_name: #rust_type))
         } else {
-            // Default to generic type for untyped parameters
-            Ok(quote!(#param_name: impl Into<PyObject>))
+            // An unannotated parameter: the per-function inference pass
+            // (issue #109, M1) gives it a type-variable name from its uses
+            // (`def add(a, b): return a + b` → `a: A`). The old
+            // `impl Into<PyObject>` fallback is gone: no ordinary rython
+            // value satisfies it, so such functions converted but were
+            // uncallable. If no variable was inferred, the function
+            // generator already failed loudly with the reason.
+            match options.param_type_vars.get(&self.arg) {
+                Some(tv) => Ok(quote!(#param_name: #tv)),
+                // No type var (the constructor synthesis renders __init__
+                // params, or an unannotated method param): a boxed PyValue
+                // fallback — the parameter's value is unknown (documented
+                // divergence, issue #109).
+                None => Ok(quote!(#param_name: stdpython::PyValue)),
+            }
         }
     }
 }
@@ -374,10 +641,11 @@ impl CodeGen for Arguments {
             params.push(param);
         }
         
-        // Process **kwargs
+        // Process **kwargs (issue #120): a boxed heterogeneous dict —
+        // callers pack extra keyword arguments into PyValue::from values.
         if let Some(kwarg) = self.kwarg {
             let kwarg_name = crate::safe_ident(&kwarg.arg);
-            params.push(quote!(#kwarg_name: impl IntoIterator<Item = (impl AsRef<str>, impl Into<PyObject>)>));
+            params.push(quote!(#kwarg_name: PyDict<String, stdpython::PyValue>));
         }
         
         Ok(quote!(#(#params),*))

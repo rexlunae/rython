@@ -28,6 +28,13 @@ pub enum AsyncRuntime {
     },
 }
 
+/// The cargo feature name on generated BINARY crates that pulls in the
+/// async runtime (tokio). Generated code gates its runtime import and the
+/// entry-point attribute on this feature, and rypip declares the feature in
+/// the generated Cargo.toml (`default = ["async-tokio"]`). Must match
+/// between codegen (python-ast) and the crate writer (rypip).
+pub const ASYNC_RUNTIME_FEATURE: &str = "async-tokio";
+
 impl Default for AsyncRuntime {
     fn default() -> Self {
         AsyncRuntime::Tokio
@@ -153,23 +160,97 @@ pub struct PythonOptions {
     /// The async runtime to use for async Python code
     pub async_runtime: AsyncRuntime,
 
+    /// Whether the generated crate declares and links the async runtime
+    /// dependency (generated BINARY crates with async code; the tokio crate
+    /// behind the `async-tokio` feature). When false — library conversions —
+    /// async functions transpile to plain `async fn`s with no runtime
+    /// import or entry attribute: the consumer supplies the executor.
+    pub async_runtime_dep: bool,
+
+    /// The inferred type-variable name for each unannotated parameter of the
+    /// CURRENT function (issue #109, M1): `a` → `A`. Parameter rendering
+    /// consults this instead of emitting the dead `impl Into<PyObject>`
+    /// fallback. Set per function by the function generator.
+    pub param_type_vars: std::rc::Rc<std::collections::HashMap<String, proc_macro2::TokenStream>>,
+
+    /// Unannotated parameters of the CURRENT function whose uses include a
+    /// stdlib method call (issue #109, M2): their method calls dispatch
+    /// through the stdlib trait (e.g. `p.pop()` → `py_pop`), never through
+    /// concrete-type arms that assume a Vec/str receiver.
+    pub param_method_params: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Module-level generated items collected during codegen (issue #109,
+    /// M3): duck-typing traits (HasSpeak) and their per-class impls. The
+    /// module generator drains this at the end and emits the items at the
+    /// top of the module output.
+    pub module_pending_items:
+        std::rc::Rc<std::cell::RefCell<Vec<proc_macro2::TokenStream>>>,
+
+    /// Duck-typing trait names already generated in this module (issue
+    /// #109, M3): `HasSpeak` and peers are emitted once per module even
+    /// when several functions bound parameters on the same method.
+    pub generated_duck_traits: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+
+    /// Duck-typed user-method calls on the CURRENT function's unannotated
+    /// parameters: param name → set of method names whose Has* trait
+    /// returns Result (so the call sites thread `?`).
+    pub duck_methods_on_params:
+        std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+
+    /// The CURRENT function's unannotated parameters (and loop elements)
+    /// CALLED as functions (`callback(...)` — s3transfer's
+    /// invoke_progress_callbacks): the callable-as-value divergence (#122) —
+    /// such calls lower to a dropped no-op at the call site.
+    pub called_params: std::rc::Rc<std::collections::HashSet<String>>,
+
     /// Emit #[deprecated] notes on generated items whose conversion was
     /// lossy (dropped parameter defaults, ignored return annotations, ...).
     /// On by default: silent semantic divergence from the Python source is
     /// exactly what these warnings exist to surface. Tools may disable this
     /// to suppress the warnings at the user's explicit request.
     pub lossy_warnings: bool,
+    /// Issue #110: names bound to a string literal and later rebound by a
+    /// String-producing expression (`out = ""; out += "x"`) — their
+    /// literal assignments are owned (`"".to_string()`).
+    pub owned_str_literals: std::rc::Rc<std::collections::HashSet<String>>,
+    /// M5 definition-time warnings collected during inference (a bound set
+    /// no known type satisfies). The transpiler drains this after codegen;
+    /// shared across option clones so pushes land in one place.
+    pub definition_warnings: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 
     /// Names in the CURRENT scope that hold an Option (assigned None on
     /// some path, or annotated Optional): non-None stores into them wrap
     /// in Some. Set per scope by the function/module generators.
     pub optional_names: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Names whose Option-ness is statically narrowed away at the CURRENT
+    /// point (issue #125): inside `if x is not None:`, and after an if/else
+    /// where both branches leave x holding a non-None value. Reads of a
+    /// narrowed name unwrap (`(x).clone().unwrap()`); their type is the
+    /// Option's inner type. Threaded by the function body loop and by
+    /// If::to_rust (the body narrows from the test).
+    pub narrowed_names: std::rc::Rc<std::collections::HashMap<String, crate::TypeInfo>>,
+    /// Generator lowering (issue #122-family): when set, `yield x` in a
+    /// function body renders as `push(x)` on this collector and `yield
+    /// from xs` as `extend(xs)`; the function codegen emits the collector
+    /// Vec and returns it (a generator builds-and-returns its list).
+    pub generator_collector: std::rc::Rc<Option<String>>,
+    /// When rendering a dict literal, force its key/value types (issue
+    /// #121): a store into a `dict[str, Any]` name sets this to
+    /// (String, PyValue) so mixed values wrap per element, and a
+    /// `dict[str, str]` annotation pins the types of an all-spread
+    /// literal (`{**aliases, **{...}}`). None = infer from the literal.
+    pub dict_forced_kv: std::rc::Rc<Option<(crate::TypeInfo, crate::TypeInfo)>>,
 
     /// Whether the CURRENT function's return annotation is `str`: returning
     /// an attribute chain then clones the String field out of the shared
     /// receiver. Python strings are immutable, so the clone reproduces
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
+
+    /// The CURRENT function's resolved return type is the boxed PyValue:
+    /// `return None` lowers to `PyValue::None_` and other returns wrap in
+    /// `PyValue::from` (the None-mixing unification).
+    pub fn_return_is_pyvalue: bool,
 
     /// The current module's package path within the generated crate
     /// ("" for the crate root, "pkg" for pkg/__init__.py, "pkg.sub" for
@@ -178,6 +259,16 @@ pub struct PythonOptions {
     /// absolute-import behavior unchanged for any conversion that does not
     /// set it.
     pub module_path: Vec<String>,
+
+    /// The current module's OWN path within the generated crate (module_path
+    /// is the package path; this is the full path including the module's own
+    /// name, e.g. ["charset_normalizer", "constant"]). Set per module in the
+    /// converter; empty in single-module/library use. The module-promotion
+    /// pass consults it to learn which names sibling modules import from
+    /// this module (`from .constant import _THAI` — a module-init local is
+    /// invisible to other modules), so cross-module constants become
+    /// importable `pub static`s.
+    pub this_module_path: Vec<String>,
 
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
@@ -245,6 +336,16 @@ pub struct PythonOptions {
     /// shares a name with a hoisted variable for other reasons keeps its
     /// fresh per-loop binding (issue #80).
     pub leaked_loop_targets: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Module-level values assigned from non-constant expressions that
+    /// functions READ: promoted to `static name: LazyLock<T>` (module.rs).
+    /// Name reads of these render as `(*name).clone()` — a static does not
+    /// auto-deref in value/borrow position, only as a method receiver.
+    pub promoted_statics: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Callable names whose VALUE reads box to the boxed None: dropped
+    /// nested functions (`hash_utf8 = sha256_utf8` — requests' auth) and
+    /// `type`-annotated callable parameters. Distinct from `called_params`
+    /// (loop elements there only DROP calls, their value reads stay real).
+    pub value_callables: std::rc::Rc<std::collections::HashSet<String>>,
     /// Locals in the current function whose only known type is a string
     /// literal (`label = "fine"`), so they lower to `&'static str`. A
     /// `-> str` function returning one must own the string (`to_string`)
@@ -298,6 +399,17 @@ pub struct PythonOptions {
     /// conversions (empty `module_defs`) never touch it.
     pub cross_module_classes:
         std::rc::Rc<std::cell::RefCell<CrossModuleClasses>>,
+
+    /// Lazily-computed per-module sets of names promoted to `pub static`
+    /// LazyLock statics (module.rs's promotion pass), keyed by module path.
+    /// A name imported from a sibling module (`from .constant import _THAI`)
+    /// is a promoted static in the DEFINING module; reads in the importing
+    /// module must render `(*name).clone()` (name.rs consults this map) and
+    /// the defining module's own promotion must include sibling-imported
+    /// names (module.rs consults it too, so both sides agree). Per-module
+    /// conversions (empty `module_defs`) never touch it.
+    pub module_promoted_statics:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<std::collections::HashSet<String>>>>>,
 }
 
 impl Default for PythonOptions {
@@ -316,10 +428,26 @@ impl Default for PythonOptions {
             with_std_python: true,
             allow_unsafe: false,
             async_runtime: AsyncRuntime::default(),
+            async_runtime_dep: false,
+            param_type_vars: std::rc::Rc::new(std::collections::HashMap::new()),
+            param_method_params: std::rc::Rc::new(std::collections::HashSet::new()),
+            module_pending_items: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            generated_duck_traits: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
+            duck_methods_on_params: std::rc::Rc::new(std::collections::HashMap::new()),
+            called_params: std::rc::Rc::new(std::collections::HashSet::new()),
             lossy_warnings: true,
+            owned_str_literals: std::rc::Rc::new(std::collections::HashSet::new()),
+            definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
+            dict_forced_kv: std::rc::Rc::new(None),
+            generator_collector: std::rc::Rc::new(None),
             clone_str_attribute_returns: false,
+            fn_return_is_pyvalue: false,
             module_path: Vec::new(),
+            this_module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             numpy_backend: None,
@@ -330,6 +458,8 @@ impl Default for PythonOptions {
             empty_pinned: std::rc::Rc::new(std::collections::HashMap::new()),
             hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
+            promoted_statics: std::rc::Rc::new(std::collections::HashSet::new()),
+            value_callables: std::rc::Rc::new(std::collections::HashSet::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
@@ -339,6 +469,9 @@ impl Default for PythonOptions {
             )),
             cross_module_classes: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleClasses::Uncomputed,
+            )),
+            module_promoted_statics: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
             )),
         }
     }

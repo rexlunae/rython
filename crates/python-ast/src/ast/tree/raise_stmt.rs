@@ -4,7 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableNode,
+    SymbolTableScopes,
 };
 
 /// Raise statement (raise [exception [from cause]])
@@ -110,16 +111,20 @@ impl CodeGen for Raise {
             }
             None => {
                 // Bare `raise` re-raises the exception the enclosing except
-                // handler caught (a runtime error outside a handler, as in
-                // Python).
+                // handler caught. Outside a handler (`_onerror_reraise` —
+                // pip's misc, an rmtree onerror callback) the active
+                // exception is unknown: a generic re-raise (documented
+                // divergence).
                 if !ctx.in_except_handler() {
-                    return Err(
-                        "bare `raise` outside an except handler has no exception to re-raise"
-                            .to_string()
-                            .into(),
+                    options.definition_warnings.borrow_mut().push(
+                        "bare `raise` outside an except handler re-raises a generic \
+                         exception (the active exception is unmodeled)"
+                            .to_string(),
                     );
+                    quote!(PyException::new("RuntimeError", "bare raise"))
+                } else {
+                    quote!(__rython_exc.clone())
                 }
-                quote!(__rython_exc.clone())
             }
         };
 
@@ -135,7 +140,7 @@ impl CodeGen for Raise {
 /// `raise Name(...)` can construct a PyException carrying that class name.
 /// Anything else is treated as an expression already producing a
 /// PyException value (e.g. a variable bound by `except ... as e`).
-fn is_exception_class_name(name: &str) -> bool {
+pub fn is_exception_class_name(name: &str) -> bool {
     matches!(
         name,
         "Exception"
@@ -184,6 +189,9 @@ fn is_exception_class_name(name: &str) -> bool {
     ) || name.ends_with("Error")
         || name.ends_with("Exception")
         || name.ends_with("Warning")
+        // The exception GROUP classes (`isinstance(exc_value,
+        // (BaseExceptionGroup, ExceptionGroup))` — rich's traceback).
+        || matches!(name, "BaseExceptionGroup" | "ExceptionGroup")
 }
 
 /// Lower the raised expression to a PyException value: `Name(...)` and bare
@@ -199,7 +207,9 @@ fn exception_value(
     match exc {
         ExprType::Call(call) => {
             if let ExprType::Name(name) = call.func.as_ref() {
-                if is_exception_class_name(&name.id) {
+                if is_exception_class_name(&name.id)
+                    || resolved_is_exception_class(&name.id, &options, &symbols)
+                {
                     let kind = &name.id;
                     let msg = match call.args.len() {
                         0 => quote!(String::new()),
@@ -230,7 +240,10 @@ fn exception_value(
             let tokens = exc.clone().to_rust(ctx, options, symbols)?;
             Ok(quote!(#tokens))
         }
-        ExprType::Name(name) if is_exception_class_name(&name.id) => {
+        ExprType::Name(name)
+            if is_exception_class_name(&name.id)
+                || resolved_is_exception_class(&name.id, &options, &symbols) =>
+        {
             let kind = &name.id;
             Ok(quote!(PyException::new(#kind, String::new())))
         }
@@ -238,6 +251,30 @@ fn exception_value(
             let tokens = other.clone().to_rust(ctx, options, symbols)?;
             Ok(quote!(#tokens))
         }
+    }
+}
+
+/// Whether a name resolves (in the current symbol table) to a class that
+/// IS an exception class by its bases — `InvalidCodepointContext` inherits
+/// `IDNAError`, which follows the `*Error` convention, even though its own
+/// name does not. Resolves imported classes through the defining module.
+fn resolved_is_exception_class(
+    name: &str,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    match symbols.get(name) {
+        Some(SymbolTableNode::ClassDef(c)) => crate::is_exception_class(c),
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            if options.module_defs.contains_key(&path) {
+                crate::module_class_def(&options, &path, name)
+                    .is_some_and(|(c, _)| crate::is_exception_class(&c))
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 

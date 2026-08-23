@@ -146,6 +146,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExprType {
                 let name = ob.extract().map_err(|e| extraction_failure("parsing Name expression", &ob, e))?;
                 Ok(Self::Name(name))
             }
+            // The walrus operator (`if (x := f()) is not None:`): a
+            // NamedExpr assigns its target and evaluates to it.
+            "NamedExpr" => {
+                let ne = ob.extract().map_err(|e| extraction_failure("extracting NamedExpr in expression", &ob, e))?;
+                Ok(Self::NamedExpr(ne))
+            }
             "UnaryOp" => {
                 let c = ob.extract().map_err(|e| extraction_failure("extracting UnaryOp in expression", &ob, e))?;
                 Ok(Self::UnaryOp(c))
@@ -224,6 +230,26 @@ impl<'a> CodeGen for ExprType {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        thread_local! {
+            static E_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let d = E_DEPTH.with(|c| c.get());
+        if d > 100 && d % 20 == 0 {
+        }
+        E_DEPTH.with(|c| c.set(d + 1));
+        let result = self.to_rust_inner(ctx, options, symbols);
+        E_DEPTH.with(|c| c.set(d));
+        return result;
+    }
+}
+
+impl ExprType {
+    fn to_rust_inner(
+        self,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self {
             ExprType::Attribute(attribute) => attribute.to_rust(ctx, options, symbols),
             ExprType::Await(func) => func.to_rust(ctx, options, symbols),
@@ -247,6 +273,7 @@ impl<'a> CodeGen for ExprType {
             ExprType::YieldFrom(yf) => yf.to_rust(ctx, options, symbols),
             ExprType::JoinedStr(js) => js.to_rust(ctx, options, symbols),
             ExprType::FormattedValue(fv) => fv.to_rust(ctx, options, symbols),
+            ExprType::NamedExpr(ne) => ne.to_rust(ctx, options, symbols),
             ExprType::List(l) => {
                 // Type-aware list lowering: infer the element type across
                 // the literal, then coerce each element to it —
@@ -280,17 +307,58 @@ impl<'a> CodeGen for ExprType {
                     expected = crate::unify(expected, t.clone());
                 }
                 if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {
-                    let kinds = distinct
-                        .iter()
-                        .map(|d| d.display())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(format!(
-                        "list literal mixes incompatible element types ({kinds}); \
-                         elements must share a common type (or annotate the \
-                         variable, e.g. `xs: list[float] = [...]`)"
-                    )
-                    .into());
+                    // A list of DIFFERENT class instances (`[d_sp, d_ta,
+                    // ...]` — charset_normalizer's debug plugin list) has
+                    // no single Rust element type. That is a documented
+                    // divergence (heterogeneous class lists cannot build in
+                    // rython; rustc reports the Vec element mismatch), but
+                    // the conversion itself proceeds — primitive mixes
+                    // ([1, "a"]) stay a loud error.
+                    if !distinct.iter().all(|t| matches!(t, crate::TypeInfo::Class(_))) {
+                        // A HETEROGENEOUS list involving a TUPLE
+                        // (`['s3_use_arn_region', ('s3',
+                        // 'use_arn_region')]` — botocore's
+                        // configprovider): a structured config list — box
+                        // the elements as PyValue (documented divergence).
+                        // A list mixing an OPTIONAL element (`["--username",
+                        // username]` where username is `str | None` — pip's
+                        // subversion) boxes the same way. Primitive mixes
+                        // without tuples/optionals ([1, 'a']) stay a loud
+                        // error.
+                        if distinct.iter().any(|t| {
+                            matches!(
+                                t,
+                                crate::TypeInfo::Tuple(_)
+                                    | crate::TypeInfo::Option(_)
+                                    // A NESTED list mixing (`[["apple",
+                                    // ...], 1.123]` — rich's logging demo):
+                                    // a list-of-container element boxes
+                                    // (documented divergence).
+                                    | crate::TypeInfo::Vec(_)
+                            )
+                        })
+                            // A WIDE primitive mix (`[1, 2, 3, None, 4,
+                            // True, False, "Hello World"]` — rich's scope
+                            // demo): three or more distinct scalar kinds —
+                            // boxed PyValue (the boxed-container
+                            // divergence, #130).
+                            || distinct.len() >= 3
+                        {
+                            expected = crate::TypeInfo::PyValue;
+                        } else {
+                            let kinds = distinct
+                                .iter()
+                                .map(|d| d.display())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(format!(
+                                "list literal mixes incompatible element types ({kinds}); \
+                                 elements must share a common type (or annotate the \
+                                 variable, e.g. `xs: list[float] = [...]`)"
+                            )
+                            .into());
+                        }
+                    }
                 }
                 let expected_elt = if matches!(expected, crate::TypeInfo::PyObject) {
                     None
@@ -299,75 +367,74 @@ impl<'a> CodeGen for ExprType {
                 };
 
                 let mut elements = Vec::new();
-                for li in l {
-                    let code = if matches!(li, ExprType::Starred(_)) {
-                        li.clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
-                    } else {
-                        crate::render_typed(
-                            &li,
+                let mut starred_vals: Vec<TokenStream> = Vec::new();
+                for li in &l {
+                    if let ExprType::Starred(starred) = li {
+                        // `[*xs]` — the spread's collection extends the
+                        // list (`[key, *val]` — urllib3). The spread reads
+                        // the collection WITHOUT consuming it (Python's
+                        // `[*xs, a]` leaves `xs` usable), so the reuse-clone
+                        // rule applies like any other name read.
+                        let inner = crate::render_reused(
+                            &starred.value,
                             ctx.clone(),
                             options.clone(),
                             symbols.clone(),
-                            expected_elt.clone(),
-                        )?
-                    };
-
-                    // Check if this is a starred expression
-                    if matches!(li, ExprType::Starred(_)) {
-                        let code_str = code.to_string();
-                        // Special handling for sys::argv unpacking
-                        if code_str.contains("sys :: argv") {
-                            // Mark that we need special sys::argv handling with a unique marker
-                            elements.push(quote! { __STARRED_ARGV_MARKER__ });
-                        } else {
-                            elements.push(code);
-                        }
-                    } else {
-                        elements.push(code);
+                        )?;
+                        starred_vals.push(inner);
+                        continue;
                     }
+                    let code = crate::render_typed(
+                        &li,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        expected_elt.clone(),
+                    )?;
+                    elements.push(code);
                 }
                 
                 // If we have starred expressions, handle them specially
                 if has_starred {
-                    let mut final_elements = Vec::new();
-                    let mut has_argv_starred = false;
-                    
-                    for element in elements {
-                        let elem_str = element.to_string();
-                        if elem_str.contains("__STARRED_ARGV_MARKER__") {
-                            has_argv_starred = true;
-                            continue; // Skip the placeholder
+                    // Emit elements in SOURCE ORDER: a spread before or
+                    // between fixed elements must interleave (`[*xs, a]` is
+                    // `xs` then `a`, not `a` then `xs` — the old lowering
+                    // pushed all fixed elements first and extended with the
+                    // spreads after, silently reordering).
+                    enum Seg {
+                        Fixed(proc_macro2::TokenStream),
+                        Spread(proc_macro2::TokenStream),
+                    }
+                    // `elements` holds the fixed renders in source order;
+                    // merge them back with the spreads by walking the
+                    // literal once.
+                    let mut segments: Vec<Seg> = Vec::new();
+                    let mut si = 0usize;
+                    let mut ei = 0usize;
+                    for li in &l {
+                        if let ExprType::Starred(_) = li {
+                            segments.push(Seg::Spread(starred_vals[si].clone()));
+                            si += 1;
                         } else {
-                            final_elements.push(element);
+                            segments.push(Seg::Fixed(elements[ei].clone()));
+                            ei += 1;
                         }
                     }
-                    
-                    // Build the vector with proper unpacking
-                    if has_argv_starred {
-                        if final_elements.is_empty() {
-                            // Only sys::argv unpacking
-                            Ok(quote! {
-                                (*sys::argv).clone()
-                            })
-                        } else {
-                            // Mix of regular elements and sys::argv unpacking
-                            // Clone each element to avoid ownership issues
-                            Ok(quote! {
-                                {
-                                    let mut vec = Vec::new();
-                                    #(vec.push((#final_elements).clone().to_string());)*
-                                    vec.extend((*sys::argv).iter().cloned());
-                                    vec
-                                }
-                            })
+                    let elt_ty = expected_elt
+                        .as_ref()
+                        .map(|t| t.to_rust_type())
+                        .unwrap_or_else(|| quote!(_));
+                    let stmts = segments.iter().map(|seg| match seg {
+                        Seg::Fixed(t) => quote!(__rython_list.push(#t);),
+                        Seg::Spread(t) => quote!(__rython_list.extend(#t);),
+                    });
+                    Ok(quote! {
+                        {
+                            let mut __rython_list: Vec<#elt_ty> = Vec::new();
+                            #(#stmts)*
+                            __rython_list
                         }
-                    } else {
-                        // Other starred expressions (not sys::argv)
-                        Ok(quote! {
-                            vec![#(#final_elements),*]
-                        })
-                    }
+                    })
                 } else {
                     // Elements keep their own types: [1, 2, 3] must become a
                     // Vec<i64>, not a Vec<String>.
@@ -636,6 +703,19 @@ impl CodeGen for Expr {
         if matches!(self.value, ExprType::NoneType(_)) {
             return Ok(quote!());
         }
+        // A bare `...` statement is a no-op (Python's Ellipsis as a
+        // statement — the Protocol-stub idiom `def f(...) -> None: ...`).
+        // As a VALUE (assignment, argument, return) Constant::to_rust
+        // rejects it loudly.
+        if matches!(
+            &self.value,
+            ExprType::Constant(c)
+                if c.0
+                    .as_ref()
+                    .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+        ) {
+            return Ok(quote!());
+        }
         self.value.to_rust(ctx, options, symbols)
     }
 }
@@ -687,8 +767,7 @@ mod tests {
 /// yield bool; anything else is wrapped in stdpython's Truthy::is_truthy,
 /// giving Python's truth table (empty string/collection and zero are
 /// false).
-pub fn condition_to_rust(
-    expr: &ExprType,
+pub fn condition_to_rust(    expr: &ExprType,
     ctx: CodeGenContext,
     options: PythonOptions,
     symbols: SymbolTableScopes,
@@ -725,5 +804,354 @@ pub fn condition_to_rust(
             let tokens = other.clone().to_rust(ctx, options, symbols)?;
             Ok(quote!((#tokens).is_truthy()))
         }
+    }
+}
+
+/// Issue #125: if the test is `x is not None` (or `None is not x`) and x
+/// holds an Option, return (x, inner_type) so the if body can narrow x:
+/// reads unwrap, and the comprehension/iteration over x sees the inner
+/// element type. Returns None for any other test shape.
+pub fn narrowing_from_test(
+    test: &ExprType,
+    options: &PythonOptions,
+) -> Option<(String, Option<crate::TypeInfo>)> {
+    let ExprType::Compare(cmp) = test else {
+        return None;
+    };
+    if cmp.ops.len() != 1 || !matches!(cmp.ops[0], crate::Compares::IsNot) {
+        return None;
+    }
+    // One side must be None, the other a plain name.
+    let left_is_none = crate::is_none_expr(&cmp.left);
+    let right_is_none = cmp
+        .comparators
+        .first()
+        .is_some_and(crate::is_none_expr);
+    if left_is_none == right_is_none {
+        return None; // both None (degenerate) or neither — no narrowing
+    }
+    let name = if left_is_none {
+        cmp.comparators.first()?
+    } else {
+        &cmp.left
+    };
+    let ExprType::Name(n) = name else {
+        return None;
+    };
+    // Only names that are statically known to hold an Option narrow.
+    if !options.optional_names.contains(&n.id) {
+        return None;
+    }
+    let inner = options
+        .name_types
+        .get(&n.id)
+        .and_then(|t| match t {
+            crate::TypeInfo::Option(inner) => Some((**inner).clone()),
+            _ => None,
+        });
+    Some((n.id.clone(), inner))
+}
+
+/// Issue #121: `if isinstance(x, (bytes, bytearray)):` (or
+/// `if not isinstance(...)`) narrows a `str | bytes` union or a boxed
+/// PyValue union: the tested branch becomes the concrete member type, the
+/// other branch becomes the complement (String for StrOrBytes, the boxed
+/// PyValue for PyValue). A compound test — `if isinstance(x, tuple) and
+/// len(x) == 2:` — narrows only the body (the `and` could fail on the
+/// other conjunct, so the else stays the original type). Returns
+/// (name, body_type, else_type). None for any other test.
+pub fn isinstance_narrowing(
+    test: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<(String, crate::TypeInfo, crate::TypeInfo)> {
+    use crate::ExprType;
+    // The test may be wrapped in a unary not: `if not isinstance(...)`.
+    let (negated, inner) = match test {
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::Not) => {
+            (true, u.operand.as_ref())
+        }
+        // A compound `isinstance(x, T) and <rest>` narrows the body only.
+        ExprType::BoolOp(op) if matches!(op.op, crate::BoolOps::And) => {
+            for value in &op.values {
+                if let Some((name, body_ty, _)) =
+                    isinstance_narrowing(value, options, symbols)
+                {
+                    // The else branch keeps the ORIGINAL type: the `and`
+                    // may have failed on the other conjunct, so the
+                    // complement narrowing does not apply.
+                    let original = options
+                        .name_types
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(crate::TypeInfo::StrOrBytes);
+                    return Some((name, body_ty, original));
+                }
+            }
+            return None;
+        }
+        other => (false, other),
+    };
+    let ExprType::Call(call) = inner else {
+        return None;
+    };
+    let ExprType::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id != "isinstance" || call.args.len() != 2 {
+        return None;
+    }
+    let ExprType::Name(n) = &call.args[0] else {
+        return None;
+    };
+    // The name must be a str|bytes union or a boxed PyValue union.
+    let is_union = options
+        .name_types
+        .get(&n.id)
+        .is_some_and(|t| matches!(t, crate::TypeInfo::StrOrBytes | crate::TypeInfo::PyValue));
+    if !is_union {
+        return None;
+    }
+    // The second argument: a tuple of type names or a single type name
+    // (str narrows to String, bytes/bytearray to Bytes, int/float/bool/
+    // tuple to the PyValue members). Aliased type names (`builtin_str =
+    // str`) and imported aliases resolve through symbols.
+    fn resolve_type_name(
+        id: &str,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
+    ) -> Option<String> {
+        resolve_type_name_depth(id, options, symbols, 0)
+    }
+    fn resolve_type_name_depth(
+        id: &str,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 16 {
+            return None;
+        }
+        match symbols.get(id) {
+            Some(crate::SymbolTableNode::Assign { value, .. }) => match value {
+                ExprType::Name(n)
+                    if matches!(
+                        n.id.as_str(),
+                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "tuple"
+                    ) =>
+                {
+                    Some(n.id.clone())
+                }
+                _ => None,
+            },
+            Some(crate::SymbolTableNode::Alias(canonical)) => {
+                // A self-aliasing re-export (`from .connection import
+                // ProxyConfig as ProxyConfig` — urllib3) would recurse
+                // forever; the alias is a no-op.
+                if canonical == id {
+                    None
+                } else {
+                    resolve_type_name_depth(canonical, options, symbols, depth + 1)
+                }
+            }
+            Some(crate::SymbolTableNode::ImportFrom(i)) => {
+                let path = i.resolved_module_path(options);
+                if options.module_defs.contains_key(&path) {
+                    let module = options.module_defs.get(&path)?;
+                    let module: &crate::Module = module;
+                    let syms = module
+                        .clone()
+                        .find_symbols(SymbolTableScopes::new());
+                    resolve_type_name_depth(id, options, &syms, depth + 1)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    // Collect the resolved target type names (deduplicated, in order).
+    let mut targets: Vec<String> = Vec::new();
+    match &call.args[1] {
+        ExprType::Name(t) => {
+            let id = resolve_type_name(&t.id, options, symbols).unwrap_or_else(|| t.id.clone());
+            targets.push(id);
+        }
+        ExprType::Tuple(tup) => {
+            for elt in &tup.elts {
+                let ExprType::Name(t) = elt else {
+                    return None;
+                };
+                let id = resolve_type_name(&t.id, options, symbols)
+                    .unwrap_or_else(|| t.id.clone());
+                targets.push(id);
+            }
+        }
+        _ => return None,
+    }
+    let known = |id: &str| {
+        matches!(
+            id,
+            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "tuple"
+        )
+    };
+    if targets.is_empty() || targets.iter().any(|t| !known(t)) {
+        return None;
+    }
+    // Map each resolved target to the member TypeInfo it narrows to.
+    let member_of = |id: &str| -> Option<crate::TypeInfo> {
+        match id {
+            "str" => Some(crate::TypeInfo::String),
+            "bytes" | "bytearray" => Some(crate::TypeInfo::Bytes),
+            "int" => Some(crate::TypeInfo::Int),
+            "float" => Some(crate::TypeInfo::Float),
+            "bool" => Some(crate::TypeInfo::Bool),
+            // A tuple member is read as its element vector
+            // (PyValue::as_tuple().unwrap().clone()).
+            "tuple" => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
+            _ => None,
+        }
+    };
+    let members: Vec<crate::TypeInfo> = targets
+        .iter()
+        .filter_map(|t| member_of(t))
+        .collect();
+    // Deduplicate: (bytes, bytearray) both narrow to Bytes.
+    let mut distinct: Vec<crate::TypeInfo> = Vec::new();
+    for m in members {
+        if !distinct.contains(&m) {
+            distinct.push(m);
+        }
+    }
+    if distinct.is_empty() {
+        return None;
+    }
+    let original_is_pyvalue = options
+        .name_types
+        .get(&n.id)
+        .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue));
+    let (tested, other) = if distinct.len() == 1 {
+        let member = distinct.pop().unwrap();
+        if original_is_pyvalue {
+            (
+                crate::TypeInfo::PyValueMember(Box::new(member.clone())),
+                crate::TypeInfo::PyValue,
+            )
+        } else {
+            // StrOrBytes: bytes → Bytes, str → String; the complement is
+            // the other branch.
+            match member {
+                crate::TypeInfo::Bytes => {
+                    (crate::TypeInfo::Bytes, crate::TypeInfo::String)
+                }
+                crate::TypeInfo::String => {
+                    (crate::TypeInfo::String, crate::TypeInfo::Bytes)
+                }
+                _ => return None,
+            }
+        }
+    } else {
+        // Several DISTINCT member targets on a PyValue narrow nothing
+        // (the test itself still dispatches at runtime via call.rs).
+        return None;
+    };
+    let (body_ty, else_ty) = if negated {
+        (other, tested)
+    } else {
+        (tested, other)
+    };
+    Some((n.id.clone(), body_ty, else_ty))
+}
+
+/// Issue #125: update the function-level narrowed set after a statement.
+/// An `if x is not None: <body> else: <else>` where BOTH branches leave x
+/// non-None narrows x for the rest of the function. Any statement that can
+/// assign None to a narrowed name drops it from the set (a store of a
+/// possibly-None value — conservative: an `x = ...` whose value is not
+/// statically non-None removes x).
+pub fn update_narrowed_after_statement(
+    stmt: &crate::Statement,
+    narrowed: &mut std::collections::HashMap<String, crate::TypeInfo>,
+    options: &PythonOptions,
+) {
+    match &stmt.statement {
+        crate::StatementType::If(i) => {
+            // The test narrows x in the body; both branches leaving x
+            // non-None narrows x AFTER the if/else.
+            if let Some((name, inner)) = narrowing_from_test(&i.test, options) {
+                let body_ok = branch_ends_non_none(&i.body);
+                let else_ok = branch_ends_non_none(&i.orelse);
+                if body_ok && else_ok {
+                    narrowed.insert(
+                        name,
+                        inner.unwrap_or(crate::TypeInfo::StrOrBytes),
+                    );
+                }
+            }
+            // A name narrowed by an INNER statement only narrows within that
+            // branch, not after the if (a branch may not run). Nothing to
+            // propagate.
+        }
+        // `x = None` (or any store that may produce None) invalidates the
+        // narrowing; an assignment of a statically non-None value keeps it.
+        crate::StatementType::Assign(a) => {
+            if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
+                if narrowed.contains_key(&n.id) && !statically_non_none(&a.value) {
+                    narrowed.remove(&n.id);
+                }
+            }
+        }
+        crate::StatementType::AugAssign(a) => {
+            if let crate::ExprType::Name(n) = &a.target {
+                narrowed.remove(&n.id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a statement list's last statement is an assignment of a
+/// statically non-None value to some name (the "branch leaves the name
+/// non-None" check for post-if narrowing). Only the LAST store matters:
+/// earlier stores are overwritten.
+fn branch_ends_non_none(body: &[crate::Statement]) -> bool {
+    for stmt in body.iter().rev() {
+        match &stmt.statement {
+            crate::StatementType::Assign(a) => {
+                return statically_non_none(&a.value);
+            }
+            crate::StatementType::Pass => continue,
+            // A nested if/else is treated conservatively: only when its own
+            // branches both assign non-None does it count as ending non-None.
+            crate::StatementType::If(i) => {
+                if i.orelse.is_empty() {
+                    return false;
+                }
+                return branch_ends_non_none(&i.body) && branch_ends_non_none(&i.orelse);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether an expression is statically NOT None: a literal other than None,
+/// a non-None constant, a call (functions never return the None literal
+/// here — conservative), a non-Option name, or a container literal.
+fn statically_non_none(expr: &crate::ExprType) -> bool {
+    match expr {
+        crate::ExprType::Constant(c) => c.0.is_some(),
+        crate::ExprType::Name(n) => !matches!(n.id.as_str(), "None" | "True" | "False"),
+        crate::ExprType::List(_)
+        | crate::ExprType::Dict(_)
+        | crate::ExprType::Set(_)
+        | crate::ExprType::Tuple(_)
+        | crate::ExprType::ListComp(_)
+        | crate::ExprType::DictComp(_)
+        | crate::ExprType::SetComp(_)
+        | crate::ExprType::Call(_)
+        | crate::ExprType::JoinedStr(_)
+        | crate::ExprType::FormattedValue(_) => true,
+        _ => false,
     }
 }

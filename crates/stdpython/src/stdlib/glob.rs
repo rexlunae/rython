@@ -9,39 +9,78 @@ use std::path::Path;
 /// Find all pathnames matching a given pattern
 #[cfg(feature = "std")]
 pub fn glob<P: AsRef<str>>(pathname: P) -> Result<Vec<String>, PyException> {
-    let pattern = pathname.as_ref();
+    glob_impl(pathname.as_ref(), false)
+}
+
+/// glob with recursive `**` support (CPython's `recursive=True`).
+#[cfg(feature = "std")]
+fn glob_impl(pattern: &str, recursive: bool) -> Result<Vec<String>, PyException> {
     let mut results = Vec::new();
-    
-    // Handle absolute vs relative paths
-    if pattern.starts_with('/') || pattern.starts_with("\\") || (pattern.len() > 1 && pattern.chars().nth(1) == Some(':')) {
-        glob_recursive(Path::new("/"), pattern, &mut results)?;
+
+    // Handle absolute vs relative paths. Results keep the pattern's shape:
+    // a relative pattern yields relative paths (issue #82) — the old code
+    // resolved the base to current_dir() and pushed absolute paths.
+    let is_absolute = pattern.starts_with('/')
+        || pattern.starts_with("\\")
+        || (pattern.len() > 1 && pattern.chars().nth(1) == Some(':'));
+    let base: std::path::PathBuf = if is_absolute {
+        std::path::PathBuf::from("/")
     } else {
-        let cwd = std::env::current_dir()
-            .map_err(|e| crate::runtime_error(format!("Failed to get current directory: {}", e)))?;
-        glob_recursive(&cwd, pattern, &mut results)?;
+        std::env::current_dir()
+            .map_err(|e| crate::runtime_error(format!("Failed to get current directory: {}", e)))?
+    };
+
+    glob_recursive(&base, pattern, recursive, &mut results)?;
+
+    if is_absolute {
+        results.sort();
+        return Ok(results);
     }
-    
-    results.sort();
-    Ok(results)
+    // Strip the cwd prefix back off so relative patterns stay relative.
+    let cwd = std::env::current_dir()
+        .map_err(|e| crate::runtime_error(format!("Failed to get current directory: {}", e)))?;
+    let cwd_str = cwd.to_string_lossy();
+    let mut relative = Vec::new();
+    for r in results {
+        if let Some(stripped) = r.strip_prefix(&*cwd_str) {
+            let stripped = stripped.trim_start_matches('/');
+            if stripped.is_empty() {
+                // A match of the cwd itself: CPython renders it as ".".
+                relative.push(".".to_string());
+            } else {
+                relative.push(stripped.to_string());
+            }
+        } else {
+            relative.push(r);
+        }
+    }
+    relative.sort();
+    Ok(relative)
 }
 
 /// Recursive glob implementation
 #[cfg(feature = "std")]
-fn glob_recursive(base_path: &Path, pattern: &str, results: &mut Vec<String>) -> Result<(), PyException> {
+fn glob_recursive(
+    base_path: &Path,
+    pattern: &str,
+    recursive: bool,
+    results: &mut Vec<String>,
+) -> Result<(), PyException> {
     let pattern_parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
     if pattern_parts.is_empty() {
         return Ok(());
     }
-    
-    glob_recursive_helper(base_path, &pattern_parts, 0, results)
+
+    glob_recursive_helper(base_path, &pattern_parts, 0, recursive, results)
 }
 
 #[cfg(feature = "std")]
 fn glob_recursive_helper(
-    current_path: &Path, 
-    pattern_parts: &[&str], 
+    current_path: &Path,
+    pattern_parts: &[&str],
     part_index: usize,
-    results: &mut Vec<String>
+    recursive: bool,
+    results: &mut Vec<String>,
 ) -> Result<(), PyException> {
     if part_index >= pattern_parts.len() {
         if current_path.exists() {
@@ -49,13 +88,15 @@ fn glob_recursive_helper(
         }
         return Ok(());
     }
-    
+
     let current_pattern = pattern_parts[part_index];
-    
-    // Handle ** (recursive wildcard)
-    if current_pattern == "**" {
+
+    // Handle ** (recursive wildcard). CPython's default is
+    // recursive=False, where ** behaves exactly like * (issue #82);
+    // recursive=True descends (skipping hidden directories, like Python).
+    if current_pattern == "**" && recursive {
         // Try matching current directory first
-        glob_recursive_helper(current_path, pattern_parts, part_index + 1, results)?;
+        glob_recursive_helper(current_path, pattern_parts, part_index + 1, recursive, results)?;
 
         // Then recursively search subdirectories. Python's ** does not
         // descend into hidden directories.
@@ -67,20 +108,20 @@ fn glob_recursive_helper(
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with('.'));
                 if path.is_dir() && !hidden {
-                    glob_recursive_helper(&path, pattern_parts, part_index, results)?;
+                    glob_recursive_helper(&path, pattern_parts, part_index, recursive, results)?;
                 }
             }
         }
         return Ok(());
     }
-    
+
     if !current_path.is_dir() {
         return Ok(());
     }
-    
+
     let entries = std::fs::read_dir(current_path)
         .map_err(|e| crate::runtime_error(format!("Failed to read directory: {}", e)))?;
-    
+
     for entry in entries.flatten() {
         let path = entry.path();
         let filename = path.file_name()
@@ -100,11 +141,11 @@ fn glob_recursive_helper(
                 results.push(path.to_string_lossy().to_string());
             } else {
                 // Continue with next part
-                glob_recursive_helper(&path, pattern_parts, part_index + 1, results)?;
+                glob_recursive_helper(&path, pattern_parts, part_index + 1, recursive, results)?;
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -154,27 +195,10 @@ fn match_glob_recursive(text: &[char], pattern: &[char], text_idx: usize, patter
                 false
             }
         }
-        '{' => {
-            // Brace expansion - simplified version
-            if let Some(alternatives) = parse_brace_expansion(pattern, pattern_idx) {
-                for (alt_pattern, next_idx) in alternatives {
-                    if match_glob_recursive(text, &alt_pattern, text_idx, 0) &&
-                       match_glob_recursive(text, pattern, text_idx + alt_pattern.len(), next_idx) {
-                        return true;
-                    }
-                }
-                false
-            } else {
-                // Treat as literal '{'
-                if text[text_idx] == '{' {
-                    match_glob_recursive(text, pattern, text_idx + 1, pattern_idx + 1)
-                } else {
-                    false
-                }
-            }
-        }
         c => {
-            // Match exact character
+            // Match exact character. NOTE: `{a,b}` brace expansion is
+            // deliberately NOT implemented — CPython's glob has no brace
+            // expansion, so `{` is an ordinary literal (issue #82).
             if text[text_idx] == c {
                 match_glob_recursive(text, pattern, text_idx + 1, pattern_idx + 1)
             } else {
@@ -233,48 +257,12 @@ fn match_char_class(ch: char, pattern: &[char], start_idx: usize) -> Option<(boo
 }
 
 /// Parse brace expansion like {a,b,c}
-fn parse_brace_expansion(pattern: &[char], start_idx: usize) -> Option<Vec<(Vec<char>, usize)>> {
-    if start_idx >= pattern.len() || pattern[start_idx] != '{' {
-        return None;
-    }
-    
-    let mut idx = start_idx + 1;
-    let mut alternatives = Vec::new();
-    let mut current_alt = Vec::new();
-    let mut brace_count = 1;
-    
-    while idx < pattern.len() && brace_count > 0 {
-        match pattern[idx] {
-            '{' => {
-                brace_count += 1;
-                current_alt.push(pattern[idx]);
-            }
-            '}' => {
-                brace_count -= 1;
-                if brace_count == 0 {
-                    alternatives.push((current_alt.clone(), idx + 1));
-                    break;
-                } else {
-                    current_alt.push(pattern[idx]);
-                }
-            }
-            ',' if brace_count == 1 => {
-                alternatives.push((current_alt.clone(), idx + 1));
-                current_alt.clear();
-            }
-            c => {
-                current_alt.push(c);
-            }
-        }
-        idx += 1;
-    }
-    
-    if brace_count == 0 && !alternatives.is_empty() {
-        Some(alternatives)
-    } else {
-        None
-    }
-}
+///
+/// Intentionally absent: CPython's glob has no brace expansion, so `{` is
+/// an ordinary literal character (issue #82). Kept as a tombstone so nobody
+/// re-adds shell-style braces in the mistaken belief glob supports them.
+#[allow(dead_code)]
+fn parse_brace_expansion_removed() {}
 
 /// Find all pathnames matching pattern (with recursive search)
 #[cfg(feature = "std")]
@@ -286,8 +274,8 @@ pub fn rglob<P: AsRef<str>>(pathname: P) -> Result<Vec<String>, PyException> {
     } else {
         format!("**/{}", pattern)
     };
-    
-    glob(recursive_pattern)
+
+    glob_impl(&recursive_pattern, true)
 }
 
 /// Determine if pathname is a hidden file
@@ -301,28 +289,31 @@ pub fn is_hidden<P: AsRef<str>>(pathname: P) -> bool {
     false
 }
 
-/// Escape glob metacharacters
+/// Escape glob metacharacters with the bracket escapes CPython uses:
+/// `*` -> `[*]`, `?` -> `[?]`, `[` -> `[[]`; `]`, `{`, `}` are not magic
+/// and stay untouched (issue #82). The old backslash escapes were not
+/// readable by this module's own matcher, so `glob(escape(name))` never
+/// round-tripped.
 pub fn escape<P: AsRef<str>>(pathname: P) -> String {
     let path_str = pathname.as_ref();
     let mut result = String::new();
-    
+
     for ch in path_str.chars() {
         match ch {
-            '*' | '?' | '[' | ']' | '{' | '}' => {
-                result.push('\\');
-                result.push(ch);
-            }
+            '*' => result.push_str("[*]"),
+            '?' => result.push_str("[?]"),
+            '[' => result.push_str("[[]"),
             c => result.push(c),
         }
     }
-    
+
     result
 }
 
 /// Check if string has glob metacharacters
 pub fn has_magic<P: AsRef<str>>(pathname: P) -> bool {
     let path_str = pathname.as_ref();
-    path_str.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'))
+    path_str.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
 
 /// Same as glob but returns iterator (simplified - returns Vec for now)
@@ -355,9 +346,15 @@ mod tests {
     
     #[test]
     fn test_escape() {
-        assert_eq!(escape("file*.txt"), "file\\*.txt");
-        assert_eq!(escape("test[123].py"), "test\\[123\\].py");
+        // CPython's bracket escapes, readable by this module's own matcher.
+        assert_eq!(escape("file*.txt"), "file[*].txt");
+        assert_eq!(escape("test[123].py"), "test[[]123].py");
+        assert_eq!(escape("a?b{c}d]e"), "a[?]b{c}d]e");
         assert_eq!(escape("normal_file.txt"), "normal_file.txt");
+        // The matcher round-trips what escape produces.
+        assert!(match_glob("file*.txt", &escape("file*.txt")));
+        assert!(match_glob("test[123].py", &escape("test[123].py")));
+        assert!(!match_glob("fileX.txt", &escape("file*.txt")));
     }
     
     #[test]
@@ -365,7 +362,7 @@ mod tests {
         assert!(has_magic("*.txt"));
         assert!(has_magic("file?.py"));
         assert!(has_magic("test[123]"));
-        assert!(has_magic("{a,b,c}"));
+        assert!(!has_magic("{a,b,c}"));
         assert!(!has_magic("normal_file.txt"));
     }
     

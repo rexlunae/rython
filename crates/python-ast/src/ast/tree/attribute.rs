@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 pub struct Attribute {
     pub value: Box<ExprType>,
     pub attr: String,
-    ctx: String,
+    /// Load/Store/Del context marker, carried from the Python AST.
+    pub ctx: String,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {
@@ -89,7 +90,129 @@ impl<'a> CodeGen for Attribute {
         // stdlib module path. Computed before `self.value` is moved below.
         let root_shadowed = crate::ast::tree::call::root_name(&self.value)
             .is_some_and(|root| crate::module_name_shadowed(root, &symbols));
-        let module_chain = is_module_path_chain(&self.value, &symbols);
+        // A CLASS-CONSTANT read (`GzipDecoderState.SWALLOW_DATA` — urllib3's
+        // response decoders): literal class-level constants emit as
+        // `impl X { pub const NAME: T = v; }` (class_def.rs), so the read
+        // renders `X::NAME`, not `X.NAME`. Computed before moves below.
+        // The rendered path is the CLASS's name, not the receiver's
+        // identifier: a @classmethod body reads `cls.DEFAULT` where `cls`
+        // is bound to the enclosing ClassDef — the constant lives on the
+        // class (urllib3's Retry.from_int).
+        let class_const_read: Option<String> = match self.value.as_ref() {
+            ExprType::Name(receiver) => symbols
+                .get(&receiver.id)
+                .is_some_and(|s| match s {
+                    crate::SymbolTableNode::ClassDef(class) => class.body.iter().any(|bs| {
+                        matches!(
+                            &bs.statement,
+                            crate::StatementType::Assign(a)
+                                if a.targets.len() == 1
+                                    && matches!(&a.targets[0], ExprType::Name(n) if n.id == self.attr)
+                                    && crate::ast::tree::module::const_static_type(&a.value)
+                                        .is_some()
+                        )
+                    }),
+                    _ => false,
+                })
+                .then(|| {
+                    // The class's OWN name (for `cls`, the receiver
+                    // identifier is not a Rust type in scope).
+                    match symbols.get(&receiver.id) {
+                        Some(crate::SymbolTableNode::ClassDef(c)) => c.name.clone(),
+                        _ => receiver.id.clone(),
+                    }
+                }),
+            _ => None,
+        };
+        // A receiver that IS a class (a @classmethod's `cls`, or a bare
+        // class name read as a value): an attribute on it that is NOT a
+        // class-body constant (`cls.DEFAULT` where `Retry.DEFAULT =
+        // Retry(3)` is assigned at MODULE level after the class — urllib3's
+        // Retry.from_int) has no static item — the module-level
+        // class-attribute divergence: the read boxes to None. Also an
+        // IMPORTED class (`Retry.DEFAULT` in connectionpool.py — Retry is
+        // imported from util.retry): the class body has no DEFAULT, so the
+        // read boxes the same way.
+        let class_value_receiver: Option<String> = match self.value.as_ref() {
+            ExprType::Name(receiver) => {
+                let is_class = match symbols.get(&receiver.id) {
+                    Some(crate::SymbolTableNode::ClassDef(_)) => true,
+                    Some(crate::SymbolTableNode::ImportFrom(_)) => {
+                        crate::resolve_class_referenced(&receiver.id, &symbols, &options).is_some()
+                    }
+                    Some(crate::SymbolTableNode::Alias(_)) => {
+                        crate::resolve_class_referenced(&receiver.id, &symbols, &options).is_some()
+                    }
+                    _ => false,
+                };
+                if is_class {
+                    if class_const_read.is_some() {
+                        None
+                    } else {
+                        Some(receiver.id.clone())
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let module_chain = is_module_path_chain(&self.value, &symbols, &options);
+        // A module-path member read into a CRATE module whose generated
+        // code has no item of that name (`util.ssl_.PROTOCOL_TLS` —
+        // urllib3's pyopenssl, where PROTOCOL_TLS is an external ssl
+        // constant the generated ssl_ module never defines): the member is
+        // unmodeled — the read lowers to the boxed None (the
+        // dynamic-module-member divergence, the same model getattr uses).
+        // stdpython modules are exempt: their members resolve through the
+        // runtime. Computed before `self.value`/`symbols` are moved below.
+        // A module-path member read where the member is a CLASS in the
+        // defining module (`urllib3_connection::HTTPSConnection` — urllib3's
+        // http2/__init__.py, `orig_HTTPSConnection =
+        // urllib3_connection.HTTPSConnection`): a class read as a VALUE has
+        // no runtime equivalent — the boxed None (the classes-as-values
+        // divergence, the same model name.rs uses). The class IS a path
+        // item, but a VALUE read of it is unrepresentable.
+        let class_value_module_member = module_chain
+            && !crate::ast::tree::call::root_name(&self.value)
+                .is_some_and(|r| crate::is_stdpython_module(r))
+            && crate::ast::tree::call::module_path_of_chain(&self.value, &symbols, &options)
+                .is_some_and(|mod_path| {
+                    options.module_defs.contains_key(&mod_path)
+                        && crate::ast::tree::module::module_def_has_path_item(
+                            &options,
+                            &mod_path,
+                            &self.attr,
+                        )
+                        && crate::module_class_def(&options, &mod_path, &self.attr).is_some()
+                });
+        let missing_module_member = module_chain
+            && !crate::ast::tree::call::root_name(&self.value)
+                .is_some_and(|r| crate::is_stdpython_module(r))
+            && crate::ast::tree::call::module_path_of_chain(&self.value, &symbols, &options)
+                .is_some_and(|mod_path| {
+                    options.module_defs.contains_key(&mod_path)
+                        && !crate::ast::tree::module::module_def_has_path_item(
+                            &options,
+                            &mod_path,
+                            &self.attr,
+                        )
+                });
+        // An attribute read on an except-bound name (`e.expected` —
+        // urllib3's _error_catcher reading IncompleteRead's dynamic
+        // fields): the exception object has no static fields (rython
+        // models exceptions as name + message), so the read lowers to
+        // the boxed None (the dynamic-attribute divergence). Computed
+        // before `self.value`/`symbols` are moved below.
+        let except_binding_receiver: Option<String> = match self.value.as_ref() {
+            ExprType::Name(receiver) => match symbols.get(&receiver.id) {
+                Some(crate::SymbolTableNode::ExceptBinding) => {
+                    Some(receiver.id.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         // True when the chain's root is a vendored `[python-modules]`
         // dependency — those lower to `crate::<dep>::<attr>` paths (see
         // the emission below). Computed before `self.value` is moved.
@@ -101,9 +224,30 @@ impl<'a> CodeGen for Attribute {
         // chain (`textlib.core.double`) must NOT be re-prefixed. Checked
         // before `self.value` is moved.
         let single_segment_chain = matches!(self.value.as_ref(), ExprType::Name(_));
+        // An EXTERNAL module root (ssl, socket, zlib, logging, ...) — no
+        // generated items exist, so the attribute lowers to the boxed None
+        // (computed before `self.value`/`symbols` are moved below).
+        let external_root = external_module_root(&self.value, &symbols, &options);
+        // A BOXED-PyValue receiver (`self._response().body.closed` — the
+        // emscripten response where `body` is a PyValue field): the
+        // attribute read has no static shape — it lowers to the boxed None
+        // (dynamic-attribute divergence, the same model getattr uses).
+        // Computed before `self.value`/`symbols` are moved below.
+        let pyvalue_receiver = receiver_is_pyvalue(&self.value, &ctx, &symbols, &options);
+        let receiver_is_field_chain = matches!(self.value.as_ref(), ExprType::Attribute(_));
+        // A PROPERTY GETTER read (`self.url` — urllib3's geturl, where url
+        // is `@property def url`): the property lowers as a plain method
+        // returning Result, so the read routes to the getter CALL and
+        // unwraps (`self.url()?`). Computed before the moves below.
+        let property_getter = crate::receiver_class(&self.value, &ctx, &symbols, &options)
+            .is_some_and(|(class, _)| class.has_property_getter(&self.attr));
+        let warnings = options.definition_warnings.clone();
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
+        // Debug-form of the receiver for -W messages (captured before the
+        // move above).
+        let value_debug = format!("{:?}", value_str);
 
         // Determine if this is a module access or a field/method access
         // Module names are typically lowercase and match Python stdlib modules
@@ -131,6 +275,40 @@ impl<'a> CodeGen for Attribute {
             ) || module_chain);
 
         if is_module_access {
+            // An EXTERNAL module (ssl, socket, zlib, logging, ...) has no
+            // generated items: the attribute read lowers to the boxed None
+            // with a warning (documented divergence — the external object's
+            // attribute is unmodeled, the same model getattr uses).
+            if let Some(root) = &external_root {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the module `{}` is external to the generated \
+                     crate (external-module divergence)",
+                    root, self.attr, root
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A module-path member read into a CRATE module with no item of
+            // that name: the boxed None (see missing_module_member above).
+            if missing_module_member {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the generated module has no runtime item for \
+                     `{}` (the member is unmodeled — the \
+                     dynamic-module-member divergence)",
+                    value_debug, self.attr, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A module-path member that is a CLASS read as a VALUE
+            // (`urllib3_connection::HTTPSConnection` — http2/__init__.py):
+            // the boxed None (classes-as-values divergence).
+            if class_value_module_member {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` (a class read as a value) lowers to the boxed None \
+                     (classes cannot be runtime values in rython)",
+                    value_debug, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             // Use :: for module access (Python's sys.executable becomes sys::executable)
             // Special handling for LazyLock static variables that need
             // dereferencing. os::environ is NOT here: it is a live-view
@@ -139,6 +317,14 @@ impl<'a> CodeGen for Attribute {
                 (value_str.as_str(), self.attr.as_str()),
                 ("sys", "executable") | ("sys", "argv")
             );
+
+            // `sys.modules` — the process's import registry (requests'
+            // packages.py aliasing): rython's crate is static, so the
+            // registry is always empty — the read lowers to an empty dict
+            // (list(sys.modules) iterates nothing, indexing misses).
+            if value_str == "sys" && self.attr == "modules" {
+                return Ok(quote!(PyDict::<String, stdpython::PyValue>::from([])));
+            }
 
             if needs_deref {
                 // Wrap dereferenced values in parentheses to ensure correct precedence
@@ -166,12 +352,83 @@ impl<'a> CodeGen for Attribute {
                 Ok(quote!(#value_tokens::#attr))
             }
         } else {
+            // A read on an EXTERNAL-module receiver (`TLSVersion.
+            // MINIMUM_SUPPORTED` — from ssl, external): the attribute has
+            // no runtime item — the boxed None.
+            if let Some(root) = &external_root {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the module `{}` is external to the generated \
+                     crate (external-module divergence)",
+                    root, self.attr, root
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A read on a BOXED-PyValue receiver (`self._response().body
+            // .closed` — the emscripten response's `body` field is PyValue):
+            // the attribute has no static shape — the boxed None (the
+            // dynamic-attribute divergence).
+            // A read on a BOXED-PyValue receiver (`self._response().body
+            // .closed` — the emscripten response's `body` field is PyValue):
+            // the attribute has no static shape — the boxed None (the
+            // dynamic-attribute divergence). Only FIELD-CHAIN receivers
+            // qualify: a plain Name receiver may be a CALLEE being rendered
+            // (`b.lower()` renders its func through this path), and its
+            // dynamic protocol methods must not be boxed away.
+            if pyvalue_receiver && receiver_is_field_chain {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the receiver is a boxed PyValue \
+                     (dynamic-attribute divergence)",
+                    value_debug, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A class-constant read (`GzipDecoderState.SWALLOW_DATA`):
+            // `X::NAME` — the const lives on the class's impl block.
+            if let Some(receiver) = &class_const_read {
+                let receiver = crate::safe_ident(receiver);
+                return Ok(quote!(#receiver::#attr));
+            }
+            // A CLASS receiver read as a value with a non-const attribute
+            // (`cls.DEFAULT` — module-level class attribute): no static
+            // item — the boxed None (module-level class-attribute
+            // divergence).
+            if let Some(receiver) = &class_value_receiver {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` (a module-level class attribute) lowers to the boxed \
+                     None (the class-attribute divergence; class attributes \
+                     assigned outside the class body are not importable)",
+                    receiver, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // An attribute read on an except-bound name (`e.expected` —
+            // urllib3's _error_catcher reading IncompleteRead's dynamic
+            // fields): the exception object has no static fields (rython
+            // models exceptions as name + message), so the read lowers to
+            // the boxed None (the dynamic-attribute divergence).
+            if let Some(receiver) = &except_binding_receiver {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the receiver is an exception object \
+                     bound by `except ... as`, and rython models exceptions \
+                     as name + message (the dynamic-attribute divergence)",
+                    receiver, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
             // Use . for field/method access (Python's obj.field becomes obj.field).
             // A class field owned by an ancestor of the receiver's class is
             // reached through the embedded base structs (`self.__rython_base.f`)
             // or, in a generic trait default, through the base accessors
             // (`self.base().f`); an own field in a generic trait default goes
             // through its accessor (`self.f()`).
+            // A PROPERTY GETTER read (`self.url` — urllib3's geturl, where
+            // url is `@property def url`): the property lowers as a plain
+            // method returning Result, so the read routes to the getter CALL
+            // and unwraps (`self.url()?`). Only when the receiver's class
+            // actually defines the getter — a genuine field read is untouched.
+            if property_getter && field_access.is_none() {
+                return Ok(quote!(#value_tokens.#attr()?));
+            }
             match field_access {
                 None => Ok(quote!(#value_tokens.#attr)),
                 Some(FieldRewrite::Accessor { field }) => {
@@ -254,7 +511,7 @@ pub(crate) fn to_rust_place_expr(
                 attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let is_module = !root_shadowed
                 && (crate::ast::tree::call::root_name(&attr.value).is_some_and(|_root| {
-                    crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols)
+                    crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols, options)
                 }) || matches!(
                     value_tokens.to_string().as_str(),
                     "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio"
@@ -418,7 +675,11 @@ pub(crate) enum FieldRewrite {
 /// field access. Attribute chains recurse: each segment between the root
 /// and the accessed attribute is itself a module path item, so
 /// `pkg.sub.fn` resolves `pkg.sub` the same way.
-pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+pub(crate) fn is_module_path_chain(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
     match expr {
         ExprType::Name(n) => {
             if crate::module_name_shadowed(&n.id, symbols) {
@@ -427,12 +688,206 @@ pub(crate) fn is_module_path_chain(expr: &ExprType, symbols: &SymbolTableScopes)
             match symbols.get(&n.id) {
                 Some(SymbolTableNode::Import(_)) => true,
                 Some(SymbolTableNode::Alias(canonical)) => {
-                    matches!(symbols.get(canonical), Some(SymbolTableNode::Import(_)))
+                    // Follow the alias to the canonical name — which may be
+                    // a submodule import (`from .. import connection as
+                    // urllib3_connection`).
+                    is_module_path_chain(
+                        &ExprType::Name(crate::ast::tree::name::Name {
+                            id: canonical.clone(),
+                        }),
+                        symbols,
+                        options,
+                    )
+                }
+                // A RELATIVE SUBMODULE import (`from . import exceptions`,
+                // `from .util import ssl_`): the name IS a module when the
+                // submodule exists in the crate — attribute reads resolve
+                // as paths (`exceptions.SecurityWarning`,
+                // `ssl_.ALPN_PROTOCOLS`). A sibling that re-exports a
+                // STDPYTHON module (`from .compat import json as
+                // complexjson` — requests' models.py, where compat.py does
+                // `import json`) is ALSO a module path: the import lowered
+                // to `use <stdpython>::json as complexjson;`, so
+                // `complexjson.dumps(...)` resolves as `complexjson::dumps`.
+                Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                    let mut sub = ifm.resolved_module_path(options);
+                    sub.push(n.id.clone());
+                    if options.module_defs.contains_key(&sub) {
+                        return true;
+                    }
+                    let path = ifm.resolved_module_path(options);
+                    options.module_defs.contains_key(&path)
+                        && crate::ast::tree::module::module_reexports_stdpython_module(
+                            options,
+                            &path,
+                            &n.id,
+                        )
+                        .is_some()
+                }
+                // An ABSOLUTE import whose name resolves to a crate
+                // SUBMODULE (`from urllib3.contrib import pyopenssl` —
+                // requests/__init__.py's dead pyopenssl branch): the name
+                // is a module when `module + name` is a module of the
+                // crate — attribute calls resolve as paths
+                // (`pyopenssl::inject_into_urllib3`). A VALUE import
+                // (`from .utils import make_headers`) is not a module
+                // (`module + name` is not a crate module).
+                Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
+                    let mut sub = ifm.resolved_module_path(options);
+                    sub.push(n.id.clone());
+                    options.module_defs.contains_key(&sub)
                 }
                 _ => false,
             }
         }
-        ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols),
+        ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols, options),
         _ => false,
     }
+}
+
+/// The class of a receiver expression, resolving through `self.field()`
+/// accessor CALLS (`self._response().body` — the receiver of `.body` is
+/// the `_response()` accessor, whose class is the `_response` field's
+/// class). The `_mut` accessor spelling (`self._response_mut()`) strips
+/// back to the field name.
+fn receiver_class_deep(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    match expr {
+        ExprType::Call(c) => {
+            let ExprType::Attribute(a) = c.func.as_ref() else {
+                return None;
+            };
+            if let Some(r) = crate::receiver_class(&ExprType::Attribute(a.clone()), ctx, symbols, options) {
+                return Some(r);
+            }
+            if let Some(stripped) = a.attr.strip_suffix("_mut") {
+                let mut a2 = a.clone();
+                a2.attr = stripped.to_string();
+                return crate::receiver_class(&ExprType::Attribute(a2), ctx, symbols, options);
+            }
+            None
+        }
+        _ => crate::receiver_class(expr, ctx, symbols, options),
+    }
+}
+
+/// Whether an ATTRIBUTE chain ends at a PyValue-typed class field
+/// (`self._response().body` — `body` is `pub body: PyValue` on the
+/// emscripten response). Reads THROUGH such a chain are dynamic.
+fn field_chain_ends_in_pyvalue(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Attribute(a) = expr else {
+        return false;
+    };
+    let Some((class, class_symbols)) =
+        receiver_class_deep(&a.value, ctx, symbols, options)
+    else {
+        return false;
+    };
+    let Ok(fields) = class.infer_fields(&class_symbols, options) else {
+        return false;
+    };
+    fields
+        .iter()
+        .find(|(name, _)| name == &a.attr)
+        .is_some_and(|(_, ty)| ty.to_string().contains("PyValue"))
+}
+
+/// Whether an expression is a BOXED PyValue at runtime: a name with an
+/// unknown/boxed type (but never `self`), a call with a known boxed return,
+/// or a field chain ending at a PyValue-typed field. Attribute reads and
+/// method calls ON such a receiver have no static shape — the
+/// dynamic-attribute divergence.
+pub(crate) fn receiver_is_pyvalue(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    match expr {
+        ExprType::Name(n) => {
+            if n.id == "self" {
+                return false;
+            }
+            matches!(
+                crate::infer_type(expr, options, symbols),
+                crate::TypeInfo::PyValue
+                    | crate::TypeInfo::PyObject
+                    | crate::TypeInfo::PyValueMember(_)
+            )
+        }
+        ExprType::Attribute(_) => field_chain_ends_in_pyvalue(expr, ctx, symbols, options),
+        ExprType::Call(c) => matches!(
+            crate::call_return_typeinfo(c, Some(symbols), Some(options)),
+            Some(crate::TypeInfo::PyValue | crate::TypeInfo::PyObject)
+        ),
+        _ => false,
+    }
+}
+
+/// The root name of a module-path chain whose module is EXTERNAL — stdlib
+/// rython does not model (ssl, socket, logging, http, zlib, threading,
+/// codecs, ...) or a non-vendored dependency (socks) — resolved through the
+/// symbol table to its module path and checked against the generated crate.
+/// None when the chain is not a module path, is shadowed, or the module is
+/// part of the crate / stdpython / a vendored dependency. Only meaningful
+/// when the whole crate is known (multi-module conversion); single-module
+/// conversions return None (any import may be a sibling).
+pub(crate) fn external_module_root(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<String> {
+    // Only meaningful when the whole crate is known (multi-module
+    // conversion); a single-module conversion (len == 1) only knows the
+    // module itself, so any import may be a sibling.
+    if options.module_defs.len() <= 1 {
+        return None;
+    }
+    let root = match expr {
+        ExprType::Name(n) => n.id.clone(),
+        ExprType::Attribute(a) => return external_module_root(&a.value, symbols, options),
+        _ => return None,
+    };
+    if crate::module_name_shadowed(&root, symbols) {
+        return None;
+    }
+    let module_path: Option<Vec<String>> = match symbols.get(&root) {
+        Some(SymbolTableNode::Import(im)) => im
+            .names
+            .first()
+            .map(|al| al.name.split('.').map(|s| s.to_string()).collect()),
+        Some(SymbolTableNode::Alias(canonical)) => match symbols.get(canonical) {
+            Some(SymbolTableNode::Import(im)) => im
+                .names
+                .first()
+                .map(|al| al.name.split('.').map(|s| s.to_string()).collect()),
+            Some(SymbolTableNode::ImportFrom(ifm)) => Some(ifm.resolved_module_path(options)),
+            _ => None,
+        },
+        Some(SymbolTableNode::ImportFrom(ifm)) => Some(ifm.resolved_module_path(options)),
+        _ => None,
+    };
+    let Some(path) = module_path else {
+        return None;
+    };
+    let first = path.first().map(|s| s.as_str()).unwrap_or("");
+    if crate::ast::tree::import::is_stdpython_module(first) {
+        return None;
+    }
+    if options.module_defs.contains_key(&path) {
+        return None;
+    }
+    if options.python_modules.contains(first) {
+        return None;
+    }
+    Some(root)
 }

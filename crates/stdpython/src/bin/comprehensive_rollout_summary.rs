@@ -103,7 +103,7 @@ fn test_math_functions() -> i32 {
     
     // Test core math functions
     if sqrt_wrapper(144.0).is_ok() { success += 1; }
-    if pow_wrapper(2.0, 3.0) > 0.0 { success += 1; }
+    if pow_wrapper(2.0, 3.0).is_ok_and(|v| v > 0.0) { success += 1; }
     if sin_wrapper(consts::PI / 2.0) > 0.9 { success += 1; }
     if log_wrapper(100.0, Some(10.0)).is_ok() { success += 1; }
     if factorial_wrapper(5).is_ok() { success += 1; }

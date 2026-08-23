@@ -281,7 +281,7 @@ impl<T> deque<T> {
     /// Find index of first occurrence
     pub fn index(&self, value: &T, start: Option<usize>, stop: Option<usize>) -> Result<usize, PyException> 
     where 
-        T: PartialEq,
+        T: PartialEq + crate::PyRepr,
     {
         let start = start.unwrap_or(0);
         let stop = stop.unwrap_or(self.inner.len()).min(self.inner.len());
@@ -298,17 +298,29 @@ impl<T> deque<T> {
             }
         }
         
-        Err(crate::value_error("deque.index(x): x not in deque"))
+        // CPython names the missing value with repr(): "9 is not in deque",
+        // "'x' is not in deque" — single quotes for str, not Rust Debug's
+        // double quotes.
+        Err(crate::value_error(format!("{} is not in deque", value.py_repr())))
     }
     
-    /// Insert item at position
-    pub fn insert(&mut self, index: usize, item: T) {
+    /// Insert item at position. A bounded deque at its maximum size raises
+    /// IndexError like CPython (issue #82) instead of silently evicting.
+    pub fn insert(&mut self, index: usize, item: T) -> Result<(), PyException> {
+        if let Some(max_len) = self.maxlen {
+            if self.inner.len() >= max_len {
+                return Err(crate::index_error(
+                    "deque already at its maximum size",
+                ));
+            }
+        }
         if index >= self.inner.len() {
             self.inner.push_back(item);
         } else {
             self.inner.insert(index, item);
         }
         self.check_maxlen();
+        Ok(())
     }
     
     /// Clear the deque
@@ -383,6 +395,40 @@ impl<T> Truthy for deque<T> {
     }
 }
 
+/// deque participates in the PyListOps traits so Python-level
+/// `d.insert(i, x)` and `d.count(x)` lower through the same codegen arms as
+/// lists. insert applies Python index rules and raises IndexError at maxlen
+/// (issue #82) instead of silently evicting.
+impl<T> crate::PyListOps<T> for deque<T> {
+    fn count(&self, item: &T) -> i64
+    where
+        T: PartialEq,
+    {
+        self.inner.iter().filter(|e| *e == item).count() as i64
+    }
+    fn py_insert(&mut self, index: i64, item: T) -> Result<(), crate::PyException> {
+        if let Some(max_len) = self.maxlen {
+            if self.inner.len() >= max_len {
+                return Err(crate::index_error(
+                    "deque already at its maximum size",
+                ));
+            }
+        }
+        let len = self.inner.len() as i64;
+        let idx = if index < 0 {
+            len.checked_add(index).unwrap_or(i64::MIN).max(0)
+        } else {
+            index.min(len)
+        } as usize;
+        if idx >= self.inner.len() {
+            self.inner.push_back(item);
+        } else {
+            self.inner.insert(idx, item);
+        }
+        Ok(())
+    }
+}
+
 /// defaultdict - dict subclass with default factory function
 #[derive(Debug, Clone)]
 pub struct defaultdict<K, V> 
@@ -390,7 +436,10 @@ where
     K: Hash + Eq + Clone,
     V: Clone,
 {
-    inner: HashMap<K, V>,
+    // Insertion-ordered PyDict, not a std HashMap: iteration order must
+    // match CPython's dict (issue #82), which a HashMap randomizes per
+    // process.
+    inner: crate::PyDict<K, V>,
     default_factory: Option<fn() -> V>,
 }
 
@@ -402,7 +451,7 @@ where
     /// Create new defaultdict with factory function
     pub fn new(default_factory: fn() -> V) -> Self {
         Self {
-            inner: HashMap::new(),
+            inner: crate::PyDict::default(),
             default_factory: Some(default_factory),
         }
     }
@@ -410,7 +459,7 @@ where
     /// Create defaultdict without factory
     pub fn without_factory() -> Self {
         Self {
-            inner: HashMap::new(),
+            inner: crate::PyDict::default(),
             default_factory: None,
         }
     }
@@ -440,7 +489,9 @@ where
     
     /// Remove key
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.inner.remove(key)
+        // shift_remove keeps the remaining insertion order intact (Python's
+        // dict.pop preserves the order of the other keys).
+        self.inner.shift_remove(key)
     }
     
     /// Check if key exists

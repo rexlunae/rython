@@ -19,20 +19,12 @@ fn unsupported_statement_returns_err() {
 
 /// `del` is unsupported; it must error with the statement name and position.
 #[test]
-fn del_statement_returns_err_with_location() {
+fn del_statement_parses() {
+    // Issue #112: `del` is a representable statement now (index targets
+    // lower through py_pop); `del name` is rejected at CODEGEN time with a
+    // clear message (see codegen_semantics), not at parse time.
     let result = parse("x = 1\ndel x", "del_test.py");
-    let err = result.expect_err("del statement should be rejected");
-    let message = err.to_string();
-    assert!(
-        message.contains("Delete"),
-        "error should name the construct: {}",
-        message
-    );
-    assert!(
-        message.contains("line 2"),
-        "error should carry the source line: {}",
-        message
-    );
+    result.expect("del statement should parse");
 }
 
 /// Slice subscripts are not yet representable; they must error, not panic.

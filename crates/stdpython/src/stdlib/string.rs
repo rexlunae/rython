@@ -5,10 +5,6 @@
 
 use crate::{PyException, python_function};
 use alloc::{format, string::String, string::ToString, vec::Vec};
-#[cfg(feature = "std")]
-use std::collections::HashSet;
-#[cfg(not(feature = "std"))]
-use hashbrown::HashSet;
 
 // String constants
 pub const ascii_lowercase: &str = "abcdefghijklmnopqrstuvwxyz";
@@ -88,101 +84,140 @@ impl Template {
         }
     }
     
-    /// Substitute variables from mapping
+    /// Substitute variables from mapping. A single left-to-right scan
+    /// (issue #82): `$$` is an escaped delimiter, `$name`/`${name}` resolve
+    /// to the longest identifier, and substituted VALUES are never
+    /// re-scanned (CPython's regex-based sub). A missing variable raises
+    /// KeyError('name') — message is the quoted key, not a prose string.
     pub fn substitute<K, V>(&self, mapping: &[(K, V)]) -> Result<String, PyException>
     where
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let mut result = self.template.clone();
-        let mut substituted = HashSet::new();
-        
-        // Find all variable references
-        for (key, value) in mapping {
-            let key_str = key.as_ref();
-            
-            // Handle both $var and ${var} forms
-            let simple_var = format!("{}{}", self.delimiter, key_str);
-            let braced_var = format!("{}{{{}}}", self.delimiter, key_str);
-            
-            if result.contains(&simple_var) {
-                result = result.replace(&simple_var, value.as_ref());
-                substituted.insert(key_str.to_string());
-            }
-            
-            if result.contains(&braced_var) {
-                result = result.replace(&braced_var, value.as_ref());
-                substituted.insert(key_str.to_string());
-            }
-        }
-        
-        // Check for unsubstituted variables
-        if result.contains(self.delimiter) {
-            // Look for remaining variable references
-            let chars: Vec<char> = result.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                if chars[i] == self.delimiter {
-                    if i + 1 < chars.len() {
-                        if chars[i + 1] == '{' {
-                            // Find closing brace
-                            let mut end = i + 2;
-                            while end < chars.len() && chars[end] != '}' {
-                                end += 1;
-                            }
-                            if end < chars.len() {
-                                let var_name: String = chars[i+2..end].iter().collect();
-                                if !substituted.contains(&var_name) {
-                                    return Err(crate::key_error(format!("'{}' variable not provided", var_name)));
-                                }
-                                i = end + 1;
-                                continue;
-                            }
-                        } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
-                            // Find end of identifier
-                            let mut end = i + 2;
-                            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
-                                end += 1;
-                            }
-                            let var_name: String = chars[i+1..end].iter().collect();
-                            if !substituted.contains(&var_name) {
-                                return Err(crate::key_error(format!("'{}' variable not provided", var_name)));
-                            }
-                            i = end;
-                            continue;
-                        }
-                    }
-                }
-                i += 1;
-            }
-        }
-        
-        Ok(result)
+        self.substitute_impl(mapping, false)
     }
     
-    /// Safe substitute - leave unmatched variables as-is
+    /// Safe substitute - leave unmatched and invalid placeholders as-is
     pub fn safe_substitute<K, V>(&self, mapping: &[(K, V)]) -> String
     where
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let mut result = self.template.clone();
-        
-        for (key, value) in mapping {
-            let key_str = key.as_ref();
-            let simple_var = format!("{}{}", self.delimiter, key_str);
-            let braced_var = format!("{}{{{}}}", self.delimiter, key_str);
-            
-            if result.contains(&simple_var) {
-                result = result.replace(&simple_var, value.as_ref());
+        self.substitute_impl(mapping, true).expect("safe_substitute never errors")
+    }
+
+    fn substitute_impl<K, V>(&self, mapping: &[(K, V)], safe: bool) -> Result<String, PyException>
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let chars: Vec<char> = self.template.chars().collect();
+        let mut result = String::with_capacity(self.template.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != self.delimiter {
+                result.push(chars[i]);
+                i += 1;
+                continue;
             }
-            
-            if result.contains(&braced_var) {
-                result = result.replace(&braced_var, value.as_ref());
+            // At a delimiter. CPython's scanner treats anything after a
+            // delimiter that is not an escape, an identifier, or a braced
+            // identifier as an invalid placeholder (ValueError) — or, in
+            // safe mode, leaves it literal.
+            let invalid = |col: usize| {
+                crate::value_error(format!(
+                    "Invalid placeholder in string: line 1, col {}",
+                    col
+                ))
+            };
+            let Some(&next) = chars.get(i + 1) else {
+                if safe {
+                    result.push(self.delimiter);
+                    i += 1;
+                    continue;
+                }
+                return Err(invalid(i + 1));
+            };
+            if next == self.delimiter {
+                // Escaped delimiter: $$ -> $.
+                result.push(self.delimiter);
+                i += 2;
+                continue;
             }
+            if next == '{' {
+                let mut end = i + 2;
+                while end < chars.len()
+                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                let name: String = chars[i + 2..end].iter().collect();
+                let well_formed = !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && chars.get(end) == Some(&'}');
+                if !well_formed {
+                    if safe {
+                        result.push(self.delimiter);
+                        result.push('{');
+                        result.push_str(&name);
+                        i = end;
+                        continue;
+                    }
+                    return Err(invalid(i + 1));
+                }
+                match lookup(mapping, &name) {
+                    Some(v) => {
+                        result.push_str(v.as_ref());
+                        i = end + 1;
+                    }
+                    None if safe => {
+                        result.push_str(&format!("{}{{{}}}", self.delimiter, name));
+                        i = end + 1;
+                    }
+                    None => {
+                        return Err(crate::key_error(format!("'{}'", name)));
+                    }
+                }
+                continue;
+            }
+            if next.is_ascii_alphabetic() || next == '_' {
+                // Simple identifier: scan the longest run of identifier
+                // characters so `$ab` never shadows `$ab` with a prefix
+                // key `a` (issue #82).
+                let mut end = i + 2;
+                while end < chars.len()
+                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                let name: String = chars[i + 1..end].iter().collect();
+                match lookup(mapping, &name) {
+                    Some(v) => {
+                        result.push_str(v.as_ref());
+                        i = end;
+                    }
+                    None if safe => {
+                        result.push_str(&format!("{}{}", self.delimiter, name));
+                        i = end;
+                    }
+                    None => {
+                        return Err(crate::key_error(format!("'{}'", name)));
+                    }
+                }
+                continue;
+            }
+            // Invalid placeholder: digit, space, punctuation after $.
+            if safe {
+                result.push(self.delimiter);
+                i += 1;
+                continue;
+            }
+            return Err(invalid(i + 1));
         }
-        
-        result
+        Ok(result)
     }
     
     /// Get template string
@@ -200,6 +235,19 @@ impl core::fmt::Display for Template {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(f, "{}", self.template)
     }
+}
+
+/// First pair whose key matches (dict semantics: the caller's mapping
+/// slice should already be deduplicated by construction).
+fn lookup<'a, K, V>(mapping: &'a [(K, V)], name: &str) -> Option<&'a V>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    mapping
+        .iter()
+        .find(|(k, _)| k.as_ref() == name)
+        .map(|(_, v)| v)
 }
 
 /// Formatter - string formatting operations

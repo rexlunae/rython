@@ -154,10 +154,12 @@ impl CodeGen for BinOp {
         // For Div, Python semantics are elementwise/numeric true division.
         // Route through the stdpython py_div helper: numeric operands
         // divide to f64, and NdArray operands (numpy) divide elementwise.
+        // The `?` propagates a catchable ZeroDivisionError instead of
+        // silently yielding inf/nan (issue #107).
         if matches!(self.op, BinOps::Div) {
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
-            return Ok(quote!(py_div(#left, #right)));
+            return Ok(quote!(py_div(#left, #right)?));
         }
 
         // Python's `@` is matrix multiplication (numpy semantics for

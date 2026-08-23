@@ -111,7 +111,7 @@ fn json_dumps_matches_python_defaults() {
     use stdpython::json::JSONValue;
 
     // Default separators are ", " and ": ".
-    let mut obj = std::collections::HashMap::new();
+    let mut obj = crate::PyDict::default();
     obj.insert("a".to_string(), JSONValue::Int(1));
     let out = json::dumps(&JSONValue::Object(obj), None);
     assert_eq!(out, "{\"a\": 1}");
@@ -411,7 +411,7 @@ fn issue81_negative_index_overflow_does_not_panic() {
         .is_err());
     // insert prepends, like Python (insert(-huge, x) == insert(0, x)).
     let mut v = vec![1i64, 2];
-    v.py_insert(-9223372036854775808i64, 9);
+    let _ = v.py_insert(-9223372036854775808i64, 9);
     assert_eq!(v, vec![9, 1, 2]);
 }
 
@@ -419,19 +419,19 @@ fn issue81_negative_index_overflow_does_not_panic() {
 fn py_insert_matches_python_index_rules() {
     // Python: [1, 2, 3].insert(-1, 9) -> [1, 2, 9, 3]
     let mut v = vec![1i64, 2, 3];
-    v.py_insert(-1, 9);
+    let _ = v.py_insert(-1, 9);
     assert_eq!(v, vec![1, 2, 9, 3]);
     // insert(100, x) clamps to append
     let mut v = vec![1i64, 2];
-    v.py_insert(100, 9);
+    let _ = v.py_insert(100, 9);
     assert_eq!(v, vec![1, 2, 9]);
     // insert(-100, x) clamps to prepend
     let mut v = vec![1i64, 2];
-    v.py_insert(-100, 9);
+    let _ = v.py_insert(-100, 9);
     assert_eq!(v, vec![9, 1, 2]);
     // plain positive index
     let mut v = vec![1i64, 3];
-    v.py_insert(1, 2);
+    let _ = v.py_insert(1, 2);
     assert_eq!(v, vec![1, 2, 3]);
 }
 

@@ -137,6 +137,19 @@ where
 }
 
 python_function! {
+    /// sys.exc_info(): the active exception as (type, value, traceback).
+    /// rython's exceptions are string-tagged PyException values with no
+    /// traceback object — the tuple lowers to a boxed value whose members
+    /// are None (the traceback divergence).
+    pub fn exc_info() -> crate::PyValue
+    [signature: ()]
+    [concrete_types: () -> crate::PyValue]
+    {
+        crate::PyValue::None_
+    }
+}
+
+python_function! {
     /// sys.platform - platform identifier
     pub fn platform() -> &'static str
     [signature: ()]
@@ -208,5 +221,19 @@ python_function! {
     [concrete_types: () -> &'static str]
     {
         platform()
+    }
+}
+
+python_function! {
+    /// sys.audit - fire an audit event (urllib3's connection.py,
+    /// `sys.audit("http.client.connect", self, self.host, self.port)`).
+    /// rython has no audit-hook framework — the event is dropped (the
+    /// audit divergence: CPython's audit hooks observe the event; rython
+    /// programs cannot register hooks, so nothing is lost at runtime).
+    pub fn audit(event: String, args: Vec<crate::PyValue>) -> ()
+    [signature: (event, args)]
+    [concrete_types: (String, Vec<crate::PyValue>) -> ()]
+    {
+        let _ = (event, args);
     }
 }

@@ -779,6 +779,8 @@ accepted as permanent spec:
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |
 | Exception matching ignores the hierarchy between `BaseException`/`Exception` and leaf names (`except LookupError` misses `IndexError`) | Defect class; flat matching is exact-name only |
 | Argument-render-then-mutate shapes (`print(xs, xs.pop(), xs)`) render the first argument before the mutation | Recorded in issue #79 |
+| A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
+| A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; callables cannot be runtime values |
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | Verified stdlib divergences (json/defaultdict ordering, `math.remainder`, `strftime` edge cases, `glob` paths, `pathlib` edges, `string.Template`, …) | Tracked as defects in issue #82 |
 

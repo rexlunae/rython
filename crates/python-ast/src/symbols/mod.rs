@@ -47,6 +47,43 @@ impl SymbolTableScopes {
         }
         None
     }
+
+    /// All module-level class definitions visible in this scope (the first
+    /// binding of each name wins, mirroring `get`). Used by the parameter
+    /// inference's duck-typing pass (issue #109, M3) to index user classes
+    /// by their method names.
+    pub fn all_classes(&self) -> Vec<ClassDef> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for table in self.0.iter() {
+            for value in table.symbols.values() {
+                if let SymbolTableNode::ClassDef(class) = value {
+                    if seen.insert(class.name.clone()) {
+                        out.push(class.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// All module-level function definitions visible in this scope (the
+    /// first binding of each name wins). Used by the parameter inference's
+    /// interprocedural pass (issue #109, M4) to resolve callees.
+    pub fn all_functions(&self) -> Vec<FunctionDef> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for table in self.0.iter() {
+            for value in table.symbols.values() {
+                if let SymbolTableNode::FunctionDef(f) = value {
+                    if seen.insert(f.name.clone()) {
+                        out.push(f.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Default for SymbolTableScopes {
@@ -72,6 +109,11 @@ pub enum SymbolTableNode {
     Import(Import),
     ImportFrom(ImportFrom),
     Alias(String),
+    /// A name bound by an `except ... as name:` clause: a runtime
+    /// PyException object with no static fields. Attribute reads on it have
+    /// no shape — they lower to the boxed None (the dynamic-attribute
+    /// divergence; rython models exceptions as name + message only).
+    ExceptBinding,
     /// A name bound to a `rust.bind(...)` / `rust.c_bind(...)` declaration:
     /// a compile-time symbol. Call sites lower to direct calls into the
     /// bound crate; the name never exists as a runtime value.

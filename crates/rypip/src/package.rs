@@ -25,12 +25,17 @@ pub struct PyModule {
 pub struct PyPackage {
     /// Package name, sanitized to a valid crate/module identifier.
     pub name: String,
-    /// Package version (from pyproject.toml, else "0.1.0").
+    /// Package version (from pyproject.toml / setup.cfg / setup.py, else
+    /// "0.1.0").
     pub version: String,
     /// The package root directory: the project root (where pyproject.toml /
     /// rython.toml live), or the single file's parent for a bare file.
     pub root: PathBuf,
     pub modules: Vec<PyModule>,
+    /// PEP 508 dependency requirements from the project's packaging
+    /// metadata (`[project] dependencies`, `install_requires`), resolved by
+    /// the converter against PyPI unless vendored via `[python-modules]`.
+    pub dependencies: Vec<String>,
 }
 
 impl PyPackage {
@@ -70,8 +75,12 @@ pub fn sanitize_name(name: &str) -> String {
 }
 
 /// Discover a Python package at `path`, which may be a single `.py` file, a
-/// package directory (with `__init__.py`), or a project directory containing
-/// `pyproject.toml` and a package subdirectory (flat or `src/` layout).
+/// package directory (with `__init__.py`), or a project directory resolved
+/// the way Python resolves it — `pyproject.toml` (PEP 621 +
+/// `[tool.setuptools]`), `setup.cfg`, or `setup.py` (executed via python3
+/// when available) determine the name, version, packages, py-modules, and
+/// dependencies. Projects without any packaging metadata fall back to the
+/// historical layout heuristics (flat or `src/`).
 pub fn discover(path: &Path) -> Result<PyPackage> {
     let path = path
         .canonicalize()
@@ -100,57 +109,116 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
                 file: path,
                 is_init: false,
             }],
+            dependencies: Vec::new(),
         });
     }
 
-    // Project metadata, if present.
-    let (mut name, version) = read_pyproject(&path)?;
-
-    // Locate the package source root.
-    let source_root = locate_source_root(&path, name.as_deref())?;
-    if name.is_none() {
-        name = source_root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string);
-    }
-    let name = sanitize_name(&name.context("cannot determine package name")?);
+    // Project metadata, resolved the way Python's tooling does.
+    let meta = crate::packaging::read_project_metadata(&path)?;
+    let mut name = meta.name.clone();
 
     let mut modules = Vec::new();
-    collect_modules(&source_root, &[], &mut modules)?;
-    if modules.is_empty() {
-        bail!("no Python modules found under {}", source_root.display());
+    let mut found_metadata_packages = false;
+
+    // Explicit packages / find_packages() / py-modules from the metadata.
+    let package_dirs = crate::packaging::resolve_package_dirs(&path, &meta)?;
+    if !package_dirs.is_empty() || !meta.py_modules.is_empty() {
+        found_metadata_packages = true;
+        // collect_modules recurses into subpackages itself, so only feed it
+        // the TOP-LEVEL packages (feeding nested ones would duplicate every
+        // module path).
+        let top_level = top_level_dirs(&package_dirs);
+        for dir in top_level {
+            let abs = path.join(&dir);
+            let prefix = dotted_prefix(&dir);
+            collect_modules(&abs, &prefix, &mut modules)?;
+        }
+        for py_module in &meta.py_modules {
+            // py-modules are single files; try the project root and src/.
+            let mut file = path.join(format!("{}.py", py_module));
+            if !file.is_file() {
+                file = path.join("src").join(format!("{}.py", py_module));
+            }
+            if !file.is_file() {
+                bail!(
+                    "py-module `{}` declared by the project metadata is missing ({})",
+                    py_module,
+                    file.display()
+                );
+            }
+            let source = fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            modules.push(PyModule {
+                path: vec![sanitize_name(py_module)],
+                source,
+                file,
+                is_init: false,
+            });
+        }
     }
+
+    if !found_metadata_packages {
+        // No packaging metadata (or none that names packages): fall back to
+        // the historical layout heuristics.
+        let source_root = locate_source_root(&path, name.as_deref())?;
+        if name.is_none() {
+            name = source_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string);
+        }
+        collect_modules(&source_root, &[], &mut modules)?;
+    }
+
+    if modules.is_empty() {
+        bail!("no Python modules found under {}", path.display());
+    }
+
+    let name = sanitize_name(&name.context("cannot determine package name")?);
 
     Ok(PyPackage {
         name,
-        version: version.unwrap_or_else(|| "0.1.0".to_string()),
+        version: meta.version.unwrap_or_else(|| "0.1.0".to_string()),
         root: path.to_path_buf(),
         modules,
+        dependencies: meta.dependencies,
     })
 }
 
-/// Read `[project] name`/`version` from pyproject.toml, if the file exists.
-fn read_pyproject(root: &Path) -> Result<(Option<String>, Option<String>)> {
-    let pyproject = root.join("pyproject.toml");
-    if !pyproject.is_file() {
-        return Ok((None, None));
+/// The module-path prefix for a package directory resolved from metadata:
+/// `pkg` → `["pkg"]`, `src/pkg` → `["pkg"]` (src/ is a layout container,
+/// not part of the import path), `a.b` → `["a", "b"]`.
+fn dotted_prefix(dir: &std::path::Path) -> Vec<String> {
+    let mut parts: Vec<String> = dir
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    // A leading `src` (or `lib`) layout container is not importable.
+    if parts.first().is_some_and(|p| p == "src" || p == "lib") && parts.len() > 1 {
+        parts.remove(0);
     }
-    let text = fs::read_to_string(&pyproject)
-        .with_context(|| format!("reading {}", pyproject.display()))?;
-    let value: toml::Value = text
-        .parse()
-        .with_context(|| format!("parsing {}", pyproject.display()))?;
-    let project = value.get("project");
-    let name = project
-        .and_then(|p| p.get("name"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let version = project
-        .and_then(|p| p.get("version"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    Ok((name, version))
+    parts.iter().map(|p| sanitize_name(p)).collect()
+}
+
+/// Keep only the packages that are not nested inside another package in the
+/// list (their subpackages are collected recursively anyway).
+fn top_level_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let nested = dirs.iter().any(|other| {
+            other != dir
+                && dir
+                    .strip_prefix(other)
+                    .is_ok_and(|rest| !rest.as_os_str().is_empty())
+        });
+        if !nested {
+            out.push(dir.clone());
+        }
+    }
+    out
 }
 
 /// Find the directory whose `.py` files make up the package.

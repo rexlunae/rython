@@ -174,10 +174,109 @@ impl CodeGen for Compare {
                     }
                     continue;
                 }
+                // `x is False` / `x is True` on a boxed PyValue (issue
+                // #121): test the Bool member, not Rust reference equality
+                // (`&x == &false` would not type-check).
+                if matches!(op, Compares::Is | Compares::IsNot) {
+                    let bool_lit = |e: &ExprType| -> Option<bool> {
+                        match e {
+                            ExprType::Constant(c) => match &c.0 {
+                                Some(litrs::Literal::Bool(b)) => Some(b.value()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    };
+                    let pyvalue_operand = |e: &ExprType| -> Option<TokenStream> {
+                        if let ExprType::Name(n) = e
+                            && options
+                                .name_types
+                                .get(&n.id)
+                                .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
+                        {
+                            e.clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .ok()
+                        } else {
+                            None
+                        }
+                    };
+                    let (val, operand) = if let Some(b) = bool_lit(comparator_ast) {
+                        (b, pyvalue_operand(left_ast))
+                    } else if let Some(b) = bool_lit(left_ast) {
+                        (b, pyvalue_operand(comparator_ast))
+                    } else {
+                        (false, None)
+                    };
+                    if let Some(operand) = operand {
+                        let tokens = match op {
+                            Compares::Is => quote!(
+                                (#operand).is_bool() && (#operand).as_bool() == Some(#val)
+                            ),
+                            _ => quote!(
+                                !((#operand).is_bool() && (#operand).as_bool() == Some(#val))
+                            ),
+                        };
+                        index += 1;
+                        left = quote!(#operand);
+                        outer_ts.extend(tokens);
+                        if index < ops.len() {
+                            outer_ts.extend(quote!( && ));
+                        }
+                        continue;
+                    }
+                    // `x is SomeClass` / `x is not SomeClass`
+                    // (`self.ConnectionCls is DummyConnection` — urllib3's
+                    // connectionpool): classes cannot be runtime values (the
+                    // classes-as-values divergence) — the identity check is
+                    // statically false/true.
+                    let class_operand = if crate::is_class_value_expr(comparator_ast, &symbols) {
+                        Some(left_ast)
+                    } else if crate::is_class_value_expr(left_ast, &symbols) {
+                        Some(comparator_ast)
+                    } else {
+                        None
+                    };
+                    if class_operand.is_some() {
+                        let tokens = match op {
+                            Compares::Is => quote!(false),
+                            _ => quote!(true),
+                        };
+                        index += 1;
+                        outer_ts.extend(tokens);
+                        if index < ops.len() {
+                            outer_ts.extend(quote!( && ));
+                        }
+                        continue;
+                    }
+                }
             }
             let comparator = comparator_ast
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // A GENERIC (inferred) parameter compares with an integer
+            // literal converted to the parameter's own type via
+            // stdpython's PyFromInt (`B::py_from_int(0)`): Rust std has no
+            // int/float cross-PartialOrd, so the bounds
+            // `B: PyLe<B> + PyFromInt` are satisfied by both i64 and f64
+            // (Python promotes `2.5 <= 0` to a float comparison).
+            let comparator = if let ExprType::Name(n) = left_ast {
+                if let Some(tv) = options.param_type_vars.get(&n.id) {
+                    if matches!(
+                        comparator_ast,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::Integer(_)))
+                    ) {
+                        quote!(#tv :: py_from_int(#comparator))
+                    } else {
+                        comparator
+                    }
+                } else {
+                    comparator
+                }
+            } else {
+                comparator
+            };
             // Comparisons route through the stdpython PyEq/PyNe/PyLt/PyLe/
             // PyGt/PyGe traits (in scope via `use stdpython::*`): scalars
             // and containers get their existing PartialEq/PartialOrd

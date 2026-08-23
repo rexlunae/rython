@@ -6,7 +6,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
+use crate::{ASYNC_RUNTIME_FEATURE, CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,15 +158,22 @@ impl CodeGen for Module {
             });
         }
         
-        // Add async runtime dependency if async functions are detected
-        // We'll check this early so we can add the import at the top
-        let needs_async_runtime = self.raw.body.iter().any(|s| {
-            matches!(&s.statement, crate::StatementType::AsyncFunctionDef(_))
-        });
-        
-        if needs_async_runtime {
+        // Add async runtime dependency if async functions are detected.
+        // We'll check this early so we can add the import at the top. The
+        // import is only emitted for generated BINARY crates
+        // (options.async_runtime_dep): library conversions transpile async
+        // functions to plain async fns and leave the executor to the
+        // consumer. It is feature-gated so `--no-default-features` builds
+        // still compile (the entry point then carries the compile_error
+        // below).
+        let needs_async_runtime = module_contains_async(&self.raw.body);
+
+        if needs_async_runtime && options.async_runtime_dep {
             let runtime_import = format_ident!("{}", options.async_runtime.import());
-            stream.extend(quote!(use #runtime_import;));
+            stream.extend(quote! {
+                #[cfg(feature = #ASYNC_RUNTIME_FEATURE)]
+                use #runtime_import;
+            });
         }
         
         let mut main_body_stmts = Vec::new();
@@ -205,13 +212,18 @@ impl CodeGen for Module {
             collect_class_defs(&self.raw.body, &mut classes);
             let mut hierarchy = std::collections::HashSet::new();
             for c in &classes {
-                let has_real_base = c.bases.iter().any(|b| b.id != "object");
+                let has_real_base = c
+                    .bases
+                    .iter()
+                    .any(|b| matches!(b, crate::ExprType::Name(n) if n.id != "object"));
                 if has_real_base {
                     hierarchy.insert(c.name.clone());
                 }
                 for b in &c.bases {
-                    if b.id != "object" {
-                        hierarchy.insert(b.id.clone());
+                    if let crate::ExprType::Name(n) = b
+                        && n.id != "object"
+                    {
+                        hierarchy.insert(n.id.clone());
                     }
                 }
             }
@@ -263,7 +275,7 @@ impl CodeGen for Module {
             matches!(
                 &s.statement,
                 crate::StatementType::FunctionDef(f)
-                    if f.name == "main" && f.resolved_return_type().is_some()
+                    if f.name == "main" && f.resolved_return_type(&symbols, &options).is_some()
             )
         });
 
@@ -275,6 +287,11 @@ impl CodeGen for Module {
         // drive both the hoisted sets and hoisted_declarations.
         for s in &self.raw.body {
             if let crate::StatementType::If(if_stmt) = &s.statement {
+                // `if TYPE_CHECKING:` never runs at runtime — skip the
+                // whole block (imports, type-only classes).
+                if Self::is_type_checking_test(&if_stmt.test) {
+                    continue;
+                }
                 let test_str = format!("{:?}", if_stmt.test);
                 if test_str.contains("__name__") && test_str.contains("__main__") {
                     let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body)
@@ -288,9 +305,31 @@ impl CodeGen for Module {
             }
             // Module-level constants are static items, not runtime stores.
             if let crate::StatementType::Assign(a) = &s.statement {
-                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                    if module_assign_counts.get(&n.id) == Some(&1)
-                        && const_static_type(&a.value).is_some()
+                // Issue #127: a decorator-factory assignment emits the
+                // synthesized cached function at module level (handled in
+                // the emit loop) — not a runtime store.
+                if crate::try_lru_cache_factory(a, Some(&options), &symbols).is_some() {
+                    continue;
+                }
+                // A type alias (`builtin_str = str`) is a declaration, not
+                // a runtime store.
+                if let [crate::ExprType::Name(_)] = a.targets.as_slice()
+                    && let crate::ExprType::Name(n) = &a.value
+                    && matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                    )
+                {
+                    continue;
+                }
+                if let Some(names) = assign_name_targets(a) {
+                    // A type alias (`builtin_str = str`) is a declaration, not
+                    // a runtime store — skip it from the init body too.
+                    if names
+                        .iter()
+                        .all(|n| module_assign_counts.get(n) == Some(&1))
+                        && (const_static_type(&a.value).is_some()
+                            || is_type_alias_value(&a.value))
                     {
                         continue;
                     }
@@ -300,8 +339,188 @@ impl CodeGen for Module {
                 module_init_raw.push(s.clone());
             }
         }
+
+        // Module-level values assigned from NON-constant expressions that
+        // functions read are promoted to LazyLock statics (a `let` inside
+        // __module_init__ is invisible to functions — E0425). Constrained to
+        // a single top-level store (reassignment/conditional stores keep the
+        // __module_init__ lowering: a static would freeze the first value),
+        // a non-const value, and NOT a typing alias or the builtin-alias
+        // declaration shape. A value that a SIBLING module imports
+        // (`from .constant import _THAI` — charset_normalizer's utils) is
+        // promoted the same way: without a `pub static`, the importing
+        // module's `use crate::charset_normalizer::constant::_THAI;` fails
+        // with E0432 (a module-init local is invisible to other modules).
+        let function_free_reads = module_function_free_reads(&self.raw.body);
+        let mut promoted_statics: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // In a multi-module conversion, the promotion decision comes from the
+        // SHARED computation (`module_promoted_static_names`) so the DEFINING
+        // module and every IMPORTING module agree on which names are statics
+        // (an importing module renders reads of them as `(*name).clone()`).
+        // The inline loop below is the fallback for library/single-module
+        // use, where `this_module_path` is empty and there are no siblings.
+        if !options.this_module_path.is_empty()
+            && options.module_defs.contains_key(&options.this_module_path)
+        {
+            promoted_statics = module_promoted_static_names(&options, &options.this_module_path)
+                .as_ref()
+                .clone();
+        } else {
+        for s in &self.raw.body {
+            if let crate::StatementType::If(if_stmt) = &s.statement {
+                if Self::is_type_checking_test(&if_stmt.test) {
+                    continue;
+                }
+                let test_str = format!("{:?}", if_stmt.test);
+                if test_str.contains("__name__") && test_str.contains("__main__") {
+                    continue;
+                }
+            }
+            if let crate::StatementType::Assign(a) = &s.statement {
+                if crate::try_lru_cache_factory(a, Some(&options), &symbols).is_some() {
+                    continue;
+                }
+                if let [crate::ExprType::Name(_)] = a.targets.as_slice()
+                    && let crate::ExprType::Name(n) = &a.value
+                    && matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                    )
+                {
+                    continue;
+                }
+                if let Some(targets) = assign_name_targets(a) {
+                    for n in &targets {
+                        if module_assign_counts.get(n) == Some(&1)
+                            && const_static_type(&a.value).is_none()
+                            && !is_type_alias_value(&a.value)
+                            // rust.bind / rust.c_bind declarations are
+                            // compile-time bindings, not runtime stores: the
+                            // Assign codegen handles them (issue #79 family).
+                            && !crate::is_rust_bind_call(&a.value)
+                            && function_free_reads.contains(n)
+                            // A name ALSO bound by an import (see
+                            // module_promoted_static_names): the import owns
+                            // the name — a promoted static would collide.
+                            && !matches!(
+                                symbols.get(n),
+                                Some(crate::SymbolTableNode::ImportFrom(_))
+                                    | Some(crate::SymbolTableNode::Import(_))
+                            )
+                        {
+                            promoted_statics.insert(n.clone());
+                        }
+                    }
+                }
+            }
+        }
+        }
+        // Transitive promotion to a fixpoint (mirrors the shared
+        // module_promoted_static_names): every name a PROMOTED name's
+        // initializer reads must also be promoted.
+        let mut init_reads: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for s2 in &self.raw.body {
+            if let crate::StatementType::Assign(a) = &s2.statement {
+                if const_static_type(&a.value).is_some() {
+                    continue;
+                }
+                if let Some(targets) = assign_name_targets(a) {
+                    for n in &targets {
+                        if module_assign_counts.get(n) == Some(&1) {
+                            let reads = module_expr_reads(&a.value);
+                            init_reads.insert(n.clone(), reads);
+                        }
+                    }
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            let snapshot: std::collections::HashSet<String> = promoted_statics.clone();
+            for (n, reads) in &init_reads {
+                if !snapshot.contains(n) {
+                    continue;
+                }
+                for r in reads {
+                    if !promoted_statics.contains(r) && init_reads.contains_key(r) {
+                        promoted_statics.insert(r.clone());
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // A DEFINITE if/else module value (`if sys.platform == "win32":
+        // preferred_clock = time.perf_counter else: preferred_clock =
+        // time.time` — requests' sessions): both branches assign the SAME
+        // name exactly once, so the value is definitely set — promote to a
+        // LazyLock static whose closure is the conditional expression (the
+        // multi-store exclusion is only about UNDEFINITE stores; a static
+        // here cannot freeze a stale value).
+        let mut promoted_conditional: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, s) in self.raw.body.iter().enumerate() {
+            if let crate::StatementType::If(if_stmt) = &s.statement {
+                if if_stmt.orelse.is_empty() {
+                    continue;
+                }
+                let branch_name = |stmts: &[crate::Statement]| -> Option<String> {
+                    if stmts.len() != 1 {
+                        return None;
+                    }
+                    match &stmts[0].statement {
+                        crate::StatementType::Assign(a) if a.targets.len() == 1 => {
+                            match &a.targets[0] {
+                                crate::ExprType::Name(n) => Some(n.id.clone()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let (Some(b1), Some(b2)) =
+                    (branch_name(&if_stmt.body), branch_name(&if_stmt.orelse))
+                    && b1 == b2
+                    // The two branches alone give a count of 4 (each
+                    // nested store counts ×2); anything else (a top-level
+                    // store, another conditional) makes it 5+.
+                    && module_assign_counts.get(&b1) == Some(&4)
+                    && function_free_reads.contains(&b1)
+                {
+                    promoted_conditional.insert(b1.clone(), i);
+                    promoted_statics.insert(b1.clone());
+                }
+            }
+            // A DEFINITE try/except module value (`try: is_urllib3_1 =
+            // int(...) == 1 except (TypeError, AttributeError):
+            // is_urllib3_1 = True` — requests' compat.py): the SAME name
+            // is stored once in the try body and once in a handler — a
+            // definite value (the try either completes or raises into the
+            // handler), so it can be promoted to a LazyLock static without
+            // freezing a stale value. Same count shape as the if/else case
+            // (each nested store ×2 → 4).
+            if let crate::StatementType::Try(t) = &s.statement {
+                let body_name = single_assign_name(&t.body);
+                if let Some(name) = body_name
+                    && t.handlers.iter().all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                    && module_assign_counts.get(&name) == Some(&4)
+                    && function_free_reads.contains(&name)
+                {
+                    promoted_conditional.insert(name.clone(), i);
+                    promoted_statics.insert(name.clone());
+                }
+            }
+        }
         let (init_hoisted, init_leaked) = hoisted_name_set(&module_init_raw, &ctx, &symbols, &options);
         let (main_hoisted, main_leaked) = hoisted_name_set(&main_body_raw, &ctx, &symbols, &options);
+        // Name reads of promoted statics render as `(*name).clone()` (name.rs);
+        // every scope rendered below (module init, __main__, functions) sees
+        // the set through the cloned options.
+        options.promoted_statics = std::rc::Rc::new(promoted_statics.clone());
 
         // Module-level code gets no per-function analysis pass, so run the
         // same type inference / empty-container pinning here: without it,
@@ -310,14 +529,69 @@ impl CodeGen for Module {
         // though the pinning use is right there (issue #81-family, Devin
         // review on #103). The __main__ block gets its own pass.
         {
-            let info = crate::analyze_function_types(&module_init_raw);
+            let info = crate::analyze_function_types(&module_init_raw, Some(&options), Some(&symbols));
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
-        let main_info = crate::analyze_function_types(&main_body_raw);
+        // Module-level aliasing (`b = a` on a container, later mutated) is
+        // the same divergence the function-level guard rejects (issue #79).
+        crate::check_aliasing(
+            &module_init_raw,
+            &symbols,
+            &options.name_types,
+            &options.use_counts,
+        )?;
+        // Issue #112: `del name` at module level lowers to a no-op; a use
+        // after the del is a loud error (the module body is one scope).
+        crate::check_deleted_names(&module_init_raw)?;
+        // Issue #109, M5: module-level calls (including the __main__ block)
+        // are checked against callee inferred bounds at conversion time.
+        crate::check_call_sites(
+            &module_init_raw,
+            &symbols,
+            &options.name_types,
+            &options,
+        )?;
+        let main_info = crate::analyze_function_types(&main_body_raw, Some(&options), Some(&symbols));
+        crate::check_aliasing(
+            &main_body_raw,
+            &symbols,
+            &main_info.name_types,
+            &main_info.use_counts,
+        )?;
+        crate::check_call_sites(
+            &main_body_raw,
+            &symbols,
+            &main_info.name_types,
+            &options,
+        )?;
 
+        // The module docstring is emitted as #![doc] attributes above; its
+        // statement (a leading string Expr) must be SKIPPED here or it
+        // leaks into the generated module as a bare string literal (the
+        // requests build failure in the library sweep). Skip exactly when
+        // the docstring was emitted above: only then was the leading string
+        // consumed (a lone short string with no doc markers stays a bare
+        // expression statement, matching the pre-sweep behavior).
+        let mut pending_docstring = self.get_module_docstring().is_some()
+            && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
+        let mut seen_non_doc_statement = false;
         for s in self.raw.body {
+            if pending_docstring
+                && matches!(
+                    &s.statement,
+                    crate::StatementType::Expr(e)
+                        if matches!(
+                            &e.value,
+                            crate::ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(_)))
+                        )
+                )
+            {
+                pending_docstring = false;
+                continue;
+            }
             // Check if this statement is an async function
             if let crate::StatementType::AsyncFunctionDef(_) = &s.statement {
                 has_async_functions = true;
@@ -365,25 +639,378 @@ impl CodeGen for Module {
                     // Skip generating this if statement - we've processed its contents
                     continue;
                 }
+                // `if TYPE_CHECKING:` never runs at runtime — the whole
+                // block is skipped — EXCEPT its imports of REAL
+                // sibling-module names, which still emit `use` statements:
+                // annotations reference those names and find_symbols already
+                // registered the imports (requests/adapters.py imports
+                // PreparedRequest under TYPE_CHECKING and uses it in
+                // signatures; urllib3/util/connection.py imports
+                // BaseHTTPConnection the same way). typing /
+                // typing_extensions and external-module imports lower to
+                // nothing — their annotations resolve to the boxed PyValue.
+                if Self::is_type_checking_test(&if_stmt.test) {
+                    for body_stmt in &if_stmt.body {
+                        let render_import = match &body_stmt.statement {
+                            crate::StatementType::ImportFrom(i) => {
+                                let root = i.module.split('.').next().unwrap_or("");
+                                if matches!(root, "typing" | "typing_extensions") {
+                                    false
+                                } else if crate::ast::tree::import::is_stdpython_module(root) {
+                                    // A stdpython-module import whose ITEM
+                                    // may not exist in the runtime module
+                                    // (`from io import BufferedWriter` —
+                                    // requests' utils.py, only used as an
+                                    // annotation; stdpython::io has
+                                    // StringIO but no BufferedWriter): emit
+                                    // the `use` only for names with a
+                                    // known runtime counterpart, else the
+                                    // generated build fails E0432.
+                                    i.names
+                                        .iter()
+                                        .all(|a| crate::ast::tree::import::stdpython_module_item(
+                                            root,
+                                            &a.name,
+                                        ))
+                                } else {
+                                    // Only sibling-module imports whose
+                                    // names are actually GENERATED (not
+                                    // TYPE_CHECKING stubs) emit `use`s.
+                                    let path = i.resolved_module_path(&options);
+                                    i.names.iter().all(|a| {
+                                        crate::ast::tree::module::module_def_has_runtime_item(
+                                            &options,
+                                            &path,
+                                            &a.name,
+                                        )
+                                    })
+                                }
+                            }
+                            _ => false,
+                        };
+                        if render_import {
+                            let stmt_token = body_stmt
+                                .clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .map_err(|e| wrap_module_error(&module_filename, e))?;
+                            if !stmt_token.to_string().trim().is_empty() {
+                                stream.extend(stmt_token);
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
+            // A NON-LEADING module-level bare STRING expression
+            // (`"IDNA Mapping Table from UTS46."` — idna's uts46data, a
+            // docstring mid-module) is an annotation with no runtime
+            // effect: a bare string literal in item position is not legal
+            // Rust. Drop it. A module whose FIRST statement is a bare
+            // string (a lone-string test module) keeps it — the
+            // pre-sweep behavior the tests rely on.
+            if seen_non_doc_statement
+                && let crate::StatementType::Expr(e) = &s.statement
+                && matches!(
+                    &e.value,
+                    crate::ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                )
+            {
+                continue;
+            }
+            seen_non_doc_statement = true;
             
             // Module-level constants become static items visible to every
             // function in the module.
             if let crate::StatementType::Assign(a) = &s.statement {
-                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                    if module_assign_counts.get(&n.id) == Some(&1) {
+                // A module-level assign to a name the module ALSO imports
+                // (`SSLTransport = None` then `from .ssltransport import
+                // SSLTransport` — urllib3's ssl_.py): Python's LAST binding
+                // wins, so the import overrides the assign.
+                //
+                // A SIBLING import emits a real `use` binding the name — the
+                // store is dead; emitting it would collide (E0252) or render
+                // the imported class unusable (E0433). Drop it.
+                //
+                // An EXTERNAL import emits nothing (external-module
+                // divergence), so the name must still resolve for siblings
+                // that read it (`ssl_::HAS_NEVER_CHECK_COMMON_NAME` from
+                // connection.rs): emit a boxed-None static — the external
+                // value is unmodeled.
+                if let Some(names) = assign_name_targets(a) {
+                    let mut sibling_owned = false;
+                    let mut external_owned = false;
+                    for n in &names {
+                        match symbols.get(n) {
+                            Some(crate::SymbolTableNode::ImportFrom(_))
+                            | Some(crate::SymbolTableNode::Import(_)) => {
+                                if crate::ast::tree::import::resolves_to_external_import(
+                                    n, &options, &symbols,
+                                ) {
+                                    external_owned = true;
+                                } else {
+                                    sibling_owned = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if sibling_owned {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "module-level assignment to `{}` is dropped: the name is also \
+                             imported from a sibling module, and Python's later import \
+                             binding wins",
+                            names.join(", ")
+                        ));
+                        continue;
+                    }
+                    if external_owned {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "module-level assignment to `{}` is dropped: the name is also \
+                             imported from a module external to the generated crate; the \
+                             name lowers to the boxed None (external-module divergence)",
+                            names.join(", ")
+                        ));
+                        for n in &names {
+                            let ident = crate::safe_ident(n);
+                            stream.extend(quote! {
+                                pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                                    std::sync::LazyLock::new(|| stdpython::PyValue::None_);
+                            });
+                        }
+                        continue;
+                    }
+                }
+                // A type alias (`builtin_str = str`): emit the pub type at
+                // module level so re-exports resolve; Assign::to_rust also
+                // knows this shape, but the module path must place it as a
+                // declaration, not an init-time store.
+                if let [crate::ExprType::Name(target)] = a.targets.as_slice()
+                    && let crate::ExprType::Name(n) = &a.value
+                    && matches!(
+                        n.id.as_str(),
+                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                    )
+                {
+                    let ty = match n.id.as_str() {
+                        "str" => quote!(String),
+                        "bytes" | "bytearray" => quote!(Vec<u8>),
+                        "int" => quote!(i64),
+                        "float" => quote!(f64),
+                        _ => quote!(bool),
+                    };
+                    let ident = crate::safe_ident(&target.id);
+                    stream.extend(quote! {
+                        #[allow(dead_code)]
+                        pub type #ident = #ty;
+                    });
+                    continue;
+                }
+                // Issue #127: `name = lru_cache(maxsize=N)(fn)` — the
+                // decorator factory applied as an expression. Emit the
+                // synthesized cached function as a module-level item (the
+                // same @lru_cache machinery a decorated definition gets),
+                // not an init-time store. find_symbols registered the name
+                // as the function so call sites resolve.
+                if let Some(synth) =
+                    crate::try_lru_cache_factory(a, Some(&options), &symbols)
+                {
+                    stream.extend(
+                        synth
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                            .map_err(|e| wrap_module_error(&module_filename, e))?,
+                    );
+                    continue;
+                }
+                if let Some(names) = assign_name_targets(a) {
+                    // Every target must be a single-store name for the
+                    // static promotion (a chained `__version__ = version =
+                    // '2.7.0'` promotes BOTH names to `pub static`).
+                    if names
+                        .iter()
+                        .all(|n| module_assign_counts.get(n) == Some(&1))
+                    {
                         if let Some(ty) = const_static_type(&a.value) {
-                            let ident = crate::safe_ident(&n.id);
                             let value = a.value.clone().to_rust(
                                 ctx.clone(),
                                 options.clone(),
                                 symbols.clone(),
                             )?;
-                            stream.extend(quote!(pub static #ident: #ty = #value;));
+                            for n in &names {
+                                let ident = crate::safe_ident(n);
+                                stream.extend(quote!(pub static #ident: #ty = #value;));
+                            }
                             continue;
                         }
                     }
+                    // A TYPE ALIAS whose value is a typing annotation
+                    // (`_TYPE_REDUCE_RESULT = tuple[typing.Callable[...,
+                    // object], ...]`, `_TYPE_BODY = typing.Union[...]` —
+                    // urllib3): the name is consumed by annotation
+                    // resolution (resolve_alias_typeinfo), never a runtime
+                    // value. Emit a `pub type` alias when the annotation
+                    // resolves, else nothing — the old behavior emitted a
+                    // nonsense `py_index` store.
+                    if names.len() == 1
+                        && is_type_alias_value(&a.value)
+                    {
+                        if let Some(ty) =
+                            crate::resolve_alias_typeinfo(&a.value, &symbols, &options)
+                                .map(|t| t.to_rust_type())
+                        {
+                            let ident = crate::safe_ident(&names[0]);
+                            stream.extend(quote! {
+                                #[allow(dead_code)]
+                                pub type #ident = #ty;
+                            });
+                        }
+                        continue;
+                    }
                 }
+            }
+
+            // A module-level value that functions read or siblings import
+            // (promoted_statics): emit a LazyLock static whose closure holds
+            // the initializer, and a TOUCH (`let _ = &*name;`) in
+            // __module_init__ at the store's position, so initialization
+            // still happens at import time, in order. Function reads deref
+            // the static automatically (LazyLock: Deref). A fallible
+            // initializer (rendered with a trailing `?`) unwraps inside the
+            // closure, panicking on failure — the import-time raise becomes
+            // an abort (divergence). A CHAINED assignment (`__version__ =
+            // version = '2.7.0'`) where every target is promoted emits one
+            // static per name, all with the same initializer (the assign.rs
+            // chain lowering would otherwise hide the values in
+            // __module_init__).
+            if let crate::StatementType::Assign(a) = &s.statement {
+                let promoted: Vec<String> = match assign_name_targets(a) {
+                    Some(names) => names
+                        .into_iter()
+                        .filter(|n| promoted_statics.contains(n))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if promoted.is_empty() {
+                    // fall through to the ordinary Assign lowering
+                } else {
+                let promoted_first = promoted[0].clone();
+                let rhs = a
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                let stripped = crate::ast::tree::call::strip_trailing_question(&rhs);
+                let is_fallible = stripped.to_string() != rhs.to_string();
+                let value_tokens = if is_fallible {
+                    quote!(match #stripped {
+                        Ok(__rython_v) => __rython_v,
+                        Err(__rython_e) => panic!(
+                            "module-level `{}` initialization failed: {}",
+                            stringify!(#promoted_first),
+                            __rython_e
+                        ),
+                    })
+                } else {
+                    stripped
+                };
+                for n in promoted {
+                    let ident = crate::safe_ident(&n);
+                    // The static's type: the codegen's inferred type when
+                    // known, a few recognized stdlib constructors, else the
+                    // boxed PyValue (the value model's dynamic fallback).
+                    // Boxed values wrap in PyValue::from so the closure's
+                    // type matches.
+                    let (ty, wrapped) =
+                        match module_init_static_ty(&n, &a.value, &options) {
+                            Some(ty) => (ty, value_tokens.clone()),
+                            None => (
+                                quote!(stdpython::PyValue),
+                                quote!(stdpython::PyValue::from(#value_tokens.clone())),
+                            ),
+                        };
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<#ty> =
+                            std::sync::LazyLock::new(|| #wrapped);
+                    });
+                    module_init_stmts.push(quote!(let _ = &*#ident;));
+                }
+                has_module_init_code = true;
+                continue;
+                }
+            }
+
+            // A DEFINITE if/else module value (promoted_conditional): the If
+            // statement itself becomes the static's conditional initializer
+            // (`if sys.platform == "win32": preferred_clock =
+            // time.perf_counter else: ...` → `static preferred_clock:
+            // LazyLock<fn() -> f64> = LazyLock::new(|| if ... { ... } else
+            // { ... })`). The branch values are stdpython module functions
+            // (fn items); the fn-pointer type keeps the call sites
+            // (`preferred_clock()`) compiling.
+            if let crate::StatementType::If(if_stmt) = &s.statement
+                && if_stmt.body.len() == 1
+                && if_stmt.orelse.len() == 1
+                && let crate::StatementType::Assign(b1) = &if_stmt.body[0].statement
+                && let crate::StatementType::Assign(b2) = &if_stmt.orelse[0].statement
+                && let [crate::ExprType::Name(n1)] = b1.targets.as_slice()
+                && let [crate::ExprType::Name(n2)] = b2.targets.as_slice()
+                && n1.id == n2.id
+                && promoted_conditional.contains_key(&n1.id)
+            {
+                let ident = crate::safe_ident(&n1.id);
+                let test = if_stmt
+                    .test
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                let v1 = b1
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                let v2 = b2
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                // Both branch values are stdpython module FUNCTION reads
+                // (`time.perf_counter` / `time.time`): the static is a
+                // fn-pointer; anything else falls back to the boxed None
+                // initializer (the values are dropped).
+                let is_fn_attr = |v: &crate::ExprType| -> bool {
+                    matches!(
+                        v,
+                        crate::ExprType::Attribute(a)
+                            if matches!(a.value.as_ref(), crate::ExprType::Name(_))
+                    )
+                };
+                if is_fn_attr(&b1.value) && is_fn_attr(&b2.value) {
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<fn() -> f64> =
+                            std::sync::LazyLock::new(|| {
+                                if #test {
+                                    #v1
+                                } else {
+                                    #v2
+                                }
+                            });
+                    });
+                } else {
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| {
+                                if #test {
+                                    stdpython::PyValue::None_
+                                } else {
+                                    stdpython::PyValue::None_
+                                }
+                            });
+                    });
+                }
+                module_init_stmts.push(quote!(let _ = &*#ident;));
+                has_module_init_code = true;
+                continue;
             }
 
             // Categorize statements into declarations vs executable code
@@ -395,6 +1022,141 @@ impl CodeGen for Module {
                 o.leaked_loop_targets = std::rc::Rc::new(init_leaked.clone());
                 o
             };
+            // A module-level `try: <imports> except ImportError: <fallback>`
+            // (`from urllib3.contrib.socks import SOCKSProxyManager` —
+            // requests' adapters.py; `from .ssltransport import
+            // SSLTransport` — urllib3's ssl_.py): rython's imports are
+            // STATIC, so the try body always succeeds and the ImportError
+            // fallback (dropped in try_stmt.rs) never runs. The try wrapper
+            // is meaningless — flatten its body to MODULE level so import
+            // statements emit their `use` at module scope (where call sites
+            // outside the wrapper can see them) instead of inside the
+            // lowered try closure.
+            let flattenable_try = match &s.statement {
+                crate::StatementType::Try(t) => {
+                    !t.handlers.is_empty()
+                        && t.orelse.is_empty()
+                        && t.finalbody.is_empty()
+                        && t.handlers.iter().all(|h| {
+                            crate::ast::tree::try_stmt::is_bare_import_error(
+                                &h.exception_type,
+                            ) && (matches!(
+                                h.exception_type,
+                                Some(crate::ExprType::Name(_))
+                            ) || crate::ast::tree::try_stmt::try_body_contains_import(
+                                &t.body,
+                            ))
+                        })
+                }
+                _ => false,
+            };
+            if flattenable_try {
+                if let crate::StatementType::Try(t) = &s.statement {
+                    // A try/except-ImportError whose HANDLER ASSIGNS a name
+                    // the try body IMPORTS (`try: from charset_normalizer
+                    // import __version__ as charset_normalizer_version
+                    // except ImportError: charset_normalizer_version =
+                    // None` — requests/__init__.py): rython's imports are
+                    // static, so the import always succeeds and the
+                    // fallback never runs — but the fallback's Assign still
+                    // makes the name a MODULE-INIT local (hoisted `let`),
+                    // which would collide with the flattened import's `use`
+                    // alias of a static (E0530). Drop the import: the name
+                    // lowers to the module-init local (None in practice).
+                    let handler_assigned: std::collections::HashSet<String> = t
+                        .handlers
+                        .iter()
+                        .flat_map(|h| h.body.iter())
+                        .filter_map(|bs| match &bs.statement {
+                            crate::StatementType::Assign(a) => assign_name_targets(a),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect();
+                    for body_stmt in &t.body {
+                        let body_is_decl =
+                            Self::is_declaration_statement(&body_stmt.statement);
+                        let body_tokens = body_stmt
+                            .clone()
+                            .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
+                            .map_err(|e| wrap_module_error(&module_filename, e))?;
+                        if body_tokens.to_string() != "" {
+                            // The IMPORTED name is reassigned in a handler:
+                            // drop the emitted `use` (see above).
+                            let import_dropped = if let crate::StatementType::ImportFrom(i) =
+                                &body_stmt.statement
+                            {
+                                i.names.iter().any(|a| {
+                                    let bound = a.asname.as_deref().unwrap_or(&a.name);
+                                    handler_assigned.contains(bound)
+                                })
+                            } else {
+                                false
+                            };
+                            if !import_dropped {
+                                if body_is_decl {
+                                    stream.extend(body_tokens);
+                                } else {
+                                    module_init_stmts.push(body_tokens);
+                                    has_module_init_code = true;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            // A DEFINITE try/except module value (promoted_conditional —
+            // requests' compat.py is_urllib3_1): the try either completes
+            // or raises into the handler, and BOTH store the same name —
+            // the value is definitely set. Emit the LazyLock static whose
+            // closure runs the try and falls back to the handler's value.
+            if let crate::StatementType::Try(t) = &s.statement {
+                if let Some(name) = single_assign_name(&t.body)
+                    && t.handlers
+                        .iter()
+                        .all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                    && (promoted_conditional.contains_key(&name)
+                        || promoted_statics.contains(&name))
+                {
+                    let ident = crate::safe_ident(&name);
+                    let body_assign = match &t.body[0].statement {
+                        crate::StatementType::Assign(a) => a.clone(),
+                        _ => unreachable!("single_assign_name matched"),
+                    };
+                    let handler_assign = match &t.handlers[0].body[0].statement {
+                        crate::StatementType::Assign(a) => a.clone(),
+                        _ => unreachable!("single_assign_name matched"),
+                    };
+                    let body_val = body_assign
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    let handler_val = handler_assign
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    let body_val = crate::ast::tree::call::strip_trailing_question(&body_val);
+                    // The try body runs first; on error the handler's value
+                    // applies. The handler may itself fail — propagate.
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| {
+                                match (|| -> Result<_, PyException> {
+                                    Ok(stdpython::PyValue::from(#body_val))
+                                })() {
+                                    Ok(__rython_v) => __rython_v,
+                                    Err(_) => stdpython::PyValue::from(#handler_val),
+                                }
+                            });
+                    });
+                    module_init_stmts.push(quote!(let _ = &*#ident;));
+                    has_module_init_code = true;
+                    continue;
+                }
+            }
             let statement = s
                 .clone()
                 .to_rust(ctx.clone(), init_options, symbols.clone())
@@ -413,12 +1175,20 @@ impl CodeGen for Module {
         }
 
         // Hoist assigned names to declarations at the top of each generated
-        // scope (assignments themselves lower to plain stores).
-        let init_decls = hoisted_declarations(&module_init_raw, &ctx, &symbols, &options);
+        // scope (assignments themselves lower to plain stores). Promoted
+        // LazyLock statics are excluded — they have no `let` in the body.
+        let init_decls = hoisted_declarations(
+            &module_init_raw,
+            &ctx,
+            &symbols,
+            &options,
+            &promoted_statics,
+        );
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
-        let main_decls = hoisted_declarations(&main_body_raw, &ctx, &symbols, &options);
+        let main_decls =
+            hoisted_declarations(&main_body_raw, &ctx, &symbols, &options, &Default::default());
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -477,14 +1247,26 @@ impl CodeGen for Module {
                 let user_main_is_async = stream_str.contains("pub async fn main (");
                 
                 if user_main_is_async {
-                    // User's async main becomes the Rust entry point
+                    // User's async main becomes the Rust entry point. The
+                    // runtime attribute is gated on the generated crate's
+                    // `async-tokio` feature (rypip declares it default-on
+                    // for async binaries); without it a compile_error names
+                    // the fix instead of a bare "no main function".
                     let runtime_attr = options.async_runtime.main_attribute();
                     let attr_tokens: proc_macro2::TokenStream = runtime_attr.parse()
                         .unwrap_or_else(|_| quote!(tokio::main)); // fallback to tokio::main
                     
-                    // Replace the user's function signature and add attributes
+                    // Replace the user's function signature and add the
+                    // feature-gated attribute.
                     let new_stream_str = stream_str
-                        .replace("pub async fn main (", &format!("#[{}] async fn main(", runtime_attr));
+                        .replace(
+                            "pub async fn main (",
+                            &format!(
+                                "#[cfg_attr(feature = \"{}\", {})] async fn main(",
+                                ASYNC_RUNTIME_FEATURE,
+                                runtime_attr
+                            ),
+                        );
                     stream = new_stream_str.parse::<proc_macro2::TokenStream>()
                         .unwrap_or_else(|_| stream);
                         
@@ -497,7 +1279,7 @@ impl CodeGen for Module {
                             .unwrap_or_else(|_| stream);
 
                         stream.extend(quote! {
-                            #[#attr_tokens]
+                            #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                             async fn main() {
                                 let __rython_result: Result<(), PyException> = async {
                                     __module_init__()?;
@@ -511,6 +1293,16 @@ impl CodeGen for Module {
                             }
                         });
                     }
+                    // A compile_error! applies to the whole crate wherever it
+                    // sits, so emit it once for the feature-off build.
+                    stream.extend(quote! {
+                        #[cfg(not(feature = #ASYNC_RUNTIME_FEATURE))]
+                        compile_error!(
+                            "this program uses async/await and needs the async runtime; \
+                             build the generated crate with --features async-tokio \
+                             (rypip enables it by default)"
+                        );
+                    });
                 } else {
                     // User's sync main becomes the Rust entry point
                     // Need to modify the function to match Rust main signature requirements
@@ -575,8 +1367,19 @@ impl CodeGen for Module {
                     } else {
                         quote!()
                     };
+                    // The runtime attribute applies only when the generated
+                    // crate's `async-tokio` feature is enabled (rypip
+                    // declares it default-on for async binaries); without
+                    // it, `async fn main` has no executor, so a compile_error
+                    // names the fix instead of a bare "no main function".
                     stream.extend(quote! {
-                        #[#attr_tokens]
+                        #[cfg(not(feature = #ASYNC_RUNTIME_FEATURE))]
+                        compile_error!(
+                            "this program uses async/await and needs the async runtime; \
+                             build the generated crate with --features async-tokio \
+                             (rypip enables it by default)"
+                        );
+                        #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                         async fn main() {
                             let __rython_result: Result<(), PyException> = async {
                                 #init_call
@@ -622,7 +1425,225 @@ impl CodeGen for Module {
                 }
             });
         }
+        // Module-level generated items collected during codegen (issue
+        // #109, M3: duck-typing traits like HasSpeak and their per-class
+        // impls). Emitted at the TOP of the module, above the functions.
+        let pending = options.module_pending_items.borrow_mut().drain(..).collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let mut prefix = TokenStream::new();
+            for item in pending {
+                prefix.extend(item);
+            }
+            prefix.extend(stream);
+            stream = prefix;
+        }
         Ok(stream)
+    }
+}
+
+/// Whether a statement body contains any async construct (async def, await,
+/// async for, async with) anywhere, including nested control flow. Drives
+/// the async-runtime import and the async entry-point decision. Function
+/// and class bodies count (their code runs in this module).
+pub fn module_contains_async(body: &[crate::Statement]) -> bool {
+    fn expr_contains_async(expr: &crate::ExprType) -> bool {
+        match expr {
+            crate::ExprType::Await(_) => true,
+            crate::ExprType::Call(c) => {
+                expr_contains_async(&c.func)
+                    || c.args.iter().any(expr_contains_async)
+                    || c.keywords.iter().any(|k| expr_contains_async(&k.value))
+            }
+            crate::ExprType::BoolOp(b) => b.values.iter().any(expr_contains_async),
+            crate::ExprType::BinOp(b) => {
+                expr_contains_async(&b.left) || expr_contains_async(&b.right)
+            }
+            crate::ExprType::UnaryOp(u) => expr_contains_async(&u.operand),
+            crate::ExprType::IfExp(i) => {
+                expr_contains_async(&i.test)
+                    || expr_contains_async(&i.body)
+                    || expr_contains_async(&i.orelse)
+            }
+            crate::ExprType::Dict(d) => {
+                d.keys.iter().flatten().any(expr_contains_async)
+                    || d.values.iter().any(expr_contains_async)
+            }
+            crate::ExprType::Set(s) => s.elts.iter().any(expr_contains_async),
+            crate::ExprType::List(items) => items.iter().any(expr_contains_async),
+            crate::ExprType::Tuple(t) => t.elts.iter().any(expr_contains_async),
+            crate::ExprType::Compare(c) => {
+                expr_contains_async(&c.left) || c.comparators.iter().any(expr_contains_async)
+            }
+            crate::ExprType::Attribute(a) => expr_contains_async(&a.value),
+            crate::ExprType::Subscript(s) => {
+                expr_contains_async(&s.value)
+                    || match &s.kind {
+                        crate::SubscriptKind::Index(e) => expr_contains_async(e),
+                        crate::SubscriptKind::Slice { lower, upper, step } => {
+                            lower.as_deref().is_some_and(expr_contains_async)
+                                || upper.as_deref().is_some_and(expr_contains_async)
+                                || step.as_deref().is_some_and(expr_contains_async)
+                        }
+                    }
+            }
+            crate::ExprType::Starred(s) => expr_contains_async(&s.value),
+            crate::ExprType::NamedExpr(n) => {
+                expr_contains_async(&n.left) || expr_contains_async(&n.right)
+            }
+            crate::ExprType::Yield(y) => y.value.as_deref().is_some_and(expr_contains_async),
+            crate::ExprType::YieldFrom(y) => expr_contains_async(&y.value),
+            crate::ExprType::Lambda(l) => expr_contains_async(&l.body),
+            crate::ExprType::JoinedStr(f) => f.values.iter().any(expr_contains_async),
+            crate::ExprType::FormattedValue(f) => {
+                expr_contains_async(&f.value)
+                    || f.format_spec.as_deref().is_some_and(expr_contains_async)
+            }
+            crate::ExprType::ListComp(l) => {
+                expr_contains_async(&l.elt)
+                    || l.generators.iter().any(|g| {
+                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            crate::ExprType::SetComp(s) => {
+                expr_contains_async(&s.elt)
+                    || s.generators.iter().any(|g| {
+                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            crate::ExprType::DictComp(d) => {
+                expr_contains_async(&d.value)
+                    || d.generators.iter().any(|g| {
+                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            crate::ExprType::GeneratorExp(g) => {
+                expr_contains_async(&g.elt)
+                    || g.generators.iter().any(|gg| {
+                        expr_contains_async(&gg.iter) || gg.ifs.iter().any(expr_contains_async)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_contains_async(stmt: &crate::Statement) -> bool {
+        match &stmt.statement {
+            crate::StatementType::AsyncFunctionDef(_)
+            | crate::StatementType::AsyncFor(_)
+            | crate::StatementType::AsyncWith(_) => true,
+            crate::StatementType::FunctionDef(f) => f.body.iter().any(stmt_contains_async),
+            crate::StatementType::ClassDef(c) => c.body.iter().any(stmt_contains_async),
+            crate::StatementType::If(i) => {
+                i.body.iter().any(stmt_contains_async) || i.orelse.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::For(f) => {
+                expr_contains_async(&f.iter)
+                    || f.body.iter().any(stmt_contains_async)
+                    || f.orelse.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::While(w) => {
+                w.body.iter().any(stmt_contains_async) || w.orelse.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::Try(t) => {
+                t.body.iter().any(stmt_contains_async)
+                    || t.handlers.iter().any(|h| h.body.iter().any(stmt_contains_async))
+                    || t.orelse.iter().any(stmt_contains_async)
+                    || t.finalbody.iter().any(stmt_contains_async)
+            }
+            crate::StatementType::With(w) => w.body.iter().any(stmt_contains_async),
+            crate::StatementType::Expr(e) => expr_contains_async(&e.value),
+            crate::StatementType::Assign(a) => {
+                expr_contains_async(&a.value)
+                    || a.targets.iter().any(expr_contains_async)
+            }
+            crate::StatementType::AugAssign(a) => {
+                expr_contains_async(&a.target) || expr_contains_async(&a.value)
+            }
+            crate::StatementType::Return(Some(e)) => expr_contains_async(&e.value),
+            crate::StatementType::Raise(r) => {
+                r.exc.as_ref().is_some_and(expr_contains_async)
+                    || r.cause.as_ref().is_some_and(expr_contains_async)
+            }
+            crate::StatementType::Assert { test, msg } => {
+                expr_contains_async(test)
+                    || msg.as_deref().is_some_and(expr_contains_async)
+            }
+            _ => false,
+        }
+    }
+
+    body.iter().any(stmt_contains_async)
+}
+
+/// Whether a module body imports `asyncio` (plain or from-import, aliased
+/// or not). Drives whether the generated crate needs stdpython's
+/// tokio-backed `async-tokio` feature even for library conversions.
+pub fn module_imports_asyncio(body: &[crate::Statement]) -> bool {
+    fn stmt_imports_asyncio(stmt: &crate::Statement) -> bool {
+        match &stmt.statement {
+            crate::StatementType::Import(imp) => imp.names.iter().any(|a| {
+                a.name.split('.').next().is_some_and(|root| root == "asyncio")
+            }),
+            crate::StatementType::ImportFrom(imp) => {
+                imp.module.split('.').next().is_some_and(|root| root == "asyncio")
+            }
+            crate::StatementType::If(i) => {
+                i.body.iter().any(stmt_imports_asyncio) || i.orelse.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::For(f) => {
+                f.body.iter().any(stmt_imports_asyncio) || f.orelse.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::While(w) => {
+                w.body.iter().any(stmt_imports_asyncio) || w.orelse.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::Try(t) => {
+                t.body.iter().any(stmt_imports_asyncio)
+                    || t.handlers.iter().any(|h| h.body.iter().any(stmt_imports_asyncio))
+                    || t.orelse.iter().any(stmt_imports_asyncio)
+                    || t.finalbody.iter().any(stmt_imports_asyncio)
+            }
+            crate::StatementType::With(w) => w.body.iter().any(stmt_imports_asyncio),
+            crate::StatementType::FunctionDef(f) => f.body.iter().any(stmt_imports_asyncio),
+            _ => false,
+        }
+    }
+    body.iter().any(stmt_imports_asyncio)
+}
+
+/// The plain-Name targets of a module-level Assign, when EVERY target is a
+/// plain Name (single-store promotion only applies to name targets; a
+/// chained `a = b = expr` where both are names promotes both — urllib3's
+/// `__version__ = version = '2.7.0'` in _version.py). Returns None when any
+/// target is a subscript/attribute/tuple (mixed targets cannot all be
+/// promoted as statics).
+fn assign_name_targets(a: &crate::Assign) -> Option<Vec<String>> {    if a.targets.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(a.targets.len());
+    for t in &a.targets {
+        match t {
+            crate::ExprType::Name(n) => out.push(n.id.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The single plain-Name target of a one-assignment statement list, or
+/// None when the list is not exactly one `x = ...` (used by the definite
+/// try/except module-value promotion — requests' compat.py is_urllib3_1).
+fn single_assign_name(stmts: &[crate::Statement]) -> Option<String> {
+    if stmts.len() != 1 {
+        return None;
+    }
+    match &stmts[0].statement {
+        crate::StatementType::Assign(a) if a.targets.len() == 1 => {
+            match &a.targets[0] {
+                crate::ExprType::Name(n) => Some(n.id.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -718,8 +1739,1152 @@ fn count_module_stores(
 /// leading unary minus). Non-literal or reassigned module globals keep
 /// the old __module_init__ lowering, where referencing them from a
 /// function is a loud compile error rather than a silent divergence.
-fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {
+/// Whether a module-level assignment's VALUE is a typing annotation (a
+/// container/typing generic subscript, or a `typing.X` attribute): the name
+/// is a TYPE ALIAS consumed by annotation resolution, never a runtime value
+/// (`_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], ...]`,
+/// `_TYPE_BODY = typing.Union[...]` — urllib3).
+/// Names that SIBLING modules of the crate import FROM this module
+/// (`from .constant import _THAI` in charset_normalizer's utils, where
+/// `_THAI = 1 << 6` is a module-level value). Such names must be promoted
+/// to `pub static` (LazyLock) items in THIS module, or the importing
+/// module's `use crate::charset_normalizer::constant::_THAI;` fails with
+/// E0432 — a module-init local is invisible to other modules. Only
+/// meaningful in multi-module conversions (module_defs populated); a
+/// single-module conversion has no siblings and returns empty.
+fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<String> {
+    use crate::StatementType as ST;
+    let mut names = std::collections::HashSet::new();
+    if options.module_defs.len() <= 1 || options.this_module_path.is_empty() {
+        return names;
+    }
+    let this_path = &options.this_module_path;
+    for (path, module) in options.module_defs.iter() {
+        if *path == *this_path {
+            continue;
+        }
+        // The sibling's own package path: relative imports inside it
+        // resolve against ITS path, not this module's.
+        let mut sibling_options = options.clone();
+        sibling_options.module_path = module_package_path_from_defs(path, &options);
+        for stmt in &module.raw.body {
+            if let ST::ImportFrom(ifm) = &stmt.statement {
+                if ifm.resolved_module_path(&sibling_options) == *this_path {
+                    for alias in &ifm.names {
+                        names.insert(alias.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The promotion decision for the module at `path` in the generated crate:
+/// the names that WILL be emitted as `pub static` LazyLock statics there.
+/// Computed on demand from the module's AST (module_defs), then cached in
+/// `options.module_promoted_statics` so the DEFINING module's promotion
+/// pass and every IMPORTING module's read lowering agree (name.rs renders
+/// `(*name).clone()` for such names). Mirrors the promotion loop in
+/// `Module::to_rust` exactly.
+pub(crate) fn module_promoted_static_names(
+    options: &PythonOptions,
+    path: &[String],
+) -> std::rc::Rc<std::collections::HashSet<String>> {
+    if let Some(cached) = options.module_promoted_statics.borrow().get(path) {
+        return cached.clone();
+    }
+    let Some(module) = options.module_defs.get(path) else {
+        return std::rc::Rc::new(std::collections::HashSet::new());
+    };
+    let mut target = options.clone();
+    target.this_module_path = path.to_vec();
+    let mut counts = std::collections::HashMap::new();
+    count_module_stores(&module.raw.body, &mut counts);
+    let free_reads = module_function_free_reads(&module.raw.body);
+    let sibling = sibling_imported_names(&target);
+    let symbols = (**module).clone().find_symbols(crate::SymbolTableScopes::new());
+    let mut names = std::collections::HashSet::new();
+    // Module-level name → the module-level names its INITIALIZER reads.
+    // A name whose initializer reads a PROMOTED name must itself be
+    // promoted (url.py's `_IPV6_ADDRZ_RE = re.compile("^" +
+    // _IPV6_ADDRZ_PAT + "$")` — the RE is promoted because functions use
+    // it, but _IPV6_ADDRZ_PAT is only read by OTHER module-level
+    // initializers, not functions; a static's closure cannot reference a
+    // module-init local (E0425). Computed transitively to a fixpoint.
+    let mut init_reads: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for stmt in &module.raw.body {
+        if let crate::StatementType::Assign(a) = &stmt.statement {
+            // Only NON-const single-store names participate: const names
+            // are already emitted as plain `pub static` items, so the
+            // transitive closure must not double-promote them.
+            if const_static_type(&a.value).is_some() {
+                continue;
+            }
+            if let Some(targets) = assign_name_targets(a) {
+                for n in &targets {
+                    if counts.get(n) == Some(&1) {
+                        let reads = module_expr_reads(&a.value);
+                        init_reads.insert(n.clone(), reads);
+                    }
+                }
+            }
+        }
+    }
+    for stmt in &module.raw.body {
+        if let crate::StatementType::If(if_stmt) = &stmt.statement {
+            if Module::is_type_checking_test(&if_stmt.test) {
+                continue;
+            }
+            let test_str = format!("{:?}", if_stmt.test);
+            if test_str.contains("__name__") && test_str.contains("__main__") {
+                continue;
+            }
+        }
+        // A DEFINITE try/except module value (requests' compat.py
+        // is_urllib3_1 — same name stored once in the try body and once in
+        // a handler, so the value is definitely set): promote like the
+        // if/else case, including for SIBLING-imported names.
+        if let crate::StatementType::Try(t) = &stmt.statement {
+            let body_name = single_assign_name(&t.body);
+            if let Some(name) = body_name
+                && t.handlers
+                    .iter()
+                    .all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                && counts.get(&name) == Some(&4)
+                && (free_reads.contains(&name) || sibling.contains(&name))
+            {
+                names.insert(name.clone());
+            }
+        }
+        if let crate::StatementType::Assign(a) = &stmt.statement {
+            if crate::try_lru_cache_factory(a, Some(&target), &symbols).is_some() {
+                continue;
+            }
+            if let [crate::ExprType::Name(_)] = a.targets.as_slice()
+                && let crate::ExprType::Name(n) = &a.value
+                && matches!(
+                    n.id.as_str(),
+                    "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
+                )
+            {
+                continue;
+            }
+            // EVERY target must be a single-store plain name for the
+            // promotion (a chained `__version__ = version = '2.7.0'`
+            // promotes both names, but only when each is stored exactly
+            // once — a reassigned chained target must not freeze).
+            if let Some(targets) = assign_name_targets(a) {
+                for n in &targets {
+                    if counts.get(n) == Some(&1)
+                        && const_static_type(&a.value).is_none()
+                        && !is_type_alias_value(&a.value)
+                        && !crate::is_rust_bind_call(&a.value)
+                        && (free_reads.contains(n) || sibling.contains(n))
+                        // A name ALSO bound by an import (`SSLTransport =
+                        // None` then `from .ssltransport import
+                        // SSLTransport` — urllib3's ssl_.py): Python's
+                        // LAST binding wins, so the import overrides the
+                        // assign; a promoted static would collide with
+                        // the import's `use` (E0252) and render the
+                        // imported class unusable (E0433). The import
+                        // owns the name.
+                        && !matches!(
+                            symbols.get(n),
+                            Some(crate::SymbolTableNode::ImportFrom(_))
+                                | Some(crate::SymbolTableNode::Import(_))
+                        )
+                    {
+                        names.insert(n.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Transitive promotion to a fixpoint: every name a PROMOTED name's
+    // initializer reads must also be promoted (url.py's `_IPV6_ADDRZ_RE =
+    // re.compile("^" + _IPV6_ADDRZ_PAT + "$")` — the RE is promoted
+    // because functions use it, but _IPV6_ADDRZ_PAT is only read by OTHER
+    // module-level initializers, never a function; a static's closure
+    // cannot reference a module-init local (E0425)).
+    loop {
+        let mut changed = false;
+        let snapshot: std::collections::HashSet<String> = names.clone();
+        for (n, reads) in &init_reads {
+            if !snapshot.contains(n) {
+                continue;
+            }
+            for r in reads {
+                if !names.contains(r) && init_reads.contains_key(r) {
+                    names.insert(r.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let rc = std::rc::Rc::new(names);
+    options
+        .module_promoted_statics
+        .borrow_mut()
+        .insert(path.to_vec(), rc.clone());
+    rc
+}
+
+/// The names a module-level expression READS (bare Names and attribute
+/// roots) — used by the transitive static-promotion fixpoint (a promoted
+/// static's initializer must not reference a module-init local).
+fn module_expr_reads(expr: &crate::ExprType) -> std::collections::HashSet<String> {
+    use crate::ExprType as ET;
+    let mut out = std::collections::HashSet::new();
+    fn walk(e: &crate::ExprType, out: &mut std::collections::HashSet<String>) {
+        match e {
+            ET::Name(n) => {
+                out.insert(n.id.clone());
+            }
+            ET::Attribute(a) => walk(&a.value, out),
+            ET::Call(c) => {
+                walk(&c.func, out);
+                for a in &c.args {
+                    walk(a, out);
+                }
+                for kw in &c.keywords {
+                    walk(&kw.value, out);
+                }
+            }
+            ET::BinOp(op) => {
+                walk(&op.left, out);
+                walk(&op.right, out);
+            }
+            ET::BoolOp(op) => {
+                for v in &op.values {
+                    walk(v, out);
+                }
+            }
+            ET::Compare(c) => {
+                walk(&c.left, out);
+                for c in &c.comparators {
+                    walk(c, out);
+                }
+            }
+            ET::UnaryOp(u) => walk(&u.operand, out),
+            ET::Subscript(s) => {
+                walk(&s.value, out);
+                match &s.kind {
+                    crate::SubscriptKind::Index(i) => walk(i, out),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        if let Some(l) = lower {
+                            walk(l, out);
+                        }
+                        if let Some(u) = upper {
+                            walk(u, out);
+                        }
+                        if let Some(st) = step {
+                            walk(st, out);
+                        }
+                    }
+                }
+            }
+            ET::List(l) => {
+                for e in l {
+                    walk(e, out);
+                }
+            }
+            ET::Tuple(t) => {
+                for e in &t.elts {
+                    walk(e, out);
+                }
+            }
+            ET::Set(s) => {
+                for e in &s.elts {
+                    walk(e, out);
+                }
+            }
+            ET::Dict(d) => {
+                for k in d.keys.iter().flatten() {
+                    walk(k, out);
+                }
+                for v in &d.values {
+                    walk(v, out);
+                }
+            }
+            ET::IfExp(i) => {
+                walk(&i.test, out);
+                walk(&i.body, out);
+                walk(&i.orelse, out);
+            }
+            ET::Lambda(l) => {
+                walk(&l.body, out);
+            }
+            ET::Starred(s) => walk(&s.value, out),
+            ET::Yield(y) => {
+                if let Some(v) = &y.value {
+                    walk(v, out);
+                }
+            }
+            ET::YieldFrom(y) => walk(&y.value, out),
+            ET::Await(a) => walk(&a.value, out),
+            ET::JoinedStr(j) => {
+                for part in &j.values {
+                    if let ET::FormattedValue(f) = part {
+                        walk(&f.value, out);
+                    }
+                }
+            }
+            // Comprehensions and generator expressions read their element
+            // expression and their iterables (`"|".join(x % _subs for x in
+            // _variations)` — urllib3's url.py _IPV6_PAT chain): every
+            // name in them must be promoted with the static.
+            ET::ListComp(lc) => {
+                walk(&lc.elt, out);
+                for g in &lc.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            ET::SetComp(sc) => {
+                walk(&sc.elt, out);
+                for g in &sc.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            ET::DictComp(dc) => {
+                walk(&dc.key, out);
+                walk(&dc.value, out);
+                for g in &dc.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            ET::GeneratorExp(ge) => {
+                walk(&ge.elt, out);
+                for g in &ge.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(expr, &mut out);
+    out
+}
+
+/// The package path of a module at `path` within module_defs: the parent
+/// directory, unless the module IS a package (`__init__.py` — its path is
+/// the package dir itself, and no other module has it as a strict prefix).
+fn module_package_path_from_defs(
+    path: &[String],
+    options: &PythonOptions,
+) -> Vec<String> {
+    let is_package = options.module_defs.keys().any(|k| {
+        k.len() > path.len() && k[..path.len()] == path[..]
+    });
+    if is_package {
+        path.to_vec()
+    } else {
+        path[..path.len().saturating_sub(1)].to_vec()
+    }
+}
+
+/// Names READ as free variables inside function bodies anywhere in the
+/// module (top-level and nested): every Name that appears in a function
+/// body and is not bound there (param, assignment target, def/class name,
+/// loop/with target, walrus target, comprehension target). Module-level
+/// values assigned from non-constant expressions are promoted to LazyLock
+/// statics when a function reads them — the old lowering hid the value
+/// inside __module_init__, where functions cannot see it (issue #137
+/// cluster: `log = logging.getLogger(...)` in urllib3 / charset_normalizer).
+fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::HashSet<String> {
+    use crate::StatementType as ST;
+    let mut all_names = std::collections::HashSet::new();
+    let mut bound = std::collections::HashSet::new();
+
+    // Collect every Name AND every bound target inside an expression. The
+    // free reads are all_names minus bound; a name that is both read and
+    // bound (a local, a def name) cancels out.
+    fn walk_expr(
+        expr: &crate::ExprType,
+        all: &mut std::collections::HashSet<String>,
+        bound: &mut std::collections::HashSet<String>,
+    ) {
+        match expr {
+            crate::ExprType::Name(n) => {
+                all.insert(n.id.clone());
+            }
+            crate::ExprType::Call(c) => {
+                walk_expr(&c.func, all, bound);
+                for a in &c.args {
+                    walk_expr(a, all, bound);
+                }
+                for kw in &c.keywords {
+                    walk_expr(&kw.value, all, bound);
+                }
+            }
+            crate::ExprType::BinOp(op) => {
+                walk_expr(&op.left, all, bound);
+                walk_expr(&op.right, all, bound);
+            }
+            crate::ExprType::BoolOp(op) => {
+                for v in &op.values {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::UnaryOp(op) => walk_expr(&op.operand, all, bound),
+            crate::ExprType::Compare(cmp) => {
+                walk_expr(&cmp.left, all, bound);
+                for c in &cmp.comparators {
+                    walk_expr(c, all, bound);
+                }
+            }
+            crate::ExprType::IfExp(e) => {
+                walk_expr(&e.test, all, bound);
+                walk_expr(&e.body, all, bound);
+                walk_expr(&e.orelse, all, bound);
+            }
+            crate::ExprType::NamedExpr(e) => {
+                bind_target(&e.left, bound);
+                walk_expr(&e.right, all, bound);
+            }
+            crate::ExprType::Dict(d) => {
+                for k in d.keys.iter().flatten() {
+                    walk_expr(k, all, bound);
+                }
+                for v in &d.values {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::Set(s) => {
+                for e in &s.elts {
+                    walk_expr(e, all, bound);
+                }
+            }
+            crate::ExprType::List(elts) => {
+                for e in elts {
+                    walk_expr(e, all, bound);
+                }
+            }
+            crate::ExprType::Tuple(t) => {
+                for e in &t.elts {
+                    walk_expr(e, all, bound);
+                }
+            }
+            crate::ExprType::Attribute(a) => walk_expr(&a.value, all, bound),
+            crate::ExprType::Subscript(sub) => {
+                walk_expr(&sub.value, all, bound);
+                match &sub.kind {
+                    crate::SubscriptKind::Index(i) => walk_expr(i, all, bound),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        for o in [lower, upper, step].into_iter().flatten() {
+                            walk_expr(o, all, bound);
+                        }
+                    }
+                }
+            }
+            crate::ExprType::Starred(s) => walk_expr(&s.value, all, bound),
+            crate::ExprType::Await(e) => walk_expr(&e.value, all, bound),
+            crate::ExprType::Yield(y) => {
+                if let Some(v) = &y.value {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::YieldFrom(y) => walk_expr(&y.value, all, bound),
+            crate::ExprType::FormattedValue(f) => walk_expr(&f.value, all, bound),
+            crate::ExprType::JoinedStr(j) => {
+                for v in &j.values {
+                    walk_expr(v, all, bound);
+                }
+            }
+            crate::ExprType::Lambda(l) => {
+                for p in &l.args.args {
+                    bound.insert(p.arg.clone());
+                }
+                for p in &l.args.posonlyargs {
+                    bound.insert(p.arg.clone());
+                }
+                for p in &l.args.kwonlyargs {
+                    bound.insert(p.arg.clone());
+                }
+                if let Some(p) = &l.args.vararg {
+                    bound.insert(p.arg.clone());
+                }
+                if let Some(p) = &l.args.kwarg {
+                    bound.insert(p.arg.clone());
+                }
+                walk_expr(&l.body, all, bound);
+            }
+            crate::ExprType::ListComp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.elt, all, bound);
+            }
+            crate::ExprType::SetComp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.elt, all, bound);
+            }
+            crate::ExprType::GeneratorExp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.elt, all, bound);
+            }
+            crate::ExprType::DictComp(c) => {
+                for g in &c.generators {
+                    bind_target(&g.target, bound);
+                    walk_expr(&g.iter, all, bound);
+                    for cond in &g.ifs {
+                        walk_expr(cond, all, bound);
+                    }
+                }
+                walk_expr(&c.key, all, bound);
+                walk_expr(&c.value, all, bound);
+            }
+            _ => {}
+        }
+    }
+
+    // A Name/Tuple/Starred assignment target binds its Names.
+    fn bind_target(target: &crate::ExprType, bound: &mut std::collections::HashSet<String>) {
+        match target {
+            crate::ExprType::Name(n) => {
+                bound.insert(n.id.clone());
+            }
+            crate::ExprType::Tuple(t) => {
+                for e in &t.elts {
+                    bind_target(e, bound);
+                }
+            }
+            crate::ExprType::Starred(s) => bind_target(&s.value, bound),
+            _ => {}
+        }
+    }
+
+    fn param_names(args: &crate::Arguments, bound: &mut std::collections::HashSet<String>) {
+        for p in args.posonlyargs.iter().chain(args.args.iter()).chain(args.kwonlyargs.iter()) {
+            bound.insert(p.arg.clone());
+        }
+        if let Some(p) = &args.vararg {
+            bound.insert(p.arg.clone());
+        }
+        if let Some(p) = &args.kwarg {
+            bound.insert(p.arg.clone());
+        }
+    }
+
+    fn walk_stmt(
+        stmt: &crate::Statement,
+        all: &mut std::collections::HashSet<String>,
+        bound: &mut std::collections::HashSet<String>,
+    ) {
+        match &stmt.statement {
+            ST::Assign(a) => {
+                for t in &a.targets {
+                    bind_target(t, bound);
+                }
+                if let Some(ann) = &a.annotation {
+                    walk_expr(ann, all, bound);
+                }
+                walk_expr(&a.value, all, bound);
+            }
+            ST::AugAssign(a) => {
+                bind_target(&a.target, bound);
+                walk_expr(&a.target, all, bound);
+                walk_expr(&a.value, all, bound);
+            }
+            ST::AnnotatedName { name, annotation } => {
+                bound.insert(name.clone());
+                walk_expr(annotation, all, bound);
+            }
+            ST::For(f) => {
+                bind_target(&f.target, bound);
+                walk_expr(&f.iter, all, bound);
+                for s in f.body.iter().chain(f.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::AsyncFor(f) => {
+                bind_target(&f.target, bound);
+                walk_expr(&f.iter, all, bound);
+                for s in f.body.iter().chain(f.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::While(w) => {
+                walk_expr(&w.test, all, bound);
+                for s in w.body.iter().chain(w.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::If(i) => {
+                walk_expr(&i.test, all, bound);
+                for s in i.body.iter().chain(i.orelse.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::With(w) => {
+                for item in &w.items {
+                    walk_expr(&item.context_expr, all, bound);
+                    if let Some(v) = &item.optional_vars {
+                        bind_target(v, bound);
+                    }
+                }
+                for s in &w.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::AsyncWith(w) => {
+                for item in &w.items {
+                    walk_expr(&item.context_expr, all, bound);
+                    if let Some(v) = &item.optional_vars {
+                        bind_target(v, bound);
+                    }
+                }
+                for s in &w.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::Try(t) => {
+                for s in &t.body {
+                    walk_stmt(s, all, bound);
+                }
+                for h in &t.handlers {
+                    if let Some(e) = &h.exception_type {
+                        walk_expr(e, all, bound);
+                    }
+                    if let Some(n) = &h.name {
+                        bound.insert(n.clone());
+                    }
+                    for s in &h.body {
+                        walk_stmt(s, all, bound);
+                    }
+                }
+                for s in t.orelse.iter().chain(t.finalbody.iter()) {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                bound.insert(f.name.clone());
+                param_names(&f.args, bound);
+                for s in &f.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::ClassDef(c) => {
+                bound.insert(c.name.clone());
+                // Class METHOD bodies read module values; the class body's
+                // own assignments bind class attrs (method reads of a bare
+                // name resolve to module scope in Python, but over-binding
+                // only skips a promotion — never mis-promotes).
+                for s in &c.body {
+                    walk_stmt(s, all, bound);
+                }
+            }
+            ST::Expr(e) => walk_expr(&e.value, all, bound),
+            ST::Return(Some(e)) => walk_expr(&e.value, all, bound),
+            ST::Call(c) => walk_expr(
+                &crate::ExprType::Call(c.clone()),
+                all,
+                bound,
+            ),
+            ST::Assert { test, msg, .. } => {
+                walk_expr(test, all, bound);
+                if let Some(m) = msg {
+                    walk_expr(m, all, bound);
+                }
+            }
+            ST::Raise(r) => {
+                if let Some(e) = &r.exc {
+                    walk_expr(e, all, bound);
+                }
+                if let Some(c) = &r.cause {
+                    walk_expr(c, all, bound);
+                }
+            }
+            ST::Delete(targets) => {
+                for t in targets {
+                    walk_expr(t, all, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_module_defs(
+            stmt: &crate::Statement,
+            all: &mut std::collections::HashSet<String>,
+            bound: &mut std::collections::HashSet<String>,
+        ) {
+            use crate::StatementType as ST2;
+            match &stmt.statement {
+                // A def/class body anywhere under module-level control flow
+                // reads module values; walk it with the full walker (which
+                // binds the def's own scope).
+                ST2::FunctionDef(_) | ST2::AsyncFunctionDef(_) | ST2::ClassDef(_) => {
+                    walk_stmt(stmt, all, bound);
+                }
+                // Control-flow shells only HOST defs — their own
+                // assignments bind MODULE scope, not a function's locals,
+                // so they must not enter the bound set.
+                ST2::If(i) => {
+                    let is_type_checking = matches!(
+                        &i.test,
+                        crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                    ) || matches!(
+                        &i.test,
+                        crate::ExprType::Attribute(a) if a.attr == "TYPE_CHECKING"
+                    );
+                    if !is_type_checking {
+                        for s in i.body.iter().chain(i.orelse.iter()) {
+                            walk_module_defs(s, all, bound);
+                        }
+                    }
+                }
+                ST2::While(w) => {
+                    for s in w.body.iter().chain(w.orelse.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::For(f) => {
+                    for s in f.body.iter().chain(f.orelse.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::AsyncFor(f) => {
+                    for s in f.body.iter().chain(f.orelse.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::With(w) => {
+                    for s in &w.body {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::AsyncWith(w) => {
+                    for s in &w.body {
+                        walk_module_defs(s, all, bound);
+                    }
+                }
+                ST2::Try(t) => {
+                    for s in t.body.iter().chain(t.orelse.iter()).chain(t.finalbody.iter()) {
+                        walk_module_defs(s, all, bound);
+                    }
+                    for h in &t.handlers {
+                        for s in &h.body {
+                            walk_module_defs(s, all, bound);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for s in body {
+            walk_module_defs(s, &mut all_names, &mut bound);
+        }
+
+    all_names
+        .difference(&bound)
+        .cloned()
+        .collect()
+}
+
+/// Does `name` have a runtime item in the module at `path` — i.e. is it
+/// GENERATED, not a TYPE_CHECKING-only stub (`if TYPE_CHECKING: class
+/// BaseHTTPConnection(Protocol)` — urllib3's _base_connection)? TYPE_CHECKING
+/// imports of such names must NOT emit `use` statements (the item does not
+/// exist in the generated crate), and annotations referencing them resolve
+/// to the boxed PyValue instead of a bare struct name (type_ctx.rs).
+pub(crate) fn module_def_has_runtime_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    fn scan(body: &[crate::Statement], name: &str, in_type_checking: bool) -> bool {
+        use crate::StatementType as ST;
+        for s in body {
+            match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                    if !in_type_checking && f.name == name {
+                        return true;
+                    }
+                }
+                ST::ClassDef(c) => {
+                    if !in_type_checking && c.name == name {
+                        return true;
+                    }
+                }
+                ST::Assign(a) => {
+                    if !in_type_checking
+                        && a.targets.iter().any(|t| {
+                            matches!(t, crate::ExprType::Name(n) if n.id == name)
+                        })
+                    {
+                        return true;
+                    }
+                }
+                ST::If(i) => {
+                    // `if TYPE_CHECKING:` (bare) or `if typing.TYPE_CHECKING:`
+                    // (attribute) marks a compile-time-only block.
+                    let tc = in_type_checking
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                        )
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Attribute(a)
+                                if a.attr == "TYPE_CHECKING"
+                                    && matches!(
+                                        a.value.as_ref(),
+                                        crate::ExprType::Name(m) if m.id == "typing"
+                                    )
+                        );
+                    if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
+                        return true;
+                    }
+                }
+                ST::While(w) => {
+                    if scan(&w.body, name, in_type_checking)
+                        || scan(&w.orelse, name, in_type_checking)
+                    {
+                        return true;
+                    }
+                }
+                ST::For(f) => {
+                    if scan(&f.body, name, in_type_checking)
+                        || scan(&f.orelse, name, in_type_checking)
+                    {
+                        return true;
+                    }
+                }
+                ST::With(w) => {
+                    if scan(&w.body, name, in_type_checking) {
+                        return true;
+                    }
+                }
+                ST::Try(t) => {
+                    for part in [&t.body, &t.orelse, &t.finalbody] {
+                        if scan(part, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                    for h in &t.handlers {
+                        if scan(&h.body, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    if scan(&module.raw.body, name, false) {
+        return true;
+    }
+    // The name may be a SUBMODULE of the package (`from .util import
+    // connection, ssl_` — urllib3's connection.py, where connection and
+    // ssl_ are util/connection.rs / util/ssl_.rs): the defining module's
+    // body has no item of that name, but the generated crate has a module
+    // at `path + [name]`, so the import (`pub use crate::urllib3::util::
+    // connection;`) resolves.
+    let mut submodule = path.to_vec();
+    submodule.push(name.to_string());
+    if options.module_defs.contains_key(&submodule) {
+        return true;
+    }
+    // The name may be RE-EXPORTED by the defining module via its own
+    // ImportFrom (`from .request import SKIP_HEADER, SKIPPABLE_HEADERS` —
+    // urllib3's util/__init__.py): the generated util/mod.rs carries the
+    // `pub use crate::urllib3::util::request::SKIP_HEADER;` chain, so an
+    // importer's `from .util import SKIP_HEADER` resolves. Follow the
+    // chain to the defining module's item.
+    module_reexports_item(options, path, name, &mut std::collections::HashSet::new())
+}
+
+/// Whether the module at `path` actually generates a PATH ITEM named
+/// `name` — a `pub static` (const or promoted), a `pub fn`, or a `pub
+/// struct` — so a module-path read (`util::ssl_::PROTOCOL_TLS`) resolves.
+/// Strictly weaker than [`module_def_has_runtime_item`]: a body Assign
+/// that only lands in `__module_init__` (a try/except-conditional value
+/// that is never promoted) is NOT a path item — reading it as
+/// `module::NAME` is E0425, and the read must box to None (the
+/// dynamic-module-member divergence).
+pub(crate) fn module_def_has_path_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    // A module-level FUNCTION or CLASS is a `pub fn` / `pub struct`.
+    for s in &module.raw.body {
+        match &s.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                if f.name == name {
+                    return true;
+                }
+            }
+            crate::StatementType::ClassDef(c) => {
+                if c.name == name {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // A const-literal Assign emits a plain `pub static` — but only when
+    // the name is assigned EXACTLY ONCE at module level. A const that is
+    // REASSIGNED later (`HAS_NEVER_CHECK_COMMON_NAME = False` then a
+    // conditional reassignment in a try — urllib3's ssl_.py) stays a
+    // module-init local, not a path item; reading it as `ssl_::
+    // HAS_NEVER_CHECK_COMMON_NAME` must box to None.
+    // The module's OWN single-store accounting (the const-static
+    // emission condition `module_assign_counts.get(n) == Some(&1)`):
+    // conditional stores count DOUBLE, so a const with a conditional
+    // reassignment is NOT a plain static.
+    let mut counts = std::collections::HashMap::new();
+    count_module_stores(&module.raw.body, &mut counts);
+    if counts.get(name) == Some(&1) && module.raw.body.iter().any(|s| {
+        matches!(&s.statement, crate::StatementType::Assign(a)
+            if a.targets.iter().any(|t| {
+                matches!(t, crate::ExprType::Name(n) if n.id == name)
+            })
+                && const_static_type(&a.value).is_some())
+    }) {
+        return true;
+    }
+    // A non-const single-store name READ BY A FUNCTION (or imported by a
+    // sibling) promotes to a `pub static LazyLock`.
+    module_promoted_static_names(options, path).contains(name)
+        // A SUBMODULE of the package (`util.util` — urllib3's pyopenssl,
+        // where `from .. import util` then `util.util.to_bytes(...)`
+        // names the util/util.py module): the module itself is the path
+        // item the next attribute segment resolves into.
+        || {
+            let mut sub = path.to_vec();
+            sub.push(name.to_string());
+            options.module_defs.contains_key(&sub)
+        }
+}
+
+/// Whether the module at `path` RE-EXPORTS `name` through one of its own
+/// ImportFrom statements (`from .request import SKIP_HEADER` in urllib3's
+/// util/__init__.py): the generated module re-exports the name, so a
+/// sibling importing `from .util import SKIP_HEADER` resolves. The chain
+/// is followed depth-first with a visited set (a cycle of re-exports is
+/// not a runtime item).
+fn module_reexports_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+    visited: &mut std::collections::HashSet<Vec<String>>,
+) -> bool {
+    if !visited.insert(path.to_vec()) {
+        return false;
+    }
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    use crate::StatementType as ST;
+    for s in &module.raw.body {
+        // A plain `import json` binding the name (requests' compat.py
+        // re-exports stdlib json): the name resolves through the
+        // stdpython glob, so the re-export has a runtime item.
+        if let ST::Import(im) = &s.statement {
+            if im.names.iter().any(|a| {
+                a.asname.as_deref() == Some(name)
+                    || (a.asname.is_none()
+                        && a.name.split('.').next() == Some(name))
+            }) && im
+                .names
+                .iter()
+                .any(|a| a.name.split('.').next().is_some_and(crate::is_stdpython_module))
+            {
+                return true;
+            }
+            continue;
+        }
+        let ST::ImportFrom(i) = &s.statement else { continue };
+        // The import must bind OUR name (as itself or with an asname).
+        if !i.names.iter().any(|a| {
+            a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name)
+        }) {
+            continue;
+        }
+        // Resolve the re-export's defining module in THIS module's package
+        // context (options.module_path is the caller's context; set it to
+        // the defining module's package path, like ImportFrom::to_rust's
+        // caller does). An __init__ module's path IS its package path;
+        // otherwise the package is the parent.
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+        let mut ctx = options.clone();
+        ctx.module_path = if is_package {
+            path.to_vec()
+        } else {
+            path[..path.len().saturating_sub(1)].to_vec()
+        };
+        let target = i.resolved_module_path(&ctx);
+        // The re-export target may itself be a module of the crate whose
+        // item exists, or another re-export chain.
+        let defining = i
+            .names
+            .iter()
+            .find(|a| a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name))
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| name.to_string());
+        if !target.is_empty() && options.module_defs.contains_key(&target) {
+            let mut sub = target.clone();
+            sub.push(defining.clone());
+            if options.module_defs.contains_key(&sub)
+                || module_reexports_item(options, &target, &defining, visited)
+                || scan_module_body_for_item(options, &target, &defining)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the module at `path` directly defines `name` (a function, class,
+/// or assignment) OUTSIDE of TYPE_CHECKING — the leaf of a re-export chain.
+fn scan_module_body_for_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    fn scan(body: &[crate::Statement], name: &str, in_type_checking: bool) -> bool {
+        use crate::StatementType as ST;
+        for s in body {
+            match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                    if !in_type_checking && f.name == name {
+                        return true;
+                    }
+                }
+                ST::ClassDef(c) => {
+                    if !in_type_checking && c.name == name {
+                        return true;
+                    }
+                }
+                ST::Assign(a) => {
+                    if !in_type_checking
+                        && a.targets.iter().any(|t| {
+                            matches!(t, crate::ExprType::Name(n) if n.id == name)
+                        })
+                    {
+                        return true;
+                    }
+                }
+                // A conditional DEFINITION (`if sys.version_info >= (3, 11):
+                // def where(): ...` — certifi's core.py): the function is
+                // emitted (the version branch is the modern one), so a
+                // sibling import of it resolves. Recurse into nested
+                // statement lists, skipping TYPE_CHECKING blocks.
+                ST::If(i) => {
+                    let tc = in_type_checking
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                        )
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Attribute(a)
+                                if a.attr == "TYPE_CHECKING"
+                                    && matches!(
+                                        a.value.as_ref(),
+                                        crate::ExprType::Name(m) if m.id == "typing"
+                                    )
+                        );
+                    if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
+                        return true;
+                    }
+                }
+                ST::Try(t) => {
+                    for part in [&t.body, &t.orelse, &t.finalbody] {
+                        if scan(part, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                    for h in &t.handlers {
+                        if scan(&h.body, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    scan(&module.raw.body, name, false)
+}
+
+fn is_type_alias_value(value: &crate::ExprType) -> bool {
     match value {
+        crate::ExprType::Subscript(sub) => match sub.value.as_ref() {
+            crate::ExprType::Name(n) => matches!(
+                n.id.as_str(),
+                "tuple" | "Tuple" | "list" | "List" | "dict" | "Dict" | "set" | "Set"
+                    | "frozenset" | "Union" | "Optional" | "Callable" | "Iterable"
+                    | "Sequence" | "Mapping" | "MutableMapping" | "Type" | "Literal"
+                    | "Any" | "Generator" | "Iterator" | "SupportsRead" | "SupportsItems"
+                    | "IO" | "ClassVar"
+            ),
+            crate::ExprType::Attribute(a) => {
+                matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "typing")
+            }
+            _ => false,
+        },
+        crate::ExprType::Attribute(a) => {
+            matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "typing")
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {    match value {
         crate::ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
@@ -736,7 +2901,83 @@ fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {
                 _ => None,
             }
         }
+        // Integer bitwise/shift expressions (`1 << 6`, `1 | 2`) are
+        // constant: they render as plain Rust operators (bin_ops
+        // `generate_rust_code`), so the module-level constant machinery
+        // can emit `pub static X: i64 = (1) << (6);` (charset_normalizer's
+        // `_THAI = 1 << 6` flags). Only the bitwise/shift family is safe:
+        // Add/Sub/Mult route through py_add/py_sub/py_mul (not static
+        // initializers), and Div/FloorDiv/Mod/Pow have Python-specific
+        // semantics that the plain operator would not reproduce.
+        crate::ExprType::BinOp(op) => {
+            if !matches!(
+                op.op,
+                crate::ast::tree::bin_ops::BinOps::LShift
+                    | crate::ast::tree::bin_ops::BinOps::RShift
+                    | crate::ast::tree::bin_ops::BinOps::BitOr
+                    | crate::ast::tree::bin_ops::BinOps::BitXor
+                    | crate::ast::tree::bin_ops::BinOps::BitAnd
+            ) {
+                return None;
+            }
+            match (
+                const_static_type(&op.left),
+                const_static_type(&op.right),
+            ) {
+                (Some(l), Some(r)) if l.to_string() == "i64" && r.to_string() == "i64" => {
+                    Some(quote!(i64))
+                }
+                _ => None,
+            }
+        }
         _ => None,
+    }
+}
+
+/// The Rust type for a promoted module-level static: the codegen's inferred
+/// type when it has one (`options.name_types`), else a few recognized
+/// stdlib constructors (`datetime.date(...)` — urllib3's RECENT_DATE), else
+/// None (the caller boxes the value into PyValue).
+fn module_init_static_ty(
+    name: &str,
+    value: &crate::ExprType,
+    options: &crate::PythonOptions,
+) -> Option<TokenStream> {
+    // A type containing the UNINFERRED `_` (`PyDict<_, _>` — a dict of
+    // EXTERNAL values that all box to None, urllib3's pyopenssl
+    // `_stdlib_to_openssl_verify`): `_` is not allowed in static type
+    // signatures (E0121), and a boxed-None dict cannot be a typed PyDict
+    // (PyValue has no Hash/Eq — E0277). Fall back to the boxed PyValue.
+    if let Some(t) = options.name_types.get(name)
+        && !type_contains_uninferred(t)
+    {
+        return Some(t.to_rust_type());
+    }
+    if let crate::ExprType::Call(c) = value
+        && let crate::ExprType::Attribute(a) = c.func.as_ref()
+        && let crate::ExprType::Name(n) = a.value.as_ref()
+    {
+        match (n.id.as_str(), a.attr.as_str()) {
+            ("datetime", "date") => return Some(quote!(stdpython::datetime::date)),
+            ("datetime", "datetime") => return Some(quote!(stdpython::datetime::datetime)),
+            ("datetime", "timedelta") => return Some(quote!(stdpython::datetime::timedelta)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a type contains the UNINFERRED placeholder (`TypeInfo::PyObject`
+/// renders as `_`) anywhere — dict/list elements of external-module reads.
+fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
+    match t {
+        crate::TypeInfo::PyObject => true,
+        crate::TypeInfo::Vec(inner) | crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {
+            type_contains_uninferred(inner)
+        }
+        crate::TypeInfo::Dict(k, v) => type_contains_uninferred(k) || type_contains_uninferred(v),
+        crate::TypeInfo::Tuple(ts) => ts.iter().any(type_contains_uninferred),
+        _ => false,
     }
 }
 
@@ -772,6 +3013,7 @@ fn hoisted_declarations(
     ctx: &crate::CodeGenContext,
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
+    skip: &std::collections::HashSet<String>,
 ) -> TokenStream {
     // Class-aware mutation facts need the block's own assignments in the
     // symbol table (`c = Counter(...)` then `c.bump()` needs `c` mutable).
@@ -787,6 +3029,10 @@ fn hoisted_declarations(
         // assignment lowers to nothing, so there is no runtime binding to
         // hoist — declaring one would be a dead variable.
         if matches!(symbols.get(name), Some(SymbolTableNode::RustBinding(_))) {
+            continue;
+        }
+        // Promoted LazyLock statics have no `let` binding in the init body.
+        if skip.contains(name) {
             continue;
         }
         let ident = crate::safe_ident(name);
@@ -841,6 +3087,21 @@ impl Module {
     /// - main()
     /// - result = main()
     /// - sys.exit(main())
+    /// Whether an if-test is `TYPE_CHECKING` (or `typing.TYPE_CHECKING`):
+    /// the compile-time-only guard that never runs at runtime — its block
+    /// (imports, type-only class definitions) must be skipped entirely
+    /// (requests' _types.py).
+    fn is_type_checking_test(test: &crate::ExprType) -> bool {
+        match test {
+            crate::ExprType::Name(n) => n.id == "TYPE_CHECKING",
+            crate::ExprType::Attribute(a) => {
+                matches!(a.value.as_ref(), crate::ExprType::Name(m) if m.id == "typing")
+                    && a.attr == "TYPE_CHECKING"
+            }
+            _ => false,
+        }
+    }
+
     fn is_simple_main_call_block(body: &[crate::Statement]) -> bool {
         // Must have exactly one statement
         if body.len() != 1 {
@@ -885,7 +3146,8 @@ impl Module {
         use crate::StatementType::*;
         match stmt_type {
             // These are declarations that can stay at module level
-            FunctionDef(_) | AsyncFunctionDef(_) | ClassDef(_) | Import(_) | ImportFrom(_) => true,
+            FunctionDef(_) | AsyncFunctionDef(_) | ClassDef(_) | Import(_) | ImportFrom(_)
+            | Global(_) | Nonlocal(_) | AnnotatedName { .. } => true,
             
             // Standalone expressions can stay at module level (e.g., constants, simple values)
             // These are typically used in tests or simple modules
@@ -894,7 +3156,7 @@ impl Module {
             // These are executable statements that must go in the init function
             Assign(_) | AugAssign(_) | Call(_) | Return(_) |
             If(_) | For(_) | While(_) | Try(_) | With(_) | AsyncWith(_) | AsyncFor(_) |
-            Raise(_) | Assert { .. } | Pass | Break | Continue => false,
+            Raise(_) | Assert { .. } | Pass | Break | Continue | Delete(_) => false,
             
             // Handle unimplemented statements conservatively as executable
             Unimplemented(_) => false,
@@ -1001,6 +3263,15 @@ impl Module {
         match &first_stmt.statement {
             StatementType::Expr(expr) => match &expr.value {
                 ExprType::Constant(c) => {
+                    // The Ellipsis sentinel is not a docstring (Protocol
+                    // stubs and `...` placeholders must not emit a bogus
+                    // #![doc]).
+                    if c.0
+                        .as_ref()
+                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                    {
+                        return None;
+                    }
                     let raw_string = c.to_string();
                     Some(self.format_module_docstring(&raw_string))
                 },
@@ -1254,6 +3525,155 @@ pub fn module_class_def(
     info.classes.get(name).cloned().map(|c| (c, info.symbols.clone()))
 }
 
+/// Resolve a class name through a module, following RE-EXPORT chains
+/// (`from urllib3.util import Timeout` where util/__init__.py does
+/// `from .timeout import Timeout`): the class may live in the module the
+/// import re-exports from, several levels deep.
+pub fn resolve_imported_class(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+    depth: usize,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(c) = module_class_def(options, path, name) {
+        return Some(c);
+    }
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    let syms = module.clone().find_symbols(SymbolTableScopes::new());
+    match syms.get(name) {
+        Some(crate::SymbolTableNode::ImportFrom(i)) => {
+            let defining = i
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref() == Some(name))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| name.to_string());
+            // Resolve the relative import in the DEFINING module's
+            // context (`from .timeout import Timeout` in util/__init__.py
+            // is relative to ["urllib3", "util"], not the caller).
+            let mut ctx = options.clone();
+            // The relative import resolves in the DEFINING module's PACKAGE
+            // context: module_class_def's path includes the module name
+            // (["urllib3", "connection"]), but resolved_module_path expects
+            // the package path (["urllib3"]). An __init__ module IS its own
+            // package: its package path is the full module path
+            // (["urllib3", "util"] for urllib3/util/__init__.py — the
+            // re-export chain `from urllib3.util import Timeout` follows
+            // through it). Detect by a longer module key under the path.
+            let is_package = options
+                .module_defs
+                .keys()
+                .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+            ctx.module_path = if is_package {
+                path.to_vec()
+            } else {
+                path[..path.len().saturating_sub(1)].to_vec()
+            };
+            let path2 = i.resolved_module_path(&ctx);
+            resolve_imported_class(options, &path2, &defining, depth + 1)
+        }
+        // A RE-EXPORT alias (`from ._base_connection import ProxyConfig
+        // as ProxyConfig` in connection.py — urllib3): the canonical name
+        // resolves in the same module; a self-alias would recurse forever,
+        // so stop there.
+        Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
+            resolve_imported_class(options, path, canonical, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a class REFERENCED BY NAME in the current scope to its
+/// ClassDef, following imports into sibling modules (`from
+/// urllib3.util.retry import Retry` — requests' adapters.py) and re-export
+/// chains. Unlike [`resolve_imported_class`] this starts from the CALLER's
+/// symbol table: the name may be a local ClassDef or an imported one.
+/// Used to render class-body constants through the LOCAL name (the
+/// import's `use` brings it into scope), so `Retry::DEFAULT_ALLOWED_METHODS`
+/// works from a caller that only imported Retry.
+pub fn resolve_class_referenced(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<crate::ClassDef> {
+    match symbols.get(name) {
+        Some(crate::SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+        Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
+            resolve_class_referenced(canonical, symbols, options)
+        }
+        Some(crate::SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            if options.module_defs.contains_key(&path) {
+                let canonical = i
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(name))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| name.to_string());
+                resolve_imported_class(options, &path, &canonical, 0)
+                    .map(|(c, _)| c)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a FUNCTION defined at the top level of another module of the
+/// crate, with that module's symbol table (issue #123): `from
+/// pip._internal.locations import get_scheme` + `scheme = get_scheme(...)`
+/// needs `get_scheme`'s `-> Scheme` return annotation to type
+/// `scheme.scripts`, and keyword arguments on an imported function require
+/// its signature. Returns None when the module or the function is not
+/// found (an import of a builtin/stdlib name, a vendored non-module, ...).
+pub fn module_function_def(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<(crate::FunctionDef, SymbolTableScopes)> {
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    // A name may have MULTIPLE definitions: `@typing.overload` stubs (with
+    // `...` default placeholders) followed by the real implementation
+    // (urllib3's `ssl_wrap_socket`). Skip the overload stubs and return the
+    // first NON-overload definition — the callable the call sites actually
+    // invoke. (find_symbols keeps the LAST definition for same-module
+    // call sites; this loop keeps the first non-stub for cross-module ones.)
+    for s in &module.raw.body {
+        if let crate::StatementType::FunctionDef(f) = &s.statement {
+            if f.name == name {
+                let is_overload_stub = f.decorator_list.iter().any(|d| {
+                    match d {
+                        crate::ExprType::Name(n) => n.id == "overload",
+                        crate::ExprType::Attribute(a) => a.attr == "overload",
+                        _ => false,
+                    }
+                });
+                if !is_overload_stub {
+                    return Some((f.clone(), symbols));
+                }
+            }
+        }
+    }
+    // Only overload stubs exist (a stub-only module, e.g. a vendored
+    // typing stubs file): fall back to the first definition so signature
+    // resolution still finds SOMETHING.
+    for s in &module.raw.body {
+        if let crate::StatementType::FunctionDef(f) = &s.statement {
+            if f.name == name {
+                return Some((f.clone(), symbols));
+            }
+        }
+    }
+    None
+}
+
 /// The cached class facts for the module at `path`, building the
 /// once-per-conversion table over every module of the crate on first use.
 fn module_class_info(
@@ -1303,23 +3723,30 @@ impl CrossModuleClasses {
 fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let mut classes = std::collections::HashMap::new();
-    for s in &module.raw.body {
-        if let crate::StatementType::ClassDef(c) = &s.statement {
-            classes.insert(c.name.clone(), c.clone());
-        }
+    // Classes come from the SYMBOL TABLE, not the raw body: find_symbols
+    // runs the dataclass/NamedTuple __init__ synthesis on its ClassDef
+    // clones, so a cross-module call site (`Url(...)` in connection.py)
+    // resolves the constructor against the synthesized class.
+    for c in symbols.all_classes() {
+        classes.insert(c.name.clone(), c);
     }
     let mut traits = std::collections::HashMap::new();
     let mut class_list = Vec::new();
     collect_class_defs(&module.raw.body, &mut class_list);
     let mut hierarchy = std::collections::HashSet::new();
     for c in &class_list {
-        let has_real_base = c.bases.iter().any(|b| b.id != "object");
+        let has_real_base = c
+            .bases
+            .iter()
+            .any(|b| matches!(b, crate::ExprType::Name(n) if n.id != "object"));
         if has_real_base {
             hierarchy.insert(c.name.clone());
         }
         for b in &c.bases {
-            if b.id != "object" {
-                hierarchy.insert(b.id.clone());
+            if let crate::ExprType::Name(n) = b
+                && n.id != "object"
+            {
+                hierarchy.insert(n.id.clone());
             }
         }
     }
@@ -1439,4 +3866,60 @@ pub fn cross_module_mut_self_table(
         }
     }
     table
+}
+
+
+/// Whether the module at `path` re-exports `name` from a STDPYTHON module
+/// (`from .compat import json as complexjson` where compat.py does
+/// `import json`): the generated module has no item of that name (stdlib
+/// modules resolve through the runtime glob), so the importer must route
+/// to the runtime module (`use <stdpython>::json as complexjson;`).
+/// Returns the stdpython module name (None when the re-export is not a
+/// stdpython module). Nested imports (try/except bodies) are followed.
+pub(crate) fn module_reexports_stdpython_module(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<String> {
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    fn walk(body: &[crate::Statement], name: &str) -> Option<String> {
+        use crate::StatementType as ST;
+        for s in body {
+            let found: Option<String> = match &s.statement {
+                ST::Import(im) => im
+                    .names
+                    .iter()
+                    .find(|a| {
+                        a.asname.as_deref() == Some(name)
+                            || (a.asname.is_none() && a.name.split('.').next() == Some(name))
+                    })
+                    .map(|a| a.name.split('.').next().unwrap_or("").to_string())
+                    .filter(|m| crate::is_stdpython_module(m)),
+                ST::If(i) => walk(&i.body, name).or_else(|| walk(&i.orelse, name)),
+                ST::Try(t) => {
+                    for part in [&t.body, &t.orelse, &t.finalbody] {
+                        if let Some(m) = walk(part, name) {
+                            return Some(m);
+                        }
+                    }
+                    for h in &t.handlers {
+                        if let Some(m) = walk(&h.body, name) {
+                            return Some(m);
+                        }
+                    }
+                    None
+                }
+                ST::While(w) => walk(&w.body, name).or_else(|| walk(&w.orelse, name)),
+                ST::For(f) => walk(&f.body, name).or_else(|| walk(&f.orelse, name)),
+                ST::With(w) => walk(&w.body, name),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+    walk(&module.raw.body, name)
 }

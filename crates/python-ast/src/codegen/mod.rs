@@ -123,6 +123,22 @@ impl CodeGenContext {
         }
     }
 
+    /// True inside a FUNCTION body (module and class level are false): a
+    /// nested function definition there is a CLOSURE in Python — rython's
+    /// closures do not capture the enclosing scope (the closure-capture
+    /// divergence), so the definition lowers to a no-op. Trait-method
+    /// bodies (incl. re-emitted overrides) are function bodies too.
+    pub fn is_function_body(&self) -> bool {
+        match self {
+            CodeGenContext::Function { .. } | CodeGenContext::Trait { .. } => true,
+            CodeGenContext::Async(inner) => inner.is_function_body(),
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.is_function_body(),
+            _ => false,
+        }
+    }
+
     /// The name of the class whose method body this context sits inside, if
     /// any — the class `self` refers to.
     pub fn enclosing_class_name(&self) -> Option<&str> {

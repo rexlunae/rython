@@ -70,7 +70,7 @@ impl CodeGen for Statement {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
-        self.statement
+        let result = self.statement
             .clone()
             .to_rust(ctx, options, symbols)
             .map_err(|e| {
@@ -86,7 +86,8 @@ impl CodeGen for Statement {
                     crate::format_error_chain(e.as_ref()),
                     "",
                 ))
-            })
+            });
+        result
     }
 }
 
@@ -117,6 +118,27 @@ pub enum StatementType {
     AsyncFor(AsyncFor),
     Raise(Raise),
     With(With),
+    /// `global a, b` — declares module-level names (issue #115). Reads of
+    /// the names resolve to module statics; WRITES from a function are a
+    /// loud error (rython has no mutable module state).
+    Global(Vec<String>),
+    /// `nonlocal a, b` — a nested-function binding directive (rich's
+    /// traceback IPython hooks). rython's closures do not capture outer
+    /// function scopes, so the declaration has no runtime effect — a
+    /// no-op (the closure-capture divergence).
+    Nonlocal(Vec<String>),
+    /// A bare annotated declaration (`x: int` — no value). At module/class
+    /// level this is a dataclass-style field declaration; inside functions
+    /// it declares nothing at runtime (lowered as a no-op). Carried so
+    /// `@dataclass` can synthesize `__init__` from the class body.
+    AnnotatedName {
+        name: String,
+        annotation: ExprType,
+    },
+    /// `del xs[i]` / `del d[k]` — removes an element (issue #112). Index
+    /// targets lower through py_pop; `del name` and `del a.b` are loud
+    /// errors (unbinding is not representable in the value model).
+    Delete(Vec<ExprType>),
 
     Unimplemented(String),
 }
@@ -144,11 +166,33 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 // An annotated assignment (`x: int = 5`) is an ordinary
                 // assignment with a type annotation we carry on the Assign
                 // node (so empty-container pinning can honor it); a bare
-                // annotation (`x: int`) declares nothing at runtime.
+                // annotation (`x: int`) declares nothing at runtime — but
+                // it IS a dataclass field declaration at class level, so it
+                // is carried as AnnotatedName rather than dropped.
                 let value = ob
                     .getattr("value")
                     .map_err(|e| extraction_failure("annotated assignment value", &ob, e))?;
                 if value.is_none() {
+                    let target = ob
+                        .getattr("target")
+                        .map_err(|e| extraction_failure("annotated assignment target", &ob, e))?
+                        .extract()
+                        .map_err(|e| extraction_failure("annotated assignment target", &ob, e))?;
+                    let annotation = ob
+                        .getattr("annotation")
+                        .ok()
+                        .filter(|a| !a.is_none())
+                        .map(|a| a.extract())
+                        .transpose()
+                        .map_err(|e| {
+                            extraction_failure("annotated assignment annotation", &ob, e)
+                        })?;
+                    if let (ExprType::Name(n), Some(annotation)) = (target, annotation) {
+                        return Ok(StatementType::AnnotatedName {
+                            name: n.id,
+                            annotation,
+                        });
+                    }
                     return Ok(StatementType::Pass);
                 }
                 let target = ob
@@ -228,6 +272,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                     .extract()
                     .map_err(|e| extraction_failure("expression statement", &ob, e))?;
                 Ok(StatementType::Expr(expr))
+            }
+            "Global" => {
+                let names = ob
+                    .getattr("names")
+                    .map_err(|e| extraction_failure("global names", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("global names", &ob, e))?;
+                Ok(StatementType::Global(names))
+            }
+            "Nonlocal" => {
+                let names = ob
+                    .getattr("names")
+                    .map_err(|e| extraction_failure("nonlocal names", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("nonlocal names", &ob, e))?;
+                Ok(StatementType::Nonlocal(names))
+            }
+            "Delete" => {
+                let targets = ob
+                    .getattr("targets")
+                    .map_err(|e| extraction_failure("delete targets", &ob, e))?
+                    .extract()
+                    .map_err(|e| extraction_failure("delete targets", &ob, e))?;
+                Ok(StatementType::Delete(targets))
             }
             "Return" => {
                 tracing::debug!("return expression: {}", dump(&ob, None)?);
@@ -503,7 +571,23 @@ impl CodeGen for StatementType {
                 }
             }
             StatementType::Pass => Ok(quote! {}),
-            StatementType::FunctionDef(s) => s.to_rust(ctx, options, symbols),
+            StatementType::FunctionDef(s) => {
+                if ctx.is_function_body() {
+                    // A NESTED function definition (a closure in Python):
+                    // rython's closures do not capture the enclosing
+                    // function's scope (the closure-capture divergence), so
+                    // the definition is a no-op — calls through the name
+                    // drop (function_def.rs adds it to called_params).
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "nested function `{}` is dropped: rython's closures do not \
+                         capture the enclosing scope (the closure-capture divergence)",
+                        s.name
+                    ));
+                    Ok(TokenStream::new())
+                } else {
+                    s.to_rust(ctx, options, symbols)
+                }
+            }
             StatementType::Import(s) => s.to_rust(ctx, options, symbols),
             StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols),
             StatementType::Expr(s) => s.to_rust(ctx, options, symbols),
@@ -516,7 +600,21 @@ impl CodeGen for StatementType {
             StatementType::Return(None) => Ok(return_tokens(&ctx, quote!(()))),
             StatementType::Return(Some(e)) => {
                 let value = if matches!(e.value, ExprType::NoneType(_)) {
-                    quote!(())
+                    // A `return None` in a PyValue-returning function is
+                    // the boxed None (the None-mixing unification); a
+                    // plain-None function returns the unit value.
+                    if options.fn_return_is_pyvalue {
+                        quote!(PyValue::None_)
+                    } else {
+                        quote!(())
+                    }
+                } else if options.fn_return_is_pyvalue {
+                    // A PyValue-returning function wraps its other returns
+                    // (the identity From passes already-boxed values).
+                    let tokens = e
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    quote!(PyValue::from(#tokens))
                 } else {
                     let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
                     // A `-> str` function's return value must be an owned
@@ -555,6 +653,124 @@ impl CodeGen for StatementType {
             StatementType::AsyncFor(af) => af.to_rust(ctx, options, symbols),
             StatementType::Raise(r) => r.to_rust(ctx, options, symbols),
             StatementType::With(w) => w.to_rust(ctx, options, symbols),
+            // `global a, b` declares module scope — a no-op here: reads
+            // resolve to the module statics, and writes are rejected at
+            // conversion time (issue #115).
+            StatementType::Global(_) => Ok(quote! {}),
+            StatementType::Nonlocal(_) => Ok(quote! {}),
+            // A bare annotated declaration (`x: int`) declares nothing at
+            // runtime: the annotation only types the name (dataclass-style
+            // field declarations are consumed by the class codegen; inside
+            // a function the annotation types later assignments).
+            StatementType::AnnotatedName { .. } => Ok(quote! {}),
+            // `del xs[i]` / `del d[k]`: Python removes the element at the
+            // index (negative from the end, IndexError/KeyError when
+            // missing) — the runtime's py_pop already implements exactly
+            // that; the returned element is discarded. `del name` and
+            // `del a.b` are loud errors: unbinding a name or removing a
+            // struct field is not representable in rython's value model.
+            StatementType::Delete(targets) => {
+                let mut stmts = Vec::new();
+                for target in targets {
+                    match target {
+                        ExprType::Subscript(sub) => {
+                            let receiver = crate::subscript_receiver_place(
+                                &sub.value,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            match &sub.kind {
+                                crate::SubscriptKind::Index(index) => {
+                                    let idx = index
+                                        .clone()
+                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                    // A string-literal KEY is owned (dict
+                                    // keys normalize to String).
+                                    let idx = if matches!(
+                                        index.as_ref(),
+                                        ExprType::Constant(c)
+                                            if matches!(
+                                                &c.0,
+                                                Some(litrs::Literal::String(_))
+                                            )
+                                    ) {
+                                        quote!((#idx).to_string())
+                                    } else {
+                                        idx
+                                    };
+                                    // py_pop takes the index BY VALUE.
+                                    stmts.push(quote!((#receiver).py_pop(#idx)?;));
+                                }
+                                crate::SubscriptKind::Slice {
+                                    lower, upper, step, ..
+                                } => {
+                                    // `del xs[:]` — a FULL slice (all bounds
+                                    // None) clears the container in place
+                                    // (`del self._buffer[:]` — botocore's
+                                    // AWSConnection._send_output): the
+                                    // runtime's clear (Python's `xs[:] = []`).
+                                    if lower.is_none() && upper.is_none() && step.is_none() {
+                                        stmts.push(quote!((#receiver).clear();));
+                                    } else {
+                                        // A BOUNDED slice delete (`del
+                                        // self._writes[start:end]` —
+                                        // botocore's restdoc): removing a
+                                        // range is unmodeled — a no-op with
+                                        // a warning (documented divergence).
+                                        options.definition_warnings.borrow_mut().push(
+                                            "del with a bounded slice target is dropped \
+                                             (removing a range of elements is unmodeled; \
+                                             the elements stay in the container)"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        ExprType::Name(_) => {
+                            // `del name` unbinds the binding. Lowered to a
+                            // no-op: behaviorally identical as long as the
+                            // name is not referenced afterwards, which the
+                            // check_deleted_names pass enforces loudly
+                            // (issue #112).
+                        }
+                        ExprType::Attribute(a) => {
+                            // `del obj.attr` on a NON-self object (`del
+                            // newmod.newmod, ...` — pygments' module
+                            // proxy cleanup, where newmod is a module
+                            // object from _automodule): dynamic module
+                            // machinery — a no-op with a warning (the
+                            // module-object / class-as-value divergence).
+                            // `del self.field` remains a loud error (a
+                            // real struct-member removal).
+                            if !matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "del of `{}` attribute is dropped (removing an \
+                                     attribute from a non-self object is unmodeled — \
+                                     the module-object/class-as-value divergence)",
+                                    a.attr
+                                ));
+                            } else {
+                                return Err(format!(
+                                    "del with an attribute target (removing a field) is not \
+                                     supported: class fields are struct members and cannot be \
+                                     removed (issue #112)"
+                                )
+                                .into());
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "del with this target shape is not supported (issue #112)"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Ok(quote!(#(#stmts)*))
+            }
             _ => {
                 let error = err_from(StatementNotYetImplemented(self));
                 Err(error.into())

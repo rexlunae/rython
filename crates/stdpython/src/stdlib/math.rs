@@ -107,12 +107,24 @@ python_function! {
 
 python_function! {
     /// math.pow - power function
-    pub fn pow<T, U>(x: T, y: U) -> f64
+    pub fn pow<T, U>(x: T, y: U) -> Result<f64, PyException>
     where [T: Into<f64>, U: Into<f64>]
     [signature: (x, y)]
-    [concrete_types: (f64, f64) -> f64]
+    [concrete_types: (f64, f64) -> Result<f64, crate::PyException>]
     {
-        x.into().powf(y.into())
+        let x = x.into();
+        let y = y.into();
+        // CPython raises ValueError: math domain error for a negative base
+        // with a non-integral exponent (the result would be complex) and
+        // for zero raised to a negative power (a division by zero) —
+        // issue #82; the bare powf silently yields NaN/inf.
+        if x < 0.0 && y.fract() != 0.0 {
+            return Err(crate::value_error("math domain error"));
+        }
+        if x == 0.0 && y < 0.0 {
+            return Err(crate::value_error("math domain error"));
+        }
+        Ok(x.powf(y))
     }
 }
 
@@ -562,12 +574,21 @@ python_function! {
 
 python_function! {
     /// math.ldexp - return x * (2**i)
-    pub fn ldexp<T>(x: T, i: i32) -> f64
+    pub fn ldexp<T>(x: T, i: i32) -> Result<f64, PyException>
     where [T: Into<f64>]
     [signature: (x, i)]
-    [concrete_types: (f64, i32) -> f64]
+    [concrete_types: (f64, i32) -> Result<f64, crate::PyException>]
     {
-        x.into() * (2.0_f64).powi(i)
+        let x = x.into();
+        // libm::ldexp scales the exponent directly, so subnormal results
+        // (ldexp(1e-300, 1074)) stay exact; x * 2f64.powi(i) rounded through
+        // an intermediate that overflows to inf or underflows to 0
+        // (issue #82).
+        let result = libm::ldexp(x, i);
+        if result.is_infinite() && !x.is_infinite() {
+            return Err(crate::overflow_error("math range error"));
+        }
+        Ok(result)
     }
 }
 
@@ -579,6 +600,10 @@ python_function! {
     [concrete_types: (f64) -> (f64, f64)]
     {
         let val = x.into();
+        if val.is_infinite() {
+            // CPython: modf(inf) -> (0.0, inf); inf - inf would be NaN.
+            return (0.0, val);
+        }
         let integer_part = val.trunc();
         let fractional_part = val - integer_part;
         (fractional_part, integer_part)
@@ -595,7 +620,8 @@ python_function! {
         let x = x.into();
         let y = y.into();
         
-        if y == 0.0 {
+        if y == 0.0 || x.is_infinite() {
+            // fmod(inf, y) is a domain error in CPython, not NaN.
             Err(crate::value_error("math domain error"))
         } else {
             Ok(x % y)
@@ -612,23 +638,22 @@ python_function! {
     {
         let x = x.into();
         let y = y.into();
-        
-        if y == 0.0 {
-            Err(crate::value_error("math domain error"))
-        } else {
-            // IEEE 754 remainder rounds the quotient half-to-even, unlike
-            // f64::round which rounds halves away from zero.
-            let q = x / y;
-            let n = {
-                let r = q.round();
-                if (q - q.trunc()).abs() == 0.5 {
-                    // Exactly halfway: pick the even neighbour.
-                    if r % 2.0 == 0.0 { r } else { r - q.signum() }
-                } else {
-                    r
-                }
-            };
-            Ok(x - n * y)
+
+        // CPython's m_remainder: NaN operands give NaN; an infinite
+        // divisor gives x; an infinite dividend or zero divisor is a
+        // domain error. The value itself is the IEEE 754 remainder,
+        // computed by libm exactly (half-to-even, fmod-based reduction) —
+        // the old x - round(x/y)*y double-rounded for large quotients
+        // (issue #82).
+        if x.is_nan() || y.is_nan() {
+            return Ok(f64::NAN);
         }
+        if y.is_infinite() {
+            return Ok(x);
+        }
+        if x.is_infinite() || y == 0.0 {
+            return Err(crate::value_error("math domain error"));
+        }
+        Ok(libm::remainder(x, y))
     }
 }
