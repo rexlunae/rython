@@ -1810,6 +1810,14 @@ impl CodeGen for ClassDef {
         // `impl X { pub const NAME: T = v; }` so class-attribute reads
         // (`X.NAME`, rendered `X::NAME` — attribute.rs) resolve.
         let mut class_constants = TokenStream::new();
+        // Class-level COMPUTED constants (`DEFAULT_ALLOWED_METHODS =
+        // frozenset(["HEAD", ...])` — urllib3's Retry): not literal, so a
+        // plain const cannot hold them; emitted as
+        // `impl X { pub static NAME: LazyLock<T> = ...; }` — the same
+        // LazyLock model module-level promotion uses. Reads inside class
+        // methods (dropped-default inlining, `cls.NAME`) deref-clone the
+        // static (attribute.rs / call.rs consult the same shape).
+        let mut class_lazylock_constants = TokenStream::new();
         for stmt in self.body.iter().skip(body_start) {
             match &stmt.statement {
                 StatementType::FunctionDef(_) | StatementType::Pass => {}
@@ -1826,6 +1834,45 @@ impl CodeGen for ClassDef {
                         .clone()
                         .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     class_constants.extend(quote!(pub const #ident: #ty = #value;));
+                }
+                // A class-level COMPUTED constant: single-store name
+                // assigned a non-literal value (frozenset/dict/list/set
+                // literal or a constructor call). Python resolves these at
+                // class-definition time and they are READ as
+                // class-attributes; the LazyLock static keeps them
+                // importable inside method defaults. Values that reference
+                // module state (a plain Name/attribute read) stay dropped
+                // (the class-as-value divergence) — only literal-built
+                // values are promoted.
+                StatementType::Assign(a)
+                    if a.targets.len() == 1
+                        && let ExprType::Name(n) = &a.targets[0]
+                        && crate::ast::tree::module::const_static_type(&a.value).is_none()
+                        && class_body_computed_constant(&a.value) =>
+                {
+                    let ident = crate::safe_ident(&n.id);
+                    let rhs = a
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let stripped =
+                        crate::ast::tree::call::strip_trailing_question(&rhs);
+                    let value_tokens = if stripped.to_string() != rhs.to_string() {
+                        quote!(match #stripped {
+                            Ok(__rython_v) => __rython_v,
+                            Err(__rython_e) => panic!(
+                                "class-level `{}` initialization failed: {}",
+                                stringify!(#ident),
+                                __rython_e
+                            ),
+                        })
+                    } else {
+                        stripped
+                    };
+                    class_lazylock_constants.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
+                    });
                 }
                 // A string-literal Expr anywhere in the body (a docstring
                 // placed after a class constant — botocore's TokenSigner):
@@ -2224,6 +2271,7 @@ impl CodeGen for ClassDef {
             #trait_stream
             impl #class_name {
                 #class_constants
+                #class_lazylock_constants
                 #constructor
                 #init_forwarder
                 #methods_stream
@@ -3725,6 +3773,53 @@ fn class_level_metadata_body(stmts: &[crate::Statement]) -> bool {
             || matches!(&s.statement, crate::StatementType::AugAssign(a)
                 if matches!(&a.target, ExprType::Name(_)))
     })
+}
+
+/// Whether a class-body assignment VALUE is a literal-built computed
+/// constant the class-LazyLock promotion can hold: a frozenset/set/list/
+/// dict literal (or a call constructing one — `frozenset([...])`), with no
+/// reference to module state (no bare Name/Attribute reads — those depend
+/// on the module scope the class-LazyLock cannot see). urllib3's Retry:
+/// `DEFAULT_ALLOWED_METHODS = frozenset(["HEAD", "GET", ...])`.
+pub(crate) fn class_body_computed_constant(value: &crate::ExprType) -> bool {
+    match value {
+        ExprType::Call(c) => {
+            // `frozenset(...)` / `set(...)` / `list(...)` / `tuple(...)`
+            // of literal elements (or a dict/list/set literal directly).
+            let is_collector = match c.func.as_ref() {
+                ExprType::Name(n) => matches!(
+                    n.id.as_str(),
+                    "frozenset" | "set" | "list" | "tuple" | "dict"
+                ),
+                _ => false,
+            };
+            is_collector
+                && c.args.iter().all(|a| match a {
+                    ExprType::List(l) => l.iter().all(expr_is_literal),
+                    ExprType::Set(s) => s.elts.iter().all(expr_is_literal),
+                    ExprType::Tuple(t) => t.elts.iter().all(expr_is_literal),
+                    ExprType::Dict(d) => {
+                        d.keys.iter().flatten().all(expr_is_literal)
+                            && d.values.iter().all(expr_is_literal)
+                    }
+                    _ => false,
+                })
+        }
+        ExprType::List(l) => l.iter().all(expr_is_literal),
+        ExprType::Set(s) => s.elts.iter().all(expr_is_literal),
+        ExprType::Tuple(t) => t.elts.iter().all(expr_is_literal),
+        ExprType::Dict(d) => {
+            d.keys.iter().flatten().all(expr_is_literal)
+                && d.values.iter().all(expr_is_literal)
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_literal(e: &crate::ExprType) -> bool {
+    matches!(e, crate::ExprType::Constant(_))
+        || matches!(e, crate::ExprType::UnaryOp(u)
+            if matches!(u.operand.as_ref(), crate::ExprType::Constant(_)))
 }
 
 /// Whether a type-token string is a `Vec<T>` and, if so, the inner type

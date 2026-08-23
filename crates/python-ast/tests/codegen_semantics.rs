@@ -6867,3 +6867,64 @@ fn classmethod_cls_reference_resolves_to_class() {
         out
     );
 }
+
+#[test]
+fn class_body_computed_constant_promotes_to_lazylock() {
+    // urllib3's Retry: `DEFAULT_ALLOWED_METHODS = frozenset(["HEAD",
+    // "GET", ...])` — a class-body COMPUTED constant (not a literal, so no
+    // `pub const`). It is emitted as a class-level LazyLock static, and a
+    // dropped-default reference inside the class (`__init__`'s
+    // `allowed_methods=DEFAULT_ALLOWED_METHODS`, inlined at a
+    // `Retry::new(...)` call site) deref-clones it.
+    let out = compile(
+        "class Retry:\n    DEFAULT_ALLOWED_METHODS = frozenset([\"HEAD\", \"GET\"])\n    def __init__(self, allowed_methods=None) -> None:\n        self.allowed = allowed_methods\n",
+        "retryconst.py",
+    );
+    assert!(
+        out.contains("pub static DEFAULT_ALLOWED_METHODS"),
+        "class-body computed constant must be a LazyLock static: {}",
+        out
+    );
+}
+
+#[test]
+fn itertools_takewhile_swaps_predicate_and_iterable() {
+    // urllib3's retry.get_backoff_time: `takewhile(lambda x: ..., reversed(
+    // self.history))` — Python (predicate, iterable) maps to the runtime
+    // (iterable, predicate).
+    let out = compile(
+        "from itertools import takewhile\n\ndef f(items: list[int]) -> int:\n    return len(list(takewhile(lambda x: x > 0, reversed(items))))\n",
+        "tw.py",
+    );
+    assert!(
+        out.contains("takewhile (reversed") || out.contains("takewhile(reversed"),
+        "iterable must be the first runtime arg: {}",
+        out
+    );
+    assert!(
+        !out.contains("takewhile :: new"),
+        "takewhile must not lower as a module-path construction: {}",
+        out
+    );
+}
+
+#[test]
+fn iter_builtin_boxes_its_argument() {
+    // urllib3's request.py body_to_chunks: `chunks = iter(body)` — the
+    // iterator factory lowers to the boxed argument (values are already
+    // iterable at their natural position).
+    let out = compile(
+        "def f(body: bytes) -> None:\n    chunks = iter(body)\n    for chunk in chunks:\n        pass\n",
+        "iterb.py",
+    );
+    assert!(
+        out.contains("PyValue :: from") || out.contains("PyValue::from"),
+        "iter(x) must box its argument: {}",
+        out
+    );
+    assert!(
+        !out.contains("iter (body)"),
+        "bare iter(body) must not leak: {}",
+        out
+    );
+}

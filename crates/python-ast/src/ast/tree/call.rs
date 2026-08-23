@@ -1609,6 +1609,7 @@ impl<'a> CodeGen for Call {
                     | "type"
                     | "set"
                     | "bytearray"
+                    | "iter"
             ) && symbols.get(bname).is_none()
                 // A loop element shadowing the builtin (`for filter in ...:
                 // filter(**kwargs)` — botocore's docs client): the call
@@ -2351,6 +2352,22 @@ impl<'a> CodeGen for Call {
                         }
                         return Ok(quote!(#f(&(#a))));
                     }
+                    // iter(x): Python's iterator factory. rython's value
+                    // model makes every value already iterable at its
+                    // natural position (a for-loop over the value), so the
+                    // factory is the identity — the argument boxes to a
+                    // PyValue (urllib3's `chunks = iter(body)` in
+                    // request.py's body_to_chunks).
+                    "iter" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err("iter() takes exactly one argument".to_string().into());
+                        }
+                        let a = &rendered[0];
+                        return Ok(quote!(PyValue::from(#a)));
+                    }
                     // Dynamic attribute access on a boxed/foreign value
                     // (getattr/hasattr/setattr — requests' __getstate__,
                     // urllib3's ssl probing): rython's static model cannot
@@ -2708,6 +2725,9 @@ impl<'a> CodeGen for Call {
                     | "combinations_with_replacement"
                     | "permutations"
                     | "starmap"
+                    | "takewhile"
+                    | "dropwhile"
+                    | "filterfalse"
             );
             if from_itertools && handled {
                 let name = n.id.as_str();
@@ -2897,6 +2917,21 @@ impl<'a> CodeGen for Call {
                         }
                         let (f, xs) = (&rendered[0], &rendered[1]);
                         return Ok(quote!(starmap(#f, &(#xs))));
+                    }
+                    // takewhile/dropwhile/filterfalse: the runtime takes
+                    // (iterable, predicate) — Python's (predicate,
+                    // iterable) order is swapped at the call site (urllib3's
+                    // `takewhile(lambda x: ..., reversed(...))`).
+                    "takewhile" | "dropwhile" | "filterfalse" => {
+                        kw_of(&[])?;
+                        if rendered.len() != 2 {
+                            return Err(format!("{}() takes a predicate and an iterable", name)
+                                .to_string()
+                                .into());
+                        }
+                        let (pred, xs) = (&rendered[0], &rendered[1]);
+                        let ident = crate::safe_ident(name);
+                        return Ok(quote!(#ident(#xs, #pred)));
                     }
                     _ => unreachable!(),
                 }
@@ -3707,13 +3742,14 @@ impl<'a> CodeGen for Call {
                         // shadows the imported alias's canonical): the
                         // arguments lower positionally (the
                         // dynamic-dispatch divergence) instead of failing.
-                        let mapped = map_call_arguments(
+                        let mapped = map_call_arguments_inner(
                             &sig,
                             &self.args,
                             &self.keywords,
                             &ctx,
                             &options,
                             &class_symbols,
+                            Some(&class.name),
                         );
                         let MappedArguments { prelude, args } = match mapped {
                             Ok(m) => m,
@@ -6420,6 +6456,23 @@ fn map_call_arguments(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<MappedArguments, Box<dyn std::error::Error>> {
+    map_call_arguments_inner(func, args, keywords, ctx, options, symbols, None)
+}
+
+/// [`map_call_arguments`] with the CONSTRUCTED class's name (when the call
+/// is a class construction `Retry(...)` / `Retry::new(...)`): dropped
+/// defaults that reference CLASS-BODY constants (`DEFAULT_ALLOWED_METHODS`
+/// — urllib3's Retry) resolve through the class, even at module level
+/// where there is no enclosing-class context.
+fn map_call_arguments_inner(
+    func: &crate::FunctionDef,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+    constructed_class: Option<&str>,
+) -> Result<MappedArguments, Box<dyn std::error::Error>> {
     let fname = &func.name;
     // Optional-annotated parameters take Option values: the Option-slot
     // lowering wraps plain arguments in Some, passes None and
@@ -6470,6 +6523,47 @@ fn map_call_arguments(
             && let Some(v) = resolve_constant_name(&n.id, &symbols, &options)
         {
             return Ok(v);
+        }
+        // A CLASS-BODY computed constant used as a dropped DEFAULT inside
+        // the defining class (`Retry::new(...)` from from_int, whose
+        // __init__ defaults reference `DEFAULT_ALLOWED_METHODS =
+        // frozenset([...])` — a class-level LazyLock static, not a module
+        // name): deref-clone the class static. The name is not in the
+        // symbol table (class bodies register only the class), so resolve
+        // through the ENCLOSING class's ClassDef — or the class being
+        // CONSTRUCTED (a module-level `Retry.DEFAULT = Retry(...)` call).
+        if let ExprType::Name(n) = expr
+            && let Some(class_name) = ctx
+                .enclosing_class_name()
+                .or(constructed_class)
+            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+            && class.body.iter().any(|bs| {
+                matches!(&bs.statement, crate::StatementType::Assign(a)
+                    if a.targets.len() == 1
+                        && matches!(&a.targets[0], ExprType::Name(t) if t.id == n.id)
+                        && crate::ast::tree::module::const_static_type(&a.value).is_some())
+            })
+        {
+            let ident = crate::safe_ident(&n.id);
+            let class_ident = crate::safe_ident(class_name);
+            return Ok(quote!((*#class_ident::#ident).clone()));
+        }
+        if let ExprType::Name(n) = expr
+            && let Some(class_name) = ctx
+                .enclosing_class_name()
+                .or(constructed_class)
+            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+            && class.body.iter().any(|bs| {
+                matches!(&bs.statement, crate::StatementType::Assign(a)
+                    if a.targets.len() == 1
+                        && matches!(&a.targets[0], ExprType::Name(t) if t.id == n.id)
+                        && crate::ast::tree::module::const_static_type(&a.value).is_none()
+                        && crate::class_body_computed_constant(&a.value))
+            })
+        {
+            let ident = crate::safe_ident(&n.id);
+            let class_ident = crate::safe_ident(class_name);
+            return Ok(quote!((*#class_ident::#ident).clone()));
         }
         // A CALLABLE parameter (`dict_class: type = OrderedDict` —
         // requests' sessions): rython cannot hold a class/function as a
