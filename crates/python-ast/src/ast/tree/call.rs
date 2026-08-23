@@ -5637,7 +5637,22 @@ impl<'a> CodeGen for Call {
                     }
                 }
             } else {
-                arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                // A CLASS NAME passed as a call argument without a resolved
+                // signature (`merge_setting(request.headers, self.headers,
+                // CaseInsensitiveDict)` — requests' sessions.py, where the
+                // callee's dict_class: type param maps to the boxed PyValue
+                // but the callee signature isn't resolved in this context):
+                // classes cannot be runtime values — the boxed None (the
+                // callables-as-data divergence).
+                if crate::is_class_value_expr(&arg, &symbols) {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "callable argument (a class name) lowers to the boxed None \
+                         (callables cannot be runtime values in rython)"
+                    ));
+                    quote!(stdpython::PyValue::None_)
+                } else {
+                    arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                }
             };
             all_args.push(rust_arg);
         }
