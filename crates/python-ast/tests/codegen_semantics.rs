@@ -7126,3 +7126,20 @@ fn static_initializer_reads_promote_transitively() {
         out
     );
 }
+
+#[test]
+fn aliased_external_import_field_call_boxes_field() {
+    // urllib3's response.py: `try: import brotlicffi as brotli except
+    // ImportError: ...` then `self._obj = brotli.Decompressor()` — the
+    // alias resolves to an EXTERNAL module, so the field's value is a
+    // foreign object — a boxed PyValue (external-object divergence).
+    let out = compile(
+        "try:\n    import brotlicffi as brotli\nexcept ImportError:\n    brotli = None\n\nclass ContentDecoder:\n    pass\n\nif brotli is not None:\n    class BrotliDecoder(ContentDecoder):\n        def __init__(self) -> None:\n            self._obj = brotli.Decompressor()\n",
+        "brdec.py",
+    );
+    assert!(
+        out.contains("_obj : stdpython :: PyValue") || out.contains("_obj: stdpython::PyValue"),
+        "external-import call must box the field: {}",
+        out
+    );
+}

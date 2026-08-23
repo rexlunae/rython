@@ -2997,6 +2997,48 @@ fn infer_field_type(
                                 .module_defs
                                 .contains_key(&i.resolved_module_path(options))
                         }
+                        // `import brotlicffi as brotli` — the alias resolves
+                        // to the Import symbol (urllib3's response decoders
+                        // with the dropped-ImportError fallback): follow it
+                        // to the canonical name's Import/ImportFrom.
+                        SymbolTableNode::Alias(canonical) => {
+                            let mut hops = 0;
+                            let mut cur = symbols.get(canonical);
+                            let mut external = false;
+                            loop {
+                                if hops > 16 {
+                                    break;
+                                }
+                                match cur {
+                                    Some(SymbolTableNode::Alias(next)) => {
+                                        cur = symbols.get(next);
+                                    }
+                                    Some(SymbolTableNode::Import(i)) => {
+                                        let path = i
+                                            .names
+                                            .first()
+                                            .map(|al| {
+                                                al.name
+                                                    .split('.')
+                                                    .map(|s| s.to_string())
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+                                        external = !options.module_defs.contains_key(&path);
+                                        break;
+                                    }
+                                    Some(SymbolTableNode::ImportFrom(i)) => {
+                                        external = !options
+                                            .module_defs
+                                            .contains_key(&i.resolved_module_path(options));
+                                        break;
+                                    }
+                                    _ => break,
+                                }
+                                hops += 1;
+                            }
+                            external
+                        }
                         // `try: import brotli except: brotli = None` — the
                         // Assign(None) fallback shadows the import.
                         SymbolTableNode::Assign { value, .. }
