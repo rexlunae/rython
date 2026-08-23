@@ -2258,7 +2258,7 @@ impl StrOrBytes {
 
 impl Truthy for StrOrBytes {
     fn is_truthy(&self) -> bool {
-        !self.len() == 0
+        self.len() != 0
     }
 }
 
