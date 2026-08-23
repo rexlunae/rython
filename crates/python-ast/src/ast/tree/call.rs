@@ -3223,6 +3223,7 @@ impl<'a> CodeGen for Call {
                         | "finditer"
                         | "sub"
                         | "split"
+                        | "compile"
                         | "md5"
                         | "sha1"
                         | "sha256"
@@ -3240,7 +3241,7 @@ impl<'a> CodeGen for Call {
                 // keywords.
                 let is_re_fn = matches!(
                     fname.as_str(),
-                    "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub" | "split"
+                    "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub" | "split" | "compile"
                 );
                 let mut width_kw: Option<crate::ExprType> = None;
                 let mut flags_kw: Option<crate::ExprType> = None;
@@ -3504,6 +3505,29 @@ impl<'a> CodeGen for Call {
                             (None, None) => quote!(70),
                         };
                         Ok(quote!(#p(&(#t), #width)?))
+                    }
+                    (
+                        "compile",
+                        [pat, ..],
+                    ) => {
+                        if rendered.len() > 2 {
+                            return Err("compile() takes at most 2 positional arguments"
+                                .to_string()
+                                .into());
+                        }
+                        if rendered.len() > 1 && flags_kw.is_some() {
+                            return Err("compile() got multiple values for argument 'flags'"
+                                .to_string()
+                                .into());
+                        }
+                        let flags = match (self.args.get(1), flags_kw) {
+                            (Some(e), None) => flag_letters(&symbols, e)?,
+                            (None, Some(e)) => flag_letters(&symbols, &e)?,
+                            (None, None) => String::new(),
+                            _ => unreachable!(),
+                        };
+                        let p = qual("compile");
+                        Ok(quote!(#p(&(#pat), #flags)?))
                     }
                     (
                         "search" | "match" | "fullmatch" | "findall" | "finditer",
@@ -6586,17 +6610,14 @@ fn map_call_arguments_inner(
         // frozenset([...])` — a class-level LazyLock static, not a module
         // name): deref-clone the class static. The name is not in the
         // symbol table (class bodies register only the class), so resolve
-        // through the ENCLOSING class's ClassDef — or the class being
-        // CONSTRUCTED (a module-level `Retry.DEFAULT = Retry(...)` call).
-        // The class may be IMPORTED into the caller (`from
-        // urllib3.util.retry import Retry` — requests' adapters.py): its
-        // ClassDef lives in the defining module, but the import's `use`
-        // brings the class name into scope, so the static renders through
-        // the LOCAL name (`Retry::DEFAULT_ALLOWED_METHODS`).
+        // through the class being CONSTRUCTED first (a `Retry(...)` call
+        // from ANOTHER class's method — requests' adapters.py — must
+        // resolve Retry's constants, not the enclosing HTTPAdapter's) —
+        // or the ENCLOSING class's ClassDef for non-construction calls
+        // (`map_call_arguments_inner` with no constructed_class).
         if let ExprType::Name(n) = expr
-            && let Some(class_name) = ctx
-                .enclosing_class_name()
-                .or(constructed_class)
+            && let Some(class_name) = constructed_class
+                .or(ctx.enclosing_class_name())
             && let Some(class) = crate::resolve_class_referenced(
                 &class_name,
                 &symbols,
@@ -6614,9 +6635,8 @@ fn map_call_arguments_inner(
             return Ok(quote!((*#class_ident::#ident).clone()));
         }
         if let ExprType::Name(n) = expr
-            && let Some(class_name) = ctx
-                .enclosing_class_name()
-                .or(constructed_class)
+            && let Some(class_name) = constructed_class
+                .or(ctx.enclosing_class_name())
             && let Some(class) = crate::resolve_class_referenced(
                 &class_name,
                 &symbols,

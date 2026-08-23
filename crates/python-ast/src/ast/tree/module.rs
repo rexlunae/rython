@@ -416,6 +416,44 @@ impl CodeGen for Module {
             }
         }
         }
+        // Transitive promotion to a fixpoint (mirrors the shared
+        // module_promoted_static_names): every name a PROMOTED name's
+        // initializer reads must also be promoted.
+        let mut init_reads: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for s2 in &self.raw.body {
+            if let crate::StatementType::Assign(a) = &s2.statement {
+                if const_static_type(&a.value).is_some() {
+                    continue;
+                }
+                if let Some(targets) = assign_name_targets(a) {
+                    for n in &targets {
+                        if module_assign_counts.get(n) == Some(&1) {
+                            let reads = module_expr_reads(&a.value);
+                            init_reads.insert(n.clone(), reads);
+                        }
+                    }
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            let snapshot: std::collections::HashSet<String> = promoted_statics.clone();
+            for (n, reads) in &init_reads {
+                if !snapshot.contains(n) {
+                    continue;
+                }
+                for r in reads {
+                    if !promoted_statics.contains(r) && init_reads.contains_key(r) {
+                        promoted_statics.insert(r.clone());
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         // A DEFINITE if/else module value (`if sys.platform == "win32":
         // preferred_clock = time.perf_counter else: preferred_clock =
         // time.time` — requests' sessions): both branches assign the SAME
@@ -1596,6 +1634,33 @@ pub(crate) fn module_promoted_static_names(
     let sibling = sibling_imported_names(&target);
     let symbols = (**module).clone().find_symbols(crate::SymbolTableScopes::new());
     let mut names = std::collections::HashSet::new();
+    // Module-level name → the module-level names its INITIALIZER reads.
+    // A name whose initializer reads a PROMOTED name must itself be
+    // promoted (url.py's `_IPV6_ADDRZ_RE = re.compile("^" +
+    // _IPV6_ADDRZ_PAT + "$")` — the RE is promoted because functions use
+    // it, but _IPV6_ADDRZ_PAT is only read by OTHER module-level
+    // initializers, not functions; a static's closure cannot reference a
+    // module-init local (E0425). Computed transitively to a fixpoint.
+    let mut init_reads: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for stmt in &module.raw.body {
+        if let crate::StatementType::Assign(a) = &stmt.statement {
+            // Only NON-const single-store names participate: const names
+            // are already emitted as plain `pub static` items, so the
+            // transitive closure must not double-promote them.
+            if const_static_type(&a.value).is_some() {
+                continue;
+            }
+            if let Some(targets) = assign_name_targets(a) {
+                for n in &targets {
+                    if counts.get(n) == Some(&1) {
+                        let reads = module_expr_reads(&a.value);
+                        init_reads.insert(n.clone(), reads);
+                    }
+                }
+            }
+        }
+    }
     for stmt in &module.raw.body {
         if let crate::StatementType::If(if_stmt) = &stmt.statement {
             if Module::is_type_checking_test(&if_stmt.test) {
@@ -1650,12 +1715,143 @@ pub(crate) fn module_promoted_static_names(
             }
         }
     }
+    // Transitive promotion to a fixpoint: every name a PROMOTED name's
+    // initializer reads must also be promoted (url.py's `_IPV6_ADDRZ_RE =
+    // re.compile("^" + _IPV6_ADDRZ_PAT + "$")` — the RE is promoted
+    // because functions use it, but _IPV6_ADDRZ_PAT is only read by OTHER
+    // module-level initializers, never a function; a static's closure
+    // cannot reference a module-init local (E0425)).
+    loop {
+        let mut changed = false;
+        let snapshot: std::collections::HashSet<String> = names.clone();
+        for (n, reads) in &init_reads {
+            if !snapshot.contains(n) {
+                continue;
+            }
+            for r in reads {
+                if !names.contains(r) && init_reads.contains_key(r) {
+                    names.insert(r.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let rc = std::rc::Rc::new(names);
     options
         .module_promoted_statics
         .borrow_mut()
         .insert(path.to_vec(), rc.clone());
     rc
+}
+
+/// The names a module-level expression READS (bare Names and attribute
+/// roots) — used by the transitive static-promotion fixpoint (a promoted
+/// static's initializer must not reference a module-init local).
+fn module_expr_reads(expr: &crate::ExprType) -> std::collections::HashSet<String> {
+    use crate::ExprType as ET;
+    let mut out = std::collections::HashSet::new();
+    fn walk(e: &crate::ExprType, out: &mut std::collections::HashSet<String>) {
+        match e {
+            ET::Name(n) => {
+                out.insert(n.id.clone());
+            }
+            ET::Attribute(a) => walk(&a.value, out),
+            ET::Call(c) => {
+                walk(&c.func, out);
+                for a in &c.args {
+                    walk(a, out);
+                }
+                for kw in &c.keywords {
+                    walk(&kw.value, out);
+                }
+            }
+            ET::BinOp(op) => {
+                walk(&op.left, out);
+                walk(&op.right, out);
+            }
+            ET::BoolOp(op) => {
+                for v in &op.values {
+                    walk(v, out);
+                }
+            }
+            ET::Compare(c) => {
+                walk(&c.left, out);
+                for c in &c.comparators {
+                    walk(c, out);
+                }
+            }
+            ET::UnaryOp(u) => walk(&u.operand, out),
+            ET::Subscript(s) => {
+                walk(&s.value, out);
+                match &s.kind {
+                    crate::SubscriptKind::Index(i) => walk(i, out),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        if let Some(l) = lower {
+                            walk(l, out);
+                        }
+                        if let Some(u) = upper {
+                            walk(u, out);
+                        }
+                        if let Some(st) = step {
+                            walk(st, out);
+                        }
+                    }
+                }
+            }
+            ET::List(l) => {
+                for e in l {
+                    walk(e, out);
+                }
+            }
+            ET::Tuple(t) => {
+                for e in &t.elts {
+                    walk(e, out);
+                }
+            }
+            ET::Set(s) => {
+                for e in &s.elts {
+                    walk(e, out);
+                }
+            }
+            ET::Dict(d) => {
+                for k in d.keys.iter().flatten() {
+                    walk(k, out);
+                }
+                for v in &d.values {
+                    walk(v, out);
+                }
+            }
+            ET::IfExp(i) => {
+                walk(&i.test, out);
+                walk(&i.body, out);
+                walk(&i.orelse, out);
+            }
+            ET::Lambda(l) => {
+                walk(&l.body, out);
+            }
+            ET::Starred(s) => walk(&s.value, out),
+            ET::Yield(y) => {
+                if let Some(v) = &y.value {
+                    walk(v, out);
+                }
+            }
+            ET::YieldFrom(y) => walk(&y.value, out),
+            ET::Await(a) => walk(&a.value, out),
+            ET::JoinedStr(j) => {
+                for part in &j.values {
+                    if let ET::FormattedValue(f) = part {
+                        walk(&f.value, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(expr, &mut out);
+    out
 }
 
 /// The package path of a module at `path` within module_defs: the parent

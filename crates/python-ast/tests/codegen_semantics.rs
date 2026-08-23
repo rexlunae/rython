@@ -6901,7 +6901,7 @@ fn imported_class_constant_default_resolves_through_import() {
         "class Retry:\n    DEFAULT_ALLOWED_METHODS = frozenset([\"HEAD\", \"GET\"])\n    def __init__(self, allowed_methods=DEFAULT_ALLOWED_METHODS, backoff_max=120) -> None:\n        self.allowed = allowed_methods\n        self.backoff = backoff_max\n";
     let retry_mod = parse(retry_src, "retry.py").unwrap();
     let adapters_src =
-        "from retry import Retry\ndef make() -> Retry:\n    return Retry()\n";
+        "from retry import Retry\nclass HTTPAdapter:\n    def __init__(self) -> None:\n        self.retries = Retry()\n";
     let adapters_mod = parse(adapters_src, "adapters.py").unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["retry".to_string()], std::rc::Rc::new(retry_mod));
@@ -7099,6 +7099,30 @@ fn module_level_try_import_error_flattens_imports_to_module_scope() {
     assert!(
         !out.contains("__rython_try_result"),
         "the dead try wrapper must not lower: {}",
+        out
+    );
+}
+
+#[test]
+fn static_initializer_reads_promote_transitively() {
+    // urllib3's url.py: `_IPV6_ADDRZ_PAT = r"\[" + _IPV6_PAT + ...` then
+    // `_IPV6_ADDRZ_RE = re.compile("^" + _IPV6_ADDRZ_PAT + "$")` — the RE
+    // is promoted (functions use it), so its closure references
+    // _IPV6_ADDRZ_PAT; that name is only read by OTHER module-level
+    // initializers, never a function, yet it must ALSO become a static
+    // (a static closure cannot see a module-init local — E0425).
+    let out = compile(
+        "import re\n_IPV6_PAT = \"x\"\n_IPV6_ADDRZ_PAT = \"[\" + _IPV6_PAT + \"]\"\n_IPV6_ADDRZ_RE = re.compile(\"^\" + _IPV6_ADDRZ_PAT + \"$\")\ndef use(re_: object) -> object:\n    return _IPV6_ADDRZ_RE\n",
+        "urltest.py",
+    );
+    assert!(
+        out.contains("pub static _IPV6_ADDRZ_RE") && out.contains("pub static _IPV6_ADDRZ_PAT"),
+        "transitive promotion must static both names: {}",
+        out
+    );
+    assert!(
+        out.contains("pub static _IPV6_PAT"),
+        "the chain's root must promote too: {}",
         out
     );
 }
