@@ -436,8 +436,17 @@ pub mod path {
                     }
                 }
             }
+            // CPython's varscan is ASCII-only and requires the name to
+            // START with a letter or underscore (`$1abc` stays literal —
+            // verified against python3; Devin round-2 review on PR #140).
             let mut j = i + 1;
-            while j < bytes.len() && (bytes[j].is_alphanumeric() || bytes[j] == '_') {
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == '_')
+            {
+                let first_ok = bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == '_';
+                if !first_ok {
+                    break;
+                }
                 j += 1;
             }
             if j > i + 1 {

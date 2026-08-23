@@ -2599,6 +2599,11 @@ fn os_path_expandvars_matches_python() {
     assert_eq!(expandvars("no$RY_UNSET_X var"), "no$RY_UNSET_X var");
     assert_eq!(expandvars("${RY_UNSET_X}/log"), "${RY_UNSET_X}/log");
     assert_eq!(expandvars("a${RY_UNSET_X}b"), "a${RY_UNSET_X}b");
+    // CPython's varscan is ASCII-only and requires a letter/underscore
+    // start: `$naive` (Unicode letter) and `$1abc` (digit start) stay
+    // literal. Verified against python3.
+    assert_eq!(expandvars("$naive"), "$naive");
+    assert_eq!(expandvars("$1abc"), "$1abc");
     assert_eq!(expandvars("plain"), "plain");
     assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
 }
