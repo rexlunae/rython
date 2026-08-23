@@ -322,17 +322,14 @@ impl CodeGen for Module {
                 {
                     continue;
                 }
-                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                    if module_assign_counts.get(&n.id) == Some(&1)
-                        && const_static_type(&a.value).is_some()
-                    {
-                        continue;
-                    }
-                    // A TYPE ALIAS (`_TYPE_BODY = typing.Union[...]`) is a
-                    // declaration, not a runtime store — skip it from the
-                    // init body too.
-                    if module_assign_counts.get(&n.id) == Some(&1)
-                        && is_type_alias_value(&a.value)
+                if let Some(names) = assign_name_targets(a) {
+                    // A type alias (`builtin_str = str`) is a declaration, not
+                    // a runtime store — skip it from the init body too.
+                    if names
+                        .iter()
+                        .all(|n| module_assign_counts.get(n) == Some(&1))
+                        && (const_static_type(&a.value).is_some()
+                            || is_type_alias_value(&a.value))
                     {
                         continue;
                     }
@@ -393,17 +390,19 @@ impl CodeGen for Module {
                 {
                     continue;
                 }
-                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                    if module_assign_counts.get(&n.id) == Some(&1)
-                        && const_static_type(&a.value).is_none()
-                        && !is_type_alias_value(&a.value)
-                        // rust.bind / rust.c_bind declarations are
-                        // compile-time bindings, not runtime stores: the
-                        // Assign codegen handles them (issue #79 family).
-                        && !crate::is_rust_bind_call(&a.value)
-                        && function_free_reads.contains(&n.id)
-                    {
-                        promoted_statics.insert(n.id.clone());
+                if let Some(targets) = assign_name_targets(a) {
+                    for n in &targets {
+                        if module_assign_counts.get(n) == Some(&1)
+                            && const_static_type(&a.value).is_none()
+                            && !is_type_alias_value(&a.value)
+                            // rust.bind / rust.c_bind declarations are
+                            // compile-time bindings, not runtime stores: the
+                            // Assign codegen handles them (issue #79 family).
+                            && !crate::is_rust_bind_call(&a.value)
+                            && function_free_reads.contains(n)
+                        {
+                            promoted_statics.insert(n.clone());
+                        }
                     }
                 }
             }
@@ -692,16 +691,24 @@ impl CodeGen for Module {
                     );
                     continue;
                 }
-                if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                    if module_assign_counts.get(&n.id) == Some(&1) {
+                if let Some(names) = assign_name_targets(a) {
+                    // Every target must be a single-store name for the
+                    // static promotion (a chained `__version__ = version =
+                    // '2.7.0'` promotes BOTH names to `pub static`).
+                    if names
+                        .iter()
+                        .all(|n| module_assign_counts.get(n) == Some(&1))
+                    {
                         if let Some(ty) = const_static_type(&a.value) {
-                            let ident = crate::safe_ident(&n.id);
                             let value = a.value.clone().to_rust(
                                 ctx.clone(),
                                 options.clone(),
                                 symbols.clone(),
                             )?;
-                            stream.extend(quote!(pub static #ident: #ty = #value;));
+                            for n in &names {
+                                let ident = crate::safe_ident(n);
+                                stream.extend(quote!(pub static #ident: #ty = #value;));
+                            }
                             continue;
                         }
                     }
@@ -713,12 +720,14 @@ impl CodeGen for Module {
                     // value. Emit a `pub type` alias when the annotation
                     // resolves, else nothing — the old behavior emitted a
                     // nonsense `py_index` store.
-                    if is_type_alias_value(&a.value) {
+                    if names.len() == 1
+                        && is_type_alias_value(&a.value)
+                    {
                         if let Some(ty) =
                             crate::resolve_alias_typeinfo(&a.value, &symbols, &options)
                                 .map(|t| t.to_rust_type())
                         {
-                            let ident = crate::safe_ident(&n.id);
+                            let ident = crate::safe_ident(&names[0]);
                             stream.extend(quote! {
                                 #[allow(dead_code)]
                                 pub type #ident = #ty;
@@ -729,19 +738,31 @@ impl CodeGen for Module {
                 }
             }
 
-            // A module-level value that functions read (promoted_statics):
-            // emit a LazyLock static whose closure holds the initializer,
-            // and a TOUCH (`let _ = &*name;`) in __module_init__ at the
-            // store's position, so initialization still happens at import
-            // time, in order. Function reads deref the static automatically
-            // (LazyLock: Deref). A fallible initializer (rendered with a
-            // trailing `?`) unwraps inside the closure, panicking on
-            // failure — the import-time raise becomes an abort (divergence).
-            if let crate::StatementType::Assign(a) = &s.statement
-                && let [crate::ExprType::Name(n)] = a.targets.as_slice()
-                && promoted_statics.contains(&n.id)
-            {
-                let ident = crate::safe_ident(&n.id);
+            // A module-level value that functions read or siblings import
+            // (promoted_statics): emit a LazyLock static whose closure holds
+            // the initializer, and a TOUCH (`let _ = &*name;`) in
+            // __module_init__ at the store's position, so initialization
+            // still happens at import time, in order. Function reads deref
+            // the static automatically (LazyLock: Deref). A fallible
+            // initializer (rendered with a trailing `?`) unwraps inside the
+            // closure, panicking on failure — the import-time raise becomes
+            // an abort (divergence). A CHAINED assignment (`__version__ =
+            // version = '2.7.0'`) where every target is promoted emits one
+            // static per name, all with the same initializer (the assign.rs
+            // chain lowering would otherwise hide the values in
+            // __module_init__).
+            if let crate::StatementType::Assign(a) = &s.statement {
+                let promoted: Vec<String> = match assign_name_targets(a) {
+                    Some(names) => names
+                        .into_iter()
+                        .filter(|n| promoted_statics.contains(n))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if promoted.is_empty() {
+                    // fall through to the ordinary Assign lowering
+                } else {
+                let promoted_first = promoted[0].clone();
                 let rhs = a
                     .value
                     .clone()
@@ -754,32 +775,37 @@ impl CodeGen for Module {
                         Ok(__rython_v) => __rython_v,
                         Err(__rython_e) => panic!(
                             "module-level `{}` initialization failed: {}",
-                            stringify!(#ident),
+                            stringify!(#promoted_first),
                             __rython_e
                         ),
                     })
                 } else {
                     stripped
                 };
-                // The static's type: the codegen's inferred type when known,
-                // a few recognized stdlib constructors, else the boxed
-                // PyValue (the value model's dynamic fallback). Boxed values
-                // wrap in PyValue::from so the closure's type matches.
-                let (ty, wrapped) =
-                    match module_init_static_ty(&n.id, &a.value, &options) {
-                        Some(ty) => (ty, value_tokens),
-                        None => (
-                            quote!(stdpython::PyValue),
-                            quote!(stdpython::PyValue::from(#value_tokens)),
-                        ),
-                    };
-                stream.extend(quote! {
-                    pub static #ident: std::sync::LazyLock<#ty> =
-                        std::sync::LazyLock::new(|| #wrapped);
-                });
-                module_init_stmts.push(quote!(let _ = &*#ident;));
+                for n in promoted {
+                    let ident = crate::safe_ident(&n);
+                    // The static's type: the codegen's inferred type when
+                    // known, a few recognized stdlib constructors, else the
+                    // boxed PyValue (the value model's dynamic fallback).
+                    // Boxed values wrap in PyValue::from so the closure's
+                    // type matches.
+                    let (ty, wrapped) =
+                        match module_init_static_ty(&n, &a.value, &options) {
+                            Some(ty) => (ty, value_tokens.clone()),
+                            None => (
+                                quote!(stdpython::PyValue),
+                                quote!(stdpython::PyValue::from(#value_tokens.clone())),
+                            ),
+                        };
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<#ty> =
+                            std::sync::LazyLock::new(|| #wrapped);
+                    });
+                    module_init_stmts.push(quote!(let _ = &*#ident;));
+                }
                 has_module_init_code = true;
                 continue;
+                }
             }
 
             // A DEFINITE if/else module value (promoted_conditional): the If
@@ -1317,6 +1343,26 @@ pub fn module_imports_asyncio(body: &[crate::Statement]) -> bool {
     body.iter().any(stmt_imports_asyncio)
 }
 
+/// The plain-Name targets of a module-level Assign, when EVERY target is a
+/// plain Name (single-store promotion only applies to name targets; a
+/// chained `a = b = expr` where both are names promotes both — urllib3's
+/// `__version__ = version = '2.7.0'` in _version.py). Returns None when any
+/// target is a subscript/attribute/tuple (mixed targets cannot all be
+/// promoted as statics).
+fn assign_name_targets(a: &crate::Assign) -> Option<Vec<String>> {
+    if a.targets.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(a.targets.len());
+    for t in &a.targets {
+        match t {
+            crate::ExprType::Name(n) => out.push(n.id.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Count stores to each name across MODULE scope: top-level assignments
 /// plus everything nested in module-level control flow — if/while/for
 /// bodies (and the for target itself, which rebinds every iteration),
@@ -1498,14 +1544,20 @@ pub(crate) fn module_promoted_static_names(
             {
                 continue;
             }
-            if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                if counts.get(&n.id) == Some(&1)
-                    && const_static_type(&a.value).is_none()
-                    && !is_type_alias_value(&a.value)
-                    && !crate::is_rust_bind_call(&a.value)
-                    && (free_reads.contains(&n.id) || sibling.contains(&n.id))
-                {
-                    names.insert(n.id.clone());
+            // EVERY target must be a single-store plain name for the
+            // promotion (a chained `__version__ = version = '2.7.0'`
+            // promotes both names, but only when each is stored exactly
+            // once — a reassigned chained target must not freeze).
+            if let Some(targets) = assign_name_targets(a) {
+                for n in &targets {
+                    if counts.get(n) == Some(&1)
+                        && const_static_type(&a.value).is_none()
+                        && !is_type_alias_value(&a.value)
+                        && !crate::is_rust_bind_call(&a.value)
+                        && (free_reads.contains(n) || sibling.contains(n))
+                    {
+                        names.insert(n.clone());
+                    }
                 }
             }
         }

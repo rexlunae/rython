@@ -1345,11 +1345,41 @@ fn assigned_parameters_are_rebound_mutably() {
 }
 
 #[test]
+fn chained_module_string_constants_promote_both_names() {
+    // urllib3/_version.py: `__version__ = version = '2.7.0'` — a chained
+    // module-level constant. Both names become `pub static` (the importing
+    // module's `from ._version import __version__` needs the item).
+    let out = compile(
+        "__version__ = version = '2.7.0'\n",
+        "version.py",
+    );
+    assert!(
+        out.contains("pub static __version__ : & 'static str = \"2.7.0\""),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("pub static version : & 'static str = \"2.7.0\""),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn chained_assignment_assigns_each_target() {
+    // A module-level chained constant (`a = b = 1`) promotes BOTH names to
+    // `pub static` (each is a single-store module value — urllib3's
+    // `__version__ = version = '2.7.0'`). Inside a function, the chain
+    // keeps the ordinary lowering.
     let out = compile("a = b = 1", "chain.py");
+    assert!(out.contains("pub static a : i64 = 1"), "generated: {}", out);
+    assert!(out.contains("pub static b : i64 = 1"), "generated: {}", out);
+
+    let out = compile(
+        "def f(n: int) -> int:\n    a = b = n\n    return a + b\n",
+        "chain_fn.py",
+    );
     assert!(out.contains("__rython_chain"), "generated: {}", out);
-    assert!(out.contains("let a"), "generated: {}", out);
-    assert!(out.contains("let b"), "generated: {}", out);
     assert!(out.contains("a = __rython_chain"), "generated: {}", out);
     assert!(out.contains("b = __rython_chain"), "generated: {}", out);
 }
