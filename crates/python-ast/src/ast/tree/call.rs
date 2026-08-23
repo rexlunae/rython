@@ -3257,6 +3257,11 @@ impl<'a> CodeGen for Call {
                         | "reader"
                         | "writer"
                         | "StringIO"
+                        | "BufferedRWPair"
+                        | "BufferedReader"
+                        | "BufferedWriter"
+                        | "TextIOWrapper"
+                        | "DEFAULT_BUFFER_SIZE"
                 )
             });
             if let (Some((fname, module_prefix)), true) = (target, known) {
@@ -3718,6 +3723,32 @@ impl<'a> CodeGen for Call {
                             "io.BytesIO(...) lowers as the boxed PyValue (no binary \
                              in-memory buffer in rython — the file-object \
                              divergence)"
+                                .to_string(),
+                        );
+                        Ok(quote!(stdpython::PyValue::None_))
+                    }
+                    // io.BufferedRWPair/BufferedReader/BufferedWriter/
+                    // TextIOWrapper: buffered file-object wrappers (urllib3's
+                    // ssltransport.makefile) — no rython equivalent — the
+                    // boxed PyValue (the file-object divergence).
+                    ("BufferedRWPair", _) | ("BufferedReader", _) | ("BufferedWriter", _)
+                    | ("TextIOWrapper", _) => {
+                        options.definition_warnings.borrow_mut().push(
+                            "io.{}(...) lowers as the boxed PyValue (buffered \
+                             file-object wrappers are unmodeled — the \
+                             file-object divergence)"
+                                .to_string(),
+                        );
+                        Ok(quote!(stdpython::PyValue::None_))
+                    }
+                    // io.DEFAULT_BUFFER_SIZE: a module constant — the
+                    // buffering default — the boxed None (the constant is
+                    // unmodeled; buffering is a no-op on the boxed wrapper).
+                    ("DEFAULT_BUFFER_SIZE", _) => {
+                        options.definition_warnings.borrow_mut().push(
+                            "io.DEFAULT_BUFFER_SIZE lowers to the boxed None (the \
+                             constant is unmodeled — buffering is a no-op on the \
+                             boxed file-object divergence)"
                                 .to_string(),
                         );
                         Ok(quote!(stdpython::PyValue::None_))

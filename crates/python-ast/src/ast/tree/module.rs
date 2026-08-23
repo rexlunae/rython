@@ -1887,6 +1887,47 @@ fn module_expr_reads(expr: &crate::ExprType) -> std::collections::HashSet<String
                     }
                 }
             }
+            // Comprehensions and generator expressions read their element
+            // expression and their iterables (`"|".join(x % _subs for x in
+            // _variations)` — urllib3's url.py _IPV6_PAT chain): every
+            // name in them must be promoted with the static.
+            ET::ListComp(lc) => {
+                walk(&lc.elt, out);
+                for g in &lc.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            ET::SetComp(sc) => {
+                walk(&sc.elt, out);
+                for g in &sc.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            ET::DictComp(dc) => {
+                walk(&dc.key, out);
+                walk(&dc.value, out);
+                for g in &dc.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
+            ET::GeneratorExp(ge) => {
+                walk(&ge.elt, out);
+                for g in &ge.generators {
+                    walk(&g.iter, out);
+                    for c in &g.ifs {
+                        walk(c, out);
+                    }
+                }
+            }
             _ => {}
         }
     }
