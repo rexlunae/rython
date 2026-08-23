@@ -558,24 +558,33 @@ pub fn resolve_dependency(req: &Requirement, offline: bool) -> Result<ResolvedDe
     if !artifact_path.is_file() {
         let bytes = fetch_bytes(&url)?;
         // Integrity: PyPI's JSON metadata carries the sha256 of every
-        // artifact. A mismatch (tampered cache, mirror, intercepted
-        // download) is a loud error — never extract unverified code.
-        if let Some(digests) = artifact.get("digests").and_then(|d| d.get("sha256"))
-            && let expected = digests.as_str().unwrap_or_default()
-            && !expected.is_empty()
-        {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(&bytes);
-            let actual: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-            if actual != expected.to_ascii_lowercase() {
-                return Err(anyhow::anyhow!(
-                    "sha256 mismatch for `{}` ({}): expected {}, got {}",
-                    file_name,
-                    url,
-                    expected,
-                    actual
-                ));
-            }
+        // artifact. FAIL CLOSED — a missing digest means the response is
+        // not from real PyPI (mirror/intercepted), and a mismatch means
+        // tampering; either way the artifact is never extracted or
+        // transpiled.
+        let expected = artifact
+            .get("digests")
+            .and_then(|d| d.get("sha256"))
+            .and_then(|d| d.as_str())
+            .filter(|d| !d.is_empty())
+            .with_context(|| {
+                format!(
+                    "`{}` ({}) has no sha256 digest in the index response; \
+                     refusing to extract an unverified artifact",
+                    file_name, url
+                )
+            })?;
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(&bytes);
+        let actual: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        if actual != expected.to_ascii_lowercase() {
+            return Err(anyhow::anyhow!(
+                "sha256 mismatch for `{}` ({}): expected {}, got {}",
+                file_name,
+                url,
+                expected,
+                actual
+            ));
         }
         fs::write(&artifact_path, bytes)
             .with_context(|| format!("writing {}", artifact_path.display()))?;

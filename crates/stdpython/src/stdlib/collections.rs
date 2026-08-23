@@ -281,7 +281,7 @@ impl<T> deque<T> {
     /// Find index of first occurrence
     pub fn index(&self, value: &T, start: Option<usize>, stop: Option<usize>) -> Result<usize, PyException> 
     where 
-        T: PartialEq + core::fmt::Debug,
+        T: PartialEq + crate::PyRepr,
     {
         let start = start.unwrap_or(0);
         let stop = stop.unwrap_or(self.inner.len()).min(self.inner.len());
@@ -298,8 +298,10 @@ impl<T> deque<T> {
             }
         }
         
-        // CPython names the missing value: "9 is not in deque".
-        Err(crate::value_error(format!("{:?} is not in deque", value)))
+        // CPython names the missing value with repr(): "9 is not in deque",
+        // "'x' is not in deque" — single quotes for str, not Rust Debug's
+        // double quotes.
+        Err(crate::value_error(format!("{} is not in deque", value.py_repr())))
     }
     
     /// Insert item at position. A bounded deque at its maximum size raises
