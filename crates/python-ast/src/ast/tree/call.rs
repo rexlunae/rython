@@ -4097,6 +4097,7 @@ impl<'a> CodeGen for Call {
                 }
                 _ => resolve_construction_class(&receiver.id, &symbols, &options),
             };
+            let mut is_associated = false;
             if let Some((class, class_symbols)) = resolved
                 && let Some(method) = class.method_on_mro(&attr.attr, &class_symbols)
                 && (matches!(method.decorator_list.as_slice(), [ExprType::Name(n)] if n.id == "classmethod")
@@ -4114,6 +4115,43 @@ impl<'a> CodeGen for Call {
                 }
                 let MappedArguments { prelude, args } = map_call_arguments(
                     &sig,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                )?;
+                is_associated = true;
+                let cname = crate::safe_ident(&receiver.id);
+                let method_name = crate::safe_ident(&attr.attr);
+                return Ok(quote!({ #prelude #cname::#method_name(#(#args),*)? }));
+            }
+            // An UNBOUND-method call (`RequestMethods.__init__(self,
+            // headers)` — urllib3's connectionpool, where HTTPConnectionPool
+            // extends RequestMethods and explicitly initializes the mixin):
+            // the class name is a type and the instance is the first
+            // argument — the call lowers to the associated `Class::method(
+            // self, ...)`, with the receiver kept in the args (Python binds
+            // it to the first parameter). The generated method is
+            // `pub(crate) fn __init__(&mut self, ...)`, so passing `self`
+            // positionally works. Re-resolves the class (the first arm
+            // moved `resolved`); only when the first arm's classmethod/
+            // staticmethod guard did NOT match (it returns on success).
+            if !is_associated
+                && let Some((class, class_symbols)) = (match symbols.get(&receiver.id) {
+                    Some(crate::SymbolTableNode::ClassDef(c)) => {
+                        Some((c.clone(), symbols.clone()))
+                    }
+                    _ => resolve_construction_class(&receiver.id, &symbols, &options),
+                })
+                && let Some(method) = class.method_on_mro(&attr.attr, &class_symbols)
+                && attr.attr == "__init__"
+                && !method.decorator_list.iter().any(|d| {
+                    matches!(d, ExprType::Name(n) if n.id == "classmethod" || n.id == "staticmethod")
+                })
+            {
+                let MappedArguments { prelude, args } = map_call_arguments(
+                    &method,
                     &self.args,
                     &self.keywords,
                     &ctx,
