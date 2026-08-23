@@ -1610,6 +1610,7 @@ impl<'a> CodeGen for Call {
                     | "set"
                     | "bytearray"
                     | "iter"
+                    | "tuple"
             ) && symbols.get(bname).is_none()
                 // A loop element shadowing the builtin (`for filter in ...:
                 // filter(**kwargs)` — botocore's docs client): the call
@@ -2573,6 +2574,22 @@ impl<'a> CodeGen for Call {
                         }
                         let a = &rendered[0];
                         return Ok(quote!(list(#a)));
+                    }
+                    // tuple(x): Python's tuple factory. rython's value
+                    // model boxes tuples, so the factory is the boxed
+                    // argument (urllib3's `context["socket_options"] =
+                    // tuple(socket_opts)` in poolmanager.py).
+                    "tuple" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() != 1 {
+                            return Err("tuple() requires an iterable argument in rython"
+                                .to_string()
+                                .into());
+                        }
+                        let a = &rendered[0];
+                        return Ok(quote!(PyValue::from(#a)));
                     }
                     // bytes(x): the byte representation. On a str|bytes
                     // union this extracts the bytes branch (idna's

@@ -6928,3 +6928,24 @@ fn iter_builtin_boxes_its_argument() {
         out
     );
 }
+
+#[test]
+fn tuple_builtin_boxes_its_argument() {
+    // urllib3's poolmanager.py: `context["socket_options"] = tuple(socket_opts)`
+    // — the tuple constructor lowers to the boxed argument (values are already
+    // boxed; tuple() on a boxed iterable is identity in rython's model).
+    let out = compile(
+        "def f(socket_opts: list) -> list:\n    return tuple(socket_opts)\n",
+        "tupleb.py",
+    );
+    assert!(
+        out.contains("PyValue :: from") || out.contains("PyValue::from"),
+        "tuple(x) must box its argument: {}",
+        out
+    );
+    assert!(
+        !out.contains("tuple (socket_opts)"),
+        "bare tuple(socket_opts) must not leak: {}",
+        out
+    );
+}
