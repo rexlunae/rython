@@ -129,18 +129,32 @@ impl<'a> CodeGen for Attribute {
         // class-body constant (`cls.DEFAULT` where `Retry.DEFAULT =
         // Retry(3)` is assigned at MODULE level after the class — urllib3's
         // Retry.from_int) has no static item — the module-level
-        // class-attribute divergence: the read boxes to None.
+        // class-attribute divergence: the read boxes to None. Also an
+        // IMPORTED class (`Retry.DEFAULT` in connectionpool.py — Retry is
+        // imported from util.retry): the class body has no DEFAULT, so the
+        // read boxes the same way.
         let class_value_receiver: Option<String> = match self.value.as_ref() {
-            ExprType::Name(receiver) => match symbols.get(&receiver.id) {
-                Some(crate::SymbolTableNode::ClassDef(_)) => {
+            ExprType::Name(receiver) => {
+                let is_class = match symbols.get(&receiver.id) {
+                    Some(crate::SymbolTableNode::ClassDef(_)) => true,
+                    Some(crate::SymbolTableNode::ImportFrom(_)) => {
+                        crate::resolve_class_referenced(&receiver.id, &symbols, &options).is_some()
+                    }
+                    Some(crate::SymbolTableNode::Alias(_)) => {
+                        crate::resolve_class_referenced(&receiver.id, &symbols, &options).is_some()
+                    }
+                    _ => false,
+                };
+                if is_class {
                     if class_const_read.is_some() {
                         None
                     } else {
                         Some(receiver.id.clone())
                     }
+                } else {
+                    None
                 }
-                _ => None,
-            },
+            }
             _ => None,
         };
         let module_chain = is_module_path_chain(&self.value, &symbols, &options);
