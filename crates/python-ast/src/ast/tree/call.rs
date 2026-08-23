@@ -4057,7 +4057,13 @@ impl<'a> CodeGen for Call {
                 && let Some((_class, _cs)) =
                     crate::module_class_def(&options, &mod_path, &attr.attr)
             {
+                // The FULL crate path: `sessions.Session()` renders as
+                // `crate::requests::sessions::Session::new()` — a bare
+                // `Session` is only in scope if the module imports the
+                // class itself, which it may not (`from . import
+                // sessions` binds the MODULE, requests' api.py).
                 let cname = crate::safe_ident(&attr.attr);
+                let path_parts = mod_path.iter().map(|p| crate::safe_ident(p));
                 let mut args = Vec::new();
                 for arg in &self.args {
                     args.push(arg.clone().to_rust(
@@ -4074,9 +4080,9 @@ impl<'a> CodeGen for Call {
                     )?);
                 }
                 if args.is_empty() {
-                    return Ok(quote!(#cname::new()?));
+                    return Ok(quote!(crate::#(#path_parts)::*::#cname::new()?));
                 }
-                return Ok(quote!(#cname::new(#(#args),*)?));
+                return Ok(quote!(crate::#(#path_parts)::*::#cname::new(#(#args),*)?));
             }
         }
 

@@ -86,7 +86,41 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
             name,
             "datetime" | "date" | "time" | "timedelta" | "timezone"
         ),
-        "os" | "sys" | "time" | "math" | "random" | "warnings" | "tempfile"
+        // os: enumerated — the runtime module has these (and only these);
+        // anything else (`from os import PathLike` — annotation-only)
+        // drops loudly and maps to the boxed PyValue.
+        "os" => matches!(
+            name,
+            "chdir"
+                | "environ"
+                | "execv"
+                | "getcwd"
+                | "getenv"
+                | "name"
+                | "putenv"
+                | "remove"
+                | "replace"
+                | "sep"
+                | "urandom"
+                | "close"
+                | "write"
+                | "fdopen"
+                | "fstat"
+                | "abspath"
+                | "basename"
+                | "dirname"
+                | "exists"
+                | "expanduser"
+                | "isdir"
+                | "isfile"
+                | "join"
+                | "normpath"
+                | "relpath"
+                | "split"
+                | "splitext"
+                | "path"
+        ),
+        "sys" | "time" | "math" | "random" | "warnings" | "tempfile"
         | "textwrap" | "heapq" | "copy" | "string" | "glob" | "pathlib"
         | "csv" | "subprocess" | "sysconfig" | "argparse" | "venv" => true,
         _ => false,
