@@ -820,8 +820,16 @@ impl CodeGen for ImportFrom {
             // must not emit a `use` for a name the sibling never exports.
             // (find_symbols keeps the LAST binding, so a FunctionDef /
             // ClassDef / Assign symbol here means the local def won.)
+            // The check tests the name the import actually BINDS — the
+            // asname when aliased (`from .util.url import _normalize_host
+            // as normalize_host` — urllib3's connectionpool.py, where the
+            // LOCAL `def _normalize_host` overrides the unaliased spelling
+            // while the aliased `normalize_host` still resolves to the
+            // imported function). A local def of the CANONICAL name does
+            // not shadow the alias.
+            let bound_name = alias.asname.as_deref().unwrap_or(&alias.name);
             if matches!(
-                symbols.get(&alias.name),
+                symbols.get(bound_name),
                 Some(
                     crate::SymbolTableNode::FunctionDef(_)
                         | crate::SymbolTableNode::ClassDef(_)
@@ -831,7 +839,7 @@ impl CodeGen for ImportFrom {
                 options.definition_warnings.borrow_mut().push(format!(
                     "`from {} import {}` is dropped: the module defines `{}` \
                      locally, and Python's later definition wins",
-                    self.module, alias.name, alias.name
+                    self.module, alias.name, bound_name
                 ));
                 continue;
             }
@@ -925,7 +933,17 @@ impl CodeGen for ImportFrom {
             // — callers reach `textlib.double` through the re-export chain.
             // Absolute imports of user modules stay plain `use`: callers
             // import from the defining module directly.
-            let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+            // An underscore-prefixed sibling ITEM is `pub(crate)` in the
+            // defining module (`_wrap_proxy_error` — urllib3's
+            // connection.py): the re-export must match, or Rust rejects a
+            // `pub use` of a crate-only item (E0364).
+            let visibility = if self.level > 0 && alias.name.starts_with("_") {
+                quote!(pub(crate))
+            } else if self.level > 0 {
+                quote!(pub)
+            } else {
+                quote!()
+            };
             let import = match &alias.asname {
                 None if variants.is_empty() => {
                     quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name; }

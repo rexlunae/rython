@@ -599,10 +599,22 @@ impl FunctionDef {
         // (`use crate::urllib3::connection::_wrap_proxy_error`), so it must
         // be crate-visible; a class method's underscore-prefix privacy
         // stays (methods are reached through the trait or the receiver).
+        // The module's own context reaches module-level functions as
+        // Module (or Async(Module)) — not `Function { class: None }` —
+        // so those contexts take the same module-level path.
+        let is_module_level = matches!(&ctx, CodeGenContext::Function { class: None })
+            || matches!(&ctx, CodeGenContext::Module(_))
+            || matches!(
+                &ctx,
+                CodeGenContext::Async(inner)
+                    if matches!(inner.as_ref(), CodeGenContext::Module(_))
+            );
         let visibility = if matches!(&ctx, CodeGenContext::Trait { .. }) {
             quote!()
-        } else if matches!(&ctx, CodeGenContext::Function { class: None }) {
+        } else if is_module_level && self.name.starts_with("_") && !self.name.starts_with("__") {
             quote!(pub(crate))  // module-level: sibling modules import it
+        } else if is_module_level {
+            quote!(pub)
         } else if self.name.starts_with("_") && !self.name.starts_with("__") {
             quote!()  // private, no visibility modifier
         } else if self.name.starts_with("__") && self.name.ends_with("__") {

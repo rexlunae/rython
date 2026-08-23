@@ -2635,8 +2635,19 @@ pub(crate) fn module_def_has_path_item(
             _ => {}
         }
     }
-    // A const-literal Assign emits a plain `pub static`.
-    if module.raw.body.iter().any(|s| {
+    // A const-literal Assign emits a plain `pub static` — but only when
+    // the name is assigned EXACTLY ONCE at module level. A const that is
+    // REASSIGNED later (`HAS_NEVER_CHECK_COMMON_NAME = False` then a
+    // conditional reassignment in a try — urllib3's ssl_.py) stays a
+    // module-init local, not a path item; reading it as `ssl_::
+    // HAS_NEVER_CHECK_COMMON_NAME` must box to None.
+    // The module's OWN single-store accounting (the const-static
+    // emission condition `module_assign_counts.get(n) == Some(&1)`):
+    // conditional stores count DOUBLE, so a const with a conditional
+    // reassignment is NOT a plain static.
+    let mut counts = std::collections::HashMap::new();
+    count_module_stores(&module.raw.body, &mut counts);
+    if counts.get(name) == Some(&1) && module.raw.body.iter().any(|s| {
         matches!(&s.statement, crate::StatementType::Assign(a)
             if a.targets.iter().any(|t| {
                 matches!(t, crate::ExprType::Name(n) if n.id == name)
