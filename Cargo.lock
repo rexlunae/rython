@@ -746,6 +746,7 @@ dependencies = [
  "quote",
  "rust-format",
  "serde_json",
+ "sha2",
  "tar",
  "toml",
  "zip",

@@ -283,10 +283,16 @@ impl ClassDef {
                     names
                         .into_iter()
                         .enumerate()
+                        // A REQUIRED field (index below the default offset)
+                        // takes no default: mapping it to `defaults[0]`
+                        // (via saturating_sub) made required fields
+                        // optional and misaligned every default.
                         .filter_map(|(i, n)| {
-                            m.args.defaults
-                                .get(i.saturating_sub(skip))
-                                .map(|d| (n, (**d).clone()))
+                            if i < skip {
+                                None
+                            } else {
+                                m.args.defaults.get(i - skip).map(|d| (n, (**d).clone()))
+                            }
                         })
                         .collect()
                 })

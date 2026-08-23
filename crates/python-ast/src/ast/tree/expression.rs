@@ -368,11 +368,15 @@ impl ExprType {
 
                 let mut elements = Vec::new();
                 let mut starred_vals: Vec<TokenStream> = Vec::new();
-                for li in l {
+                for li in &l {
                     if let ExprType::Starred(starred) = li {
                         // `[*xs]` — the spread's collection extends the
-                        // list (`[key, *val]` — urllib3).
-                        let inner = starred.value.clone().to_rust(
+                        // list (`[key, *val]` — urllib3). The spread reads
+                        // the collection WITHOUT consuming it (Python's
+                        // `[*xs, a]` leaves `xs` usable), so the reuse-clone
+                        // rule applies like any other name read.
+                        let inner = crate::render_reused(
+                            &starred.value,
                             ctx.clone(),
                             options.clone(),
                             symbols.clone(),
@@ -392,54 +396,45 @@ impl ExprType {
                 
                 // If we have starred expressions, handle them specially
                 if has_starred {
-                    let mut final_elements = Vec::new();
-                    let mut has_argv_starred = false;
-                    
-                    for element in elements {
-                        let elem_str = element.to_string();
-                        if elem_str.contains("__STARRED_ARGV_MARKER__") {
-                            has_argv_starred = true;
-                            continue; // Skip the placeholder
+                    // Emit elements in SOURCE ORDER: a spread before or
+                    // between fixed elements must interleave (`[*xs, a]` is
+                    // `xs` then `a`, not `a` then `xs` — the old lowering
+                    // pushed all fixed elements first and extended with the
+                    // spreads after, silently reordering).
+                    enum Seg {
+                        Fixed(proc_macro2::TokenStream),
+                        Spread(proc_macro2::TokenStream),
+                    }
+                    // `elements` holds the fixed renders in source order;
+                    // merge them back with the spreads by walking the
+                    // literal once.
+                    let mut segments: Vec<Seg> = Vec::new();
+                    let mut si = 0usize;
+                    let mut ei = 0usize;
+                    for li in &l {
+                        if let ExprType::Starred(_) = li {
+                            segments.push(Seg::Spread(starred_vals[si].clone()));
+                            si += 1;
                         } else {
-                            final_elements.push(element);
+                            segments.push(Seg::Fixed(elements[ei].clone()));
+                            ei += 1;
                         }
                     }
-                    
-                    // Build the vector with proper unpacking
-                    if has_argv_starred {
-                        if final_elements.is_empty() {
-                            // Only sys::argv unpacking
-                            Ok(quote! {
-                                (*sys::argv).clone()
-                            })
-                        } else {
-                            // Mix of regular elements and sys::argv unpacking
-                            // Clone each element to avoid ownership issues
-                            Ok(quote! {
-                                {
-                                    let mut vec = Vec::new();
-                                    #(vec.push((#final_elements).clone().to_string());)*
-                                    vec.extend((*sys::argv).iter().cloned());
-                                    vec
-                                }
-                            })
+                    let elt_ty = expected_elt
+                        .as_ref()
+                        .map(|t| t.to_rust_type())
+                        .unwrap_or_else(|| quote!(_));
+                    let stmts = segments.iter().map(|seg| match seg {
+                        Seg::Fixed(t) => quote!(__rython_list.push(#t);),
+                        Seg::Spread(t) => quote!(__rython_list.extend(#t);),
+                    });
+                    Ok(quote! {
+                        {
+                            let mut __rython_list: Vec<#elt_ty> = Vec::new();
+                            #(#stmts)*
+                            __rython_list
                         }
-                    } else {
-                        // Other starred expressions (not sys::argv):
-                        // `[a, *xs]` pushes a and extends xs.
-                        let elt_ty = expected_elt
-                            .as_ref()
-                            .map(|t| t.to_rust_type())
-                            .unwrap_or_else(|| quote!(_));
-                        Ok(quote! {
-                            {
-                                let mut __rython_list: Vec<#elt_ty> = Vec::new();
-                                #( __rython_list.push(#final_elements); )*
-                                #( __rython_list.extend(#starred_vals); )*
-                                __rython_list
-                            }
-                        })
-                    }
+                    })
                 } else {
                     // Elements keep their own types: [1, 2, 3] must become a
                     // Vec<i64>, not a Vec<String>.
