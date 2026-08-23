@@ -5524,6 +5524,14 @@ impl<'a> CodeGen for Call {
         // (captured before the consuming loop so asyncio::sleep can re-render
         // its first argument as a float)
         let first_arg_expr = self.args.first().cloned();
+        // The second argument's inferred type, captured before the consuming
+        // loop (os.setenv's Option-vs-plain value routing).
+        let second_arg_option = self.args.get(1).map(|a| {
+            matches!(
+                crate::infer_type(a, &options, &symbols),
+                crate::TypeInfo::Option(_)
+            )
+        });
         for (i, arg) in self.args.into_iter().enumerate() {
             let rust_arg = if let Some(param) = pos_params.get(i) {
                 // A CALLABLE parameter (`dict_class: type`): the argument
@@ -5586,6 +5594,22 @@ impl<'a> CodeGen for Call {
 
         // Check if this function returns a Result that should be unwrapped
         let name_str = format!("{}", name);
+
+        // os.setenv(name, value) with an OPTIONAL value (requests'
+        // set_environ — `os.environ[name] = value` where the value is a
+        // narrowed Option<String>): route through setenv_opt, which
+        // unwraps the Option (None is a no-op, matching Python's
+        // `if value is None: return` guard). A non-Option value keeps
+        // the plain setenv.
+        if name_str == "os :: setenv" && all_args.len() == 2 {
+            let first = &all_args[0];
+            let second = &all_args[1];
+            return Ok(if second_arg_option == Some(true) {
+                quote!(os::setenv_opt(#first, #second))
+            } else {
+                quote!(os::setenv(#first, #second))
+            });
+        }
 
         // datetime.strptime parses and validates, so it raises ValueError
         // like Python; propagate rather than hand back a bare Result.

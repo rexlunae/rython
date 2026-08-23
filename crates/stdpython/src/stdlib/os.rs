@@ -238,12 +238,22 @@ python_function! {
 
 /// os.setenv with an OPTIONAL value (requests' set_environ generator —
 /// `os.environ[name] = value` where the value is a narrowed
-/// `Option<String>`): the Option is unwrapped; a None is a no-op.
+/// `Option<String>`): the Option is unwrapped; a None is a no-op. A plain
+/// String value (direct `os.setenv(k, v)` with a non-Option argument)
+/// passes through unchanged.
 pub fn setenv_opt<K: AsStrLike>(key: K, value: Option<String>) -> () {
     if let Some(v) = value {
         unsafe {
             std::env::set_var(key.as_str_like(), v);
         }
+    }
+}
+
+/// Non-Option variant for setenv_opt call sites where the value is a
+/// plain String (the codegen routes both shapes to setenv_opt).
+pub fn setenv_opt_str<K: AsStrLike>(key: K, value: String) -> () {
+    unsafe {
+        std::env::set_var(key.as_str_like(), value);
     }
 }
 
