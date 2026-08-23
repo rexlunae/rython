@@ -144,6 +144,26 @@ impl<'a> CodeGen for Attribute {
             _ => None,
         };
         let module_chain = is_module_path_chain(&self.value, &symbols, &options);
+        // A module-path member read into a CRATE module whose generated
+        // code has no item of that name (`util.ssl_.PROTOCOL_TLS` —
+        // urllib3's pyopenssl, where PROTOCOL_TLS is an external ssl
+        // constant the generated ssl_ module never defines): the member is
+        // unmodeled — the read lowers to the boxed None (the
+        // dynamic-module-member divergence, the same model getattr uses).
+        // stdpython modules are exempt: their members resolve through the
+        // runtime. Computed before `self.value`/`symbols` are moved below.
+        let missing_module_member = module_chain
+            && !crate::ast::tree::call::root_name(&self.value)
+                .is_some_and(|r| crate::is_stdpython_module(r))
+            && crate::ast::tree::call::module_path_of_chain(&self.value, &symbols, &options)
+                .is_some_and(|mod_path| {
+                    options.module_defs.contains_key(&mod_path)
+                        && !crate::ast::tree::module::module_def_has_path_item(
+                            &options,
+                            &mod_path,
+                            &self.attr,
+                        )
+                });
         // An attribute read on an except-bound name (`e.expected` —
         // urllib3's _error_catcher reading IncompleteRead's dynamic
         // fields): the exception object has no static fields (rython
@@ -230,6 +250,17 @@ impl<'a> CodeGen for Attribute {
                     "`{}.{}` is dropped: the module `{}` is external to the generated \
                      crate (external-module divergence)",
                     root, self.attr, root
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A module-path member read into a CRATE module with no item of
+            // that name: the boxed None (see missing_module_member above).
+            if missing_module_member {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` is dropped: the generated module has no runtime item for \
+                     `{}` (the member is unmodeled — the \
+                     dynamic-module-member divergence)",
+                    value_debug, self.attr, self.attr
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));
             }
@@ -627,8 +658,36 @@ pub(crate) fn is_module_path_chain(
                 // `from .util import ssl_`): the name IS a module when the
                 // submodule exists in the crate — attribute reads resolve
                 // as paths (`exceptions.SecurityWarning`,
-                // `ssl_.ALPN_PROTOCOLS`).
+                // `ssl_.ALPN_PROTOCOLS`). A sibling that re-exports a
+                // STDPYTHON module (`from .compat import json as
+                // complexjson` — requests' models.py, where compat.py does
+                // `import json`) is ALSO a module path: the import lowered
+                // to `use <stdpython>::json as complexjson;`, so
+                // `complexjson.dumps(...)` resolves as `complexjson::dumps`.
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                    let mut sub = ifm.resolved_module_path(options);
+                    sub.push(n.id.clone());
+                    if options.module_defs.contains_key(&sub) {
+                        return true;
+                    }
+                    let path = ifm.resolved_module_path(options);
+                    options.module_defs.contains_key(&path)
+                        && crate::ast::tree::module::module_reexports_stdpython_module(
+                            options,
+                            &path,
+                            &n.id,
+                        )
+                        .is_some()
+                }
+                // An ABSOLUTE import whose name resolves to a crate
+                // SUBMODULE (`from urllib3.contrib import pyopenssl` —
+                // requests/__init__.py's dead pyopenssl branch): the name
+                // is a module when `module + name` is a module of the
+                // crate — attribute calls resolve as paths
+                // (`pyopenssl::inject_into_urllib3`). A VALUE import
+                // (`from .utils import make_headers`) is not a module
+                // (`module + name` is not a crate module).
+                Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
                     let mut sub = ifm.resolved_module_path(options);
                     sub.push(n.id.clone());
                     options.module_defs.contains_key(&sub)

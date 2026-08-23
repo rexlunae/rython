@@ -7505,3 +7505,82 @@ fn import_reexport_of_stdpython_module_is_kept() {
         out
     );
 }
+
+#[test]
+fn module_path_member_read_missing_item_boxes_to_none() {
+    // urllib3's pyopenssl.py: `util.ssl_.PROTOCOL_TLS` — a module-path
+    // member read where the generated ssl_ module has no PROTOCOL_TLS
+    // item (it is an external ssl constant). The read must box to None
+    // (E0425 otherwise).
+    let a = parse("def ssl_wrap_socket():\n    return 1\n", "ssl_.py").unwrap();
+    let b = parse(
+        concat!(
+            "from . import util\n",
+            "\n",
+            "_versions = {\n",
+            "    util.ssl_.PROTOCOL_TLS: 1,\n",
+            "}\n",
+        ),
+        "pyopenssl.py",
+    )
+    .unwrap();
+    let util_init = parse("from . import ssl_\n", "util/__init__.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["util".to_string(), "ssl_".to_string()], std::rc::Rc::new(a));
+    defs.insert(vec!["util".to_string()], std::rc::Rc::new(util_init));
+    defs.insert(vec!["pyopenssl".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        "from . import util\n\n_versions = {\n    util.ssl_.PROTOCOL_TLS: 1,\n}\n",
+        "pyopenssl.py",
+        options,
+    )
+    .expect("converts");
+    // The missing member must not render as a raw `::PROTOCOL_TLS` path.
+    assert!(
+        !out.contains("PROTOCOL_TLS"),
+        "missing module member must not render as a raw path: {}",
+        out
+    );
+}
+
+
+#[test]
+fn stdpython_module_reexport_via_sibling_aliases_to_runtime() {
+    // requests' models.py: `from .compat import json as complexjson` where
+    // compat.py does `import json` (stdlib) inside a try/except. The
+    // generated compat.rs has no `json` item, so the import must route to
+    // the runtime module (`use <stdpython>::json as complexjson;`) —
+    // otherwise `complexjson.dumps(...)` is E0425.
+    let a = parse(
+        "import json\n\ndef to_native_string(s, encoding):\n    return s\n",
+        "compat.py",
+    )
+    .unwrap();
+    let b = parse(
+        "from .compat import json as complexjson\n\ndef f():\n    return complexjson.dumps({})\n",
+        "models.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["compat".to_string()], std::rc::Rc::new(a));
+    defs.insert(vec!["models".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        "from .compat import json as complexjson\n\ndef f():\n    return complexjson.dumps({})\n",
+        "models.py",
+        options,
+    )
+    .expect("converts");
+    assert!(
+        out.contains("as complexjson"),
+        "aliased stdpython-module reexport must route to the runtime module: {}",
+        out
+    );
+}

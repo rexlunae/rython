@@ -2602,6 +2602,63 @@ pub(crate) fn module_def_has_runtime_item(
     module_reexports_item(options, path, name, &mut std::collections::HashSet::new())
 }
 
+/// Whether the module at `path` actually generates a PATH ITEM named
+/// `name` — a `pub static` (const or promoted), a `pub fn`, or a `pub
+/// struct` — so a module-path read (`util::ssl_::PROTOCOL_TLS`) resolves.
+/// Strictly weaker than [`module_def_has_runtime_item`]: a body Assign
+/// that only lands in `__module_init__` (a try/except-conditional value
+/// that is never promoted) is NOT a path item — reading it as
+/// `module::NAME` is E0425, and the read must box to None (the
+/// dynamic-module-member divergence).
+pub(crate) fn module_def_has_path_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    // A module-level FUNCTION or CLASS is a `pub fn` / `pub struct`.
+    for s in &module.raw.body {
+        match &s.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                if f.name == name {
+                    return true;
+                }
+            }
+            crate::StatementType::ClassDef(c) => {
+                if c.name == name {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // A const-literal Assign emits a plain `pub static`.
+    if module.raw.body.iter().any(|s| {
+        matches!(&s.statement, crate::StatementType::Assign(a)
+            if a.targets.iter().any(|t| {
+                matches!(t, crate::ExprType::Name(n) if n.id == name)
+            })
+                && const_static_type(&a.value).is_some())
+    }) {
+        return true;
+    }
+    // A non-const single-store name READ BY A FUNCTION (or imported by a
+    // sibling) promotes to a `pub static LazyLock`.
+    module_promoted_static_names(options, path).contains(name)
+        // A SUBMODULE of the package (`util.util` — urllib3's pyopenssl,
+        // where `from .. import util` then `util.util.to_bytes(...)`
+        // names the util/util.py module): the module itself is the path
+        // item the next attribute segment resolves into.
+        || {
+            let mut sub = path.to_vec();
+            sub.push(name.to_string());
+            options.module_defs.contains_key(&sub)
+        }
+}
+
 /// Whether the module at `path` RE-EXPORTS `name` through one of its own
 /// ImportFrom statements (`from .request import SKIP_HEADER` in urllib3's
 /// util/__init__.py): the generated module re-exports the name, so a
@@ -2719,6 +2776,42 @@ fn scan_module_body_for_item(
                         return true;
                     }
                 }
+                // A conditional DEFINITION (`if sys.version_info >= (3, 11):
+                // def where(): ...` — certifi's core.py): the function is
+                // emitted (the version branch is the modern one), so a
+                // sibling import of it resolves. Recurse into nested
+                // statement lists, skipping TYPE_CHECKING blocks.
+                ST::If(i) => {
+                    let tc = in_type_checking
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+                        )
+                        || matches!(
+                            &i.test,
+                            crate::ExprType::Attribute(a)
+                                if a.attr == "TYPE_CHECKING"
+                                    && matches!(
+                                        a.value.as_ref(),
+                                        crate::ExprType::Name(m) if m.id == "typing"
+                                    )
+                        );
+                    if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
+                        return true;
+                    }
+                }
+                ST::Try(t) => {
+                    for part in [&t.body, &t.orelse, &t.finalbody] {
+                        if scan(part, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                    for h in &t.handlers {
+                        if scan(&h.body, name, in_type_checking) {
+                            return true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2809,7 +2902,14 @@ fn module_init_static_ty(
     value: &crate::ExprType,
     options: &crate::PythonOptions,
 ) -> Option<TokenStream> {
-    if let Some(t) = options.name_types.get(name) {
+    // A type containing the UNINFERRED `_` (`PyDict<_, _>` — a dict of
+    // EXTERNAL values that all box to None, urllib3's pyopenssl
+    // `_stdlib_to_openssl_verify`): `_` is not allowed in static type
+    // signatures (E0121), and a boxed-None dict cannot be a typed PyDict
+    // (PyValue has no Hash/Eq — E0277). Fall back to the boxed PyValue.
+    if let Some(t) = options.name_types.get(name)
+        && !type_contains_uninferred(t)
+    {
         return Some(t.to_rust_type());
     }
     if let crate::ExprType::Call(c) = value
@@ -2824,6 +2924,20 @@ fn module_init_static_ty(
         }
     }
     None
+}
+
+/// Whether a type contains the UNINFERRED placeholder (`TypeInfo::PyObject`
+/// renders as `_`) anywhere — dict/list elements of external-module reads.
+fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
+    match t {
+        crate::TypeInfo::PyObject => true,
+        crate::TypeInfo::Vec(inner) | crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {
+            type_contains_uninferred(inner)
+        }
+        crate::TypeInfo::Dict(k, v) => type_contains_uninferred(k) || type_contains_uninferred(v),
+        crate::TypeInfo::Tuple(ts) => ts.iter().any(type_contains_uninferred),
+        _ => false,
+    }
 }
 
 /// Declarations for every name assigned in a statement list, so
@@ -3711,4 +3825,60 @@ pub fn cross_module_mut_self_table(
         }
     }
     table
+}
+
+
+/// Whether the module at `path` re-exports `name` from a STDPYTHON module
+/// (`from .compat import json as complexjson` where compat.py does
+/// `import json`): the generated module has no item of that name (stdlib
+/// modules resolve through the runtime glob), so the importer must route
+/// to the runtime module (`use <stdpython>::json as complexjson;`).
+/// Returns the stdpython module name (None when the re-export is not a
+/// stdpython module). Nested imports (try/except bodies) are followed.
+pub(crate) fn module_reexports_stdpython_module(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<String> {
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    fn walk(body: &[crate::Statement], name: &str) -> Option<String> {
+        use crate::StatementType as ST;
+        for s in body {
+            let found: Option<String> = match &s.statement {
+                ST::Import(im) => im
+                    .names
+                    .iter()
+                    .find(|a| {
+                        a.asname.as_deref() == Some(name)
+                            || (a.asname.is_none() && a.name.split('.').next() == Some(name))
+                    })
+                    .map(|a| a.name.split('.').next().unwrap_or("").to_string())
+                    .filter(|m| crate::is_stdpython_module(m)),
+                ST::If(i) => walk(&i.body, name).or_else(|| walk(&i.orelse, name)),
+                ST::Try(t) => {
+                    for part in [&t.body, &t.orelse, &t.finalbody] {
+                        if let Some(m) = walk(part, name) {
+                            return Some(m);
+                        }
+                    }
+                    for h in &t.handlers {
+                        if let Some(m) = walk(&h.body, name) {
+                            return Some(m);
+                        }
+                    }
+                    None
+                }
+                ST::While(w) => walk(&w.body, name).or_else(|| walk(&w.orelse, name)),
+                ST::For(f) => walk(&f.body, name).or_else(|| walk(&f.orelse, name)),
+                ST::With(w) => walk(&w.body, name),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+    walk(&module.raw.body, name)
 }

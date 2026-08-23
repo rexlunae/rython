@@ -873,6 +873,29 @@ impl CodeGen for ImportFrom {
             };
 
             let name = crate::safe_ident(&alias.name);
+            // A name the defining module re-exports from a STDPYTHON
+            // module (`from .compat import json as complexjson` where
+            // compat.py does `import json` — requests' models.py): the
+            // generated compat.rs has no `json` item (stdlib modules
+            // resolve through the runtime), so the import must route to
+            // the runtime module directly (`use <stdpython>::json as
+            // complexjson;`) — a `use crate::requests::compat::json`
+            // would fail E0432.
+            if let Some(runtime_module) =
+                crate::ast::tree::module::module_reexports_stdpython_module(
+                    &options,
+                    &self.resolved_module_path(&options),
+                    &alias.name,
+                )
+            {
+                let runtime = crate::safe_ident(&options.stdpython);
+                let module = crate::safe_ident(&runtime_module);
+                let asname = crate::safe_ident(alias.asname.as_deref().unwrap_or(&alias.name));
+                tokens.extend(quote! {
+                    use #runtime::#module as #asname;
+                });
+                continue;
+            }
             // A sibling-module import whose defining module was NOT
             // generated (`from urllib3.contrib import pyopenssl` — the
             // contrib/pyopenssl.py module fails conversion, so no

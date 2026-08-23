@@ -6733,9 +6733,11 @@ pub(crate) fn module_path_of(
             Some(crate::SymbolTableNode::Alias(canonical)) => {
                 current = canonical.clone();
             }
-            Some(crate::SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+            Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
                 let mut path = ifm.resolved_module_path(options);
-                // The canonical (unaliased) name is the actual module.
+                // The canonical (unaliased) name is the actual module —
+                // relative (`from .http2 import probe`) or absolute
+                // (`from urllib3.contrib import pyopenssl`).
                 path.push(
                     ifm.names
                         .iter()
@@ -6749,6 +6751,53 @@ pub(crate) fn module_path_of(
         }
     }
     None
+}
+
+/// The CRATE module path a DOTTED CHAIN resolves to (`util.ssl_` from
+/// `from .. import util` in urllib3's pyopenssl → ["urllib3", "util",
+/// "ssl_"]), for the module-member-read drop: reading a member the
+/// generated module never defines lowers to the boxed None. The chain's
+/// ROOT name resolves through its import; each following segment that is
+/// itself a module of the crate extends the path. None when the chain is
+/// not a sibling-module path.
+pub(crate) fn module_path_of_chain(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<Vec<String>> {
+    // Collect the dotted parts root-first: `util.ssl_` → ["util", "ssl_"].
+    let mut parts = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            ExprType::Attribute(a) => {
+                parts.push(a.attr.clone());
+                cur = &a.value;
+            }
+            ExprType::Name(n) => {
+                parts.push(n.id.clone());
+                break;
+            }
+            _ => return None,
+        }
+    }
+    parts.reverse();
+    // Resolve the ROOT name through its import, then extend with every
+    // segment that is itself a module of the crate.
+    let root = ExprType::Name(crate::ast::tree::name::Name {
+        id: parts.remove(0),
+    });
+    let mut path = module_path_of(&root, symbols, options)?;
+    for part in parts {
+        let mut sub = path.clone();
+        sub.push(part);
+        if options.module_defs.contains_key(&sub) {
+            path = sub;
+        } else {
+            break;
+        }
+    }
+    Some(path)
 }
 
 /// The MODULE path a dotted chain names (`botocore.httpsession` →
