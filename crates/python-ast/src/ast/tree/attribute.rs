@@ -166,6 +166,26 @@ impl<'a> CodeGen for Attribute {
         // dynamic-module-member divergence, the same model getattr uses).
         // stdpython modules are exempt: their members resolve through the
         // runtime. Computed before `self.value`/`symbols` are moved below.
+        // A module-path member read where the member is a CLASS in the
+        // defining module (`urllib3_connection::HTTPSConnection` — urllib3's
+        // http2/__init__.py, `orig_HTTPSConnection =
+        // urllib3_connection.HTTPSConnection`): a class read as a VALUE has
+        // no runtime equivalent — the boxed None (the classes-as-values
+        // divergence, the same model name.rs uses). The class IS a path
+        // item, but a VALUE read of it is unrepresentable.
+        let class_value_module_member = module_chain
+            && !crate::ast::tree::call::root_name(&self.value)
+                .is_some_and(|r| crate::is_stdpython_module(r))
+            && crate::ast::tree::call::module_path_of_chain(&self.value, &symbols, &options)
+                .is_some_and(|mod_path| {
+                    options.module_defs.contains_key(&mod_path)
+                        && crate::ast::tree::module::module_def_has_path_item(
+                            &options,
+                            &mod_path,
+                            &self.attr,
+                        )
+                        && crate::module_class_def(&options, &mod_path, &self.attr).is_some()
+                });
         let missing_module_member = module_chain
             && !crate::ast::tree::call::root_name(&self.value)
                 .is_some_and(|r| crate::is_stdpython_module(r))
@@ -275,6 +295,17 @@ impl<'a> CodeGen for Attribute {
                      `{}` (the member is unmodeled — the \
                      dynamic-module-member divergence)",
                     value_debug, self.attr, self.attr
+                ));
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A module-path member that is a CLASS read as a VALUE
+            // (`urllib3_connection::HTTPSConnection` — http2/__init__.py):
+            // the boxed None (classes-as-values divergence).
+            if class_value_module_member {
+                warnings.borrow_mut().push(format!(
+                    "`{}.{}` (a class read as a value) lowers to the boxed None \
+                     (classes cannot be runtime values in rython)",
+                    value_debug, self.attr
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));
             }
