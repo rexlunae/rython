@@ -457,6 +457,78 @@ impl ClassDef {
         self.methods().find(|m| m.name == "__init__")
     }
 
+    /// The property getter/setter PAIRS on this class: Python's
+    /// `@property def x` + `@x.setter def x` lower to TWO plain methods
+    /// with the SAME Python name — Rust forbids same-name methods
+    /// (E0428). The setter gets a distinct Rust name `x_set` (the
+    /// property-read/set divergence keeps the getter as a plain method
+    /// `x`). Returns the setter's Python name → the setter FunctionDef.
+    pub fn property_setters(&self) -> std::collections::HashMap<String, FunctionDef> {
+        let mut out = std::collections::HashMap::new();
+        let methods: Vec<&FunctionDef> = self.methods().collect();
+        for (i, m) in methods.iter().enumerate() {
+            let is_setter = m.decorator_list.iter().any(|d| match d {
+                ExprType::Attribute(a) => {
+                    a.attr == "setter"
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == m.name)
+                }
+                _ => false,
+            });
+            if is_setter {
+                // The GETTER must exist for this to be a pair: the setter
+                // alone (a `@x.setter` with no preceding `@property`) is
+                // not a valid Python property anyway.
+                let has_getter = methods.iter().enumerate().any(|(j, g)| {
+                    j != i && g.name == m.name && {
+                        let is_getter = g.decorator_list.iter().any(|d| match d {
+                            ExprType::Name(n) => n.id == "property",
+                            ExprType::Attribute(a) => a.attr == "property",
+                            _ => false,
+                        });
+                        is_getter
+                    }
+                });
+                if has_getter {
+                    out.insert(m.name.clone(), (*m).clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the class defines a property getter named `name` (a
+    /// `@property def name` or the getter half of a pair) — used to route
+    /// attribute READS to the getter method call.
+    pub fn has_property_getter(&self, name: &str) -> bool {
+        self.methods().any(|m| {
+            m.name == name
+                && m.decorator_list.iter().any(|d| match d {
+                    ExprType::Name(n) => n.id == "property",
+                    ExprType::Attribute(a) => a.attr == "property",
+                    _ => false,
+                })
+        })
+    }
+
+    /// The RUST name a method is emitted under: a property SETTER in a
+    /// getter/setter pair lowers as `{name}_set` (Rust forbids same-name
+    /// methods — E0428); everything else keeps its Python name. Callers
+    /// (attribute read/store routing, super trampolines) must use the
+    /// SAME name so call sites match the definition.
+    pub fn emitted_method_name(&self, m: &FunctionDef) -> String {
+        if m.is_property_setter() && self.property_setters().contains_key(&m.name) {
+            format!("{}_set", m.name)
+        } else {
+            m.name.clone()
+        }
+    }
+
+    /// Whether a method with this PYTHON name is a property setter (needs
+    /// `{name}_set` at call sites).
+    pub fn is_property_setter(&self, name: &str) -> bool {
+        self.property_setters().contains_key(name)
+    }
+
     /// The methods defined directly on the class, in source order.
     /// The methods defined directly on the class, in source order —
     /// EXCLUDING `@typing.overload` stubs (their `...` bodies and default
@@ -1066,6 +1138,11 @@ impl ClassDef {
 
         let mut stores = Vec::new();
         collect_field_stores(&init.body, &mut stores);
+        // A store to a PROPERTY name (`self.retries = retries` where
+        // retries is `@property` + `@retries.setter` — urllib3's
+        // BaseHTTPResponse): Python's assignment invokes the SETTER method,
+        // not a field write — the store must not create a struct field.
+        stores.retain(|s| !self.is_property_setter(&s.attr));
         // An ANNOTATED store pins the field type (issue #121): a later
         // plain store of the same attribute (`self.headers: dict[str, str |
         // None] = {}` then `self.headers = dict(headers)` — urllib3's
@@ -1366,8 +1443,7 @@ fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>
                         }
                     }
                 }
-            }
-            StatementType::If(s) => {
+            }            StatementType::If(s) => {
                 collect_field_stores(&s.body, out);
                 collect_field_stores(&s.orelse, out);
             }
@@ -2166,9 +2242,15 @@ impl CodeGen for ClassDef {
             if m.name == "new" && !m.args.args.iter().any(|p| p.arg != "self") {
                 continue;
             }
+            // A property SETTER in a getter/setter pair emits under the
+            // distinct Rust name `{name}_set` (Rust forbids same-name
+            // methods): clone the FunctionDef with the renamed method.
+            let mut emitted = (*m).clone();
+            if self.is_property_setter(&m.name) {
+                emitted.name = self.emitted_method_name(m);
+            }
             methods_stream.extend(
-(*m).clone()
-                    .to_rust(method_ctx.clone(), options.clone(), symbols.clone())?,
+                emitted.to_rust(method_ctx.clone(), options.clone(), symbols.clone())?,
             );
         }
 
@@ -2348,9 +2430,14 @@ impl ClassDef {
                     .get(&self.name)
                     .is_some_and(|s| s.contains(&m.name)),
             };
+            // A property SETTER emits under `{name}_set` (same rename as
+            // the impl loop above).
+            let mut emitted = (*m).clone();
+            if self.is_property_setter(&m.name) {
+                emitted.name = self.emitted_method_name(m);
+            }
             own_method_defaults.extend(
-(*m).clone()
-                    .to_rust(trait_ctx, options.clone(), symbols.clone())?,
+                emitted.to_rust(trait_ctx, options.clone(), symbols.clone())?,
             );
         }
 
@@ -2399,7 +2486,8 @@ impl ClassDef {
                 .and_then(|r| options.trait_mut_self.get(&r.name))
                 .is_some_and(|s| s.contains(&m.name));
             let mut helper = (*m).clone();
-            helper.name = format!("__rython_super_{}", m.name);
+            let emitted_name = self.emitted_method_name(m);
+            helper.name = format!("__rython_super_{}", emitted_name);
             let helper_ctx = CodeGenContext::Trait {
                 class: self.name.clone(),
                 generic: true,
@@ -2555,8 +2643,15 @@ impl ClassDef {
                             .get(&ancestor.name)
                             .is_some_and(|s| s.contains(&am.name)),
                     };
+                    // A property SETTER in a pair emits under `{name}_set`
+                    // — the DEFINING class's pair (the name in the
+                    // hierarchy is the pair's Python name).
+                    let mut emitted = m.clone();
+                    if self.is_property_setter(&am.name) {
+                        emitted.name = self.emitted_method_name(&am);
+                    }
                     override_stream.extend(
-                        m.to_rust(trait_ctx, options.clone(), symbols.clone())?,
+                        emitted.to_rust(trait_ctx, options.clone(), symbols.clone())?,
                     );
                 }
             }

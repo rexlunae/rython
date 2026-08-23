@@ -6293,7 +6293,14 @@ pub(crate) fn receiver_class(
                 ExprType::Name(cn) => (cn.id.clone(), symbols.clone()),
                 _ => return None,
             },
-            _ => return None,
+            // A TYPED PARAMETER receiver (`def f(c: C): return c.x` — the
+            // annotation resolves the class, so property reads/setter
+            // stores on the parameter route correctly). The class name is
+            // in name_types as TypeInfo::Class.
+            _ => match options.name_types.get(&n.id) {
+                Some(crate::TypeInfo::Class(cname)) => (cname.clone(), symbols.clone()),
+                _ => return None,
+            },
         },
         // Composition: `self.field.method()` resolves through the owner
         // class's field types. `field_class` yields the field's class

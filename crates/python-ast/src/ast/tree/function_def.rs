@@ -999,7 +999,20 @@ impl FunctionDef {
                                 info.name_types
                                     .insert(p.arg.clone(), crate::TypeInfo::PyValue);
                             }
-                            _ => {}
+                            // A CLASS-typed parameter (`def f(c: C)` —
+                            // requests' sessions): record the class so
+                            // receiver resolution (property reads/setter
+                            // stores on the parameter) can route to the
+                            // class's methods.
+                            _ => {
+                                let cname = n.id.clone();
+                                if symbols.get(&cname).is_some() {
+                                    info.name_types.insert(
+                                        p.arg.clone(),
+                                        crate::TypeInfo::Class(cname),
+                                    );
+                                }
+                            }
                         },
                         other => {
                             if crate::is_none_expr(other) {
@@ -2473,6 +2486,20 @@ pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
 }
 
 impl FunctionDef {
+    /// Whether this method is a property SETTER (`@x.setter def x(...)` —
+    /// the `setter` decorator spelling). Only the setter half of a
+    /// getter/setter pair gets the distinct Rust name `{name}_set`; the
+    /// getter (`@property def x`) keeps its name.
+    pub fn is_property_setter(&self) -> bool {
+        self.decorator_list.iter().any(|d| match d {
+            ExprType::Attribute(a) => {
+                a.attr == "setter"
+                    && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == self.name)
+            }
+            _ => false,
+        })
+    }
+
     /// The return type the generated Rust function actually carries, if any.
     ///
     /// Inference from the body comes first (it reflects the type the body

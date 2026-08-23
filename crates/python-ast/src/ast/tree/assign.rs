@@ -644,6 +644,25 @@ impl<'a> CodeGen for Assign {
         let render = |target: &ExprType,
                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // A PROPERTY SETTER store (`self.url = v` where url is
+            // `@property def url` + `@url.setter def url`): Python's
+            // property assignment invokes the SETTER method. rython lowers
+            // the setter as a plain method `{name}_set` (distinct Rust
+            // name), so the store routes to the call `self.url_set(v)?`
+            // instead of a field write.
+            if let ExprType::Attribute(attr) = target
+                && let Some((class, _class_symbols)) =
+                    crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+                && class.is_property_setter(&attr.attr)
+            {
+                let recv = attr.value.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                let setter = crate::safe_ident(&format!("{}_set", attr.attr));
+                return Ok(quote!(#recv.#setter(#value)?;));
+            }
             match target {
                 ExprType::Subscript(sub) => render_subscript_store(sub, value),
                 _ => render_one(target, value),

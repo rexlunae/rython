@@ -181,6 +181,12 @@ impl<'a> CodeGen for Attribute {
         // Computed before `self.value`/`symbols` are moved below.
         let pyvalue_receiver = receiver_is_pyvalue(&self.value, &ctx, &symbols, &options);
         let receiver_is_field_chain = matches!(self.value.as_ref(), ExprType::Attribute(_));
+        // A PROPERTY GETTER read (`self.url` — urllib3's geturl, where url
+        // is `@property def url`): the property lowers as a plain method
+        // returning Result, so the read routes to the getter CALL and
+        // unwraps (`self.url()?`). Computed before the moves below.
+        let property_getter = crate::receiver_class(&self.value, &ctx, &symbols, &options)
+            .is_some_and(|(class, _)| class.has_property_getter(&self.attr));
         let warnings = options.definition_warnings.clone();
         let value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let value_str = value_tokens.to_string();
@@ -339,6 +345,14 @@ impl<'a> CodeGen for Attribute {
             // or, in a generic trait default, through the base accessors
             // (`self.base().f`); an own field in a generic trait default goes
             // through its accessor (`self.f()`).
+            // A PROPERTY GETTER read (`self.url` — urllib3's geturl, where
+            // url is `@property def url`): the property lowers as a plain
+            // method returning Result, so the read routes to the getter CALL
+            // and unwraps (`self.url()?`). Only when the receiver's class
+            // actually defines the getter — a genuine field read is untouched.
+            if property_getter && field_access.is_none() {
+                return Ok(quote!(#value_tokens.#attr()?));
+            }
             match field_access {
                 None => Ok(quote!(#value_tokens.#attr)),
                 Some(FieldRewrite::Accessor { field }) => {

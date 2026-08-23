@@ -7193,3 +7193,31 @@ fn tuple_import_error_handler_drops_with_import_body() {
         out
     );
 }
+
+#[test]
+fn property_getter_setter_pair_renames_setter_and_routes_access() {
+    // urllib3's response.py: `@property def url` + `@url.setter def url` —
+    // two same-named methods, which Rust forbids (E0428). The setter
+    // lowers as `{name}_set`; a read `obj.url` routes to the getter call
+    // `obj.url()?`; a store `obj.url = v` routes to the setter call
+    // `obj.url_set(v)?`.
+    let out = compile(
+        "class C:\n    def __init__(self) -> None:\n        self._url = ''\n\n    @property\n    def url(self) -> str:\n        return self._url\n\n    @url.setter\n    def url(self, v: str) -> None:\n        self._url = v\n\ndef get(c: C) -> str:\n    return c.url\n\ndef set(c: C, v: str) -> None:\n    c.url = v\n",
+        "propair.py",
+    );
+    assert!(
+        out.contains("fn url_set") && !out.contains("fn url(&mut self, v"),
+        "setter must lower as url_set: {}",
+        out
+    );
+    assert!(
+        out.contains("c.url()?") || out.contains("c . url () ?"),
+        "property read must route to the getter call: {}",
+        out
+    );
+    assert!(
+        out.contains("c.url_set(v)?") || out.contains("c . url_set (v) ?"),
+        "property store must route to the setter call: {}",
+        out
+    );
+}
