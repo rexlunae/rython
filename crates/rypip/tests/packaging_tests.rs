@@ -2,37 +2,15 @@
 //! setup.py) and PEP 440/508 dependency resolution.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::Scratch;
 use rypip::package::discover;
 use rypip::packaging::{read_project_metadata, resolve_package_dirs};
 use rypip::resolve::{
     matches_specifier, parse_requirement, parse_version, version_cmp, version_satisfies,
 };
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "rypip-pkgtest-{}-{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("creating scratch dir");
-        Scratch(dir)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // PEP 440 version comparison and specifiers

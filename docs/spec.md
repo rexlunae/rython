@@ -658,7 +658,9 @@ crate is a dependency, not a module.
 ### 11.2 Exporting to CPython (`--pyo3`)
 
 `rypip convert --pyo3` adds a `python` cargo feature, a `cdylib` crate
-type, and a generated `#[pymodule]` wrapping every public top-level
+type, a generated `build.rs` requesting pyo3's extension-module link
+args (without them a macOS linker rejects the cdylib's undefined
+`_Py_*` symbols), and a generated `#[pymodule]` wrapping every public top-level
 function whose signature is expressible in concrete types (every
 parameter annotated with a mappable type —
 `int`/`float`/`str`/`bool`/`bytes`/containers/`Optional`; no defaults,
@@ -696,7 +698,9 @@ Module metadata comes from `__module_license__` (defaults to `"GPL"`),
 `__module_name__`; a misc-device sub-mode is driven by
 `__device_name__`/`__bufsz__`/`__magic__`/`__device_mode__` dunders.
 The raw-FFI target generates a C-free build pipeline (Makefile +
-`-Zbuild-std`, kmalloc-backed allocator, `.modinfo` sections);
+`-Zbuild-std`, kmalloc-backed allocator, `.modinfo` sections — the
+`.modinfo` placement is gated with `cfg_attr(target_os = "linux", …)`
+so a module authored on any host still type-checks there);
 `--rust-for-linux` (valid only alongside `--kernel-module`) generates a
 `module!`-macro crate for CONFIG_RUST kernels instead. `printk`
 f-strings may interpolate only integer locals and literals; `!s`/`!r`

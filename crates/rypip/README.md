@@ -99,10 +99,12 @@ generated crate; `json`, `string`, `collections`, and `itertools` stay
 available.
 
 With `--pyo3`, the crate gains a `python` cargo feature, a `cdylib` target,
-and a generated `#[pymodule]` exposing every top-level function whose
-signature is expressible in concrete Rust types (parameters annotated with
-`int`/`float`/`str`/`bool`/`bytes`, returns annotated or inferable). Build
-the extension with `cargo build --features python`.
+a generated `build.rs` requesting pyo3's extension-module link args (so the
+undefined `_Py_*` symbols link on macOS too), and a generated `#[pymodule]`
+exposing every top-level function whose signature is expressible in concrete
+Rust types (parameters annotated with `int`/`float`/`str`/`bool`/`bytes`,
+returns annotated or inferable). Build the extension with
+`cargo build --features python`.
 
 ## Python library dependencies
 

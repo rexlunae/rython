@@ -3595,6 +3595,17 @@ impl<'a> CodeGen for Call {
                             (None, None) => String::new(),
                             _ => unreachable!(),
                         };
+                        // Escape unescaped literal braces for the Rust
+                        // engine (see the search/match arm).
+                        let pat = match (&self.args[0], &pat) {
+                            (ExprType::Constant(c), _)
+                                if let Some(litrs::Literal::String(slit)) = &c.0 =>
+                            {
+                                let escaped = escape_regex_braces(&slit.value());
+                                quote!(#escaped)
+                            }
+                            _ => pat.clone(),
+                        };
                         let p = qual("compile");
                         Ok(quote!(#p(&(#pat), #flags)?))
                     }
@@ -3632,22 +3643,31 @@ impl<'a> CodeGen for Call {
                         // runtime error.
                         let mut target = fname.clone();
                         let mut pat_lit: Option<String> = None;
-                        if fname == "findall" {
-                            if let ExprType::Constant(c) = &self.args[0] {
-                                if let Some(litrs::Literal::String(slit)) = &c.0 {
-                                    let pattern = slit.value();
-                                    // Python's regex treats an unescaped `{`
-                                    // as literal; Rust's regex crate treats
-                                    // it as a repetition start
-                                    // (`{(.*?)}` — botocore's serialize):
-                                    // escape the braces for the Rust engine.
-                                    let escaped = escape_regex_braces(pattern);
+                        if let ExprType::Constant(c) = &self.args[0] {
+                            if let Some(litrs::Literal::String(slit)) = &c.0 {
+                                // Python's regex treats an unescaped `{` that
+                                // does not form a quantifier as a literal;
+                                // Rust's regex crate treats it as a
+                                // repetition start (`{(.*?)}` — botocore's
+                                // serialize): escape the braces for the
+                                // Rust engine, on EVERY entry point that
+                                // takes a pattern.
+                                let escaped = escape_regex_braces(&slit.value());
+                                // findall's result SHAPE depends on the
+                                // pattern's capture-group count (strings for
+                                // 0-1 groups, tuples beyond), so it is also
+                                // compiled here to pick the variant — which
+                                // also surfaces bad patterns before the
+                                // program ever runs. 2+ groups there stay a
+                                // loud conversion error.
+                                if fname == "findall" {
                                     let re = regex::Regex::new(&escaped).map_err(|e| {
                                         format!(
                                             "re.findall(): cannot compile pattern {:?}: {} \
                                              (the regex engine does not support Python's \
                                              backreferences or lookarounds)",
-                                            pattern, e
+                                            slit.value(),
+                                            e
                                         )
                                     })?;
                                     match re.captures_len() - 1 {
@@ -3663,8 +3683,8 @@ impl<'a> CodeGen for Call {
                                             .into());
                                         }
                                     }
-                                    pat_lit = Some(escaped);
                                 }
+                                pat_lit = Some(escaped);
                             }
                         }
                         let p = qual(&target);
@@ -3708,6 +3728,17 @@ impl<'a> CodeGen for Call {
                             (None, None) => String::new(),
                             _ => unreachable!(),
                         };
+                        // Escape unescaped literal braces for the Rust
+                        // engine (see the search/match arm).
+                        let pat = match (&self.args[0], &pat) {
+                            (ExprType::Constant(c), _)
+                                if let Some(litrs::Literal::String(slit)) = &c.0 =>
+                            {
+                                let escaped = escape_regex_braces(&slit.value());
+                                quote!(#escaped)
+                            }
+                            _ => pat.clone(),
+                        };
                         let p = qual("split");
                         Ok(quote!(#p(&(#pat), &(#text), #maxsplit, #flags)?))
                     }
@@ -3734,6 +3765,17 @@ impl<'a> CodeGen for Call {
                         let flags = match flags_kw {
                             Some(e) => flag_letters(&symbols, &e)?,
                             None => String::new(),
+                        };
+                        // Escape unescaped literal braces for the Rust
+                        // engine (see the search/match arm).
+                        let pat = match (&self.args[0], &pat) {
+                            (ExprType::Constant(c), _)
+                                if let Some(litrs::Literal::String(slit)) = &c.0 =>
+                            {
+                                let escaped = escape_regex_braces(&slit.value());
+                                quote!(#escaped)
+                            }
+                            _ => pat.clone(),
                         };
                         let p = qual("sub");
                         Ok(quote!(#p(&(#pat), &(#repl), &(#text), #count, #flags)?))

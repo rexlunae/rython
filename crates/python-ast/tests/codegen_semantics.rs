@@ -2655,6 +2655,47 @@ fn dict_literals_and_methods_lower_through_pydict() {
 }
 
 #[test]
+fn del_full_slice_clears_in_place() {
+    // Python: `del xs[:]` on ["a","b","c"] leaves []; the lowering is the
+    // container's in-place clear. Verified against python3.
+    let out = compile(
+        "xs = [\"a\", \"b\", \"c\"]\ndel xs[:]\n",
+        "delclear.py",
+    );
+    assert!(out.contains(". clear ()"), "generated: {}", out);
+}
+
+#[test]
+fn bounded_slice_delete_is_a_loud_error() {
+    // Python: `del xs[1:3]` on [1,2,3,4] leaves [1,4]. rython has no
+    // range removal, and dropping the statement would silently keep the
+    // elements — loud conversion error naming the working rebuild.
+    let err = compile_err("xs = [1, 2, 3, 4]\ndel xs[1:3]\n", "bounedel.py");
+    assert!(
+        err.contains("`del` with a bounded slice target"),
+        "err: {err}"
+    );
+    assert!(err.contains("xs = xs[:start] + xs[end:]"), "err: {err}");
+}
+
+#[test]
+fn slice_assignment_is_a_loud_error() {
+    // Python: `xs[1:3] = []` on [1,2,3,4] leaves [1,4] — range-replace
+    // with a different-length RHS inserts/removes. Dropping it would
+    // silently leave the container untouched — loud error naming the
+    // supported rebuild instead.
+    let err = compile_err("xs = [1, 2, 3, 4]\nxs[1:3] = []\n", "sliceassign.py");
+    assert!(
+        err.contains("slice assignment to"),
+        "err: {err}"
+    );
+    assert!(
+        err.contains("rebuild the container instead"),
+        "err: {err}"
+    );
+}
+
+#[test]
 fn keyword_arguments_map_to_parameter_positions() {
     let src = concat!(
         "def volume(w: int, h: int, d: int) -> int:\n",
