@@ -893,6 +893,26 @@ fn exception_matching_walks_the_cpython_hierarchy() {
         assert!(PyException::new(base_only, "").matches("BaseException"));
     }
 
+    // BaseException is the tree's root: exact catch only.
+    // Verified against python3 3.14: raising BaseException under
+    // `except Exception:` escapes; `except BaseException:` catches it.
+    let root = PyException::new("BaseException", "");
+    assert!(!root.matches("Exception"));
+    assert!(root.matches("BaseException"));
+
+    // ExceptionGroup multiply inherits (BaseExceptionGroup, Exception):
+    // `except Exception:` catches it, but a bare BaseExceptionGroup stays
+    // outside Exception. Verified against python3 3.14 with
+    // ExceptionGroup('eg', [ValueError('v')]) raised under each clause.
+    let eg = PyException::new("ExceptionGroup", "eg");
+    assert!(eg.matches("Exception"));
+    assert!(eg.matches("BaseExceptionGroup"));
+    assert!(eg.matches("BaseException"));
+    assert!(!eg.matches("ValueError"));
+    let bg = PyException::new("BaseExceptionGroup", "bg");
+    assert!(bg.matches("BaseExceptionGroup"));
+    assert!(!bg.matches("Exception"));
+
     assert!(!key_err.matches("TypeError"), "siblings do not catch");
 }
 

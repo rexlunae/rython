@@ -4538,6 +4538,19 @@ impl PyException {
         if self.exception_type == name {
             return true;
         }
+        // BaseException is the tree's ROOT: it has no parent entry, but
+        // unlike a truly-unknown type it IS in-tree — only an exact
+        // `except BaseException:` catches it, never `except Exception:`.
+        if self.exception_type == "BaseException" {
+            return false;
+        }
+        // ExceptionGroup MULTIPLY inherits (BaseExceptionGroup, Exception)
+        // in CPython; the single-parent walk below cannot reach Exception,
+        // so that second ancestry is explicit here. A bare
+        // BaseExceptionGroup stays outside Exception.
+        if self.exception_type == "ExceptionGroup" && name == "Exception" {
+            return true;
+        }
         match direct_exception_parent(&self.exception_type) {
             Some(first) => {
                 let mut current = Some(first);
