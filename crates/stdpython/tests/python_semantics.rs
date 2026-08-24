@@ -848,6 +848,117 @@ fn tempfile_gettempdir_picks_first_usable_cpython_candidate() {
     let _ = std::fs::remove_file(&probe);
 }
 
+#[test]
+fn exception_matching_walks_the_cpython_hierarchy() {
+    // Python: `except X:` catches raised type E iff X is E or an ancestor
+    // of E. Verified against python3 3.14 by raising each leaf under its
+    // claimed clause (and confirming the negatives escape):
+    //   FileNotFoundError IS-A OSError, Exception, BaseException,
+    //     EnvironmentError (the OSError alias)
+    //   KeyError / IndexError ARE-A LookupError, but NOT each other
+    //   UnicodeDecodeError IS-A ValueError (two hops via UnicodeError)
+    //   TabError IS-A SyntaxError (three hops)
+    //   ZeroDivisionError IS-A ArithmeticError
+    //   SystemExit / KeyboardInterrupt / GeneratorExit are NOT caught by
+    //     `except Exception:` (they hang off BaseException directly)
+    use stdpython::PyException;
+    let file_nf = PyException::new("FileNotFoundError", "gone");
+    assert!(file_nf.matches("FileNotFoundError"));
+    assert!(file_nf.matches("OSError"));
+    assert!(file_nf.matches("EnvironmentError"));
+    assert!(file_nf.matches("Exception"));
+    assert!(file_nf.matches("BaseException"));
+
+    let key_err = PyException::new("KeyError", "k");
+    assert!(key_err.matches("LookupError"));
+    assert!(!PyException::new("IndexError", "i").matches("KeyError"));
+
+    assert!(
+        PyException::new("UnicodeDecodeError", "bad").matches("ValueError"),
+        "two-hop ancestry through UnicodeError"
+    );
+    assert!(
+        PyException::new("TabError", "tabs").matches("SyntaxError"),
+        "three-hop ancestry"
+    );
+    assert!(
+        PyException::new("ZeroDivisionError", "/0").matches("ArithmeticError")
+    );
+
+    for base_only in ["SystemExit", "KeyboardInterrupt", "GeneratorExit"] {
+        assert!(
+            !PyException::new(base_only, "").matches("Exception"),
+            "{base_only} must not be caught by except Exception:"
+        );
+        assert!(PyException::new(base_only, "").matches("BaseException"));
+    }
+
+    // BaseException is the tree's root: exact catch only.
+    // Verified against python3 3.14: raising BaseException under
+    // `except Exception:` escapes; `except BaseException:` catches it.
+    let root = PyException::new("BaseException", "");
+    assert!(!root.matches("Exception"));
+    assert!(root.matches("BaseException"));
+
+    // ExceptionGroup multiply inherits (BaseExceptionGroup, Exception):
+    // `except Exception:` catches it, but a bare BaseExceptionGroup stays
+    // outside Exception. Verified against python3 3.14 with
+    // ExceptionGroup('eg', [ValueError('v')]) raised under each clause.
+    let eg = PyException::new("ExceptionGroup", "eg");
+    assert!(eg.matches("Exception"));
+    assert!(eg.matches("BaseExceptionGroup"));
+    assert!(eg.matches("BaseException"));
+    assert!(!eg.matches("ValueError"));
+    let bg = PyException::new("BaseExceptionGroup", "bg");
+    assert!(bg.matches("BaseExceptionGroup"));
+    assert!(!bg.matches("Exception"));
+
+    assert!(!key_err.matches("TypeError"), "siblings do not catch");
+}
+
+#[test]
+fn exception_leaf_constructors_carry_their_type_names() {
+    use stdpython::*;
+    assert_eq!(import_error("no module").exception_type, "ImportError");
+    assert_eq!(
+        module_not_found_error("nomod").exception_type,
+        "ModuleNotFoundError"
+    );
+    assert_eq!(stop_iteration("").exception_type, "StopIteration");
+    assert_eq!(recursion_error("deep").exception_type, "RecursionError");
+    assert_eq!(
+        unicode_decode_error("bad bytes").exception_type,
+        "UnicodeDecodeError"
+    );
+    assert_eq!(timeout_error("slow").exception_type, "TimeoutError");
+    // The hierarchy sees through every constructor.
+    assert!(file_not_found_error("x").matches("OSError"));
+    assert!(module_not_found_error("x").matches("ImportError"));
+}
+
+#[test]
+fn ascii_escapes_outside_printable_ascii_like_python() {
+    // Python: ascii() is repr() with non-printable-ASCII code points
+    // escaped (\xXX, \uXXXX, \UXXXXXXXX — lowercase hex). Verified against
+    // python3 3.14:
+    //   ascii('café')      -> "'caf\\xe9'"
+    //   ascii('😀')         -> "'\\U0001f600'"
+    //   ascii(42)          -> '42'
+    //   ascii(True)        -> 'True'
+    //   ascii(3.5)         -> '3.5'
+    //   ascii('\n')        -> "'\\n'"   (repr already escapes it)
+    //   ascii(chr(0x7f))   -> "'\\x7f'" (DEL escapes; printable passes)
+    use stdpython::ascii;
+    assert_eq!(ascii("café"), "'caf\\xe9'");
+    assert_eq!(ascii("😀"), "'\\U0001f600'");
+    assert_eq!(ascii("\n"), "'\\n'");
+    assert_eq!(ascii("\u{7f}"), "'\\x7f'");
+    assert_eq!(ascii(&42i64), "42");
+    assert_eq!(ascii(&true), "True");
+    assert_eq!(ascii(&3.5f64), "3.5");
+}
+
+
 // ---- str operations: code points and the Python method surface ----
 
 #[test]

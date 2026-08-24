@@ -466,16 +466,22 @@ A raised exception is a value:
 pub struct PyException { pub message: String, pub exception_type: String }
 ```
 
-Matching is **by exact type-name string**, with `Exception` and
-`BaseException` matching everything. The class *hierarchy in between is
-not modeled*: `except LookupError` does not catch `IndexError`
-(deviation, §12.3). `except (A, B)` ORs the names; a dotted name
-matches on its final attribute; a bare `except:` catches all. (A bare
-`except:` anywhere but last is a `SyntaxError` in CPython's parser —
-which rython uses — so the not-last case never reaches conversion.)
-`except E as e` binds a copy of the exception; `str(e)` is the message,
-`repr(e)` is `Type('message')`. An uncaught exception exits with
-status 1, printing `Type: message` to stderr on the wrapped entry
+Matching walks **CPython's built-in exception hierarchy**: the clause
+matches when its name is the raised type or one of its ancestors, so
+`except LookupError:` catches `IndexError`/`KeyError`, `except OSError:`
+catches the whole file-exception subtree, and — like CPython —
+`except Exception:` does NOT catch `SystemExit`, `KeyboardInterrupt` or
+`GeneratorExit` (they hang off `BaseException` directly). The tree is
+generated from python3 3.14 `__mro__` dumps; the `EnvironmentError`/
+`IOError` aliases resolve to `OSError` for matching. An exception type
+outside the built-in tree is caught only by `Exception`,
+`BaseException`, or its exact name. `except (A, B)` ORs the names; a
+dotted name matches on its final attribute; a bare `except:` catches
+all. (A bare `except:` anywhere but last is a `SyntaxError` in CPython's
+parser — which rython uses — so the not-last case never reaches
+conversion.) `except E as e` binds a copy of the exception; `str(e)` is
+the message, `repr(e)` is `Type('message')`. An uncaught exception exits
+with status 1, printing `Type: message` to stderr on the wrapped entry
 paths — §9 notes one entry path that currently prints Rust's `Debug`
 form instead.
 
@@ -593,6 +599,23 @@ Available on the `alloc` (no-OS) tier: `string`, `json`, `collections`,
 `itertools`, `functools`, `heapq`, `copy`, `textwrap`, `hashlib`,
 `csv`. Everything OS-touching is std-only and is a loud conversion
 error under `--no-std`.
+
+#### 10.2.1 Feature-gated platform surfaces
+
+Platform-heavy functionality is wrapped, not reimplemented: where an
+existing Rust crate provides the behavior (HTTP clients are the first
+case), stdpython depends on it behind an opt-in cargo feature and the
+default build stays dependency-light. Conventions:
+
+- **Feature naming**: `<module>` for one natural backing crate,
+  `<module>-<backend>` where several exist — extending the established
+  precedents `async-tokio` (asyncio on tokio) and the numpy backends
+  (`numpy-rayon`, …). The alloc/no_std tier is never affected.
+- **Tooling contract**: importing a gated module is a **loud conversion
+  error naming the exact cargo feature** to enable — the same guard
+  mechanism §10.2 already uses for the alloc tier under `--no-std`.
+  Generated crate manifests enable the named feature on their stdpython
+  dependency when the source legitimately imports it.
 
 Known stdlib divergences from CPython that are verified but not yet
 fixed are tracked in issue #82; they are defects, not spec.
@@ -781,7 +804,6 @@ accepted as permanent spec:
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |
-| Exception matching ignores the hierarchy between `BaseException`/`Exception` and leaf names (`except LookupError` misses `IndexError`) | Defect class; flat matching is exact-name only |
 | Argument-render-then-mutate shapes (`print(xs, xs.pop(), xs)`) render the first argument before the mutation | Recorded in issue #79 |
 | A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
 | A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; callables cannot be runtime values |
