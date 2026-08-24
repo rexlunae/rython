@@ -2599,11 +2599,22 @@ fn os_path_expandvars_matches_python() {
     assert_eq!(expandvars("no$RY_UNSET_X var"), "no$RY_UNSET_X var");
     assert_eq!(expandvars("${RY_UNSET_X}/log"), "${RY_UNSET_X}/log");
     assert_eq!(expandvars("a${RY_UNSET_X}b"), "a${RY_UNSET_X}b");
-    // CPython's varscan is ASCII-only and requires a letter/underscore
-    // start: `$naive` (Unicode letter) and `$1abc` (digit start) stay
-    // literal. Verified against python3.
+    // CPython's varscan is ASCII-only (`re.compile(r'\$(\w+|\{[^}]*\})',
+    // re.ASCII)`): the bare name is [A-Za-z0-9_]+ with NO first-character
+    // rule. A Unicode letter ends the scan (`$naive` scans `na`, unset,
+    // so the text stays), and a DIGIT-LEADING name behaves like any
+    // other: expanded when the variable exists, literal when not.
+    // Verified against python3 3.14:
+    //   1abc=hello python3 -c "...expandvars('$1abc')..." -> 'hello'
+    //   ...expandvars('${1abc}-x')...                     -> 'hello-x'
+    //   ...expandvars('$9zzz') (unset)                    -> '$9zzz'
+    unsafe {
+        std::env::set_var("1abc", "digit-led");
+    }
     assert_eq!(expandvars("$naive"), "$naive");
-    assert_eq!(expandvars("$1abc"), "$1abc");
+    assert_eq!(expandvars("$1abc"), "digit-led");
+    assert_eq!(expandvars("${1abc}-x"), "digit-led-x");
+    assert_eq!(expandvars("$9zzz"), "$9zzz");
     assert_eq!(expandvars("plain"), "plain");
     assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
 }

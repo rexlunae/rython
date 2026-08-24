@@ -436,17 +436,16 @@ pub mod path {
                     }
                 }
             }
-            // CPython's varscan is ASCII-only and requires the name to
-            // START with a letter or underscore (`$1abc` stays literal —
-            // verified against python3; Devin round-2 review on PR #140).
+            // CPython's varscan is ASCII-only (`re.compile(r'\$(\w+|\{[^}]*\})',
+            // re.ASCII)`): the bare name is `[A-Za-z0-9_]+` whatever its
+            // FIRST character — a digit-leading reference (`$1abc`) expands
+            // when the variable is set and stays literal when it is not,
+            // exactly like any other name (verified against python3 3.14;
+            // Devin round-3 review on PR #140).
             let mut j = i + 1;
             while j < bytes.len()
                 && (bytes[j].is_ascii_alphanumeric() || bytes[j] == '_')
             {
-                let first_ok = bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == '_';
-                if !first_ok {
-                    break;
-                }
                 j += 1;
             }
             if j > i + 1 {
