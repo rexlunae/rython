@@ -2579,3 +2579,63 @@ mod cpython_numeric_and_stdlib_fixes {
         );
     }
 }
+
+#[test]
+fn os_path_expandvars_matches_python() {
+    // Verified against python3:
+    //   os.environ['RY_TEST_V']='hello'
+    //   os.path.expandvars('$RY_TEST_V/x')   -> 'hello/x'
+    //   os.path.expandvars('${RY_TEST_V}-t') -> 'hello-t'
+    //   os.path.expandvars('no$UNSET var')   -> 'no$UNSET var'
+    //   os.path.expandvars('plain')          -> 'plain'
+    unsafe {
+        std::env::set_var("RY_TEST_V", "hello");
+    }
+    use stdpython::stdlib::os::path::expandvars;
+    assert_eq!(expandvars("$RY_TEST_V/x"), "hello/x");
+    assert_eq!(expandvars("${RY_TEST_V}-tail"), "hello-tail");
+    // Unknown variables stay literal — bare AND braced forms
+    // (CPython: os.path.expandvars('${RY_UNSET_X}/log') keeps the text).
+    assert_eq!(expandvars("no$RY_UNSET_X var"), "no$RY_UNSET_X var");
+    assert_eq!(expandvars("${RY_UNSET_X}/log"), "${RY_UNSET_X}/log");
+    assert_eq!(expandvars("a${RY_UNSET_X}b"), "a${RY_UNSET_X}b");
+    // CPython's varscan is ASCII-only (`re.compile(r'\$(\w+|\{[^}]*\})',
+    // re.ASCII)`): the bare name is [A-Za-z0-9_]+ with NO first-character
+    // rule. A Unicode letter ends the scan (`$naive` scans `na`, unset,
+    // so the text stays), and a DIGIT-LEADING name behaves like any
+    // other: expanded when the variable exists, literal when not.
+    // Verified against python3 3.14:
+    //   1abc=hello python3 -c "...expandvars('$1abc')..." -> 'hello'
+    //   ...expandvars('${1abc}-x')...                     -> 'hello-x'
+    //   ...expandvars('$9zzz') (unset)                    -> '$9zzz'
+    unsafe {
+        std::env::set_var("1abc", "digit-led");
+    }
+    assert_eq!(expandvars("$naive"), "$naive");
+    assert_eq!(expandvars("$1abc"), "digit-led");
+    assert_eq!(expandvars("${1abc}-x"), "digit-led-x");
+    assert_eq!(expandvars("$9zzz"), "$9zzz");
+    // The whole `${...}` span is ONE varscan token: when the variable is
+    // unset, an inner `$b` must NOT be re-expanded even though `b` is
+    // set — CPython keeps the literal text and advances past the brace.
+    // Verified against python3 3.14 (with b=XX):
+    //   ...expandvars('${a$b}')        -> '${a$b}'
+    //   ...expandvars('pre${a$b}post') -> 'pre${a$b}post'
+    //   ...expandvars('${}')           -> '${}'
+    //   ...expandvars('${a{b}}')       -> '${a{b}}'
+    unsafe {
+        std::env::set_var("RY_TEST_B", "XX");
+    }
+    assert_eq!(expandvars("${a$RY_TEST_B}"), "${a$RY_TEST_B}");
+    assert_eq!(expandvars("pre${a$RY_TEST_B}post"), "pre${a$RY_TEST_B}post");
+    assert_eq!(expandvars("${}"), "${}");
+    assert_eq!(expandvars("${a{RY_TEST_B}}}"), "${a{RY_TEST_B}}}");
+    // An UNTERMINATED `${...` never matches the braced token, so the
+    // scan falls through and a later bare reference still expands,
+    // exactly like CPython's regex failing at that position.
+    // Verified against python3 3.14:
+    //   ...expandvars('x${abc$RY_TEST_B') -> 'x${abcXX'
+    assert_eq!(expandvars("x${abc$RY_TEST_B"), "x${abcXX");
+    assert_eq!(expandvars("plain"), "plain");
+    assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
+}
