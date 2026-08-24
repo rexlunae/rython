@@ -198,13 +198,18 @@ fn scan_modinfo(ast: &python_ast::Module) -> std::collections::BTreeMap<String, 
 /// `#[used]` keeps the entries alive across `ld -r --gc-sections` (the
 /// C-free module link step): nothing references them from the entry
 /// points, so without it the license would be GC'd out of the module.
+///
+/// The `.modinfo` placement is gated to Linux (`cfg_attr`): Mach-O rejects
+/// dot-prefixed section specifiers outright, and a module authored on a
+/// non-Linux host must still type-check there (`cargo check`) — only an
+/// actual Linux kernel build needs the strings in `.modinfo`.
 fn modinfo_statics(modinfo: &std::collections::BTreeMap<String, String>) -> String {
     let mut out = String::new();
     for (idx, (key, value)) in modinfo.iter().enumerate() {
         let entry = format!("{key}={value}");
         let len = entry.len();
         let padded = (len + 7) & !7; // align to 8 bytes
-        out.push_str("#[used]\n#[no_mangle]\n#[link_section = \".modinfo\"]\n");
+        out.push_str("#[used]\n#[no_mangle]\n#[cfg_attr(target_os = \"linux\", link_section = \".modinfo\")]\n");
         out.push_str(&format!(
             "static __mod_info_{idx}: [u8; {padded}] = *b\"{entry}"
         ));
@@ -3334,10 +3339,17 @@ fn write_cargo_toml(
         toml.push_str(&format!("{entry}\n"));
     }
     if opts.pyo3 {
+        // pyo3-build-config lets the generated build script request pyo3's
+        // extension-module link args (see below): since pyo3 0.23+ its own
+        // build scripts stopped emitting them, and on macOS the linker then
+        // rejects the undefined `_Py_*` symbols that must resolve against
+        // whichever interpreter loads the module.
         toml.push_str(
             "pyo3 = { version = \"0.29\", features = [\"extension-module\"], optional = true }\n\n\
+             [build-dependencies]\n\
+             pyo3-build-config = { version = \"0.29\", optional = true }\n\n\
              [features]\n\
-             python = [\"dep:pyo3\"]\n\n\
+             python = [\"dep:pyo3\", \"dep:pyo3-build-config\"]\n\n\
              [lib]\n\
              crate-type = [\"lib\", \"cdylib\"]\n",
         );
@@ -3361,6 +3373,28 @@ fn write_cargo_toml(
         );
     }
     fs::write(out_dir.join("Cargo.toml"), toml)?;
+    // PyO3 bindings need a build script: pyo3 requires the downstream
+    // crate to ask for its extension-module link args (a macOS linker
+    // rejects the cdylib's undefined `_Py_*` symbols otherwise). The
+    // helper is a no-op on platforms that don't need it.
+    if opts.pyo3 {
+        fs::write(
+            out_dir.join("build.rs"),
+            concat!(
+                "//! Linker setup for the PyO3 bindings (built with `--features python`).\n",
+                "//!\n",
+                "//! pyo3 requires the downstream build script to request its\n",
+                "//! extension-module link args: on macOS the linker otherwise rejects\n",
+                "//! the undefined `_Py_*` symbols that must resolve against the\n",
+                "//! interpreter process loading the module.\n",
+                "\n",
+                "fn main() {\n",
+                "    #[cfg(feature = \"python\")]\n",
+                "    pyo3_build_config::add_extension_module_link_args();\n",
+                "}\n",
+            ),
+        )?;
+    }
     // Keep the generated crate out of any enclosing workspace.
     let manifest = out_dir.join("Cargo.toml");
     let mut text = fs::read_to_string(&manifest)?;

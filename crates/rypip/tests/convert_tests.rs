@@ -2,35 +2,13 @@
 //! the generated crate layout, and compile a converted package for real.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
+mod common;
+
+use common::Scratch;
 use rypip::convert::ConvertOptions;
-
-/// A scratch directory that's removed when dropped.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "rypip-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("creating scratch dir");
-        Scratch(dir)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Build a generated crate. RUSTFLAGS is scrubbed: in the default warn mode
 /// generated crates intentionally surface rustc warnings about the source
@@ -379,9 +357,17 @@ fn pyo3_conversion_generates_bindings() {
     assert!(manifest.contains("pyo3"), "manifest: {}", manifest);
     assert!(manifest.contains("cdylib"), "manifest: {}", manifest);
     assert!(
-        manifest.contains("python = [\"dep:pyo3\"]"),
+        manifest.contains("python = [\"dep:pyo3\", \"dep:pyo3-build-config\"]"),
         "manifest: {}",
         manifest
+    );
+    // The generated build script requests pyo3's extension-module link
+    // args: without them a macOS linker rejects the cdylib's undefined
+    // `_Py_*` symbols (they resolve against the loading interpreter).
+    let build_rs = fs::read_to_string(out.join("build.rs")).unwrap();
+    assert!(
+        build_rs.contains("add_extension_module_link_args"),
+        "build.rs must request pyo3's link args: {build_rs}"
     );
 
     let bindings = fs::read_to_string(out.join("src/python_api.rs")).unwrap();
@@ -2576,6 +2562,73 @@ fn re_module_matches_python_at_runtime() {
             "multi=['a', 'c']",
         ],
         "re semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn regex_brace_patterns_and_slice_shapes_match_python_at_runtime() {
+    // Issue #134: a Python pattern's unescaped `{` that does not form a
+    // quantifier is literal — the converter escapes it for Rust's regex
+    // crate on every re entry point (search/split/sub/findall/...). The
+    // `utf8` codec alias, str.replace, in-place clear via `del xs[:]`,
+    // and slice-rebuild reads round it out; bounded `del xs[i:j]` and
+    // slice assignment are LOUD conversion errors (see codegen_semantics).
+    let scratch = Scratch::new("regex-braces");
+    let file = scratch.path().join("brace_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "import re\n",
+            "\n",
+            "def main() -> int:\n",
+            "    m = re.search(\"{(.*?)}\", \"a {x} b\")\n",
+            "    if m:\n",
+            "        print(f\"search={m.group(1)}\")\n",
+            "    parts = re.split(\"{;}\", \"a{b}\")\n",
+            "    print(f\"split={repr(parts)}\")\n",
+            "    tagged = re.sub(\"{(.*?)}\", \"<\\\\1>\", \"a {y} z\")\n",
+            "    print(f\"sub={tagged}\")\n",
+            "    data = \"caf\\xc3\\xa9\".encode(\"utf8\")\n",
+            "    print(f\"utf8={len(data)}\")\n",
+            "    print(f\"replaced={'hello'.replace('l', 'L')}\")\n",
+            "    ys = [\"a\", \"b\", \"c\"]\n",
+            "    del ys[:]\n",
+            "    print(f\"cleared={repr(ys)}\")\n",
+            "    xs = [1, 2, 3, 4]\n",
+            "    xs = xs[:1] + xs[3:]\n",
+            "    print(f\"sliceassign={repr(xs)}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/brace_demo"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "search=x",
+            "split=['a{b}']",
+            "sub=a <y> z",
+            "utf8=7",
+            "replaced=heLLo",
+            "cleared=[]",
+            "sliceassign=[1, 4]",
+        ],
+        "regex-brace / codec / slice semantics diverged from CPython"
     );
 }
 

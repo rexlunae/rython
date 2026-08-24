@@ -4,12 +4,125 @@
 //! Implementation matches Python's tempfile module API.
 
 use crate::PyException;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+// CPython's tempfile does not trust a single env var: it probes candidates
+// for writability (verified against python3 3.14,
+// `tempfile._candidate_tempdir_list` + `_get_default_tempdir`). $TMPDIR,
+// $TEMP and $TMP are tried in order (empty values skipped), then `/tmp`,
+// `/var/tmp`, `/usr/tmp`, then the current directory; a candidate counts
+// only if a freshly created file can be written and removed there. Rust's
+// `std::env::temp_dir()` instead returns TMPDIR or, on macOS, the Darwin
+// per-user temp dir with no probe at all — silently different from CPython
+// whenever TMPDIR is unset or unusable (e.g. sandboxed environments deny
+// /var/folders/...). The functions below mirror CPython's algorithm.
+
+/// The directories CPython's tempfile would try, in order.
+#[cfg(feature = "std")]
+fn candidate_tempdir_list() -> Vec<PathBuf> {
+    let mut list = Vec::new();
+    for name in ["TMPDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            if !value.is_empty() {
+                list.push(PathBuf::from(value));
+            }
+        }
+    }
+    // OS-specific defaults (CPython tries these on POSIX).
+    #[cfg(unix)]
+    list.extend(["/tmp", "/var/tmp", "/usr/tmp"].map(PathBuf::from));
+    // As a last resort, the current directory.
+    match std::env::current_dir() {
+        Ok(cwd) => list.push(cwd),
+        Err(_) => list.push(PathBuf::from(".")),
+    }
+    list
+}
+
+/// Absolute path without resolving symlinks: CPython uses `abspath`, so
+/// `/tmp` stays `/tmp` instead of becoming macOS's `/private/tmp`.
+#[cfg(feature = "std")]
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+/// Whether a directory accepts a created-written-removed file — CPython's
+/// usability probe, trying up to 100 random names per directory.
+#[cfg(feature = "std")]
+fn accepts_probe_file(dir: &Path) -> bool {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    for _ in 0..100 {
+        let filename = dir.join(generate_random_string(8));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&filename) {
+            Ok(mut file) => {
+                let written = file.write_all(b"blat").is_ok();
+                drop(file);
+                // Unlink unconditionally — CPython never leaves the probe
+                // file behind, even when the write failed (Devin review
+                // on PR #141).
+                let removed = std::fs::remove_file(&filename).is_ok();
+                return written && removed;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
+    false
+}
+
+/// First usable candidate, mirroring CPython `_get_default_tempdir`.
+#[cfg(feature = "std")]
+fn first_usable_tempdir(dirlist: &[PathBuf]) -> Option<PathBuf> {
+    dirlist
+        .iter()
+        .map(|candidate| absolutize(candidate))
+        .find(|dir| accepts_probe_file(dir))
+}
+
+/// The default temp dir, or the `FileNotFoundError` CPython raises when no
+/// candidate works ("No usable temporary directory found in [...]").
+#[cfg(feature = "std")]
+pub fn try_default_tempdir() -> Result<PathBuf, PyException> {
+    let dirlist = candidate_tempdir_list();
+    first_usable_tempdir(&dirlist).ok_or_else(|| {
+        PyException::new(
+            "FileNotFoundError",
+            format!("No usable temporary directory found in {:?}", dirlist),
+        )
+    })
+}
+
+/// The default temp dir with CPython's cache-on-first-success semantics
+/// (`tempfile.tempdir` is set once and reused; failures are not cached).
+#[cfg(feature = "std")]
+fn cached_default_tempdir() -> Result<PathBuf, PyException> {
+    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(dir) = CACHE.get() {
+        return Ok(dir.clone());
+    }
+    let dir = try_default_tempdir()?;
+    let _ = CACHE.set(dir.clone());
+    Ok(dir)
+}
 
 /// Get temporary directory
 #[cfg(feature = "std")]
 pub fn gettempdir() -> PathBuf {
-    std::env::temp_dir()
+    // CPython raises FileNotFoundError here; this signature cannot carry
+    // one, so panic loudly with the same message instead of guessing.
+    cached_default_tempdir().unwrap_or_else(|e| panic!("{}", e.message))
 }
 
 /// Get temporary directory as string
@@ -49,9 +162,16 @@ pub fn mkstemp(suffix: Option<&str>, prefix: Option<&str>, dir: Option<&str>, _t
     
     let mut attempts = 0;
     let max_attempts = 1000;
-    
+
+    // Resolve the default directory up front so an unusable one raises
+    // FileNotFoundError (like CPython) instead of panicking in gettempdir.
+    let resolved_dir: Option<String> = match dir {
+        Some(d) => Some(d.to_string()),
+        None => Some(cached_default_tempdir()?.to_string_lossy().into_owned()),
+    };
+
     while attempts < max_attempts {
-        let filename = mktemp(suffix, prefix, dir);
+        let filename = mktemp(suffix, prefix, resolved_dir.as_deref());
         
         let mut open_options = OpenOptions::new();
         open_options.read(true).write(true).create_new(true);
@@ -89,13 +209,16 @@ pub fn mkstemp(suffix: Option<&str>, prefix: Option<&str>, dir: Option<&str>, _t
 pub fn mkdtemp(suffix: Option<&str>, prefix: Option<&str>, dir: Option<&str>) -> Result<String, PyException> {
     let mut attempts = 0;
     let max_attempts = 1000;
-    
+
+    // Resolve the default directory up front so an unusable one raises
+    // FileNotFoundError (like CPython) instead of panicking in gettempdir.
+    let base = match dir {
+        Some(d) => PathBuf::from(d),
+        None => cached_default_tempdir()?,
+    };
+
     while attempts < max_attempts {
-        let mut path = if let Some(dir) = dir {
-            PathBuf::from(dir)
-        } else {
-            gettempdir()
-        };
+        let mut path = base.clone();
         
         let prefix = prefix.unwrap_or("tmp");
         let suffix = suffix.unwrap_or("");
@@ -476,6 +599,65 @@ mod tests {
         let temp_dir = mkdtemp(None, Some("test_"), None).unwrap();
         assert!(std::path::Path::new(&temp_dir).exists());
         std::fs::remove_dir(&temp_dir).unwrap();
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn unusable_candidates_fall_through_like_cpython() {
+        // Verified against python3: `TMPDIR=/nonexistent-xyz python3 -c
+        // "import tempfile; print(tempfile.gettempdir())"` still prints
+        // /tmp — an unusable candidate is skipped, not trusted.
+        let picked = first_usable_tempdir(&[
+            PathBuf::from("/definitely-missing-rython-scratch"),
+            PathBuf::from("/tmp"),
+        ]);
+        assert_eq!(picked, Some(PathBuf::from("/tmp")));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn probe_rejects_missing_directories() {
+        // Verified against python3: a candidate that cannot hold a file is
+        // never returned by _get_default_tempdir.
+        assert!(!accepts_probe_file(Path::new(
+            "/definitely-missing-rython-scratch/nested"
+        )));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn candidate_list_orders_env_before_defaults() {
+        // CPython's _candidate_tempdir_list: $TMPDIR, $TEMP, $TMP (each only
+        // when non-empty), then the POSIX defaults, then the cwd last.
+        let dirlist = candidate_tempdir_list();
+        let env_names = ["TMPDIR", "TEMP", "TMP"];
+        let env_count = env_names
+            .iter()
+            .filter(|n| {
+                std::env::var_os(n)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            })
+            .count();
+        for (index, name) in env_names.iter().enumerate().take(env_count) {
+            let expected = std::env::var_os(name).unwrap();
+            assert_eq!(
+                dirlist[index],
+                PathBuf::from(&expected),
+                "env candidate {name} must be passed through in order"
+            );
+        }
+        let defaults_at = env_count;
+        assert_eq!(
+            &dirlist[defaults_at..defaults_at + 3],
+            ["/tmp", "/var/tmp", "/usr/tmp"].map(PathBuf::from),
+            "POSIX defaults must follow the env candidates"
+        );
+        assert_eq!(
+            dirlist.last(),
+            std::env::current_dir().ok().as_ref(),
+            "the cwd is the last-resort candidate"
+        );
     }
     
     #[test]

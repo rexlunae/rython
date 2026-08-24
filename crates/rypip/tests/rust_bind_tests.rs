@@ -3,35 +3,13 @@
 //! generated Cargo.toml, and the converted program compiles and runs.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
+mod common;
+
+use common::Scratch;
 use rypip::convert::ConvertOptions;
-
-/// A scratch directory that's removed when dropped.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "rypip-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("creating scratch dir");
-        Scratch(dir)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Build a generated crate. RUSTFLAGS is scrubbed: in the default warn mode
 /// generated crates intentionally surface rustc warnings about the source

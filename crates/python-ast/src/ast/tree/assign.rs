@@ -628,15 +628,21 @@ impl<'a> CodeGen for Assign {
                 }
                 crate::SubscriptKind::Slice { .. } => {
                     // Slice assignment (`memoryview(byte_obj)[0:n] =
-                    // subarray` — urllib3's emscripten fetch loop) has no
-                    // rython lowering: a no-op with a warning (documented
-                    // divergence) instead of failing the module.
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "slice assignment (`{:?}[a:b] = ...`) is dropped (no \
-                         rython equivalent)",
+                    // subarray` — urllib3's emscripten fetch loop; `xs[a:b]
+                    // = [...]`) replaces a range in place in Python —
+                    // different-length RHS inserts or removes elements.
+                    // rython has no range-replace lowering, and dropping
+                    // the statement would silently leave the container
+                    // untouched: loud conversion error naming the working
+                    // rebuild (read-side slices ARE supported).
+                    return Err(format!(
+                        "slice assignment to `{:?}[a:b]` is not supported: rython has \
+                         no range-replace lowering, and skipping it would silently keep \
+                         the container unchanged; rebuild the container instead \
+                         (`xs = xs[:a] + replacement + xs[b:]`)",
                         sub.value
-                    ));
-                    Ok(TokenStream::new())
+                    )
+                    .into());
                 }
             }
         };

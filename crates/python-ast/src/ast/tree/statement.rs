@@ -714,15 +714,22 @@ impl CodeGen for StatementType {
                                         stmts.push(quote!((#receiver).clear();));
                                     } else {
                                         // A BOUNDED slice delete (`del
-                                        // self._writes[start:end]` —
-                                        // botocore's restdoc): removing a
-                                        // range is unmodeled — a no-op with
-                                        // a warning (documented divergence).
-                                        options.definition_warnings.borrow_mut().push(
-                                            "del with a bounded slice target is dropped \
-                                             (removing a range of elements is unmodeled; \
-                                             the elements stay in the container)"
-                                                .to_string(),
+                                        // xs[start:end]`) removes a range of
+                                        // elements IN PLACE in Python; rython's
+                                        // value model has no range removal, so
+                                        // dropping the statement would silently
+                                        // leave them in the container — never
+                                        // silent: loud conversion error naming
+                                        // the working rewrite (slice
+                                        // assignment IS supported).
+                                        return Err(
+                                            "`del` with a bounded slice target is not \
+                                             supported: removing a range of elements is \
+                                             unmodeled, and skipping the statement would \
+                                             silently keep them in the container; rebuild \
+                                             the list instead (`xs = xs[:start] + xs[end:]`)"
+                                                .to_string()
+                                                .into(),
                                         );
                                     }
                                 }

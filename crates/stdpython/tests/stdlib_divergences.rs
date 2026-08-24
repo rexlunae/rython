@@ -6,6 +6,8 @@
 //! nothing.
 #![cfg(feature = "std")]
 
+mod common;
+
 use stdpython::*;
 use stdpython::stdlib::datetime::{date, datetime, time};
 use stdpython::stdlib::string::Template;
@@ -378,10 +380,7 @@ fn glob_relative_patterns_yield_relative_paths_and_starstar_is_not_recursive_by_
     // return absolute paths; `**` was always recursive (CPython's default
     // is recursive=False, where `**` behaves like `*`), and `{a,b}` brace
     // expansion was implemented even though CPython's glob does not have it.
-    let scratch = std::env::temp_dir().join(format!(
-        "rython-glob-test-{}",
-        std::process::id()
-    ));
+    let scratch = common::create_scratch("glob-relative");
     std::fs::create_dir_all(scratch.join("sub")).unwrap();
     std::fs::write(scratch.join("a.txt"), b"").unwrap();
     std::fs::write(scratch.join("sub").join("b.txt"), b"").unwrap();
