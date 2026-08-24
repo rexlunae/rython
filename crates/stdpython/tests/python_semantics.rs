@@ -1,5 +1,7 @@
 //! Regression tests pinning stdpython behavior to real Python semantics.
 
+mod common;
+
 use stdpython::*;
 
 #[test]
@@ -809,9 +811,7 @@ fn environ_is_a_live_view() {
 
 #[test]
 fn glob_wildcards_skip_hidden_files() {
-    let dir = std::env::temp_dir().join(format!("rython-glob-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::create_scratch("glob-hidden");
     std::fs::write(dir.join("visible.txt"), "v").unwrap();
     std::fs::write(dir.join(".hidden.txt"), "h").unwrap();
 
@@ -827,6 +827,25 @@ fn glob_wildcards_skip_hidden_files() {
     assert!(dotted[0].ends_with(".hidden.txt"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tempfile_gettempdir_picks_first_usable_cpython_candidate() {
+    // Python: tempfile.gettempdir() probes $TMPDIR, $TEMP, $TMP, /tmp,
+    // /var/tmp, /usr/tmp and finally os.getcwd(), returning the first
+    // directory that accepts a created-and-removed file. Verified against
+    // python3 3.14 on macOS: with every temp variable unset it returns
+    // '/tmp' — not Rust's Darwin-specific /var/folders/... path — and even
+    // TMPDIR=/nonexistent-xyz still yields '/tmp'.
+    let dir = stdpython::stdlib::tempfile::gettempdir();
+    assert!(dir.is_absolute(), "gettempdir must be absolute: {:?}", dir);
+    let probe = dir.join(format!(
+        "rython-tempfile-pin-{}",
+        std::process::id()
+    ));
+    std::fs::write(&probe, b"x")
+        .expect("gettempdir must return a directory that accepts writes");
+    let _ = std::fs::remove_file(&probe);
 }
 
 // ---- str operations: code points and the Python method surface ----
