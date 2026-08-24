@@ -35,12 +35,13 @@ This library uses a generic trait-based design that mirrors Python's built-in be
 ## What's Implemented
 
 ### Python Built-in Functions (40+)
-✅ **Math/Logic**: `abs()`, `min()`, `max()`, `sum()`, `all()`, `any()`  
-✅ **Iteration**: `enumerate()`, `zip()`, `range()`, `len()`  
-✅ **Type Conversion**: `bool()`, `int()`, `float()`, `str()`, `list()`, `dict()`, `tuple()`, `set()`  
+✅ **Math/Logic**: `abs()`, `min()`, `max()`, `sum()`, `all()`, `any()`, `round()`, `divmod()`, `pow()`  
+✅ **Iteration**: `enumerate()`, `zip()`, `range()`, `len()`, `sorted()`, `reversed()`, `map()`, `filter()`  
+✅ **Type Conversion**: `bool()`, `int()`, `float()`, `str()`, `list()`, `dict()`, `tuple()`, `set()`, `frozenset()`, `slice()`  
 ✅ **Object Introspection**: `type()`, `isinstance()`, `hasattr()`, `getattr()`, `setattr()`, `delattr()`, `id()`, `hash()`  
-✅ **Character/Unicode**: `ord()`, `chr()`  
-✅ **I/O**: `print()` with full parameter support (std mode only)  
+✅ **Character/Unicode**: `ord()`, `chr()`, `ascii()` (repr with non-printable-ASCII escaping)  
+✅ **Numeric Formatting**: `hex()`, `oct()`, `bin()`  
+✅ **I/O**: `print()` with full parameter support, `input()`, `open()` (std mode only)
 
 ### Python Built-in Types with Complete Method Sets
 
@@ -67,20 +68,49 @@ This library uses a generic trait-based design that mirrors Python's built-in be
 ✅ **Set Operations**: `union()`, `intersection()`, `difference()`  
 ✅ **Membership**: `contains()`  
 
+### Standard Library Modules
+`argparse`, `asyncio` (tokio-backed), `collections`, `copy`, `csv`,
+`datetime`, `functools`, `glob`, `hashlib`, `heapq`, `io`, `itertools`,
+`json`, `math`, `os`/`os.path`, `pathlib`, `random`, `re`, `string`,
+`subprocess`, `sys`, `sysconfig`, `tempfile`, `textwrap`, `time`,
+`unicodedata`-style codec handling, `venv`, `warnings`
+
 ### Exception System
-✅ **Complete Exception Hierarchy**: `PyException`, `ValueError`, `TypeError`, `IndexError`, `KeyError`, `AttributeError`, `NameError`, `ZeroDivisionError`, `OverflowError`, `RuntimeError`
+✅ **Complete built-in exception tree**: every CPython built-in exception
+name is modeled, and `except` matching walks the real hierarchy —
+`except LookupError:` catches `IndexError`/`KeyError`, `except OSError:`
+catches `FileNotFoundError` and friends, while `except Exception:`
+correctly does NOT catch `SystemExit`/`KeyboardInterrupt`/`GeneratorExit`
+(tree verified against python3 3.14 `__mro__` dumps).
 
 ## What's Not Implemented
 
-❌ **Advanced Python Features**: Decorators, metaclasses, generators, async/await  
-❌ **Complex Built-ins**: `exec()`, `eval()`, `compile()`, `globals()`, `locals()`  
+❌ **Complex Built-ins**: `exec()`, `eval()`, `compile()`, `globals()`, `locals()` — dynamic code execution and frame introspection have no static-Rust equivalent  
+❌ **Frame-introspection surfaces**: `dir()`, `vars()`, `callable()`, first-class `iter()`/`next()` objects — handled at conversion time by the compiler instead of at runtime  
 ❌ **File I/O** (no_std mode): File operations, directory handling  
-❌ **Networking**: Socket operations, HTTP clients  
+❌ **Networking**: Socket operations, HTTP clients (see feature-gated surfaces below)  
 ❌ **Threading**: Thread management, locks, synchronization  
-❌ **Regular Expressions**: `re` module functionality  
-❌ **Date/Time**: `datetime`, `time` module functionality  
-❌ **OS Interface**: `os`, `sys` module functionality  
-❌ **Import System**: Dynamic module loading  
+❌ **Dynamic Import System**: `__import__`, importlib-style loading
+
+## Feature-Gated Platform Surfaces
+
+Platform-heavy functionality is **not** hand-reimplemented: where an
+existing Rust crate provides the behavior, stdpython wraps it behind an
+opt-in cargo **feature** instead of growing a mandatory dependency.
+
+- **Naming**: one feature per surface — `<module>` when there is one
+  natural backing crate, `<module>-<backend>` when several exist. This
+  extends the existing precedents: `async-tokio` (asyncio on tokio) and
+  the numpy backend features (`numpy-rayon`, `numpy-simd`, …).
+- **Default posture**: the default build stays dependency-light, and the
+  alloc/no_std tier is never affected.
+- **Tooling contract**: importing a gated module from converted Python is
+  a **loud conversion error naming the exact cargo feature to enable**
+  (rythonc/python-ast guard these the same way they guard missing
+  feature tiers). Generated crate manifests then enable the feature on
+  their stdpython dependency.
+- HTTP clients will be the first consumer of this convention (backed by
+  an established Rust HTTP crate behind e.g. a `http` feature).  
 
 ## Usage
 
