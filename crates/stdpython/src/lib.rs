@@ -1869,6 +1869,31 @@ pub fn repr<T: PyRepr + ?Sized>(x: &T) -> String {
     x.py_repr()
 }
 
+/// Python ascii() builtin: repr(), with every code point outside
+/// printable ASCII escaped to `\xXX`, `\uXXXX` or `\UXXXXXXXX` (lowercase
+/// hex). Printable ASCII (`0x20..=0x7e`) passes through untouched —
+/// escaping anything else is repr's job already (`ascii("\n")` ==
+/// `"'\\n'"`, DEL escapes: `ascii(chr(0x7f))` == `"'\\x7f'"`). Verified
+/// against python3 3.14.
+pub fn ascii<T: PyRepr + ?Sized>(x: &T) -> String {
+    let mut out = String::with_capacity(x.py_repr().len() + 8);
+    for ch in x.py_repr().chars() {
+        match ch {
+            ' '..='~' => out.push(ch),
+            c if (c as u32) <= 0xff => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if (c as u32) <= 0xffff => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => {
+                out.push_str(&format!("\\U{:08x}", c as u32));
+            }
+        }
+    }
+    out
+}
+
 // ============================================================================
 // hash(): CPython's algorithms with PYTHONHASHSEED=0
 // ============================================================================
@@ -4491,10 +4516,124 @@ impl PyException {
     }
 
     /// Whether this exception is caught by an `except <name>:` clause.
-    /// `Exception` and `BaseException` catch everything (rython does not
-    /// model the full class hierarchy between them yet).
+    ///
+    /// Python semantics: the clause matches when `<name>` is the raised
+    /// type itself or one of its ancestors. The tree below is CPython's
+    /// built-in exception hierarchy (verified by dumping `__mro__` for
+    /// every built-in exception under python3 3.14), so
+    /// `except LookupError:` now catches IndexError/KeyError,
+    /// `except OSError:` catches FileNotFoundError and friends, and
+    /// `except Exception:` correctly does NOT catch SystemExit,
+    /// KeyboardInterrupt or GeneratorExit — the old exact-name check
+    /// missed all of that (spec §12.3 defect class, fixed here).
     pub fn matches(&self, name: &str) -> bool {
-        name == "Exception" || name == "BaseException" || self.exception_type == name
+        // EnvironmentError and IOError are historical ALIASES of OSError:
+        // `issubclass(FileNotFoundError, EnvironmentError)` is True in
+        // CPython even though the alias never appears in FileNotFoundError's
+        // MRO — so aliases resolve to the canonical name before matching.
+        let name = match name {
+            "EnvironmentError" | "IOError" => "OSError",
+            other => other,
+        };
+        if self.exception_type == name {
+            return true;
+        }
+        match direct_exception_parent(&self.exception_type) {
+            Some(first) => {
+                let mut current = Some(first);
+                while let Some(parent) = current {
+                    if parent == name {
+                        return true;
+                    }
+                    current = direct_exception_parent(parent);
+                }
+                false
+            }
+            // An exception type outside the built-in tree keeps the
+            // historical broad posture: only Exception/BaseException are
+            // treated as catching it.
+            None => name == "Exception" || name == "BaseException",
+        }
+    }
+}
+
+/// The DIRECT parent of every built-in Python exception type (`None` for
+/// BaseException). One hop per entry; `PyException::matches` walks the
+/// chain. Verified against python3 3.14 by dumping each built-in
+/// exception's `__mro__`.
+fn direct_exception_parent(exc: &str) -> Option<&'static str> {
+    match exc {
+        "ArithmeticError" => Some("Exception"),
+        "AssertionError" => Some("Exception"),
+        "AttributeError" => Some("Exception"),
+        "BaseExceptionGroup" => Some("BaseException"),
+        "BlockingIOError" => Some("OSError"),
+        "BrokenPipeError" => Some("ConnectionError"),
+        "BufferError" => Some("Exception"),
+        "BytesWarning" => Some("Warning"),
+        "ChildProcessError" => Some("OSError"),
+        "ConnectionAbortedError" => Some("ConnectionError"),
+        "ConnectionError" => Some("OSError"),
+        "ConnectionRefusedError" => Some("ConnectionError"),
+        "ConnectionResetError" => Some("ConnectionError"),
+        "DeprecationWarning" => Some("Warning"),
+        "EOFError" => Some("Exception"),
+        "EncodingWarning" => Some("Warning"),
+        "EnvironmentError" => Some("OSError"),
+        "Exception" => Some("BaseException"),
+        "ExceptionGroup" => Some("BaseExceptionGroup"),
+        "FileExistsError" => Some("OSError"),
+        "FileNotFoundError" => Some("OSError"),
+        "FloatingPointError" => Some("ArithmeticError"),
+        "FutureWarning" => Some("Warning"),
+        "GeneratorExit" => Some("BaseException"),
+        "IOError" => Some("OSError"),
+        "ImportError" => Some("Exception"),
+        "ImportWarning" => Some("Warning"),
+        "IndentationError" => Some("SyntaxError"),
+        "IndexError" => Some("LookupError"),
+        "InterruptedError" => Some("OSError"),
+        "IsADirectoryError" => Some("OSError"),
+        "KeyError" => Some("LookupError"),
+        "KeyboardInterrupt" => Some("BaseException"),
+        "LookupError" => Some("Exception"),
+        "MemoryError" => Some("Exception"),
+        "ModuleNotFoundError" => Some("ImportError"),
+        "NameError" => Some("Exception"),
+        "NotADirectoryError" => Some("OSError"),
+        "NotImplementedError" => Some("RuntimeError"),
+        "OSError" => Some("Exception"),
+        "OverflowError" => Some("ArithmeticError"),
+        "PendingDeprecationWarning" => Some("Warning"),
+        "PermissionError" => Some("OSError"),
+        "ProcessLookupError" => Some("OSError"),
+        "PythonFinalizationError" => Some("RuntimeError"),
+        "RecursionError" => Some("RuntimeError"),
+        "ReferenceError" => Some("Exception"),
+        "ResourceWarning" => Some("Warning"),
+        "RuntimeError" => Some("Exception"),
+        "RuntimeWarning" => Some("Warning"),
+        "StopAsyncIteration" => Some("Exception"),
+        "StopIteration" => Some("Exception"),
+        "SyntaxError" => Some("Exception"),
+        "SyntaxWarning" => Some("Warning"),
+        "SystemError" => Some("Exception"),
+        "SystemExit" => Some("BaseException"),
+        "TabError" => Some("IndentationError"),
+        "TimeoutError" => Some("OSError"),
+        "TypeError" => Some("Exception"),
+        "UnboundLocalError" => Some("NameError"),
+        "UnicodeDecodeError" => Some("UnicodeError"),
+        "UnicodeEncodeError" => Some("UnicodeError"),
+        "UnicodeError" => Some("ValueError"),
+        "UnicodeTranslateError" => Some("UnicodeError"),
+        "UnicodeWarning" => Some("Warning"),
+        "UserWarning" => Some("Warning"),
+        "ValueError" => Some("Exception"),
+        "Warning" => Some("Exception"),
+        "ZeroDivisionError" => Some("ArithmeticError"),
+        "_IncompleteInputError" => Some("SyntaxError"),
+        _ => None,
     }
 }
 
@@ -4517,13 +4656,63 @@ impl From<PyException> for pyo3::PyErr {
             "RuntimeError" => PyRuntimeError::new_err(msg),
             "NotImplementedError" => PyNotImplementedError::new_err(msg),
             "OSError" => PyOSError::new_err(msg),
+            "EnvironmentError" | "IOError" => PyEnvironmentError::new_err(msg),
             "FileNotFoundError" => PyFileNotFoundError::new_err(msg),
+            "FileExistsError" => PyFileExistsError::new_err(msg),
             "PermissionError" => PyPermissionError::new_err(msg),
+            "IsADirectoryError" => PyIsADirectoryError::new_err(msg),
+            "NotADirectoryError" => PyNotADirectoryError::new_err(msg),
+            "InterruptedError" => PyInterruptedError::new_err(msg),
+            "ChildProcessError" => PyChildProcessError::new_err(msg),
+            "ProcessLookupError" => PyProcessLookupError::new_err(msg),
+            "TimeoutError" => PyTimeoutError::new_err(msg),
+            "ConnectionError" => PyConnectionError::new_err(msg),
+            "BrokenPipeError" => PyBrokenPipeError::new_err(msg),
+            "ConnectionAbortedError" => PyConnectionAbortedError::new_err(msg),
+            "ConnectionRefusedError" => PyConnectionRefusedError::new_err(msg),
+            "ConnectionResetError" => PyConnectionResetError::new_err(msg),
+            "BlockingIOError" => PyBlockingIOError::new_err(msg),
             "StopIteration" => PyStopIteration::new_err(msg),
+            "StopAsyncIteration" => PyStopAsyncIteration::new_err(msg),
             "OverflowError" => PyOverflowError::new_err(msg),
+            "FloatingPointError" => PyFloatingPointError::new_err(msg),
             "NameError" => PyNameError::new_err(msg),
+            "UnboundLocalError" => PyUnboundLocalError::new_err(msg),
             "LookupError" => PyLookupError::new_err(msg),
             "ArithmeticError" => PyArithmeticError::new_err(msg),
+            "ImportError" => PyImportError::new_err(msg),
+            "ModuleNotFoundError" => PyModuleNotFoundError::new_err(msg),
+            "RecursionError" => PyRecursionError::new_err(msg),
+            "MemoryError" => PyMemoryError::new_err(msg),
+            "ReferenceError" => PyReferenceError::new_err(msg),
+            "BufferError" => PyBufferError::new_err(msg),
+            "EOFError" => PyEOFError::new_err(msg),
+            "SyntaxError" => PySyntaxError::new_err(msg),
+            // pyo3 0.29 wraps no IndentationError/TabError class; both ARE
+            // SyntaxErrors in CPython's tree, so surfacing them as such
+            // keeps `except SyntaxError:` working for Python callers.
+            "IndentationError" | "TabError" => PySyntaxError::new_err(msg),
+            "SystemError" => PySystemError::new_err(msg),
+            "UnicodeError" => PyUnicodeError::new_err(msg),
+            "UnicodeDecodeError" => PyUnicodeDecodeError::new_err(msg),
+            "UnicodeEncodeError" => PyUnicodeEncodeError::new_err(msg),
+            "UnicodeTranslateError" => PyUnicodeTranslateError::new_err(msg),
+            "BaseException" => PyBaseException::new_err(msg),
+            "KeyboardInterrupt" => PyKeyboardInterrupt::new_err(msg),
+            "SystemExit" => PySystemExit::new_err(msg),
+            "GeneratorExit" => PyGeneratorExit::new_err(msg),
+            "Warning" => PyWarning::new_err(msg),
+            "DeprecationWarning" => PyDeprecationWarning::new_err(msg),
+            "PendingDeprecationWarning" => PyPendingDeprecationWarning::new_err(msg),
+            "UserWarning" => PyUserWarning::new_err(msg),
+            "FutureWarning" => PyFutureWarning::new_err(msg),
+            "RuntimeWarning" => PyRuntimeWarning::new_err(msg),
+            "SyntaxWarning" => PySyntaxWarning::new_err(msg),
+            "ImportWarning" => PyImportWarning::new_err(msg),
+            "UnicodeWarning" => PyUnicodeWarning::new_err(msg),
+            "BytesWarning" => PyBytesWarning::new_err(msg),
+            "EncodingWarning" => PyEncodingWarning::new_err(msg),
+            "ResourceWarning" => PyResourceWarning::new_err(msg),
             // Anything unrecognized keeps its full "Type: message" display.
             _ => PyRuntimeError::new_err(format!("{}", e)),
         }
@@ -4617,6 +4806,136 @@ pub fn overflow_error<M: AsRef<str>>(message: M) -> PyException {
 /// Python RuntimeError
 pub fn runtime_error<M: AsRef<str>>(message: M) -> PyException {
     PyException::new("RuntimeError", message.as_ref())
+}
+
+/// Python AssertionError
+pub fn assertion_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("AssertionError", message.as_ref())
+}
+
+/// Python ImportError
+pub fn import_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("ImportError", message.as_ref())
+}
+
+/// Python ModuleNotFoundError (an ImportError)
+pub fn module_not_found_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("ModuleNotFoundError", message.as_ref())
+}
+
+/// Python EOFError
+pub fn eof_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("EOFError", message.as_ref())
+}
+
+/// Python FloatingPointError (an ArithmeticError)
+pub fn floating_point_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("FloatingPointError", message.as_ref())
+}
+
+/// Python RecursionError (a RuntimeError)
+pub fn recursion_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("RecursionError", message.as_ref())
+}
+
+/// Python MemoryError
+pub fn memory_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("MemoryError", message.as_ref())
+}
+
+/// Python ReferenceError
+pub fn reference_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("ReferenceError", message.as_ref())
+}
+
+/// Python BufferError
+pub fn buffer_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("BufferError", message.as_ref())
+}
+
+/// Python StopIteration
+pub fn stop_iteration<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("StopIteration", message.as_ref())
+}
+
+/// Python StopAsyncIteration
+pub fn stop_async_iteration<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("StopAsyncIteration", message.as_ref())
+}
+
+/// Python SyntaxError
+pub fn syntax_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("SyntaxError", message.as_ref())
+}
+
+/// Python IndentationError (a SyntaxError)
+pub fn indentation_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("IndentationError", message.as_ref())
+}
+
+/// Python TabError (an IndentationError)
+pub fn tab_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("TabError", message.as_ref())
+}
+
+/// Python SystemError
+pub fn system_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("SystemError", message.as_ref())
+}
+
+/// Python UnboundLocalError (a NameError)
+pub fn unbound_local_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnboundLocalError", message.as_ref())
+}
+
+/// Python UnicodeError (a ValueError)
+pub fn unicode_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnicodeError", message.as_ref())
+}
+
+/// Python UnicodeEncodeError (a UnicodeError)
+pub fn unicode_encode_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnicodeEncodeError", message.as_ref())
+}
+
+/// Python UnicodeDecodeError (a UnicodeError)
+pub fn unicode_decode_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnicodeDecodeError", message.as_ref())
+}
+
+/// Python UnicodeTranslateError (a UnicodeError)
+pub fn unicode_translate_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnicodeTranslateError", message.as_ref())
+}
+
+/// Python TimeoutError (an OSError)
+pub fn timeout_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("TimeoutError", message.as_ref())
+}
+
+/// Python FileExistsError (an OSError)
+pub fn file_exists_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("FileExistsError", message.as_ref())
+}
+
+/// Python FileNotFoundError (an OSError)
+pub fn file_not_found_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("FileNotFoundError", message.as_ref())
+}
+
+/// Python PermissionError (an OSError)
+pub fn permission_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("PermissionError", message.as_ref())
+}
+
+/// Python IsADirectoryError (an OSError)
+pub fn is_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("IsADirectoryError", message.as_ref())
+}
+
+/// Python NotADirectoryError (an OSError)
+pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("NotADirectoryError", message.as_ref())
 }
 
 // ============================================================================
