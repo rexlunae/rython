@@ -69,7 +69,11 @@ fn accepts_probe_file(dir: &Path) -> bool {
             Ok(mut file) => {
                 let written = file.write_all(b"blat").is_ok();
                 drop(file);
-                return written && std::fs::remove_file(&filename).is_ok();
+                // Unlink unconditionally — CPython never leaves the probe
+                // file behind, even when the write failed (Devin review
+                // on PR #141).
+                let removed = std::fs::remove_file(&filename).is_ok();
+                return written && removed;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => break,
