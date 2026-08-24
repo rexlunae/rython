@@ -2615,6 +2615,27 @@ fn os_path_expandvars_matches_python() {
     assert_eq!(expandvars("$1abc"), "digit-led");
     assert_eq!(expandvars("${1abc}-x"), "digit-led-x");
     assert_eq!(expandvars("$9zzz"), "$9zzz");
+    // The whole `${...}` span is ONE varscan token: when the variable is
+    // unset, an inner `$b` must NOT be re-expanded even though `b` is
+    // set — CPython keeps the literal text and advances past the brace.
+    // Verified against python3 3.14 (with b=XX):
+    //   ...expandvars('${a$b}')        -> '${a$b}'
+    //   ...expandvars('pre${a$b}post') -> 'pre${a$b}post'
+    //   ...expandvars('${}')           -> '${}'
+    //   ...expandvars('${a{b}}')       -> '${a{b}}'
+    unsafe {
+        std::env::set_var("RY_TEST_B", "XX");
+    }
+    assert_eq!(expandvars("${a$RY_TEST_B}"), "${a$RY_TEST_B}");
+    assert_eq!(expandvars("pre${a$RY_TEST_B}post"), "pre${a$RY_TEST_B}post");
+    assert_eq!(expandvars("${}"), "${}");
+    assert_eq!(expandvars("${a{RY_TEST_B}}}"), "${a{RY_TEST_B}}}");
+    // An UNTERMINATED `${...` never matches the braced token, so the
+    // scan falls through and a later bare reference still expands,
+    // exactly like CPython's regex failing at that position.
+    // Verified against python3 3.14:
+    //   ...expandvars('x${abc$RY_TEST_B') -> 'x${abcXX'
+    assert_eq!(expandvars("x${abc$RY_TEST_B"), "x${abcXX");
     assert_eq!(expandvars("plain"), "plain");
     assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
 }

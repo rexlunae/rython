@@ -423,17 +423,25 @@ pub mod path {
                 i += 1;
                 continue;
             }
-            // `${VAR}` braced form: expands only when VAR is set — an
-            // unknown braced reference stays LITERAL (`${UNSET}/log`),
-            // matching CPython (Devin round-1 review on PR #140).
+            // `${VAR}` braced form: the WHOLE `${...}` span is one token
+            // for CPython's varscan (`\$\{[^}]*\}`, re.ASCII) — expand it
+            // when VAR is set, otherwise emit the literal text and skip
+            // past the closing brace. Never re-scan inside: an inner `$b`
+            // in an unset `${a$b}` must stay literal even when `b` is set
+            // (verified against python3 3.14; Devin round-4 review on
+            // PR #140). Only an UNTERMINATED `${...` falls through to the
+            // bare-name scan below, exactly like CPython's regex failing
+            // to match at this position.
             if i + 1 < bytes.len() && bytes[i + 1] == '{' {
                 if let Some(close) = bytes[i + 2..].iter().position(|&c| c == '}') {
                     let name: String = bytes[i + 2..i + 2 + close].iter().collect();
                     if let Ok(val) = std::env::var(&name) {
                         out.push_str(&val);
-                        i += close + 3;
-                        continue;
+                    } else {
+                        out.extend(&bytes[i..i + close + 3]);
                     }
+                    i += close + 3;
+                    continue;
                 }
             }
             // CPython's varscan is ASCII-only (`re.compile(r'\$(\w+|\{[^}]*\})',
