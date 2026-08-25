@@ -1,22 +1,25 @@
-"""A tiny register-file device: kernel module + userspace driver from
-one Python file.
+"""A tiny register-file device: kernel module + userspace driver, both
+maintained as this one Python file.
 
-The SAME file converts two ways:
+THIS FILE IS THE DRIVER. You edit the Python; `make` (see the Makefile
+next to this file) rebuilds both halves from it every time - the
+generated Rust under build/ is an intermediate artifact, never the
+thing you maintain:
 
-  rypip convert driver.py --out kmod-crate --kernel-module
-      The device manifest below (__device_name__, __bufsz__, ...) turns
-      into a misc character device (/dev/rython0): a pure-Rust .ko with
-      full file_operations, an ioctl ABI, and .modinfo metadata.
+  make          -> build/rython-kmod/rython.ko
+      The device manifest below (__device_name__, __bufsz__, ...)
+      becomes a misc character device (/dev/rython0): a pure-Rust .ko
+      with full file_operations, an ioctl ABI, and .modinfo metadata.
 
-  rypip convert driver.py --out driver-crate --driver
-      The classes and functions below - ordinary Python, compiled by the
-      full transpiler - become the driver logic of a userspace binary,
-      wrapped in generated open/read/write/ioctl syscall glue that talks
-      to that device node (the UIO pattern: the kernel side stays a dumb,
-      safe byte ring; the smarts live in user space).
+  make tool     -> the userspace driver binary
+      The classes and functions below - ordinary Python, compiled by
+      the full transpiler - become the driver logic, wrapped in
+      generated open/read/write/ioctl syscall glue that talks to that
+      device node (the UIO pattern: the kernel side stays a dumb, safe
+      byte ring; the smarts live in user space, in Python).
 
-The logic is plain Python first: run `python3 driver.py` to exercise it
-under CPython before ever touching the kernel.
+Workflow: edit here -> `python3 driver.py` (CPython smoke test) ->
+`make load` -> talk to /dev/rython0 with the tool -> `make unload`.
 """
 
 __module_name__ = "rython"

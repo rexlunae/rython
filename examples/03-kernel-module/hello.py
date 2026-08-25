@@ -1,10 +1,20 @@
 """hello_rython: the classic hello-world Linux kernel module, in Python.
 
-`rypip convert --kernel-module` lowers this file to a #![no_std] Rust
-crate with C-ABI module entry points, .modinfo metadata, and printk
-lowering - no C shim, no rust-for-linux tree required. Kernel symbols
-are reached through the rykernel-shim crate, the Rust compatibility
-layer that declares what a module may call.
+THIS FILE IS THE DRIVER. You maintain the Python; the Makefile next to
+it rebuilds hello.ko from this file on every `make` (rypip lowers it to
+a #![no_std] Rust crate - C-ABI entry points, .modinfo metadata, printk
+lowering - and drives that crate's Kbuild pipeline). The generated Rust
+under build/ is an intermediate artifact, like an .o file: read it if
+you're curious, but edit here.
+
+Kernel symbols are reached through the rykernel-shim crate, the Rust
+compatibility layer that declares what a module may call. No C shim, no
+rust-for-linux tree required.
+
+    make            # build build/hello-kmod/hello.ko from this file
+    sudo insmod build/hello-kmod/hello.ko
+    sudo dmesg | tail -2
+    sudo rmmod hello
 """
 
 __module_license__ = "GPL"
