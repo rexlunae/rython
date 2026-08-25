@@ -121,7 +121,6 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 end_col_offset: f.end_col_offset,
             })
         }
-        StatementType::AsyncFor(f) => StatementType::AsyncFor(f.clone()),
         StatementType::Try(t) => StatementType::Try(Try {
             body: rename_receiver_in_body(&t.body, from, to)?,
             handlers: {
@@ -173,7 +172,6 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 end_col_offset: w.end_col_offset,
             })
         }
-        StatementType::AsyncWith(w) => StatementType::AsyncWith(w.clone()),
         StatementType::Raise(r) => StatementType::Raise(super::raise_stmt::Raise {
             exc: r.exc.as_ref().map(|e| rename_expr(e, from, to)),
             cause: r.cause.as_ref().map(|c| rename_expr(c, from, to)),
