@@ -239,9 +239,14 @@ pub(crate) fn is_numpy_alias(name: &str) -> bool {
     matches!(name, "np" | "numpy")
 }
 
-impl StdModule {
-    /// Every module, for exhaustive walks (the round-trip self-test).
-    pub(crate) const ALL: [StdModule; 31] = [
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every module, for the exhaustive round-trip walk. Lives in the
+    /// test module (its only consumer): CI builds with -D warnings, so a
+    /// test-only item in the non-test build would be a dead-code error.
+    const ALL: [StdModule; 31] = [
         StdModule::Os,
         StdModule::Sys,
         StdModule::Re,
@@ -274,17 +279,12 @@ impl StdModule {
         StdModule::Socket,
         StdModule::Urllib,
     ];
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// from_name and name() are the enum's only two string matches; the
     /// round trip pins them to each other so neither can drift.
     #[test]
     fn names_round_trip() {
-        for module in StdModule::ALL {
+        for module in ALL {
             assert_eq!(
                 StdModule::from_name(module.name()),
                 Some(module),
