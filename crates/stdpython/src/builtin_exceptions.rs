@@ -73,12 +73,16 @@ pub(crate) static BUILTIN_EXCEPTION_PARENTS: &[(&str, Option<&str>)] = &[
     ("URLError", Some("OSError")),
     ("HTTPError", Some("URLError")),
     ("ContentTooShortError", Some("URLError")),
+    // socket-module exceptions (socket.timeout IS TimeoutError; verified
+    // against python3: gaierror/herror → OSError).
+    ("gaierror", Some("OSError")),
+    ("herror", Some("OSError")),
     // RuntimeError leaves.
     ("NotImplementedError", Some("RuntimeError")),
     ("RecursionError", Some("RuntimeError")),
     ("PythonFinalizationError", Some("RuntimeError")),
-    // Syntax tree.
-    ("SyntaxError", Some("Exception")),
+    // Syntax tree (SyntaxError itself is listed with the Exception
+    // children above).
     ("IndentationError", Some("SyntaxError")),
     ("TabError", Some("IndentationError")),
     ("_IncompleteInputError", Some("SyntaxError")),
@@ -147,6 +151,34 @@ mod tests {
     }
 
     #[test]
+    fn no_shadowed_duplicate_rows() {
+        // Lookup takes the FIRST matching row, so a duplicate name is a
+        // silently dead entry — exactly the drift this table exists to
+        // prevent.
+        for (i, (name, _)) in BUILTIN_EXCEPTION_PARENTS.iter().enumerate() {
+            assert!(
+                !BUILTIN_EXCEPTION_PARENTS[..i].iter().any(|(n, _)| n == name),
+                "{name} is listed twice; the second row is shadowed"
+            );
+        }
+    }
+
+    #[test]
+    fn stdlib_module_exceptions_walk_into_the_builtin_tree() {
+        // `except OSError:` must catch a raised URLError or gaierror
+        // (python3-verified MROs; the rypip urllib e2e test pins the
+        // URLError case end to end).
+        assert_eq!(direct_exception_parent("URLError"), Some("OSError"));
+        assert_eq!(direct_exception_parent("HTTPError"), Some("URLError"));
+        assert_eq!(
+            direct_exception_parent("ContentTooShortError"),
+            Some("URLError")
+        );
+        assert_eq!(direct_exception_parent("gaierror"), Some("OSError"));
+        assert_eq!(direct_exception_parent("herror"), Some("OSError"));
+    }
+
+    #[test]
     fn alias_and_group_special_cases_hold() {
         // Verified against python3 3.14: EnvironmentError IS-A OSError
         // (alias), and ExceptionGroup additionally IS-A Exception even
@@ -201,11 +233,13 @@ pub(crate) static PYO3_CTORS: &[(&str, fn(String) -> pyo3::PyErr)] = &[
     ("PermissionError", |m| pyo3::exceptions::PyPermissionError::new_err(m)),
     ("ProcessLookupError", |m| pyo3::exceptions::PyProcessLookupError::new_err(m)),
     ("TimeoutError", |m| pyo3::exceptions::PyTimeoutError::new_err(m)),
-    // urllib.error: pyo3 wraps none of these; they surface through their
-    // OSError ancestry.
+    // urllib.error and the socket exceptions: pyo3 wraps none of these;
+    // they surface through their OSError ancestry.
     ("URLError", |m| pyo3::exceptions::PyOSError::new_err(m)),
     ("HTTPError", |m| pyo3::exceptions::PyOSError::new_err(m)),
     ("ContentTooShortError", |m| pyo3::exceptions::PyOSError::new_err(m)),
+    ("gaierror", |m| pyo3::exceptions::PyOSError::new_err(m)),
+    ("herror", |m| pyo3::exceptions::PyOSError::new_err(m)),
     ("ReferenceError", |m| pyo3::exceptions::PyReferenceError::new_err(m)),
     ("RuntimeError", |m| pyo3::exceptions::PyRuntimeError::new_err(m)),
     ("NotImplementedError", |m| pyo3::exceptions::PyNotImplementedError::new_err(m)),
@@ -244,21 +278,6 @@ pub(crate) static PYO3_CTORS: &[(&str, fn(String) -> pyo3::PyErr)] = &[
     // The OSError alias names surface as their canonical class.
     ("EnvironmentError", |m| pyo3::exceptions::PyEnvironmentError::new_err(m)),
     ("IOError", |m| pyo3::exceptions::PyIOError::new_err(m)),
-    // Syntax-tree gaps handled beside the ctor lookup.
-    // Unicode leaves.
-    ("UnicodeError", |m| pyo3::exceptions::PyUnicodeError::new_err(m)),
-    ("UnicodeDecodeError", |m| pyo3::exceptions::PyUnicodeDecodeError::new_err(m)),
-    ("UnicodeEncodeError", |m| pyo3::exceptions::PyUnicodeEncodeError::new_err(m)),
-    ("UnicodeTranslateError", |m| pyo3::exceptions::PyUnicodeTranslateError::new_err(m)),
-    ("TimeoutError", |m| pyo3::exceptions::PyTimeoutError::new_err(m)),
-    // urllib.error: pyo3 wraps none of these; they surface through their
-    // OSError ancestry.
-    ("URLError", |m| pyo3::exceptions::PyOSError::new_err(m)),
-    ("HTTPError", |m| pyo3::exceptions::PyOSError::new_err(m)),
-    ("ContentTooShortError", |m| pyo3::exceptions::PyOSError::new_err(m)),
-    // Aliases surface as their canonical class.
-    ("EnvironmentError", |m| pyo3::exceptions::PyEnvironmentError::new_err(m)),
-    ("IOError", |m| pyo3::exceptions::PyIOError::new_err(m)),
 ];
 
 /// The PyO3 constructor for a built-in exception name.
@@ -293,6 +312,14 @@ fn every_builtin_except_the_pyo3_gaps_has_a_ctor() {
         assert!(
             direct_exception_parent(name).is_some() || *name == "BaseException",
             "{name} has a ctor but is not in the parent table"
+        );
+    }
+    // Lookup takes the FIRST matching row; a duplicate ctor name is a
+    // silently dead entry.
+    for (i, (name, _)) in PYO3_CTORS.iter().enumerate() {
+        assert!(
+            !PYO3_CTORS[..i].iter().any(|(n, _)| n == name),
+            "{name} has two ctor rows; the second is shadowed"
         );
     }
 }
