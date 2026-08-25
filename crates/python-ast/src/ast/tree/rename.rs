@@ -206,15 +206,15 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         }
         StatementType::AsyncFor(f) => {
             let binds = expr_binds_name(&f.target, from);
-            if binds {
-                stmt.statement.clone()
-            } else {
-                let mut f = f.clone();
-                f.iter = rename_expr(&f.iter, from, to);
+            let mut f = f.clone();
+            // The iterable is OUTSIDE the target's scope: rename it even
+            // when the target itself shadows the receiver name.
+            f.iter = rename_expr(&f.iter, from, to);
+            if !binds {
                 f.body = rename_receiver_in_body(&f.body, from, to)?;
                 f.orelse = rename_receiver_in_body(&f.orelse, from, to)?;
-                StatementType::AsyncFor(f)
             }
+            StatementType::AsyncFor(f)
         },
         StatementType::AsyncWith(w) => {
             let binds = w.items.iter().any(|item| {
@@ -222,24 +222,24 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                     .as_ref()
                     .is_some_and(|v| expr_binds_name(v, from))
             });
-            if binds {
-                stmt.statement.clone()
-            } else {
-                let mut w = w.clone();
-                w.items = w
-                    .items
-                    .iter()
-                    .map(|item| WithItem {
-                        context_expr: rename_expr(&item.context_expr, from, to),
-                        optional_vars: item
-                            .optional_vars
-                            .as_ref()
-                            .map(|v| rename_expr(v, from, to)),
-                    })
-                    .collect();
+            let mut w = w.clone();
+            // Context-manager expressions sit outside the optional_vars
+            // binding's scope: rename them even when it shadows the
+            // receiver name.
+            w.items = w
+                .items
+                .iter()
+                .map(|item| WithItem {
+                    context_expr: rename_expr(&item.context_expr, from, to),
+                    // An `as <name>` binding KEEPS its name: it shadows the
+                    // receiver inside the body rather than referencing it.
+                    optional_vars: item.optional_vars.clone(),
+                })
+                .collect();
+            if !binds {
                 w.body = rename_receiver_in_body(&w.body, from, to)?;
-                StatementType::AsyncWith(w)
             }
+            StatementType::AsyncWith(w)
         },
         // Nested scopes: a def/lambda/class that BINDS the target keeps
         // its scope; a nested def WITHOUT such a binding captures the
@@ -534,3 +534,69 @@ fn rename_subscript_kind(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse;
+    use crate::tree::statement::StatementType;
+
+    /// Extract the body of the first function in `src`. The rename pass is
+    /// scope-local, so a module-level `async def` exercises exactly the
+    /// same paths as an (upstream-unsupported) class-level one.
+    fn method_body(src: &str) -> Vec<Statement> {
+        let module = parse(src, "t.py").expect("parse");
+        for stmt in &module.raw.body {
+            match &stmt.statement {
+                StatementType::FunctionDef(f) => return f.body.clone(),
+                StatementType::AsyncFunctionDef(f) => return f.body.clone(),
+                _ => {}
+            }
+        }
+        panic!("no function in source");
+    }
+
+    fn contains_name(body: &[Statement], name: &str) -> bool {
+        let rendered = format!("{:#?}", body);
+        rendered.contains(&format!("id: \"{name}\""))
+            || rendered.contains(&format!("\"{name}\""))
+    }
+
+    #[test]
+    fn async_for_renames_iterable_even_when_target_shadows() {
+        // The iterable sits OUTSIDE the target's binding scope: it renames
+        // even though the target shadows the receiver name; the loop BODY
+        // stays untouched there (its `factory_self` would be the loop
+        // variable).
+        let src = concat!(
+            "async def drain(factory_self):\n",
+            "    async for factory_self in factory_self.items:\n",
+            "        return item\n"
+        );
+        let body = method_body(src);
+        let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
+        assert!(
+            contains_name(&renamed, "self"),
+            "iterable must be renamed: {renamed:#?}"
+        );
+        // The loop target keeps its binding; body references stay bound to
+        // it (rendered as factory_self).
+        assert!(contains_name(&renamed, "factory_self"));
+    }
+
+    #[test]
+    fn async_with_renames_context_even_when_vars_shadow() {
+        let src = concat!(
+            "async def use_ctx(factory_self):\n",
+            "    async with factory_self.lock as factory_self:\n",
+            "        return 1\n"
+        );
+        let body = method_body(src);
+        let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
+        assert!(
+            contains_name(&renamed, "self"),
+            "context expression must be renamed: {renamed:#?}"
+        );
+        assert!(contains_name(&renamed, "factory_self"));
+    }
+}
