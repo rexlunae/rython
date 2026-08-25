@@ -174,7 +174,75 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
             })
         }
         StatementType::AsyncWith(w) => StatementType::AsyncWith(w.clone()),
-        StatementType::Raise(r) => StatementType::Raise(r.clone()),
+        StatementType::Raise(r) => StatementType::Raise(super::raise_stmt::Raise {
+            exc: r.exc.as_ref().map(|e| rename_expr(e, from, to)),
+            cause: r.cause.as_ref().map(|c| rename_expr(c, from, to)),
+            lineno: r.lineno,
+            col_offset: r.col_offset,
+            end_lineno: r.end_lineno,
+            end_col_offset: r.end_col_offset,
+        }),
+        StatementType::Assert { test, msg } => StatementType::Assert {
+            test: Box::new(rename_expr(test.as_ref(), from, to)),
+            msg: match msg {
+                Some(m) => Some(Box::new(rename_expr(m.as_ref(), from, to))),
+                None => None,
+            },
+        },
+        // `del <receiver>` unbinds the binding — same no-lowering posture
+        // as rebinding it; index targets rename through.
+        StatementType::Delete(targets) => {
+            for target in targets {
+                if matches!(target, ExprType::Name(n) if n.id == from) {
+                    return Err(format!(
+                        "method deletes its receiver `{from}`; rython's receiver is \
+                         an immutable `&self`, so the unbinding has no lowering"
+                    ));
+                }
+            }
+            let mut renamed = Vec::with_capacity(targets.len());
+            for t in targets {
+                renamed.push(rename_expr(t, from, to));
+            }
+            StatementType::Delete(renamed)
+        }
+        StatementType::AsyncFor(f) => {
+            let binds = expr_binds_name(&f.target, from);
+            if binds {
+                stmt.statement.clone()
+            } else {
+                let mut f = f.clone();
+                f.iter = rename_expr(&f.iter, from, to);
+                f.body = rename_receiver_in_body(&f.body, from, to)?;
+                f.orelse = rename_receiver_in_body(&f.orelse, from, to)?;
+                StatementType::AsyncFor(f)
+            }
+        },
+        StatementType::AsyncWith(w) => {
+            let binds = w.items.iter().any(|item| {
+                item.optional_vars
+                    .as_ref()
+                    .is_some_and(|v| expr_binds_name(v, from))
+            });
+            if binds {
+                stmt.statement.clone()
+            } else {
+                let mut w = w.clone();
+                w.items = w
+                    .items
+                    .iter()
+                    .map(|item| WithItem {
+                        context_expr: rename_expr(&item.context_expr, from, to),
+                        optional_vars: item
+                            .optional_vars
+                            .as_ref()
+                            .map(|v| rename_expr(v, from, to)),
+                    })
+                    .collect();
+                w.body = rename_receiver_in_body(&w.body, from, to)?;
+                StatementType::AsyncWith(w)
+            }
+        },
         // Nested scopes: a def/lambda/class that BINDS the target keeps
         // its scope; a nested def WITHOUT such a binding captures the
         // enclosing receiver and must be renamed through. Class bodies are
