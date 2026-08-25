@@ -3031,6 +3031,38 @@ mod socket_module {
     }
 
     #[test]
+    fn shared_socket_is_full_duplex_across_threads() {
+        // Devin review round 2 on PR #144: a blocked recv() must NOT hold
+        // the socket's internal lock — CPython sockets are full-duplex, so
+        // a reader thread and a writer thread use ONE shared socket
+        // concurrently. Pre-fix this deadlocked: the reader held the state
+        // mutex across the blocking read, and the writer's sendall on the
+        // same socket waited on it forever.
+        let srv = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        srv.bind(("127.0.0.1", 0)).unwrap();
+        srv.listen(1).unwrap();
+        let port = srv.getsockname().unwrap().1;
+        let cli = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        cli.connect(("127.0.0.1", port)).unwrap();
+        let (conn, _addr) = srv.accept().unwrap();
+        let reader_cli = cli.clone();
+        let reader = threading::Thread::new("reader", false, move || {
+            // Blocks until the peer's reply — while the main thread sends
+            // through ANOTHER clone of the same socket.
+            let got = reader_cli.recv(16).unwrap();
+            assert_eq!(got, b"pong");
+        });
+        reader.start();
+        // Give the reader time to block inside recv() before writing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cli.sendall(b"ping".to_vec()).unwrap();
+        let got = conn.recv(16).unwrap();
+        assert_eq!(got, b"ping");
+        conn.sendall(b"pong".to_vec()).unwrap();
+        reader.join();
+    }
+
+    #[test]
     fn gethostname_is_nonempty() {
         assert!(!socket::gethostname().is_empty());
     }

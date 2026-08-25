@@ -93,6 +93,14 @@ struct SocketInner {
     timeout: Mutex<Option<Duration>>,
 }
 
+/// A connected handle cloned out of the state lock for blocking I/O
+/// (see Socket::io_handle).
+#[derive(Debug)]
+enum IoHandle {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+}
+
 /// A Python socket object (socket.socket).
 #[derive(Clone, Debug)]
 pub struct Socket {
@@ -217,18 +225,17 @@ impl Socket {
         Ok(())
     }
 
-    /// Python `socket.send(bytes)` -> count sent.
-    pub fn send<B: AsRef<[u8]>>(&self, data: B) -> Result<i64, PyException> {
-        let data = data.as_ref();
-        match &mut *self.inner.state.lock().unwrap() {
-            SockState::Stream(s) => {
-                let n = s.write(data).map_err(|e| net_error(&e))?;
-                Ok(n as i64)
-            }
-            SockState::Udp(u) => {
-                let n = u.send(data).map_err(|e| net_error(&e))?;
-                Ok(n as i64)
-            }
+    /// Clone the connected I/O handle OUT of the state lock, so blocking
+    /// reads and writes run without holding it: CPython sockets are
+    /// full-duplex — a reader thread blocked in recv() must not freeze a
+    /// writer thread's send()/close() on a shared clone of the same
+    /// socket. accept() does the same with the listener. The clone is a
+    /// dup'd descriptor of the SAME underlying socket, so data and
+    /// shutdown state stay shared.
+    fn io_handle(&self) -> Result<IoHandle, PyException> {
+        match &*self.inner.state.lock().unwrap() {
+            SockState::Stream(s) => Ok(IoHandle::Tcp(s.try_clone().map_err(|e| net_error(&e))?)),
+            SockState::Udp(u) => Ok(IoHandle::Udp(u.try_clone().map_err(|e| net_error(&e))?)),
             SockState::Closed => Err(bad_fd()),
             _ => Err(PyException::new(
                 "OSError",
@@ -237,20 +244,25 @@ impl Socket {
         }
     }
 
+    /// Python `socket.send(bytes)` -> count sent.
+    pub fn send<B: AsRef<[u8]>>(&self, data: B) -> Result<i64, PyException> {
+        let data = data.as_ref();
+        let n = match self.io_handle()? {
+            IoHandle::Tcp(mut s) => s.write(data).map_err(|e| net_error(&e))?,
+            IoHandle::Udp(u) => u.send(data).map_err(|e| net_error(&e))?,
+        };
+        Ok(n as i64)
+    }
+
     /// Python `socket.sendall(bytes)`.
     pub fn sendall<B: AsRef<[u8]>>(&self, data: B) -> Result<(), PyException> {
         let data = data.as_ref();
-        match &mut *self.inner.state.lock().unwrap() {
-            SockState::Stream(s) => s.write_all(data).map_err(|e| net_error(&e)),
-            SockState::Udp(u) => {
+        match self.io_handle()? {
+            IoHandle::Tcp(mut s) => s.write_all(data).map_err(|e| net_error(&e)),
+            IoHandle::Udp(u) => {
                 u.send(data).map_err(|e| net_error(&e))?;
                 Ok(())
             }
-            SockState::Closed => Err(bad_fd()),
-            _ => Err(PyException::new(
-                "OSError",
-                "[Errno 107] Transport endpoint is not connected",
-            )),
         }
     }
 
@@ -259,17 +271,11 @@ impl Socket {
         if bufsize < 0 {
             return Err(crate::value_error("negative buffersize in recv"));
         }
+        let handle = self.io_handle()?;
         let mut buf = vec![0u8; bufsize as usize];
-        let n = match &mut *self.inner.state.lock().unwrap() {
-            SockState::Stream(s) => s.read(&mut buf).map_err(|e| net_error(&e))?,
-            SockState::Udp(u) => u.recv(&mut buf).map_err(|e| net_error(&e))?,
-            SockState::Closed => return Err(bad_fd()),
-            _ => {
-                return Err(PyException::new(
-                    "OSError",
-                    "[Errno 107] Transport endpoint is not connected",
-                ))
-            }
+        let n = match handle {
+            IoHandle::Tcp(mut s) => s.read(&mut buf).map_err(|e| net_error(&e))?,
+            IoHandle::Udp(u) => u.recv(&mut buf).map_err(|e| net_error(&e))?,
         };
         buf.truncate(n);
         Ok(buf)
@@ -278,26 +284,31 @@ impl Socket {
     /// Python `socket.sendto(bytes, (host, port))` (UDP) -> count sent.
     pub fn sendto<S: AsRef<str>, B: AsRef<[u8]>>(&self, data: B, addr: (S, i64)) -> Result<i64, PyException> {
         let data = data.as_ref();
-        let mut state = self.inner.state.lock().unwrap();
-        // CPython auto-binds an unbound UDP socket on first sendto.
-        if let SockState::Fresh { kind } = &*state {
-            if *kind == SOCK_DGRAM {
-                *state = SockState::Udp(UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| net_error(&e))?);
+        // Auto-bind (CPython binds an unbound UDP socket on first sendto)
+        // and clone the handle out; the blocking send runs unlocked.
+        let udp = {
+            let mut state = self.inner.state.lock().unwrap();
+            if let SockState::Fresh { kind } = &*state {
+                if *kind == SOCK_DGRAM {
+                    *state =
+                        SockState::Udp(UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| net_error(&e))?);
+                }
             }
-        }
-        match &*state {
-            SockState::Udp(u) => {
-                let n = u
-                    .send_to(data, (addr.0.as_ref(), addr.1 as u16))
-                    .map_err(|e| net_error(&e))?;
-                Ok(n as i64)
+            match &*state {
+                SockState::Udp(u) => u.try_clone().map_err(|e| net_error(&e))?,
+                SockState::Closed => return Err(bad_fd()),
+                _ => {
+                    return Err(PyException::new(
+                        "OSError",
+                        "sendto() requires a SOCK_DGRAM socket",
+                    ))
+                }
             }
-            SockState::Closed => Err(bad_fd()),
-            _ => Err(PyException::new(
-                "OSError",
-                "sendto() requires a SOCK_DGRAM socket",
-            )),
-        }
+        };
+        let n = udp
+            .send_to(data, (addr.0.as_ref(), addr.1 as u16))
+            .map_err(|e| net_error(&e))?;
+        Ok(n as i64)
     }
 
     /// Python `socket.recvfrom(bufsize)` (UDP) -> (bytes, (host, port)).
@@ -305,19 +316,19 @@ impl Socket {
         if bufsize < 0 {
             return Err(crate::value_error("negative buffersize in recvfrom"));
         }
-        let mut buf = vec![0u8; bufsize as usize];
-        match &*self.inner.state.lock().unwrap() {
-            SockState::Udp(u) => {
-                let (n, peer) = u.recv_from(&mut buf).map_err(|e| net_error(&e))?;
-                buf.truncate(n);
-                Ok((buf, addr_tuple(peer)))
+        let udp = match self.io_handle()? {
+            IoHandle::Udp(u) => u,
+            IoHandle::Tcp(_) => {
+                return Err(PyException::new(
+                    "OSError",
+                    "recvfrom() requires a SOCK_DGRAM socket",
+                ))
             }
-            SockState::Closed => Err(bad_fd()),
-            _ => Err(PyException::new(
-                "OSError",
-                "recvfrom() requires a SOCK_DGRAM socket",
-            )),
-        }
+        };
+        let mut buf = vec![0u8; bufsize as usize];
+        let (n, peer) = udp.recv_from(&mut buf).map_err(|e| net_error(&e))?;
+        buf.truncate(n);
+        Ok((buf, addr_tuple(peer)))
     }
 
     /// Python `socket.settimeout(seconds)` — applied to blocking reads,
