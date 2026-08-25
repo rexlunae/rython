@@ -2293,6 +2293,90 @@ impl Len for StrOrBytes {
     }
 }
 
+impl From<String> for StrOrBytes {
+    fn from(value: String) -> Self {
+        StrOrBytes::Str(value)
+    }
+}
+
+impl From<&str> for StrOrBytes {
+    fn from(value: &str) -> Self {
+        StrOrBytes::Str(value.to_string())
+    }
+}
+
+impl From<Vec<u8>> for StrOrBytes {
+    fn from(value: Vec<u8>) -> Self {
+        StrOrBytes::Bytes(value)
+    }
+}
+
+impl From<&[u8]> for StrOrBytes {
+    fn from(value: &[u8]) -> Self {
+        StrOrBytes::Bytes(value.to_vec())
+    }
+}
+
+// A bytes literal renders as &[u8; N]: the fixed-size array needs its own
+// From (unsized coercion does not fire through a generic into()).
+impl<const N: usize> From<&[u8; N]> for StrOrBytes {
+    fn from(value: &[u8; N]) -> Self {
+        StrOrBytes::Bytes(value.to_vec())
+    }
+}
+
+/// CPython's bytes repr: `b'...'`, switching to DOUBLE quotes when the
+/// content contains a single quote and no double quote (`b"a'b"`); `\n`,
+/// `\r`, `\t` and backslash are named escapes, every other byte outside
+/// printable ASCII is `\xNN` (lowercase hex — including `\a`/`\b`/`\f`/
+/// `\v` and DEL). Verified against python3 3.14.
+pub fn py_bytes_repr(bytes: &[u8]) -> String {
+    let has_single = bytes.contains(&b'\'');
+    let has_double = bytes.contains(&b'"');
+    let (open, close) = if has_single && !has_double {
+        ('"', '"')
+    } else {
+        ('\'', '\'')
+    };
+    let mut out = String::with_capacity(bytes.len() + 3);
+    out.push('b');
+    out.push(open);
+    for &b in bytes {
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'\\' => out.push_str("\\\\"),
+            b if b == open as u8 => {
+                out.push('\\');
+                out.push(b as char);
+            }
+            0x20..=0x7e => out.push(b as char),
+            other => out.push_str(&format!("\\x{:02x}", other)),
+        }
+    }
+    out.push(close);
+    out
+}
+
+impl PyToString for StrOrBytes {
+    fn py_str(self) -> String {
+        match self {
+            StrOrBytes::Str(s) => s,
+            StrOrBytes::Bytes(b) => py_bytes_repr(&b),
+        }
+    }
+}
+
+impl PyDisplay for StrOrBytes {
+    fn py_display(&self) -> String {
+        match self {
+            StrOrBytes::Str(s) => s.clone(),
+            StrOrBytes::Bytes(b) => py_bytes_repr(b),
+        }
+    }
+}
+
 /// A boxed heterogeneous Python value (issue #121): the runtime
 /// representation of wider unions that have no single concrete Rust type —
 /// `bool | str | None`, `tuple[str, str] | str | None`, `int | str | None`,
@@ -2484,6 +2568,56 @@ impl From<StrOrBytes> for PyValue {
 impl From<()> for PyValue {
     fn from(_: ()) -> Self {
         PyValue::None_
+    }
+}
+
+/// Python str() of a boxed heterogeneous value (issue #121): ints, floats,
+/// bools and None render as themselves; a str renders UNQUOTED; bytes use
+/// the `b'...'` repr form; tuple elements always render in REPR form
+/// (`str((1, 'a'))` == `"(1, 'a')"`).
+pub fn py_value_str(v: &PyValue) -> String {
+    match v {
+        PyValue::Int(i) => i.to_string(),
+        PyValue::Float(f) => py_float_repr(*f),
+        PyValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        PyValue::Str(s) => s.clone(),
+        PyValue::Bytes(b) => py_bytes_repr(b),
+        PyValue::Tuple(items) => {
+            let inner: Vec<String> = items.iter().map(py_value_repr).collect();
+            if inner.len() == 1 {
+                format!("({},)", inner[0])
+            } else {
+                format!("({})", inner.join(", "))
+            }
+        }
+        PyValue::None_ => "None".to_string(),
+    }
+}
+
+/// Python repr() of a boxed heterogeneous value: like [`py_value_str`],
+/// except a str renders QUOTED (`repr('s')` == `"'s'"`).
+pub fn py_value_repr(v: &PyValue) -> String {
+    match v {
+        PyValue::Str(s) => py_str_repr(s),
+        other => py_value_str(other),
+    }
+}
+
+impl PyToString for PyValue {
+    fn py_str(self) -> String {
+        py_value_str(&self)
+    }
+}
+
+impl PyDisplay for PyValue {
+    fn py_display(&self) -> String {
+        py_value_str(self)
+    }
+}
+
+impl PyRepr for PyValue {
+    fn py_repr(&self) -> String {
+        py_value_repr(self)
     }
 }
 

@@ -188,6 +188,12 @@ pub fn coerce_tokens(
         // Anything → PyValue (issue #121): a value stored into a boxed
         // union / Any slot wraps in PyValue::from (None via From<()>).
         (_, TypeInfo::PyValue) => Some(quote!(PyValue::from((#tokens)))),
+        // Anything → StrOrBytes (issue #121): the str | bytes union's
+        // heterogeneous slot converts via its From impls (&str, String,
+        // &[u8], Vec<u8>).
+        (_, TypeInfo::StrOrBytes) => {
+            Some(quote!(stdpython::StrOrBytes::from((#tokens))))
+        }
         _ => None,
     }
 }

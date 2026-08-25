@@ -2633,6 +2633,54 @@ fn regex_brace_patterns_and_slice_shapes_match_python_at_runtime() {
 }
 
 #[test]
+fn heterogeneous_union_annotations_match_python_at_runtime() {
+    // Issue #121: `str | bytes` lowers to StrOrBytes; wider boxable
+    // unions (`str | bytes | int | float`) to the boxed PyValue. Call
+    // sites coerce literals/typed values at the boundary. Verified
+    // against python3: tok / b'raw' / s / 7 (bytes str()s as b'raw').
+    let scratch = Scratch::new("hetero-union");
+    let file = scratch.path().join("u.py");
+    fs::write(
+        &file,
+        concat!(
+            "def auth_str(username: str | bytes) -> str:\n",
+            "    return str(username)\n",
+            "\n",
+            "def wide(v: str | bytes | int | float) -> str:\n",
+            "    return str(v)\n",
+            "\n",
+            "def main() -> int:\n",
+            "    print(auth_str(\"tok\"))\n",
+            "    print(auth_str(b\"raw\"))\n",
+            "    print(wide(\"s\"))\n",
+            "    print(wide(7))\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/u"))
+        .output()
+        .expect("running generated binary");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["tok", "b'raw'", "s", "7"],
+        "heterogeneous union lowering diverged from CPython"
+    );
+}
+
+#[test]
 fn isinstance_type_call_matches_python_at_runtime() {
     // Issue #134 (charset_normalizer): `isinstance(x, type(self))`
     // resolves `type(...)` to the statically-known class — true for the

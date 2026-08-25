@@ -849,6 +849,67 @@ fn tempfile_gettempdir_picks_first_usable_cpython_candidate() {
 }
 
 #[test]
+fn heterogeneous_union_values_str_repr_and_display() {
+    // Issue #121: str | bytes lowers to StrOrBytes and wider unions to
+    // the boxed PyValue. Python str()/repr() semantics, verified against
+    // python3 3.14:
+    //   str('s')=='s'; str(b'raw')=="b'raw'"; str(b"a'b")=='b"a\'b"'
+    //   (bytes repr switches to double quotes); non-printable bytes are
+    //   \xNN lowercase; str(7)=='7'; str(True)=='True'; str(3.5)=='3.5';
+    //   str(None)=='None'; str((1,'a'))=="(1, 'a')"; str((1,))=='(1,)';
+    //   repr('s')=="'s'".
+    use stdpython::{
+        py_bytes_repr, py_value_repr, py_value_str, PyValue, StrOrBytes,
+    };
+    let sb = |v: StrOrBytes| v.py_str();
+    assert_eq!(sb(StrOrBytes::from("s")), "s");
+    assert_eq!(sb(StrOrBytes::from(b"raw".as_slice())), "b'raw'");
+    assert_eq!(
+        sb(StrOrBytes::Bytes(vec![b'a', b'\'', b'b'])),
+        "b\"a'b\""
+    );
+    assert_eq!(
+        py_bytes_repr(&[0x00, 0x7f, 0x80, 0xff]),
+        "b'\\x00\\x7f\\x80\\xff'"
+    );
+
+    let pv = |v: &PyValue| py_value_str(v);
+    assert_eq!(pv(&PyValue::Int(7)), "7");
+    assert_eq!(pv(&PyValue::Float(3.5)), "3.5");
+    assert_eq!(pv(&PyValue::Bool(true)), "True");
+    assert_eq!(pv(&PyValue::Bool(false)), "False");
+    assert_eq!(pv(&PyValue::Str("s".into())), "s");
+    assert_eq!(
+        pv(&PyValue::Bytes(vec![b'r', b'a', b'w'])),
+        "b'raw'"
+    );
+    assert_eq!(pv(&PyValue::None_), "None");
+    assert_eq!(
+        pv(&PyValue::Tuple(std::sync::Arc::new(vec![
+            PyValue::Int(1),
+            PyValue::Str("a".into()),
+        ]))),
+        "(1, 'a')"
+    );
+    assert_eq!(
+        pv(&PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]))),
+        "(1,)"
+    );
+
+    // repr quotes strs; every other member matches its str form.
+    assert_eq!(py_value_repr(&PyValue::Str("s".into())), "'s'");
+    assert_eq!(py_value_repr(&PyValue::Int(7)), "7");
+
+    // print() uses the same rendering as str().
+    use stdpython::PyDisplay;
+    assert_eq!(PyDisplay::py_display(&StrOrBytes::from("s")), "s");
+    assert_eq!(
+        PyDisplay::py_display(&PyValue::Bytes(vec![b'r', b'a', b'w'])),
+        "b'raw'"
+    );
+}
+
+#[test]
 fn exception_matching_walks_the_cpython_hierarchy() {
     // Python: `except X:` catches raised type E iff X is E or an ancestor
     // of E. Verified against python3 3.14 by raising each leaf under its
