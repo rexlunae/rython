@@ -1606,6 +1606,15 @@ impl PyInt for i64 {
     }
 }
 
+impl PyInt for u8 {
+    // A bytes element (`data[i]`) is a `u8` in the value model, but in
+    // Python it is already an int — so `int(data[i])` is the identity
+    // conversion, widening the byte into the program's int type.
+    fn py_int(self) -> Result<i64, PyException> {
+        Ok(self as i64)
+    }
+}
+
 // PyFloat implementations
 impl PyFloat for &str {
     fn py_float(self) -> Result<f64, PyException> {
@@ -4351,6 +4360,34 @@ impl<T: Clone> PyMul<i64> for Vec<T> {
             out.extend_from_slice(self);
         }
         out
+    }
+}
+
+// String repetition: `"ab" * 3` == "ababab", a non-positive count is ""
+// (exactly like list * int). Both operand orders, and both string flavors
+// on the left, so annotated params and inferred generics alike resolve.
+impl PyMul<i64> for String {
+    type Output = String;
+    fn py_mul(&self, rhs: &i64) -> String {
+        self.repeat((*rhs).max(0) as usize)
+    }
+}
+impl PyMul<i64> for &str {
+    type Output = String;
+    fn py_mul(&self, rhs: &i64) -> String {
+        self.repeat((*rhs).max(0) as usize)
+    }
+}
+impl PyMul<String> for i64 {
+    type Output = String;
+    fn py_mul(&self, rhs: &String) -> String {
+        rhs.repeat((*self).max(0) as usize)
+    }
+}
+impl PyMul<&str> for i64 {
+    type Output = String;
+    fn py_mul(&self, rhs: &&str) -> String {
+        rhs.repeat((*self).max(0) as usize)
     }
 }
 

@@ -37,6 +37,17 @@ sort stability, and exception messages all match — and the end-to-end test
 suite diffs generated-binary output line for line against pinned
 transcripts of real `python3` runs.
 
+## Examples
+
+The [`examples/`](examples) directory holds worked, verified examples:
+a Rust binary with a module written in Python ([classes and
+inheritance through `python_module!`](examples/01-rust-with-python-module)),
+[GPU-ready numpy compute](examples/02-gpu-numpy), [Linux kernel modules
+from Python](examples/03-kernel-module), a [Python→Rust conversion
+walkthrough with the generated crate checked in](examples/04-python-to-rust),
+and [`rypip install`](examples/05-rypip-install) turning a
+`pyproject.toml` package into a native binary.
+
 ## Documentation
 
 - [Goals and design](docs/goals-and-design.md) — what Rython is, goals,

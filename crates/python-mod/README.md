@@ -35,12 +35,7 @@ Add this to your `Cargo.toml`:
 python-mod = "1.0.0"
 ```
 
-**Important**: This crate requires nightly Rust due to the use of experimental procedural macro features.
-
-```bash
-rustup install nightly
-rustup default nightly
-```
+The crate builds on stable Rust (see the workspace's `rust-toolchain.toml`).
 
 ## Quick Start
 
@@ -172,27 +167,21 @@ fn example() {
 Currently, Rython supports a limited subset of Python syntax:
 
 ### ✅ Supported
-- Function definitions (`def`)
-- Return statements
-- Basic arithmetic operations (`+`, `-`, `*`, `/`)
-- Variable assignments
-- Constants
-- Basic control flow (`if`, `else`)
-- Recursive functions
-- String operations
-- Integer and float literals
-
-### ⚠️ Limited/Experimental
-- List operations
-- Dictionary operations
-- Loop constructs
+- Function definitions (`def`), with parameter type inference for
+  unannotated parameters
+- Classes, single inheritance, `super()`, overridden methods
+- Control flow including `try`/`except`/`finally`, loops, comprehensions
+- f-strings, string/list/dict/set methods
+- A growing standard library (see the repo README and `docs/spec.md`)
 
 ### ❌ Not Yet Supported
-- Classes and objects
-- Imports
-- Exception handling
-- Advanced Python features
-- Most of the Python standard library
+- Generators/`yield`, `async`/`await` in this macro context,
+  `*args`/`**kwargs`, multiple inheritance, `eval`/`exec`
+
+The authoritative list of the accepted subset (and every known
+divergence) is [`docs/spec.md`](../../docs/spec.md) in the repository;
+see [`examples/01-rust-with-python-module`](../../examples/01-rust-with-python-module)
+for a worked example with classes and inheritance.
 
 ## File Structure
 
@@ -284,7 +273,7 @@ cargo test --test edge_case_tests     # Edge cases and boundaries
 
 ### Contributing
 
-1. Ensure you're using nightly Rust
+1. Use the toolchain pinned by the workspace's `rust-toolchain.toml`
 2. Run the full test suite: `cargo test`
 3. Add tests for new functionality
 4. Update documentation as needed
@@ -304,8 +293,8 @@ Python Source → python-ast → Rust AST → TokenStream → Rust Module
 
 ## Limitations
 
-- **Nightly Rust Required**: Uses experimental proc-macro features
-- **Limited Python Subset**: Only basic Python constructs are supported
+- **Limited Python Subset**: only the rython subset is accepted, and
+  anything outside it is a loud compile-time error
 - **Compile-time Only**: Python code is translated at build time, not runtime
 - **No Python Runtime**: Generated code is pure Rust, no Python interpreter needed
 

@@ -398,6 +398,7 @@ pub fn collect_called_params(
         visiting: HashSet::new(),
         return_visiting: HashSet::new(),
         loop_elements: HashMap::new(),
+        literal_locals: HashMap::new(),
     };
     collector.walk(body);
     collector.called_params
@@ -523,6 +524,7 @@ pub fn infer_unannotated_signature(
         visiting: HashSet::new(),
         return_visiting: HashSet::new(),
         loop_elements: HashMap::new(),
+        literal_locals: HashMap::new(),
     };
     if let Some(f) = &current_fn {
         collector.visiting.insert(f.clone());
@@ -624,18 +626,66 @@ pub fn infer_unannotated_signature(
         }
     }
     generic_params.retain(|p| !forced_elements.contains(*p));
+
+    // Parameters RETURNED as bare values (or as the arms of a returned
+    // conditional) must share ONE type: Python may return either, but a
+    // rython value has exactly one type — so their type variables unify
+    // (`clamp(value, low, high)` returning any of the three gets one `T`)
+    // instead of boxing the return to PyValue.
+    let mut same_as: HashMap<String, String> = HashMap::new();
+    {
+        let mut returned: Vec<String> = Vec::new();
+        let mut candidates: Vec<&ExprType> = Vec::new();
+        for ret in &collector.returns {
+            match ret {
+                ExprType::IfExp(ie) => {
+                    candidates.push(&ie.body);
+                    candidates.push(&ie.orelse);
+                }
+                other => candidates.push(other),
+            }
+        }
+        for e in candidates {
+            if let ExprType::Name(n) = e {
+                let root = collector.alias_root_of(&n.id);
+                if generic_params.iter().any(|p| **p == root)
+                    && !returned.contains(&root)
+                {
+                    returned.push(root);
+                }
+            }
+        }
+        if returned.len() >= 2 {
+            let rep = returned[0].clone();
+            for m in &returned[1..] {
+                same_as.insert(m.clone(), rep.clone());
+            }
+        }
+    }
+
     let mut tv_names: HashMap<String, String> = HashMap::new();
     let mut type_params = Vec::new();
     let mut param_types = HashMap::new();
-    if generic_params.len() == 1 {
-        tv_names.insert(generic_params[0].clone(), "T".to_string());
+    let unique_generics: Vec<&String> = generic_params
+        .iter()
+        .filter(|p| !same_as.contains_key(**p))
+        .cloned()
+        .collect();
+    if unique_generics.len() == 1 {
+        tv_names.insert(unique_generics[0].clone(), "T".to_string());
         type_params.push(quote!(T));
     } else {
-        for (i, name) in generic_params.iter().enumerate() {
+        for (i, name) in unique_generics.iter().enumerate() {
             let tv = format!("{}", (b'A' + i as u8) as char);
             tv_names.insert((*name).clone(), tv.clone());
             let ident = quote::format_ident!("{}", tv);
             type_params.push(quote!(#ident));
+        }
+    }
+    // Unified members share their representative's type variable.
+    for (member, rep) in &same_as {
+        if let Some(tv) = tv_names.get(rep).cloned() {
+            tv_names.insert(member.clone(), tv);
         }
     }
     for name in &all_params {
@@ -709,21 +759,33 @@ pub fn infer_unannotated_signature(
                 }
                 ParamReq::PyFromInt => quote!(#tv: PyFromInt),
                 ParamReq::Iterate(elt) => {
-                    let elt_tv = tv_names.get(elt).ok_or_else(|| {
-                        format!("internal: loop element `{elt}` has no type variable")
-                    })?;
-                    let elt_ident = quote::format_ident!("{}", elt_tv);
-                    quote!(#tv: IntoIterator<Item = #elt_ident>)
+                    // An identity-forced element (a literal-seeded local
+                    // assigned the element value) has no type variable —
+                    // the Item is its concrete type.
+                    if let Some(concrete) = identity_types.get(elt) {
+                        quote!(#tv: IntoIterator<Item = #concrete>)
+                    } else {
+                        let elt_tv = tv_names.get(elt).ok_or_else(|| {
+                            format!("internal: loop element `{elt}` has no type variable")
+                        })?;
+                        let elt_ident = quote::format_ident!("{}", elt_tv);
+                        quote!(#tv: IntoIterator<Item = #elt_ident>)
+                    }
                 }
                 ParamReq::IterateTuple(elts) => {
-                    let mut idents = Vec::new();
+                    let mut parts = Vec::new();
                     for e in elts {
-                        let e_tv = tv_names.get(e).ok_or_else(|| {
-                            format!("internal: loop element `{e}` has no type variable")
-                        })?;
-                        idents.push(quote::format_ident!("{}", e_tv));
+                        if let Some(concrete) = identity_types.get(e) {
+                            parts.push(concrete.clone());
+                        } else {
+                            let e_tv = tv_names.get(e).ok_or_else(|| {
+                                format!("internal: loop element `{e}` has no type variable")
+                            })?;
+                            let ident = quote::format_ident!("{}", e_tv);
+                            parts.push(quote!(#ident));
+                        }
                     }
-                    quote!(#tv: IntoIterator<Item = (#(#idents),*)>)
+                    quote!(#tv: IntoIterator<Item = (#(#parts),*)>)
                 }
                 ParamReq::AsRefStr => quote!(#tv: AsRef<str>),
                 ParamReq::Conversion(trait_name) => {
@@ -785,6 +847,25 @@ pub fn infer_unannotated_signature(
         if use_counts.get(*name).copied().unwrap_or(0) > 1 {
             where_bounds.push(quote!(#tv: Clone));
         }
+    }
+    // CHAINED operator bounds: an operator whose operand is itself an
+    // operator result (`a + (b - a) * t`) needs where-bounds on the
+    // intermediate Outputs (`<B as PySub<A>>::Output: PyMul<C>`), which
+    // rustc will not invent. Walk each returned expression and emit a
+    // bound per operator application that involves a type variable.
+    {
+        let tv_set: HashSet<String> = tv_names.values().cloned().collect();
+        let returns = collector.returns.clone();
+        for ret in &returns {
+            collect_op_bounds(ret, &mut collector, &param_types, &tv_set, &mut where_bounds);
+        }
+    }
+
+    // Unified type variables can produce identical bounds from different
+    // members (`T: Clone` from both `value` and `low`): dedupe globally.
+    {
+        let mut seen_global = HashSet::new();
+        where_bounds.retain(|b| seen_global.insert(b.to_string()));
     }
 
     // Parameters with stdlib-method uses, and the duck-typed user-method
@@ -967,6 +1048,80 @@ fn unify_tuple_returns(a: &TokenStream, b: &TokenStream) -> Option<TokenStream> 
     let joined = merged.join(" , ");
     let tokens: TokenStream = joined.parse().ok()?;
     Some(quote!((#tokens)))
+}
+
+/// Emit a where-bound for every operator application inside a RETURNED
+/// expression tree whose operands involve a type variable: `a + (b - a) *
+/// t` needs `B: PySub<A>`, `<B as PySub<A>>::Output: PyMul<C>`, and
+/// `A: PyAdd<...>` — bounds the signature must state for the composed
+/// return type to be well-formed. Bounds on purely concrete operands are
+/// skipped; duplicates are deduped by the caller.
+fn collect_op_bounds(
+    expr: &ExprType,
+    collector: &mut Collector,
+    param_types: &HashMap<String, TokenStream>,
+    tv_set: &HashSet<String>,
+    out: &mut Vec<TokenStream>,
+) {
+    let involves_tv = |ts: &TokenStream| {
+        ts.to_string()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|tok| tv_set.contains(tok))
+    };
+    match expr {
+        ExprType::BinOp(b) => {
+            collect_op_bounds(&b.left, collector, param_types, tv_set, out);
+            collect_op_bounds(&b.right, collector, param_types, tv_set, out);
+            // Bitwise/shift ops are integer-only (i64) — no bound needed.
+            if matches!(
+                b.op,
+                BinOps::LShift
+                    | BinOps::RShift
+                    | BinOps::BitOr
+                    | BinOps::BitXor
+                    | BinOps::BitAnd
+            ) {
+                return;
+            }
+            let Some(trait_name) = bin_op_trait(&b.op) else { return };
+            let Ok(mut left) = return_type_of(&b.left, collector, param_types) else {
+                return;
+            };
+            let Ok(mut right) = return_type_of(&b.right, collector, param_types)
+            else {
+                return;
+            };
+            if left.to_string() == "& str" {
+                left = quote!(String);
+            }
+            if right.to_string() == "& str" {
+                right = quote!(String);
+            }
+            if !involves_tv(&left) && !involves_tv(&right) {
+                return;
+            }
+            if left.to_string().contains("PyValue")
+                || right.to_string().contains("PyValue")
+            {
+                return;
+            }
+            let t = quote::format_ident!("{}", trait_name);
+            out.push(quote!(#left: #t<#right>));
+        }
+        ExprType::IfExp(e) => {
+            collect_op_bounds(&e.body, collector, param_types, tv_set, out);
+            collect_op_bounds(&e.orelse, collector, param_types, tv_set, out);
+        }
+        ExprType::UnaryOp(u) => {
+            collect_op_bounds(&u.operand, collector, param_types, tv_set, out);
+        }
+        ExprType::Tuple(t) => {
+            for e in &t.elts {
+                collect_op_bounds(e, collector, param_types, tv_set, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The return type expression for one return value, in terms of the type
@@ -1974,6 +2129,7 @@ fn callee_return_type(
             visiting: HashSet::new(),
             return_visiting: collector.return_visiting.clone(),
             loop_elements: HashMap::new(),
+            literal_locals: HashMap::new(),
         };
         let mut inferred: Option<TokenStream> = None;
         for ret in &returns {
@@ -2462,6 +2618,7 @@ pub fn check_call_sites(
         visiting: HashSet::new(),
         return_visiting: HashSet::new(),
         loop_elements: HashMap::new(),
+        literal_locals: HashMap::new(),
     };
     collector.walk(body);
     match collector.error {
@@ -2629,12 +2786,86 @@ struct Collector<'a> {
     /// Loop variables bound by `for x in p` over an unannotated parameter
     /// (or an alias of one): element name → the parameter it iterates (M2).
     loop_elements: HashMap<String, String>,
+    /// Locals seeded from a LITERAL (`best = ""` → String, `count = 0` →
+    /// i64): when such a local is later assigned a parameter/element value
+    /// (`best = w`), the local must keep ONE type, so the literal's
+    /// concrete type identity-forces the source — `longest(words)` with a
+    /// `best = ""` accumulator concretizes the element to String instead
+    /// of generating a generic that cannot unify with the seed.
+    literal_locals: HashMap<String, TokenStream>,
+}
+
+/// The concrete Rust type a LITERAL seed pins a local to (`best = ""` →
+/// String, `count = 0` → i64, `x = -1.5` → f64), or None for a non-literal.
+/// f-strings count as string literals; unary minus wraps a numeric literal.
+fn literal_concrete_type(e: &ExprType) -> Option<TokenStream> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(_)) => Some(quote!(String)),
+            Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+            Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
+            Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
+            _ => None,
+        },
+        ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => Some(quote!(String)),
+        ExprType::UnaryOp(u)
+            if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) =>
+        {
+            match u.operand.as_ref() {
+                ExprType::Constant(c) => match &c.0 {
+                    Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+                    Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 impl<'a> Collector<'a> {
     fn add(&mut self, param: &str, req: ParamReq) {
         if self.unannotated.contains(param) {
             self.reqs.entry(param.to_string()).or_default().push(req);
+        }
+    }
+
+    /// Follow the alias chain (`best = w`, `w` the loop element of `words`)
+    /// to the underlying parameter or element name.
+    fn alias_root_of(&self, name: &str) -> String {
+        let mut cur = name.to_string();
+        let mut hops = 0;
+        while let Some(next) = self.alias.get(&cur) {
+            cur = next.clone();
+            hops += 1;
+            if hops > 32 {
+                break;
+            }
+        }
+        cur
+    }
+
+    /// The parameter/element roots of bare Names inside an ARITHMETIC
+    /// expression (recursing through BinOp/UnaryOp only — a Call operand
+    /// like `len(w)` has its own result type and must not force `w`),
+    /// excluding `exclude` (the accumulator itself).
+    fn arithmetic_name_roots(&self, e: &ExprType, exclude: &str, out: &mut Vec<String>) {
+        match e {
+            ExprType::Name(n) if n.id != exclude => {
+                let root = self.alias_root_of(&n.id);
+                if self.unannotated.contains(&root) {
+                    out.push(root);
+                }
+            }
+            ExprType::BinOp(b) => {
+                self.arithmetic_name_roots(&b.left, exclude, out);
+                self.arithmetic_name_roots(&b.right, exclude, out);
+            }
+            ExprType::UnaryOp(u) => {
+                self.arithmetic_name_roots(&u.operand, exclude, out);
+            }
+            _ => {}
         }
     }
 
@@ -2663,6 +2894,19 @@ impl<'a> Collector<'a> {
                                 || self.alias.contains_key(&src.id));
                         if aliases_param {
                             if let ExprType::Name(src) = &a.value {
+                                // A local seeded from a LITERAL (`best =
+                                // ""`) that is now assigned a parameter or
+                                // loop-element value (`best = w`) keeps ONE
+                                // type: the seed's concrete type identity-
+                                // forces the source, concretizing the
+                                // element instead of emitting a generic
+                                // that cannot unify with the seed.
+                                if let Some(ty) =
+                                    self.literal_locals.get(&target.id).cloned()
+                                {
+                                    let root = self.alias_root_of(&src.id);
+                                    self.add(&root, ParamReq::Identity(ty));
+                                }
                                 self.alias.insert(target.id.clone(), src.id.clone());
                             }
                         } else if self.unannotated.contains(&target.id) {
@@ -2746,6 +2990,36 @@ impl<'a> Collector<'a> {
                             } else {
                                 self.reassigned.insert(target.id.clone());
                             }
+                        } else if let Some(ty) = literal_concrete_type(&a.value) {
+                            // A LITERAL store to a plain local: remember the
+                            // seed type. If the local already aliases a
+                            // parameter/element (`best = w` then `best =
+                            // ""`), the mixed local forces the source to
+                            // the literal's concrete type, same as the
+                            // seed-then-alias order above.
+                            if self.alias.contains_key(&target.id) {
+                                let root = self.alias_root_of(&target.id);
+                                self.add(&root, ParamReq::Identity(ty.clone()));
+                            }
+                            self.literal_locals.insert(target.id.clone(), ty);
+                        } else if let Some(seed) =
+                            self.literal_locals.get(&target.id).cloned()
+                        {
+                            // A literal-seeded ACCUMULATOR (`s = 0; s = s +
+                            // x`): the local keeps one type, so parameter/
+                            // element operands of the arithmetic are forced
+                            // to the seed's concrete type.
+                            if matches!(&a.value, ExprType::BinOp(_)) {
+                                let mut roots = Vec::new();
+                                self.arithmetic_name_roots(
+                                    &a.value,
+                                    &target.id,
+                                    &mut roots,
+                                );
+                                for r in roots {
+                                    self.add(&r, ParamReq::Identity(seed.clone()));
+                                }
+                            }
                         }
                     }
                     // Subscript stores mutate the container: `p[i] = v`.
@@ -2782,6 +3056,16 @@ impl<'a> Collector<'a> {
                     if let ExprType::Name(n) = &a.target {
                         if let Some(t) = op_trait {
                             self.add(&n.id, ParamReq::Op(t, self.rhs_of(&a.value)));
+                        }
+                        // `s += x` on a literal-seeded LOCAL: same as
+                        // `s = s + x` — the accumulator keeps its seed
+                        // type, forcing param/element operands to it.
+                        if let Some(seed) = self.literal_locals.get(&n.id).cloned() {
+                            let mut roots = Vec::new();
+                            self.arithmetic_name_roots(&a.value, &n.id, &mut roots);
+                            for r in roots {
+                                self.add(&r, ParamReq::Identity(seed.clone()));
+                            }
                         }
                     } else if let ExprType::Subscript(s) = &a.target {
                         if let ExprType::Name(n) = s.value.as_ref() {
@@ -3943,6 +4227,7 @@ impl<'a> Collector<'a> {
             visiting: self.visiting.clone(),
             return_visiting: self.return_visiting.clone(),
             loop_elements: HashMap::new(),
+            literal_locals: HashMap::new(),
         };
         inner.walk(&callee.body);
         let inner_error = inner.error.clone();

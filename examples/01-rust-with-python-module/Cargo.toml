@@ -1,0 +1,18 @@
+# A plain Rust binary whose geometry code is written in Python and
+# compiled to Rust at build time by the `python_module!` proc-macro.
+#
+# The two path dependencies are all a downstream project needs:
+#   - python-mod:  the proc-macro that compiles src/*.py at build time
+#   - stdpython:   the Python-semantics runtime the generated code calls into
+[package]
+name = "rust-with-python-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+python-mod = { path = "../../crates/python-mod" }
+stdpython = { path = "../../crates/stdpython" }
+
+# Standalone crate: keep this example out of the rython workspace.
+[workspace]

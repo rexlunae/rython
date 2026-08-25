@@ -1,0 +1,10 @@
+# An ordinary PEP 621 Python package. `rypip install` reads this
+# metadata, converts the package to a Rust crate, builds it in release
+# mode, and installs the native binary where cargo installs binaries.
+[project]
+name = "linetool"
+version = "0.1.0"
+description = "wc-style line/word/char counter, installed as a native binary by rypip"
+
+[tool.setuptools]
+packages = ["linetool"]
