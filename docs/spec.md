@@ -128,6 +128,9 @@ declaration — loud, but at the wrong layer (§12.1).
 | `frozenset[T]` | `std::collections::HashSet<T>` (as an annotation) | The `frozenset(iterable)` *call* produces the distinct runtime type `FrozenSet<T>`; empty `frozenset()` is a loud error |
 | `tuple` (literal) | Rust tuple `(A, B, …)` | There is no `tuple[…]` annotation mapping; tuples exist structurally |
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
+| `bytes \| bytearray` | `Vec<u8>` | Members mapping to the same Rust type collapse to it |
+| `str \| bytes` (and `\| bytearray`) | `stdpython::StrOrBytes` | Heterogeneous pair; narrowed by `is_str()`/`is_bytes()`; `str()`/`print()` render bytes in their `b'...'` repr form |
+| any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. Operators on a boxed value are not modeled — they fail the build loudly rather than guessing |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
 
 Dict keys normalize `&str → String`, so `{"a": 1}` is `PyDict<String, i64>`
