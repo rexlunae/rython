@@ -1914,27 +1914,17 @@ impl<'a> CodeGen for Call {
                                     .map(str::to_string),
                                 ExprType::Name(n) => {
                                     // A user-class instance resolves through
-                                    // name_types; builtin type objects (int,
-                                    // str, ...) act as their own class names.
+                                    // name_types. A BUILTIN type name (int,
+                                    // str, ...) acts as its own class name —
+                                    // detected via the single authoritative
+                                    // annotation mapping rather than a
+                                    // parallel string list.
                                     match options.name_types.get(&n.id) {
                                         Some(crate::TypeInfo::Class(cname)) => {
                                             Some(cname.clone())
                                         }
-                                        _ => matches!(
-                                            n.id.as_str(),
-                                            "int"
-                                                | "str"
-                                                | "float"
-                                                | "bool"
-                                                | "bytes"
-                                                | "bytearray"
-                                                | "list"
-                                                | "tuple"
-                                                | "set"
-                                                | "dict"
-                                                | "frozenset"
-                                        )
-                                        .then(|| n.id.clone()),
+                                        _ => crate::ast::tree::type_ctx::is_builtin_type_annotation(&ExprType::Name(n.clone()))
+                                            .then(|| n.id.clone()),
                                     }
                                 }
                                 _ => None,
