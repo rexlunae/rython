@@ -359,7 +359,7 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                     return Some(quote!(socket::Socket));
                 }
             }
-            let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "np" || n.id == "numpy");
+            let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if crate::is_numpy_alias(&n.id));
             if !is_np {
                 return None;
             }

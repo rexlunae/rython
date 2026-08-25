@@ -8,45 +8,11 @@ use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableNode, SymbolTable
 
 /// Python stdlib modules that the stdpython runtime crate provides. Imports
 /// of these resolve under the runtime crate; anything else is assumed to be
-/// a sibling module of the generated crate.
+/// a sibling module of the generated crate. The name set lives in the
+/// [`crate::StdModule`] enum (the boundary-parse rule); this is the
+/// convenience wrapper the many call sites keep using.
 pub(crate) fn is_stdpython_module(name: &str) -> bool {
-    matches!(
-        name,
-        "os" | "sys"
-            | "re"
-            | "io"
-            | "argparse"
-            | "json"
-            | "math"
-            | "random"
-            | "datetime"
-            | "time"
-            | "collections"
-            | "itertools"
-            | "functools"
-            | "heapq"
-            | "copy"
-            | "textwrap"
-            | "hashlib"
-            | "csv"
-            | "glob"
-            | "pathlib"
-            | "tempfile"
-            | "subprocess"
-            | "string"
-            | "sysconfig"
-            | "venv"
-            | "warnings"
-            | "numpy"
-            // asyncio lives on the tokio-backed `async-tokio` stdpython
-            // feature; generated async binaries enable it.
-            | "asyncio"
-            | "threading"
-            | "socket"
-            // urllib.request lives on the ureq-backed `http-ureq` stdpython
-            // feature; rypip enables it when a package imports it.
-            | "urllib"
-    )
+    crate::StdModule::from_name(name).is_some()
 }
 
 /// Whether a TYPE-CHECKING import of `name` from the stdpython module
@@ -55,15 +21,19 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
 /// `io.BufferedWriter` — requests' utils.py — is only an annotation; the
 /// runtime `io` has no BufferedWriter, so the use would fail E0432).
 pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
+    use crate::StdModule;
+    let Some(module) = StdModule::from_name(module) else {
+        return false;
+    };
     match module {
-        "io" => matches!(name, "StringIO" | "BytesIO"),
+        StdModule::Io => matches!(name, "StringIO" | "BytesIO"),
         // The type names come from the ThreadingType enum (one source of
         // truth); current_thread/active_count are module functions.
-        "threading" => {
+        StdModule::Threading => {
             crate::ThreadingType::from_name(name).is_some()
                 || matches!(name, "current_thread" | "active_count")
         }
-        "socket" => matches!(
+        StdModule::Socket => matches!(
             name,
             "socket"
                 | "gethostname"
@@ -76,12 +46,12 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         // URLError/HTTPError are string-tagged exceptions matched by name
         // (no runtime item), so `from urllib.error import URLError` drops
         // with the annotation-only warning — except matching still works.
-        "urllib" => matches!(name, "request" | "urlopen"),
-        "collections" => {
+        StdModule::Urllib => matches!(name, "request" | "urlopen"),
+        StdModule::Collections => {
             matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
         }
-        "re" => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "IGNORECASE"),
-        "itertools" => matches!(
+        StdModule::Re => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "IGNORECASE"),
+        StdModule::Itertools => matches!(
             name,
             "accumulate"
                 | "product"
@@ -102,19 +72,19 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "starmap"
                 | "compress"
         ),
-        "functools" => matches!(name, "reduce" | "partial" | "lru_cache" | "cache"),
-        "hashlib" => {
+        StdModule::Functools => matches!(name, "reduce" | "partial" | "lru_cache" | "cache"),
+        StdModule::Hashlib => {
             matches!(name, "md5" | "sha1" | "sha256" | "sha512" | "new")
         }
-        "json" => matches!(name, "dumps" | "loads" | "load" | "dump"),
-        "datetime" => matches!(
+        StdModule::Json => matches!(name, "dumps" | "loads" | "load" | "dump"),
+        StdModule::Datetime => matches!(
             name,
             "datetime" | "date" | "time" | "timedelta" | "timezone"
         ),
         // os: enumerated — the runtime module has these (and only these);
         // anything else (`from os import PathLike` — annotation-only)
         // drops loudly and maps to the boxed PyValue.
-        "os" => matches!(
+        StdModule::Os => matches!(
             name,
             "chdir"
                 | "environ"
@@ -145,10 +115,26 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "splitext"
                 | "path"
         ),
-        "sys" | "time" | "math" | "random" | "warnings" | "tempfile"
-        | "textwrap" | "heapq" | "copy" | "string" | "glob" | "pathlib"
-        | "csv" | "subprocess" | "sysconfig" | "argparse" | "venv" => true,
-        _ => false,
+        StdModule::Sys
+        | StdModule::Time
+        | StdModule::Math
+        | StdModule::Random
+        | StdModule::Warnings
+        | StdModule::Tempfile
+        | StdModule::Textwrap
+        | StdModule::Heapq
+        | StdModule::Copy
+        | StdModule::String
+        | StdModule::Glob
+        | StdModule::Pathlib
+        | StdModule::Csv
+        | StdModule::Subprocess
+        | StdModule::Sysconfig
+        | StdModule::Argparse
+        | StdModule::Venv => true,
+        // numpy and asyncio have no from-import item registry: their
+        // names resolve through the module paths only.
+        StdModule::Numpy | StdModule::Asyncio => false,
     }
 }
 
@@ -291,34 +277,11 @@ fn is_type_name_tuple_alias(
     false
 }
 
-/// Runtime modules that only exist on stdpython's std tier: they touch the
-/// OS (or, for math, std's float intrinsics), so the no_std profile has
-/// nothing to lower them to. json/string/collections/itertools live on the
-/// alloc tier and stay importable — and io does too: its in-memory
-/// StringIO/BytesIO buffers are pure alloc (`open()` and disk files stay
-/// std-only, guarded separately).
+/// Runtime modules that only exist on stdpython's std tier — a property
+/// of [`crate::StdModule`], never a second name list that could drift
+/// from the module set.
 pub(crate) fn is_std_only_module(name: &str) -> bool {
-    matches!(
-        name,
-        "os" | "sys"
-            | "re"
-            | "argparse"
-            | "math"
-            | "random"
-            | "datetime"
-            | "time"
-            | "glob"
-            | "pathlib"
-            | "tempfile"
-            | "subprocess"
-            | "sysconfig"
-            | "venv"
-            | "numpy"
-            | "asyncio"
-            | "threading"
-            | "socket"
-            | "urllib"
-    )
+    crate::StdModule::from_name(name).is_some_and(|m| m.is_std_only())
 }
 
 /// The conversion-time error for a std-tier import under the no_std
