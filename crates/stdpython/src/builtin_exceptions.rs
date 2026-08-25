@@ -110,11 +110,6 @@ pub(crate) fn direct_exception_parent(exc: &str) -> Option<&'static str> {
         .and_then(|(_, parent)| *parent)
 }
 
-/// Whether `exc` names a built-in exception (the root included).
-pub(crate) fn is_builtin_exception(exc: &str) -> bool {
-    BUILTIN_EXCEPTION_PARENTS.iter().any(|(name, _)| *name == exc)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,9 +271,12 @@ fn every_builtin_except_the_pyo3_gaps_has_a_ctor() {
             "{name} has no PyO3 constructor"
         );
     }
+    // A ctor name is listed iff it resolves in the tree (BaseException,
+    // the root, has no parent entry but still counts via exact match in
+    // matches()).
     for (name, _) in PYO3_CTORS {
         assert!(
-            is_builtin_exception(name),
+            direct_exception_parent(name).is_some() || *name == "BaseException",
             "{name} has a ctor but is not in the parent table"
         );
     }
