@@ -2696,6 +2696,58 @@ fn slice_assignment_is_a_loud_error() {
 }
 
 #[test]
+fn nonself_receiver_is_renamed_through_the_body_and_nested_scopes() {
+    // Python binds the instance to the FIRST parameter whatever its name
+    // (issue #132, boto3's factory_self): body references rename to the
+    // Rust `self` receiver — including through a nested function that
+    // captures it — while a nested function binding its OWN receiver
+    // keeps its scope untouched.
+    let out = compile(
+        concat!(
+            "class W:\n",
+            "    def __init__(self, base: int):\n",
+            "        self.base = base\n",
+            "\n",
+            "    def scale(factory_self, times: int) -> int:\n",
+            "        def twice():\n",
+            "            return 2\n",
+            "        return (factory_self.base * times) + twice()\n",
+            "\n",
+            "    @staticmethod\n",
+            "    def make_inner(self_arg: int) -> int:\n",
+            "        return self_arg\n",
+        ),
+        "recvrename.py",
+    );
+    assert!(
+        !out.contains("factory_self"),
+        "receiver references must be renamed to self: {out}"
+    );
+    // The renamed receiver flows through normal method lowering.
+    assert!(out.contains("self . base"), "generated: {out}");
+    // The nested staticmethod's own first parameter is ITS receiver-name
+    // binding: its body must not be rewritten to a `self` that does not
+    // exist in an associated fn.
+    let make_fn = out.split("fn make_inner").nth(1).expect("make_inner");
+    assert!(make_fn.contains("self_arg"), "generated: {}", out);
+}
+
+#[test]
+fn rebinding_a_nonself_receiver_is_a_loud_error() {
+    // Python would rebind the local reference; rython's receiver is an
+    // immutable &self, so the reassignment has no lowering — loud error
+    // instead of silently different codegen.
+    let err = compile_err(
+        "class W:\n    def m(factory_self):\n        factory_self = 3\n        return factory_self\n",
+        "recvrebind.py",
+    );
+    assert!(
+        err.contains("rebinds its receiver"),
+        "err: {err}"
+    );
+}
+
+#[test]
 fn keyword_arguments_map_to_parameter_positions() {
     let src = concat!(
         "def volume(w: int, h: int, d: int) -> int:\n",

@@ -49,6 +49,7 @@ pub mod list_comp;
 pub use list_comp::*;
 
 pub mod parameters;
+pub mod rename;
 pub use parameters::*;
 
 pub mod name;
