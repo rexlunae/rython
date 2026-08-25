@@ -931,6 +931,27 @@ impl FunctionDef {
                     ) {
                         known.insert(param.arg.clone(), ann.id.clone());
                     }
+                    // A bare threading type name (`lock: Lock` under
+                    // `from threading import Lock`): record the dotted
+                    // form, so `with lock:` on the parameter lowers to
+                    // the RAII guard (the with-statement classifier
+                    // consults local_types).
+                    if crate::ThreadingType::from_name(&ann.id).is_some()
+                        && matches!(
+                            symbols.get(&ann.id),
+                            Some(crate::SymbolTableNode::ImportFrom(i)) if i.module == "threading"
+                        )
+                    {
+                        known.insert(param.arg.clone(), format!("threading.{}", ann.id));
+                    }
+                }
+                // A dotted threading annotation (`lock: threading.Lock`):
+                // same recording as above.
+                if let Some(ExprType::Attribute(ann)) = param.annotation.as_deref()
+                    && matches!(ann.value.as_ref(), ExprType::Name(m) if m.id == "threading")
+                    && crate::ThreadingType::from_name(&ann.attr).is_some()
+                {
+                    known.insert(param.arg.clone(), format!("threading.{}", ann.attr));
                 }
                 // `bytes | bytearray` (a same-Rust-type union) is the "raw
                 // sequence" idiom: record it as bytes so isinstance checks

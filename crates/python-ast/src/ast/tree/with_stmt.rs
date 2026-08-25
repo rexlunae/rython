@@ -9,15 +9,20 @@ use crate::{
 };
 
 /// Whether a with-item's context expression is a threading synchronization
-/// object (Lock/RLock/Semaphore) — either constructed inline
-/// (`with threading.Lock():`) or a name assigned from such a construction.
-/// These have REAL `__enter__`/`__exit__` semantics (acquire/release), so
-/// the with-statement must lower to the RAII guard instead of the plain
-/// binding.
-fn is_threading_sync_call(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
-    let is_sync_name = |name: &str| {
-        crate::ThreadingType::from_name(name).is_some_and(|t| t.is_sync_guard())
-    };
+/// object (Lock/RLock/Semaphore) — constructed inline
+/// (`with threading.Lock():`), a name assigned from such a construction,
+/// or a PARAMETER annotated as one (`def crit(lock: threading.Lock):` —
+/// the exact pass-a-lock-to-a-worker pattern; local_types records the
+/// annotation). These have REAL `__enter__`/`__exit__` semantics
+/// (acquire/release), so the with-statement must lower to the RAII guard
+/// instead of the plain binding.
+fn is_threading_sync_call(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let is_sync_name =
+        |name: &str| crate::ThreadingType::from_name(name).is_some_and(|t| t.is_sync_guard());
     match expr {
         ExprType::Call(call) => match call.func.as_ref() {
             ExprType::Attribute(attr) => {
@@ -34,11 +39,20 @@ fn is_threading_sync_call(expr: &ExprType, symbols: &SymbolTableScopes) -> bool 
             }
             _ => false,
         },
-        ExprType::Name(n) => matches!(
-            symbols.get(&n.id),
-            Some(SymbolTableNode::Assign { value: ExprType::Call(c), .. })
-                if is_threading_sync_call(&ExprType::Call(c.clone()), symbols)
-        ),
+        ExprType::Name(n) => {
+            // An annotated parameter (or annotated local) recorded in
+            // local_types as "threading.Lock"/"threading.RLock"/
+            // "threading.Semaphore".
+            let annotated_sync = options.local_types.get(&n.id).is_some_and(|py| {
+                py.strip_prefix("threading.").is_some_and(is_sync_name)
+            });
+            annotated_sync
+                || matches!(
+                    symbols.get(&n.id),
+                    Some(SymbolTableNode::Assign { value: ExprType::Call(c), .. })
+                        if is_threading_sync_call(&ExprType::Call(c.clone()), symbols, options)
+                )
+        }
         _ => false,
     }
 }
@@ -118,7 +132,7 @@ impl CodeGen for With {
         // `?`, exactly Python's with-lock discipline.
         let mut item_tokens = Vec::new();
         for (index, item) in self.items.into_iter().enumerate() {
-            let is_sync = is_threading_sync_call(&item.context_expr, &symbols);
+            let is_sync = is_threading_sync_call(&item.context_expr, &symbols, &options);
             let context_expr =
                 item.context_expr
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;

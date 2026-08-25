@@ -4955,6 +4955,10 @@ fn threading_semantics_match_python_at_runtime() {
             "    time.sleep(delay)\n",
             "    print(f\"{name} done\")\n",
             "\n",
+            "def locked_worker(lock: threading.Lock, tag: str) -> None:\n",
+            "    with lock:\n",
+            "        print(f\"{tag} in section\")\n",
+            "\n",
             "def main() -> None:\n",
             "    t = threading.Thread(target=worker, args=(\"first\", 0.01))\n",
             "    print(t.is_alive())\n",
@@ -4980,6 +4984,15 @@ fn threading_semantics_match_python_at_runtime() {
             "    sem = threading.Semaphore(2)\n",
             "    print(sem.acquire())\n",
             "    sem.release()\n",
+            // A lock passed to a worker as an ANNOTATED PARAMETER: the
+            // clone shares identity, `with lock:` in the worker really
+            // acquires/releases, and the original handle sees the
+            // release (Devin review on PR #144).
+            "    lk = threading.Lock()\n",
+            "    t2 = threading.Thread(target=locked_worker, args=(lk, \"worker\"))\n",
+            "    t2.start()\n",
+            "    t2.join()\n",
+            "    print(lk.locked())\n",
             "    print(threading.active_count() >= 1)\n",
             "    print(threading.current_thread().name)\n",
             "\n",
@@ -5015,6 +5028,8 @@ fn threading_semantics_match_python_at_runtime() {
             "True",
             "False",
             "True",
+            "worker in section",
+            "False",
             "True",
             "MainThread"
         ],

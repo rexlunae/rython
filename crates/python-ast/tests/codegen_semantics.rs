@@ -7851,3 +7851,42 @@ fn bytesio_lowers_to_the_runtime_buffer() {
         out
     );
 }
+
+#[test]
+fn with_lock_on_an_annotated_parameter_lowers_to_the_guard() {
+    // Devin review on PR #144: a lock received as a FUNCTION PARAMETER —
+    // the exact pass-a-lock-to-a-worker pattern — must also lower
+    // `with lock:` to the RAII guard, not the silent bind-and-drop.
+    // Both the dotted and the from-import annotation spellings classify.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "def crit(lock: threading.Lock, n: int) -> None:\n",
+            "    with lock:\n",
+            "        print(n)\n",
+        ),
+        "wlp.py",
+    );
+    assert!(
+        out.contains("py_guard () ?"),
+        "parameter lock must lower to the RAII guard: {}",
+        out
+    );
+
+    let out = compile(
+        concat!(
+            "from threading import Semaphore\n",
+            "\n",
+            "def crit(sem: Semaphore) -> None:\n",
+            "    with sem:\n",
+            "        print(\"held\")\n",
+        ),
+        "wsp.py",
+    );
+    assert!(
+        out.contains("py_guard () ?"),
+        "from-import annotated semaphore must lower to the RAII guard: {}",
+        out
+    );
+}
