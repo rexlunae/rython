@@ -137,6 +137,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
     }
 }
 
+/// Whether a base-class NAME is METADATA — a builtin type, the
+/// Enum/TypedDict family, `object`, or the `type` metaclass — whose
+/// construction rython cannot model: the class lowers as a plain struct
+/// (the class-as-value divergence). ONE predicate: the plain-struct
+/// check and the real-base filtering previously kept two copies that had
+/// drifted (`bytearray` in one, `type` in the other).
+pub(crate) fn is_metadata_base_name(id: &str) -> bool {
+    matches!(
+        id,
+        "str" | "bytes" | "bytearray" | "int" | "float" | "bool" | "list" | "dict"
+            | "tuple" | "set" | "object" | "TypedDict"
+            // `type` — a METACLASS base (`class LexerMeta(type)` —
+            // pygments' lexer): a metaclass is a class factory, which
+            // rython cannot express as a value.
+            | "type"
+    ) || is_enum_base_name(id)
+}
+
+/// The Enum-family base names — also consulted by the class-body walk
+/// (enum MEMBERS are metadata, not struct fields).
+pub(crate) fn is_enum_base_name(id: &str) -> bool {
+    matches!(id, "Enum" | "IntEnum" | "Flag" | "IntFlag" | "StrEnum")
+}
+
 /// Whether a class is an exception class: its name matches the exception
 /// naming convention (`*Error`, `*Exception`, `*Warning`) — the same
 /// heuristic `raise` uses to construct PyException values — or one of its
@@ -145,14 +169,17 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ClassDef {
 /// class too. Lowered as a marker struct; the runtime matches exceptions by
 /// name string, so the class carries no data.
 pub fn is_exception_class(class: &ClassDef) -> bool {
-    let convention = |n: &str| {
-        n.ends_with("Error") || n.ends_with("Exception") || n.ends_with("Warning")
-    };
-    if convention(&class.name) {
+    // The canonical predicate from the raise lowering: the builtin set
+    // plus the naming convention. (The convention alone previously missed
+    // classes inheriting KeyboardInterrupt/SystemExit/StopIteration/
+    // GeneratorExit — the builtin names outside the *Error/*Exception/
+    // *Warning shape.)
+    let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
+    if is_exception(&class.name) {
         return true;
     }
     class.bases.iter().any(|b| match b {
-        ExprType::Name(n) => convention(&n.id),
+        ExprType::Name(n) => is_exception(&n.id),
         _ => false,
     })
 }
@@ -230,12 +257,7 @@ impl ClassDef {
     /// dropped.
     fn is_metadata_struct(&self) -> bool {
         self.bases.iter().any(|b| match b {
-            ExprType::Name(n) => matches!(
-                n.id.as_str(),
-                "str" | "bytes" | "bytearray" | "int" | "float" | "bool" | "list" | "dict"
-                    | "tuple" | "set" | "object" | "Enum" | "IntEnum" | "Flag" | "IntFlag"
-                    | "StrEnum" | "TypedDict"
-            ),
+            ExprType::Name(n) => is_metadata_base_name(&n.id),
             _ => false,
         })
     }
@@ -1780,23 +1802,7 @@ impl CodeGen for ClassDef {
         // filtered above) are metadata, not structural bases: the class
         // lowers as a plain struct (urllib3's `_Sentinel(Enum)`,
         // charset_normalizer's `CoherenceMatch(TypedDict)`).
-        let is_metadata_base = |id: &str| {
-            matches!(
-                id,
-                "object" | "Enum" | "IntEnum" | "Flag" | "IntFlag" | "StrEnum" | "TypedDict"
-                    // `str` (a str-subclass wrapper like botocore's
-                    // ClientConfigString): metadata — the class lowers as a
-                    // plain struct (the class-as-value divergence).
-                    | "str" | "bytes" | "int" | "float" | "bool" | "list" | "dict" | "tuple"
-                    | "set"
-                    // `type` — a METACLASS base (`class LexerMeta(type)` —
-                    // pygments' lexer): a metaclass is a class factory,
-                    // which rython cannot express as a value — metadata;
-                    // the class lowers as a plain struct (the
-                    // class-as-value divergence).
-                    | "type"
-            )
-        };
+        let is_metadata_base = |id: &str| is_metadata_base_name(id);
         let real_bases: Vec<&str> = self
             .bases
             .iter()
@@ -1990,8 +1996,7 @@ impl CodeGen for ClassDef {
                 // not struct fields (urllib3).
                 StatementType::Assign(_)
                     if self.bases.iter().any(|b| {
-                        matches!(b, ExprType::Name(n)
-                            if matches!(n.id.as_str(), "Enum" | "IntEnum" | "Flag" | "IntFlag" | "StrEnum"))
+                        matches!(b, ExprType::Name(n) if is_enum_base_name(&n.id))
                     }) => {}
                 // A class-level CONSTANT assignment (`_encode_url_methods
                 // = {...}`, `default_port = port_by_scheme["https"]`, a

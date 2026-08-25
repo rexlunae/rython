@@ -946,10 +946,7 @@ impl FunctionDef {
                 .chain(self.args.kwonlyargs.iter())
             {
                 if let Some(ExprType::Name(ann)) = param.annotation.as_deref() {
-                    if matches!(
-                        ann.id.as_str(),
-                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
-                    ) {
+                    if crate::ast::tree::assign::is_builtin_scalar_name(&ann.id) {
                         known.insert(param.arg.clone(), ann.id.clone());
                     }
                     // A bare threading type name (`lock: Lock` under
@@ -996,13 +993,8 @@ impl FunctionDef {
             let mut literal_types = std::collections::HashMap::new();
             collect_local_types(&self.body, &mut literal_types);
             for (name, ty) in literal_types {
-                let py = match ty.to_string().as_str() {
-                    "i64" => "int",
-                    "f64" => "float",
-                    "bool" => "bool",
-                    "Vec < u8 >" => "bytes",
-                    s if s.contains("str") || s.contains("String") => "str",
-                    _ => continue,
+                let Some(py) = rust_type_to_py_name(&ty) else {
+                    continue;
                 };
                 // A literal assignment overrides nothing: annotations win.
                 known.entry(name).or_insert_with(|| py.to_string());
@@ -2218,6 +2210,23 @@ fn global_write_error(body: &[Statement]) -> Option<String> {
 /// resolution (`proxy = parse_url(...)` → the callee's `-> Url`), so a
 /// field stored from the local (`self.proxy = proxy` — urllib3's
 /// ProxyManager) gets the class struct type.
+/// Map a rendered Rust type to the Python type name `local_types`
+/// records. ONE map: the producer (the local_types seeding below) and the
+/// consumer (call.rs's isinstance comparison against local_types) MUST
+/// yield the same name for the same type — they previously kept separate
+/// copies whose fallbacks disagreed.
+pub(crate) fn rust_type_to_py_name(ty: &proc_macro2::TokenStream) -> Option<&'static str> {
+    let s = ty.to_string();
+    Some(match s.as_str() {
+        "i64" => "int",
+        "f64" => "float",
+        "bool" => "bool",
+        "Vec < u8 >" => "bytes",
+        _ if s.contains("str") || s.contains("String") => "str",
+        _ => return None,
+    })
+}
+
 pub(crate) fn collect_local_types(
     body: &[Statement],
     out: &mut std::collections::HashMap<String, TokenStream>,
@@ -2605,7 +2614,7 @@ impl FunctionDef {
                         // Scheme::new(...)` line up.
                         match ann {
                             ExprType::Name(n)
-                                if !matches!(n.id.as_str(), "int" | "float" | "str" | "bool" | "bytes" | "bytearray") =>
+                                if !crate::ast::tree::assign::is_builtin_scalar_name(&n.id) =>
                             {
                                 if n.id == "Self" {
                                     // typing.Self (`def __enter__(self) ->

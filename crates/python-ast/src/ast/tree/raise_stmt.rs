@@ -140,58 +140,88 @@ impl CodeGen for Raise {
 /// `raise Name(...)` can construct a PyException carrying that class name.
 /// Anything else is treated as an expression already producing a
 /// PyException value (e.g. a variable bound by `except ... as e`).
+/// Every BUILTIN exception class name the compiler recognizes — ONE
+/// list, the compile-time mirror of stdpython's runtime hierarchy
+/// (`direct_exception_parent`). Consumers: `raise` lowering (below),
+/// class_def's exception-class detection, type_ctx's annotation typing,
+/// and the PyValue boxability checks — previously several of those kept
+/// their own partial copies, which had drifted (KeyboardInterrupt bases
+/// unrecognized by class_def; the File*Error family missing from the
+/// boxability lists).
+pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BufferError",
+    "DeprecationWarning",
+    "EOFError",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "NotADirectoryError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+];
+
+/// Whether a name is a BUILTIN exception class — the fixed set only, no
+/// naming heuristic (annotation typing and boxability must not absorb
+/// user classes that merely end in "Error").
+pub fn is_builtin_exception_name(name: &str) -> bool {
+    BUILTIN_EXCEPTION_NAMES.contains(&name)
+}
+
 pub fn is_exception_class_name(name: &str) -> bool {
-    matches!(
-        name,
-        "Exception"
-            | "BaseException"
-            | "ArithmeticError"
-            | "AssertionError"
-            | "AttributeError"
-            | "BufferError"
-            | "EOFError"
-            | "FileExistsError"
-            | "FileNotFoundError"
-            | "FloatingPointError"
-            | "ImportError"
-            | "IndentationError"
-            | "IndexError"
-            | "InterruptedError"
-            | "IsADirectoryError"
-            | "KeyError"
-            | "KeyboardInterrupt"
-            | "LookupError"
-            | "MemoryError"
-            | "ModuleNotFoundError"
-            | "NameError"
-            | "NotADirectoryError"
-            | "NotImplementedError"
-            | "OSError"
-            | "OverflowError"
-            | "PermissionError"
-            | "RecursionError"
-            | "ReferenceError"
-            | "RuntimeError"
-            | "StopAsyncIteration"
-            | "StopIteration"
-            | "SyntaxError"
-            | "SystemError"
-            | "SystemExit"
-            | "TabError"
-            | "TimeoutError"
-            | "TypeError"
-            | "UnboundLocalError"
-            | "UnicodeDecodeError"
-            | "UnicodeEncodeError"
-            | "UnicodeError"
-            | "ValueError"
-            | "ZeroDivisionError"
-    ) || name.ends_with("Error")
+    is_builtin_exception_name(name)
+        // The naming convention covers user-defined exception classes
+        // (`IDNAError`, `MyWarning`): `raise Name(...)` constructs a
+        // PyException carrying the class name.
+        || name.ends_with("Error")
         || name.ends_with("Exception")
         || name.ends_with("Warning")
-        // The exception GROUP classes (`isinstance(exc_value,
-        // (BaseExceptionGroup, ExceptionGroup))` — rich's traceback).
-        || matches!(name, "BaseExceptionGroup" | "ExceptionGroup")
 }
 
 /// Lower the raised expression to a PyException value: `Name(...)` and bare

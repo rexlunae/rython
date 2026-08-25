@@ -344,22 +344,9 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
-            ExprType::Name(n) => match n.id.as_str() {
-                // len()/count() lower to `len(&x) as i64` — Python ints are
-                // i64 everywhere (range(), indexing, arithmetic), so the
-                // inferred type must be Int, not the runtime's usize.
-                "len" | "count" => TypeInfo::Int,
-                "range" => TypeInfo::Range,
-                "str" | "repr" | "format" => TypeInfo::String,
-                "int" => TypeInfo::Int,
-                "float" => TypeInfo::Float,
-                "bool" => TypeInfo::Bool,
-                "list" => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
-                "dict" => TypeInfo::Dict(
-                    Box::new(TypeInfo::PyObject),
-                    Box::new(TypeInfo::PyObject),
-                ),
-                _ => match symbols.get(&n.id) {
+            ExprType::Name(n) => match builtin_call_type(&n.id) {
+                Some(t) => t,
+                None => match symbols.get(&n.id) {
                     // A class-construction call produces an instance of the
                     // class (not Copy: reused instances must be cloned at
                     // each move-prone use, matching Python's aliasing).
@@ -401,6 +388,28 @@ fn infer_type_inner(
         ExprType::Starred(s) => infer_type(&s.value, options, symbols),
         _ => TypeInfo::PyObject,
     }
+}
+
+/// The return TypeInfo of a builtin call, when statically known. ONE map
+/// for the two inference paths (infer_type and syntactic_type) that
+/// previously kept byte-identical copies: len()/count() must agree with
+/// the `as i64` codegen emission everywhere, or an empty container pins
+/// to different element types on different paths.
+fn builtin_call_type(name: &str) -> Option<TypeInfo> {
+    Some(match name {
+        // len()/count() lower to `len(&x) as i64` — Python ints are i64
+        // everywhere (range(), indexing, arithmetic), so the inferred
+        // type must be Int, not the runtime's usize.
+        "len" | "count" => TypeInfo::Int,
+        "range" => TypeInfo::Range,
+        "str" | "repr" | "format" => TypeInfo::String,
+        "int" => TypeInfo::Int,
+        "float" => TypeInfo::Float,
+        "bool" => TypeInfo::Bool,
+        "list" => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
+        "dict" => TypeInfo::Dict(Box::new(TypeInfo::PyObject), Box::new(TypeInfo::PyObject)),
+        _ => return None,
+    })
 }
 
 fn py_type(py: &str) -> TypeInfo {
@@ -670,20 +679,17 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             // the boxed heterogeneous value.
             "Any" | "object" => Some(TypeInfo::PyValue),
             // Builtin exception names (`BaseException | None` — the
-            // context-manager protocol): exceptions are boxed values.
-            "BaseException" | "Exception" | "ValueError" | "TypeError"
-            | "RuntimeError" | "KeyError" | "IndexError" | "AttributeError"
-            | "OSError" | "IOError" | "StopIteration" | "ArithmeticError"
-            | "LookupError" | "EnvironmentError" | "SyntaxError" | "NameError"
-            | "ImportError" | "NotImplementedError" | "ZeroDivisionError"
-            | "OverflowError" | "RecursionError" | "MemoryError" | "EOFError"
-            | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
-            | "Warning" | "UserWarning" | "DeprecationWarning" | "FutureWarning"
-            | "PendingDeprecationWarning" | "RuntimeWarning" | "ResourceWarning"
-            | "TracebackType" | "FrameType" | "CodeType"
-            // `memoryview` — a builtin buffer class (urllib3's
-            // `readinto(b: bytearray | memoryview[int])`): a boxed value.
-            | "memoryview" => Some(TypeInfo::PyValue),
+            // context-manager protocol) box as PyValue: the canonical
+            // list lives with the raise lowering (this arm was one of two
+            // drifted 33-name copies). types-module classes and
+            // `memoryview` (a builtin buffer class — urllib3's
+            // `readinto(b: bytearray | memoryview[int])`) box too.
+            "TracebackType" | "FrameType" | "CodeType" | "memoryview" => {
+                Some(TypeInfo::PyValue)
+            }
+            other if crate::ast::tree::raise_stmt::is_builtin_exception_name(other) => {
+                Some(TypeInfo::PyValue)
+            }
             _ => None,
         },
         ExprType::Subscript(sub) => match sub.value.as_ref() {
@@ -797,60 +803,10 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
     }
 }
 
-/// Whether a union member can live inside the boxed PyValue: the primitive
-/// value types, tuples of them, Literal constants, Any, or None.
-fn is_boxable_member(ann: &ExprType) -> bool {
-    if crate::is_none_expr(ann) {
-        return true;
-    }
-    match ann {
-        ExprType::Name(n) => matches!(
-            n.id.as_str(),
-            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "Any" | "memoryview"
-                | "PathLike"
-                | "BinaryIO"
-                // Builtin exception names (`BaseException | None` — the
-                // context-manager protocol in urllib3's ConnectionPool):
-                // exceptions are boxed values (PyException), so a union
-                // with one is the boxed PyValue.
-                | "BaseException" | "Exception" | "ValueError" | "TypeError"
-                | "RuntimeError" | "KeyError" | "IndexError" | "AttributeError"
-                | "OSError" | "IOError" | "StopIteration" | "ArithmeticError"
-                | "LookupError" | "EnvironmentError" | "SyntaxError" | "NameError"
-                | "ImportError" | "NotImplementedError" | "ZeroDivisionError"
-                | "OverflowError" | "RecursionError" | "MemoryError" | "EOFError"
-                | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
-                | "Warning" | "UserWarning" | "DeprecationWarning" | "FutureWarning"
-                | "PendingDeprecationWarning" | "RuntimeWarning" | "ResourceWarning"
-                | "TracebackType" | "FrameType" | "CodeType"
-        ),
-        ExprType::Subscript(sub) => {
-            match sub.value.as_ref() {
-                ExprType::Name(n) => matches!(
-                    n.id.as_str(),
-                    "tuple" | "Tuple" | "Literal" | "list" | "List" | "IO" | "Iterable"
-                        | "Union" | "Callable" | "SupportsRead" | "SupportsItems"
-                        | "Mapping" | "Dict" | "Set" | "Sequence" | "MutableMapping" | "Collection" | "Container"
-                        | "Generator" | "Iterator" | "Type" | "Optional" | "Any"
-                ),
-                // `typing.Sequence[...]` etc. (urllib3's `dict[str, T] |
-                // typing.Sequence[tuple[str, T]]`).
-                ExprType::Attribute(a) => {
-                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
-                        && matches!(
-                            a.attr.as_str(),
-                            "Tuple" | "List" | "Dict" | "Set" | "Sequence" | "Iterable"
-                                | "Iterator" | "Generator" | "Mapping" | "MutableMapping"
-                                | "Callable" | "Union" | "Optional" | "Literal" | "Any"
-                                | "IO" | "SupportsRead" | "SupportsItems" | "Type" | "Collection" | "Container"
-                        )
-                }
-                _ => false,
-            }
-        }
-        _ => false,
-    }
-}
+/// Whether a union member can live inside the boxed PyValue — the single
+/// implementation lives in arguments.rs (`is_pyvalue_boxable_member`);
+/// this module previously kept a near-verbatim clone that had drifted
+/// from it in both directions.
 
 /// A union of boxable members with no single Rust type becomes the boxed
 /// PyValue. Returns None when a member is not boxable.
@@ -859,7 +815,7 @@ fn boxable_union(members: Option<Vec<&ExprType>>) -> Option<TypeInfo> {
     if members.len() < 2 {
         return None;
     }
-    if members.iter().all(|m| is_boxable_member(m)) {
+    if members.iter().all(|m| crate::is_pyvalue_boxable_member(m)) {
         Some(TypeInfo::PyValue)
     } else {
         None
@@ -1131,20 +1087,7 @@ fn syntactic_type(expr: &ExprType) -> TypeInfo {
         // agree with the `as i64` codegen emission — a list pinned only from
         // appended lengths is Vec<i64>, not Vec<usize>.
         ExprType::Call(call) => match call.func.as_ref() {
-            ExprType::Name(n) => match n.id.as_str() {
-                "len" | "count" => TypeInfo::Int,
-                "range" => TypeInfo::Range,
-                "str" | "repr" | "format" => TypeInfo::String,
-                "int" => TypeInfo::Int,
-                "float" => TypeInfo::Float,
-                "bool" => TypeInfo::Bool,
-                "list" => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
-                "dict" => TypeInfo::Dict(
-                    Box::new(TypeInfo::PyObject),
-                    Box::new(TypeInfo::PyObject),
-                ),
-                _ => TypeInfo::PyObject,
-            },
+            ExprType::Name(n) => builtin_call_type(&n.id).unwrap_or(TypeInfo::PyObject),
             _ => TypeInfo::PyObject,
         },
         _ => TypeInfo::PyObject,

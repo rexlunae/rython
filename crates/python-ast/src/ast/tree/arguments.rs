@@ -208,16 +208,26 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
         return true;
     }
     match ann {
-        ExprType::Name(n) => matches!(
-            n.id.as_str(),
-            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "Any" | "memoryview"
-                // PathLike (os.PathLike) unions like `str | bytes |
-                // PathLike`: only the str/bytes members are real values in
-                // rython; the member is tolerated so file paths flow
-                // through the boxed PyValue (AsStrLike).
-                | "PathLike"
-                | "BinaryIO"
-        ),
+        ExprType::Name(n) => {
+            matches!(
+                n.id.as_str(),
+                "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "Any" | "memoryview"
+                    // PathLike (os.PathLike) unions like `str | bytes |
+                    // PathLike`: only the str/bytes members are real values in
+                    // rython; the member is tolerated so file paths flow
+                    // through the boxed PyValue (AsStrLike).
+                    | "PathLike"
+                    | "BinaryIO"
+                    // types-module classes (`TracebackType | None` — the
+                    // context-manager protocol): boxed values.
+                    | "TracebackType" | "FrameType" | "CodeType"
+            )
+                // Builtin exception names (`BaseException | None`):
+                // exceptions are boxed values (PyException), so a union
+                // with one is the boxed PyValue. The canonical list lives
+                // with the raise lowering.
+                || crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
+        }
         ExprType::Subscript(sub) => {
             match sub.value.as_ref() {
                 ExprType::Name(n) => matches!(

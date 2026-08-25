@@ -7,6 +7,32 @@ use crate::{
     CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions, SymbolTableNode, SymbolTableScopes,
     extract_required_attr,
 };
+use crate::ast::tree::std_module::variant as rt_variant;
+
+/// The type names isinstance() lowers against (a PyValue predicate or a
+/// static verdict exists for each). ONE list for the three consumers —
+/// the alias resolver, the single-Name target, and the tuple-of-types
+/// target — which previously kept three copies, one of them missing
+/// `frozenset` (a `MySet = frozenset` alias then failed to resolve and
+/// the check silently lowered to `false`).
+const ISINSTANCE_TARGET_NAMES: &[&str] = &[
+    "int",
+    "float",
+    "str",
+    "bool",
+    "bytes",
+    "bytearray",
+    "PathLike",
+    "BinaryIO",
+    "tuple",
+    "dict",
+    "list",
+    "set",
+    "frozenset",
+    "Mapping",
+    "Iterable",
+    "Sequence",
+];
 
 /// Runtime-module functions that return `Result<T, PyException>` because
 /// they can raise like their Python counterparts. A call through a module
@@ -166,7 +192,7 @@ fn resolve_builtin_alias(
                     if b == current {
                         return None;
                     }
-                    if matches!(b, "str" | "bytes" | "bytearray" | "int" | "float" | "bool") {
+                    if crate::ast::tree::assign::is_builtin_scalar_name(b) {
                         return Some(b.to_string());
                     }
                 }
@@ -2051,13 +2077,8 @@ impl<'a> CodeGen for Call {
                                 Some(SymbolTableNode::Assign { value, .. }) => {
                                     match value {
                                         ExprType::Name(n)
-                                            if matches!(
-                                                n.id.as_str(),
-                                                "int" | "float" | "str" | "bool" | "bytes"
-                                                    | "bytearray" | "PathLike" | "BinaryIO" | "tuple"
-                                                    | "dict" | "list" | "set"
-                                                    | "Mapping" | "Iterable" | "Sequence"
-                                            ) =>
+                                            if ISINSTANCE_TARGET_NAMES
+                                                .contains(&n.id.as_str()) =>
                                         {
                                             Some(n.id.clone())
                                         }
@@ -2103,13 +2124,7 @@ impl<'a> CodeGen for Call {
                             ExprType::Name(t) => {
                                 let id = resolve_type_name(&t.id, &options, &symbols)
                                     .unwrap_or_else(|| t.id.clone());
-                                if matches!(
-                                    id.as_str(),
-                                    "int" | "float" | "str" | "bool" | "bytes" | "bytearray"
-                                        | "tuple" | "dict" | "list" | "set" | "frozenset"
-                                        | "Mapping" | "Iterable"
-                                        | "Sequence" | "PathLike" | "BinaryIO"
-                                ) {
+                                if ISINSTANCE_TARGET_NAMES.contains(&id.as_str()) {
                                     vec![id]
                                 } else if let Some(names) =
                                     resolve_type_tuple(&t.id, &options, &symbols)
@@ -2171,13 +2186,9 @@ impl<'a> CodeGen for Call {
                                         ExprType::Name(t) => {
                                             let id = resolve_type_name(&t.id, &options, &symbols)
                                                 .unwrap_or_else(|| t.id.clone());
-                                            if matches!(
-                                                id.as_str(),
-                                                "int" | "float" | "str" | "bool" | "bytes"
-                                                    | "bytearray" | "PathLike" | "BinaryIO" | "tuple"
-                                                    | "dict" | "list" | "set" | "frozenset"
-                                                    | "Mapping" | "Iterable" | "Sequence"
-                                            ) {
+                                            if ISINSTANCE_TARGET_NAMES
+                                                .contains(&id.as_str())
+                                            {
                                                 names.push(id);
                                             } else if is_class_target(&t.id, &symbols, &options, 0)
                                                 || crate::ast::tree::raise_stmt::
@@ -2306,13 +2317,15 @@ impl<'a> CodeGen for Call {
                         // annotation as "bytes").
                         let actual: Option<String> = match &self.args[0] {
                             ExprType::Name(n) => options.local_types.get(&n.id).cloned(),
+                            // The shared map keeps this comparison in
+                            // lockstep with the local_types PRODUCER; the
+                            // "str" fallback for unmodeled literal types is
+                            // this site's own historical behavior.
                             lit => crate::ast::tree::function_def::simple_expr_type(lit).map(
-                                |ty| match ty.to_string().as_str() {
-                                    "i64" => "int".to_string(),
-                                    "f64" => "float".to_string(),
-                                    "bool" => "bool".to_string(),
-                                    "Vec < u8 >" => "bytes".to_string(),
-                                    _ => "str".to_string(),
+                                |ty| {
+                                    crate::ast::tree::function_def::rust_type_to_py_name(&ty)
+                                        .unwrap_or("str")
+                                        .to_string()
                                 },
                             ),
                         };
@@ -2948,15 +2961,15 @@ impl<'a> CodeGen for Call {
                             }
                         };
                         return Ok(match (func, initial) {
-                            (None, None) => quote!(accumulate_sum(&(#xs))),
-                            (Some(f), None) => quote!(accumulate_func(&(#xs), #f)),
+                            (None, None) => { let f = crate::safe_ident(rt_variant::ACCUMULATE_SUM); quote!(#f(&(#xs))) },
+                            (Some(f), None) => { let v = crate::safe_ident(rt_variant::ACCUMULATE_FUNC); quote!(#v(&(#xs), #f)) },
                             (None, Some(init)) => {
                                 let init = render(init)?;
-                                quote!(accumulate_sum_initial(&(#xs), #init))
+                                { let f = crate::safe_ident(rt_variant::ACCUMULATE_SUM_INITIAL); quote!(#f(&(#xs), #init)) }
                             }
                             (Some(f), Some(init)) => {
                                 let init = render(init)?;
-                                quote!(accumulate_func_initial(&(#xs), #f, #init))
+                                { let v = crate::safe_ident(rt_variant::ACCUMULATE_FUNC_INITIAL); quote!(#v(&(#xs), #f, #init)) }
                             }
                         });
                     }
@@ -2973,8 +2986,8 @@ impl<'a> CodeGen for Call {
                             let r = render(r)?;
                             let xs = &rendered[0];
                             return match r.to_string().as_str() {
-                                "2" => Ok(quote!(product_repeat2(&(#xs)))),
-                                "3" => Ok(quote!(product_repeat3(&(#xs)))),
+                                "2" => { let f = crate::safe_ident(rt_variant::PRODUCT_REPEAT2); Ok(quote!(#f(&(#xs)))) },
+                                "3" => { let f = crate::safe_ident(rt_variant::PRODUCT_REPEAT3); Ok(quote!(#f(&(#xs)))) },
                                 other => Err(format!(
                                     "product() repeat must be the literal 2 or 3 \
                                      (tuple arity is a compile-time shape); got {}",
@@ -2984,8 +2997,8 @@ impl<'a> CodeGen for Call {
                             };
                         }
                         return match rendered.as_slice() {
-                            [a, b] => Ok(quote!(product2(&(#a), &(#b)))),
-                            [a, b, c] => Ok(quote!(product3(&(#a), &(#b), &(#c)))),
+                            [a, b] => { let f = crate::safe_ident(rt_variant::PRODUCT2); Ok(quote!(#f(&(#a), &(#b)))) },
+                            [a, b, c] => { let f = crate::safe_ident(rt_variant::PRODUCT3); Ok(quote!(#f(&(#a), &(#b), &(#c)))) },
                             _ => Err("product() supports 2 or 3 iterables, or one \
                                       iterable with repeat=2/3"
                                 .to_string()
@@ -3021,7 +3034,7 @@ impl<'a> CodeGen for Call {
                         return Ok(match fill {
                             Some(v) => {
                                 let v = render(v)?;
-                                quote!(zip_longest_fill(&(#a), &(#b), #v))
+                                { let f = crate::safe_ident(rt_variant::ZIP_LONGEST_FILL); quote!(#f(&(#a), &(#b), #v)) }
                             }
                             None => quote!(zip_longest(&(#a), &(#b))),
                         });
@@ -3042,7 +3055,7 @@ impl<'a> CodeGen for Call {
                         return Ok(match key {
                             Some(f) => {
                                 let f = render(f)?;
-                                quote!(groupby_key(&(#xs), #f))
+                                { let v = crate::safe_ident(rt_variant::GROUPBY_KEY); quote!(#v(&(#xs), #f)) }
                             }
                             None => quote!(groupby(&(#xs))),
                         });
@@ -3543,10 +3556,8 @@ impl<'a> CodeGen for Call {
                 // rendered[0] becomes the full mutable-borrow expression:
                 // py_index_mut already yields &mut for subscripts, names
                 // take a fresh &mut.
-                let heap_mutator = matches!(
-                    fname.as_str(),
-                    "heappush" | "heappop" | "heapify" | "heappushpop" | "heapreplace"
-                );
+                let heap_mutator = crate::ast::tree::scope::HEAPQ_FIRST_ARG_MUTATORS
+                    .contains(&fname.as_str());
                 if heap_mutator {
                     if let Some(first) = self.args.first() {
                         rendered[0] = if matches!(first, ExprType::Subscript(_)) {
@@ -3581,7 +3592,7 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(#f, &(#xs))?))
                     }
                     ("reduce", [f, xs, init]) => {
-                        let p = qual("reduce_initial");
+                        let p = qual(rt_variant::REDUCE_INITIAL);
                         Ok(quote!(#p(#f, &(#xs), #init)))
                     }
                     ("reduce", _) => Err(arity("2 or 3")),
@@ -3739,8 +3750,8 @@ impl<'a> CodeGen for Call {
                                     })?;
                                     match re.captures_len() - 1 {
                                         0 | 1 => {}
-                                        2 => target = "findall2".to_string(),
-                                        3 => target = "findall3".to_string(),
+                                        2 => target = rt_variant::FINDALL2.to_string(),
+                                        3 => target = rt_variant::FINDALL3.to_string(),
                                         n => {
                                             return Err(format!(
                                                 "re.findall() with {} capture groups is \
@@ -3861,7 +3872,7 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p()))
                     }
                     ("StringIO", [initial]) => {
-                        let p = qual("StringIO_seeded");
+                        let p = qual(rt_variant::STRINGIO_SEEDED);
                         Ok(quote!(#p(&(#initial))))
                     }
                     // io.BytesIO: arity split like StringIO — the seeded
@@ -3871,7 +3882,7 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p()))
                     }
                     ("BytesIO", [initial]) => {
-                        let p = qual("BytesIO_seeded");
+                        let p = qual(rt_variant::BYTESIO_SEEDED);
                         Ok(quote!(#p(&(#initial))))
                     }
                     // io.BufferedRWPair/BufferedReader/BufferedWriter/
@@ -3911,7 +3922,8 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(&(#lines))?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
-                        let p = qual(&format!("{}_new", fname));
+                        let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
+                            .expect("the arm above names exactly the registry algos"));
                         Ok(quote!(#p()))
                     }
                     ("indent", [s, prefix]) => {
@@ -4653,7 +4665,7 @@ impl<'a> CodeGen for Call {
                 && crate::ast::tree::attribute::chain_root_is_self(&attr.value);
             let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
                 || mutating_self_field)
-                && crate::ast::tree::scope::MUTATING_METHODS.contains(&attr.attr.as_str())
+                && crate::ast::tree::scope::mutates_receiver(&attr.attr)
             {
                 if let ExprType::Attribute(_) = attr.value.as_ref() {
                     // The whole receiver chain renders as a place:
@@ -5971,15 +5983,17 @@ impl<'a> CodeGen for Call {
         if name_str.ends_with(":: strptime") {
             return Ok(quote!(#call_expr?));
         }
+        // `subprocess :: run` and `os :: execv` are NOT here: the if-else
+        // chain below handles both with dedicated arms before this branch
+        // is consulted, so listing them was dead (the same name in two
+        // dispatch structures of one function).
         let needs_unwrap = matches!(
             name_str.as_str(),
-            "subprocess :: run"
-                | "subprocess :: run_with_env"
+            "subprocess :: run_with_env"
                 | "subprocess :: check_call"
                 | "subprocess :: check_output"
                 | "os :: getcwd"
                 | "os :: chdir"
-                | "os :: execv"
                 | "os :: path :: abspath"
         );
 

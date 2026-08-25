@@ -314,11 +314,7 @@ impl CodeGen for Module {
                 // A type alias (`builtin_str = str`) is a declaration, not
                 // a runtime store.
                 if let [crate::ExprType::Name(_)] = a.targets.as_slice()
-                    && let crate::ExprType::Name(n) = &a.value
-                    && matches!(
-                        n.id.as_str(),
-                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
-                    )
+                    && crate::ast::tree::assign::builtin_scalar_alias_type(&a.value).is_some()
                 {
                     continue;
                 }
@@ -382,11 +378,7 @@ impl CodeGen for Module {
                     continue;
                 }
                 if let [crate::ExprType::Name(_)] = a.targets.as_slice()
-                    && let crate::ExprType::Name(n) = &a.value
-                    && matches!(
-                        n.id.as_str(),
-                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
-                    )
+                    && crate::ast::tree::assign::builtin_scalar_alias_type(&a.value).is_some()
                 {
                     continue;
                 }
@@ -786,19 +778,9 @@ impl CodeGen for Module {
                 // knows this shape, but the module path must place it as a
                 // declaration, not an init-time store.
                 if let [crate::ExprType::Name(target)] = a.targets.as_slice()
-                    && let crate::ExprType::Name(n) = &a.value
-                    && matches!(
-                        n.id.as_str(),
-                        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
-                    )
+                    && let Some(ty) =
+                        crate::ast::tree::assign::builtin_scalar_alias_type(&a.value)
                 {
-                    let ty = match n.id.as_str() {
-                        "str" => quote!(String),
-                        "bytes" | "bytearray" => quote!(Vec<u8>),
-                        "int" => quote!(i64),
-                        "float" => quote!(f64),
-                        _ => quote!(bool),
-                    };
                     let ident = crate::safe_ident(&target.id);
                     stream.extend(quote! {
                         #[allow(dead_code)]
@@ -1865,11 +1847,7 @@ pub(crate) fn module_promoted_static_names(
                 continue;
             }
             if let [crate::ExprType::Name(_)] = a.targets.as_slice()
-                && let crate::ExprType::Name(n) = &a.value
-                && matches!(
-                    n.id.as_str(),
-                    "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
-                )
+                && crate::ast::tree::assign::builtin_scalar_alias_type(&a.value).is_some()
             {
                 continue;
             }
