@@ -57,16 +57,12 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
 pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
     match module {
         "io" => matches!(name, "StringIO" | "BytesIO"),
-        "threading" => matches!(
-            name,
-            "Thread"
-                | "Lock"
-                | "RLock"
-                | "Event"
-                | "Semaphore"
-                | "current_thread"
-                | "active_count"
-        ),
+        // The type names come from the ThreadingType enum (one source of
+        // truth); current_thread/active_count are module functions.
+        "threading" => {
+            crate::ThreadingType::from_name(name).is_some()
+                || matches!(name, "current_thread" | "active_count")
+        }
         "socket" => matches!(
             name,
             "socket"

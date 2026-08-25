@@ -15,16 +15,18 @@ use crate::{
 /// the with-statement must lower to the RAII guard instead of the plain
 /// binding.
 fn is_threading_sync_call(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
-    const SYNC_TYPES: [&str; 3] = ["Lock", "RLock", "Semaphore"];
+    let is_sync_name = |name: &str| {
+        crate::ThreadingType::from_name(name).is_some_and(|t| t.is_sync_guard())
+    };
     match expr {
         ExprType::Call(call) => match call.func.as_ref() {
             ExprType::Attribute(attr) => {
-                SYNC_TYPES.contains(&attr.attr.as_str())
+                is_sync_name(&attr.attr)
                     && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
                     && !crate::module_name_shadowed("threading", symbols)
             }
             ExprType::Name(n) => {
-                SYNC_TYPES.contains(&n.id.as_str())
+                is_sync_name(&n.id)
                     && matches!(
                         symbols.get(&n.id),
                         Some(SymbolTableNode::ImportFrom(i)) if i.module == "threading"

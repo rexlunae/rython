@@ -353,20 +353,10 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
         ExprType::Attribute(attr) => {
             if let ExprType::Name(n) = attr.value.as_ref() {
                 if n.id == "threading" {
-                    return match attr.attr.as_str() {
-                        "Thread" => Some(quote!(threading::Thread)),
-                        "Lock" => Some(quote!(threading::Lock)),
-                        "RLock" => Some(quote!(threading::RLock)),
-                        "Event" => Some(quote!(threading::Event)),
-                        "Semaphore" => Some(quote!(threading::Semaphore)),
-                        _ => None,
-                    };
+                    return crate::ThreadingType::from_name(&attr.attr).map(|t| t.rust_path());
                 }
-                if n.id == "socket" {
-                    return match attr.attr.as_str() {
-                        "socket" => Some(quote!(socket::Socket)),
-                        _ => None,
-                    };
+                if n.id == "socket" && attr.attr == "socket" {
+                    return Some(quote!(socket::Socket));
                 }
             }
             let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "np" || n.id == "numpy");

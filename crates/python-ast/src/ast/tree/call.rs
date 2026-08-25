@@ -1292,7 +1292,7 @@ impl<'a> CodeGen for Call {
         // `threading.Semaphore()` — CPython's default initial value is 1;
         // the runtime constructor takes the value explicitly.
         if let ExprType::Attribute(attr) = self.func.as_ref()
-            && attr.attr == "Semaphore"
+            && crate::ThreadingType::from_name(&attr.attr) == Some(crate::ThreadingType::Semaphore)
             && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
             && !module_name_shadowed("threading", &symbols)
             && self.args.is_empty()
@@ -6895,14 +6895,16 @@ fn lower_threading_thread(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    let is_thread_name =
+        |name: &str| crate::ThreadingType::from_name(name) == Some(crate::ThreadingType::Thread);
     let is_thread = match call.func.as_ref() {
         ExprType::Attribute(attr) => {
-            attr.attr == "Thread"
+            is_thread_name(&attr.attr)
                 && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
                 && !module_name_shadowed("threading", symbols)
         }
         ExprType::Name(n) => {
-            n.id == "Thread"
+            is_thread_name(&n.id)
                 && matches!(
                     symbols.get("Thread"),
                     Some(SymbolTableNode::ImportFrom(i)) if i.module == "threading"
