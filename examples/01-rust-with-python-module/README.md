@@ -3,7 +3,9 @@
 This is an ordinary cargo binary crate whose geometry code lives in
 [`src/geometry.py`](src/geometry.py) — real Python with classes, single
 inheritance, `super()`, dynamically-dispatched method overrides, f-strings,
-and a function whose parameter types are inferred from use.
+and three functions (`scale`, `clamp`, `lerp`) with **no type annotations
+at all** — their generic Rust signatures are inferred from how the
+parameters are used.
 
 The one line that makes it work is in [`src/main.rs`](src/main.rs):
 
@@ -28,8 +30,15 @@ Expected output:
 ```
 rectangle: area=12.0 perimeter=14.0
 circle: area=3.141592653589793 perimeter=6.283185307179586
-scale(2.5, 4.0) = 10
-scale(6, 7)     = 42
+scale(2.5, 4.0)      = 10
+scale(6, 7)          = 42
+scale("na", 4)       = nananana
+scale([1, 2], 3)     = [1, 2, 1, 2, 1, 2]
+clamp(12, 0, 10)     = 10
+clamp(0.2, 0.5, 2.0) = 0.5
+clamp("m", "a", "f")  = f
+lerp(0.0, 10.0, 0.25) = 2.5
+lerp(100, 200, 2)     = 300
 ```
 
 The module is still ordinary Python, so the same file runs under CPython —
@@ -52,9 +61,20 @@ print(g.Circle(1.0).describe())"
 - `Rectangle(3.0, 4.0)` in Python is `Rectangle::new(3.0, 4.0)?` from Rust.
   Methods that can raise return `Result<T, PyException>`, so Python
   exceptions become ordinary Rust error handling.
-- `def scale(value, factor)` has no annotations: rython infers a generic
-  signature from `value * factor` (a trait bound on the runtime's `PyMul`),
-  so the single Python function is callable with `f64`s and `i64`s alike.
+- **Inferred generics, three flavors.** None of `scale`, `clamp`, `lerp`
+  are annotated; rython derives the weakest trait bounds their bodies
+  imply:
+  - `scale(value, factor)` gets a `PyMul` bound from `value * factor`, so
+    the one function multiplies floats, ints, strings (`"na" * 4`), and
+    lists (`[1, 2] * 3`) — each call monomorphized by rustc.
+  - `clamp(value, low, high)` can return any of its three parameters, so
+    inference unifies them into one variable:
+    `clamp<T>(value: T, low: T, high: T) -> Result<T, _>` — called above
+    with ints, floats, and Strings.
+  - `lerp(start, end, t)` chains three operators; the signature carries
+    the intermediate `Output` bounds
+    (`<B as PySub<A>>::Output: PyMul<C>`, ...) that make the composed
+    return type well-formed.
 
 ## Notes
 

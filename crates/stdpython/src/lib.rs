@@ -4363,6 +4363,34 @@ impl<T: Clone> PyMul<i64> for Vec<T> {
     }
 }
 
+// String repetition: `"ab" * 3` == "ababab", a non-positive count is ""
+// (exactly like list * int). Both operand orders, and both string flavors
+// on the left, so annotated params and inferred generics alike resolve.
+impl PyMul<i64> for String {
+    type Output = String;
+    fn py_mul(&self, rhs: &i64) -> String {
+        self.repeat((*rhs).max(0) as usize)
+    }
+}
+impl PyMul<i64> for &str {
+    type Output = String;
+    fn py_mul(&self, rhs: &i64) -> String {
+        self.repeat((*rhs).max(0) as usize)
+    }
+}
+impl PyMul<String> for i64 {
+    type Output = String;
+    fn py_mul(&self, rhs: &String) -> String {
+        rhs.repeat((*self).max(0) as usize)
+    }
+}
+impl PyMul<&str> for i64 {
+    type Output = String;
+    fn py_mul(&self, rhs: &&str) -> String {
+        rhs.repeat((*self).max(0) as usize)
+    }
+}
+
 // ============================================================================
 // SUBSCRIPTS: x[i] reads, x[i] = v stores, and x[a:b:c] slices
 // ============================================================================

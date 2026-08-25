@@ -55,6 +55,24 @@ class Circle(Shape):
 
 def scale(value, factor):
     """Parameter types are inferred: rython derives a generic Rust
-    signature from how the parameters are used, so this one function
-    works for floats and ints alike."""
+    signature from `value * factor`, so this one function serves every
+    type Python's `*` serves - floats, ints, strings ("na" * 4), and
+    lists ([1, 2] * 3)."""
     return value * factor
+
+
+def clamp(value, low, high):
+    """All three parameters can be returned, so inference unifies them
+    into ONE type variable: clamp<T>(value: T, low: T, high: T) -> T,
+    callable with floats, ints, or strings."""
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
+
+
+def lerp(start, end, t):
+    """Chained arithmetic: the inferred signature carries the
+    intermediate operator-output bounds for `start + (end - start) * t`."""
+    return start + (end - start) * t

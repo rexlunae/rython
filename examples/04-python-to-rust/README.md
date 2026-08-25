@@ -5,8 +5,8 @@ crate you own. Everything is checked in so you can read the before and
 after side by side:
 
 - [`wordstats.py`](wordstats.py) — the input: classes, inheritance with
-  `super()`, an overridden method, dicts, f-strings, and an unannotated
-  helper whose types are inferred.
+  `super()`, an overridden method, dicts, f-strings, and three fully
+  unannotated helpers whose generic types are inferred from use.
 - [`generated/`](generated) — the actual crate `rypip convert` produced
   from it (unedited except for one path, noted below).
 
@@ -20,6 +20,7 @@ python3 wordstats.py
 words: 12 (9 distinct)
 top: the x3
 longest: quick
+chars: 16
 tweet-sized: True
 ```
 
@@ -67,11 +68,25 @@ All in [`generated/src/wordstats.rs`](generated/src/wordstats.rs):
   when called from base-class code, and `super().summary()` runs the
   base body with the derived `self` — CPython's MRO semantics, kept at
   runtime.
-- **Inferred generics.** The unannotated `def within(value, low, high)`
-  comes out as a generic function with exactly the bounds its body
-  implies:
+- **Inferred generics.** None of `longest`, `total_chars`, or `within`
+  carry a single annotation; each comes out as a generic function with
+  exactly the bounds its body implies:
 
   ```rust
+  // `for w in words` infers an iterable; the accumulator's `best = ""`
+  // seed concretizes the element type to String:
+  pub fn longest<T>(words: T) -> Result<String, PyException>
+  where
+      T: IntoIterator<Item = String>,
+
+  // an integer-seeded accumulator over an inferred iterable, elements
+  // bounded by their `len(w)` use:
+  pub fn total_chars<A, B>(words: A) -> Result<i64, PyException>
+  where
+      A: IntoIterator<Item = B>,
+      B: Len,
+
+  // comparison-bounded, from `low <= value and value <= high`:
   pub fn within<A, B, C>(value: A, low: B, high: C) -> Result<bool, PyException>
   where
       A: PyLe<C, Output = bool>,

@@ -2709,7 +2709,7 @@ mod dict_and_exception_display {
 }
 
 mod cpython_numeric_and_stdlib_fixes {
-    use stdpython::{datetime::date, py_pow, PyInt};
+    use stdpython::{datetime::date, py_pow, PyInt, PyMul};
 
     #[test]
     fn float_power_uses_libm_pow_not_repeated_squaring() {
@@ -2730,6 +2730,12 @@ mod cpython_numeric_and_stdlib_fixes {
         // python3: int(b"\xff"[0]) == 255 — a bytes element is already an
         // int, so int() over one is the identity.
         assert_eq!(0xffu8.py_int().unwrap(), 255);
+        // python3: "ab" * 3 == "ababab"; "x" * 0 == ""; "y" * -2 == "";
+        // 3 * "ab" == "abab" * 1 — repetition in either operand order.
+        assert_eq!("ab".to_string().py_mul(&3), "ababab");
+        assert_eq!("x".py_mul(&0), "");
+        assert_eq!("y".to_string().py_mul(&-2), "");
+        assert_eq!(2i64.py_mul(&"ab".to_string()), "abab");
         // NaN and infinity raise instead of silently becoming 0/i64::MAX.
         let e = f64::NAN.py_int().unwrap_err();
         assert_eq!(format!("{}", e), "ValueError: cannot convert float NaN to integer");

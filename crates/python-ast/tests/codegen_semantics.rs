@@ -5643,6 +5643,104 @@ fn aliased_import_resolves_through_module_intercept() {
 }
 
 #[test]
+fn literal_seeded_local_concretizes_the_loop_element() {
+    // Inference: `best = ""` then `best = w` inside `for w in words` — the
+    // local keeps ONE type, so the seed's concrete type (String) forces
+    // the element instead of emitting a generic that cannot unify with
+    // the seed (`longest<A, B>` with `best: String` but `best = w: B`).
+    let out = compile(
+        concat!(
+            "def longest(words):\n",
+            "    best = \"\"\n",
+            "    for w in words:\n",
+            "        if len(w) > len(best):\n",
+            "            best = w\n",
+            "    return best\n",
+        ),
+        "seed.py",
+    );
+    assert!(
+        out.contains("IntoIterator < Item = String >"),
+        "the element must be concretized to String: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < String"),
+        "the return type must be the concrete String: {}",
+        out
+    );
+}
+
+#[test]
+fn literal_seeded_accumulator_forces_the_element_type() {
+    // Inference: `s = 0; s = s + x` inside `for x in items` — the
+    // accumulator keeps its i64 seed type, so the element is forced to
+    // i64 (a float call site is a LOUD type error, matching the
+    // one-type-per-variable model).
+    let out = compile(
+        concat!(
+            "def total(items):\n",
+            "    s = 0\n",
+            "    for x in items:\n",
+            "        s = s + x\n",
+            "    return s\n",
+        ),
+        "acc.py",
+    );
+    assert!(
+        out.contains("IntoIterator < Item = i64 >"),
+        "the element must be forced to the accumulator's seed type: {}",
+        out
+    );
+}
+
+#[test]
+fn returned_parameters_unify_into_one_type_variable() {
+    // Inference: a function returning several bare parameters (`clamp`
+    // returns value, low, or high) gives them ONE unified type variable —
+    // `clamp<T>(value: T, low: T, high: T) -> Result<T, ...>` — instead
+    // of boxing the mixed return to PyValue.
+    let out = compile(
+        concat!(
+            "def clamp(value, low, high):\n",
+            "    if value < low:\n",
+            "        return low\n",
+            "    if value > high:\n",
+            "        return high\n",
+            "    return value\n",
+        ),
+        "clampuni.py",
+    );
+    assert!(
+        out.contains("clamp < T >"),
+        "returned params must share one type variable: {}",
+        out
+    );
+    assert!(
+        !out.contains("PyValue"),
+        "the unified return must not box to PyValue: {}",
+        out
+    );
+}
+
+#[test]
+fn chained_operator_expressions_get_intermediate_output_bounds() {
+    // Inference: `a + (b - a) * t` composes operator Outputs, so the
+    // signature must carry the intermediate bounds
+    // (`<B as PySub<A>>::Output: PyMul<C>`) or the return type is not
+    // well-formed and rustc rejects the definition.
+    let out = compile(
+        "def lerp(a, b, t):\n    return a + (b - a) * t\n",
+        "lerp.py",
+    );
+    assert!(
+        out.contains(":: Output : PyMul < C >"),
+        "the intermediate operator Output must be bounded: {}",
+        out
+    );
+}
+
+#[test]
 fn np_set_backend_lowers_to_a_raisable_runtime_error() {
     // np.set_backend's runtime helper errors with a plain String (unknown
     // backend name), which `?` alone cannot convert in the generated

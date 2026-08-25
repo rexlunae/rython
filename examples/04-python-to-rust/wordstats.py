@@ -1,10 +1,10 @@
 """wordstats: a tiny word-frequency report.
 
 Ordinary Python - classes, inheritance with super(), overridden methods,
-dicts, f-strings, an unannotated (type-inferred) helper - used as the
-walkthrough program for converting Python to Rust with rypip. See
-README.md next to this file; the crate it generates is checked in under
-generated/ for reading.
+dicts, f-strings, and three fully unannotated (type-inferred) helpers -
+used as the walkthrough program for converting Python to Rust with
+rypip. See README.md next to this file; the crate it generates is
+checked in under generated/ for reading.
 """
 
 
@@ -52,12 +52,25 @@ class WordTally(Tally):
         return f"{best} x{best_count}"
 
 
-def longest(words: list[str]) -> str:
+def longest(words):
+    """No annotations: `for w in words` infers an iterable, and the
+    accumulator's `best = ""` seed concretizes the element type - the
+    signature is `longest<T: IntoIterator<Item = String>>(words: T) ->
+    Result<String, _>`."""
     best = ""
     for w in words:
         if len(w) > len(best):
             best = w
     return best
+
+
+def total_chars(words):
+    """No annotations: an integer-seeded accumulator over an inferred
+    iterable, with `len(w)` bounding the elements."""
+    n = 0
+    for w in words:
+        n = n + len(w)
+    return n
 
 
 def within(value, low, high):
@@ -73,4 +86,5 @@ if __name__ == "__main__":
     print(tally.summary())
     print(f"top: {tally.top()}")
     print(f"longest: {longest('the quick brown fox'.split())}")
+    print(f"chars: {total_chars('the quick brown fox'.split())}")
     print(f"tweet-sized: {within(tally.total, 1, 280)}")

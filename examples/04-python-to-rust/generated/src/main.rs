@@ -1,4 +1,4 @@
-#![doc = "wordstats: a tiny word-frequency report.\\n\\nOrdinary Python - classes, inheritance with super(), overridden methods,\\ndicts, f-strings, an unannotated (type-inferred) helper - used as the\\nwalkthrough program for converting Python to Rust with rypip. See\\nREADME.md next to this file; the crate it generates is checked in under\\ngenerated/ for reading.\\n"]
+#![doc = "wordstats: a tiny word-frequency report.\\n\\nOrdinary Python - classes, inheritance with super(), overridden methods,\\ndicts, f-strings, and three fully unannotated (type-inferred) helpers -\\nused as the walkthrough program for converting Python to Rust with\\nrypip. See README.md next to this file; the crate it generates is\\nchecked in under generated/ for reading.\\n"]
 #![doc = "Generated from Python file: wordstats.py"]
 use stdpython::*;
 #[doc = "Base class: a named accumulator."]
@@ -262,7 +262,11 @@ impl WordTally {
         ));
     }
 }
-pub fn longest(words: Vec<String>) -> Result<String, PyException> {
+#[doc = "No annotations: `for w in words` infers an iterable, and the\\n    accumulator's `best = \\\"\\\"` seed concretizes the element type - the\\n    signature is `longest<T: IntoIterator<Item = String>>(words: T) ->\\n    Result<String, _>`."]
+pub fn longest<T>(words: T) -> Result<String, PyException>
+where
+    T: IntoIterator<Item = String>,
+{
     let mut best;
     best = ("").to_string();
     for w in words {
@@ -270,7 +274,20 @@ pub fn longest(words: Vec<String>) -> Result<String, PyException> {
             best = w;
         };
     }
-    return Ok((best).to_string());
+    return Ok(best);
+}
+#[doc = "No annotations: an integer-seeded accumulator over an inferred\\n    iterable, with `len(w)` bounding the elements."]
+pub fn total_chars<A, B>(words: A) -> Result<i64, PyException>
+where
+    A: IntoIterator<Item = B>,
+    B: Len,
+{
+    let mut n;
+    n = 0;
+    for w in words {
+        n = (n).py_add(&(len(&(w)) as i64));
+    }
+    return Ok(n);
 }
 #[doc = "No annotations: rython infers a generic, comparison-bounded Rust\\n    signature from how the parameters are used."]
 pub fn within<A, B, C>(value: A, low: B, high: C) -> Result<bool, PyException>
@@ -297,6 +314,12 @@ fn main() {
             &(format!(
                 "longest: {}",
                 py_display(&(longest(("the quick brown fox").py_split_whitespace())?))
+            )),
+        );
+        print(
+            &(format!(
+                "chars: {}",
+                py_display(&(total_chars(("the quick brown fox").py_split_whitespace())?))
             )),
         );
         print(

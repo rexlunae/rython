@@ -20,10 +20,29 @@ fn run() -> Result<(), PyException> {
     let circle = Circle::new(1.0)?;
     println!("{}", circle.describe()?);
 
-    // `scale` has no annotations - rython inferred a generic signature
-    // from `value * factor`, so one Python function serves several types.
-    println!("scale(2.5, 4.0) = {}", scale(2.5, 4.0)?);
-    println!("scale(6, 7)     = {}", scale(6, 7)?);
+    // None of the functions below have type annotations - rython infers
+    // generic Rust signatures from how the parameters are used, so each
+    // Python function is ONE definition serving many types.
+
+    // `value * factor` covers everything Python's `*` covers:
+    println!("scale(2.5, 4.0)      = {}", scale(2.5, 4.0)?);
+    println!("scale(6, 7)          = {}", scale(6, 7)?);
+    println!("scale(\"na\", 4)       = {}", scale("na".to_string(), 4)?);
+    println!("scale([1, 2], 3)     = {:?}", scale(vec![1, 2], 3)?);
+
+    // `clamp` returns any of its three parameters, so inference unifies
+    // them into a single type variable T:
+    println!("clamp(12, 0, 10)     = {}", clamp(12, 0, 10)?);
+    println!("clamp(0.2, 0.5, 2.0) = {}", clamp(0.2, 0.5, 2.0)?);
+    println!(
+        "clamp(\"m\", \"a\", \"f\")  = {}",
+        clamp("m".to_string(), "a".to_string(), "f".to_string())?
+    );
+
+    // `lerp` chains three operators; the inferred signature carries the
+    // intermediate `Output` bounds, so floats and ints both work:
+    println!("lerp(0.0, 10.0, 0.25) = {}", lerp(0.0, 10.0, 0.25)?);
+    println!("lerp(100, 200, 2)     = {}", lerp(100, 200, 2)?);
 
     Ok(())
 }

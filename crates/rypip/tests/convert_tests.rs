@@ -1145,6 +1145,73 @@ fn classes_match_python_at_runtime() {
 }
 
 #[test]
+fn inference_seed_unification_and_return_unification_at_runtime() {
+    // Parameter type inference end to end: a literal-seeded accumulator
+    // concretizes the loop element (`best = ""` → Item = String; `s = 0`
+    // → Item = i64), parameters returned as bare values unify into one
+    // type variable (`clamp<T>` callable with ints, floats, and strings),
+    // and chained operator expressions carry their intermediate Output
+    // bounds (`lerp` callable with floats and ints).
+    let scratch = Scratch::new("infer-e2e");
+    let file = scratch.path().join("infer_e2e.py");
+    fs::write(
+        &file,
+        concat!(
+            "def longest(words):\n",
+            "    best = \"\"\n",
+            "    for w in words:\n",
+            "        if len(w) > len(best):\n",
+            "            best = w\n",
+            "    return best\n",
+            "\n",
+            "def total(items):\n",
+            "    s = 0\n",
+            "    for x in items:\n",
+            "        s = s + x\n",
+            "    return s\n",
+            "\n",
+            "def clamp(value, low, high):\n",
+            "    if value < low:\n",
+            "        return low\n",
+            "    if value > high:\n",
+            "        return high\n",
+            "    return value\n",
+            "\n",
+            "def lerp(a, b, t):\n",
+            "    return a + (b - a) * t\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(longest(\"the quick brown fox\".split()))\n",
+            "    print(total([3, 1, 4, 1, 5]))\n",
+            "    print(clamp(12, 0, 10))\n",
+            "    print(clamp(0.25, 0.5, 2.0))\n",
+            "    print(clamp(\"m\", \"a\", \"f\"))\n",
+            "    print(lerp(0.0, 10.0, 0.25))\n",
+            "    print(lerp(100, 200, 2))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/infer_e2e"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["quick", "14", "10", "0.5", "f", "2.5", "300"],
+        "inferred-generic functions diverged from CPython"
+    );
+}
+
+#[test]
 fn inherited_container_clear_mutates_the_real_field() {
     // A mutating container method (`self.regs.clear()`) reached through an
     // INHERITED method runs in the trait default, where the load-flavor
