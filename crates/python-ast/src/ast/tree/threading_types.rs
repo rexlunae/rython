@@ -46,6 +46,18 @@ impl ThreadingType {
         )
     }
 
+    /// The type's Python name — the enum is the authority even where a
+    /// string is ultimately stored (the local_types annotation records).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ThreadingType::Thread => "Thread",
+            ThreadingType::Lock => "Lock",
+            ThreadingType::RLock => "RLock",
+            ThreadingType::Event => "Event",
+            ThreadingType::Semaphore => "Semaphore",
+        }
+    }
+
     /// The type's path in the stdpython runtime, for annotations.
     pub(crate) fn rust_path(self) -> TokenStream {
         match self {

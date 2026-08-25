@@ -530,13 +530,13 @@ fn numpy_target(func: &ExprType, symbols: &SymbolTableScopes) -> Option<String> 
         ExprType::Attribute(attr) => match attr.value.as_ref() {
             ExprType::Attribute(inner) => {
                 if let ExprType::Name(m) = inner.value.as_ref() {
-                    if (m.id == "numpy" || m.id == "np") && inner.attr == "linalg" {
+                    if crate::is_numpy_alias(&m.id) && inner.attr == "linalg" {
                         return Some(format!("linalg.{}", attr.attr));
                     }
                 }
                 None
             }
-            ExprType::Name(m) if m.id == "numpy" || m.id == "np" => Some(attr.attr.clone()),
+            ExprType::Name(m) if crate::is_numpy_alias(&m.id) => Some(attr.attr.clone()),
             _ => None,
         },
         ExprType::Name(n) => match symbols.get(&n.id) {
@@ -641,7 +641,7 @@ fn np_is_bool_literal(expr: &ExprType) -> bool {
 fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let name = match expr {
         ExprType::Attribute(attr) => {
-            if !matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "np" || m.id == "numpy")
+            if !matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_numpy_alias(&m.id))
             {
                 return Err(format!(
                     "dtype= must be one of np.float64/np.float32/np.int64/np.int32/np.bool_ \
@@ -3282,22 +3282,18 @@ impl<'a> CodeGen for Call {
         // borrow (or mutably borrow) arguments, reduce() splits by arity,
         // and the re functions validate patterns at runtime (hence `?`).
         // Handled for both `from X import f; f(...)` and `import X;
-        // X.f(...)` spellings.
+        // X.f(...)` spellings. Which modules route here is a StdModule
+        // property (dispatches_from_import / dispatches_qualified) — this
+        // block previously carried three inline copies of the list.
         {
+            let dispatches_qualified = |name: &str| {
+                crate::StdModule::from_name(name).is_some_and(|m| m.dispatches_qualified())
+            };
             let target: Option<(String, Option<&'static str>)> = match self.func.as_ref() {
                 ExprType::Name(n) => match symbols.get(&n.id) {
                     Some(SymbolTableNode::ImportFrom(import))
-                        if matches!(
-                            import.module.as_str(),
-                            "functools"
-                                | "heapq"
-                                | "copy"
-                                | "textwrap"
-                                | "re"
-                                | "hashlib"
-                                | "csv"
-                                | "io"
-                        ) =>
+                        if crate::StdModule::from_name(&import.module)
+                            .is_some_and(|m| m.dispatches_from_import()) =>
                     {
                         Some((n.id.clone(), None))
                     }
@@ -3308,11 +3304,8 @@ impl<'a> CodeGen for Call {
                     // _json` — urllib3): follow it to the runtime module.
                     let root = match attr.value.as_ref() {
                         ExprType::Name(m) => {
-                            if matches!(
-                                m.id.as_str(),
-                                "functools" | "heapq" | "textwrap" | "re" | "hashlib"
-                                    | "csv" | "io" | "json" | "copy" | "math"
-                            ) && !module_name_shadowed(&m.id, &symbols)
+                            if dispatches_qualified(&m.id)
+                                && !module_name_shadowed(&m.id, &symbols)
                             {
                                 m.id.clone()
                             } else {
@@ -3326,27 +3319,14 @@ impl<'a> CodeGen for Call {
                         }
                         _ => String::new(),
                     };
-                    if matches!(
-                        root.as_str(),
-                        "functools" | "heapq" | "textwrap" | "re" | "hashlib" | "csv" | "io"
-                            | "json" | "copy" | "math"
-                    ) && !module_name_shadowed(&root, &symbols)
-                    {
-                        let module: &'static str = match root.as_str() {
-                            "functools" => "functools",
-                            "heapq" => "heapq",
-                            "re" => "re",
-                            "hashlib" => "hashlib",
-                            "csv" => "csv",
-                            "io" => "io",
-                            "json" => "json",
-                            "copy" => "copy",
-                            "math" => "math",
-                            _ => "textwrap",
-                        };
-                        Some((attr.attr.clone(), Some(module)))
-                    } else {
-                        None
+                    match crate::StdModule::from_name(&root) {
+                        Some(module)
+                            if module.dispatches_qualified()
+                                && !module_name_shadowed(&root, &symbols) =>
+                        {
+                            Some((attr.attr.clone(), Some(module.name())))
+                        }
+                        _ => None,
                     }
                 },
                 _ => None,

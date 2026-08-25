@@ -9,6 +9,29 @@ use crate::{
 
 use serde::{Deserialize, Serialize};
 
+/// Rendered receiver tokens that resolve as MODULE PATHS even without an
+/// import symbol in scope — robustness for the from-import spellings of
+/// the common runtime modules; the general mechanism is
+/// `is_module_path_chain`. ONE list, shared by the load form and the
+/// store-target form (`os.environ[k] = v`), which previously kept two
+/// copies that had already drifted apart. The bare-name set is the
+/// [`crate::StdModule::bare_token_access`] property; the extra arms are
+/// the numpy alias, the xml placeholder, and the nested module paths.
+pub(crate) fn module_access_token(value_str: &str) -> bool {
+    // The token stream renders `::` with surrounding spaces; normalize
+    // once instead of matching both spellings in every arm.
+    let normalized: String = value_str.chars().filter(|c| !c.is_whitespace()).collect();
+    match normalized.as_str() {
+        // The numpy import alias (`import numpy as np` is the canonical
+        // spelling) and the comment-only xml placeholder module.
+        "np" | "xml" => true,
+        // Nested runtime module paths (os.path.join, urllib.request.
+        // urlopen, np.linalg.inv).
+        "os::path" | "urllib::request" | "numpy::linalg" | "np::linalg" => true,
+        name => crate::StdModule::from_name(name).is_some_and(|m| m.bare_token_access()),
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 //#[pyo3(transparent)]
 pub struct Attribute {
@@ -249,32 +272,17 @@ impl<'a> CodeGen for Attribute {
         // move above).
         let value_debug = format!("{:?}", value_str);
 
-        // Determine if this is a module access or a field/method access
-        // Module names are typically lowercase and match Python stdlib modules
-        // `np`/`numpy` cover the numpy module (import numpy as np lowers to
-        // `use stdpython::numpy as np`, making np a real Rust path).
-        // A dotted chain rooted at a plain module `import` (`import pylev`)
-        // is also a module path: `pylev.wfi_levenshtein` emits
-        // `pylev::wfi_levenshtein`, and nested chains (`pylev.sub.fn`) emit
-        // `pylev::sub::fn` because each inner attribute resolves the same
-        // way. ImportFrom bindings are VALUES (a function/class), not
-        // modules, so they never turn attribute access into a path.
-        let is_module_access = !root_shadowed
-            && (matches!(
-                value_str.as_str(),
-                "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
-            "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re" | "hashlib" | "csv" | "io" |
-            "threading" | "socket" |
-            // `datetime` covers both the runtime module and the datetime
-            // TYPE from `from datetime import datetime` — either way the
-            // attribute is a path item (datetime::strptime, datetime::now),
-            // never a field on a value.
-            "datetime" |
-            "numpy" | "np" |
-            "os :: path" | "os::path" | // for nested modules
-            "urllib :: request" | "urllib::request" | // urllib.request.urlopen
-            "numpy :: linalg" | "np :: linalg" | "numpy::linalg" | "np::linalg" // np.linalg.inv
-            ) || module_chain);
+        // Determine if this is a module access or a field/method access.
+        // The bare-token module set lives in module_access_token (ONE list
+        // shared with the store-target form). A dotted chain rooted at a
+        // plain module `import` (`import pylev`) is also a module path:
+        // `pylev.wfi_levenshtein` emits `pylev::wfi_levenshtein`, and
+        // nested chains (`pylev.sub.fn`) emit `pylev::sub::fn` because
+        // each inner attribute resolves the same way. ImportFrom bindings
+        // are VALUES (a function/class), not modules, so they never turn
+        // attribute access into a path.
+        let is_module_access =
+            !root_shadowed && (module_access_token(&value_str) || module_chain);
 
         if is_module_access {
             // An EXTERNAL module (ssl, socket, zlib, logging, ...) has no
@@ -514,13 +522,7 @@ pub(crate) fn to_rust_place_expr(
             let is_module = !root_shadowed
                 && (crate::ast::tree::call::root_name(&attr.value).is_some_and(|_root| {
                     crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols, options)
-                }) || matches!(
-                    value_tokens.to_string().as_str(),
-                    "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio"
-                        | "time" | "math" | "random" | "heapq" | "functools" | "textwrap"
-                        | "itertools" | "re" | "hashlib" | "csv" | "io" | "datetime"
-                        | "numpy" | "np"
-                ));
+                }) || module_access_token(&value_tokens.to_string()));
             if is_module {
                 // Module stores render as PATHS, exactly like the load form.
                 // The attribute is an identifier — interpolating the &str

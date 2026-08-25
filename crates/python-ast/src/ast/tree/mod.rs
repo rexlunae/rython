@@ -58,6 +58,9 @@ pub use name::*;
 pub mod threading_types;
 pub(crate) use threading_types::ThreadingType;
 
+pub mod std_module;
+pub(crate) use std_module::{StdModule, is_numpy_alias};
+
 pub mod named_expression;
 pub use named_expression::*;
 

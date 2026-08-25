@@ -367,7 +367,7 @@ fn infer_type_inner(
                 // numpy functions produce arrays (`np.sum`, `numpy.mean`).
                 let on_numpy = matches!(
                     attr.value.as_ref(),
-                    ExprType::Name(n) if n.id == "np" || n.id == "numpy"
+                    ExprType::Name(n) if crate::is_numpy_alias(&n.id)
                 );
                 match attr.attr.as_str() {
                     "get" | "pop" | "setdefault" => TypeInfo::PyObject,
