@@ -2633,6 +2633,82 @@ fn regex_brace_patterns_and_slice_shapes_match_python_at_runtime() {
 }
 
 #[test]
+fn method_receiver_binding_and_associated_calls_match_python() {
+    // Issue #132: Python binds the instance to a method's FIRST parameter
+    // whatever its name (boto3's factory_self), a @staticmethod called
+    // through an instance binds no receiver, and a @classmethod's cls(v)
+    // constructs an instance of the class. Verified against python3:
+    //   w.scale(4) -> 8, w.helper(1) -> 10, Widget.helper(2) -> 20,
+    //   Widget.make(5).base -> 5
+    let scratch = Scratch::new("receiver-binding");
+    let file = scratch.path().join("widget.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Widget:\n",
+            "    def __init__(self, base: int):\n",
+            "        self.base = base\n",
+            "\n",
+            "    def scale(factory_self, times: int) -> int:\n",
+            "        return factory_self.base * times\n",
+            "\n",
+            "    def bump(factory_self, by: int):\n",
+            "        factory_self.base = factory_self.base + by\n",
+            "        return 0\n",
+            "\n",
+            "    @staticmethod\n",
+            "    def helper(x: int) -> int:\n",
+            "        return x * 10\n",
+            "\n",
+            "    @classmethod\n",
+            "    def make(cls, v: int):\n",
+            "        return cls(v)\n",
+            "\n",
+            "def main() -> int:\n",
+            "    w = Widget(2)\n",
+            "    w.bump(3)\n",
+            "    print(w.scale(2))\n",
+            "    w2 = Widget(2)\n",
+            "    print(w2.scale(4))\n",
+            "    print(w.helper(1))\n",
+            "    print(Widget.helper(2))\n",
+            "    c = Widget.make(5)\n",
+            "    print(c.base)\n",
+            "    return 0\n",
+            "    print(w.helper(1))\n",
+            "    print(Widget.helper(2))\n",
+            "    c = Widget.make(5)\n",
+            "    print(c.base)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/widget"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3: w.bump(3) mutates through the renamed
+    // receiver (base 2->5, scale(2) prints 10); the rest re-checks the
+    // static/classmethod shapes.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["10", "8", "10", "20", "5"],
+        "method receiver binding diverged from CPython"
+    );
+}
+
+#[test]
 fn map_filter_list_match_python_at_runtime() {
     // map (lambda, two-iterable, and user-function forms), filter
     // (predicate and None), and the list() builtin over lists, strings,

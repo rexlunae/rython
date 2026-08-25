@@ -852,9 +852,20 @@ impl ClassDef {
                 options,
             ))
         };
+        // The receiver is the FIRST parameter whatever its name (issue
+        // #132): a method whose stores go through `factory_self` needs
+        // `&mut self` exactly like one storing through `self`, and the
+        // renamed body at codegen time will say so too.
+        let receiver_name = m
+            .args
+            .posonlyargs
+            .first()
+            .or(m.args.args.first())
+            .map(|p| p.arg.clone())
+            .unwrap_or_else(|| "self".to_string());
         crate::analyze_scope_with(&m.body, &params, &resolve)
             .needs_mut
-            .contains("self")
+            .contains(receiver_name.as_str())
     }
 
     /// Infer the struct field list from the `self.attr = ...` stores in

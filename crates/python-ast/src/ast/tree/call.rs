@@ -4416,9 +4416,10 @@ impl<'a> CodeGen for Call {
                     let is_static = sig.decorator_list.iter().any(|d| {
                         matches!(d, ExprType::Name(n) if n.id == "staticmethod")
                     });
-                    if sig.decorator_list.iter().any(|d| {
+                    let is_classmethod = sig.decorator_list.iter().any(|d| {
                         matches!(d, ExprType::Name(n) if n.id == "classmethod")
-                    }) {
+                    });
+                    if is_classmethod {
                         if !sig.args.posonlyargs.is_empty() {
                             sig.args.posonlyargs.remove(0);
                         } else if !sig.args.args.is_empty() {
@@ -4513,6 +4514,18 @@ impl<'a> CodeGen for Call {
                         // module's scope.
                         Some(&class_symbols),
                     )?;
+                    // A @staticmethod or @classmethod called through an
+                    // INSTANCE binds no receiver in Python (`w.helper(1)`,
+                    // `w.make(3)`): lower as the ASSOCIATED call
+                    // `Class::method(args)` — method-call syntax against
+                    // the value cannot resolve an associated fn (E0599),
+                    // and a classmethod's cls is the class itself, never
+                    // the instance.
+                    if is_static || is_classmethod {
+                        let cname = crate::safe_ident(&class.name);
+                        let mname = crate::safe_ident(&attr.attr);
+                        return Ok(quote!({ #prelude #cname::#mname(#(#args),*)? }));
+                    }
                     // A field receiver (`self.inner`, `self.items`) renders
                     // in place flavor when the callee mutates the receiver
                     // (`self.inner_mut().bump()`), because the load flavor

@@ -556,7 +556,7 @@ impl FunctionDef {
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
         let argparse_rewrite = scan_argparse(&self.body)?;
-        let effective_body: Vec<Statement> = match &argparse_rewrite {
+        let mut effective_body: Vec<Statement> = match &argparse_rewrite {
             None => self.body.clone(),
             Some(rw) => self
                 .body
@@ -704,6 +704,27 @@ impl FunctionDef {
             };
         if is_method {
             crate::strip_self(&mut render_args);
+            // Python binds the instance to the first parameter whatever its
+            // name (boto3's `factory_self`); the Rust receiver is always
+            // `self`, and codegen special-cases that literal name, so body
+            // references to the original parameter are rewritten first
+            // (issue #132).
+            let receiver_name = self
+                .args
+                .posonlyargs
+                .first()
+                .or(self.args.args.first())
+                .map(|p| p.arg.clone());
+            if let Some(r) = receiver_name {
+                if r != "self" {
+                    effective_body = super::rename::rename_receiver_in_body(
+                        &effective_body,
+                        &r,
+                        "self",
+                    )
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                }
+            }
         }
 
         // A cached function's arguments form the cache KEY, so every
@@ -2606,7 +2627,31 @@ impl FunctionDef {
         } else {
             None
         };
+        // A @classmethod whose body returns `cls(...)`: the call constructs
+        // an instance of the enclosing class (`def make(cls, v): return
+        // cls(v)`), so the return type is Self. The simple-shape inferrer
+        // below cannot type a cls-call, and without this rule the signature
+        // collapses to unit and every use of the constructed value breaks.
+        if guarantees_return(&self.body)
+            && self.decorator_list.iter().any(|d| {
+                matches!(d, ExprType::Name(n) if n.id == "classmethod")
+            })
+            && self.returns_cls_construction()
+        {
+            return Some(quote!(Self));
+        }
         self.inferred_return_type().or(annotated)
+    }
+
+    /// Whether any `return` in this body is `return cls(...)` — a call to
+    /// the classmethod's own first parameter (the class reference).
+    fn returns_cls_construction(&self) -> bool {
+        let mut returns = Vec::new();
+        collect_returns(&self.body, &mut returns);
+        returns.iter().any(|r| {
+            r.as_ref()
+                .is_some_and(|e| matches!(e, ExprType::Call(c) if matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "cls")))
+        })
     }
 
     /// The Python-source text of a return annotation the generated function
