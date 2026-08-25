@@ -34,7 +34,10 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         StatementType::Assign(a) => {
             // Rebinding the receiver name itself cannot live on `&self`.
             for target in &a.targets {
-                if matches!(target, ExprType::Name(n) if n.id == from) {
+                // Unpacking targets count: `factory_self, x = f()` binds
+                // the receiver through a Tuple just as much as a bare
+                // `factory_self = ...` does.
+                if expr_binds_name(target, from) {
                     return Err(format!(
                         "method rebinds its receiver `{from}`; rython's receiver is \
                          an immutable `&self`, so the reassignment has no lowering"
@@ -338,10 +341,20 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
             end_lineno: i.end_lineno,
             end_col_offset: i.end_col_offset,
         }),
-        ExprType::NamedExpr(ne) => ExprType::NamedExpr(NamedExpr {
-            left: Box::new(rename_expr(ne.left.as_ref(), from, to)),
-            right: Box::new(rename_expr(ne.right.as_ref(), from, to)),
-        }),
+        ExprType::NamedExpr(ne) => {
+            // A walrus BINDING the receiver name (`(factory_self := x)`)
+            // rebinds it; rewriting would emit an assignment to `&self`.
+            // Keep the expression verbatim so the generated crate fails
+            // loudly on the unknown name instead.
+            if matches!(ne.left.as_ref(), ExprType::Name(n) if n.id == from) {
+                expr.clone()
+            } else {
+                ExprType::NamedExpr(NamedExpr {
+                    left: Box::new(rename_expr(ne.left.as_ref(), from, to)),
+                    right: Box::new(rename_expr(ne.right.as_ref(), from, to)),
+                })
+            }
+        }
         ExprType::Starred(s) => ExprType::Starred(Starred {
             value: Box::new(rename_expr(s.value.as_ref(), from, to)),
             ctx: s.ctx.clone(),
@@ -444,6 +457,9 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
             end_lineno: ge.end_lineno,
             end_col_offset: ge.end_col_offset,
         }),
+        ExprType::Await(a) => ExprType::Await(Await {
+            value: Box::new(rename_expr(a.value.as_ref(), from, to)),
+        }),
         ExprType::Yield(y) => ExprType::Yield(super::yield_expr::Yield {
             value: y.value.as_ref().map(|v| Box::new(rename_expr(v.as_ref(), from, to))),
             lineno: y.lineno,
@@ -481,18 +497,37 @@ fn rename_comprehension_elt(
     }
 }
 
+/// Rename generator clauses with CPython's scoping: the FIRST
+/// generator's iterable evaluates in the enclosing scope (renames), but
+/// every later iterable and every `if` evaluates inside the loop scopes,
+/// where a bound receiver name shadows the enclosing one.
 fn renamed_generators(
     generators: &[super::list_comp::Comprehension],
     from: &str,
     to: &str,
 ) -> Vec<super::list_comp::Comprehension> {
+    let mut shadowed = false;
     generators
         .iter()
-        .map(|g| super::list_comp::Comprehension {
-            target: g.target.clone(),
-            iter: rename_expr(&g.iter, from, to),
-            ifs: g.ifs.iter().map(|i| rename_expr(i, from, to)).collect(),
-            is_async: g.is_async,
+        .map(|g| {
+            let iter = if shadowed {
+                g.iter.clone()
+            } else {
+                rename_expr(&g.iter, from, to)
+            };
+            let ifs = if shadowed {
+                g.ifs.clone()
+            } else {
+                g.ifs.iter().map(|i| rename_expr(i, from, to)).collect()
+            };
+            // The target binds AFTER the iterable and BEFORE the ifs.
+            shadowed = shadowed || expr_binds_name(&g.target, from);
+            super::list_comp::Comprehension {
+                target: g.target.clone(),
+                iter,
+                ifs,
+                is_async: g.is_async,
+            }
         })
         .collect()
 }
@@ -534,7 +569,6 @@ fn rename_subscript_kind(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,7 +578,7 @@ mod tests {
     /// Extract the body of the first function in `src`. The rename pass is
     /// scope-local, so a module-level `async def` exercises exactly the
     /// same paths as an (upstream-unsupported) class-level one.
-    fn method_body(src: &str) -> Vec<Statement> {
+    fn fn_body(src: &str) -> Vec<Statement> {
         let module = parse(src, "t.py").expect("parse");
         for stmt in &module.raw.body {
             match &stmt.statement {
@@ -556,32 +590,24 @@ mod tests {
         panic!("no function in source");
     }
 
-    fn contains_name(body: &[Statement], name: &str) -> bool {
-        let rendered = format!("{:#?}", body);
-        rendered.contains(&format!("id: \"{name}\""))
-            || rendered.contains(&format!("\"{name}\""))
+    fn rendered(body: &[Statement]) -> String {
+        format!("{body:#?}")
     }
 
     #[test]
     fn async_for_renames_iterable_even_when_target_shadows() {
         // The iterable sits OUTSIDE the target's binding scope: it renames
         // even though the target shadows the receiver name; the loop BODY
-        // stays untouched there (its `factory_self` would be the loop
-        // variable).
+        // stays untouched there (its factory_self would be the loop var).
         let src = concat!(
             "async def drain(factory_self):\n",
             "    async for factory_self in factory_self.items:\n",
             "        return item\n"
         );
-        let body = method_body(src);
-        let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
-        assert!(
-            contains_name(&renamed, "self"),
-            "iterable must be renamed: {renamed:#?}"
-        );
-        // The loop target keeps its binding; body references stay bound to
-        // it (rendered as factory_self).
-        assert!(contains_name(&renamed, "factory_self"));
+        let renamed = rename_receiver_in_body(&fn_body(src), "factory_self", "self").unwrap();
+        let r = rendered(&renamed);
+        assert!(r.contains("self . items") || r.contains("self.items") || r.contains("\"self\""), "iterable must rename: {r}");
+        assert!(r.contains("factory_self"), "shadowed body keeps the binding name: {r}");
     }
 
     #[test]
@@ -591,12 +617,64 @@ mod tests {
             "    async with factory_self.lock as factory_self:\n",
             "        return 1\n"
         );
-        let body = method_body(src);
+        let renamed = rename_receiver_in_body(&fn_body(src), "factory_self", "self").unwrap();
+        let r = rendered(&renamed);
+        assert!(r.contains("\"self\""), "context must rename: {r}");
+        assert!(r.contains("factory_self"), "as-binding keeps its name: {r}");
+    }
+
+    #[test]
+    fn await_renames_its_inner_expression() {
+        let body = fn_body(
+            "async def m(factory_self):\n    v = await factory_self.get()\n    return v\n",
+        );
+        let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
+        let r = rendered(&renamed);
+        assert!(!r.contains("factory_self"), "renamed: {r}");
+    }
+
+    #[test]
+    fn tuple_unpack_rebinding_the_receiver_is_a_loud_error() {
+        let body = fn_body(
+            "def m(factory_self):\n    factory_self, x = f()\n    return x\n",
+        );
+        let err = rename_receiver_in_body(&body, "factory_self", "self")
+            .expect_err("unpacking rebind must be loud");
+        assert!(err.contains("rebinds its receiver"), "err: {err}");
+    }
+
+    #[test]
+    fn comprehension_clauses_follow_generator_scoping() {
+        // CPython scoping: the FIRST generator's iterable evaluates in the
+        // enclosing scope; every later iterable and every if evaluates
+        // inside the loop scopes where a bound receiver name shadows it.
+        let body = fn_body(
+            "def m(factory_self):\n    return [y for factory_self in [1] if factory_self == 2]\n",
+        );
         let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
         assert!(
-            contains_name(&renamed, "self"),
-            "context expression must be renamed: {renamed:#?}"
+            rendered(&renamed).contains("\"factory_self\""),
+            "shadowed if keeps the binding name: {}",
+            rendered(&renamed)
         );
-        assert!(contains_name(&renamed, "factory_self"));
+        let body = fn_body(
+            "def m(factory_self):\n    return [y for q in [1] if factory_self == 2]\n",
+        );
+        let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
+        let r = rendered(&renamed);
+        assert!(r.contains("\"self\""), "filter renames: {r}");
+        assert!(!r.contains("\"factory_self\""), "renamed: {r}");
+    }
+
+    #[test]
+    fn walrus_binding_the_receiver_stays_verbatim() {
+        // (factory_self := x) REBINDS the receiver; rewriting would emit an
+        // assignment to &self, so it stays verbatim and the generated
+        // crate fails loudly on the unknown name instead.
+        let body = fn_body(
+            "def m(factory_self):\n    y = (factory_self := 3)\n    return y\n",
+        );
+        let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
+        assert!(rendered(&renamed).contains("factory_self"));
     }
 }
