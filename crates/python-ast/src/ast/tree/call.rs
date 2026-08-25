@@ -1874,6 +1874,70 @@ impl<'a> CodeGen for Call {
                             let kind = &t.id;
                             return Ok(quote!((#arg).matches(#kind)));
                         }
+                        // `isinstance(v, type(x))`: `type(...)` of a
+                        // statically-known class instance resolves to that
+                        // class (issue #134 — charset_normalizer's codec
+                        // fallback checks `type(self)`). Decidable exactly
+                        // like the direct class-target form below: true
+                        // when v is typed as the same class, otherwise the
+                        // documented class-as-value divergence (false),
+                        // warned when v's type is unknown.
+                        if let ExprType::Call(c) = &self.args[1]
+                            && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "type")
+                            && c.args.len() == 1
+                        {
+                            let inner_class = match &c.args[0] {
+                                ExprType::Name(n) if n.id == "self" => ctx
+                                    .enclosing_class_name()
+                                    .map(str::to_string),
+                                ExprType::Name(n) => {
+                                    // A user-class instance resolves through
+                                    // name_types; builtin type objects (int,
+                                    // str, ...) act as their own class names.
+                                    match options.name_types.get(&n.id) {
+                                        Some(crate::TypeInfo::Class(cname)) => {
+                                            Some(cname.clone())
+                                        }
+                                        _ => matches!(
+                                            n.id.as_str(),
+                                            "int"
+                                                | "str"
+                                                | "float"
+                                                | "bool"
+                                                | "bytes"
+                                                | "bytearray"
+                                                | "list"
+                                                | "tuple"
+                                                | "set"
+                                                | "dict"
+                                                | "frozenset"
+                                        )
+                                        .then(|| n.id.clone()),
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(cname) = inner_class {
+                                let same_class = matches!(
+                                    &self.args[0],
+                                    ExprType::Name(n)
+                                        if options.name_types.get(&n.id).is_some_and(|ty| {
+                                            matches!(
+                                                ty,
+                                                crate::TypeInfo::Class(cc) if cc == &cname
+                                            )
+                                        })
+                                );
+                                if !same_class {
+                                    options.definition_warnings.borrow_mut().push(format!(
+                                        "isinstance(x, type(self)) with x not statically \
+                                         typed as `{cname}` lowers to false (the \
+                                         class-as-value divergence)"
+                                    ));
+                                }
+                                return Ok(quote!(#same_class));
+                            }
+                        }
                         // A NON-exception class target (`isinstance(other,
                         // CompatibleFamillyRange)`, or an alias/import of one
                         // like `TimeoutSauce`): statically decidable in

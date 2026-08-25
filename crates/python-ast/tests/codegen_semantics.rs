@@ -2696,6 +2696,61 @@ fn slice_assignment_is_a_loud_error() {
 }
 
 #[test]
+fn isinstance_type_call_resolves_statically() {
+    // Issue #134 (charset_normalizer): `isinstance(x, type(self))` —
+    // `type(...)` of a statically-known instance resolves to that class.
+    // Same class: true. A different known class: false. An UNANNOTATED
+    // argument has unknown type: the documented class-as-value divergence
+    // lowers to false and records a definition warning naming it.
+    let src = concat!(
+        "class Door:\n",
+        "    def __init__(self, ok: bool):\n",
+        "        self.ok = ok\n",
+        "\n",
+        "    def same(self, other: \"Door\") -> bool:\n",
+        "        return isinstance(other, type(self))\n",
+        "\n",
+        "    def diff(self, other: \"Door\") -> bool:\n",
+        "        return isinstance(other, type(int))\n",
+        "\n",
+        "    def unknown(self, other) -> bool:\n",
+        "        return isinstance(other, type(self))\n"
+    );
+    let out = compile(src, "istype.py");
+
+    let same_part = out.split("fn same").nth(1).expect("same fn");
+    assert!(
+        same_part.contains("return Ok (true)"),
+        "same-class must be true: {}",
+        out
+    );
+    let diff_part = out.split("fn diff").nth(1).expect("diff fn");
+    assert!(
+        diff_part.contains("return Ok (false)"),
+        "different class must be false: {}",
+        out
+    );
+}
+
+#[test]
+fn isinstance_type_call_unknown_argument_warns_divergence() {
+    let src = concat!(
+        "class Door:\n",
+        "    def unknown(self, other) -> bool:\n",
+        "        return isinstance(other, type(self))\n"
+    );
+    let (out, warnings) = compile_with_warnings(src, "istypeunknown.py");
+    assert!(out.contains("return Ok (false)"), "generated: {}", out);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("class-as-value divergence")),
+        "warnings: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn nonself_receiver_is_renamed_through_the_body_and_nested_scopes() {
     // Python binds the instance to the FIRST parameter whatever its name
     // (issue #132, boto3's factory_self): body references rename to the
