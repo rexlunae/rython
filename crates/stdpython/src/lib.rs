@@ -4652,8 +4652,9 @@ impl PyException {
     /// Whether this exception is caught by an `except <name>:` clause.
     ///
     /// Python semantics: the clause matches when `<name>` is the raised
-    /// type itself or one of its ancestors. The tree below is CPython's
-    /// built-in exception hierarchy (verified by dumping `__mro__` for
+    /// type itself or one of its ancestors. The tree is CPython's
+    /// built-in exception hierarchy, modeled as the [`crate::builtin_exceptions`]
+    /// enum (verified by dumping `__mro__` for
     /// every built-in exception under python3 3.14), so
     /// `except LookupError:` now catches IndexError/KeyError,
     /// `except OSError:` catches FileNotFoundError and friends, and
@@ -4661,53 +4662,30 @@ impl PyException {
     /// KeyboardInterrupt or GeneratorExit — the old exact-name check
     /// missed all of that (spec §12.3 defect class, fixed here).
     pub fn matches(&self, name: &str) -> bool {
-        // EnvironmentError and IOError are historical ALIASES of OSError:
-        // `issubclass(FileNotFoundError, EnvironmentError)` is True in
-        // CPython even though the alias never appears in FileNotFoundError's
-        // MRO — so aliases resolve to the canonical name before matching.
-        let name = match name {
-            "EnvironmentError" | "IOError" => "OSError",
-            other => other,
-        };
+        use crate::builtin_exceptions::BuiltinException;
+        // Exact name equality covers user-defined classes and builtins
+        // alike (a raised MyError is caught by `except MyError:`).
         if self.exception_type == name {
             return true;
         }
-        // BaseException is the tree's ROOT: it has no parent entry, but
-        // unlike a truly-unknown type it IS in-tree — only an exact
-        // `except BaseException:` catches it, never `except Exception:`.
-        if self.exception_type == "BaseException" {
-            return false;
-        }
-        // ExceptionGroup MULTIPLY inherits (BaseExceptionGroup, Exception)
-        // in CPython; the single-parent walk below cannot reach Exception,
-        // so that second ancestry is explicit here. A bare
-        // BaseExceptionGroup stays outside Exception.
-        if self.exception_type == "ExceptionGroup" && name == "Exception" {
-            return true;
-        }
-        match direct_exception_parent(&self.exception_type) {
-            Some(first) => {
-                let mut current = Some(first);
-                while let Some(parent) = current {
-                    if parent == name {
-                        return true;
-                    }
-                    current = direct_exception_parent(parent);
-                }
-                false
-            }
-            // An exception type outside the built-in tree keeps the
-            // historical broad posture: only Exception/BaseException are
-            // treated as catching it.
-            None => name == "Exception" || name == "BaseException",
+        // Both names parse into the built-in tree exactly once (the
+        // aliases EnvironmentError/IOError canonicalize to OSError there,
+        // so `except IOError:` catches a raised OSError and vice versa —
+        // CPython treats them as the same class object); the ancestry
+        // question is then a compile-checked enum walk.
+        match (
+            BuiltinException::from_name(&self.exception_type),
+            BuiltinException::from_name(name),
+        ) {
+            (Some(raised), Some(target)) => raised.is_caught_by(target),
+            // A raised type outside the built-in tree (a user class)
+            // keeps the historical broad posture: only Exception and
+            // BaseException are treated as catching it.
+            (None, _) => name == "Exception" || name == "BaseException",
+            // A built-in raised type is never caught by an unknown name.
+            (Some(_), None) => false,
         }
     }
-}
-
-/// The direct parent of a built-in exception name. Delegates to the
-/// single-source table in [`crate::builtin_exceptions`].
-fn direct_exception_parent(exc: &str) -> Option<&'static str> {
-    crate::builtin_exceptions::direct_exception_parent(exc)
 }
 
 /// Map a raised PyException onto the corresponding real Python exception
@@ -4716,16 +4694,14 @@ fn direct_exception_parent(exc: &str) -> Option<&'static str> {
 #[cfg(feature = "std")]
 impl From<PyException> for pyo3::PyErr {
     fn from(e: PyException) -> pyo3::PyErr {
-        use pyo3::exceptions::*;
         let msg = e.message.clone();
-        // One lookup into the single-source exception table (see
-        // builtin_exceptions): every built-in name raises its real Python
-        // class; IndentationError/TabError/_IncompleteInputError surface
-        // through SyntaxError (pyo3 0.29 wraps neither), and anything
-        // unrecognized keeps its full "Type: message" display.
-        match crate::builtin_exceptions::pyo3_ctor(&e.exception_type) {
-            Some(ctor) => ctor(msg),
-            None => PyRuntimeError::new_err(format!("{}", e)),
+        // One parse into the built-in exception enum (see
+        // builtin_exceptions): every built-in type raises its real Python
+        // class via the exhaustive pyo3_err match; anything unrecognized
+        // (a user-defined class) keeps its full "Type: message" display.
+        match crate::builtin_exceptions::BuiltinException::from_name(&e.exception_type) {
+            Some(builtin) => builtin.pyo3_err(msg),
+            None => pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)),
         }
     }
 }
