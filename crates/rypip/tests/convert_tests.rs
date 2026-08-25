@@ -2652,6 +2652,10 @@ fn method_receiver_binding_and_associated_calls_match_python() {
             "    def scale(factory_self, times: int) -> int:\n",
             "        return factory_self.base * times\n",
             "\n",
+            "    def bump(factory_self, by: int):\n",
+            "        factory_self.base = factory_self.base + by\n",
+            "        return 0\n",
+            "\n",
             "    @staticmethod\n",
             "    def helper(x: int) -> int:\n",
             "        return x * 10\n",
@@ -2662,7 +2666,15 @@ fn method_receiver_binding_and_associated_calls_match_python() {
             "\n",
             "def main() -> int:\n",
             "    w = Widget(2)\n",
-            "    print(w.scale(4))\n",
+            "    w.bump(3)\n",
+            "    print(w.scale(2))\n",
+            "    w2 = Widget(2)\n",
+            "    print(w2.scale(4))\n",
+            "    print(w.helper(1))\n",
+            "    print(Widget.helper(2))\n",
+            "    c = Widget.make(5)\n",
+            "    print(c.base)\n",
+            "    return 0\n",
             "    print(w.helper(1))\n",
             "    print(Widget.helper(2))\n",
             "    c = Widget.make(5)\n",
@@ -2684,11 +2696,14 @@ fn method_receiver_binding_and_associated_calls_match_python() {
     let output = Command::new(krate.root.join("target/debug/widget"))
         .output()
         .expect("running generated binary");
+    // Verified against python3: w.bump(3) mutates through the renamed
+    // receiver (base 2->5, scale(2) prints 10); the rest re-checks the
+    // static/classmethod shapes.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        vec!["8", "10", "20", "5"],
+        vec!["10", "8", "10", "20", "5"],
         "method receiver binding diverged from CPython"
     );
 }
