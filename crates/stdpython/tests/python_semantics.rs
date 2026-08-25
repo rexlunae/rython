@@ -2769,3 +2769,295 @@ fn os_path_expandvars_matches_python() {
     assert_eq!(expandvars("plain"), "plain");
     assert_eq!(expandvars("$RY_TEST_V$RY_TEST_V"), "hellohello");
 }
+
+mod threading_module {
+    use stdpython::threading;
+
+    #[test]
+    fn thread_lifecycle_matches_python() {
+        // Verified against python3: is_alive() is False before start and
+        // after join; join() waits for the body.
+        let (tx, rx) = std::sync::mpsc::channel::<i64>();
+        let t = threading::Thread::new("worker", false, move || {
+            tx.send(42).unwrap();
+        });
+        assert!(!t.is_alive());
+        t.start();
+        t.join();
+        assert!(!t.is_alive());
+        assert_eq!(rx.recv().unwrap(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "threads can only be started once")]
+    fn double_start_raises_pythons_runtime_error() {
+        // Verified against python3: RuntimeError('threads can only be started once')
+        let t = threading::Thread::new("worker", false, || {});
+        t.start();
+        t.join();
+        t.start();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot join thread before it is started")]
+    fn join_before_start_raises_pythons_runtime_error() {
+        // Verified against python3: RuntimeError('cannot join thread before it is started')
+        let t = threading::Thread::new("worker", false, || {});
+        t.join();
+    }
+
+    #[test]
+    fn lock_matches_python() {
+        // Verified against python3: acquire() -> True, locked() flips,
+        // release() of an unlocked lock -> RuntimeError('release unlocked lock').
+        let lock = threading::Lock();
+        assert!(!lock.locked());
+        assert!(lock.acquire().unwrap());
+        assert!(lock.locked());
+        lock.release().unwrap();
+        assert!(!lock.locked());
+        let e = lock.release().unwrap_err();
+        assert_eq!(format!("{}", e), "RuntimeError: release unlocked lock");
+        // The with-statement guard releases on drop.
+        {
+            let _g = lock.py_guard().unwrap();
+            assert!(lock.locked());
+        }
+        assert!(!lock.locked());
+    }
+
+    #[test]
+    fn lock_excludes_across_threads() {
+        // Two threads bump a shared counter under the lock; the final
+        // value proves every increment was mutually excluded.
+        let lock = threading::Lock();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let lock = lock.clone();
+            let counter = counter.clone();
+            let t = threading::Thread::new("bump", false, move || {
+                for _ in 0..100 {
+                    let _g = lock.py_guard().unwrap();
+                    let v = counter.load(std::sync::atomic::Ordering::SeqCst);
+                    counter.store(v + 1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            t.start();
+            handles.push(t);
+        }
+        for t in &handles {
+            t.join();
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 400);
+    }
+
+    #[test]
+    fn rlock_is_reentrant_and_owner_checked() {
+        // Verified against python3: nested acquire on one thread works;
+        // release without acquire -> RuntimeError('cannot release un-acquired lock').
+        let rl = threading::RLock();
+        assert!(rl.acquire().unwrap());
+        assert!(rl.acquire().unwrap());
+        rl.release().unwrap();
+        rl.release().unwrap();
+        let e = rl.release().unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "RuntimeError: cannot release un-acquired lock"
+        );
+    }
+
+    #[test]
+    fn event_signals_a_waiting_thread() {
+        // Verified against python3: is_set() False -> set() -> wait() True.
+        let ev = threading::Event();
+        assert!(!ev.is_set());
+        let ev2 = ev.clone();
+        let t = threading::Thread::new("setter", false, move || {
+            ev2.set();
+        });
+        t.start();
+        assert!(ev.wait().unwrap());
+        t.join();
+        assert!(ev.is_set());
+        let mut ev = ev;
+        ev.clear();
+        assert!(!ev.is_set());
+    }
+
+    #[test]
+    fn semaphore_counts_and_blocks_at_zero() {
+        // Verified against python3: acquire() -> True; a release unblocks
+        // a waiter.
+        let sem = threading::Semaphore(1);
+        assert!(sem.acquire().unwrap());
+        let sem2 = sem.clone();
+        let t = threading::Thread::new("waiter", false, move || {
+            // Blocks until the main thread releases.
+            sem2.acquire().unwrap();
+            sem2.release().unwrap();
+        });
+        t.start();
+        sem.release().unwrap();
+        t.join();
+    }
+
+    #[test]
+    #[should_panic(expected = "semaphore initial value must be >= 0")]
+    fn negative_semaphore_raises_pythons_value_error() {
+        // Verified against python3: ValueError('semaphore initial value must be >= 0')
+        threading::Semaphore(-1);
+    }
+
+    #[test]
+    fn current_thread_and_active_count() {
+        // Verified against python3: spawned threads are named
+        // 'Thread-N (target)'; active_count() counts the main thread.
+        // (The 'MainThread' name is pinned by the end-to-end convert test
+        // — the cargo test harness runs tests on NAMED worker threads, so
+        // the main-thread mapping is not observable here.)
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let t = threading::Thread::new("namer", false, move || {
+            tx.send(threading::current_thread().name).unwrap();
+        });
+        t.start();
+        t.join();
+        let name = rx.recv().unwrap();
+        assert!(
+            name.starts_with("Thread-") && name.ends_with(" (namer)"),
+            "CPython thread naming: {}",
+            name
+        );
+        assert!(threading::active_count() >= 1);
+    }
+}
+
+mod socket_module {
+    use stdpython::{socket, threading};
+
+    #[test]
+    fn tcp_echo_roundtrip() {
+        // A loopback echo: server thread accepts one connection and echoes
+        // with a prefix; mirrors the CPython socket walkthrough.
+        let srv = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        srv.bind(("127.0.0.1", 0)).unwrap();
+        srv.listen(1).unwrap();
+        let port = srv.getsockname().unwrap().1;
+        let srv2 = srv.clone();
+        let t = threading::Thread::new("serve", false, move || {
+            let (mut conn, _addr) = srv2.accept().unwrap();
+            let data = conn.recv(1024).unwrap();
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&data);
+            conn.sendall(reply).unwrap();
+            conn.close().unwrap();
+            let mut srv2 = srv2;
+            srv2.close().unwrap();
+        });
+        t.start();
+        let mut cli = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        cli.connect(("127.0.0.1", port)).unwrap();
+        cli.sendall(b"ping".to_vec()).unwrap();
+        let got = cli.recv(1024).unwrap();
+        assert_eq!(got, b"echo:ping");
+        cli.close().unwrap();
+        t.join();
+    }
+
+    #[test]
+    fn refused_connection_raises_connection_refused_error() {
+        // Verified against python3: ConnectionRefusedError('[Errno 111]
+        // Connection refused'), caught by `except OSError:` through the
+        // hierarchy.
+        let cli = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        let e = cli.connect(("127.0.0.1", 1)).unwrap_err();
+        assert_eq!(e.exception_type, "ConnectionRefusedError");
+        assert!(e.matches("ConnectionError"));
+        assert!(e.matches("OSError"));
+        assert!(
+            e.message.starts_with("[Errno "),
+            "CPython message shape: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn recv_timeout_raises_timeout_error() {
+        // Verified against python3: TimeoutError('timed out').
+        let srv = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        srv.bind(("127.0.0.1", 0)).unwrap();
+        srv.listen(1).unwrap();
+        let port = srv.getsockname().unwrap().1;
+        let cli = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        cli.connect(("127.0.0.1", port)).unwrap();
+        cli.settimeout(0.05).unwrap();
+        let e = cli.recv(10).unwrap_err();
+        assert_eq!(format!("{}", e), "TimeoutError: timed out");
+        assert!(e.matches("OSError"));
+    }
+
+    #[test]
+    fn closed_socket_raises_bad_file_descriptor() {
+        // Verified against python3: OSError('[Errno 9] Bad file descriptor');
+        // close() through ONE handle closes every clone (object semantics).
+        let mut s = socket::socket(socket::AF_INET, socket::SOCK_STREAM).unwrap();
+        let s2 = s.clone();
+        s.close().unwrap();
+        let e = s2.recv(1).unwrap_err();
+        assert_eq!(format!("{}", e), "OSError: [Errno 9] Bad file descriptor");
+    }
+
+    #[test]
+    fn udp_roundtrip_via_sendto_recvfrom() {
+        let a = socket::socket(socket::AF_INET, socket::SOCK_DGRAM).unwrap();
+        a.bind(("127.0.0.1", 0)).unwrap();
+        let port = a.getsockname().unwrap().1;
+        let b = socket::socket(socket::AF_INET, socket::SOCK_DGRAM).unwrap();
+        b.sendto(b"datagram".to_vec(), ("127.0.0.1", port)).unwrap();
+        let (data, _peer) = a.recvfrom(64).unwrap();
+        assert_eq!(data, b"datagram");
+    }
+
+    #[test]
+    fn bad_family_raises_os_error() {
+        // Verified against python3: OSError('[Errno 97] Address family not
+        // supported by protocol').
+        let e = socket::socket(999, socket::SOCK_STREAM).unwrap_err();
+        assert_eq!(
+            format!("{}", e),
+            "OSError: [Errno 97] Address family not supported by protocol"
+        );
+    }
+
+    #[test]
+    fn gethostname_is_nonempty() {
+        assert!(!socket::gethostname().is_empty());
+    }
+}
+
+mod bytesio {
+    use stdpython::io;
+
+    #[test]
+    fn bytesio_cursor_semantics_match_python() {
+        // python3: BytesIO(b"seeded").write(b"!") OVERWRITES at the
+        // cursor: buffer b'!eeded', write returns 1, read() -> b'eeded'.
+        let mut b = io::BytesIO_seeded(b"seeded");
+        assert_eq!(b.write(b"!").unwrap(), 1);
+        assert_eq!(b.getvalue().unwrap(), b"!eeded");
+        assert_eq!(b.read().unwrap(), b"eeded");
+        // At the end, write appends.
+        assert_eq!(b.write(b"xy").unwrap(), 2);
+        assert_eq!(b.getvalue().unwrap(), b"!eededxy");
+    }
+
+    #[test]
+    fn closed_bytesio_raises_pythons_value_error() {
+        // Verified against python3: ValueError('I/O operation on closed file.')
+        let mut b = io::BytesIO();
+        b.close().unwrap();
+        let e = b.read().unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
+    }
+}

@@ -1575,39 +1575,41 @@ pub fn module_contains_async(body: &[crate::Statement]) -> bool {
     body.iter().any(stmt_contains_async)
 }
 
-/// Whether a module body imports `asyncio` (plain or from-import, aliased
-/// or not). Drives whether the generated crate needs stdpython's
-/// tokio-backed `async-tokio` feature even for library conversions.
-pub fn module_imports_asyncio(body: &[crate::Statement]) -> bool {
-    fn stmt_imports_asyncio(stmt: &crate::Statement) -> bool {
+/// Whether a module body imports a module with the given ROOT name (plain
+/// or from-import, aliased or not, anywhere in the statement tree). Drives
+/// the feature-gated stdpython surfaces: `asyncio` needs `async-tokio`,
+/// `urllib` (urllib.request) needs `http-ureq`.
+pub fn module_imports_root(body: &[crate::Statement], root: &str) -> bool {
+    fn stmt_imports_root(stmt: &crate::Statement, root: &str) -> bool {
+        let any = |stmts: &[crate::Statement]| stmts.iter().any(|s| stmt_imports_root(s, root));
         match &stmt.statement {
-            crate::StatementType::Import(imp) => imp.names.iter().any(|a| {
-                a.name.split('.').next().is_some_and(|root| root == "asyncio")
-            }),
+            crate::StatementType::Import(imp) => imp
+                .names
+                .iter()
+                .any(|a| a.name.split('.').next().is_some_and(|r| r == root)),
             crate::StatementType::ImportFrom(imp) => {
-                imp.module.split('.').next().is_some_and(|root| root == "asyncio")
+                imp.module.split('.').next().is_some_and(|r| r == root)
             }
-            crate::StatementType::If(i) => {
-                i.body.iter().any(stmt_imports_asyncio) || i.orelse.iter().any(stmt_imports_asyncio)
-            }
-            crate::StatementType::For(f) => {
-                f.body.iter().any(stmt_imports_asyncio) || f.orelse.iter().any(stmt_imports_asyncio)
-            }
-            crate::StatementType::While(w) => {
-                w.body.iter().any(stmt_imports_asyncio) || w.orelse.iter().any(stmt_imports_asyncio)
-            }
+            crate::StatementType::If(i) => any(&i.body) || any(&i.orelse),
+            crate::StatementType::For(f) => any(&f.body) || any(&f.orelse),
+            crate::StatementType::While(w) => any(&w.body) || any(&w.orelse),
             crate::StatementType::Try(t) => {
-                t.body.iter().any(stmt_imports_asyncio)
-                    || t.handlers.iter().any(|h| h.body.iter().any(stmt_imports_asyncio))
-                    || t.orelse.iter().any(stmt_imports_asyncio)
-                    || t.finalbody.iter().any(stmt_imports_asyncio)
+                any(&t.body)
+                    || t.handlers.iter().any(|h| any(&h.body))
+                    || any(&t.orelse)
+                    || any(&t.finalbody)
             }
-            crate::StatementType::With(w) => w.body.iter().any(stmt_imports_asyncio),
-            crate::StatementType::FunctionDef(f) => f.body.iter().any(stmt_imports_asyncio),
+            crate::StatementType::With(w) => any(&w.body),
+            crate::StatementType::FunctionDef(f) => any(&f.body),
             _ => false,
         }
     }
-    body.iter().any(stmt_imports_asyncio)
+    body.iter().any(|s| stmt_imports_root(s, root))
+}
+
+/// Whether a module body imports `asyncio` — see [`module_imports_root`].
+pub fn module_imports_asyncio(body: &[crate::Statement]) -> bool {
+    module_imports_root(body, "asyncio")
 }
 
 /// The plain-Name targets of a module-level Assign, when EVERY target is a

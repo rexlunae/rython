@@ -4,9 +4,42 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, Node, PythonOptions, Statement, SymbolTableScopes,
-    extract_list, WithItem,
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, Statement, SymbolTableNode,
+    SymbolTableScopes, extract_list, WithItem,
 };
+
+/// Whether a with-item's context expression is a threading synchronization
+/// object (Lock/RLock/Semaphore) — either constructed inline
+/// (`with threading.Lock():`) or a name assigned from such a construction.
+/// These have REAL `__enter__`/`__exit__` semantics (acquire/release), so
+/// the with-statement must lower to the RAII guard instead of the plain
+/// binding.
+fn is_threading_sync_call(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    const SYNC_TYPES: [&str; 3] = ["Lock", "RLock", "Semaphore"];
+    match expr {
+        ExprType::Call(call) => match call.func.as_ref() {
+            ExprType::Attribute(attr) => {
+                SYNC_TYPES.contains(&attr.attr.as_str())
+                    && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
+                    && !crate::module_name_shadowed("threading", symbols)
+            }
+            ExprType::Name(n) => {
+                SYNC_TYPES.contains(&n.id.as_str())
+                    && matches!(
+                        symbols.get(&n.id),
+                        Some(SymbolTableNode::ImportFrom(i)) if i.module == "threading"
+                    )
+            }
+            _ => false,
+        },
+        ExprType::Name(n) => matches!(
+            symbols.get(&n.id),
+            Some(SymbolTableNode::Assign { value: ExprType::Call(c), .. })
+                if is_threading_sync_call(&ExprType::Call(c.clone()), symbols)
+        ),
+        _ => false,
+    }
+}
 
 /// Regular with statement (with context as var: ...)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -75,18 +108,38 @@ impl CodeGen for With {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         // Evaluate each context manager and bind its `as` target (or a
         // throwaway binding when there is none, so side effects still run).
-        // __enter__/__exit__ protocol semantics are not modeled yet, but the
-        // expression is no longer dropped and the target is in scope; Rust's
-        // Drop at end of block approximates __exit__ cleanup.
+        // The general __enter__/__exit__ protocol is not modeled yet
+        // (Rust's Drop at end of block approximates __exit__ cleanup), with
+        // one REAL implementation: threading Lock/RLock/Semaphore context
+        // expressions lower to the runtime's RAII guard — acquire at entry,
+        // release when the guard drops, exception-safe through unwinding
+        // `?`, exactly Python's with-lock discipline.
         let mut item_tokens = Vec::new();
-        for item in self.items {
+        for (index, item) in self.items.into_iter().enumerate() {
+            let is_sync = is_threading_sync_call(&item.context_expr, &symbols);
             let context_expr =
                 item.context_expr
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             match item.optional_vars {
+                Some(vars) if is_sync => {
+                    // CPython binds the target to __enter__'s return (True
+                    // for locks) — a shape with no honest lowering here.
+                    let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    return Err(format!(
+                        "`with <lock> as {}:` is not supported yet (a lock's __enter__ \
+                         returns True, not the lock); use `with <lock>:` and name the \
+                         lock outside the statement",
+                        target
+                    )
+                    .into());
+                }
                 Some(vars) => {
                     let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     item_tokens.push(quote! { let mut #target = #context_expr; });
+                }
+                None if is_sync => {
+                    let guard = crate::safe_ident(&format!("__rython_with_guard_{}", index));
+                    item_tokens.push(quote! { let #guard = (#context_expr).py_guard()?; });
                 }
                 None => {
                     item_tokens.push(quote! { let _ = #context_expr; });

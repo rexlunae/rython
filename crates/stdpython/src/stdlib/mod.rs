@@ -94,8 +94,9 @@ pub mod textwrap;
 #[cfg(feature = "std")]
 pub mod re;
 
-/// Python io module (StringIO); PyFile itself lives at the crate root.
-#[cfg(feature = "std")]
+/// Python io module (StringIO/BytesIO); PyFile itself lives at the crate
+/// root. In-memory buffers are pure alloc, so the module lives on every
+/// tier — only the DISK backends of PyFile (and `open()`) are std-gated.
 pub mod io;
 
 /// Python argparse module: the runtime half of conversion-time parsers.
@@ -119,4 +120,22 @@ pub mod codec;
 /// `numpy-cuda`, and `numpy-vulkan` add accelerated backends.
 #[cfg(feature = "std")]
 pub mod numpy;
+
+/// Python threading module - thread management (Thread) and
+/// synchronization (Lock, RLock, Event, Semaphore) on std::thread.
+/// std-gated: threads need an OS.
+#[cfg(feature = "std")]
+pub mod threading;
+
+/// Python socket module - TCP/UDP sockets on std::net.
+/// std-gated: sockets need an OS.
+#[cfg(feature = "std")]
+pub mod socket;
+
+/// Python urllib package (urllib.request) - HTTP(S) client wrapped over
+/// the ureq crate. Feature-gated per the platform-surface convention:
+/// only crates that import urllib.request enable `http-ureq` (rypip does
+/// this automatically for converted packages).
+#[cfg(feature = "http-ureq")]
+pub mod urllib;
 

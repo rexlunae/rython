@@ -2948,6 +2948,17 @@ fn package_async_flags(package: &PyPackage) -> (bool, bool) {
     (uses_async, imports_asyncio)
 }
 
+/// Whether any module of the package imports urllib (urllib.request):
+/// drives stdpython's ureq-backed `http-ureq` feature on the generated
+/// crate's dependency, the same way asyncio drives `async-tokio`.
+fn package_imports_urllib(package: &PyPackage) -> bool {
+    package.modules.iter().any(|module| {
+        parse_enhanced(&module.source, parse_filename(module))
+            .map(|ast| python_ast::module_imports_root(&ast.raw.body, "urllib"))
+            .unwrap_or(false)
+    })
+}
+
 /// Conversion-level PythonOptions shared by every module of one conversion
 /// (see `transpile`): the registries, `module_defs`, and the shared
 /// cross-module trait-mut cache.
@@ -3261,12 +3272,29 @@ fn write_cargo_toml(
             ),
         }
     } else {
-        // The std tier of stdpython, with the tokio-backed asyncio module
-        // when the package uses it (async code or `import asyncio`).
-        let async_feature = if needs_async_stdpython {
-            ", features = [\"async-tokio\"]"
+        // The std tier of stdpython, with the feature-gated surfaces the
+        // package actually uses: the tokio-backed asyncio module (async
+        // code or `import asyncio`) and the ureq-backed urllib.request
+        // HTTP client (`import urllib.request` — the platform-surface
+        // feature convention).
+        let mut features: Vec<&str> = Vec::new();
+        if needs_async_stdpython {
+            features.push("async-tokio");
+        }
+        if package_imports_urllib(package) {
+            features.push("http-ureq");
+        }
+        let feature_list = if features.is_empty() {
+            String::new()
         } else {
-            ""
+            format!(
+                ", features = [{}]",
+                features
+                    .iter()
+                    .map(|f| format!("\"{}\"", f))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
         match (&stdpython_source, opts.no_std) {
             (StdpythonSource::Path(path), true) => format!(
@@ -3276,20 +3304,17 @@ fn write_cargo_toml(
             (StdpythonSource::Path(path), false) => format!(
                 "stdpython = {{ path = \"{}\"{} }}",
                 path.display().to_string().replace('\\', "/"),
-                async_feature,
+                feature_list,
             ),
             (StdpythonSource::Registry(version), true) => format!(
                 "stdpython = {{ version = \"{}\", default-features = false, features = [\"alloc\"] }}",
                 version,
             ),
             (StdpythonSource::Registry(version), false) => {
-                if needs_async_stdpython {
-                    format!(
-                        "stdpython = {{ version = \"{}\", features = [\"async-tokio\"] }}",
-                        version
-                    )
-                } else {
+                if feature_list.is_empty() {
                     format!("stdpython = \"{}\"", version)
+                } else {
+                    format!("stdpython = {{ version = \"{}\"{} }}", version, feature_list)
                 }
             }
         }

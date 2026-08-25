@@ -346,8 +346,29 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
             _ => None,
         },
         // numpy scalar type annotations: np.float64 → f64, np.int32 → i32,
-        // ... (and ndarray → the numpy NdArray type).
+        // ... (and ndarray → the numpy NdArray type). threading/socket
+        // object annotations map to their runtime types, so a worker
+        // parameter (`ready: threading.Event`, `srv: socket.socket`) is a
+        // real shared handle rather than a boxed PyValue.
         ExprType::Attribute(attr) => {
+            if let ExprType::Name(n) = attr.value.as_ref() {
+                if n.id == "threading" {
+                    return match attr.attr.as_str() {
+                        "Thread" => Some(quote!(threading::Thread)),
+                        "Lock" => Some(quote!(threading::Lock)),
+                        "RLock" => Some(quote!(threading::RLock)),
+                        "Event" => Some(quote!(threading::Event)),
+                        "Semaphore" => Some(quote!(threading::Semaphore)),
+                        _ => None,
+                    };
+                }
+                if n.id == "socket" {
+                    return match attr.attr.as_str() {
+                        "socket" => Some(quote!(socket::Socket)),
+                        _ => None,
+                    };
+                }
+            }
             let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "np" || n.id == "numpy");
             if !is_np {
                 return None;

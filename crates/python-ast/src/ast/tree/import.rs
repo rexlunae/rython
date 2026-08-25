@@ -41,6 +41,11 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
             // asyncio lives on the tokio-backed `async-tokio` stdpython
             // feature; generated async binaries enable it.
             | "asyncio"
+            | "threading"
+            | "socket"
+            // urllib.request lives on the ureq-backed `http-ureq` stdpython
+            // feature; rypip enables it when a package imports it.
+            | "urllib"
     )
 }
 
@@ -52,6 +57,30 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
 pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
     match module {
         "io" => matches!(name, "StringIO" | "BytesIO"),
+        "threading" => matches!(
+            name,
+            "Thread"
+                | "Lock"
+                | "RLock"
+                | "Event"
+                | "Semaphore"
+                | "current_thread"
+                | "active_count"
+        ),
+        "socket" => matches!(
+            name,
+            "socket"
+                | "gethostname"
+                | "AF_INET"
+                | "AF_INET6"
+                | "SOCK_STREAM"
+                | "SOCK_DGRAM"
+        ),
+        // urllib: the request submodule and its items. urllib.error's
+        // URLError/HTTPError are string-tagged exceptions matched by name
+        // (no runtime item), so `from urllib.error import URLError` drops
+        // with the annotation-only warning — except matching still works.
+        "urllib" => matches!(name, "request" | "urlopen"),
         "collections" => {
             matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
         }
@@ -269,13 +298,14 @@ fn is_type_name_tuple_alias(
 /// Runtime modules that only exist on stdpython's std tier: they touch the
 /// OS (or, for math, std's float intrinsics), so the no_std profile has
 /// nothing to lower them to. json/string/collections/itertools live on the
-/// alloc tier and stay importable.
+/// alloc tier and stay importable — and io does too: its in-memory
+/// StringIO/BytesIO buffers are pure alloc (`open()` and disk files stay
+/// std-only, guarded separately).
 pub(crate) fn is_std_only_module(name: &str) -> bool {
     matches!(
         name,
         "os" | "sys"
             | "re"
-            | "io"
             | "argparse"
             | "math"
             | "random"
@@ -289,6 +319,9 @@ pub(crate) fn is_std_only_module(name: &str) -> bool {
             | "venv"
             | "numpy"
             | "asyncio"
+            | "threading"
+            | "socket"
+            | "urllib"
     )
 }
 
@@ -462,8 +495,24 @@ impl CodeGen for Import {
                         quote! {}
                     }
                 }
+                // `import urllib.request` — a dotted stdpython submodule
+                // (the numpy.linalg model). Unaliased, the chain resolves
+                // through the glob-re-exported `urllib` module; aliased, it
+                // binds a real path.
+                "urllib.request" => {
+                    let runtime = crate::safe_ident(&options.stdpython);
+                    match &alias.asname {
+                        None => quote! {},
+                        Some(asname) => {
+                            let asname = crate::safe_ident(asname);
+                            quote! {
+                                use #runtime::urllib::request as #asname;
+                            }
+                        }
+                    }
+                }
                 // Python stdlib modules that don't have direct Rust equivalents
-                "urllib" | "xml" => {
+                "xml" => {
                     // These will be provided by the stdpython runtime
                     // Generate a comment instead of a use statement
                     quote! {
@@ -962,6 +1011,7 @@ impl CodeGen for ImportFrom {
                 ("functools", "reduce") => &["reduce_initial"],
                 ("re", "findall") => &["findall2", "findall3"],
                 ("io", "StringIO") => &["StringIO_seeded"],
+                ("io", "BytesIO") => &["BytesIO_seeded"],
                 ("hashlib", "md5") => &["md5_new"],
                 ("hashlib", "sha1") => &["sha1_new"],
                 ("hashlib", "sha256") => &["sha256_new"],

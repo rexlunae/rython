@@ -264,6 +264,7 @@ impl<'a> CodeGen for Attribute {
                 value_str.as_str(),
                 "sys" | "os" | "subprocess" | "json" | "urllib" | "xml" | "asyncio" |
             "time" | "math" | "random" | "heapq" | "functools" | "textwrap" | "itertools" | "re" | "hashlib" | "csv" | "io" |
+            "threading" | "socket" |
             // `datetime` covers both the runtime module and the datetime
             // TYPE from `from datetime import datetime` — either way the
             // attribute is a path item (datetime::strptime, datetime::now),
@@ -271,6 +272,7 @@ impl<'a> CodeGen for Attribute {
             "datetime" |
             "numpy" | "np" |
             "os :: path" | "os::path" | // for nested modules
+            "urllib :: request" | "urllib::request" | // urllib.request.urlopen
             "numpy :: linalg" | "np :: linalg" | "numpy::linalg" | "np::linalg" // np.linalg.inv
             ) || module_chain);
 
