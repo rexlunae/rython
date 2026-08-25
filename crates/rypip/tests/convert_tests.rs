@@ -2633,6 +2633,57 @@ fn regex_brace_patterns_and_slice_shapes_match_python_at_runtime() {
 }
 
 #[test]
+fn isinstance_type_call_matches_python_at_runtime() {
+    // Issue #134 (charset_normalizer): `isinstance(x, type(self))`
+    // resolves `type(...)` to the statically-known class — true for the
+    // same class, false against another builtin type. Verified against
+    // python3: True / False.
+    let scratch = Scratch::new("isinstance-type");
+    let file = scratch.path().join("doors.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Door:\n",
+            "    def __init__(self, ok: bool):\n",
+            "        self.ok = ok\n",
+            "\n",
+            "    def same(self, other: \"Door\") -> bool:\n",
+            "        return isinstance(other, type(self))\n",
+            "\n",
+            "    def diff(self, other: \"Door\") -> bool:\n",
+            "        return isinstance(other, type(int))\n",
+            "\n",
+            "def main() -> int:\n",
+            "    d = Door(True)\n",
+            "    print(d.same(Door(False)))\n",
+            "    print(d.diff(Door(True)))\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/doors"))
+        .output()
+        .expect("running generated binary");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["True", "False"],
+        "isinstance(type()) diverged from CPython"
+    );
+}
+
+#[test]
 fn method_receiver_binding_and_associated_calls_match_python() {
     // Issue #132: Python binds the instance to a method's FIRST parameter
     // whatever its name (boto3's factory_self), a @staticmethod called
