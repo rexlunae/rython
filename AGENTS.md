@@ -63,6 +63,15 @@ message text, ordering, and float formatting.
 - **Generated code must stay readable** and warning-clean under the
   default lints: run the mutability/hoisting analyses rather than
   sprinkling `#[allow]`.
+- **Parse strings into enums at the boundary; never scatter string
+  lists.** AST identifiers arrive as strings, so ONE `match` on the
+  string is unavoidable — but it happens exactly once, in a typed
+  enum's `from_name` (see `ThreadingType` in
+  `python-ast/src/ast/tree/threading_types.rs`); every other consumer
+  (classifiers, lowerings, registries) works with the enum. Duplicated
+  stringly-typed name lists that can drift out of sync are a defect,
+  not a style choice. When adding a compiler-known runtime surface,
+  give its name set an enum first.
 - **Respect the tiers.** Anything OS-touching is `std`-gated in
   stdpython; alloc-tier additions must build with
   `--no-default-features --features alloc` (CI cross-checks

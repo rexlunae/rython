@@ -55,6 +55,9 @@ pub use parameters::*;
 pub mod name;
 pub use name::*;
 
+pub mod threading_types;
+pub(crate) use threading_types::ThreadingType;
+
 pub mod named_expression;
 pub use named_expression::*;
 

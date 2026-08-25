@@ -4646,6 +4646,14 @@ fn direct_exception_parent(exc: &str) -> Option<&'static str> {
         "Warning" => Some("Exception"),
         "ZeroDivisionError" => Some("ArithmeticError"),
         "_IncompleteInputError" => Some("SyntaxError"),
+        // Stdlib-module exceptions (not builtins) raised by the socket and
+        // urllib runtimes, matched by bare name. Verified against python3:
+        // URLError.__mro__ is URLError → OSError; HTTPError → URLError;
+        // socket.gaierror/herror → OSError (socket.timeout IS TimeoutError).
+        "URLError" => Some("OSError"),
+        "HTTPError" => Some("URLError"),
+        "gaierror" => Some("OSError"),
+        "herror" => Some("OSError"),
         _ => None,
     }
 }
@@ -4997,10 +5005,19 @@ pub use stdlib::asyncio;
 pub use stdlib::time;
 #[cfg(feature = "std")]
 pub use stdlib::re;
-#[cfg(feature = "std")]
+// io is in-memory buffers (StringIO/BytesIO) — pure alloc, every tier;
+// the disk-backed PyFile constructors and open() stay std-only.
 pub use stdlib::io;
 #[cfg(feature = "std")]
 pub use stdlib::argparse;
+#[cfg(feature = "std")]
+pub use stdlib::threading;
+#[cfg(feature = "std")]
+pub use stdlib::socket;
+/// Python urllib.request (ureq-backed; gated on the http-ureq feature,
+/// which implies std).
+#[cfg(feature = "http-ureq")]
+pub use stdlib::urllib;
 // The Match-method trait must be in scope for m.group()/m.span() to
 // resolve through the Option layer in generated code.
 #[cfg(feature = "std")]
@@ -5258,15 +5275,17 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
 /// code (csv.writer among others) works against either, exactly as
 /// Python's file protocol does.
 ///
-/// Note: Only available with `std` feature - requires OS I/O capabilities
-#[cfg(feature = "std")]
+/// The in-memory Buffer backend is pure alloc, so the type lives on every
+/// tier (no_std file I/O = io.StringIO/io.BytesIO); the DISK backends and
+/// `open()` are std-gated.
 pub struct PyFile {
     backend: PyFileBackend,
 }
 
-#[cfg(feature = "std")]
 enum PyFileBackend {
+    #[cfg(feature = "std")]
     DiskRead(std::io::BufReader<std::fs::File>),
+    #[cfg(feature = "std")]
     DiskWrite(std::io::BufWriter<std::fs::File>),
     /// io.StringIO: contents plus a cursor in CHARACTERS (Python
     /// counts positions in code points). write() OVERWRITES at the
@@ -5276,20 +5295,20 @@ enum PyFileBackend {
     Closed,
 }
 
-#[cfg(feature = "std")]
-fn closed_file_error() -> PyException {
+pub(crate) fn closed_file_error() -> PyException {
     // CPython: ValueError: I/O operation on closed file.
     value_error("I/O operation on closed file.")
 }
 
-#[cfg(feature = "std")]
 impl PyFile {
+    #[cfg(feature = "std")]
     fn new_read(reader: std::io::BufReader<std::fs::File>) -> Self {
         Self {
             backend: PyFileBackend::DiskRead(reader),
         }
     }
 
+    #[cfg(feature = "std")]
     fn new_write(writer: std::io::BufWriter<std::fs::File>) -> Self {
         Self {
             backend: PyFileBackend::DiskWrite(writer),
@@ -5308,9 +5327,10 @@ impl PyFile {
 
     /// Python file.read() method
     pub fn read(&mut self) -> Result<String, PyException> {
-        use std::io::Read;
         match &mut self.backend {
+            #[cfg(feature = "std")]
             PyFileBackend::DiskRead(reader) => {
+                use std::io::Read;
                 let mut contents = String::new();
                 reader.read_to_string(&mut contents)
                     .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
@@ -5321,6 +5341,7 @@ impl PyFile {
                 *pos = data.chars().count();
                 Ok(out)
             }
+            #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
@@ -5329,9 +5350,10 @@ impl PyFile {
     /// Python file.readline() method: the line INCLUDES its
     /// terminator, as in Python; empty means end of file.
     pub fn readline(&mut self) -> Result<String, PyException> {
-        use std::io::BufRead;
         match &mut self.backend {
+            #[cfg(feature = "std")]
             PyFileBackend::DiskRead(reader) => {
+                use std::io::BufRead;
                 let mut line = String::new();
                 reader.read_line(&mut line)
                     .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
@@ -5348,6 +5370,7 @@ impl PyFile {
                 *pos += line.chars().count();
                 Ok(line)
             }
+            #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
@@ -5372,10 +5395,11 @@ impl PyFile {
     /// written, as Python does. On a StringIO buffer this overwrites at
     /// the cursor (Python semantics), not appends.
     pub fn write<D: AsRef<str>>(&mut self, data: D) -> Result<i64, PyException> {
-        use std::io::Write;
         let text = data.as_ref();
         match &mut self.backend {
+            #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(writer) => {
+                use std::io::Write;
                 writer.write_all(text.as_bytes())
                     .map_err(|e| runtime_error(&format!("Write error: {}", e)))?;
                 Ok(text.chars().count() as i64)
@@ -5388,6 +5412,7 @@ impl PyFile {
                 *pos += written;
                 Ok(written as i64)
             }
+            #[cfg(feature = "std")]
             PyFileBackend::DiskRead(_) => Err(runtime_error("File not opened for writing")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
@@ -5409,6 +5434,7 @@ impl PyFile {
         match &self.backend {
             PyFileBackend::Buffer { data, .. } => Ok(data.clone()),
             PyFileBackend::Closed => Err(closed_file_error()),
+            #[cfg(feature = "std")]
             _ => Err(PyException::new(
                 "AttributeError",
                 "'_io.TextIOWrapper' object has no attribute 'getvalue'",
@@ -5418,12 +5444,15 @@ impl PyFile {
 
     /// Python file.close() method
     pub fn close(&mut self) -> Result<(), PyException> {
-        use std::io::Write;
-        let old = std::mem::replace(&mut self.backend, PyFileBackend::Closed);
+        let old = core::mem::replace(&mut self.backend, PyFileBackend::Closed);
+        #[cfg(feature = "std")]
         if let PyFileBackend::DiskWrite(mut writer) = old {
+            use std::io::Write;
             writer.flush()
                 .map_err(|e| runtime_error(&format!("Flush error: {}", e)))?;
         }
+        #[cfg(not(feature = "std"))]
+        let _ = old;
         Ok(())
     }
 }

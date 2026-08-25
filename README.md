@@ -87,7 +87,8 @@ cargo test -p python-ast
 `stdpython` is tiered for `no_std` use: the default `std` tier has the full
 surface; the `alloc` tier (`--no-default-features --features alloc`) keeps
 everything that doesn't need an OS (strings, collections, json, itertools,
-functools, heapq, textwrap, hashlib, csv, …) and works on embedded targets.
+functools, heapq, textwrap, hashlib, csv, the in-memory
+`io.StringIO`/`io.BytesIO` file buffers, …) and works on embedded targets.
 
 ## Compatibility
 
@@ -116,7 +117,12 @@ error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `json`, `re` (incl. flags, named groups, findall tuples),
 `datetime`/`time` (incl. `strptime`), `itertools`, `functools.reduce`,
 `heapq`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
-`collections`, `pathlib`, `glob`, `subprocess`, `tempfile`, and more.
+`collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
+`threading` (Thread with static targets, Lock/RLock/Event/Semaphore
+with a real `with lock:` acquire/release lowering), `socket` (TCP/UDP
+over std::net with the CPython OSError hierarchy), `urllib.request`
+(`urlopen` for http/https, behind stdpython's opt-in `http-ureq`
+feature that `rypip` enables automatically), and more.
 
 Known gaps:
 
@@ -144,9 +150,10 @@ Known gaps:
   semantics: `-0.0 == 0.0` (they share a cache entry) and `NaN != NaN`
   (a NaN key never hits, so the wrapped function is called every time —
   exactly CPython's dict behavior).
-- **File objects** cover text modes (`r`/`w`/`a`) and `io.StringIO`;
-  binary modes, `BytesIO`, `seek`/`tell`, and file-based `json`
-  (`dump`/`load`) are not supported yet.
+- **File objects** cover text modes (`r`/`w`/`a`), `io.StringIO`, and
+  `io.BytesIO` (in-memory binary buffers); binary DISK modes,
+  `seek`/`tell`, and file-based `json` (`dump`/`load`) are not
+  supported yet.
 
 ## Documented divergences from CPython
 
@@ -347,7 +354,9 @@ is complete. What's ahead:
 - Moving remaining panic cases into catchable Python exceptions via the
   existing `Result<T, PyException>` model
 - Broader `isinstance`/type-narrowing via real type inference
-- Binary file modes and `io.BytesIO`; file-based `json`
+- Binary disk file modes and `seek`/`tell`; file-based `json`
+- Threading/networking edges: `Condition`, `Barrier`, `queue.Queue`,
+  socket `setsockopt`, urllib POST/`Request` objects
 - Continued stdlib expansion, always CPython-verified with loud
   boundaries
 

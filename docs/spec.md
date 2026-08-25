@@ -309,9 +309,15 @@ targets destructure.
 ### 5.3 `with`
 
 `with` binds the context expression and relies on Rust's `Drop` at end
-of scope; `__enter__`/`__exit__` are not called (deviation, §12.3). For
-the supported file objects this reproduces `with open(...) as f:`
-behavior (close on exit).
+of scope; the general `__enter__`/`__exit__` protocol is not called
+(deviation, §12.3). For the supported file objects this reproduces
+`with open(...) as f:` behavior (close on exit). One real
+implementation: `with lock:` over a threading `Lock`/`RLock`/
+`Semaphore` (a name assigned from the constructor, or the constructor
+inline) lowers to the runtime's RAII guard — acquire at entry, release
+when the guard drops, exception-safe through `?` unwinding — exactly
+Python's with-lock discipline. `with lock as x:` (CPython binds
+`__enter__`'s `True`) is a loud error.
 
 ### 5.4 Imports
 
@@ -592,13 +598,17 @@ groups; backreferences/lookarounds are a loud `re.error`),
 `heapq`, `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect),
 `collections` (`Counter`, `deque`, `defaultdict`, `OrderedDict`,
 `ChainMap`), `pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
-(conversion-time; §10.3), `string`, `io.StringIO`, `numpy` (a sizable
-subset with pluggable execution backends).
+(conversion-time; §10.3), `string`, `io` (`StringIO`/`BytesIO`),
+`threading` (§10.5), `socket` (§10.5), `numpy` (a sizable subset with
+pluggable execution backends). `urllib.request` (§10.5) rides the
+feature-gate convention below.
 
 Available on the `alloc` (no-OS) tier: `string`, `json`, `collections`,
 `itertools`, `functools`, `heapq`, `copy`, `textwrap`, `hashlib`,
-`csv`. Everything OS-touching is std-only and is a loud conversion
-error under `--no-std`.
+`csv`, and `io`'s in-memory buffers (`StringIO`/`BytesIO` — the no_std
+profile's file I/O; `open()` and disk files stay std-only). Everything
+OS-touching is std-only and is a loud conversion error under
+`--no-std`.
 
 #### 10.2.1 Feature-gated platform surfaces
 
@@ -611,11 +621,15 @@ default build stays dependency-light. Conventions:
   `<module>-<backend>` where several exist — extending the established
   precedents `async-tokio` (asyncio on tokio) and the numpy backends
   (`numpy-rayon`, …). The alloc/no_std tier is never affected.
-- **Tooling contract**: importing a gated module is a **loud conversion
-  error naming the exact cargo feature** to enable — the same guard
-  mechanism §10.2 already uses for the alloc tier under `--no-std`.
-  Generated crate manifests enable the named feature on their stdpython
-  dependency when the source legitimately imports it.
+- **Tooling contract**: rypip detects the import and enables the named
+  feature on the generated crate's stdpython dependency (the asyncio/
+  `async-tokio` mechanism); under `--no-std` the import is a loud
+  conversion error naming the tier, like every std surface.
+
+The first consumer is `urllib.request`: stdpython's `http-ureq`
+feature wraps the ureq crate (with rustls, so `https://` works) and
+`import urllib.request` in a converted package puts
+`features = ["http-ureq"]` on the generated stdpython dependency.
 
 Known stdlib divergences from CPython that are verified but not yet
 fixed are tracked in issue #82; they are defects, not spec.
@@ -636,8 +650,48 @@ value-taking option without `default=`.
 
 Text modes (`r`/`w`/`a`) and `io.StringIO` behind one surface,
 including iteration, `with … as f:`, and CPython's
-`"I/O operation on closed file"` error. Not supported (loud): binary
-modes, `BytesIO`, `seek`/`tell`, file-based `json.dump`/`load`.
+`"I/O operation on closed file"` error. `io.BytesIO` is the binary
+sibling (its own type: `read`/`write`/`getvalue`/`close` over bytes,
+with StringIO's overwrite-at-cursor discipline). Both buffers are pure
+alloc and exist on the no_std tier. Not supported (loud): binary DISK
+modes, `seek`/`tell`, file-based `json.dump`/`load`.
+
+### 10.5 Threading and networking
+
+**`threading`** (std tier): `Thread(target=, args=, daemon=)` —
+the target must be a plain function name and args a tuple/list literal
+(callables are not values; the lowering resolves the target at
+conversion time, the `functools.partial` model), `start()`, `join()`,
+`is_alive()`, `Lock`/`RLock` (`acquire`/`release`/`locked`, CPython's
+RuntimeError messages, catchable), `Event`
+(`is_set`/`set`/`clear`/`wait`), `Semaphore`, `current_thread().name`
+("MainThread" / "Thread-N (target)"), `active_count()`. Thread objects
+and locks are HANDLES with Python's reference semantics — cloning
+shares — and thread args follow ordinary argument semantics (shared
+handles share; containers copy, the §12.3 value-semantics divergence).
+An unhandled exception in a thread prints CPython's
+"Exception in thread NAME:" header and the exception line (no
+traceback frames). `start()`/`join()` misuse panics with CPython's
+RuntimeError text (§12.2 family).
+
+**`socket`** (std tier): `socket.socket(AF_INET|AF_INET6,
+SOCK_STREAM|SOCK_DGRAM)`, `bind`, `listen`, `accept`, `connect`,
+`send`/`sendall`/`recv`, `sendto`/`recvfrom`, `settimeout`,
+`getsockname`/`getpeername`, `close`, `gethostname()`. Errors raise
+the real CPython hierarchy (`ConnectionRefusedError` IS-A
+`ConnectionError` IS-A `OSError`; timeouts raise
+`TimeoutError('timed out')`) with CPython's `[Errno N] text` message
+shape. Not modeled (loud rustc error): `setsockopt`, `makefile`, the
+address families beyond AF_INET/AF_INET6.
+
+**`urllib.request`** (std tier, `http-ureq` feature; §10.2.1):
+`urlopen(url)` for http/https with redirects, returning a response
+with `.status`, `read()` (bytes), `getcode()`, `geturl()`,
+`getheader(name)`, `close()`. An error status raises `HTTPError`
+("HTTP Error 404: Not Found"); transport failures raise `URLError`
+in CPython's `<urlopen error …>` shape (reason wording is
+backend-derived, §12.3). `URLError`/`HTTPError`/`gaierror` are wired
+into the exception hierarchy (`except OSError:` catches them).
 
 ---
 
@@ -698,7 +752,9 @@ fails loudly listing the skipped functions. Incompatible with
 Generates a `#![no_std]` library on stdpython's `alloc` tier. Loud
 conversion errors (never deferred to rustc): `print`/`input`/`open`,
 std-tier imports (`os`, `sys`, `math`, `random`, `datetime`, `re`,
-`argparse`, …), and `__main__` blocks. The runtime ladder is
+`argparse`, `threading`, `socket`, `urllib`, …), and `__main__`
+blocks. `import io` works: the in-memory `StringIO`/`BytesIO` buffers
+are the profile's file I/O (§10.4). The runtime ladder is
 `core ⊂ alloc ⊂ std`; a strictly-core tier is not implemented and
 fails loudly.
 
@@ -808,6 +864,11 @@ accepted as permanent spec:
 | A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
 | A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; callables cannot be runtime values |
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
+| A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
+| A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |
+| TCP `socket.bind()` binds AND starts listening (std::net has no half-bound TCP socket); a connection can be accepted by the OS before `listen()` runs, and binding a client socket before `connect()` is a loud error | Model limit of the std::net backend |
+| `URLError`'s reason text inside CPython's `<urlopen error …>` shape is the HTTP backend's wording, not CPython's | Model limit of the wrapped-crate convention (§10.2.1) |
+| `HTTPError` carries CPython's message but not the error response's body/headers (exceptions are string-tagged values) | Model limit; §8.1 representation |
 | Verified stdlib divergences (json/defaultdict ordering, `math.remainder`, `strftime` edge cases, `glob` paths, `pathlib` edges, `string.Template`, …) | Tracked as defects in issue #82 |
 
 ---
@@ -856,5 +917,8 @@ everything here lands under §1.2's rules when it lands.
   expressions with them.
 - **Aliasing**: conversion-time detection of alias-and-mutate shapes,
   possibly an opt-in shared-mutability lowering (issue #79).
-- **I/O and stdlib**: binary file modes, `io.BytesIO`, file-based
-  `json`; continued module expansion against the issue #82 register.
+- **I/O and stdlib**: binary DISK file modes, `seek`/`tell`,
+  file-based `json`; continued module expansion against the issue #82
+  register (threading's `Condition`/`Barrier`/`queue.Queue`, socket
+  `setsockopt`, urllib POST/`Request` objects are the known next
+  edges of §10.5).

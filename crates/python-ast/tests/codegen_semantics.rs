@@ -7738,3 +7738,302 @@ fn stdpython_module_reexport_via_sibling_aliases_to_runtime() {
         out
     );
 }
+
+// ---------------------------------------------------------------------------
+// threading / socket / urllib.request / alloc-tier io
+// ---------------------------------------------------------------------------
+
+#[test]
+fn threading_thread_lowers_target_and_args_statically() {
+    // threading.Thread(target=f, args=(...)) resolves the callable at
+    // conversion time (the functools.partial model): the body closure
+    // calls the target through the normal lowering, and Name-arguments
+    // are cloned so the caller's bindings stay usable after start().
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "def worker(name: str, n: int) -> None:\n",
+            "    print(name, n)\n",
+            "\n",
+            "def run() -> None:\n",
+            "    label = \"x\"\n",
+            "    t = threading.Thread(target=worker, args=(label, 2))\n",
+            "    t.start()\n",
+            "    t.join()\n",
+            "    print(label)\n",
+        ),
+        "threads.py",
+    );
+    assert!(
+        out.contains("threading :: Thread :: new"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("let label = (label) . clone ()"),
+        "args must be cloned into the closure: {}",
+        out
+    );
+    assert!(
+        out.contains("report_thread_exception"),
+        "thread bodies report unhandled exceptions: {}",
+        out
+    );
+}
+
+#[test]
+fn threading_thread_unsupported_shapes_error_loudly() {
+    // A lambda target is the callable-as-value divergence: loud.
+    let err = compile_err(
+        "import threading\nt = threading.Thread(target=lambda: 1)\n",
+        "tl.py",
+    );
+    assert!(err.contains("target"), "error: {}", err);
+    // Unknown keywords never silently drop.
+    let err = compile_err(
+        concat!(
+            "import threading\n",
+            "def w() -> None:\n",
+            "    pass\n",
+            "t = threading.Thread(target=w, kwargs={\"a\": 1})\n",
+        ),
+        "tk.py",
+    );
+    assert!(err.contains("not supported"), "error: {}", err);
+}
+
+#[test]
+fn with_lock_lowers_to_the_raii_guard() {
+    // `with lock:` must acquire and release (Python's __enter__/__exit__),
+    // not silently bind-and-drop: the guard acquires now and releases on
+    // Drop, exception-safe through `?` unwinding.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "def run() -> None:\n",
+            "    lock = threading.Lock()\n",
+            "    with lock:\n",
+            "        print(\"held\")\n",
+        ),
+        "wl.py",
+    );
+    assert!(
+        out.contains("py_guard () ?"),
+        "with-lock must lower to the RAII guard: {}",
+        out
+    );
+
+    // The `as` form binds __enter__'s True in Python — no honest lowering.
+    let err = compile_err(
+        concat!(
+            "import threading\n",
+            "def run() -> None:\n",
+            "    lock = threading.Lock()\n",
+            "    with lock as got:\n",
+            "        print(got)\n",
+        ),
+        "wlas.py",
+    );
+    assert!(err.contains("not supported"), "error: {}", err);
+}
+
+#[test]
+fn socket_calls_thread_the_result_question_mark() {
+    // socket.socket() and the socket-object methods return Result
+    // (network errors are catchable OSError kinds), so every call site
+    // threads `?`.
+    let out = compile(
+        concat!(
+            "import socket\n",
+            "\n",
+            "def run() -> None:\n",
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "    s.connect((\"127.0.0.1\", 80))\n",
+            "    s.sendall(\"hi\".encode(\"utf-8\"))\n",
+            "    data = s.recv(64)\n",
+            "    s.close()\n",
+        ),
+        "sock.py",
+    );
+    assert!(
+        out.contains("socket :: socket (socket :: AF_INET , socket :: SOCK_STREAM) ?"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains(". connect ("), "generated: {}", out);
+    assert!(
+        out.contains(". recv (64) ?"),
+        "recv must thread ?: {}",
+        out
+    );
+    // sendall passes the payload by reference (the runtime takes
+    // AsRef<[u8]>), so a named buffer survives its send.
+    assert!(
+        out.contains(". sendall (& ("),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn urllib_request_urlopen_lowers_with_question_mark() {
+    let out = compile(
+        concat!(
+            "import urllib.request\n",
+            "\n",
+            "def run() -> None:\n",
+            "    resp = urllib.request.urlopen(\"http://example.com/\")\n",
+            "    print(resp.status)\n",
+            "    data = resp.read()\n",
+            "    print(resp.getcode())\n",
+        ),
+        "fetch.py",
+    );
+    assert!(
+        out.contains("urllib :: request :: urlopen (\"http://example.com/\") ?"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("resp . status"),
+        "status is a field read: {}",
+        out
+    );
+    assert!(
+        out.contains(". read () ?"),
+        "read threads ?: {}",
+        out
+    );
+}
+
+#[test]
+fn nostd_threading_socket_urllib_error_loudly_but_io_converts() {
+    // The OS-backed modules have no no_std lowering: loud at conversion.
+    for src in [
+        "import threading\n",
+        "import socket\n",
+        "import urllib.request\n",
+    ] {
+        let err = compile_nostd(src, "imp.py").expect_err("std-tier import must fail");
+        assert!(err.contains("std tier"), "{:?}: {}", src, err);
+    }
+    // io's in-memory buffers are pure alloc: the no_std profile keeps
+    // them (this IS no_std file I/O).
+    let out = compile_nostd(
+        concat!(
+            "import io\n",
+            "\n",
+            "def run() -> str:\n",
+            "    buf = io.StringIO()\n",
+            "    buf.write(\"hello\")\n",
+            "    return buf.getvalue()\n",
+        ),
+        "nostd_io.py",
+    )
+    .expect("io.StringIO is alloc-tier");
+    assert!(out.contains("io :: StringIO"), "generated: {}", out);
+}
+
+#[test]
+fn bytesio_lowers_to_the_runtime_buffer() {
+    // io.BytesIO is a real binary buffer now (arity-split like StringIO),
+    // not a boxed PyValue drop.
+    let out = compile(
+        concat!(
+            "import io\n",
+            "\n",
+            "def run() -> None:\n",
+            "    b = io.BytesIO(b\"seed\")\n",
+            "    b.write(b\"!\")\n",
+            "    data = b.getvalue()\n",
+            "    e = io.BytesIO()\n",
+        ),
+        "bio.py",
+    );
+    assert!(
+        out.contains("io :: BytesIO_seeded"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("io :: BytesIO ()"), "generated: {}", out);
+    assert!(
+        !out.contains("PyValue :: None_"),
+        "BytesIO must not box away: {}",
+        out
+    );
+}
+
+#[test]
+fn with_lock_on_an_annotated_parameter_lowers_to_the_guard() {
+    // Devin review on PR #144: a lock received as a FUNCTION PARAMETER —
+    // the exact pass-a-lock-to-a-worker pattern — must also lower
+    // `with lock:` to the RAII guard, not the silent bind-and-drop.
+    // Both the dotted and the from-import annotation spellings classify.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "def crit(lock: threading.Lock, n: int) -> None:\n",
+            "    with lock:\n",
+            "        print(n)\n",
+        ),
+        "wlp.py",
+    );
+    assert!(
+        out.contains("py_guard () ?"),
+        "parameter lock must lower to the RAII guard: {}",
+        out
+    );
+
+    let out = compile(
+        concat!(
+            "from threading import Semaphore\n",
+            "\n",
+            "def crit(sem: Semaphore) -> None:\n",
+            "    with sem:\n",
+            "        print(\"held\")\n",
+        ),
+        "wsp.py",
+    );
+    assert!(
+        out.contains("py_guard () ?"),
+        "from-import annotated semaphore must lower to the RAII guard: {}",
+        out
+    );
+}
+
+#[test]
+fn threading_thread_daemon_flag_lowers_from_bool_constants() {
+    // Devin review round 3 on PR #144: the parser represents True/False
+    // as bool CONSTANTS (not Names), so daemon=True was wrongly rejected
+    // by a Name-only match. Both values must lower into Thread::new's
+    // daemon argument.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "def w() -> None:\n",
+            "    pass\n",
+            "\n",
+            "def run() -> None:\n",
+            "    t = threading.Thread(target=w, daemon=True)\n",
+            "    t.start()\n",
+            "    u = threading.Thread(target=w, daemon=False)\n",
+            "    u.start()\n",
+            "    u.join()\n",
+        ),
+        "daemon.py",
+    );
+    assert!(
+        out.contains("Thread :: new (\"w\" , true ,"),
+        "daemon=True must reach Thread::new: {}",
+        out
+    );
+    assert!(
+        out.contains("Thread :: new (\"w\" , false ,"),
+        "daemon=False must reach Thread::new: {}",
+        out
+    );
+}

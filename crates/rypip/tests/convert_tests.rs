@@ -5064,3 +5064,305 @@ fn warnings_module_matches_python_transcript() {
     assert!(stderr.contains("negative value"), "stderr: {}", stderr);
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn threading_semantics_match_python_at_runtime() {
+    // Thread lifecycle (start/join/is_alive), with-lock, RLock reentrancy,
+    // Event, Semaphore, active_count — sequenced by join() so the output
+    // is deterministic.
+    let scratch = Scratch::new("threads");
+    let file = scratch.path().join("threads.py");
+    fs::write(
+        &file,
+        concat!(
+            "import threading\n",
+            "import time\n",
+            "\n",
+            "def worker(name: str, delay: float) -> None:\n",
+            "    time.sleep(delay)\n",
+            "    print(f\"{name} done\")\n",
+            "\n",
+            "def locked_worker(lock: threading.Lock, tag: str) -> None:\n",
+            "    with lock:\n",
+            "        print(f\"{tag} in section\")\n",
+            "\n",
+            "def main() -> None:\n",
+            "    t = threading.Thread(target=worker, args=(\"first\", 0.01))\n",
+            "    print(t.is_alive())\n",
+            "    t.start()\n",
+            "    t.join()\n",
+            "    print(t.is_alive())\n",
+            "    lock = threading.Lock()\n",
+            "    with lock:\n",
+            "        print(\"locked section\")\n",
+            "    print(lock.acquire())\n",
+            "    lock.release()\n",
+            "    rl = threading.RLock()\n",
+            "    with rl:\n",
+            "        with rl:\n",
+            "            print(\"reentrant\")\n",
+            "    ev = threading.Event()\n",
+            "    print(ev.is_set())\n",
+            "    ev.set()\n",
+            "    print(ev.wait())\n",
+            "    print(ev.is_set())\n",
+            "    ev.clear()\n",
+            "    print(ev.is_set())\n",
+            "    sem = threading.Semaphore(2)\n",
+            "    print(sem.acquire())\n",
+            "    sem.release()\n",
+            // A lock passed to a worker as an ANNOTATED PARAMETER: the
+            // clone shares identity, `with lock:` in the worker really
+            // acquires/releases, and the original handle sees the
+            // release (Devin review on PR #144).
+            "    lk = threading.Lock()\n",
+            "    t2 = threading.Thread(target=locked_worker, args=(lk, \"worker\"))\n",
+            "    t2.start()\n",
+            "    t2.join()\n",
+            "    print(lk.locked())\n",
+            "    print(threading.active_count() >= 1)\n",
+            "    print(threading.current_thread().name)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/threads"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "False",
+            "first done",
+            "False",
+            "locked section",
+            "True",
+            "reentrant",
+            "False",
+            "True",
+            "True",
+            "False",
+            "True",
+            "worker in section",
+            "False",
+            "True",
+            "MainThread"
+        ],
+        "threading semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn socket_echo_matches_python_at_runtime() {
+    // A loopback TCP echo: the server runs in a thread (bind/listen/
+    // accept/recv/sendall), an Event sequences the client connect, and a
+    // refused connection is caught through the OSError hierarchy.
+    let scratch = Scratch::new("sockets");
+    // An ephemeral port from the OS, released before the generated binary
+    // binds it (a fixed literal port would collide across test runs).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let file = scratch.path().join("sockets.py");
+    fs::write(
+        &file,
+        format!(
+            concat!(
+                "import socket\n",
+                "import threading\n",
+                "\n",
+                "def serve(port: int, ready: threading.Event) -> None:\n",
+                "    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+                "    srv.bind((\"127.0.0.1\", port))\n",
+                "    srv.listen(1)\n",
+                "    ready.set()\n",
+                "    conn, addr = srv.accept()\n",
+                "    data = conn.recv(1024)\n",
+                "    text = data.decode(\"utf-8\")\n",
+                "    reply = \"echo:\" + text\n",
+                "    conn.sendall(reply.encode(\"utf-8\"))\n",
+                "    conn.close()\n",
+                "    srv.close()\n",
+                "\n",
+                "def main() -> None:\n",
+                "    port = {port}\n",
+                "    ready = threading.Event()\n",
+                "    t = threading.Thread(target=serve, args=(port, ready))\n",
+                "    t.start()\n",
+                "    ready.wait()\n",
+                "    cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+                "    cli.connect((\"127.0.0.1\", port))\n",
+                "    cli.sendall(\"ping\".encode(\"utf-8\"))\n",
+                "    got = cli.recv(1024)\n",
+                "    print(got.decode(\"utf-8\"))\n",
+                "    cli.close()\n",
+                "    t.join()\n",
+                "    print(\"closed\")\n",
+                "    try:\n",
+                "        bad = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+                "        bad.connect((\"127.0.0.1\", 1))\n",
+                "    except OSError:\n",
+                "        print(\"refused\")\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+            port = port
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/sockets"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["echo:ping", "closed", "refused"],
+        "socket semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn urllib_request_matches_python_at_runtime() {
+    // urlopen against a local one-shot HTTP server: status, body bytes,
+    // getcode, and a refused connection caught through URLError IS-A
+    // OSError. The generated Cargo.toml must enable stdpython's ureq-backed
+    // `http-ureq` feature (the platform-surface convention).
+    use std::io::{Read, Write};
+    let scratch = Scratch::new("urlfetch");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = conn.read(&mut buf);
+        let body = "hello from server";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        conn.write_all(resp.as_bytes()).unwrap();
+    });
+    let file = scratch.path().join("fetch.py");
+    fs::write(
+        &file,
+        format!(
+            concat!(
+                "import urllib.request\n",
+                "\n",
+                "def main() -> None:\n",
+                "    resp = urllib.request.urlopen(\"http://127.0.0.1:{port}/\")\n",
+                "    print(resp.status)\n",
+                "    data = resp.read()\n",
+                "    print(data.decode(\"utf-8\"))\n",
+                "    print(resp.getcode())\n",
+                "    try:\n",
+                "        urllib.request.urlopen(\"http://127.0.0.1:1/none\")\n",
+                "    except OSError:\n",
+                "        print(\"unreachable\")\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+            port = port
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains("http-ureq"),
+        "urllib.request import must enable stdpython's http-ureq feature: {}",
+        manifest
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/fetch"))
+        .output()
+        .expect("running generated binary");
+    server.join().unwrap();
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["200", "hello from server", "200", "unreachable"],
+        "urllib.request semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn bytesio_and_stringio_match_python_at_runtime() {
+    // io.BytesIO is a real binary buffer (write returns the byte count and
+    // overwrites at the cursor, exactly like StringIO's text discipline).
+    let scratch = Scratch::new("bytesbuf");
+    let file = scratch.path().join("bytesbuf.py");
+    fs::write(
+        &file,
+        concat!(
+            "import io\n",
+            "\n",
+            "def run() -> None:\n",
+            "    b = io.BytesIO(b\"seeded\")\n",
+            "    n = b.write(b\"!\")\n",
+            "    print(n)\n",
+            "    data = b.getvalue()\n",
+            "    print(data.decode(\"utf-8\"))\n",
+            "    rest = b.read()\n",
+            "    print(rest.decode(\"utf-8\"))\n",
+            "    s = io.StringIO()\n",
+            "    s.write(\"no_std file I/O\")\n",
+            "    print(s.getvalue())\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/bytesbuf"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["1", "!eeded", "eeded", "no_std file I/O"],
+        "in-memory buffer semantics diverged from CPython"
+    );
+}

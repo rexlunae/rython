@@ -24,6 +24,10 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "glob", "rglob", "iglob",
     // os: entropy source can fail (os.urandom raises OSError).
     "urandom",
+    // socket.socket() rejects unknown families/kinds with OSError.
+    "socket",
+    // urllib.request.urlopen raises URLError/HTTPError.
+    "urlopen",
 ];
 
 /// Issue #111: keyword-argument signatures of stdpython runtime functions
@@ -1277,6 +1281,24 @@ impl<'a> CodeGen for Call {
                 id: builtin,
             }));
             return c.to_rust(ctx, options, symbols);
+        }
+        // `threading.Thread(target=f, args=(...))` — the constructor takes
+        // a CALLABLE, which rython cannot pass as a value: the target is
+        // resolved statically and the thread body synthesized at conversion
+        // time (the functools.partial model).
+        if let Some(tokens) = lower_threading_thread(&self, &ctx, &options, &symbols)? {
+            return Ok(tokens);
+        }
+        // `threading.Semaphore()` — CPython's default initial value is 1;
+        // the runtime constructor takes the value explicitly.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && crate::ThreadingType::from_name(&attr.attr) == Some(crate::ThreadingType::Semaphore)
+            && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
+            && !module_name_shadowed("threading", &symbols)
+            && self.args.is_empty()
+            && self.keywords.is_empty()
+        {
+            return Ok(quote!(threading::Semaphore(1)));
         }
         // Calls to functions that return Result<T, PyException> get `?` so
         // exceptions propagate to the caller (or an enclosing try block),
@@ -3361,6 +3383,7 @@ impl<'a> CodeGen for Call {
                         | "reader"
                         | "writer"
                         | "StringIO"
+                        | "BytesIO"
                         | "BufferedRWPair"
                         | "BufferedReader"
                         | "BufferedWriter"
@@ -3861,17 +3884,15 @@ impl<'a> CodeGen for Call {
                         let p = qual("StringIO_seeded");
                         Ok(quote!(#p(&(#initial))))
                     }
-                    // io.BytesIO: the runtime has no binary in-memory buffer
-                    // (only the StringIO text buffer) — the call boxes as
-                    // PyValue (the file-object divergence).
-                    ("BytesIO", _) => {
-                        options.definition_warnings.borrow_mut().push(
-                            "io.BytesIO(...) lowers as the boxed PyValue (no binary \
-                             in-memory buffer in rython — the file-object \
-                             divergence)"
-                                .to_string(),
-                        );
-                        Ok(quote!(stdpython::PyValue::None_))
+                    // io.BytesIO: arity split like StringIO — the seeded
+                    // form starts with the cursor at 0, as in Python.
+                    ("BytesIO", []) => {
+                        let p = qual("BytesIO");
+                        Ok(quote!(#p()))
+                    }
+                    ("BytesIO", [initial]) => {
+                        let p = qual("BytesIO_seeded");
+                        Ok(quote!(#p(&(#initial))))
                     }
                     // io.BufferedRWPair/BufferedReader/BufferedWriter/
                     // TextIOWrapper: buffered file-object wrappers (urllib3's
@@ -5194,14 +5215,48 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!((#receiver).count(&(#value))));
                     }
                     // File-object and csv.Writer methods return Result (I/O
-                    // can fail; Python raises): thread `?`.
+                    // can fail; Python raises): thread `?`. The threading
+                    // (acquire/release/wait) and socket (accept/getsockname/
+                    // getpeername) object methods return Result the same way
+                    // — lock release and socket state errors are catchable
+                    // Python exceptions.
                     ("read", [])
                     | ("readline", [])
                     | ("readlines", [])
                     | ("close", [])
-                    | ("getvalue", []) => {
+                    | ("getvalue", [])
+                    | ("acquire", [])
+                    | ("release", [])
+                    | ("wait", [])
+                    | ("accept", [])
+                    | ("getsockname", [])
+                    | ("getpeername", []) => {
                         let m = crate::safe_ident(&attr.attr);
                         return Ok(quote!((#receiver).#m()?));
+                    }
+                    // Socket methods with arguments: all Result-returning
+                    // (network I/O raises OSError kinds); byte payloads pass
+                    // by reference (the runtime takes AsRef<[u8]>), so a
+                    // buffer survives its send.
+                    ("connect", [a]) | ("bind", [a]) => {
+                        let m = crate::safe_ident(&attr.attr);
+                        return Ok(quote!((#receiver).#m(#a)?));
+                    }
+                    ("listen", [n]) | ("recv", [n]) | ("recvfrom", [n]) => {
+                        let m = crate::safe_ident(&attr.attr);
+                        return Ok(quote!((#receiver).#m(#n)?));
+                    }
+                    // Python accepts int or float seconds; the runtime takes
+                    // f64 (the coercion is exact for any plausible timeout).
+                    ("settimeout", [t]) => {
+                        return Ok(quote!((#receiver).settimeout((#t) as f64)?));
+                    }
+                    ("send", [d]) | ("sendall", [d]) => {
+                        let m = crate::safe_ident(&attr.attr);
+                        return Ok(quote!((#receiver).#m(&(#d))?));
+                    }
+                    ("sendto", [d, a]) => {
+                        return Ok(quote!((#receiver).sendto(&(#d), #a)?));
                     }
                     ("write", [d]) => {
                         return Ok(quote!((#receiver).write(&(#d))?));
@@ -6900,6 +6955,158 @@ pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> b
             | Some(SymbolTableNode::ClassDef(_))
             | Some(SymbolTableNode::RustBinding(_))
     )
+}
+
+/// `threading.Thread(target=f, args=(...), daemon=...)`: callables are not
+/// values in rython, so the constructor's target is resolved statically (a
+/// plain function name) and the thread body is synthesized as a closure at
+/// conversion time — the same model functools.partial uses. Name-elements
+/// of args are CLONED into the closure: shared-identity runtime objects
+/// (locks, events, sockets) keep sharing through the clone, containers
+/// copy (rython's value-semantics ledger divergence, exactly as ordinary
+/// call arguments behave). Returns Ok(None) when the call is not a
+/// threading.Thread construction.
+fn lower_threading_thread(
+    call: &Call,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    let is_thread_name =
+        |name: &str| crate::ThreadingType::from_name(name) == Some(crate::ThreadingType::Thread);
+    let is_thread = match call.func.as_ref() {
+        ExprType::Attribute(attr) => {
+            is_thread_name(&attr.attr)
+                && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
+                && !module_name_shadowed("threading", symbols)
+        }
+        ExprType::Name(n) => {
+            is_thread_name(&n.id)
+                && matches!(
+                    symbols.get("Thread"),
+                    Some(SymbolTableNode::ImportFrom(i)) if i.module == "threading"
+                )
+        }
+        _ => false,
+    };
+    if !is_thread {
+        return Ok(None);
+    }
+    if !call.args.is_empty() {
+        return Err(
+            "threading.Thread(...): positional arguments are not supported yet; pass \
+             target= and args= as keywords"
+                .to_string()
+                .into(),
+        );
+    }
+    let mut target: Option<String> = None;
+    let mut thread_args: Vec<ExprType> = Vec::new();
+    let mut daemon = false;
+    for kw in &call.keywords {
+        match kw.arg.as_deref() {
+            Some("target") => match &kw.value {
+                ExprType::Name(n) => target = Some(n.id.clone()),
+                _ => {
+                    return Err(
+                        "threading.Thread(target=...): the target must be a plain \
+                         function name — callables are not runtime values in rython"
+                            .to_string()
+                            .into(),
+                    );
+                }
+            },
+            Some("args") => match &kw.value {
+                ExprType::Tuple(t) => thread_args = t.elts.clone(),
+                ExprType::List(l) => thread_args = l.clone(),
+                _ => {
+                    return Err(
+                        "threading.Thread(args=...): the arguments must be a tuple or \
+                         list literal, so they can be bound at conversion time"
+                            .to_string()
+                            .into(),
+                    );
+                }
+            },
+            Some("daemon") => match &kw.value {
+                // The parser represents True/False as bool Constants; the
+                // Name spelling covers synthesized/re-entered ASTs.
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if b.value()) =>
+                {
+                    daemon = true
+                }
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value()) =>
+                {
+                    daemon = false
+                }
+                ExprType::Name(n) if n.id == "True" => daemon = true,
+                ExprType::Name(n) if n.id == "False" => daemon = false,
+                _ => {
+                    return Err(
+                        "threading.Thread(daemon=...): only the literal True/False is \
+                         supported"
+                            .to_string()
+                            .into(),
+                    );
+                }
+            },
+            other => {
+                return Err(format!(
+                    "threading.Thread keyword `{}` is not supported yet (supported: \
+                     target=, args=, daemon=); rython refuses to silently ignore it",
+                    other.unwrap_or("**kwargs")
+                )
+                .into());
+            }
+        }
+    }
+    let Some(target) = target else {
+        return Err(
+            "threading.Thread(...) requires target= (a thread with no target does \
+             nothing)"
+                .to_string()
+                .into(),
+        );
+    };
+    // The synthesized body call lowers through the normal machinery, so
+    // argument marshalling and exception propagation match a direct call.
+    let inner = Call {
+        func: Box::new(ExprType::Name(crate::ast::tree::name::Name {
+            id: target.clone(),
+        })),
+        args: thread_args.clone(),
+        keywords: Vec::new(),
+    };
+    let body = inner.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+    // Clone captured names OUTSIDE the move closure, so the caller's
+    // bindings stay usable after start().
+    let mut clones = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for arg in &thread_args {
+        if let ExprType::Name(n) = arg {
+            if !matches!(n.id.as_str(), "True" | "False" | "None") && seen.insert(n.id.clone()) {
+                let ident = crate::safe_ident(&n.id);
+                clones.push(quote!(let #ident = (#ident).clone();));
+            }
+        }
+    }
+    let target_name = target.as_str();
+    Ok(Some(quote! {
+        threading::Thread::new(#target_name, #daemon, {
+            #(#clones)*
+            move || {
+                let __rython_thread_body = || -> Result<(), PyException> {
+                    let _ = #body;
+                    Ok(())
+                };
+                if let Err(e) = __rython_thread_body() {
+                    threading::report_thread_exception(&e);
+                }
+            }
+        })
+    }))
 }
 
 /// The name at the root of a dotted expression chain (`os` in `os.path`,

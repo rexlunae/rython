@@ -70,10 +70,26 @@ This library uses a generic trait-based design that mirrors Python's built-in be
 
 ### Standard Library Modules
 `argparse`, `asyncio` (tokio-backed), `collections`, `copy`, `csv`,
-`datetime`, `functools`, `glob`, `hashlib`, `heapq`, `io`, `itertools`,
-`json`, `math`, `os`/`os.path`, `pathlib`, `random`, `re`, `string`,
-`subprocess`, `sys`, `sysconfig`, `tempfile`, `textwrap`, `time`,
-`unicodedata`-style codec handling, `venv`, `warnings`
+`datetime`, `functools`, `glob`, `hashlib`, `heapq`, `io` (StringIO
+and BytesIO, on every tier), `itertools`, `json`, `math`,
+`os`/`os.path`, `pathlib`, `random`, `re`, `socket` (TCP/UDP on
+std::net), `string`, `subprocess`, `sys`, `sysconfig`, `tempfile`,
+`textwrap`, `threading` (Thread/Lock/RLock/Event/Semaphore on
+std::thread), `time`, `unicodedata`-style codec handling,
+`urllib.request` (ureq-backed, behind the `http-ureq` feature),
+`venv`, `warnings`
+
+### Threading
+✅ **Thread management**: `threading.Thread(target=, args=, daemon=)`, `start()`, `join()`, `is_alive()`, `current_thread().name`, `active_count()` — CPython's thread naming and RuntimeError messages  
+✅ **Locks & synchronization**: `Lock`, `RLock` (reentrant, owner-checked), `Event`, `Semaphore`, all shareable handles with `with lock:` acquire/release guards  
+✅ **Exception reporting**: an unhandled exception in a thread prints CPython's `Exception in thread NAME:` header (no traceback frames — rython has no frames)
+
+### Networking
+✅ **Sockets**: `socket.socket(AF_INET/AF_INET6, SOCK_STREAM/SOCK_DGRAM)`, `bind`/`listen`/`accept`, `connect`, `send`/`sendall`/`recv`, `sendto`/`recvfrom`, `settimeout` (TimeoutError "timed out"), `getsockname`/`getpeername`, `close`, `gethostname()` — errors raise the real CPython hierarchy (`ConnectionRefusedError` IS-A `ConnectionError` IS-A `OSError`) with `[Errno N]` messages  
+✅ **HTTP client**: `urllib.request.urlopen()` for http/https behind the opt-in `http-ureq` feature (see below) — `.status`, `read()`, `getcode()`, `getheader()`, HTTPError/URLError wired into the exception tree
+
+### File I/O in no_std mode
+✅ **In-memory buffers on the alloc tier**: `io.StringIO` and `io.BytesIO` (Python's cursor semantics, byte/char-exact write counts, the closed-file ValueError) build with `--no-default-features --features alloc` — a target with no OS has no disk, so the in-memory file surface IS its file I/O. Disk files (`open()`, directory handling via `os`/`pathlib`/`glob`) stay std-only.
 
 ### Exception System
 ✅ **Complete built-in exception tree**: every CPython built-in exception
@@ -87,9 +103,9 @@ correctly does NOT catch `SystemExit`/`KeyboardInterrupt`/`GeneratorExit`
 
 ❌ **Complex Built-ins**: `exec()`, `eval()`, `compile()`, `globals()`, `locals()` — dynamic code execution and frame introspection have no static-Rust equivalent  
 ❌ **Frame-introspection surfaces**: `dir()`, `vars()`, `callable()`, first-class `iter()`/`next()` objects — handled at conversion time by the compiler instead of at runtime  
-❌ **File I/O** (no_std mode): File operations, directory handling  
-❌ **Networking**: Socket operations, HTTP clients (see feature-gated surfaces below)  
-❌ **Threading**: Thread management, locks, synchronization  
+❌ **Disk I/O** (no_std mode): real files and directories need an OS — the alloc tier's file I/O is the in-memory `StringIO`/`BytesIO` surface above  
+❌ **Networking edges**: `setsockopt`, `socket.makefile`, address families beyond AF_INET/AF_INET6, urllib POST bodies and `Request` objects  
+❌ **Threading edges**: `Condition`, `Barrier`, `queue.Queue`, lock/wait timeouts  
 ❌ **Dynamic Import System**: `__import__`, importlib-style loading
 
 ## Feature-Gated Platform Surfaces
@@ -104,13 +120,14 @@ opt-in cargo **feature** instead of growing a mandatory dependency.
   the numpy backend features (`numpy-rayon`, `numpy-simd`, …).
 - **Default posture**: the default build stays dependency-light, and the
   alloc/no_std tier is never affected.
-- **Tooling contract**: importing a gated module from converted Python is
-  a **loud conversion error naming the exact cargo feature to enable**
-  (rythonc/python-ast guard these the same way they guard missing
-  feature tiers). Generated crate manifests then enable the feature on
-  their stdpython dependency.
-- HTTP clients will be the first consumer of this convention (backed by
-  an established Rust HTTP crate behind e.g. a `http` feature).  
+- **Tooling contract**: rypip detects the import and enables the named
+  feature on the generated crate's stdpython dependency automatically
+  (the `async-tokio` mechanism); under `--no-std` the import is a loud
+  conversion error naming the tier.
+- HTTP clients are the first consumer: `urllib.request` wraps the ureq
+  crate (with rustls, so `https://` works) behind the **`http-ureq`**
+  feature — `import urllib.request` in a converted package puts
+  `features = ["http-ureq"]` on the generated stdpython dependency.
 
 ## Usage
 
@@ -131,11 +148,12 @@ rython_stdpython = { version = "1.0", default-features = false, features = ["all
 ```
 
 The `alloc` tier keeps heap-backed Python semantics (strings, lists,
-dicts/sets, exceptions, json) with no OS dependency; everything that
-touches the OS (I/O, os/os.path, datetime, subprocess, tempfile, glob,
-pathlib, random, math's float intrinsics) is `std`-only. A strictly-core
-tier without an allocator is not implemented yet and fails loudly at
-compile time.
+dicts/sets, exceptions, json, the in-memory io.StringIO/io.BytesIO
+buffers) with no OS dependency; everything that touches the OS (disk
+I/O, os/os.path, datetime, subprocess, tempfile, glob, pathlib,
+random, threading, socket, math's float intrinsics) is `std`-only. A
+strictly-core tier without an allocator is not implemented yet and
+fails loudly at compile time.
 
 ### Example Usage
 
