@@ -1606,6 +1606,15 @@ impl PyInt for i64 {
     }
 }
 
+impl PyInt for u8 {
+    // A bytes element (`data[i]`) is a `u8` in the value model, but in
+    // Python it is already an int — so `int(data[i])` is the identity
+    // conversion, widening the byte into the program's int type.
+    fn py_int(self) -> Result<i64, PyException> {
+        Ok(self as i64)
+    }
+}
+
 // PyFloat implementations
 impl PyFloat for &str {
     fn py_float(self) -> Result<f64, PyException> {

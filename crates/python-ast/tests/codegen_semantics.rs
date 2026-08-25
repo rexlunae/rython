@@ -5643,6 +5643,34 @@ fn aliased_import_resolves_through_module_intercept() {
 }
 
 #[test]
+fn np_set_backend_lowers_to_a_raisable_runtime_error() {
+    // np.set_backend's runtime helper errors with a plain String (unknown
+    // backend name), which `?` alone cannot convert in the generated
+    // Result<_, PyException> functions — the lowering must map it into a
+    // raised RuntimeError, and take the argument by reference so &str
+    // literals and String locals both coerce.
+    let out = compile(
+        "import numpy as np\ndef pick() -> None:\n    np.set_backend(\"cuda\")\n",
+        "setbackend.py",
+    );
+    assert!(
+        out.contains("set_backend_by_name"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("RuntimeError"),
+        "the String error must surface as a raised RuntimeError: {}",
+        out
+    );
+    assert!(
+        !out.contains("set_backend_by_name (\"cuda\") ?"),
+        "bare `?` on the String error can never compile: {}",
+        out
+    );
+}
+
+#[test]
 fn aliased_import_reassignment_still_shadows() {
     // F10 guard: a later `np = ...` replaces the alias in the symbol
     // table, so user code still wins over the module intercept.

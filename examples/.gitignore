@@ -1,0 +1,3 @@
+# Example crates build standalone; their lockfiles and build output stay
+# local (target/ is already ignored repo-wide).
+Cargo.lock

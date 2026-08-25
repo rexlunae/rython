@@ -2727,6 +2727,9 @@ mod cpython_numeric_and_stdlib_fixes {
         assert_eq!("42\n".py_int().unwrap(), 42);
         assert_eq!(" 7 ".py_int().unwrap(), 7);
         assert_eq!("1_000".py_int().unwrap(), 1000);
+        // python3: int(b"\xff"[0]) == 255 — a bytes element is already an
+        // int, so int() over one is the identity.
+        assert_eq!(0xffu8.py_int().unwrap(), 255);
         // NaN and infinity raise instead of silently becoming 0/i64::MAX.
         let e = f64::NAN.py_int().unwrap_err();
         assert_eq!(format!("{}", e), "ValueError: cannot convert float NaN to integer");

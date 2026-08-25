@@ -938,7 +938,12 @@ fn lower_numpy_call(
                 .into());
             }
             let a = np_render(&args[0], &npc)?;
-            Ok(quote!(numpy::set_backend_by_name(#a)?))
+            // set_backend_by_name errors with a plain String (unknown
+            // backend name); surface it as a raised RuntimeError so the
+            // generated Result<_, PyException> functions can `?` it. The
+            // extra `&` lets both &str literals and String locals coerce.
+            Ok(quote!(numpy::set_backend_by_name(&#a)
+                .map_err(|e| PyException::new("RuntimeError", e))?))
         }
 
         "sum" | "prod" | "mean" | "max" | "min" | "all" | "any" | "argmax" | "argmin" => {
@@ -5501,6 +5506,22 @@ impl<'a> CodeGen for Call {
                     }
                     ("items", []) => {
                         return Ok(quote!((#receiver).py_items()));
+                    }
+                    // dict/list/set .clear() mutates in place, so it must
+                    // go through the PLACE-flavored receiver computed
+                    // above. Without this arm the call fell to the generic
+                    // fallback, which re-renders the receiver in LOAD
+                    // flavor — in a trait default that is the cloning
+                    // accessor (`self.regs()`), and the clear silently
+                    // vanished.
+                    ("clear", [])
+                        if !crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value,
+                            &symbols,
+                            &options,
+                        ) =>
+                    {
+                        return Ok(quote!((#receiver).clear()));
                     }
                     ("setdefault", [key, default]) => {
                         if string_keyed_dict {

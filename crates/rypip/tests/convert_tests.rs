@@ -1145,6 +1145,55 @@ fn classes_match_python_at_runtime() {
 }
 
 #[test]
+fn inherited_container_clear_mutates_the_real_field() {
+    // A mutating container method (`self.regs.clear()`) reached through an
+    // INHERITED method runs in the trait default, where the load-flavor
+    // field accessor clones — the clear must route through the mutable
+    // accessor or it silently vanishes (found via examples/03: the Device
+    // RESET protocol cleared a clone and DUMP still showed the registers).
+    let scratch = Scratch::new("inherited-clear");
+    let file = scratch.path().join("bankclear.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Bank:\n",
+            "    def __init__(self, regs: dict[int, int]):\n",
+            "        self.regs = regs\n",
+            "\n",
+            "    def clear(self) -> None:\n",
+            "        self.regs.clear()\n",
+            "\n",
+            "class Dev(Bank):\n",
+            "    def __init__(self, regs: dict[int, int]):\n",
+            "        super().__init__(regs)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    d = Dev({1: 2})\n",
+            "    d.clear()\n",
+            "    print(len(d.regs))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/bankclear"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3: clear() through the inherited method
+    // empties the dict, so len is 0.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "0",
+        "inherited clear() must mutate the real field, not a clone"
+    );
+}
+
+#[test]
 fn super_dispatch_keeps_the_derived_self_at_runtime() {
     // super() must run the ancestor's ORIGINAL body with the DERIVED self:
     // a `self.speak()` inside Animal.describe (reached through

@@ -8,6 +8,9 @@ members = [
     "crates/rykernel-shim",
     "crates/stdpython",
 ]
+# Example crates (and the crates rypip generates inside examples/) build
+# standalone — each carries its own [workspace] table.
+exclude = ["examples"]
 
 [workspace.package]
 version = "1.2.0"
