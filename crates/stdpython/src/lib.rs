@@ -4689,8 +4689,9 @@ impl PyException {
     /// Whether this exception is caught by an `except <name>:` clause.
     ///
     /// Python semantics: the clause matches when `<name>` is the raised
-    /// type itself or one of its ancestors. The tree below is CPython's
-    /// built-in exception hierarchy (verified by dumping `__mro__` for
+    /// type itself or one of its ancestors. The tree is CPython's
+    /// built-in exception hierarchy, modeled as the [`crate::builtin_exceptions`]
+    /// enum (verified by dumping `__mro__` for
     /// every built-in exception under python3 3.14), so
     /// `except LookupError:` now catches IndexError/KeyError,
     /// `except OSError:` catches FileNotFoundError and friends, and
@@ -4698,134 +4699,29 @@ impl PyException {
     /// KeyboardInterrupt or GeneratorExit — the old exact-name check
     /// missed all of that (spec §12.3 defect class, fixed here).
     pub fn matches(&self, name: &str) -> bool {
-        // EnvironmentError and IOError are historical ALIASES of OSError:
-        // `issubclass(FileNotFoundError, EnvironmentError)` is True in
-        // CPython even though the alias never appears in FileNotFoundError's
-        // MRO — so aliases resolve to the canonical name before matching.
-        let name = match name {
-            "EnvironmentError" | "IOError" => "OSError",
-            other => other,
-        };
+        use crate::builtin_exceptions::BuiltinException;
+        // Exact name equality covers user-defined classes and builtins
+        // alike (a raised MyError is caught by `except MyError:`).
         if self.exception_type == name {
             return true;
         }
-        // BaseException is the tree's ROOT: it has no parent entry, but
-        // unlike a truly-unknown type it IS in-tree — only an exact
-        // `except BaseException:` catches it, never `except Exception:`.
-        if self.exception_type == "BaseException" {
-            return false;
+        // Both names parse into the built-in tree exactly once (the
+        // aliases EnvironmentError/IOError canonicalize to OSError there,
+        // so `except IOError:` catches a raised OSError and vice versa —
+        // CPython treats them as the same class object); the ancestry
+        // question is then a compile-checked enum walk.
+        match (
+            BuiltinException::from_name(&self.exception_type),
+            BuiltinException::from_name(name),
+        ) {
+            (Some(raised), Some(target)) => raised.is_caught_by(target),
+            // A raised type outside the built-in tree (a user class)
+            // keeps the historical broad posture: only Exception and
+            // BaseException are treated as catching it.
+            (None, _) => name == "Exception" || name == "BaseException",
+            // A built-in raised type is never caught by an unknown name.
+            (Some(_), None) => false,
         }
-        // ExceptionGroup MULTIPLY inherits (BaseExceptionGroup, Exception)
-        // in CPython; the single-parent walk below cannot reach Exception,
-        // so that second ancestry is explicit here. A bare
-        // BaseExceptionGroup stays outside Exception.
-        if self.exception_type == "ExceptionGroup" && name == "Exception" {
-            return true;
-        }
-        match direct_exception_parent(&self.exception_type) {
-            Some(first) => {
-                let mut current = Some(first);
-                while let Some(parent) = current {
-                    if parent == name {
-                        return true;
-                    }
-                    current = direct_exception_parent(parent);
-                }
-                false
-            }
-            // An exception type outside the built-in tree keeps the
-            // historical broad posture: only Exception/BaseException are
-            // treated as catching it.
-            None => name == "Exception" || name == "BaseException",
-        }
-    }
-}
-
-/// The DIRECT parent of every built-in Python exception type (`None` for
-/// BaseException). One hop per entry; `PyException::matches` walks the
-/// chain. Verified against python3 3.14 by dumping each built-in
-/// exception's `__mro__`.
-fn direct_exception_parent(exc: &str) -> Option<&'static str> {
-    match exc {
-        "ArithmeticError" => Some("Exception"),
-        "AssertionError" => Some("Exception"),
-        "AttributeError" => Some("Exception"),
-        "BaseExceptionGroup" => Some("BaseException"),
-        "BlockingIOError" => Some("OSError"),
-        "BrokenPipeError" => Some("ConnectionError"),
-        "BufferError" => Some("Exception"),
-        "BytesWarning" => Some("Warning"),
-        "ChildProcessError" => Some("OSError"),
-        "ConnectionAbortedError" => Some("ConnectionError"),
-        "ConnectionError" => Some("OSError"),
-        "ConnectionRefusedError" => Some("ConnectionError"),
-        "ConnectionResetError" => Some("ConnectionError"),
-        "DeprecationWarning" => Some("Warning"),
-        "EOFError" => Some("Exception"),
-        "EncodingWarning" => Some("Warning"),
-        "EnvironmentError" => Some("OSError"),
-        "Exception" => Some("BaseException"),
-        "ExceptionGroup" => Some("BaseExceptionGroup"),
-        "FileExistsError" => Some("OSError"),
-        "FileNotFoundError" => Some("OSError"),
-        "FloatingPointError" => Some("ArithmeticError"),
-        "FutureWarning" => Some("Warning"),
-        "GeneratorExit" => Some("BaseException"),
-        "IOError" => Some("OSError"),
-        "ImportError" => Some("Exception"),
-        "ImportWarning" => Some("Warning"),
-        "IndentationError" => Some("SyntaxError"),
-        "IndexError" => Some("LookupError"),
-        "InterruptedError" => Some("OSError"),
-        "IsADirectoryError" => Some("OSError"),
-        "KeyError" => Some("LookupError"),
-        "KeyboardInterrupt" => Some("BaseException"),
-        "LookupError" => Some("Exception"),
-        "MemoryError" => Some("Exception"),
-        "ModuleNotFoundError" => Some("ImportError"),
-        "NameError" => Some("Exception"),
-        "NotADirectoryError" => Some("OSError"),
-        "NotImplementedError" => Some("RuntimeError"),
-        "OSError" => Some("Exception"),
-        "OverflowError" => Some("ArithmeticError"),
-        "PendingDeprecationWarning" => Some("Warning"),
-        "PermissionError" => Some("OSError"),
-        "ProcessLookupError" => Some("OSError"),
-        "PythonFinalizationError" => Some("RuntimeError"),
-        "RecursionError" => Some("RuntimeError"),
-        "ReferenceError" => Some("Exception"),
-        "ResourceWarning" => Some("Warning"),
-        "RuntimeError" => Some("Exception"),
-        "RuntimeWarning" => Some("Warning"),
-        "StopAsyncIteration" => Some("Exception"),
-        "StopIteration" => Some("Exception"),
-        "SyntaxError" => Some("Exception"),
-        "SyntaxWarning" => Some("Warning"),
-        "SystemError" => Some("Exception"),
-        "SystemExit" => Some("BaseException"),
-        "TabError" => Some("IndentationError"),
-        "TimeoutError" => Some("OSError"),
-        "TypeError" => Some("Exception"),
-        "UnboundLocalError" => Some("NameError"),
-        "UnicodeDecodeError" => Some("UnicodeError"),
-        "UnicodeEncodeError" => Some("UnicodeError"),
-        "UnicodeError" => Some("ValueError"),
-        "UnicodeTranslateError" => Some("UnicodeError"),
-        "UnicodeWarning" => Some("Warning"),
-        "UserWarning" => Some("Warning"),
-        "ValueError" => Some("Exception"),
-        "Warning" => Some("Exception"),
-        "ZeroDivisionError" => Some("ArithmeticError"),
-        "_IncompleteInputError" => Some("SyntaxError"),
-        // Stdlib-module exceptions (not builtins) raised by the socket and
-        // urllib runtimes, matched by bare name. Verified against python3:
-        // URLError.__mro__ is URLError → OSError; HTTPError → URLError;
-        // socket.gaierror/herror → OSError (socket.timeout IS TimeoutError).
-        "URLError" => Some("OSError"),
-        "HTTPError" => Some("URLError"),
-        "gaierror" => Some("OSError"),
-        "herror" => Some("OSError"),
-        _ => None,
     }
 }
 
@@ -4835,78 +4731,14 @@ fn direct_exception_parent(exc: &str) -> Option<&'static str> {
 #[cfg(feature = "std")]
 impl From<PyException> for pyo3::PyErr {
     fn from(e: PyException) -> pyo3::PyErr {
-        use pyo3::exceptions::*;
         let msg = e.message.clone();
-        match e.exception_type.as_str() {
-            "ValueError" => PyValueError::new_err(msg),
-            "TypeError" => PyTypeError::new_err(msg),
-            "KeyError" => PyKeyError::new_err(msg),
-            "IndexError" => PyIndexError::new_err(msg),
-            "AttributeError" => PyAttributeError::new_err(msg),
-            "AssertionError" => PyAssertionError::new_err(msg),
-            "ZeroDivisionError" => PyZeroDivisionError::new_err(msg),
-            "RuntimeError" => PyRuntimeError::new_err(msg),
-            "NotImplementedError" => PyNotImplementedError::new_err(msg),
-            "OSError" => PyOSError::new_err(msg),
-            "EnvironmentError" | "IOError" => PyEnvironmentError::new_err(msg),
-            "FileNotFoundError" => PyFileNotFoundError::new_err(msg),
-            "FileExistsError" => PyFileExistsError::new_err(msg),
-            "PermissionError" => PyPermissionError::new_err(msg),
-            "IsADirectoryError" => PyIsADirectoryError::new_err(msg),
-            "NotADirectoryError" => PyNotADirectoryError::new_err(msg),
-            "InterruptedError" => PyInterruptedError::new_err(msg),
-            "ChildProcessError" => PyChildProcessError::new_err(msg),
-            "ProcessLookupError" => PyProcessLookupError::new_err(msg),
-            "TimeoutError" => PyTimeoutError::new_err(msg),
-            "ConnectionError" => PyConnectionError::new_err(msg),
-            "BrokenPipeError" => PyBrokenPipeError::new_err(msg),
-            "ConnectionAbortedError" => PyConnectionAbortedError::new_err(msg),
-            "ConnectionRefusedError" => PyConnectionRefusedError::new_err(msg),
-            "ConnectionResetError" => PyConnectionResetError::new_err(msg),
-            "BlockingIOError" => PyBlockingIOError::new_err(msg),
-            "StopIteration" => PyStopIteration::new_err(msg),
-            "StopAsyncIteration" => PyStopAsyncIteration::new_err(msg),
-            "OverflowError" => PyOverflowError::new_err(msg),
-            "FloatingPointError" => PyFloatingPointError::new_err(msg),
-            "NameError" => PyNameError::new_err(msg),
-            "UnboundLocalError" => PyUnboundLocalError::new_err(msg),
-            "LookupError" => PyLookupError::new_err(msg),
-            "ArithmeticError" => PyArithmeticError::new_err(msg),
-            "ImportError" => PyImportError::new_err(msg),
-            "ModuleNotFoundError" => PyModuleNotFoundError::new_err(msg),
-            "RecursionError" => PyRecursionError::new_err(msg),
-            "MemoryError" => PyMemoryError::new_err(msg),
-            "ReferenceError" => PyReferenceError::new_err(msg),
-            "BufferError" => PyBufferError::new_err(msg),
-            "EOFError" => PyEOFError::new_err(msg),
-            "SyntaxError" => PySyntaxError::new_err(msg),
-            // pyo3 0.29 wraps no IndentationError/TabError class; both ARE
-            // SyntaxErrors in CPython's tree, so surfacing them as such
-            // keeps `except SyntaxError:` working for Python callers.
-            "IndentationError" | "TabError" => PySyntaxError::new_err(msg),
-            "SystemError" => PySystemError::new_err(msg),
-            "UnicodeError" => PyUnicodeError::new_err(msg),
-            "UnicodeDecodeError" => PyUnicodeDecodeError::new_err(msg),
-            "UnicodeEncodeError" => PyUnicodeEncodeError::new_err(msg),
-            "UnicodeTranslateError" => PyUnicodeTranslateError::new_err(msg),
-            "BaseException" => PyBaseException::new_err(msg),
-            "KeyboardInterrupt" => PyKeyboardInterrupt::new_err(msg),
-            "SystemExit" => PySystemExit::new_err(msg),
-            "GeneratorExit" => PyGeneratorExit::new_err(msg),
-            "Warning" => PyWarning::new_err(msg),
-            "DeprecationWarning" => PyDeprecationWarning::new_err(msg),
-            "PendingDeprecationWarning" => PyPendingDeprecationWarning::new_err(msg),
-            "UserWarning" => PyUserWarning::new_err(msg),
-            "FutureWarning" => PyFutureWarning::new_err(msg),
-            "RuntimeWarning" => PyRuntimeWarning::new_err(msg),
-            "SyntaxWarning" => PySyntaxWarning::new_err(msg),
-            "ImportWarning" => PyImportWarning::new_err(msg),
-            "UnicodeWarning" => PyUnicodeWarning::new_err(msg),
-            "BytesWarning" => PyBytesWarning::new_err(msg),
-            "EncodingWarning" => PyEncodingWarning::new_err(msg),
-            "ResourceWarning" => PyResourceWarning::new_err(msg),
-            // Anything unrecognized keeps its full "Type: message" display.
-            _ => PyRuntimeError::new_err(format!("{}", e)),
+        // One parse into the built-in exception enum (see
+        // builtin_exceptions): every built-in type raises its real Python
+        // class via the exhaustive pyo3_err match; anything unrecognized
+        // (a user-defined class) keeps its full "Type: message" display.
+        match crate::builtin_exceptions::BuiltinException::from_name(&e.exception_type) {
+            Some(builtin) => builtin.pyo3_err(msg),
+            None => pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)),
         }
     }
 }
@@ -5133,6 +4965,8 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 // ============================================================================
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================
+
+mod builtin_exceptions;
 
 /// Python Standard Library modules
 pub mod stdlib;

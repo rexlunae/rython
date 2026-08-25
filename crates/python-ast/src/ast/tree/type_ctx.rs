@@ -613,6 +613,32 @@ pub fn render_typed_reused(
 /// would only add `.to_string()` noise. Container and numeric params get
 /// the real expected type (a `Vec<String>` param still needs owned
 /// strings, but those come from the list-literal lowering).
+/// Whether a name annotation is one of Python's builtin types whose
+/// `type(...)` object acts as its own class (`type(int)` IS `int`). This
+/// boundary function is the SINGLE source for that name set: bare
+/// container names are otherwise loud errors (§3.2), so routing through
+/// [`annotation_type_info`] would silently drop them while wrongly
+/// accepting `object`/`Any` and exception names.
+pub fn is_builtin_type_annotation(ann: &ExprType) -> bool {
+    match ann {
+        ExprType::Name(n) => matches!(
+            n.id.as_str(),
+            "int"
+                | "float"
+                | "bool"
+                | "str"
+                | "bytes"
+                | "bytearray"
+                | "list"
+                | "tuple"
+                | "set"
+                | "dict"
+                | "frozenset"
+        ),
+        _ => false,
+    }
+}
+
 pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
     let t = annotation_type_info(ann)?;
     if matches!(t, TypeInfo::String) {
