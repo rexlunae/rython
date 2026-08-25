@@ -7890,3 +7890,37 @@ fn with_lock_on_an_annotated_parameter_lowers_to_the_guard() {
         out
     );
 }
+
+#[test]
+fn threading_thread_daemon_flag_lowers_from_bool_constants() {
+    // Devin review round 3 on PR #144: the parser represents True/False
+    // as bool CONSTANTS (not Names), so daemon=True was wrongly rejected
+    // by a Name-only match. Both values must lower into Thread::new's
+    // daemon argument.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "def w() -> None:\n",
+            "    pass\n",
+            "\n",
+            "def run() -> None:\n",
+            "    t = threading.Thread(target=w, daemon=True)\n",
+            "    t.start()\n",
+            "    u = threading.Thread(target=w, daemon=False)\n",
+            "    u.start()\n",
+            "    u.join()\n",
+        ),
+        "daemon.py",
+    );
+    assert!(
+        out.contains("Thread :: new (\"w\" , true ,"),
+        "daemon=True must reach Thread::new: {}",
+        out
+    );
+    assert!(
+        out.contains("Thread :: new (\"w\" , false ,"),
+        "daemon=False must reach Thread::new: {}",
+        out
+    );
+}

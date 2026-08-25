@@ -6952,6 +6952,18 @@ fn lower_threading_thread(
                 }
             },
             Some("daemon") => match &kw.value {
+                // The parser represents True/False as bool Constants; the
+                // Name spelling covers synthesized/re-entered ASTs.
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if b.value()) =>
+                {
+                    daemon = true
+                }
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value()) =>
+                {
+                    daemon = false
+                }
                 ExprType::Name(n) if n.id == "True" => daemon = true,
                 ExprType::Name(n) if n.id == "False" => daemon = false,
                 _ => {
