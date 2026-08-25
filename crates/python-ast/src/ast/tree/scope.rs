@@ -50,19 +50,27 @@ enum Init {
     Yes,
 }
 
-/// Python methods that mutate their receiver; calling one on a name means
-/// the binding must be mutable. An unlisted mutating method surfaces as a
-/// missing-`mut` compile error in the generated code (loud, not silent).
-pub(crate) const MUTATING_METHODS: &[&str] = &[
+/// Python methods that mutate a CONTAINER receiver in place (list, dict,
+/// set, deque). ONE registry with two consumers: the aliasing guard
+/// (aliasing.rs) tracks exactly these, and the needs-`mut` analysis below
+/// adds the non-container receiver mutators. Previously aliasing.rs kept
+/// its own copy of this list and the two had drifted (the deque methods
+/// were missing here, so `d.appendleft(x)` emitted a binding without
+/// `mut` — E0596 in the generated crate).
+pub(crate) const CONTAINER_MUTATING_METHODS: &[&str] = &[
     "append",
+    "appendleft",
     "extend",
+    "extendleft",
     "insert",
     "remove",
     "pop",
+    "popleft",
     "popitem",
     "clear",
     "sort",
     "reverse",
+    "rotate",
     "update",
     "add",
     "discard",
@@ -70,9 +78,13 @@ pub(crate) const MUTATING_METHODS: &[&str] = &[
     "intersection_update",
     "difference_update",
     "symmetric_difference_update",
+];
+
+/// Receiver-mutating methods that are NOT container aliasing concerns:
+/// file objects (reads advance the cursor), csv.Writer's row methods,
+/// and Vec::push emitted for list.append.
+const NONCONTAINER_MUTATING_METHODS: &[&str] = &[
     "push",
-    // File-object methods take &mut self (reads advance the cursor);
-    // csv.Writer's row methods write through it.
     "read",
     "readline",
     "readlines",
@@ -82,6 +94,13 @@ pub(crate) const MUTATING_METHODS: &[&str] = &[
     "writerow",
     "writerows",
 ];
+
+/// Whether calling this method on a name means the binding must be
+/// mutable. An unlisted mutating method surfaces as a missing-`mut`
+/// compile error in the generated code (loud, not silent).
+pub(crate) fn mutates_receiver(name: &str) -> bool {
+    CONTAINER_MUTATING_METHODS.contains(&name) || NONCONTAINER_MUTATING_METHODS.contains(&name)
+}
 
 struct Analysis<'r> {
     assigned: Vec<String>,
@@ -601,18 +620,20 @@ fn walk_loop(
     walk_stmts(orelse, a, outer_multi);
 }
 
+/// The heapq functions that mutate their first argument in place (the
+/// heapq surface treats a plain list as a heap, so `heappush(h, x)`
+/// mutates `h` like a method call would). ONE registry: call.rs's
+/// `&mut`-rendering consults it too, so the borrow emission and this
+/// needs-`mut` analysis cannot drift.
+pub(crate) const HEAPQ_FIRST_ARG_MUTATORS: &[&str] =
+    &["heappush", "heappop", "heapify", "heappushpop", "heapreplace"];
+
 /// Free functions that mutate their first argument in place: the heapq
-/// surface treats a plain list as a heap, so `heappush(h, x)` mutates `h`
-/// like a method call would.
-const FIRST_ARG_MUTATORS: &[&str] = &[
-    "heappush",
-    "heappop",
-    "heapify",
-    "heappushpop",
-    "heapreplace",
-    // csv.writer(f) holds &mut f for the writer's lifetime.
-    "writer",
-];
+/// mutators plus csv.writer(f), which holds &mut f for the writer's
+/// lifetime.
+fn mutates_first_arg(name: &str) -> bool {
+    HEAPQ_FIRST_ARG_MUTATORS.contains(&name) || name == "writer"
+}
 
 fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
     if let ExprType::Attribute(attr) = call.func.as_ref() {
@@ -621,7 +642,7 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         // the bare-function branch below.
         if let ExprType::Name(m) = attr.value.as_ref() {
             if matches!(m.id.as_str(), "heapq" | "csv")
-                && FIRST_ARG_MUTATORS.contains(&attr.attr.as_str())
+                && mutates_first_arg(&attr.attr)
             {
                 if let Some(first) = call.args.first() {
                     if let Some(name) = chain_base_name(first) {
@@ -638,7 +659,7 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         // a name the syntactic list doesn't know.
         let mutates = match (a.resolve_call)(call) {
             Some(verdict) => verdict,
-            None => MUTATING_METHODS.contains(&attr.attr.as_str()),
+            None => mutates_receiver(&attr.attr),
         };
         if mutates {
             if let Some(name) = chain_base_name(&attr.value) {
@@ -654,9 +675,9 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         walk_expr(&attr.value, a);
     } else {
         // Free functions that mutate their first argument in place; see
-        // FIRST_ARG_MUTATORS.
+        // mutates_first_arg.
         if let ExprType::Name(n) = call.func.as_ref() {
-            if FIRST_ARG_MUTATORS.contains(&n.id.as_str()) {
+            if mutates_first_arg(&n.id) {
                 if let Some(first) = call.args.first() {
                     if let Some(name) = chain_base_name(first) {
                         a.record_mutation(name);

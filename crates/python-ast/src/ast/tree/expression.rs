@@ -860,6 +860,25 @@ pub fn narrowing_from_test(
 /// len(x) == 2:` — narrows only the body (the `and` could fail on the
 /// other conjunct, so the else stays the original type). Returns
 /// (name, body_type, else_type). None for any other test.
+/// The member TypeInfo an isinstance NARROWING target maps to — the ONE
+/// authority for the narrowing name set: the alias-resolution guard and
+/// the known-target gate in isinstance_narrowing both derive from it, so
+/// the three lists (previously kept in sync by hand, 55 lines apart)
+/// cannot drift.
+fn narrowing_member_of(id: &str) -> Option<crate::TypeInfo> {
+    match id {
+        "str" => Some(crate::TypeInfo::String),
+        "bytes" | "bytearray" => Some(crate::TypeInfo::Bytes),
+        "int" => Some(crate::TypeInfo::Int),
+        "float" => Some(crate::TypeInfo::Float),
+        "bool" => Some(crate::TypeInfo::Bool),
+        // A tuple member is read as its element vector
+        // (PyValue::as_tuple().unwrap().clone()).
+        "tuple" => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
+        _ => None,
+    }
+}
+
 pub fn isinstance_narrowing(
     test: &ExprType,
     options: &PythonOptions,
@@ -934,12 +953,7 @@ pub fn isinstance_narrowing(
         }
         match symbols.get(id) {
             Some(crate::SymbolTableNode::Assign { value, .. }) => match value {
-                ExprType::Name(n)
-                    if matches!(
-                        n.id.as_str(),
-                        "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "tuple"
-                    ) =>
-                {
+                ExprType::Name(n) if narrowing_member_of(&n.id).is_some() => {
                     Some(n.id.clone())
                 }
                 _ => None,
@@ -989,32 +1003,12 @@ pub fn isinstance_narrowing(
         }
         _ => return None,
     }
-    let known = |id: &str| {
-        matches!(
-            id,
-            "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "tuple"
-        )
-    };
-    if targets.is_empty() || targets.iter().any(|t| !known(t)) {
+    if targets.is_empty() || targets.iter().any(|t| narrowing_member_of(t).is_none()) {
         return None;
     }
-    // Map each resolved target to the member TypeInfo it narrows to.
-    let member_of = |id: &str| -> Option<crate::TypeInfo> {
-        match id {
-            "str" => Some(crate::TypeInfo::String),
-            "bytes" | "bytearray" => Some(crate::TypeInfo::Bytes),
-            "int" => Some(crate::TypeInfo::Int),
-            "float" => Some(crate::TypeInfo::Float),
-            "bool" => Some(crate::TypeInfo::Bool),
-            // A tuple member is read as its element vector
-            // (PyValue::as_tuple().unwrap().clone()).
-            "tuple" => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
-            _ => None,
-        }
-    };
     let members: Vec<crate::TypeInfo> = targets
         .iter()
-        .filter_map(|t| member_of(t))
+        .filter_map(|t| narrowing_member_of(t))
         .collect();
     // Deduplicate: (bytes, bytearray) both narrow to Bytes.
     let mut distinct: Vec<crate::TypeInfo> = Vec::new();

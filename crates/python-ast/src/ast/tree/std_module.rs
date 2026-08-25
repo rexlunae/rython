@@ -232,6 +232,77 @@ impl StdModule {
     }
 }
 
+/// The arity/keyword VARIANT names of runtime functions — one Python
+/// name maps to several Rust functions split by call shape (accumulate
+/// with initial=, StringIO seeded, ...). Each name literal exists exactly
+/// once, here: import.rs consumes the per-function slices (emitting
+/// `#[allow(unused_imports)] use` for every variant so the lowering can
+/// pick any of them), and call.rs renders individual variants through
+/// these constants. Previously the same names were spelled in both files
+/// and could drift — a call.rs arm without a matching import entry is an
+/// E0425 in the GENERATED crate.
+pub(crate) mod variant {
+    pub(crate) const ACCUMULATE_SUM: &str = "accumulate_sum";
+    pub(crate) const ACCUMULATE_FUNC: &str = "accumulate_func";
+    pub(crate) const ACCUMULATE_SUM_INITIAL: &str = "accumulate_sum_initial";
+    pub(crate) const ACCUMULATE_FUNC_INITIAL: &str = "accumulate_func_initial";
+    pub(crate) const PRODUCT2: &str = "product2";
+    pub(crate) const PRODUCT3: &str = "product3";
+    pub(crate) const PRODUCT_REPEAT2: &str = "product_repeat2";
+    pub(crate) const PRODUCT_REPEAT3: &str = "product_repeat3";
+    pub(crate) const ZIP_LONGEST_FILL: &str = "zip_longest_fill";
+    pub(crate) const GROUPBY_KEY: &str = "groupby_key";
+    pub(crate) const REDUCE_INITIAL: &str = "reduce_initial";
+    pub(crate) const FINDALL2: &str = "findall2";
+    pub(crate) const FINDALL3: &str = "findall3";
+    pub(crate) const STRINGIO_SEEDED: &str = "StringIO_seeded";
+    pub(crate) const BYTESIO_SEEDED: &str = "BytesIO_seeded";
+    pub(crate) const MD5_NEW: &str = "md5_new";
+    pub(crate) const SHA1_NEW: &str = "sha1_new";
+    pub(crate) const SHA256_NEW: &str = "sha256_new";
+    pub(crate) const SHA512_NEW: &str = "sha512_new";
+}
+
+/// Per-(module, python-name) variant lists, for import.rs's bring-along.
+pub(crate) fn runtime_fn_variants(module: StdModule, name: &str) -> &'static [&'static str] {
+    use variant::*;
+    match (module, name) {
+        (StdModule::Itertools, "accumulate") => &[
+            ACCUMULATE_SUM,
+            ACCUMULATE_FUNC,
+            ACCUMULATE_SUM_INITIAL,
+            ACCUMULATE_FUNC_INITIAL,
+        ],
+        (StdModule::Itertools, "product") => {
+            &[PRODUCT2, PRODUCT3, PRODUCT_REPEAT2, PRODUCT_REPEAT3]
+        }
+        (StdModule::Itertools, "zip_longest") => &[ZIP_LONGEST_FILL],
+        (StdModule::Itertools, "groupby") => &[GROUPBY_KEY],
+        (StdModule::Functools, "reduce") => &[REDUCE_INITIAL],
+        (StdModule::Re, "findall") => &[FINDALL2, FINDALL3],
+        (StdModule::Io, "StringIO") => &[STRINGIO_SEEDED],
+        (StdModule::Io, "BytesIO") => &[BYTESIO_SEEDED],
+        (StdModule::Hashlib, "md5") => &[MD5_NEW],
+        (StdModule::Hashlib, "sha1") => &[SHA1_NEW],
+        (StdModule::Hashlib, "sha256") => &[SHA256_NEW],
+        (StdModule::Hashlib, "sha512") => &[SHA512_NEW],
+        _ => &[],
+    }
+}
+
+/// The `hashlib.<algo>()` zero-argument constructor's `_new` variant,
+/// through the same shared constants (call.rs previously derived these
+/// by `format!`, which import.rs's hardcoded list could silently miss).
+pub(crate) fn hashlib_new_variant(fname: &str) -> Option<&'static str> {
+    Some(match fname {
+        "md5" => variant::MD5_NEW,
+        "sha1" => variant::SHA1_NEW,
+        "sha256" => variant::SHA256_NEW,
+        "sha512" => variant::SHA512_NEW,
+        _ => return None,
+    })
+}
+
 /// The numpy module's import aliases: `import numpy as np` is THE
 /// canonical spelling, so both names appear throughout Python sources.
 /// One predicate instead of scattered `== "np" || == "numpy"` checks.

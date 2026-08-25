@@ -955,28 +955,9 @@ impl CodeGen for ImportFrom {
             // Python. Names without variants keep the plain import, so a
             // genuinely unused `from itertools import pairwise` still
             // surfaces as the source weakness it is.
-            let variants: &[&str] = match (self.module.as_str(), alias.name.as_str()) {
-                ("itertools", "accumulate") => &[
-                    "accumulate_sum",
-                    "accumulate_func",
-                    "accumulate_sum_initial",
-                    "accumulate_func_initial",
-                ],
-                ("itertools", "product") => {
-                    &["product2", "product3", "product_repeat2", "product_repeat3"]
-                }
-                ("itertools", "zip_longest") => &["zip_longest_fill"],
-                ("itertools", "groupby") => &["groupby_key"],
-                ("functools", "reduce") => &["reduce_initial"],
-                ("re", "findall") => &["findall2", "findall3"],
-                ("io", "StringIO") => &["StringIO_seeded"],
-                ("io", "BytesIO") => &["BytesIO_seeded"],
-                ("hashlib", "md5") => &["md5_new"],
-                ("hashlib", "sha1") => &["sha1_new"],
-                ("hashlib", "sha256") => &["sha256_new"],
-                ("hashlib", "sha512") => &["sha512_new"],
-                _ => &[],
-            };
+            let variants: &[&str] = crate::StdModule::from_name(&self.module)
+                .map(|m| crate::ast::tree::std_module::runtime_fn_variants(m, &alias.name))
+                .unwrap_or(&[]);
 
             let name = crate::safe_ident(&alias.name);
             // A name the defining module re-exports from a STDPYTHON

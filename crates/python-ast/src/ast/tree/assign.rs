@@ -42,6 +42,33 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
     }
 }
 
+/// The builtin SCALAR type names an alias assignment can declare
+/// (`builtin_str = str` — requests' compat). ONE predicate: five sites
+/// (the module-init skips, the static-promotion skip, and the two
+/// `pub type` emissions) previously each spelled the list, and the
+/// Rust-type mapping existed twice — a partial edit would have emitted a
+/// `pub type` AND promoted a static of the same name (E0428), or skipped
+/// the store without ever declaring the alias (E0412).
+pub(crate) fn is_builtin_scalar_name(name: &str) -> bool {
+    matches!(name, "str" | "bytes" | "bytearray" | "int" | "float" | "bool")
+}
+
+/// When `value` is a builtin-scalar type NAME, the Rust type its alias
+/// declaration maps to; None otherwise.
+pub(crate) fn builtin_scalar_alias_type(value: &ExprType) -> Option<TokenStream> {
+    let ExprType::Name(n) = value else {
+        return None;
+    };
+    Some(match n.id.as_str() {
+        "str" => quote!(String),
+        "bytes" | "bytearray" => quote!(Vec<u8>),
+        "int" => quote!(i64),
+        "float" => quote!(f64),
+        "bool" => quote!(bool),
+        _ => return None,
+    })
+}
+
 impl<'a> CodeGen for Assign {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -158,19 +185,8 @@ impl<'a> CodeGen for Assign {
         if matches!(ctx, CodeGenContext::Module(_))
             && self.targets.len() == 1
             && let ExprType::Name(target) = &self.targets[0]
-            && let ExprType::Name(n) = &self.value
-            && matches!(
-                n.id.as_str(),
-                "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
-            )
+            && let Some(ty) = builtin_scalar_alias_type(&self.value)
         {
-            let ty = match n.id.as_str() {
-                "str" => quote!(String),
-                "bytes" | "bytearray" => quote!(Vec<u8>),
-                "int" => quote!(i64),
-                "float" => quote!(f64),
-                _ => quote!(bool),
-            };
             let ident = crate::safe_ident(&target.id);
             return Ok(quote! {
                 #[allow(dead_code)]

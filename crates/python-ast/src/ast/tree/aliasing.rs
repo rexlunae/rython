@@ -16,12 +16,10 @@ use crate::ast::tree::StatementType;
 use crate::{ExprType, FunctionDef, Statement, SymbolTableNode, SymbolTableScopes, TypeInfo};
 
 /// Methods that mutate their receiver in place, for the container types
-/// rython models (list, dict, deque, set, ...).
-const MUTATING_METHODS: &[&str] = &[
-    "append", "appendleft", "extend", "extendleft", "insert", "pop", "popleft", "remove",
-    "clear", "sort", "reverse", "rotate", "update", "setdefault", "popitem", "add",
-    "discard", "intersection_update", "difference_update", "symmetric_difference_update",
-];
+/// rython models (list, dict, deque, set, ...) — the single registry in
+/// scope.rs (this module previously kept its own copy, which had
+/// drifted).
+use crate::ast::tree::scope::CONTAINER_MUTATING_METHODS as MUTATING_METHODS;
 
 /// The root name of a mutation target: `a`, `a[i]`, `a[i][j]`, `a.k`.
 fn root_name_of(target: &ExprType) -> Option<&str> {
