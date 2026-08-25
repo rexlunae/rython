@@ -68,6 +68,11 @@ pub(crate) static BUILTIN_EXCEPTION_PARENTS: &[(&str, Option<&str>)] = &[
     ("PermissionError", Some("OSError")),
     ("ProcessLookupError", Some("OSError")),
     ("TimeoutError", Some("OSError")),
+    // urllib.error family (the http-ureq runtime raises these):
+    // URLError IS-A OSError and HTTPError IS-A URLError in CPython.
+    ("URLError", Some("OSError")),
+    ("HTTPError", Some("URLError")),
+    ("ContentTooShortError", Some("URLError")),
     // RuntimeError leaves.
     ("NotImplementedError", Some("RuntimeError")),
     ("RecursionError", Some("RuntimeError")),
@@ -196,6 +201,11 @@ pub(crate) static PYO3_CTORS: &[(&str, fn(String) -> pyo3::PyErr)] = &[
     ("PermissionError", |m| pyo3::exceptions::PyPermissionError::new_err(m)),
     ("ProcessLookupError", |m| pyo3::exceptions::PyProcessLookupError::new_err(m)),
     ("TimeoutError", |m| pyo3::exceptions::PyTimeoutError::new_err(m)),
+    // urllib.error: pyo3 wraps none of these; they surface through their
+    // OSError ancestry.
+    ("URLError", |m| pyo3::exceptions::PyOSError::new_err(m)),
+    ("HTTPError", |m| pyo3::exceptions::PyOSError::new_err(m)),
+    ("ContentTooShortError", |m| pyo3::exceptions::PyOSError::new_err(m)),
     ("ReferenceError", |m| pyo3::exceptions::PyReferenceError::new_err(m)),
     ("RuntimeError", |m| pyo3::exceptions::PyRuntimeError::new_err(m)),
     ("NotImplementedError", |m| pyo3::exceptions::PyNotImplementedError::new_err(m)),
@@ -241,6 +251,11 @@ pub(crate) static PYO3_CTORS: &[(&str, fn(String) -> pyo3::PyErr)] = &[
     ("UnicodeEncodeError", |m| pyo3::exceptions::PyUnicodeEncodeError::new_err(m)),
     ("UnicodeTranslateError", |m| pyo3::exceptions::PyUnicodeTranslateError::new_err(m)),
     ("TimeoutError", |m| pyo3::exceptions::PyTimeoutError::new_err(m)),
+    // urllib.error: pyo3 wraps none of these; they surface through their
+    // OSError ancestry.
+    ("URLError", |m| pyo3::exceptions::PyOSError::new_err(m)),
+    ("HTTPError", |m| pyo3::exceptions::PyOSError::new_err(m)),
+    ("ContentTooShortError", |m| pyo3::exceptions::PyOSError::new_err(m)),
     // Aliases surface as their canonical class.
     ("EnvironmentError", |m| pyo3::exceptions::PyEnvironmentError::new_err(m)),
     ("IOError", |m| pyo3::exceptions::PyIOError::new_err(m)),
