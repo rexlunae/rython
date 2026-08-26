@@ -14,10 +14,13 @@
 //! | Feature          | Backend | Requirements                           |
 //! |------------------|---------|----------------------------------------|
 //! | `numpy`          | scalar  | none (always available)                |
-//! | `numpy-rayon`    | rayon   | multithreaded elementwise + reductions |
-//! | `numpy-simd`     | simd    | runtime-detected AVX2/AVX-512/SSE2/NEON |
-//! | `numpy-cuda`     | cuda    | CUDA driver at runtime (cudarc)        |
-//! | `numpy-vulkan`   | vulkan  | Vulkan driver at runtime (ash)         |
+//! | `numpy-rayon`    | rayon   | multithreaded elementwise kernels       |
+//! | `numpy-simd`     | simd    | LLVM-auto-vectorized kernels (alias of scalar; no hand-written intrinsics yet, issue #164) |
+//! | `numpy-cuda`     | cuda    | FEATURE COMPILES BUT NO KERNELS SHIP — selecting it is a loud runtime error (issue #164) |
+//! | `numpy-vulkan`   | vulkan  | FEATURE COMPILES BUT NO KERNELS SHIP — selecting it is a loud runtime error (issue #164) |
+//!
+//! Reductions (`sum`, `mean`, ...) are not engine-dispatched; they run
+//! their own sequential loops in `reduce.rs`.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -258,12 +261,16 @@ pub(crate) enum UnOp {
 pub(crate) mod scalar;
 
 #[cfg(feature = "numpy-rayon")]
+#[path = "rayon_eng.rs"]
 pub(crate) mod rayon_eng;
 #[cfg(feature = "numpy-simd")]
+#[path = "simd.rs"]
 pub(crate) mod simd;
 #[cfg(feature = "numpy-cuda")]
+#[path = "cuda.rs"]
 pub(crate) mod cuda;
 #[cfg(feature = "numpy-vulkan")]
+#[path = "vulkan.rs"]
 pub(crate) mod vulkan;
 
 macro_rules! dispatch_binary {
