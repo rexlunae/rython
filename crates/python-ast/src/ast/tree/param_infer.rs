@@ -184,6 +184,11 @@ pub const STDLIB_METHOD_TABLE: &[(&str, &str, bool, MethodReturn)] = &[
     ("insert", "PyListOps", true, MethodReturn::Unit),
     ("count", "PyListOps", false, MethodReturn::I64),
     ("pop", "PyPop", true, MethodReturn::Unknown),
+    // bytes methods (PyDecode, non-mutating). decode on an unannotated
+    // parameter — the isinstance-residual morphs of issue #161's
+    // `_unicode_path` — dispatches through the trait, which the boxed
+    // PyValue also implements (the dynamic router's Other arm).
+    ("decode", "PyDecode", false, MethodReturn::Str),
 ];
 
 /// The inferred signature for a function with unannotated parameters.
@@ -598,9 +603,18 @@ pub fn infer_unannotated_signature(
 
     // One type variable per GENERIC parameter, in declaration order (single
     // param: `T`, otherwise `A`, `B`, ...).
+    // Pinned parameters are CONCRETE (a str-pinned one is String, a
+    // value-pinned one is the boxed PyValue): they take no type variable
+    // and no bounds — a declared-but-unused type parameter plus bounds on
+    // it would not name the signature's actual type (issue #161's `load`,
+    // whose `path = norm(path)` value-pins the parameter).
     let mut generic_params: Vec<&String> = all_params
         .iter()
-        .filter(|p| !identity_types.contains_key(*p))
+        .filter(|p| {
+            !identity_types.contains_key(*p)
+                && !collector.string_pinned.contains(*p)
+                && !collector.value_pinned.contains(*p)
+        })
         .collect();
     // A loop element of an identity-forced parameter is driven by the
     // concrete type — drop its type variable (a declared-but-unconstrained
@@ -2414,6 +2428,20 @@ fn definitionally_satisfiable(reqs: &[ParamReq]) -> bool {
         TypeInfo::Vec(Box::new(TypeInfo::String)),
         TypeInfo::Dict(Box::new(TypeInfo::String), Box::new(TypeInfo::Int)),
     ];
+    // Bytes is deliberately NOT a general candidate: its impl set is not
+    // enumerated, so the permissive `uncertain` rule would satisfy every
+    // bound set and void the check. A set that includes the bytes-native
+    // PyDecode (`p.decode(...)` — issue #161's residual morphs) is tried
+    // against Bytes, though — bytes is the type such a parameter holds.
+    if reqs
+        .iter()
+        .any(|r| matches!(r, ParamReq::Method(t, _, _) if t == "PyDecode"))
+        && reqs
+            .iter()
+            .all(|r| definition_req_satisfied(r, &TypeInfo::Bytes))
+    {
+        return true;
+    }
     candidates
         .iter()
         .any(|t| reqs.iter().all(|r| definition_req_satisfied(r, t)))
@@ -2561,6 +2589,10 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
             TypeInfo::String | TypeInfo::StrRef | TypeInfo::Vec(_) | TypeInfo::Dict(..)
         ),
         "PyStrOps" => matches!(ty, TypeInfo::String | TypeInfo::StrRef),
+        // bytes.decode — a str/int/list argument at a decode call site is
+        // CPython's AttributeError, loud here. (A Bytes argument answers
+        // through the permissive `uncertain` arm above.)
+        "PyDecode" => matches!(ty, TypeInfo::Bytes),
         "PyListOps" => matches!(ty, TypeInfo::Vec(_)),
         "PyPop" => match (ty, rhs) {
             (TypeInfo::Vec(_), Some(TypeInfo::Int)) => true,

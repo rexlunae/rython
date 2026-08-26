@@ -2574,6 +2574,15 @@ impl From<&[u8]> for PyValue {
     }
 }
 
+// A bytes LITERAL (`b"raw"`) is a borrowed array `&[u8; N]`, which does
+// not unsize during trait selection — box it directly (issue #161's
+// impl-Into parameters take bytes literals at call sites).
+impl<const N: usize> From<&[u8; N]> for PyValue {
+    fn from(value: &[u8; N]) -> Self {
+        PyValue::Bytes(value.to_vec())
+    }
+}
+
 impl From<StrOrBytes> for PyValue {
     fn from(value: StrOrBytes) -> Self {
         match value {
@@ -2787,6 +2796,90 @@ impl PyDisplay for PyValue {
 impl PyRepr for PyValue {
     fn py_repr(&self) -> String {
         py_value_repr(self)
+    }
+}
+
+/// Python `bytes.decode(encoding, errors)` as a trait, so receivers
+/// without a statically-known type can decode: an unannotated parameter
+/// (`T: PyDecode` — the isinstance-residual morphs of issue #161's
+/// `_unicode_path`) and the boxed PyValue (the dynamic router's `Other`
+/// arm hands the morph its boxed payload). `errors="replace"` follows
+/// CPython for utf-8 (invalid sequences become U+FFFD); any other
+/// non-strict errors value decodes strictly — the documented decode
+/// divergence. A non-bytes boxed value raises CPython's AttributeError.
+pub trait PyDecode {
+    fn py_decode<E: AsRef<str>, R: AsRef<str>>(
+        &self,
+        encoding: E,
+        errors: R,
+    ) -> Result<String, PyException>;
+}
+
+impl PyDecode for [u8] {
+    fn py_decode<E: AsRef<str>, R: AsRef<str>>(
+        &self,
+        encoding: E,
+        errors: R,
+    ) -> Result<String, PyException> {
+        let enc = encoding.as_ref();
+        if errors.as_ref() == "replace"
+            && matches!(enc, "utf-8" | "utf8")
+        {
+            return Ok(String::from_utf8_lossy(self).into_owned());
+        }
+        stdlib::codec::decode_by_name(self, enc)
+    }
+}
+
+impl PyDecode for Vec<u8> {
+    fn py_decode<E: AsRef<str>, R: AsRef<str>>(
+        &self,
+        encoding: E,
+        errors: R,
+    ) -> Result<String, PyException> {
+        self.as_slice().py_decode(encoding, errors)
+    }
+}
+
+// A bytes LITERAL argument (`_unicode_path_any(b"raw")`) is a borrowed
+// array — the bound instantiates at `&[u8; N]`, which the reference
+// blanket reaches through the array impl.
+impl<const N: usize> PyDecode for [u8; N] {
+    fn py_decode<E: AsRef<str>, R: AsRef<str>>(
+        &self,
+        encoding: E,
+        errors: R,
+    ) -> Result<String, PyException> {
+        self[..].py_decode(encoding, errors)
+    }
+}
+
+impl<T: PyDecode + ?Sized> PyDecode for &T {
+    fn py_decode<E: AsRef<str>, R: AsRef<str>>(
+        &self,
+        encoding: E,
+        errors: R,
+    ) -> Result<String, PyException> {
+        (**self).py_decode(encoding, errors)
+    }
+}
+
+impl PyDecode for PyValue {
+    fn py_decode<E: AsRef<str>, R: AsRef<str>>(
+        &self,
+        encoding: E,
+        errors: R,
+    ) -> Result<String, PyException> {
+        match self {
+            PyValue::Bytes(b) => b.py_decode(encoding, errors),
+            other => Err(PyException::new(
+                "AttributeError",
+                format!(
+                    "'{}' object has no attribute 'decode'",
+                    other.py_type_name()
+                ),
+            )),
+        }
     }
 }
 

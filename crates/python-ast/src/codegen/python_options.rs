@@ -294,6 +294,16 @@ pub struct PythonOptions {
     /// `PyValue::from` (the None-mixing unification).
     pub fn_return_is_pyvalue: bool,
 
+    /// The CURRENT free function's parameters whose inferred type is the
+    /// boxed PyValue (a value-pinned parameter — reassigned from a call
+    /// result, issue #161's `path = os.path.expandvars(path)`): they
+    /// render as `impl Into<stdpython::PyValue>` with a boxing prologue,
+    /// so call sites keep passing plain values (String, bytes, an
+    /// already-boxed PyValue) exactly like Python. Set per function;
+    /// empty for methods and trait bodies (impl-Trait parameters are not
+    /// legal in trait method signatures).
+    pub pyvalue_into_params: std::rc::Rc<std::collections::HashSet<String>>,
+
     /// The current module's package path within the generated crate
     /// ("" for the crate root, "pkg" for pkg/__init__.py, "pkg.sub" for
     /// pkg/sub/module.py). Relative imports (`from .x import y`,
@@ -520,6 +530,7 @@ impl Default for PythonOptions {
             generator_collector: std::rc::Rc::new(None),
             clone_str_attribute_returns: false,
             fn_return_is_pyvalue: false,
+            pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
             module_path: Vec::new(),
             this_module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),

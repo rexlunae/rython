@@ -8963,3 +8963,105 @@ fn mixed_element_list_returns_get_vec_pyvalue_signature() {
         out
     );
 }
+
+// ---- Issue #161: boxed fallback for isinstance dispatch ----
+
+#[test]
+fn unknown_typed_argument_dispatches_through_the_router() {
+    // An isinstance-dispatched call whose argument has NO statically-known
+    // type (`path` reassigned through an untyped call — botocore
+    // configloader's `path = os.path.expandvars(path)`) routes through
+    // the dynamic router at runtime instead of failing loudly. The
+    // reassigned-from-a-call parameter value-pins to the boxed PyValue:
+    // `impl Into<stdpython::PyValue>` with a boxing prologue, stores
+    // wrapped in PyValue::from — call sites keep passing plain values.
+    let out = compile(
+        concat!(
+            "def _unicode_path(path):\n",
+            "    if isinstance(path, str):\n",
+            "        return path\n",
+            "    return path.decode(\"utf-8\", \"replace\")\n",
+            "\n",
+            "def norm(p):\n",
+            "    return p\n",
+            "\n",
+            "def load(path):\n",
+            "    path = norm(path)\n",
+            "    return _unicode_path(path)\n",
+        ),
+        "router161.py",
+    );
+    assert!(
+        out.contains("load (path : impl Into < stdpython :: PyValue >)"),
+        "the value-pinned parameter must take impl Into<PyValue>: {}",
+        out
+    );
+    assert!(
+        out.contains("let mut path : stdpython :: PyValue = path . into () ;"),
+        "the prologue must box the parameter: {}",
+        out
+    );
+    // The dispatch site calls the ROUTER (the original name), not a
+    // compile-time morph and not a loud error.
+    assert!(
+        out.contains("_unicode_path (path)"),
+        "the unknown-typed call must go through the router: {}",
+        out
+    );
+    // The parameter takes no dead type variable: its type is concrete.
+    assert!(
+        !out.contains("load < T >"),
+        "a value-pinned parameter must not leave a generic leftover: {}",
+        out
+    );
+}
+
+#[test]
+fn decode_residual_morph_derives_and_bounds_pydecode() {
+    // The RESIDUAL morph of a str-tested dispatcher whose fall-through
+    // decodes (`return path.decode(enc, 'replace')`) types as String —
+    // only bytes has decode in Python 3 — so the dynamic router derives,
+    // and the morph's parameter carries the PyDecode bound the boxed
+    // Other arm (PyValue) and static bytes callers both satisfy.
+    let out = compile(
+        concat!(
+            "def _unicode_path(path):\n",
+            "    if isinstance(path, str):\n",
+            "        return path\n",
+            "    return path.decode(\"utf-8\", \"replace\")\n",
+        ),
+        "residual161.py",
+    );
+    assert!(
+        out.contains("T : PyDecode"),
+        "the residual morph must bound PyDecode: {}",
+        out
+    );
+    assert!(
+        out.contains("py_decode (\"utf-8\" , \"replace\")"),
+        "two-positional decode must lower through the trait: {}",
+        out
+    );
+    // The router exists (the residual's return derived as String).
+    assert!(
+        out.contains("pub fn _unicode_path (path : impl Into < UnicodePathArg > ,)"),
+        "the router must derive for the decode residual: {}",
+        out
+    );
+}
+
+#[test]
+fn two_arg_decode_on_bytes_receiver_lowers_through_pydecode() {
+    // bytes.decode(enc, errors) with BOTH positional arguments (botocore
+    // configloader passes the errors mode positionally): the PyDecode
+    // lowering ('replace' follows CPython for utf-8).
+    let out = compile(
+        "def f(b: bytes) -> str:\n    return b.decode(\"utf-8\", \"replace\")\n",
+        "decode2arg.py",
+    );
+    assert!(
+        out.contains("py_decode (\"utf-8\" , \"replace\")"),
+        "two-positional decode must lower through the trait: {}",
+        out
+    );
+}

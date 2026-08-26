@@ -1812,6 +1812,24 @@ impl FunctionDef {
         for name in &none_defaulted {
             final_param_types.insert(name.clone(), quote!(Option<()>));
         }
+        // A FREE function's value-pinned parameters (inferred boxed
+        // PyValue — issue #161) render `impl Into<stdpython::PyValue>`
+        // with a boxing prologue, so callers pass plain values exactly
+        // like Python. Methods and trait bodies keep the bare PyValue
+        // (impl-Trait parameters are not legal in trait signatures).
+        let pyvalue_into_params: std::collections::HashSet<String> = if matches!(
+            &ctx,
+            CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+        ) {
+            std::collections::HashSet::new()
+        } else {
+            final_param_types
+                .iter()
+                .filter(|(_, ty)| ty.to_string() == "stdpython :: PyValue")
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        options.pyvalue_into_params = std::rc::Rc::new(pyvalue_into_params);
         options.param_type_vars = std::rc::Rc::new(final_param_types);
         // An INFERRED String return needs the same literal-owning
         // treatment as an annotated `-> str`: `return "pos"` in a generic
@@ -1896,6 +1914,18 @@ impl FunctionDef {
                     streams_prologue.extend(quote!(let mut #ident: String = #ident.into();));
                 } else {
                     streams_prologue.extend(quote!(let #ident: String = #ident.into();));
+                }
+            } else if options.pyvalue_into_params.contains(name) {
+                // Value-pinned parameters arrive as impl
+                // Into<stdpython::PyValue>; box them up front (issue #161).
+                if scope.needs_mut.contains(name) {
+                    streams_prologue.extend(
+                        quote!(let mut #ident: stdpython::PyValue = #ident.into();),
+                    );
+                } else {
+                    streams_prologue.extend(
+                        quote!(let #ident: stdpython::PyValue = #ident.into();),
+                    );
                 }
             } else if scope.needs_mut.contains(name) {
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
@@ -1993,7 +2023,11 @@ impl FunctionDef {
             self.resolved_return_type(&symbols, &options),
             Some(ref ty) if ty.to_string() == "stdpython :: PyValue"
         ) || (self.returns.is_none()
-            && inferred_signature.is_generic()
+            // A unified return exists whenever the collector ran — for a
+            // generic signature AND for one whose parameters pinned
+            // concrete (a value-pinned PyValue, issue #161); a method's
+            // synthesized signature never carries one, so methods keep
+            // their own path.
             && guarantees_return(&self.body)
             && matches!(
                 &inferred_signature.return_type,
@@ -2069,7 +2103,16 @@ impl FunctionDef {
         let return_type = if let Some(elt) = &gen_elt {
             let t = elt.to_rust_type();
             quote!(-> Result<Vec<#t>, PyException>)
-        } else if inferred_signature.is_generic() && self.returns.is_none() {
+        } else if (inferred_signature.is_generic()
+            || inferred_signature.return_type.is_some())
+            && self.returns.is_none()
+        {
+            // Inference ran and owns the unannotated return type: a
+            // generic signature, or a non-generic one whose parameters
+            // pinned concrete while the collector still unified the
+            // returns (issue #161's value-pinned PyValue params). A
+            // method's synthesized signature has neither, so methods keep
+            // the resolved_return_type path.
             // The inferred generic return (issue #109, M1): a parameter's
             // variable, a conversion result, or an associated Output. Only
             // when every path returns — a fall-through body returns unit.

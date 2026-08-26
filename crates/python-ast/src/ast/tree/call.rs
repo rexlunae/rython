@@ -5463,6 +5463,56 @@ impl<'a> CodeGen for Call {
                             }
                         }
                     }
+                    // decode on a receiver WITHOUT a statically-known bytes
+                    // type — an unannotated parameter (`T: PyDecode`, the
+                    // isinstance-residual morphs of issue #161) or a boxed
+                    // PyValue — dispatches through the PyDecode trait at
+                    // runtime. Defaults are Python's (utf-8, strict).
+                    ("decode", args @ ([] | [_] | [_, _]))
+                        if crate::ast::tree::call::root_name(&attr.value)
+                            .is_some_and(|root| {
+                                options.param_method_params.contains(root)
+                                    || matches!(
+                                        options.name_types.get(root),
+                                        Some(crate::TypeInfo::PyValue)
+                                    )
+                            }) =>
+                    {
+                        let enc = args
+                            .first()
+                            .map(|e| quote!(#e))
+                            .unwrap_or_else(|| quote!("utf-8"));
+                        let errors = args
+                            .get(1)
+                            .map(|e| quote!(#e))
+                            .unwrap_or_else(|| quote!("strict"));
+                        return Ok(quote!(
+                            (#receiver).py_decode(#enc, #errors)?
+                        ));
+                    }
+                    // bytes.decode(enc, errors) with BOTH positional
+                    // arguments (`path.decode(filesystem_encoding,
+                    // 'replace')` — botocore configloader): the PyDecode
+                    // lowering ('replace' follows CPython for utf-8; other
+                    // non-strict errors values decode strictly — the
+                    // documented decode divergence). A bytes-typed
+                    // receiver qualifies alongside the str-like ones
+                    // (Vec<u8> implements the trait directly).
+                    ("decode", [enc, errors])
+                        if crate::ast::tree::call::receiver_is_str_like(
+                            &attr.value, &options, &symbols,
+                        ) || matches!(
+                            &*attr.value,
+                            ExprType::Name(n) if matches!(
+                                options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Bytes)
+                            )
+                        ) =>
+                    {
+                        return Ok(quote!(
+                            (#receiver).py_decode(#enc, #errors)?
+                        ));
+                    }
                     // bytes.decode("utf-8"|"ascii"|"punycode"): the codec
                     // layer in stdpython (Rust strings ARE utf-8, so the
                     // bytes→String conversion is the codec's job).
@@ -5856,13 +5906,20 @@ impl<'a> CodeGen for Call {
                     if boxed { (None, false) } else { classify(arg) };
                 sites.push(AxisSite { axis, boxed, py_ty, is_class });
             }
-            if sites.iter().any(|s| s.boxed) {
+            // An argument with NO statically-known type (a local reassigned
+            // through untyped calls — botocore configloader's
+            // `path = os.path.expandvars(path)` before `_unicode_path(path)`,
+            // issue #161) dispatches at runtime through the router exactly
+            // like a boxed one: `impl Into<Enum>` resolves From for the
+            // argument's actual concrete type (or fails loudly at build
+            // when that type is outside the tested set).
+            if sites.iter().any(|s| s.boxed || s.py_ty.is_none()) {
                 let Some(router) = &spec.router else {
                     return Err(format!(
-                        "cannot dispatch `{}` on a boxed value: its dynamic \
-                         router is unavailable (a parameter without a concrete \
-                         annotation, or an underivable morph return type); \
-                         annotate the value with a concrete type",
+                        "cannot dispatch `{}` on a boxed or statically-unknown \
+                         value: its dynamic router is unavailable (a parameter \
+                         without a concrete annotation, or an underivable morph \
+                         return type); annotate the value with a concrete type",
                         callee_name.id
                     )
                     .into());
@@ -5891,20 +5948,16 @@ impl<'a> CodeGen for Call {
                         rendered.push(a);
                         continue;
                     };
-                    if site.boxed {
+                    // Boxed and statically-unknown arguments both pass
+                    // unadorned: the router's `impl Into<Enum>` does the
+                    // routing (From<PyValue> tests variants in order;
+                    // From<T> lands a concrete value directly).
+                    if site.boxed || site.py_ty.is_none() {
                         rendered.push(a);
                         continue;
                     }
                     let Some(py_ty) = &site.py_ty else {
-                        return Err(format!(
-                            "cannot dispatch the call to `{}`: the type of an \
-                             isinstance-dispatched argument is not statically \
-                             known — annotate the value (or the enclosing \
-                             parameter) so the converter can pick the right \
-                             specialization",
-                            callee_name.id
-                        )
-                        .into());
+                        unreachable!("unknown-typed sites take the unadorned path above")
                     };
                     if axis_dispatch_suffix(site.axis, py_ty, site.is_class)
                         .is_some()

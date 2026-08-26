@@ -895,6 +895,18 @@ fn variant_expr_type(
             return crate::TypeInfo::String;
         }
     }
+    // `x.decode(...)` is a str whatever the receiver's type: only bytes
+    // has decode in Python 3, and the PyDecode lowering returns String.
+    // This types the RESIDUAL morph of a str-tested dispatcher (`return
+    // path.decode(fs_enc, 'replace')` — botocore configloader's
+    // `_unicode_path`, issue #161), whose receiver has no static type,
+    // so the router's return derives and the boxed fallback can exist.
+    if let ExprType::Call(c) = e
+        && let ExprType::Attribute(a) = c.func.as_ref()
+        && a.attr == "decode"
+    {
+        return crate::TypeInfo::String;
+    }
     crate::infer_type(e, opts, symbols)
 }
 
