@@ -3207,8 +3207,26 @@ fn range_replace_mechanics_match_python() {
         .unwrap();
     assert_eq!(ys.len(), 3);
     assert!(matches!(ys[0], PyValue::Int(9)));
-    let err = ys
-        .py_slice_assign_step(None, None, 2, vec![PyValue::Int(1)])
-        .unwrap_err();
-    assert_eq!(err.exception_type, "ValueError");
+    // Negative-step DELETE: extended_slice_indices walks descending, so
+    // removing in emitted order is correct. Verified against python3:
+    //   [1,2,3,4]; del x[::-1] -> []
+    //   [0,1,2];   del x[::-2] -> [1]
+    let mut rev = vec![
+        PyValue::Int(1),
+        PyValue::Int(2),
+        PyValue::Int(3),
+        PyValue::Int(4),
+    ];
+    rev.py_slice_delete_step(None, None, -1).unwrap();
+    assert_eq!(rev.len(), 0);
+    let mut rev2 = vec![PyValue::Int(0), PyValue::Int(1), PyValue::Int(2)];
+    rev2.py_slice_delete_step(None, None, -2).unwrap();
+    let kept: Vec<i64> = rev2
+        .iter()
+        .map(|v| match v {
+            PyValue::Int(i) => *i,
+            other => unreachable!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kept, vec![1]);
 }
