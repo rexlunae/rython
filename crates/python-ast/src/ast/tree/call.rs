@@ -3472,6 +3472,26 @@ impl<'a> CodeGen for Call {
                         {
                             &mut _usedforsecurity_kw
                         }
+                        // deepcopy's `memo=` keyword (issue #154:
+                        // `copy.deepcopy(params, memo=_ForgetfulDict())` —
+                        // boto3's dynamodb transform) is dropped: rython's
+                        // value model has no shared references, so every
+                        // deepcopy already produces fresh objects — the
+                        // forgetful-memo behavior. A REAL memo's
+                        // dedup-within-one-call (shared refs inside `params`
+                        // mapping to ONE new object) is not reproduced;
+                        // that's the §12.3 aliasing divergence, surfaced
+                        // through -W.
+                        Some("memo") if fname == "deepcopy" => {
+                            options.definition_warnings.borrow_mut().push(
+                                "deepcopy(memo=...) is dropped: rython's value \
+                                 semantics copy everything fresh (the forgetful-memo \
+                                 behavior); a real memo's shared-reference dedup is \
+                                 not reproduced (issue #154, the aliasing divergence)"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         // csv reader/writer: a `**d` SPREAD of the class-level
                         // dialect defaults (`csv.reader(self.stream,
                         // **self.defaults)` — distlib's CSVReader, where

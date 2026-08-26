@@ -8626,3 +8626,25 @@ fn global_shadowed_by_a_plain_local_disqualifies_the_static() {
         warnings
     );
 }
+
+#[test]
+fn deepcopy_memo_kwarg_is_dropped_with_a_warning() {
+    // Issue #154: copy.deepcopy(x, memo=...) — boto3's dynamodb transform
+    // passes a forgetful memo dict. rython's value semantics already copy
+    // everything fresh, so the kwarg drops with a -W note instead of the
+    // unexpected-keyword error.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import copy\n",
+            "def f(params: dict[str, int]) -> dict[str, int]:\n",
+            "    return copy.deepcopy(params, memo={})\n",
+        ),
+        "dc_memo.py",
+    );
+    assert!(out.contains("copy :: deepcopy"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("deepcopy(memo=...)")),
+        "the dropped memo must be reported through -W: {:?}",
+        warnings
+    );
+}
