@@ -3174,6 +3174,48 @@ mod bytesio {
     }
 }
 
+// ---- Boxed-value arithmetic (issues #115/#120) ----
+
+#[test]
+fn pyvalue_add_dispatches_like_cpython() {
+    use stdpython::{PyAdd, PyValue};
+    let v = |a: PyValue, b: PyValue| a.py_add(&b);
+    // Verified against python3: 1 + 2 == 3; 1 + 2.5 == 3.5;
+    // True + True == 2 (bool ⊂ int); 'ab' + 'cd' == 'abcd';
+    // b'ab' + b'c' == b'abc'; (1, 'x') + (2,) == (1, 'x', 2).
+    assert_eq!(v(PyValue::Int(1), PyValue::Int(2)), PyValue::Int(3));
+    assert_eq!(v(PyValue::Int(1), PyValue::Float(2.5)), PyValue::Float(3.5));
+    assert_eq!(v(PyValue::Bool(true), PyValue::Bool(true)), PyValue::Int(2));
+    assert_eq!(
+        v(PyValue::from("ab"), PyValue::from("cd")),
+        PyValue::from("abcd")
+    );
+    assert_eq!(
+        v(PyValue::Bytes(b"ab".to_vec()), PyValue::Bytes(b"c".to_vec())),
+        PyValue::Bytes(b"abc".to_vec())
+    );
+    let t = |vals: Vec<PyValue>| PyValue::Tuple(std::sync::Arc::new(vals));
+    assert_eq!(
+        v(
+            t(vec![PyValue::Int(1), PyValue::from("x")]),
+            t(vec![PyValue::Int(2)])
+        ),
+        t(vec![PyValue::Int(1), PyValue::from("x"), PyValue::Int(2)])
+    );
+    // Concrete right operands box and delegate.
+    assert_eq!(PyValue::from("v").py_add(&"-x"), PyValue::from("v-x"));
+    assert_eq!(PyValue::Int(1).py_add(&2i64), PyValue::Int(3));
+}
+
+#[test]
+#[should_panic(expected = "unsupported operand type(s) for +: 'int' and 'str'")]
+fn pyvalue_add_mismatch_panics_cpythons_type_error() {
+    use stdpython::{PyAdd, PyValue};
+    // Verified against python3: 1 + 'x' raises
+    // TypeError: unsupported operand type(s) for +: 'int' and 'str'.
+    let _ = PyValue::Int(1).py_add(&PyValue::from("x"));
+}
+
 #[test]
 fn range_replace_mechanics_match_python() {
     // Issue #153: Python semantics verified against python3 3.14 -

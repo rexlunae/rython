@@ -6323,3 +6323,79 @@ fn varargs_pack_forward_and_index_match_python_at_runtime() {
         "*args semantics diverged from CPython"
     );
 }
+
+#[test]
+fn string_and_computed_globals_mutate_at_runtime() {
+    // Issue #115 completion: string-literal and COMPUTED module
+    // initializers written through `global` are mutable statics too —
+    // `LazyLock<Mutex<String>>` / `LazyLock<Mutex<T>>` (typed when the
+    // initializer's type infers, boxed PyValue otherwise, exercised here
+    // by the environ-get fallback). Writes are visible module-wide;
+    // `label += "!"` is the compound form; boxed `+` dispatches at
+    // runtime (PyValue arithmetic).
+    let scratch = Scratch::new("globstr");
+    let file = scratch.path().join("globstr.py");
+    fs::write(
+        &file,
+        concat!(
+            "import os\n",
+            "\n",
+            "label = \"start\"\n",
+            "tag = os.environ.get(\"RYTHON_NO_SUCH_VAR\", \"fallback\")\n",
+            "\n",
+            "def compute() -> int:\n",
+            "    return 2\n",
+            "\n",
+            "limit = compute()\n",
+            "\n",
+            "def bump_label(suffix: str) -> None:\n",
+            "    global label\n",
+            "    label = label + suffix\n",
+            "\n",
+            "def extend_label() -> None:\n",
+            "    global label\n",
+            "    label += \"!\"\n",
+            "\n",
+            "def raise_limit() -> None:\n",
+            "    global limit\n",
+            "    limit = limit + 10\n",
+            "\n",
+            "def retag() -> None:\n",
+            "    global tag\n",
+            "    tag = tag + \"-x\"\n",
+            "\n",
+            "def main() -> None:\n",
+            "    bump_label(\"-a\")\n",
+            "    bump_label(\"-b\")\n",
+            "    extend_label()\n",
+            "    raise_limit()\n",
+            "    retag()\n",
+            "    print(label)\n",
+            "    print(limit)\n",
+            "    print(tag)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/globstr"))
+        .env_remove("RYTHON_NO_SUCH_VAR")
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["start-a-b!", "12", "fallback-x"],
+        "string/computed global semantics diverged from CPython"
+    );
+}

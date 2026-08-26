@@ -424,6 +424,61 @@ impl<'a> CodeGen for Assign {
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // Issue #115: a store to a `global`-declared name whose module
+            // binding is a MUTABLE static writes THROUGH the static —
+            // py_global_write(&name, v) — instead of binding a local. Only
+            // scopes that own the binding take this path: module scope, or
+            // a function declaring the name `global` (scope_global_writables);
+            // a plain assignment elsewhere stays a local, as in Python.
+            if let ExprType::Name(name) = target
+                && options.scope_global_writables.contains(&name.id)
+                && let Some(kind) = options.mutable_statics.get(&name.id)
+            {
+                let ident = crate::safe_ident(&name.id);
+                let stored = if kind.boxed() {
+                    if value_is_none_early {
+                        quote!(stdpython::PyValue::None_)
+                    } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {
+                        quote!(#value)
+                    } else if matches!(
+                        &value_expr,
+                        ExprType::List(_) | ExprType::Dict(_) | ExprType::Set(_)
+                            | ExprType::ListComp(_) | ExprType::DictComp(_) | ExprType::SetComp(_)
+                    ) || matches!(
+                        &value_expr,
+                        ExprType::Call(c)
+                            if matches!(
+                                c.func.as_ref(),
+                                ExprType::Name(f) if matches!(
+                                    symbols.get(&f.id),
+                                    Some(crate::SymbolTableNode::ClassDef(_))
+                                )
+                            )
+                    ) {
+                        // A container or class instance has no PyValue
+                        // representation — the store cannot round-trip
+                        // through the boxed global (issue #115 scope).
+                        return Err(format!(
+                            "`global {}` stores a value with no boxed \
+                             representation (a container or class instance); \
+                             a BOXED mutable module global holds scalars, \
+                             strings, and None — rython refuses to silently \
+                             ignore the write (issue #115)",
+                            name.id
+                        )
+                        .into());
+                    } else {
+                        quote!(stdpython::PyValue::from(#value))
+                    }
+                } else if matches!(kind, crate::MutableGlobalKind::Str) && value_is_str_literal {
+                    // A String static stores literals owned.
+                    quote!((#value).to_string())
+                } else {
+                    quote!(#value)
+                };
+                let global_ref = kind.static_ref(&ident);
+                return Ok(quote!(stdpython::py_global_write(#global_ref, #stored);));
+            }
             // An attribute store target renders in place flavor: in a
             // generic trait default, `self.f = v` must store through the
             // mutable accessor (`*self.f_mut() = v`) rather than the load
@@ -497,6 +552,19 @@ impl<'a> CodeGen for Assign {
                     }
                 }
             };
+            // Issue #123 family: `self.path = path` followed by a later
+            // read of `path` (pip's Prefix stores the parameter, then
+            // passes it to get_scheme). Python shares by reference; the
+            // Rust move would poison the later use (E0382). Cloning the
+            // store is faithful ONLY for values Python cannot mutate
+            // (str/bytes) — mutable containers keep the move, so aliasing
+            // stays loud (issue #79).
+            let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
+                if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
+                    && matches!(
+                        crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
+                        crate::TypeInfo::String | crate::TypeInfo::Bytes
+                    ));
             Ok(match target {
                 ExprType::Name(name) => {
                     // Issue #121: a name holding a boxed PyValue (wider
@@ -542,6 +610,9 @@ impl<'a> CodeGen for Assign {
                 }
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
+                }
+                ExprType::Attribute(_) if stored_name_needs_clone => {
+                    quote!(#target_code = (#value).clone();)
                 }
                 _ => quote!(#target_code = #value;),
             })
