@@ -552,19 +552,6 @@ impl<'a> CodeGen for Assign {
                     }
                 }
             };
-            // Issue #123 family: `self.path = path` followed by a later
-            // read of `path` (pip's Prefix stores the parameter, then
-            // passes it to get_scheme). Python shares by reference; the
-            // Rust move would poison the later use (E0382). Cloning the
-            // store is faithful ONLY for values Python cannot mutate
-            // (str/bytes) — mutable containers keep the move, so aliasing
-            // stays loud (issue #79).
-            let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
-                if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
-                    && matches!(
-                        crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
-                        crate::TypeInfo::String | crate::TypeInfo::Bytes
-                    ));
             Ok(match target {
                 ExprType::Name(name) => {
                     // Issue #121: a name holding a boxed PyValue (wider
@@ -610,9 +597,6 @@ impl<'a> CodeGen for Assign {
                 }
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
-                }
-                ExprType::Attribute(_) if stored_name_needs_clone => {
-                    quote!(#target_code = (#value).clone();)
                 }
                 _ => quote!(#target_code = #value;),
             })
@@ -713,46 +697,48 @@ impl<'a> CodeGen for Assign {
                         (#receiver).py_set_index(#index, __rython_val)?;
                     }))
                 }
-                crate::SubscriptKind::Slice { lower, upper, step } => {
-                    // Slice assignment `xs[a:b] = R` (issue #153: pip's
-                    // cmdoptions, urllib3's fetch loop) replaces the range
-                    // IN PLACE — a different-length RHS inserts or removes
-                    // elements, bounds clamp, negatives count from the end.
-                    // The runtime's py_splice is CPython-exact for step-1
-                    // slices; an EXTENDED slice (`xs[a:b:2] = R`, which
-                    // Python only accepts for equal lengths) stays a loud
-                    // error.
-                    if step.is_some() {
-                        return Err(
-                            "slice assignment with a step (`xs[a:b:s] = ...`) is not \
-                             supported; assign to the step-1 slice or rebuild the \
-                             container"
-                                .to_string()
-                                .into(),
-                        );
-                    }
-                    let bound = |b: &Option<Box<ExprType>>| -> Result<
-                        TokenStream,
-                        Box<dyn std::error::Error>,
-                    > {
-                        Ok(match b {
-                            None => quote!(None),
+                crate::SubscriptKind::Slice { lower, upper, step, .. } => {
+                    // Slice assignment (`xs[a:b] = [...]`,
+                    // `memoryview(byte_obj)[0:n] = sub` — urllib3's
+                    // emscripten fetch loop) replaces a range in place: a
+                    // different-length RHS inserts or removes elements. The
+                    // runtime's py_slice_assign clamps/negativizes bounds
+                    // exactly like reads (issue #153).
+                    let step_is_one = crate::ast::tree::subscript::is_step_one(
+                        step.as_deref(),
+                    );
+                    let receiver = crate::subscript_receiver_place(
+                        sub.value.as_ref(),
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let bound_tok = |b: &Option<Box<ExprType>>| -> Result<TokenStream, Box<dyn std::error::Error>> {
+                        match b {
                             Some(e) => {
-                                let t = e.clone().to_rust(
-                                    ctx.clone(),
-                                    options.clone(),
-                                    symbols.clone(),
-                                )?;
-                                quote!(Some((#t) as i64))
+                                let t = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                Ok(quote!(Some(#t)))
                             }
-                        })
+                            None => Ok(quote!(None)),
+                        }
                     };
-                    let lo = bound(lower)?;
-                    let hi = bound(upper)?;
-                    Ok(quote!({
-                        let __rython_val = #value;
-                        py_splice(&mut (#receiver), #lo, #hi, __rython_val);
-                    }))
+                    let lo_tok = bound_tok(lower)?;
+                    let up_tok = bound_tok(upper)?;
+                    // step == 1 (explicit or omitted): contiguous splice.
+                    // Any other nonzero step: extended replacement - the
+                    // runtime checks that the replacement matches the
+                    // selected slot count and raises ValueError otherwise
+                    // (exactly like CPython's list_ass_subscript).
+                    if step_is_one {
+                        Ok(quote!({
+                            (#receiver).py_slice_assign(#lo_tok, #up_tok, #value);
+                        }))
+                    } else {
+                        let st_tok = step.clone().unwrap().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        Ok(quote!({
+                            (#receiver).py_slice_assign_step(#lo_tok, #up_tok, #st_tok, #value)?;
+                        }))
+                    }
                 }
             }
         };

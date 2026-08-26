@@ -3215,3 +3215,60 @@ fn pyvalue_add_mismatch_panics_cpythons_type_error() {
     // TypeError: unsupported operand type(s) for +: 'int' and 'str'.
     let _ = PyValue::Int(1).py_add(&PyValue::from("x"));
 }
+
+#[test]
+fn range_replace_mechanics_match_python() {
+    // Issue #153: Python semantics verified against python3 3.14 -
+    //   xs=[0,1,2,3]; xs[1:3]=["a","b"] -> [0,"a","b",3]   (replace)
+    //   xs[1:1]=["q"]                   -> insert          (zero-width)
+    //   del xs[1:3]                     -> removes range
+    //   strided: ys[::2]=[9,9] on [0,1,2] -> [9,1,9]
+    //   mismatched stride length raises ValueError
+    use stdpython::{py_value_str, PySliceReplace, PyValue};
+    let mut v = vec![
+        PyValue::Int(0),
+        PyValue::Int(1),
+        PyValue::Int(2),
+        PyValue::Int(3),
+    ];
+    v.py_slice_assign(
+        Some(1),
+        Some(3),
+        vec![PyValue::Str("a".into()), PyValue::Str("b".into())],
+    );
+    assert_eq!(
+        py_value_str(&PyValue::Tuple(std::sync::Arc::new(v.clone()))),
+        "(0, 'a', 'b', 3)"
+    );
+    v.py_slice_assign(Some(1), Some(1), vec![PyValue::Int(9)]);
+    assert_eq!(v.len(), 5);
+    v.py_slice_delete(Some(1), Some(3));
+    assert_eq!(v.len(), 3);
+    let mut ys = vec![PyValue::Int(0), PyValue::Int(1), PyValue::Int(2)];
+    ys.py_slice_assign_step(None, None, 2, vec![PyValue::Int(9), PyValue::Int(9)])
+        .unwrap();
+    assert_eq!(ys.len(), 3);
+    assert!(matches!(ys[0], PyValue::Int(9)));
+    // Negative-step DELETE: extended_slice_indices walks descending, so
+    // removing in emitted order is correct. Verified against python3:
+    //   [1,2,3,4]; del x[::-1] -> []
+    //   [0,1,2];   del x[::-2] -> [1]
+    let mut rev = vec![
+        PyValue::Int(1),
+        PyValue::Int(2),
+        PyValue::Int(3),
+        PyValue::Int(4),
+    ];
+    rev.py_slice_delete_step(None, None, -1).unwrap();
+    assert_eq!(rev.len(), 0);
+    let mut rev2 = vec![PyValue::Int(0), PyValue::Int(1), PyValue::Int(2)];
+    rev2.py_slice_delete_step(None, None, -2).unwrap();
+    let kept: Vec<i64> = rev2
+        .iter()
+        .map(|v| match v {
+            PyValue::Int(i) => *i,
+            other => unreachable!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kept, vec![1]);
+}

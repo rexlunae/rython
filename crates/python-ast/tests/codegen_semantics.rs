@@ -2669,32 +2669,81 @@ fn del_full_slice_clears_in_place() {
 }
 
 #[test]
-fn bounded_slice_delete_lowers_to_py_del_range() {
-    // Issue #153: `del xs[1:3]` on [1,2,3,4] leaves [1,4] — the runtime's
-    // py_del_range removes the range in place (bounds clamp, negatives
-    // count from the end). A STEPPED slice delete stays loud.
+fn bounded_slice_delete_lowers_to_py_slice_delete() {
+    // Python: `del xs[1:3]` on [1,2,3,4] leaves [1,4] - range removal
+    // with clamped/negative-normalized bounds (issue #153).
     let out = compile("xs = [1, 2, 3, 4]\ndel xs[1:3]\n", "bounedel.py");
-    assert!(out.contains("py_del_range"), "generated: {}", out);
-    let err = compile_err("xs = [1, 2, 3, 4]\ndel xs[0:4:2]\n", "stepdel.py");
-    assert!(err.contains("stepped slice"), "err: {err}");
-}
-
-#[test]
-fn slice_assignment_lowers_to_py_splice() {
-    // Issue #153: `xs[1:3] = R` replaces the range in place — a
-    // different-length RHS inserts or removes elements (pip's
-    // cmdoptions). Open bounds pass None; a STEPPED slice assignment
-    // stays loud.
-    let out = compile("xs = [1, 2, 3, 4]\nxs[1:3] = [9]\n", "sliceassign.py");
-    assert!(out.contains("py_splice"), "generated: {}", out);
-    let out = compile("xs = [1, 2, 3, 4]\nxs[2:] = [7, 8]\n", "sliceopen.py");
     assert!(
-        out.contains("py_splice") && out.contains("None"),
+        out.contains("py_slice_delete (Some (1) , Some (3))"),
         "generated: {}",
         out
     );
-    let err = compile_err("xs = [1, 2, 3, 4]\nxs[0:4:2] = [7, 8]\n", "stepassign.py");
-    assert!(err.contains("slice assignment with a step"), "err: {err}");
+}
+
+#[test]
+fn extended_step_slice_delete_lowers_to_the_step_variant() {
+    // `del xs[a:b:c]` removes the strided selection via the runtime's
+    // index-computing delete.
+    let out = compile(
+        "xs = [1, 2, 3, 4]\ndel xs[::2]\n",
+        "stepdel.py",
+    );
+    assert!(
+        out.contains("py_slice_delete_step"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn negative_step_slice_delete_removes_the_selection() {
+    // Python: `del xs[::-1]` on [1,2,3,4] leaves []; `del xs[::-2]` on
+    // [0,1,2] leaves [1]. Verified against python3 3.14 - the runtime's
+    // extended index walk removes highest-slot-first.
+    let out = compile("xs = [1, 2, 3, 4]\ndel xs[::-1]\n", "negdel.py");
+    assert!(
+        out.contains("py_slice_delete_step"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn slice_assignment_lowers_to_py_slice_assign() {
+    // Issue #153: `xs[a:b] = R` replaces the clamped range in place -
+    // a different-length RHS inserts or removes elements, exactly like
+    // CPython's list_ass_subscript.
+    let out = compile("xs = [1, 2, 3, 4]\nxs[1:3] = [9]\n", "sliceassign.py");
+    assert!(
+        out.contains("py_slice_assign (Some (1) , Some (3) , vec ! [9])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn strided_slice_assignment_lowers_to_the_step_variant() {
+    // `ys[::2] = [9, 9]` on [0,1,2] -> [9,1,9]: slots computed by the
+    // runtime, replacement length-checked (ValueError on mismatch).
+    let out = compile("ys = [0, 1, 2]\nys[::2] = [9, 9]\n", "strideassign.py");
+    assert!(
+        out.contains("py_slice_assign_step"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn negative_strided_slice_assignment_assigns_in_slot_order() {
+    // Python: `ys[::-2] = [7, 8]` on [0,1,2] -> [8, 1, 7]: selection is
+    // indices [2, 0]; values assign left-to-right onto those slots.
+    // Verified against python3 3.14.
+    let out = compile("ys = [0, 1, 2]\nys[::-2] = [7, 8]\n", "negassign.py");
+    assert!(
+        out.contains("py_slice_assign_step"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
