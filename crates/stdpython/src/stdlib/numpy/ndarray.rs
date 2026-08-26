@@ -236,31 +236,25 @@ impl NdArray {
             };
             return NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(bools));
         }
-        let n = a.size;
         match (a.dtype, b.dtype) {
             (Dtype::Float64, Dtype::Float64) => {
-                let mut out = vec![0.0; n];
-                engine::binary_f64(op, a.f64(), b.f64(), &mut out);
+                let out = engine::binary_f64(op, a.f64(), b.f64());
                 NdArray::new(a.shape.clone(), out_dtype, Data::F64(out))
             }
             (Dtype::Float32, Dtype::Float32) => {
-                let mut out = vec![0.0f32; n];
-                engine::binary_f32(op, a.f32(), b.f32(), &mut out);
+                let out = engine::binary_f32(op, a.f32(), b.f32());
                 NdArray::new(a.shape.clone(), out_dtype, Data::F32(out))
             }
             (Dtype::Int64, Dtype::Int64) => {
-                let mut out = vec![0i64; n];
-                engine::binary_i64(op, a.i64(), b.i64(), &mut out);
+                let out = engine::binary_i64(op, a.i64(), b.i64());
                 NdArray::new(a.shape.clone(), out_dtype, Data::I64(out))
             }
             (Dtype::Int32, Dtype::Int32) => {
-                let mut out = vec![0i32; n];
-                engine::binary_i32(op, a.i32(), b.i32(), &mut out);
+                let out = engine::binary_i32(op, a.i32(), b.i32());
                 NdArray::new(a.shape.clone(), out_dtype, Data::I32(out))
             }
             (Dtype::Bool, Dtype::Bool) => {
-                let mut out = vec![false; n];
-                engine::binary_bool(op, a.bool(), b.bool(), &mut out);
+                let out = engine::binary_bool(op, a.bool(), b.bool());
                 NdArray::new(a.shape.clone(), out_dtype, Data::Bool(out))
             }
             // Mixed-dtype: promote to the common dtype, then recurse.
@@ -279,31 +273,25 @@ impl NdArray {
             UnOp::IsFinite | UnOp::IsInf | UnOp::IsNan | UnOp::LogicalNot => Dtype::Bool,
             _ => a.dtype,
         };
-        let n = a.size;
         match a.dtype {
             Dtype::Float64 => {
-                let mut out = vec![0.0; n];
-                engine::unary_f64(op, a.f64(), &mut out);
+                let out = engine::unary_f64(op, a.f64());
                 NdArray::new(a.shape.clone(), out_dtype, Data::F64(out))
             }
             Dtype::Float32 => {
-                let mut out = vec![0.0f32; n];
-                engine::unary_f32(op, a.f32(), &mut out);
+                let out = engine::unary_f32(op, a.f32());
                 NdArray::new(a.shape.clone(), out_dtype, Data::F32(out))
             }
             Dtype::Int64 => {
-                let mut out = vec![0i64; n];
-                engine::unary_i64(op, a.i64(), &mut out);
+                let out = engine::unary_i64(op, a.i64());
                 NdArray::new(a.shape.clone(), out_dtype, Data::I64(out))
             }
             Dtype::Int32 => {
-                let mut out = vec![0i32; n];
-                engine::unary_i32(op, a.i32(), &mut out);
+                let out = engine::unary_i32(op, a.i32());
                 NdArray::new(a.shape.clone(), out_dtype, Data::I32(out))
             }
             Dtype::Bool => {
-                let mut out = vec![false; n];
-                engine::unary_bool(op, a.bool(), &mut out);
+                let out = engine::unary_bool(op, a.bool());
                 NdArray::new(a.shape.clone(), out_dtype, Data::Bool(out))
             }
         }

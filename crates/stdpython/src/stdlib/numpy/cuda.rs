@@ -13,13 +13,13 @@ pub(crate) fn available() -> bool {
 
 macro_rules! not_impl_bin {
     ($name:ident, $t:ty) => {
-        pub(crate) fn $name(op: BinOp, a: &[$t], b: &[$t], out: &mut [$t]) {
-            let _ = (op, a, b, out);
+        pub(crate) fn $name(op: BinOp, a: &[$t], b: &[$t]) -> Vec<$t> {
+            let _ = (op, a, b);
             panic!(
                 "{}",
                 crate::PyException::new(
                     "RuntimeError",
-                    "numpy backend `cuda` is not implemented in this build (the                      feature compiles, but no cuda kernels ship yet); select                      scalar/rayon/simd or rebuild with a different backend"
+                    "numpy backend `cuda` is not implemented in this build (the cuda feature compiles, but no cuda kernels ship yet); select scalar/rayon/simd or rebuild with a different backend"
                 )
             )
         }
@@ -33,13 +33,13 @@ not_impl_bin!(binary_bool, bool);
 
 macro_rules! not_impl_un {
     ($name:ident, $t:ty) => {
-        pub(crate) fn $name(op: UnOp, a: &[$t], out: &mut [$t]) {
-            let _ = (op, a, out);
+        pub(crate) fn $name(op: UnOp, a: &[$t]) -> Vec<$t> {
+            let _ = (op, a);
             panic!(
                 "{}",
                 crate::PyException::new(
                     "RuntimeError",
-                    "numpy backend `cuda` is not implemented in this build (the                      feature compiles, but no cuda kernels ship yet); select                      scalar/rayon/simd or rebuild with a different backend"
+                    "numpy backend `cuda` is not implemented in this build (the cuda feature compiles, but no cuda kernels ship yet); select scalar/rayon/simd or rebuild with a different backend"
                 )
             )
         }
