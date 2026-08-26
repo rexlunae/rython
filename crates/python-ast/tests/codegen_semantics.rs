@@ -8647,3 +8647,19 @@ fn deepcopy_memo_kwarg_is_dropped_with_a_warning() {
         warnings
     );
 }
+
+#[test]
+fn iter_sentinel_outside_a_for_loop_is_loud() {
+    // Issue #155: the two-argument iter() lowers only in for-loop
+    // iterable position; a bare value would need an iterator object.
+    let err = compile_err(
+        concat!(
+            "def f() -> str:\n",
+            "    return \"\"\n",
+            "it = iter(f, \"\")\n",
+        ),
+        "itersent_bare.py",
+    );
+    assert!(err.contains("for-loop iterable"), "err: {err}");
+    assert!(err.contains("issue #155"), "err: {err}");
+}

@@ -2540,6 +2540,22 @@ impl<'a> CodeGen for Call {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
+                        if rendered.len() == 2 {
+                            // Issue #155: iter(callable, sentinel) is
+                            // supported only as a for-loop iterable, where
+                            // it desugars to a call-until-sentinel loop
+                            // (for_stmt.rs). As a bare value it would need
+                            // an iterator object, which the value model
+                            // does not have.
+                            return Err(
+                                "iter(callable, sentinel) is only supported as a \
+                                 for-loop iterable (`for x in iter(f, sentinel):`), \
+                                 where it lowers to a call-until-sentinel loop \
+                                 (issue #155)"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
                         if rendered.len() != 1 {
                             return Err("iter() takes exactly one argument".to_string().into());
                         }

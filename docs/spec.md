@@ -629,7 +629,10 @@ divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
 (`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
 they lower unresolved and fail in rustc, §12.1; set and tuple
-*literals* work.)
+*literals* work.) `iter(callable, sentinel)` (issue #155) is supported
+as a for-loop iterable — `for x in iter(f, sentinel):` desugars to a
+loop calling `f()` until the result equals the sentinel (bound once,
+before the loop); anywhere else the two-argument form is a loud error.
 
 String, list, dict, and set methods cover the CPython surface for the
 supported types, pinned to CPython edge cases (code-point `len`,

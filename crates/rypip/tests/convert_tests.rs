@@ -6139,3 +6139,55 @@ fn range_replace_and_range_delete_match_python_at_runtime() {
         "range-replace semantics diverged from CPython"
     );
 }
+
+#[test]
+fn iter_sentinel_form_matches_python_at_runtime() {
+    // Issue #155: `for chunk in iter(callable, sentinel):` — the
+    // two-argument iter() calls the callable until it returns the
+    // sentinel (botocore's chunked payload reads). The producer advances
+    // through a `global` counter, so this also exercises the mutable
+    // module statics end to end.
+    let scratch = Scratch::new("itersent");
+    let file = scratch.path().join("itersent.py");
+    fs::write(
+        &file,
+        concat!(
+            "pos = 0\n",
+            "\n",
+            "def read_chunk() -> str:\n",
+            "    global pos\n",
+            "    if pos >= 4:\n",
+            "        return \"\"\n",
+            "    pos = pos + 1\n",
+            "    return str(pos)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    total = \"\"\n",
+            "    for chunk in iter(read_chunk, \"\"):\n",
+            "        total = total + chunk\n",
+            "    print(total)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/itersent"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["1234"],
+        "iter(callable, sentinel) semantics diverged from CPython"
+    );
+}
