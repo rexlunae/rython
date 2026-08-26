@@ -5717,60 +5717,6 @@ impl<'a> CodeGen for Call {
                 )
                 .into());
             }
-            let Some(axis_arg) = self.args.get(spec.axis) else {
-                return Err(format!(
-                    "`{}` needs at least {} positional argument(s)",
-                    callee_name.id,
-                    spec.axis + 1
-                )
-                .into());
-            };
-            // A BOXED argument (PyValue — a heterogeneous-union value, a
-            // call whose mixed returns unified to the box) has no static
-            // type to dispatch on; when the dynamic router exists, the
-            // dispatch happens at RUNTIME through it instead.
-            let is_boxed = match axis_arg {
-                ExprType::Name(n) => matches!(
-                    options.name_types.get(&n.id),
-                    Some(crate::TypeInfo::PyValue)
-                ),
-                ExprType::Call(c) => matches!(
-                    crate::ast::tree::type_ctx::call_return_typeinfo(
-                        c,
-                        Some(&symbols),
-                        Some(&options),
-                    ),
-                    Some(crate::TypeInfo::PyValue)
-                ),
-                _ => false,
-            };
-            if is_boxed {
-                if spec.router.is_some() {
-                    // The router takes `impl Into<Enum>`, and the enum
-                    // implements From<PyValue> (first-true-test routing),
-                    // so the boxed value passes through unadorned.
-                    let orig = crate::safe_ident(&callee_name.id);
-                    let a = axis_arg.clone().to_rust(
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?;
-                    let call = quote!(#orig(#a));
-                    return Ok(if propagates_exceptions {
-                        quote!((#call)?)
-                    } else {
-                        call
-                    });
-                }
-                return Err(format!(
-                    "cannot dispatch `{}` on a boxed value: its dynamic \
-                     router is unavailable (the morphs' return types \
-                     differ, or the function takes more than one \
-                     parameter); annotate the value with a concrete type",
-                    callee_name.id
-                )
-                .into());
-            }
             let type_info_py_name = |t: &crate::TypeInfo| -> Option<String> {
                 match t {
                     crate::TypeInfo::Int => Some("int".into()),
@@ -5783,65 +5729,245 @@ impl<'a> CodeGen for Call {
                     _ => None,
                 }
             };
-            let (py_ty, is_class): (Option<String>, bool) = match axis_arg {
-                ExprType::Name(n) => match options.name_types.get(&n.id) {
-                    Some(crate::TypeInfo::Class(c)) => (Some(c.clone()), true),
-                    Some(t) => (type_info_py_name(t), false),
-                    None => (options.local_types.get(&n.id).cloned(), false),
-                },
-                // A call argument: a constructor (`describe(Dog("rex"))`)
-                // is an instance of its class; a known function resolves
-                // through its return type.
-                ExprType::Call(c) => {
-                    let ctor = matches!(
-                        c.func.as_ref(),
-                        ExprType::Name(f)
-                            if matches!(
-                                symbols.get(&f.id),
-                                Some(SymbolTableNode::ClassDef(_))
-                            )
-                    );
-                    if ctor {
-                        let ExprType::Name(f) = c.func.as_ref() else {
-                            unreachable!()
-                        };
-                        (Some(f.id.clone()), true)
-                    } else {
-                        match crate::ast::tree::type_ctx::call_return_typeinfo(
+            // A BOXED argument (PyValue — a heterogeneous-union value, a
+            // call whose mixed returns unified to the box) has no static
+            // type to dispatch on; when the dynamic router exists, the
+            // dispatch happens at RUNTIME through it instead.
+            let arg_is_boxed = |arg: &ExprType| -> bool {
+                match arg {
+                    ExprType::Name(n) => matches!(
+                        options.name_types.get(&n.id),
+                        Some(crate::TypeInfo::PyValue)
+                    ),
+                    ExprType::Call(c) => matches!(
+                        crate::ast::tree::type_ctx::call_return_typeinfo(
                             c,
                             Some(&symbols),
                             Some(&options),
-                        ) {
-                            Some(crate::TypeInfo::Class(cn)) => (Some(cn), true),
-                            Some(t) => (type_info_py_name(&t), false),
-                            None => (None, false),
+                        ),
+                        Some(crate::TypeInfo::PyValue)
+                    ),
+                    _ => false,
+                }
+            };
+            // The static (py type name, is_class) of an axis argument.
+            let classify = |arg: &ExprType| -> (Option<String>, bool) {
+                match arg {
+                    ExprType::Name(n) => match options.name_types.get(&n.id) {
+                        Some(crate::TypeInfo::Class(c)) => (Some(c.clone()), true),
+                        Some(t) => (type_info_py_name(t), false),
+                        None => (options.local_types.get(&n.id).cloned(), false),
+                    },
+                    // A call argument: a constructor
+                    // (`describe(Dog("rex"))`) is an instance of its
+                    // class; a known function resolves through its
+                    // return type.
+                    ExprType::Call(c) => {
+                        let ctor = matches!(
+                            c.func.as_ref(),
+                            ExprType::Name(f)
+                                if matches!(
+                                    symbols.get(&f.id),
+                                    Some(SymbolTableNode::ClassDef(_))
+                                )
+                        );
+                        if ctor {
+                            let ExprType::Name(f) = c.func.as_ref() else {
+                                unreachable!()
+                            };
+                            (Some(f.id.clone()), true)
+                        } else {
+                            match crate::ast::tree::type_ctx::call_return_typeinfo(
+                                c,
+                                Some(&symbols),
+                                Some(&options),
+                            ) {
+                                Some(crate::TypeInfo::Class(cn)) => (Some(cn), true),
+                                Some(t) => (type_info_py_name(&t), false),
+                                None => (None, false),
+                            }
                         }
                     }
+                    lit => (
+                        crate::ast::tree::function_def::simple_expr_type(lit)
+                            .and_then(|ty| {
+                                crate::ast::tree::function_def::rust_type_to_py_name(&ty)
+                                    .map(str::to_string)
+                            }),
+                        false,
+                    ),
                 }
-                lit => (
-                    crate::ast::tree::function_def::simple_expr_type(lit)
-                        .and_then(|ty| {
-                            crate::ast::tree::function_def::rust_type_to_py_name(&ty)
-                                .map(str::to_string)
-                        }),
-                    false,
-                ),
             };
-            let Some(py_ty) = py_ty else {
-                return Err(format!(
-                    "cannot dispatch the call to `{}`: the type of its \
-                     isinstance-dispatched argument is not statically known — \
-                     annotate the value (or the enclosing parameter) so the \
-                     converter can pick the right specialization",
-                    callee_name.id
-                )
-                .into());
-            };
-            let suffix = crate::ast::tree::specialize::dispatch_suffix(
-                &spec, &py_ty, is_class,
-            )
-            .unwrap_or("any")
-            .to_string();
+            // Type every axis argument.
+            struct AxisSite<'a> {
+                axis: &'a crate::ast::tree::specialize::SpecAxis,
+                boxed: bool,
+                py_ty: Option<String>,
+                is_class: bool,
+            }
+            let mut sites: Vec<AxisSite> = Vec::new();
+            for axis in &spec.axes {
+                let Some(arg) = self.args.get(axis.index) else {
+                    return Err(format!(
+                        "`{}` needs at least {} positional argument(s)",
+                        callee_name.id,
+                        axis.index + 1
+                    )
+                    .into());
+                };
+                let boxed = arg_is_boxed(arg);
+                let (py_ty, is_class) =
+                    if boxed { (None, false) } else { classify(arg) };
+                sites.push(AxisSite { axis, boxed, py_ty, is_class });
+            }
+            if sites.iter().any(|s| s.boxed) {
+                let Some(router) = &spec.router else {
+                    return Err(format!(
+                        "cannot dispatch `{}` on a boxed value: its dynamic \
+                         router is unavailable (a parameter without a concrete \
+                         annotation, or an underivable morph return type); \
+                         annotate the value with a concrete type",
+                        callee_name.id
+                    )
+                    .into());
+                };
+                // Route the whole call through the router: each axis
+                // parameter is `impl Into<Enum>`, so a boxed argument
+                // passes unadorned (From<PyValue>, first-true-test
+                // routing), a static argument matching a variant passes
+                // as a plain value (From<T>), and a static argument
+                // OUTSIDE the tested set boxes so it lands in `Other` —
+                // the residual arm for that axis, exactly Python.
+                use crate::ast::tree::specialize::{
+                    axis_dispatch_suffix, py_id_boxable, RouterReturn,
+                };
+                let orig = crate::safe_ident(&callee_name.id);
+                let mut rendered = Vec::new();
+                for (i, arg) in self.args.iter().enumerate() {
+                    let a = arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let Some(site) =
+                        sites.iter().find(|s| s.axis.index == i)
+                    else {
+                        rendered.push(a);
+                        continue;
+                    };
+                    if site.boxed {
+                        rendered.push(a);
+                        continue;
+                    }
+                    let Some(py_ty) = &site.py_ty else {
+                        return Err(format!(
+                            "cannot dispatch the call to `{}`: the type of an \
+                             isinstance-dispatched argument is not statically \
+                             known — annotate the value (or the enclosing \
+                             parameter) so the converter can pick the right \
+                             specialization",
+                            callee_name.id
+                        )
+                        .into());
+                    };
+                    if axis_dispatch_suffix(site.axis, py_ty, site.is_class)
+                        .is_some()
+                        || site.is_class
+                    {
+                        // A class inside the tested subtree has its own
+                        // From impl; one outside it cannot box — loud
+                        // below via the From-less build if ever reached,
+                        // so keep classes on the plain path only when a
+                        // variant exists.
+                        if site.is_class
+                            && axis_dispatch_suffix(site.axis, py_ty, true)
+                                .is_none()
+                        {
+                            return Err(format!(
+                                "cannot dispatch `{}`: argument {} is a class \
+                                 outside the isinstance-tested set, which has \
+                                 no boxed representation for runtime routing",
+                                callee_name.id,
+                                i + 1
+                            )
+                            .into());
+                        }
+                        rendered.push(a);
+                    } else if py_id_boxable(py_ty) {
+                        rendered.push(quote!(stdpython::PyValue::from(#a)));
+                    } else {
+                        return Err(format!(
+                            "cannot dispatch `{}`: argument {} has type `{}`, \
+                             outside the isinstance-tested set, with no boxed \
+                             representation for runtime routing",
+                            callee_name.id,
+                            i + 1,
+                            py_ty
+                        )
+                        .into());
+                    }
+                }
+                let call = quote!(#orig(#(#rendered),*));
+                // An output-enum router (diverging morph returns):
+                // Python's value here is the union — the boxed PyValue —
+                // so the result converts on the way out. Members that
+                // cannot box (a class) have no Python-faithful landing
+                // at a boxed call site: loud.
+                let boxes = match &router.ret {
+                    RouterReturn::Unified(_) => None,
+                    RouterReturn::Enum { members, .. } => {
+                        if !members.iter().all(|m| py_id_boxable(m)) {
+                            return Err(format!(
+                                "cannot dispatch `{}` on a boxed value: its \
+                                 morphs' return types include a class, so the \
+                                 result has no boxed representation; annotate \
+                                 the argument with a concrete type",
+                                callee_name.id
+                            )
+                            .into());
+                        }
+                        Some(())
+                    }
+                };
+                return Ok(match (boxes, propagates_exceptions) {
+                    (None, true) => quote!((#call)?),
+                    (None, false) => call,
+                    (Some(()), true) => {
+                        quote!(stdpython::PyValue::from((#call)?))
+                    }
+                    (Some(()), false) => {
+                        return Err(format!(
+                            "cannot dispatch `{}` on a boxed value in a \
+                             context that does not propagate exceptions",
+                            callee_name.id
+                        )
+                        .into());
+                    }
+                });
+            }
+            // Fully static: each axis picks its variant (or its "any"
+            // residual), joined into the morph's suffix.
+            let mut suffixes: Vec<String> = Vec::new();
+            for site in &sites {
+                let Some(py_ty) = &site.py_ty else {
+                    return Err(format!(
+                        "cannot dispatch the call to `{}`: the type of its \
+                         isinstance-dispatched argument is not statically known — \
+                         annotate the value (or the enclosing parameter) so the \
+                         converter can pick the right specialization",
+                        callee_name.id
+                    )
+                    .into());
+                };
+                suffixes.push(
+                    crate::ast::tree::specialize::axis_dispatch_suffix(
+                        site.axis, py_ty, site.is_class,
+                    )
+                    .unwrap_or("any")
+                    .to_lowercase(),
+                );
+            }
+            let suffix = suffixes.join("_");
             let mangled = crate::safe_ident(&crate::ast::tree::specialize::mangled_name(&callee_name.id, &suffix));
             let mut rendered = Vec::new();
             for arg in &self.args {

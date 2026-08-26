@@ -318,7 +318,7 @@ pub fn label_bool(value: bool) -> Result<String, PyException> {
 pub fn label_any<T>(_value: T) -> Result<String, PyException> {
     return Ok(("something else").to_string());
 }
-#[doc = "The dispatch argument for `label`: one variant per compile-time morph, `Other` for everything else."]
+#[doc = "The dispatch argument for `label`'s parameter `value`: one variant per compile-time morph, `Other` for everything else."]
 #[derive(Clone)]
 pub enum LabelArg {
     Str(String),
@@ -362,13 +362,13 @@ impl From<stdpython::PyValue> for LabelArg {
         Self::from_py_value(v)
     }
 }
-#[doc = "Dynamic router for `label`: dispatches a runtime-typed argument to the compile-time morphs, in Python's first-true-test order."]
-pub fn label(x: impl Into<LabelArg>) -> Result<String, PyException> {
-    match x.into() {
-        LabelArg::Str(v) => label_str(v),
-        LabelArg::Int(v) => label_int(v),
-        LabelArg::Bool(v) => label_bool(v),
-        LabelArg::Other(v) => label_any(v),
+#[doc = "Dynamic router for `label`: dispatches runtime-typed argument(s) to the compile-time morphs, in Python's first-true-test order per parameter."]
+pub fn label(value: impl Into<LabelArg>) -> Result<String, PyException> {
+    match value.into() {
+        LabelArg::Str(v1) => label_str(v1),
+        LabelArg::Int(v1) => label_int(v1),
+        LabelArg::Bool(v1) => label_bool(v1),
+        LabelArg::Other(v1) => label_any(v1),
     }
 }
 fn main() {

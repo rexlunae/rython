@@ -5763,6 +5763,128 @@ fn isinstance_dispatch_specializes_by_input_type() {
 }
 
 #[test]
+fn router_threads_extra_parameters_and_diverging_returns() {
+    // Two generalizations of the dynamic router: a NON-tested parameter
+    // passes through the router positionally (no enum needed for it),
+    // and morphs with DIVERGING return types still get a router — it
+    // returns an output enum (`FlipOut`) with `From<T>` per member, and
+    // `From<FlipOut> for PyValue` when every member boxes, so a boxed
+    // call site consumes the result as Python's union value.
+    let src = concat!(
+        "def pick(flag: bool) -> str | int:\n",
+        "    if flag:\n",
+        "        return \"fox\"\n",
+        "    return 42\n",
+        "\n",
+        "def tag(x, prefix: str):\n",
+        "    if isinstance(x, str):\n",
+        "        return prefix + \": \" + x\n",
+        "    if isinstance(x, int):\n",
+        "        return prefix + \" #\" + str(x)\n",
+        "    return prefix + \"?\"\n",
+        "\n",
+        "def flip(x):\n",
+        "    if isinstance(x, str):\n",
+        "        return len(x)\n",
+        "    if isinstance(x, int):\n",
+        "        return str(x)\n",
+        "    return 0\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(tag(pick(True), \"dyn\"))\n",
+        "    print(flip(pick(True)))\n",
+    );
+    let out = compile(src, "routergen.py");
+    for entry in [
+        // The untested `prefix` parameter passes through positionally.
+        "pub fn tag (x : impl Into < TagArg > , prefix : impl Into < String > ,)",
+        // The output enum, its From impls, and the PyValue landing.
+        "enum FlipOut",
+        "impl From < i64 > for FlipOut",
+        "impl From < String > for FlipOut",
+        "impl From < FlipOut > for stdpython :: PyValue",
+        // Router arms wrap diverging morph results into the enum.
+        "Ok (FlipOut :: from (",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+    // A boxed call site consumes the enum result as the boxed union.
+    assert!(
+        out.contains("stdpython :: PyValue :: from ((flip ("),
+        "a boxed call site must box the output-enum result: {}",
+        out
+    );
+}
+
+#[test]
+fn isinstance_dispatch_specializes_over_multiple_axes() {
+    // SEVERAL isinstance-tested parameters: the morphs are the cartesian
+    // product over each axis of (its variants + Any), named
+    // `pair_str_int` / `pair_str_any` / `pair_any_any` / ..., static
+    // call sites dispatch each argument independently, and the router
+    // takes one NUMBERED argument enum per tested parameter and
+    // tuple-matches them.
+    let src = concat!(
+        "def pick(flag: bool) -> str | int:\n",
+        "    if flag:\n",
+        "        return \"fox\"\n",
+        "    return 42\n",
+        "\n",
+        "def pair(a, b):\n",
+        "    if isinstance(a, str):\n",
+        "        if isinstance(b, int):\n",
+        "            return a + \" x\" + str(b)\n",
+        "        return a + \" ?\"\n",
+        "    if isinstance(a, int):\n",
+        "        if isinstance(b, int):\n",
+        "            return str(a * b)\n",
+        "        return str(a)\n",
+        "    return \"neither\"\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(pair(\"fox\", 3))\n",
+        "    print(pair(2.5, 1))\n",
+        "    print(pair(pick(True), 3))\n",
+    );
+    let out = compile(src, "multiaxis.py");
+    for entry in [
+        // Cross-product morphs (bool auto-added per int-tested axis).
+        "fn pair_str_int",
+        "fn pair_str_any",
+        "fn pair_int_int",
+        "fn pair_bool_int",
+        "fn pair_any_int",
+        "fn pair_any_any",
+        // One numbered argument enum per axis; the router tuple-matches.
+        "enum PairArg1",
+        "enum PairArg2",
+        "pub fn pair (a : impl Into < PairArg1 > , b : impl Into < PairArg2 > ,)",
+        "(PairArg1 :: Str (v1) , PairArg2 :: Int (v2)) => pair_str_int (v1 , v2)",
+        "(PairArg1 :: Other (v1) , PairArg2 :: Other (v2)) => pair_any_any (v1 , v2)",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+    // Static sites dispatch each argument independently...
+    assert!(
+        out.contains("pair_str_int (\"fox\" , 3)"),
+        "static cross dispatch must bind both axes: {}",
+        out
+    );
+    assert!(
+        out.contains("pair_any_int ("),
+        "an untested type on one axis takes that axis's residual: {}",
+        out
+    );
+    // ...and a boxed axis routes the whole call through the router, the
+    // static axis passing as a plain value via From<T>.
+    assert!(
+        out.contains("pair ((pick") || out.contains("pair (pick"),
+        "a boxed axis must dispatch through the router: {}",
+        out
+    );
+}
+
+#[test]
 fn isinstance_dispatch_emits_a_dynamic_router() {
     // A single-parameter specialized function whose morphs share a return
     // type also gets a RUNTIME router under the original name: a closed

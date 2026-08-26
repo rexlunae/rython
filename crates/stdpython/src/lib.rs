@@ -4302,6 +4302,53 @@ numeric_add!(
     f64, i64 => f64,
 );
 
+// bool ⊂ int (CPython): booleans participate in arithmetic as 0/1 —
+// `True + 1 == 2`, `True * 3 == 3`, `True * 2.5 == 2.5`. The isinstance
+// specializer's auto bool morphs (a bool argument taking an int-tested
+// arm with its parameter kept bool) rely on these, as does any bool
+// value flowing into arithmetic.
+macro_rules! bool_arith {
+    ($($trait:ident, $method:ident, $op:tt);* $(;)?) => {
+        $(
+            impl $trait<i64> for bool {
+                type Output = i64;
+                fn $method(&self, rhs: &i64) -> i64 {
+                    (*self as i64) $op *rhs
+                }
+            }
+            impl $trait<bool> for i64 {
+                type Output = i64;
+                fn $method(&self, rhs: &bool) -> i64 {
+                    *self $op (*rhs as i64)
+                }
+            }
+            impl $trait<bool> for bool {
+                type Output = i64;
+                fn $method(&self, rhs: &bool) -> i64 {
+                    (*self as i64) $op (*rhs as i64)
+                }
+            }
+            impl $trait<f64> for bool {
+                type Output = f64;
+                fn $method(&self, rhs: &f64) -> f64 {
+                    ((*self as i64) as f64) $op *rhs
+                }
+            }
+            impl $trait<bool> for f64 {
+                type Output = f64;
+                fn $method(&self, rhs: &bool) -> f64 {
+                    *self $op ((*rhs as i64) as f64)
+                }
+            }
+        )*
+    };
+}
+bool_arith!(
+    PyAdd, py_add, +;
+    PySub, py_sub, -;
+    PyMul, py_mul, *;
+);
+
 macro_rules! string_add {
     ($($l:ty, $r:ty),* $(,)?) => {
         $(impl PyAdd<$r> for $l {
@@ -5619,9 +5666,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[cfg(not(feature = "std"))]
     use alloc::vec;
+
+    #[test]
+    fn bool_arithmetic_is_zero_one() {
+        // CPython: bool ⊂ int, so booleans compute as 0/1 —
+        // `True + 1 == 2`, `True * 3 == 3`, `2 - True == 1`,
+        // `True * 2.5 == 2.5` — verified against python3.
+        assert_eq!(true.py_add(&1i64), 2);
+        assert_eq!(true.py_mul(&3i64), 3);
+        assert_eq!(2i64.py_sub(&true), 1);
+        assert_eq!(3i64.py_mul(&false), 0);
+        assert_eq!(true.py_add(&true), 2);
+        assert_eq!(true.py_mul(&2.5f64), 2.5);
+        assert_eq!(2.5f64.py_add(&false), 2.5);
+    }
 
     #[test]
     fn test_python_functions() {

@@ -536,62 +536,64 @@ impl FunctionDef {
         let mut out = TokenStream::new();
         let mut vopts = options.clone();
         vopts.rendering_specialization = true;
-        // One variant per tested BUILTIN type, plus one per concrete
-        // class in the tested subtrees (a Cat argument gets describe_Cat
-        // with `x: Cat`, keeping Cat's own overrides — Rust structs have
-        // no subtyping to flow through an Animal-typed variant).
-        let variant_types: Vec<crate::ast::tree::specialize::SpecTarget> = spec
-            .targets
-            .iter()
-            .filter(|t| {
-                matches!(t, crate::ast::tree::specialize::SpecTarget::Builtin(_))
-            })
-            .cloned()
-            .chain(spec.class_variants.iter().map(|c| {
-                crate::ast::tree::specialize::SpecTarget::Class(c.clone())
-            }))
-            .collect();
-        for target in &variant_types {
+        use crate::ast::tree::specialize::{
+            fold_morph_body, mangled_name, target_typeinfo, SpecializedFn,
+        };
+        // One morph per assignment in the cartesian product over axes:
+        // per tested BUILTIN type and per concrete class in the tested
+        // subtrees (a Cat argument gets describe_cat with `x: Cat`,
+        // keeping Cat's own overrides — Rust structs have no subtyping
+        // to flow through an Animal-typed variant), plus Any per axis;
+        // the all-Any assignment is the residual.
+        let assignments = spec.morph_assignments();
+        for assignment in &assignments {
+            let suffix = SpecializedFn::assignment_suffix(assignment);
             let mut variant = self.clone();
-            variant.name = crate::ast::tree::specialize::mangled_name(&self.name, target.suffix());
-            variant.args.args[spec.axis].annotation =
-                Some(Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
-                    id: target.suffix().to_string(),
-                })));
-            variant.body = crate::ast::tree::specialize::fold_variant_body(
-                &self.body,
-                &spec.axis_name,
-                target,
-                &symbols,
-            );
-            // The original carries no return annotation (its params were
-            // unannotated); the folded variant needs one so the annotated
-            // machinery types the returns.
+            variant.name = mangled_name(&self.name, &suffix);
+            let mut seeds: Vec<(String, crate::TypeInfo)> = Vec::new();
+            let mut unassigned: Vec<String> = Vec::new();
+            for (axis, a) in spec.axes.iter().zip(assignment) {
+                match a {
+                    Some(target) => {
+                        variant.args.args[axis.index].annotation = Some(Box::new(
+                            crate::ExprType::Name(crate::ast::tree::name::Name {
+                                id: target.suffix().to_string(),
+                            }),
+                        ));
+                        if let Some(ti) = target_typeinfo(target) {
+                            seeds.push((axis.name.clone(), ti));
+                        }
+                    }
+                    None => unassigned.push(axis.name.clone()),
+                }
+            }
+            variant.body = fold_morph_body(&self.body, &spec, assignment, &symbols);
+            // The original carries no return annotation (its tested
+            // params were unannotated); the folded morph needs one so
+            // the annotated machinery types the returns. An Any axis has
+            // no seed — derivation then fails for returns involving it,
+            // and the ordinary inference machinery takes over.
             if variant.returns.is_none() {
                 variant.returns = crate::ast::tree::specialize::derive_return_annotation(
                     &variant.body,
-                    &spec.axis_name,
-                    target,
+                    &seeds,
                     &options,
                     &symbols,
                 )
                 .map(Box::new);
             }
             crate::ast::tree::specialize::underscore_unused_params(&mut variant);
-            out.extend(variant.to_rust(ctx.clone(), vopts.clone(), symbols.clone())?);
+            let mut mopts = vopts.clone();
+            if !unassigned.is_empty() {
+                // Any leftover isinstance render on an Any axis (a shape
+                // the fold does not cover) lowers to false — the residual
+                // semantics for that axis.
+                let mut fold = options.residual_fold_false.as_ref().clone();
+                fold.extend(unassigned);
+                mopts.residual_fold_false = std::rc::Rc::new(fold);
+            }
+            out.extend(variant.to_rust(ctx.clone(), mopts, symbols.clone())?);
         }
-        let mut residual = self.clone();
-        residual.name = crate::ast::tree::specialize::mangled_name(&self.name, "any");
-        residual.body = crate::ast::tree::specialize::prune_axis_isinstance(
-            &self.body,
-            &spec.axis_name,
-        );
-        crate::ast::tree::specialize::underscore_unused_params(&mut residual);
-        let mut ropts = vopts;
-        let mut fold = options.residual_fold_false.as_ref().clone();
-        fold.insert(spec.axis_name.clone());
-        ropts.residual_fold_false = std::rc::Rc::new(fold);
-        out.extend(residual.to_rust(ctx, ropts, symbols.clone())?);
 
         // ---- The dynamic router ----
         // A closed-world argument enum (one variant per morph, plus a
@@ -603,115 +605,271 @@ impl FunctionDef {
         if let Some(router) = &spec.router
             && options.with_std_python
         {
-            use crate::ast::tree::specialize::{py_type_tokens, to_pascal, SpecTarget};
-            let enum_ident = crate::safe_ident(&router.enum_name);
+            use crate::ast::tree::specialize::{
+                py_id_boxable, py_type_tokens, to_pascal, RouterReturn, SpecTarget,
+            };
+            use quote::format_ident;
             let orig_ident = crate::safe_ident(&self.name);
-            let ret_ty = py_type_tokens(&router.return_id);
-            let any_ident = crate::safe_ident(
-                &crate::ast::tree::specialize::mangled_name(&self.name, "any"),
-            );
-
-            let mut enum_variants = TokenStream::new();
-            let mut from_impls = TokenStream::new();
-            let mut match_arms = TokenStream::new();
-            let mut boxed_arms = TokenStream::new();
-            let mut has_bool_morph = false;
-            let mut has_int_morph = false;
-            for target in &variant_types {
-                let var_ident = crate::safe_ident(&match target {
+            let enum_idents: Vec<proc_macro2::Ident> = router
+                .enum_names
+                .iter()
+                .map(|n| crate::safe_ident(n))
+                .collect();
+            let variant_ident = |t: &SpecTarget| -> proc_macro2::Ident {
+                crate::safe_ident(&match t {
                     SpecTarget::Builtin(b) => to_pascal(b),
                     SpecTarget::Class(c) => c.clone(),
-                });
-                let ty = py_type_tokens(target.suffix());
-                let morph = crate::safe_ident(
-                    &crate::ast::tree::specialize::mangled_name(
-                        &self.name,
-                        target.suffix(),
-                    ),
-                );
-                enum_variants.extend(quote!(#var_ident(#ty),));
-                from_impls.extend(quote! {
-                    impl From<#ty> for #enum_ident {
-                        fn from(v: #ty) -> Self {
-                            #enum_ident::#var_ident(v)
-                        }
-                    }
-                });
-                match_arms.extend(quote! {
-                    #enum_ident::#var_ident(v) => #morph(v),
-                });
-                if let SpecTarget::Builtin(b) = target {
-                    match b.as_str() {
-                        "bool" => has_bool_morph = true,
-                        "int" => has_int_morph = true,
-                        _ => {}
-                    }
-                    let pv_variant = crate::safe_ident(&to_pascal(b));
-                    boxed_arms.extend(quote! {
-                        stdpython::PyValue::#pv_variant(v) =>
-                            #enum_ident::#var_ident(v),
-                    });
-                    if b == "str" {
-                        // Convenience for Rust callers with &str literals.
-                        from_impls.extend(quote! {
-                            impl From<&str> for #enum_ident {
-                                fn from(v: &str) -> Self {
-                                    #enum_ident::#var_ident(v.to_string())
+                })
+            };
+
+            // The non-axis parameters pass through positionally: an int
+            // extra is `n: i64`, a str extra keeps the annotated-fn shape
+            // `s: impl Into<String>` so string literals still call
+            // directly, and morphs (whose annotated str parameters take
+            // the same shape) receive the generic value unchanged. Each
+            // AXIS parameter takes `impl Into<{F}ArgN>`, and the arm
+            // forwards its binding v1/v2/...
+            let extra_param_ty = |id: &str| -> TokenStream {
+                match id {
+                    "str" => quote!(impl Into<String>),
+                    other => py_type_tokens(other),
+                }
+            };
+            let mut sig_params = TokenStream::new();
+            let mut forward_args: Vec<TokenStream> = Vec::new();
+            let mut axis_arg_idents: Vec<proc_macro2::Ident> = Vec::new();
+            for (i, p) in self.args.args.iter().enumerate() {
+                if let Some(k) = spec.axes.iter().position(|a| a.index == i) {
+                    let ident = crate::safe_ident(&p.arg);
+                    let e = &enum_idents[k];
+                    sig_params.extend(quote!(#ident: impl Into<#e>,));
+                    axis_arg_idents.push(ident);
+                    let v = format_ident!("v{}", k + 1);
+                    forward_args.push(quote!(#v));
+                    continue;
+                }
+                let (_, name, id) = router
+                    .extra_params
+                    .iter()
+                    .find(|(idx, _, _)| *idx == i)
+                    .expect("plan_router covered every non-axis parameter");
+                let ident = crate::safe_ident(name);
+                let ty = extra_param_ty(id);
+                sig_params.extend(quote!(#ident: #ty,));
+                forward_args.push(quote!(#ident));
+            }
+
+            // The return shape: the unified type, or the OUTPUT enum
+            // (one variant per distinct morph return type, From<T> per
+            // member) — a runtime-dispatched result then lands as a
+            // matchable value, and as a boxed PyValue when every member
+            // is boxable (Python's `str | int` union).
+            let (ret_ty, out_enum_stream, wrap_result) = match &router.ret {
+                RouterReturn::Unified(id) => {
+                    (py_type_tokens(id), TokenStream::new(), false)
+                }
+                RouterReturn::Enum { name, members } => {
+                    let out_ident = crate::safe_ident(name);
+                    let mut out_variants = TokenStream::new();
+                    let mut out_from = TokenStream::new();
+                    let mut pv_arms = TokenStream::new();
+                    for m in members {
+                        let var = crate::safe_ident(&if py_id_boxable(m) {
+                            to_pascal(m)
+                        } else {
+                            m.clone()
+                        });
+                        let ty = py_type_tokens(m);
+                        out_variants.extend(quote!(#var(#ty),));
+                        out_from.extend(quote! {
+                            impl From<#ty> for #out_ident {
+                                fn from(v: #ty) -> Self {
+                                    #out_ident::#var(v)
                                 }
                             }
                         });
+                        pv_arms.extend(quote! {
+                            #out_ident::#var(v) => stdpython::PyValue::from(v),
+                        });
                     }
+                    // Every member boxable → the result converts to the
+                    // boxed PyValue, which is exactly Python's union
+                    // return — generated call sites consume it that way.
+                    let pv_impl = if members.iter().all(|m| py_id_boxable(m)) {
+                        quote! {
+                            impl From<#out_ident> for stdpython::PyValue {
+                                fn from(v: #out_ident) -> Self {
+                                    match v { #pv_arms }
+                                }
+                            }
+                        }
+                    } else {
+                        TokenStream::new()
+                    };
+                    let out_doc = format!(
+                        "The result of `{}`'s dynamic router: one variant \
+                         per distinct morph return type.",
+                        self.name
+                    );
+                    let stream = quote! {
+                        #[doc = #out_doc]
+                        #[derive(Clone)]
+                        pub enum #out_ident {
+                            #out_variants
+                        }
+                        #out_from
+                        #pv_impl
+                    };
+                    (quote!(#out_ident), stream, true)
                 }
-            }
-            // bool ⊂ int is handled at DETECTION time: an int-tested axis
-            // always carries a bool morph of its own (detect_specializable),
-            // so a boxed bool routes to a genuine bool-typed body and
-            // `str(x)` renders True/False exactly like CPython.
-            debug_assert!(
-                has_bool_morph || !has_int_morph,
-                "an int morph implies a bool morph (detect_specializable)"
-            );
+            };
 
-            let enum_doc = format!(
-                "The dispatch argument for `{}`: one variant per \
-                 compile-time morph, `Other` for everything else.",
-                self.name
-            );
-            let router_doc = format!(
-                "Dynamic router for `{}`: dispatches a runtime-typed \
-                 argument to the compile-time morphs, in Python's \
-                 first-true-test order.",
-                self.name
-            );
-            out.extend(quote! {
-                #[doc = #enum_doc]
-                #[derive(Clone)]
-                pub enum #enum_ident {
-                    #enum_variants
-                    Other(stdpython::PyValue),
-                }
-                #from_impls
-                impl #enum_ident {
-                    /// Route a BOXED runtime value to its morph.
-                    pub fn from_py_value(v: stdpython::PyValue) -> Self {
-                        match v {
-                            #boxed_arms
-                            other => #enum_ident::Other(other),
+            // One argument enum PER AXIS, each with its variants plus
+            // `Other(PyValue)`, From<T> per variant, and the boxed
+            // From<PyValue> routing.
+            let mut axis_enum_streams = TokenStream::new();
+            for (k, axis) in spec.axes.iter().enumerate() {
+                let enum_ident = &enum_idents[k];
+                let mut enum_variants = TokenStream::new();
+                let mut from_impls = TokenStream::new();
+                let mut boxed_arms = TokenStream::new();
+                let mut has_bool_morph = false;
+                let mut has_int_morph = false;
+                for target in axis.variants() {
+                    let var_ident = variant_ident(&target);
+                    let ty = py_type_tokens(target.suffix());
+                    enum_variants.extend(quote!(#var_ident(#ty),));
+                    from_impls.extend(quote! {
+                        impl From<#ty> for #enum_ident {
+                            fn from(v: #ty) -> Self {
+                                #enum_ident::#var_ident(v)
+                            }
+                        }
+                    });
+                    if let SpecTarget::Builtin(b) = &target {
+                        match b.as_str() {
+                            "bool" => has_bool_morph = true,
+                            "int" => has_int_morph = true,
+                            _ => {}
+                        }
+                        let pv_variant = crate::safe_ident(&to_pascal(b));
+                        boxed_arms.extend(quote! {
+                            stdpython::PyValue::#pv_variant(v) =>
+                                #enum_ident::#var_ident(v),
+                        });
+                        if b == "str" {
+                            // Convenience for Rust callers with &str
+                            // literals.
+                            from_impls.extend(quote! {
+                                impl From<&str> for #enum_ident {
+                                    fn from(v: &str) -> Self {
+                                        #enum_ident::#var_ident(v.to_string())
+                                    }
+                                }
+                            });
                         }
                     }
                 }
-                impl From<stdpython::PyValue> for #enum_ident {
-                    fn from(v: stdpython::PyValue) -> Self {
-                        Self::from_py_value(v)
+                // bool ⊂ int is handled at DETECTION time: an int-tested
+                // axis always carries a bool morph of its own
+                // (detect_specializable), so a boxed bool routes to a
+                // genuine bool-typed body and `str(x)` renders
+                // True/False exactly like CPython.
+                debug_assert!(
+                    has_bool_morph || !has_int_morph,
+                    "an int morph implies a bool morph (detect_specializable)"
+                );
+                let enum_doc = format!(
+                    "The dispatch argument for `{}`'s parameter `{}`: one \
+                     variant per compile-time morph, `Other` for \
+                     everything else.",
+                    self.name, axis.name
+                );
+                axis_enum_streams.extend(quote! {
+                    #[doc = #enum_doc]
+                    #[derive(Clone)]
+                    pub enum #enum_ident {
+                        #enum_variants
+                        Other(stdpython::PyValue),
                     }
+                    #from_impls
+                    impl #enum_ident {
+                        /// Route a BOXED runtime value to its morph.
+                        pub fn from_py_value(v: stdpython::PyValue) -> Self {
+                            match v {
+                                #boxed_arms
+                                other => #enum_ident::Other(other),
+                            }
+                        }
+                    }
+                    impl From<stdpython::PyValue> for #enum_ident {
+                        fn from(v: stdpython::PyValue) -> Self {
+                            Self::from_py_value(v)
+                        }
+                    }
+                });
+            }
+
+            // The dispatch match: one arm per morph assignment (the
+            // cartesian product covers every combination, so the match
+            // is exhaustive without a wildcard).
+            let arm_body = |call: TokenStream| -> TokenStream {
+                if wrap_result {
+                    quote!(Ok(#ret_ty::from((#call)?)))
+                } else {
+                    call
                 }
+            };
+            let mut match_arms = TokenStream::new();
+            for assignment in &assignments {
+                let suffix = SpecializedFn::assignment_suffix(assignment);
+                let morph = crate::safe_ident(&mangled_name(&self.name, &suffix));
+                let pats: Vec<TokenStream> = assignment
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| {
+                        let e = &enum_idents[k];
+                        let v = format_ident!("v{}", k + 1);
+                        match a {
+                            Some(t) => {
+                                let var = variant_ident(t);
+                                quote!(#e::#var(#v))
+                            }
+                            None => quote!(#e::Other(#v)),
+                        }
+                    })
+                    .collect();
+                let call = arm_body(quote!(#morph(#(#forward_args),*)));
+                if pats.len() == 1 {
+                    let p = &pats[0];
+                    match_arms.extend(quote!(#p => #call,));
+                } else {
+                    match_arms.extend(quote!((#(#pats),*) => #call,));
+                }
+            }
+            let scrutinee = if axis_arg_idents.len() == 1 {
+                let a = &axis_arg_idents[0];
+                quote!(#a.into())
+            } else {
+                let parts = axis_arg_idents.iter().map(|a| quote!(#a.into()));
+                quote!((#(#parts),*))
+            };
+
+            let router_doc = format!(
+                "Dynamic router for `{}`: dispatches runtime-typed \
+                 argument(s) to the compile-time morphs, in Python's \
+                 first-true-test order per parameter.",
+                self.name
+            );
+            out.extend(quote! {
+                #axis_enum_streams
+                #out_enum_stream
                 #[doc = #router_doc]
                 pub fn #orig_ident(
-                    x: impl Into<#enum_ident>,
+                    #sig_params
                 ) -> Result<#ret_ty, PyException> {
-                    match x.into() {
+                    match #scrutinee {
                         #match_arms
-                        #enum_ident::Other(v) => #any_ident(v),
                     }
                 }
             });

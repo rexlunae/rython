@@ -1311,6 +1311,124 @@ fn isinstance_dynamic_router_routes_boxed_values_at_runtime() {
 }
 
 #[test]
+fn router_generalizations_match_python_at_runtime() {
+    // The router generalizations end to end: an untested extra parameter
+    // passes through the router positionally (`tag`), diverging morph
+    // returns land through the output enum and box at the call site
+    // (`flip` — a boxed argument yields Python's `int | str` union), and
+    // SEVERAL isinstance-tested parameters cross-product into per-combo
+    // morphs with per-axis numbered enums (`pair` — static, mixed
+    // static/boxed, and fully boxed calls). Output must match CPython
+    // exactly.
+    let scratch = Scratch::new("router-general");
+    let file = scratch.path().join("routergen.py");
+    fs::write(
+        &file,
+        concat!(
+            "def pick(flag: bool) -> str | int:\n",
+            "    if flag:\n",
+            "        return \"fox\"\n",
+            "    return 42\n",
+            "\n",
+            "def tag(x, prefix: str):\n",
+            "    if isinstance(x, str):\n",
+            "        return prefix + \": \" + x\n",
+            "    if isinstance(x, int):\n",
+            "        return prefix + \" #\" + str(x)\n",
+            "    return prefix + \"?\"\n",
+            "\n",
+            "def flip(x):\n",
+            "    if isinstance(x, str):\n",
+            "        return len(x)\n",
+            "    if isinstance(x, int):\n",
+            "        return str(x)\n",
+            "    return 0\n",
+            "\n",
+            "def pair(a, b):\n",
+            "    if isinstance(a, str):\n",
+            "        if isinstance(b, int):\n",
+            "            return a + \" x\" + str(b)\n",
+            "        return a + \" ?\"\n",
+            "    if isinstance(a, int):\n",
+            "        if isinstance(b, int):\n",
+            "            return str(a * b)\n",
+            "        return str(a)\n",
+            "    return \"neither\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(tag(\"fox\", \"word\"))\n",
+            "    print(tag(9, \"num\"))\n",
+            "    print(tag(2.5, \"odd\"))\n",
+            "    print(tag(pick(True), \"dyn\"))\n",
+            "    print(tag(pick(False), \"dyn\"))\n",
+            "    print(flip(\"fox\"))\n",
+            "    print(flip(7))\n",
+            "    print(flip(pick(True)))\n",
+            "    print(flip(pick(False)))\n",
+            "    print(flip(2.5))\n",
+            "    print(pair(\"fox\", 3))\n",
+            "    print(pair(\"fox\", 2.5))\n",
+            "    print(pair(2, 3))\n",
+            "    print(pair(2, \"z\"))\n",
+            "    print(pair(2.5, 1))\n",
+            "    print(pair(pick(True), 3))\n",
+            "    print(pair(pick(False), pick(False)))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let generated = fs::read_to_string(krate.root.join("src/routergen.rs")).unwrap();
+    for shape in [
+        "prefix: impl Into<String>",
+        "enum FlipOut",
+        "enum PairArg1",
+        "enum PairArg2",
+        "pub fn pair(a: impl Into<PairArg1>, b: impl Into<PairArg2>)",
+    ] {
+        assert!(
+            generated.contains(shape),
+            "missing {shape}: {}",
+            generated
+        );
+    }
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/routergen"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "word: fox",
+            "num #9",
+            "odd?",
+            "dyn: fox",
+            "dyn #42",
+            "3",
+            "7",
+            "3",
+            "42",
+            "0",
+            "fox x3",
+            "fox ?",
+            "6",
+            "2",
+            "neither",
+            "fox x3",
+            "1764",
+        ],
+        "generalized router dispatch diverged from CPython"
+    );
+}
+
+#[test]
 fn inference_seed_unification_and_return_unification_at_runtime() {
     // Parameter type inference end to end: a literal-seeded accumulator
     // concretizes the loop element (`best = ""` → Item = String; `s = 0`
