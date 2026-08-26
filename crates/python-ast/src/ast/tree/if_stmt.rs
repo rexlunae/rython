@@ -125,6 +125,26 @@ impl CodeGen for If {
             else_options.narrowed_names = std::rc::Rc::new(else_n);
         }
 
+        // A test that folded to a compile-time CONSTANT — an isinstance
+        // decided through the class tree, a version gate that reached here
+        // as a literal, a bool constant: the dead branch is pruned and the
+        // live one inlined, so the output carries no `if true { ... }`
+        // noise. Constant tests have no side effects, so dropping them is
+        // sound.
+        if let Some(taken) = const_bool_tokens(&test) {
+            let (branch, opts) = if taken {
+                (self.body, body_options)
+            } else {
+                (self.orelse, else_options)
+            };
+            let stmts: Result<Vec<_>, _> = branch
+                .into_iter()
+                .map(|stmt| stmt.to_rust(ctx.clone(), opts.clone(), symbols.clone()))
+                .collect();
+            let stmts = stmts?;
+            return Ok(quote! { #(#stmts;)* });
+        }
+
         let body_stmts: Result<Vec<_>, _> = self
             .body
             .into_iter()
@@ -153,6 +173,18 @@ impl CodeGen for If {
                 }
             })
         }
+    }
+}
+
+/// Whether rendered condition tokens are a compile-time boolean constant:
+/// the bare literal, or the literal behind the condition position's
+/// truthiness call (`(true).is_truthy()`).
+fn const_bool_tokens(test: &TokenStream) -> Option<bool> {
+    let s: String = test.to_string().split_whitespace().collect();
+    match s.as_str() {
+        "true" | "(true).is_truthy()" => Some(true),
+        "false" | "(false).is_truthy()" => Some(false),
+        _ => None,
     }
 }
 

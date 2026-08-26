@@ -576,7 +576,30 @@ sort), `min`/`max` (Python's NaN-fold semantics), `sum`, `abs`, `round`
 `enumerate`, `zip`, `map`/`filter`, `all`/`any`, `repr`, `hash`
 (CPython's algorithms under `PYTHONHASHSEED=0`, including siphash13 for
 strings over the internal representation), `ord`/`chr`, `isinstance`
-(on statically-known types only — otherwise a loud error), and the
+(decided at conversion time on statically-known types, walking the class
+inheritance tree — `isinstance(dog, Animal)` folds true for `dog: Dog` —
+with constant branches pruned; a module function whose unannotated
+parameter(s) are isinstance-dispatched in plain `if` tests
+monomorphizes — one specialized Rust function per input type, and with
+SEVERAL tested parameters one per combination in their cartesian
+product (`f_str_int`, `f_str_any`, ..., capped at 32 morphs) — plus
+the generic residual, with call sites dispatching each argument
+independently by static type (an int-tested parameter also gets a bool
+morph of its own — bool ⊂ int in Python — so a bool argument takes the
+int arm while `str(x)` still renders True/False); a dynamic router is
+also emitted under the original name — one argument enum per tested
+parameter (`FArg`, or `FArg1`/`FArg2`/... numbered by position), each
+with one variant per morph plus `Other(PyValue)` and `From<T>` per
+variant, taken as `impl Into<Enum>` parameters and tuple-matched — so
+plain values pass through unchanged, untested parameters pass through
+positionally, and a boxed `PyValue` argument routes at runtime in
+Python's first-true-test order; morphs whose return types differ route
+through an output enum (`FOut`, one variant per distinct return type,
+`From<T>` per member, and `From<FOut> for PyValue` when every member
+boxes, so a runtime-dispatched result lands as Python's union value);
+other
+inferred-generic shapes lower to false with the class-as-value
+divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
 (`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
 they lower unresolved and fail in rustc, §12.1; set and tuple
