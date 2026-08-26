@@ -927,12 +927,15 @@ impl FunctionDef {
         }
 
         // Issue #115: `global x` declares module scope. Reads resolve to
-        // the module statics; WRITES need mutable module state, which
-        // rython does not model (module-level reassignment lowers to
-        // __module_init__ locals invisible to functions) — the writes are
-        // no-ops, surfaced through the -W channel (issue #115, a documented
-        // divergence; the read side still resolves the module static).
-        if let Some(name) = global_write_error(&self.body) {
+        // the module statics. A written global whose module binding
+        // qualified as a MUTABLE static (module.rs's
+        // module_global_mutable_names: a single scalar/None module store)
+        // writes THROUGH the static — py_global_write — with no warning.
+        // A write to any OTHER global keeps the documented divergence: the
+        // write is a no-op, surfaced through the -W channel.
+        if let Some(name) = global_write_error(&self.body)
+            && !options.mutable_statics.contains_key(&name)
+        {
             options.definition_warnings.borrow_mut().push(format!(
                 "function `{}` writes to module-level name `{name}`: the write is \
                  dropped (issue #115 — rython has no mutable module state visible \
@@ -940,6 +943,14 @@ impl FunctionDef {
                 self.name
             ));
         }
+        // The `global` names this function declares that ARE mutable
+        // statics: its stores route through py_global_write, and their
+        // bindings are the module statics — never hoisted locals.
+        let fn_mutable_globals: std::collections::HashSet<String> =
+            collect_global_decls(&self.body)
+                .into_iter()
+                .filter(|n| options.mutable_statics.contains_key(n))
+                .collect();
         // Issue #112: `del name` lowers to a no-op, which is faithful ONLY
         // while the name is never referenced afterwards — this pass makes
         // any such use a loud error (and a reassignment/import clears the
@@ -1260,15 +1271,22 @@ impl FunctionDef {
         // Optional annotation) are visible to every assignment in the body:
         // their non-None stores wrap in Some.
         let mut options = options;
+        // Issue #115: this function may write exactly the mutable statics
+        // its own `global` statements declare; every other scope's
+        // grant (the module's all-of-them default in particular) does not
+        // apply inside this body.
+        options.scope_global_writables = std::rc::Rc::new(fn_mutable_globals.clone());
         // Names managed by this function's prologue: hoisted assignments
         // plus mutable parameters. A `for`-loop target on one of these
         // lowers to a store into the hoisted binding, never a shadowing
-        // fresh binding (issue #80).
+        // fresh binding (issue #80). A `global`-declared mutable static is
+        // NOT a local — its binding is the module static (issue #115).
         options.hoisted_names = std::rc::Rc::new(
             scope
                 .assigned
                 .iter()
                 .chain(scope.needs_mut.iter())
+                .filter(|n| !fn_mutable_globals.contains(*n))
                 .cloned()
                 .collect(),
         );
@@ -1845,6 +1863,11 @@ impl FunctionDef {
             // parse_url(...)` — idna/urllib3): a wildcard, never a hoisted
             // binding — `let mut _;` is not legal Rust.
             if name == "_" {
+                continue;
+            }
+            // A `global`-declared mutable static has no local binding: its
+            // stores go through py_global_write (issue #115).
+            if fn_mutable_globals.contains(name) {
                 continue;
             }
             let ident = crate::safe_ident(name);
@@ -2586,6 +2609,49 @@ fn loop_target_name(target: &ExprType) -> String {
         ExprType::Name(n) => n.id.clone(),
         _ => String::new(),
     }
+}
+
+/// Issue #115: every name this function's body declares `global`,
+/// recursing through control flow but NOT into nested defs (each def is
+/// its own scope with its own declarations).
+fn collect_global_decls(body: &[Statement]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+        for stmt in stmts {
+            match &stmt.statement {
+                StatementType::Global(names) => out.extend(names.iter().cloned()),
+                StatementType::If(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::AsyncFor(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::Try(s) => {
+                    walk(&s.body, out);
+                    for h in &s.handlers {
+                        walk(&h.body, out);
+                    }
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                }
+                StatementType::With(s) => walk(&s.body, out),
+                StatementType::AsyncWith(s) => walk(&s.body, out),
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
 }
 
 /// Issue #115: a module-level name WRITTEN from this function — a `global

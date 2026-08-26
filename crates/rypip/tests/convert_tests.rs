@@ -5855,3 +5855,65 @@ fn bytesio_and_stringio_match_python_at_runtime() {
         "in-memory buffer semantics diverged from CPython"
     );
 }
+
+#[test]
+fn global_writes_mutate_module_state_at_runtime() {
+    // Issue #115: a module-level scalar/None value written by functions
+    // through `global` lowers to a mutable static (`static name:
+    // Mutex<T>`): writes are visible to every later read, module-wide.
+    // `shadow`'s plain local (no `global`) must stay a local.
+    let scratch = Scratch::new("globalw");
+    let file = scratch.path().join("globalw.py");
+    fs::write(
+        &file,
+        concat!(
+            "DEFAULT = None\n",
+            "count = 0\n",
+            "\n",
+            "def setup(v: int) -> None:\n",
+            "    global DEFAULT\n",
+            "    DEFAULT = v\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    global count\n",
+            "    count += 1\n",
+            "\n",
+            "def shadow() -> int:\n",
+            "    total = 5\n",
+            "    return total\n",
+            "\n",
+            "def run() -> int:\n",
+            "    bump()\n",
+            "    bump()\n",
+            "    if DEFAULT is None:\n",
+            "        setup(7)\n",
+            "    print(count)\n",
+            "    print(DEFAULT)\n",
+            "    print(shadow())\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/globalw"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["2", "7", "5"],
+        "global-write semantics diverged from CPython"
+    );
+}
+

@@ -424,6 +424,57 @@ impl<'a> CodeGen for Assign {
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // Issue #115: a store to a `global`-declared name whose module
+            // binding is a MUTABLE static writes THROUGH the static —
+            // py_global_write(&name, v) — instead of binding a local. Only
+            // scopes that own the binding take this path: module scope, or
+            // a function declaring the name `global` (scope_global_writables);
+            // a plain assignment elsewhere stays a local, as in Python.
+            if let ExprType::Name(name) = target
+                && options.scope_global_writables.contains(&name.id)
+                && let Some(boxed) = options.mutable_statics.get(&name.id)
+            {
+                let ident = crate::safe_ident(&name.id);
+                let stored = if *boxed {
+                    if value_is_none_early {
+                        quote!(stdpython::PyValue::None_)
+                    } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {
+                        quote!(#value)
+                    } else if matches!(
+                        &value_expr,
+                        ExprType::List(_) | ExprType::Dict(_) | ExprType::Set(_)
+                            | ExprType::ListComp(_) | ExprType::DictComp(_) | ExprType::SetComp(_)
+                    ) || matches!(
+                        &value_expr,
+                        ExprType::Call(c)
+                            if matches!(
+                                c.func.as_ref(),
+                                ExprType::Name(f) if matches!(
+                                    symbols.get(&f.id),
+                                    Some(crate::SymbolTableNode::ClassDef(_))
+                                )
+                            )
+                    ) {
+                        // A container or class instance has no PyValue
+                        // representation — the store cannot round-trip
+                        // through the boxed global (issue #115 scope).
+                        return Err(format!(
+                            "`global {}` stores a value with no boxed \
+                             representation (a container or class instance); \
+                             mutable module globals hold scalars and None \
+                             only — rython refuses to silently ignore the \
+                             write (issue #115)",
+                            name.id
+                        )
+                        .into());
+                    } else {
+                        quote!(stdpython::PyValue::from(#value))
+                    }
+                } else {
+                    quote!(#value)
+                };
+                return Ok(quote!(stdpython::py_global_write(&#ident, #stored);));
+            }
             // An attribute store target renders in place flavor: in a
             // generic trait default, `self.f = v` must store through the
             // mutable accessor (`*self.f_mut() = v`) rather than the load
