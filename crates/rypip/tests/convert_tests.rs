@@ -1145,6 +1145,290 @@ fn classes_match_python_at_runtime() {
 }
 
 #[test]
+fn isinstance_dispatch_specializes_and_matches_python_at_runtime() {
+    // The isinstance-dispatch idiom end to end: the converter emits one
+    // specialized function per input type (classes get per-CONCRETE-class
+    // variants folded through the inheritance tree, so a Cat argument
+    // takes the `isinstance(x, Animal)` arm while keeping Cat's own
+    // speak() override) plus a generic residual, and call sites dispatch
+    // statically. Output must match CPython exactly.
+    let scratch = Scratch::new("isinstance-dispatch");
+    let file = scratch.path().join("animals.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"...\"\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "class Cat(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"meow\"\n",
+            "\n",
+            "def describe(x):\n",
+            "    if isinstance(x, Dog):\n",
+            "        return x.name + \" is a dog: \" + x.speak()\n",
+            "    if isinstance(x, Animal):\n",
+            "        return x.name + \" is some animal: \" + x.speak()\n",
+            "    if isinstance(x, int):\n",
+            "        return \"the number \" + str(x)\n",
+            "    return \"unknown\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(describe(Dog(\"rex\")))\n",
+            "    print(describe(Cat(\"tom\")))\n",
+            "    print(describe(Animal(\"blob\")))\n",
+            "    print(describe(7))\n",
+            "    print(describe(2.5))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/animals"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "rex is a dog: woof",
+            "tom is some animal: meow",
+            "blob is some animal: ...",
+            "the number 7",
+            "unknown",
+        ],
+        "isinstance dispatch diverged from CPython"
+    );
+}
+
+#[test]
+fn isinstance_dynamic_router_routes_boxed_values_at_runtime() {
+    // The dynamic router end to end: statically-typed call sites still
+    // bind their compile-time morph directly, while a BOXED argument (a
+    // `str | int` return, PyValue at runtime) passes through the
+    // `impl Into<LabelArg>` router under the original function name and
+    // is routed by From<PyValue> in Python's first-true-test order.
+    // Output must match CPython exactly.
+    let scratch = Scratch::new("isinstance-router");
+    let file = scratch.path().join("router.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"...\"\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "def label(x):\n",
+            "    if isinstance(x, str):\n",
+            "        return \"word: \" + x\n",
+            "    if isinstance(x, int):\n",
+            "        return \"count: \" + str(x)\n",
+            "    if isinstance(x, Animal):\n",
+            "        return \"pet \" + x.name + \": \" + x.speak()\n",
+            "    return \"mystery\"\n",
+            "\n",
+            "def pick(flag: bool) -> str | int:\n",
+            "    if flag:\n",
+            "        return \"fox\"\n",
+            "    return 42\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(label(\"fox\"))\n",
+            "    print(label(12))\n",
+            "    print(label(Dog(\"rex\")))\n",
+            "    print(label(2.5))\n",
+            "    print(label(pick(True)))\n",
+            "    print(label(pick(False)))\n",
+            "    print(label(True))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let generated = fs::read_to_string(krate.root.join("src/router.rs")).unwrap();
+    assert!(
+        generated.contains("impl Into<LabelArg>"),
+        "the router must take impl Into<LabelArg>: {}",
+        generated
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/router"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "word: fox",
+            "count: 12",
+            "pet rex: woof",
+            "mystery",
+            "word: fox",
+            "count: 42",
+            // bool ⊂ int: True takes the int arm but str(x) still renders
+            // True — the auto-emitted bool morph keeps the Rust bool.
+            "count: True",
+        ],
+        "dynamic router dispatch diverged from CPython"
+    );
+}
+
+#[test]
+fn router_generalizations_match_python_at_runtime() {
+    // The router generalizations end to end: an untested extra parameter
+    // passes through the router positionally (`tag`), diverging morph
+    // returns land through the output enum and box at the call site
+    // (`flip` — a boxed argument yields Python's `int | str` union), and
+    // SEVERAL isinstance-tested parameters cross-product into per-combo
+    // morphs with per-axis numbered enums (`pair` — static, mixed
+    // static/boxed, and fully boxed calls). Output must match CPython
+    // exactly.
+    let scratch = Scratch::new("router-general");
+    let file = scratch.path().join("routergen.py");
+    fs::write(
+        &file,
+        concat!(
+            "def pick(flag: bool) -> str | int:\n",
+            "    if flag:\n",
+            "        return \"fox\"\n",
+            "    return 42\n",
+            "\n",
+            "def tag(x, prefix: str):\n",
+            "    if isinstance(x, str):\n",
+            "        return prefix + \": \" + x\n",
+            "    if isinstance(x, int):\n",
+            "        return prefix + \" #\" + str(x)\n",
+            "    return prefix + \"?\"\n",
+            "\n",
+            "def flip(x):\n",
+            "    if isinstance(x, str):\n",
+            "        return len(x)\n",
+            "    if isinstance(x, int):\n",
+            "        return str(x)\n",
+            "    return 0\n",
+            "\n",
+            "def pair(a, b):\n",
+            "    if isinstance(a, str):\n",
+            "        if isinstance(b, int):\n",
+            "            return a + \" x\" + str(b)\n",
+            "        return a + \" ?\"\n",
+            "    if isinstance(a, int):\n",
+            "        if isinstance(b, int):\n",
+            "            return str(a * b)\n",
+            "        return str(a)\n",
+            "    return \"neither\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(tag(\"fox\", \"word\"))\n",
+            "    print(tag(9, \"num\"))\n",
+            "    print(tag(2.5, \"odd\"))\n",
+            "    print(tag(pick(True), \"dyn\"))\n",
+            "    print(tag(pick(False), \"dyn\"))\n",
+            "    print(flip(\"fox\"))\n",
+            "    print(flip(7))\n",
+            "    print(flip(pick(True)))\n",
+            "    print(flip(pick(False)))\n",
+            "    print(flip(2.5))\n",
+            "    print(pair(\"fox\", 3))\n",
+            "    print(pair(\"fox\", 2.5))\n",
+            "    print(pair(2, 3))\n",
+            "    print(pair(2, \"z\"))\n",
+            "    print(pair(2.5, 1))\n",
+            "    print(pair(pick(True), 3))\n",
+            "    print(pair(pick(False), pick(False)))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let generated = fs::read_to_string(krate.root.join("src/routergen.rs")).unwrap();
+    for shape in [
+        "prefix: impl Into<String>",
+        "enum FlipOut",
+        "enum PairArg1",
+        "enum PairArg2",
+        "pub fn pair(a: impl Into<PairArg1>, b: impl Into<PairArg2>)",
+    ] {
+        assert!(
+            generated.contains(shape),
+            "missing {shape}: {}",
+            generated
+        );
+    }
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/routergen"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "word: fox",
+            "num #9",
+            "odd?",
+            "dyn: fox",
+            "dyn #42",
+            "3",
+            "7",
+            "3",
+            "42",
+            "0",
+            "fox x3",
+            "fox ?",
+            "6",
+            "2",
+            "neither",
+            "fox x3",
+            "1764",
+        ],
+        "generalized router dispatch diverged from CPython"
+    );
+}
+
+#[test]
 fn inference_seed_unification_and_return_unification_at_runtime() {
     // Parameter type inference end to end: a literal-seeded accumulator
     // concretizes the loop element (`best = ""` → Item = String; `s = 0`
@@ -5634,5 +5918,408 @@ fn bytesio_and_stringio_match_python_at_runtime() {
             .collect::<Vec<_>>(),
         vec!["1", "!eeded", "eeded", "no_std file I/O"],
         "in-memory buffer semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn global_writes_mutate_module_state_at_runtime() {
+    // Issue #115: a module-level scalar/None value written by functions
+    // through `global` lowers to a mutable static (`static name:
+    // Mutex<T>`): writes are visible to every later read, module-wide.
+    // `shadow`'s plain local (no `global`) must stay a local.
+    let scratch = Scratch::new("globalw");
+    let file = scratch.path().join("globalw.py");
+    fs::write(
+        &file,
+        concat!(
+            "DEFAULT = None\n",
+            "count = 0\n",
+            "\n",
+            "def setup(v: int) -> None:\n",
+            "    global DEFAULT\n",
+            "    DEFAULT = v\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    global count\n",
+            "    count += 1\n",
+            "\n",
+            "def shadow() -> int:\n",
+            "    total = 5\n",
+            "    return total\n",
+            "\n",
+            "def run() -> int:\n",
+            "    bump()\n",
+            "    bump()\n",
+            "    if DEFAULT is None:\n",
+            "        setup(7)\n",
+            "    print(count)\n",
+            "    print(DEFAULT)\n",
+            "    print(shadow())\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/globalw"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["2", "7", "5"],
+        "global-write semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn field_from_cross_module_call_result_attribute() {
+    // Issue #123: `self.bin_dir = scheme.scripts` where `scheme` is the
+    // result of a call into a SIBLING module returning a frozen dataclass
+    // (pip's Prefix over get_scheme -> Scheme). Needs call-return typing,
+    // dataclass __init__ synthesis, AND the stored-parameter clone
+    // (`self.path = path` followed by a later read of `path`).
+    let scratch = Scratch::new("xmodfield");
+    let root = scratch.path().join("pkg");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("__init__.py"),
+        concat!(
+            "from locations import get_scheme\n",
+            "\n",
+            "class Prefix:\n",
+            "    def __init__(self, path: str) -> None:\n",
+            "        self.path = path\n",
+            "        scheme = get_scheme(path)\n",
+            "        self.bin_dir = scheme.scripts\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = Prefix(\"x\")\n",
+            "    print(p.bin_dir)\n",
+            "    print(p.path)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("locations.py"),
+        concat!(
+            "from dataclasses import dataclass\n",
+            "\n",
+            "@dataclass(frozen=True)\n",
+            "class Scheme:\n",
+            "    platlib: str\n",
+            "    purelib: str\n",
+            "    scripts: str\n",
+            "\n",
+            "def get_scheme(x: str) -> Scheme:\n",
+            "    return Scheme(\"a\", \"b\", \"c\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&root).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["c", "x"],
+        "cross-module field typing diverged from CPython"
+    );
+}
+
+#[test]
+fn module_level_argparse_with_short_aliases_matches_python() {
+    // Issue #118: certifi's __main__.py shape — the parser built at
+    // MODULE level (not inside a function), with -short/--long alias
+    // pairs. The conversion-time rewrite moves the typed-namespace
+    // destructure into __module_init__; the runtime handles short
+    // options (exact, attached value) and rejects unknown option-like
+    // tokens instead of consuming them as positionals.
+    let scratch = Scratch::new("argmod");
+    let file = scratch.path().join("argmod.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "parser = argparse.ArgumentParser(prog=\"certifi\")\n",
+            "parser.add_argument(\"-c\", \"--contents\", action=\"store_true\", help=\"print contents\")\n",
+            "parser.add_argument(\"-s\", \"--scale\", type=float, default=1.0)\n",
+            "args = parser.parse_args()\n",
+            "if args.contents:\n",
+            "    print(\"contents\", args.scale)\n",
+            "else:\n",
+            "    print(\"where\", args.scale)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/argmod");
+
+    // --help: python3's exact text (3.11 format), exit 0.
+    let output = Command::new(&bin).arg("--help").output().expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: certifi [-h] [-c] [-s SCALE]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -c, --contents        print contents\n",
+            "  -s SCALE, --scale SCALE\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    // Verified against python3.
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "where 1.0\n"),
+        (&["-c"], "contents 1.0\n"),
+        (&["-s", "2.5"], "where 2.5\n"),
+        (&["-s2.5", "--contents"], "contents 2.5\n"),
+    ];
+    for (argv, expected) in cases {
+        let output = Command::new(&bin).args(*argv).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "args: {:?}", argv);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            *expected,
+            "args: {:?}",
+            argv
+        );
+    }
+
+    // An unknown option-like token is an error, never a positional.
+    // Verified against python3.
+    let output = Command::new(&bin).arg("-x").output().expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: certifi [-h] [-c] [-s SCALE]\n",
+            "certifi: error: unrecognized arguments: -x\n",
+        ),
+        "error output diverged from CPython"
+    );
+}
+
+#[test]
+fn range_replace_and_range_delete_match_python_at_runtime() {
+    // Issue #153: `xs[a:b] = R` and `del xs[a:b]` — in-place range
+    // replacement with Python's exact bound rules: different-length RHS
+    // inserts/removes, an inverted range is an insertion point, negatives
+    // count from the end, out-of-range bounds clamp, `xs[:] = R` replaces
+    // everything.
+    let scratch = Scratch::new("splice");
+    let file = scratch.path().join("splice.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    xs = [1, 2, 3, 4]\n",
+            "    xs[1:3] = [9]\n",
+            "    print(xs)\n",
+            "    xs[1:1] = [7, 8]\n",
+            "    print(xs)\n",
+            "    xs[-2:] = [0]\n",
+            "    print(xs)\n",
+            "    xs[10:20] = [5]\n",
+            "    print(xs)\n",
+            "    xs[3:1] = [6]\n",
+            "    print(xs)\n",
+            "    del xs[1:3]\n",
+            "    print(xs)\n",
+            "    del xs[-2:]\n",
+            "    print(xs)\n",
+            "    del xs[5:9]\n",
+            "    print(xs)\n",
+            "    ys = [1, 2, 3]\n",
+            "    ys[:] = [4]\n",
+            "    print(ys)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/splice"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "[1, 9, 4]",
+            "[1, 7, 8, 9, 4]",
+            "[1, 7, 8, 0]",
+            "[1, 7, 8, 0, 5]",
+            "[1, 7, 8, 6, 0, 5]",
+            "[1, 6, 0, 5]",
+            "[1, 6]",
+            "[1, 6]",
+            "[4]",
+        ],
+        "range-replace semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn iter_sentinel_form_matches_python_at_runtime() {
+    // Issue #155: `for chunk in iter(callable, sentinel):` — the
+    // two-argument iter() calls the callable until it returns the
+    // sentinel (botocore's chunked payload reads). The producer advances
+    // through a `global` counter, so this also exercises the mutable
+    // module statics end to end.
+    let scratch = Scratch::new("itersent");
+    let file = scratch.path().join("itersent.py");
+    fs::write(
+        &file,
+        concat!(
+            "pos = 0\n",
+            "\n",
+            "def read_chunk() -> str:\n",
+            "    global pos\n",
+            "    if pos >= 4:\n",
+            "        return \"\"\n",
+            "    pos = pos + 1\n",
+            "    return str(pos)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    total = \"\"\n",
+            "    for chunk in iter(read_chunk, \"\"):\n",
+            "        total = total + chunk\n",
+            "    print(total)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/itersent"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["1234"],
+        "iter(callable, sentinel) semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn varargs_pack_forward_and_index_match_python_at_runtime() {
+    // Issue #120: `*args` is the boxed heterogeneous list (Vec<PyValue>).
+    // Call sites pack extra positionals boxed; `f(*args)` forwards the
+    // vector; len/index work in the body; a `*args, **kwargs` stub takes
+    // extra keywords into its dict.
+    let scratch = Scratch::new("varargs");
+    let file = scratch.path().join("varargs.py");
+    fs::write(
+        &file,
+        concat!(
+            "def tag(*args) -> int:\n",
+            "    return len(args)\n",
+            "\n",
+            "def fwd(*args) -> int:\n",
+            "    return tag(*args)\n",
+            "\n",
+            "def first(prefix: str, *args) -> str:\n",
+            "    if len(args) > 0:\n",
+            "        return prefix + str(args[0])\n",
+            "    return prefix\n",
+            "\n",
+            "def stub(*args, **kwargs) -> int:\n",
+            "    return len(args) + len(kwargs)\n",
+            "\n",
+            "def mixed(a: int, *args, b: int = 5) -> int:\n",
+            "    return a * 100 + len(args) * 10 + b\n",
+            "\n",
+            "def required(a: int, *args, b: int) -> int:\n",
+            "    return a * 100 + len(args) * 10 + b\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(tag(1, \"x\", True))\n",
+            "    print(fwd(1, \"x\"))\n",
+            "    print(tag())\n",
+            "    print(first(\"v=\"))\n",
+            "    print(first(\"v=\", 7, 8))\n",
+            "    print(stub(1, 2, x=3))\n",
+            "    print(mixed(1, 2, b=9))\n",
+            "    print(mixed(1, 2, 3))\n",
+            "    print(required(1, 2, b=3))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/varargs"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["3", "2", "0", "v=", "v=7", "3", "119", "125", "113"],
+        "*args semantics diverged from CPython"
     );
 }

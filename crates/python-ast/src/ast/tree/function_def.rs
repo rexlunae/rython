@@ -50,8 +50,11 @@ impl PyStatementTrait for FunctionDef {
 }
 
 /// One add_argument spec collected at conversion time.
-struct ArgparseSpec {
+pub(crate) struct ArgparseSpec {
     name: String,
+    /// The short alias of `add_argument("-c", "--contents", ...)`
+    /// (issue #118 — certifi's __main__); None otherwise.
+    short: Option<String>,
     kind: &'static str, // "Str" | "Int" | "Float" | "StoreTrue"
     default: Option<ExprType>,
     help: Option<String>,
@@ -62,10 +65,10 @@ struct ArgparseSpec {
 /// literal specs. ArgumentParser/add_argument/parse_args are evaluated
 /// HERE, at conversion time — only literal specs can shape the typed
 /// namespace struct, so anything dynamic is a loud error.
-struct ArgparseRewrite {
-    skip: std::collections::HashSet<usize>,
-    parse_index: usize,
-    args_var: String,
+pub(crate) struct ArgparseRewrite {
+    pub(crate) skip: std::collections::HashSet<usize>,
+    pub(crate) parse_index: usize,
+    pub(crate) args_var: String,
     prog: Option<String>,
     description: Option<String>,
     specs: Vec<ArgparseSpec>,
@@ -81,7 +84,7 @@ fn literal_str(e: &ExprType) -> Option<String> {
     }
 }
 
-fn scan_argparse(
+pub(crate) fn scan_argparse(
     body: &[Statement],
 ) -> Result<Option<ArgparseRewrite>, Box<dyn std::error::Error>> {
     // Find `<var> = argparse.ArgumentParser(...)`.
@@ -169,23 +172,48 @@ fn scan_argparse(
                 if parse.is_some() {
                     return Err("add_argument after parse_args is not supported".into());
                 }
-                let [name_expr] = call.args.as_slice() else {
-                    return Err(
-                        "add_argument takes exactly one name (short aliases are not \
-                         supported yet)"
-                            .into(),
-                    );
+                // One name (`"count"`, `"--verbose"`), or a short+long
+                // alias pair (`"-c", "--contents"` — certifi, issue #118).
+                let (short, name) = match call.args.as_slice() {
+                    [name_expr] => {
+                        let name = literal_str(name_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        if name.starts_with('-') && !name.starts_with("--") {
+                            return Err(format!(
+                                "add_argument: short option '{}' needs a --long \
+                                 alias (the long name is the namespace attribute)",
+                                name
+                            )
+                            .into());
+                        }
+                        (None, name)
+                    }
+                    [short_expr, long_expr] => {
+                        let short = literal_str(short_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        let long = literal_str(long_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        if !short.starts_with('-')
+                            || short.starts_with("--")
+                            || !long.starts_with("--")
+                        {
+                            return Err(format!(
+                                "add_argument('{}', '{}'): a two-name argument must \
+                                 be a -short, --long alias pair",
+                                short, long
+                            )
+                            .into());
+                        }
+                        (Some(short), long)
+                    }
+                    _ => {
+                        return Err(
+                            "add_argument takes one name, or a -short, --long alias \
+                             pair"
+                                .into(),
+                        );
+                    }
                 };
-                let name = literal_str(name_expr)
-                    .ok_or("add_argument: the name must be a string literal")?;
-                if name.starts_with('-') && !name.starts_with("--") {
-                    return Err(format!(
-                        "add_argument: short option '{}' is not supported yet; use the \
-                         --long form",
-                        name
-                    )
-                    .into());
-                }
                 let mut kind: Option<&'static str> = None;
                 let mut default = None;
                 let mut help = None;
@@ -268,6 +296,7 @@ fn scan_argparse(
                 }
                 specs.push(ArgparseSpec {
                     name,
+                    short,
                     kind,
                     default,
                     help,
@@ -321,7 +350,7 @@ fn scan_argparse(
 /// Emit the parse_args replacement: a namespace struct typed from the
 /// specs, the run_parser call, and the destructuring assignment into
 /// the (hoisted) namespace variable.
-fn lower_parse_args(
+pub(crate) fn lower_parse_args(
     rw: &ArgparseRewrite,
     ctx: &CodeGenContext,
     options: &PythonOptions,
@@ -363,8 +392,13 @@ fn lower_parse_args(
             Some(h) => quote!(Some(#h)),
             None => quote!(None),
         };
+        let short = match &spec.short {
+            Some(s) => quote!(Some(#s)),
+            None => quote!(None),
+        };
         spec_tokens.push(quote!(argparse::ArgSpec {
             name: #name,
+            short: #short,
             kind: argparse::ArgKind::#kind,
             default: #default,
             help: #help,
@@ -502,13 +536,381 @@ impl CodeGen for FunctionDef {
         if depth > 50 && depth % 10 == 0 {
         }
         FN_DEPTH.with(|d| d.set(depth + 1));
-        let result = self.to_rust_inner(ctx, options, symbols);
+        // A module function registered for isinstance specialization
+        // (specialize.rs) renders as its variants + residual instead of
+        // one generic definition. Methods and nested defs never register.
+        let result = if !options.rendering_specialization
+            && matches!(ctx, CodeGenContext::Module(_))
+            && options.specialized_fns.contains_key(&self.name)
+        {
+            let spec = options.specialized_fns.get(&self.name).unwrap().clone();
+            self.render_specializations(spec, ctx, options, symbols)
+        } else {
+            self.to_rust_inner(ctx, options, symbols)
+        };
         FN_DEPTH.with(|d| d.set(depth));
         return result;
     }
 }
 
 impl FunctionDef {
+    /// Emit the monomorphized variants of an isinstance-dispatched
+    /// function (specialize.rs): one definition per tested type with the
+    /// axis parameter ANNOTATED as that type — the isinstance checks fold
+    /// to constants through the inheritance tree and dead arms are pruned
+    /// before rendering — plus the `__any` residual, whose axis stays
+    /// generic and whose tested arms are removed at the AST level.
+    fn render_specializations(
+        self,
+        spec: crate::ast::tree::specialize::SpecializedFn,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let mut out = TokenStream::new();
+        let mut vopts = options.clone();
+        vopts.rendering_specialization = true;
+        use crate::ast::tree::specialize::{
+            fold_morph_body, mangled_name, target_typeinfo, SpecializedFn,
+        };
+        // One morph per assignment in the cartesian product over axes:
+        // per tested BUILTIN type and per concrete class in the tested
+        // subtrees (a Cat argument gets describe_cat with `x: Cat`,
+        // keeping Cat's own overrides — Rust structs have no subtyping
+        // to flow through an Animal-typed variant), plus Any per axis;
+        // the all-Any assignment is the residual.
+        let assignments = spec.morph_assignments();
+        for assignment in &assignments {
+            let suffix = SpecializedFn::assignment_suffix(assignment);
+            let mut variant = self.clone();
+            variant.name = mangled_name(&self.name, &suffix);
+            let mut seeds: Vec<(String, crate::TypeInfo)> = Vec::new();
+            let mut unassigned: Vec<String> = Vec::new();
+            for (axis, a) in spec.axes.iter().zip(assignment) {
+                match a {
+                    Some(target) => {
+                        variant.args.args[axis.index].annotation = Some(Box::new(
+                            crate::ExprType::Name(crate::ast::tree::name::Name {
+                                id: target.suffix().to_string(),
+                            }),
+                        ));
+                        if let Some(ti) = target_typeinfo(target) {
+                            seeds.push((axis.name.clone(), ti));
+                        }
+                    }
+                    None => unassigned.push(axis.name.clone()),
+                }
+            }
+            variant.body = fold_morph_body(&self.body, &spec, assignment, &symbols);
+            // The original carries no return annotation (its tested
+            // params were unannotated); the folded morph needs one so
+            // the annotated machinery types the returns. An Any axis has
+            // no seed — derivation then fails for returns involving it,
+            // and the ordinary inference machinery takes over.
+            if variant.returns.is_none() {
+                variant.returns = crate::ast::tree::specialize::derive_return_annotation(
+                    &variant.body,
+                    &seeds,
+                    &options,
+                    &symbols,
+                )
+                .map(Box::new);
+            }
+            crate::ast::tree::specialize::underscore_unused_params(&mut variant);
+            let mut mopts = vopts.clone();
+            if !unassigned.is_empty() {
+                // Any leftover isinstance render on an Any axis (a shape
+                // the fold does not cover) lowers to false — the residual
+                // semantics for that axis.
+                let mut fold = options.residual_fold_false.as_ref().clone();
+                fold.extend(unassigned);
+                mopts.residual_fold_false = std::rc::Rc::new(fold);
+            }
+            out.extend(variant.to_rust(ctx.clone(), mopts, symbols.clone())?);
+        }
+
+        // ---- The dynamic router ----
+        // A closed-world argument enum (one variant per morph, plus a
+        // boxed Other) and a function under the ORIGINAL Python name that
+        // matches on it: runtime dispatch over the compile-time morphs,
+        // for boxed values and for Rust callers with runtime-varying
+        // data. Emitted only when every morph derived the same return
+        // type (planned at detection time).
+        if let Some(router) = &spec.router
+            && options.with_std_python
+        {
+            use crate::ast::tree::specialize::{
+                py_id_boxable, py_type_tokens, to_pascal, RouterReturn, SpecTarget,
+            };
+            use quote::format_ident;
+            let orig_ident = crate::safe_ident(&self.name);
+            let enum_idents: Vec<proc_macro2::Ident> = router
+                .enum_names
+                .iter()
+                .map(|n| crate::safe_ident(n))
+                .collect();
+            let variant_ident = |t: &SpecTarget| -> proc_macro2::Ident {
+                crate::safe_ident(&match t {
+                    SpecTarget::Builtin(b) => to_pascal(b),
+                    SpecTarget::Class(c) => c.clone(),
+                })
+            };
+
+            // The non-axis parameters pass through positionally: an int
+            // extra is `n: i64`, a str extra keeps the annotated-fn shape
+            // `s: impl Into<String>` so string literals still call
+            // directly, and morphs (whose annotated str parameters take
+            // the same shape) receive the generic value unchanged. Each
+            // AXIS parameter takes `impl Into<{F}ArgN>`, and the arm
+            // forwards its binding v1/v2/...
+            let extra_param_ty = |id: &str| -> TokenStream {
+                match id {
+                    "str" => quote!(impl Into<String>),
+                    other => py_type_tokens(other),
+                }
+            };
+            let mut sig_params = TokenStream::new();
+            let mut forward_args: Vec<TokenStream> = Vec::new();
+            let mut axis_arg_idents: Vec<proc_macro2::Ident> = Vec::new();
+            for (i, p) in self.args.args.iter().enumerate() {
+                if let Some(k) = spec.axes.iter().position(|a| a.index == i) {
+                    let ident = crate::safe_ident(&p.arg);
+                    let e = &enum_idents[k];
+                    sig_params.extend(quote!(#ident: impl Into<#e>,));
+                    axis_arg_idents.push(ident);
+                    let v = format_ident!("v{}", k + 1);
+                    forward_args.push(quote!(#v));
+                    continue;
+                }
+                let (_, name, id) = router
+                    .extra_params
+                    .iter()
+                    .find(|(idx, _, _)| *idx == i)
+                    .expect("plan_router covered every non-axis parameter");
+                let ident = crate::safe_ident(name);
+                let ty = extra_param_ty(id);
+                sig_params.extend(quote!(#ident: #ty,));
+                forward_args.push(quote!(#ident));
+            }
+
+            // The return shape: the unified type, or the OUTPUT enum
+            // (one variant per distinct morph return type, From<T> per
+            // member) — a runtime-dispatched result then lands as a
+            // matchable value, and as a boxed PyValue when every member
+            // is boxable (Python's `str | int` union).
+            let (ret_ty, out_enum_stream, wrap_result) = match &router.ret {
+                RouterReturn::Unified(id) => {
+                    (py_type_tokens(id), TokenStream::new(), false)
+                }
+                RouterReturn::Enum { name, members } => {
+                    let out_ident = crate::safe_ident(name);
+                    let mut out_variants = TokenStream::new();
+                    let mut out_from = TokenStream::new();
+                    let mut pv_arms = TokenStream::new();
+                    for m in members {
+                        let var = crate::safe_ident(&if py_id_boxable(m) {
+                            to_pascal(m)
+                        } else {
+                            m.clone()
+                        });
+                        let ty = py_type_tokens(m);
+                        out_variants.extend(quote!(#var(#ty),));
+                        out_from.extend(quote! {
+                            impl From<#ty> for #out_ident {
+                                fn from(v: #ty) -> Self {
+                                    #out_ident::#var(v)
+                                }
+                            }
+                        });
+                        pv_arms.extend(quote! {
+                            #out_ident::#var(v) => stdpython::PyValue::from(v),
+                        });
+                    }
+                    // Every member boxable → the result converts to the
+                    // boxed PyValue, which is exactly Python's union
+                    // return — generated call sites consume it that way.
+                    let pv_impl = if members.iter().all(|m| py_id_boxable(m)) {
+                        quote! {
+                            impl From<#out_ident> for stdpython::PyValue {
+                                fn from(v: #out_ident) -> Self {
+                                    match v { #pv_arms }
+                                }
+                            }
+                        }
+                    } else {
+                        TokenStream::new()
+                    };
+                    let out_doc = format!(
+                        "The result of `{}`'s dynamic router: one variant \
+                         per distinct morph return type.",
+                        self.name
+                    );
+                    let stream = quote! {
+                        #[doc = #out_doc]
+                        #[derive(Clone)]
+                        pub enum #out_ident {
+                            #out_variants
+                        }
+                        #out_from
+                        #pv_impl
+                    };
+                    (quote!(#out_ident), stream, true)
+                }
+            };
+
+            // One argument enum PER AXIS, each with its variants plus
+            // `Other(PyValue)`, From<T> per variant, and the boxed
+            // From<PyValue> routing.
+            let mut axis_enum_streams = TokenStream::new();
+            for (k, axis) in spec.axes.iter().enumerate() {
+                let enum_ident = &enum_idents[k];
+                let mut enum_variants = TokenStream::new();
+                let mut from_impls = TokenStream::new();
+                let mut boxed_arms = TokenStream::new();
+                let mut has_bool_morph = false;
+                let mut has_int_morph = false;
+                for target in axis.variants() {
+                    let var_ident = variant_ident(&target);
+                    let ty = py_type_tokens(target.suffix());
+                    enum_variants.extend(quote!(#var_ident(#ty),));
+                    from_impls.extend(quote! {
+                        impl From<#ty> for #enum_ident {
+                            fn from(v: #ty) -> Self {
+                                #enum_ident::#var_ident(v)
+                            }
+                        }
+                    });
+                    if let SpecTarget::Builtin(b) = &target {
+                        match b.as_str() {
+                            "bool" => has_bool_morph = true,
+                            "int" => has_int_morph = true,
+                            _ => {}
+                        }
+                        let pv_variant = crate::safe_ident(&to_pascal(b));
+                        boxed_arms.extend(quote! {
+                            stdpython::PyValue::#pv_variant(v) =>
+                                #enum_ident::#var_ident(v),
+                        });
+                        if b == "str" {
+                            // Convenience for Rust callers with &str
+                            // literals.
+                            from_impls.extend(quote! {
+                                impl From<&str> for #enum_ident {
+                                    fn from(v: &str) -> Self {
+                                        #enum_ident::#var_ident(v.to_string())
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                // bool ⊂ int is handled at DETECTION time: an int-tested
+                // axis always carries a bool morph of its own
+                // (detect_specializable), so a boxed bool routes to a
+                // genuine bool-typed body and `str(x)` renders
+                // True/False exactly like CPython.
+                debug_assert!(
+                    has_bool_morph || !has_int_morph,
+                    "an int morph implies a bool morph (detect_specializable)"
+                );
+                let enum_doc = format!(
+                    "The dispatch argument for `{}`'s parameter `{}`: one \
+                     variant per compile-time morph, `Other` for \
+                     everything else.",
+                    self.name, axis.name
+                );
+                axis_enum_streams.extend(quote! {
+                    #[doc = #enum_doc]
+                    #[derive(Clone)]
+                    pub enum #enum_ident {
+                        #enum_variants
+                        Other(stdpython::PyValue),
+                    }
+                    #from_impls
+                    impl #enum_ident {
+                        /// Route a BOXED runtime value to its morph.
+                        pub fn from_py_value(v: stdpython::PyValue) -> Self {
+                            match v {
+                                #boxed_arms
+                                other => #enum_ident::Other(other),
+                            }
+                        }
+                    }
+                    impl From<stdpython::PyValue> for #enum_ident {
+                        fn from(v: stdpython::PyValue) -> Self {
+                            Self::from_py_value(v)
+                        }
+                    }
+                });
+            }
+
+            // The dispatch match: one arm per morph assignment (the
+            // cartesian product covers every combination, so the match
+            // is exhaustive without a wildcard).
+            let arm_body = |call: TokenStream| -> TokenStream {
+                if wrap_result {
+                    quote!(Ok(#ret_ty::from((#call)?)))
+                } else {
+                    call
+                }
+            };
+            let mut match_arms = TokenStream::new();
+            for assignment in &assignments {
+                let suffix = SpecializedFn::assignment_suffix(assignment);
+                let morph = crate::safe_ident(&mangled_name(&self.name, &suffix));
+                let pats: Vec<TokenStream> = assignment
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| {
+                        let e = &enum_idents[k];
+                        let v = format_ident!("v{}", k + 1);
+                        match a {
+                            Some(t) => {
+                                let var = variant_ident(t);
+                                quote!(#e::#var(#v))
+                            }
+                            None => quote!(#e::Other(#v)),
+                        }
+                    })
+                    .collect();
+                let call = arm_body(quote!(#morph(#(#forward_args),*)));
+                if pats.len() == 1 {
+                    let p = &pats[0];
+                    match_arms.extend(quote!(#p => #call,));
+                } else {
+                    match_arms.extend(quote!((#(#pats),*) => #call,));
+                }
+            }
+            let scrutinee = if axis_arg_idents.len() == 1 {
+                let a = &axis_arg_idents[0];
+                quote!(#a.into())
+            } else {
+                let parts = axis_arg_idents.iter().map(|a| quote!(#a.into()));
+                quote!((#(#parts),*))
+            };
+
+            let router_doc = format!(
+                "Dynamic router for `{}`: dispatches runtime-typed \
+                 argument(s) to the compile-time morphs, in Python's \
+                 first-true-test order per parameter.",
+                self.name
+            );
+            out.extend(quote! {
+                #axis_enum_streams
+                #out_enum_stream
+                #[doc = #router_doc]
+                pub fn #orig_ident(
+                    #sig_params
+                ) -> Result<#ret_ty, PyException> {
+                    match #scrutinee {
+                        #match_arms
+                    }
+                }
+            });
+        }
+        Ok(out)
+    }
+
     fn to_rust_inner(
         self,
         ctx: CodeGenContext,
@@ -517,6 +919,32 @@ impl FunctionDef {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
+
+        // Issue #119: a MODULE-level `__getattr__` / `__dir__` implements
+        // the module attribute protocol (PEP 562) — a dynamic fallback for
+        // attribute reads that rython cannot model (module attributes
+        // resolve statically at conversion time). Lowering the definition
+        // as an ordinary function produces dead code that misstates the
+        // module's behavior, so the definition is a loud error naming the
+        // dunder and the fix.
+        let is_module_ctx = matches!(&ctx, CodeGenContext::Module(_))
+            || matches!(
+                &ctx,
+                CodeGenContext::Async(inner)
+                    if matches!(inner.as_ref(), CodeGenContext::Module(_))
+            );
+        if is_module_ctx && (self.name == "__getattr__" || self.name == "__dir__") {
+            return Err(format!(
+                "module-level `{}` implements the module attribute protocol \
+                 (PEP 562), which is not supported yet: rython resolves module \
+                 attributes statically at conversion time, so the dynamic \
+                 fallback could never run; define or import the module's \
+                 attributes explicitly and remove the `{}` definition — rython \
+                 refuses to silently ignore it (issue #119)",
+                self.name, self.name
+            )
+            .into());
+        }
 
         // A `@typing.overload` STUB (`def f(x: int = ...) -> int: ...`) is
         // compile-time metadata: its `...` defaults and `...` body are
@@ -533,12 +961,15 @@ impl FunctionDef {
         }
 
         // Issue #115: `global x` declares module scope. Reads resolve to
-        // the module statics; WRITES need mutable module state, which
-        // rython does not model (module-level reassignment lowers to
-        // __module_init__ locals invisible to functions) — the writes are
-        // no-ops, surfaced through the -W channel (issue #115, a documented
-        // divergence; the read side still resolves the module static).
-        if let Some(name) = global_write_error(&self.body) {
+        // the module statics. A written global whose module binding
+        // qualified as a MUTABLE static (module.rs's
+        // module_global_mutable_names: a single scalar/None module store)
+        // writes THROUGH the static — py_global_write — with no warning.
+        // A write to any OTHER global keeps the documented divergence: the
+        // write is a no-op, surfaced through the -W channel.
+        if let Some(name) = global_write_error(&self.body)
+            && !options.mutable_statics.contains_key(&name)
+        {
             options.definition_warnings.borrow_mut().push(format!(
                 "function `{}` writes to module-level name `{name}`: the write is \
                  dropped (issue #115 — rython has no mutable module state visible \
@@ -546,6 +977,14 @@ impl FunctionDef {
                 self.name
             ));
         }
+        // The `global` names this function declares that ARE mutable
+        // statics: its stores route through py_global_write, and their
+        // bindings are the module statics — never hoisted locals.
+        let fn_mutable_globals: std::collections::HashSet<String> =
+            collect_global_decls(&self.body)
+                .into_iter()
+                .filter(|n| options.mutable_statics.contains_key(n))
+                .collect();
         // Issue #112: `del name` lowers to a no-op, which is faithful ONLY
         // while the name is never referenced afterwards — this pass makes
         // any such use a loud error (and a reassignment/import clears the
@@ -866,15 +1305,22 @@ impl FunctionDef {
         // Optional annotation) are visible to every assignment in the body:
         // their non-None stores wrap in Some.
         let mut options = options;
+        // Issue #115: this function may write exactly the mutable statics
+        // its own `global` statements declare; every other scope's
+        // grant (the module's all-of-them default in particular) does not
+        // apply inside this body.
+        options.scope_global_writables = std::rc::Rc::new(fn_mutable_globals.clone());
         // Names managed by this function's prologue: hoisted assignments
         // plus mutable parameters. A `for`-loop target on one of these
         // lowers to a store into the hoisted binding, never a shadowing
-        // fresh binding (issue #80).
+        // fresh binding (issue #80). A `global`-declared mutable static is
+        // NOT a local — its binding is the module static (issue #115).
         options.hoisted_names = std::rc::Rc::new(
             scope
                 .assigned
                 .iter()
                 .chain(scope.needs_mut.iter())
+                .filter(|n| !fn_mutable_globals.contains(*n))
                 .cloned()
                 .collect(),
         );
@@ -1167,6 +1613,15 @@ impl FunctionDef {
                         Box::new(crate::TypeInfo::PyValue),
                     ));
             }
+            // Issue #120: the *args parameter is the boxed heterogeneous
+            // list (`Vec<PyValue>`): extra positional arguments pack into
+            // it at call sites; len/index/iterate yield PyValue.
+            if let Some(vararg) = &self.args.vararg {
+                info.name_types.insert(
+                    vararg.arg.clone(),
+                    crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+                );
+            }
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
@@ -1358,6 +1813,30 @@ impl FunctionDef {
             final_param_types.insert(name.clone(), quote!(Option<()>));
         }
         options.param_type_vars = std::rc::Rc::new(final_param_types);
+        // An INFERRED String return needs the same literal-owning
+        // treatment as an annotated `-> str`: `return "pos"` in a generic
+        // function whose return type unified to String must own the
+        // &'static str (to_string), or the declared Result<String>
+        // mismatches at build time.
+        if inferred_signature
+            .return_type
+            .as_ref()
+            .is_some_and(|t| t.to_string() == "String")
+            && !options.clone_str_attribute_returns
+        {
+            options.clone_str_attribute_returns = true;
+            let mut locals = std::collections::HashMap::new();
+            collect_local_types(&effective_body, &mut locals);
+            options.str_literal_locals = std::rc::Rc::new(
+                locals
+                    .into_iter()
+                    .filter(|(_, ty)| {
+                        ty.to_string() == quote!(&'static str).to_string()
+                    })
+                    .map(|(name, _)| name)
+                    .collect(),
+            );
+        }
         options.param_method_params =
             std::rc::Rc::new(inferred_signature.method_params.clone());
         options.duck_methods_on_params =
@@ -1427,6 +1906,11 @@ impl FunctionDef {
             // parse_url(...)` — idna/urllib3): a wildcard, never a hoisted
             // binding — `let mut _;` is not legal Rust.
             if name == "_" {
+                continue;
+            }
+            // A `global`-declared mutable static has no local binding: its
+            // stores go through py_global_write (issue #115).
+            if fn_mutable_globals.contains(name) {
                 continue;
             }
             let ident = crate::safe_ident(name);
@@ -2168,6 +2652,49 @@ fn loop_target_name(target: &ExprType) -> String {
         ExprType::Name(n) => n.id.clone(),
         _ => String::new(),
     }
+}
+
+/// Issue #115: every name this function's body declares `global`,
+/// recursing through control flow but NOT into nested defs (each def is
+/// its own scope with its own declarations).
+fn collect_global_decls(body: &[Statement]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+        for stmt in stmts {
+            match &stmt.statement {
+                StatementType::Global(names) => out.extend(names.iter().cloned()),
+                StatementType::If(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::AsyncFor(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::Try(s) => {
+                    walk(&s.body, out);
+                    for h in &s.handlers {
+                        walk(&h.body, out);
+                    }
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                }
+                StatementType::With(s) => walk(&s.body, out),
+                StatementType::AsyncWith(s) => walk(&s.body, out),
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
 }
 
 /// Issue #115: a module-level name WRITTEN from this function — a `global

@@ -139,6 +139,73 @@ impl CodeGen for For {
             };
             (target, quote!(#(#body_stmts;)*))
         };
+        // Issue #155: `for x in iter(callable, sentinel):` — the
+        // two-argument iter() form calls `callable()` until it produces
+        // `sentinel` (botocore's chunked payload reads). Desugared into a
+        // `loop` that binds each result, breaks on equality with the
+        // sentinel (bound once, before the loop), and otherwise runs the
+        // body — a sentinel break is normal exhaustion, so it never sets
+        // the for/else break flag. The callable lowers as an ordinary
+        // zero-argument call, so everything the call machinery supports
+        // (module functions, partial-bound names) works here.
+        if let ExprType::Call(c) = &self.iter
+            && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "iter")
+            && symbols.get("iter").is_none()
+            && c.args.len() == 2
+            && c.keywords.is_empty()
+        {
+            let call_expr = ExprType::Call(crate::Call {
+                func: Box::new(c.args[0].clone()),
+                args: Vec::new(),
+                keywords: Vec::new(),
+            });
+            let call = call_expr.to_rust(body_ctx.clone(), options.clone(), symbols.clone())?;
+            let sentinel = crate::render_reused(
+                &c.args[1],
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
+            let core = quote! {
+                let __rython_sentinel = #sentinel;
+                loop {
+                    let __rython_item = #call;
+                    if __rython_item == __rython_sentinel {
+                        break;
+                    }
+                    let #loop_target = __rython_item;
+                    #loop_inner
+                }
+            };
+            if !has_else {
+                return Ok(quote!({ #core }));
+            }
+            let else_stmts: Result<Vec<_>, _> = self
+                .orelse
+                .into_iter()
+                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+                .collect();
+            let else_stmts = else_stmts?;
+            return Ok(if tracks_break {
+                quote! {
+                    {
+                        let mut __rython_broke = false;
+                        #core
+                        if !__rython_broke {
+                            #(#else_stmts;)*
+                        }
+                    }
+                }
+            } else {
+                quote! {
+                    {
+                        #core
+                        #(#else_stmts;)*
+                    }
+                }
+            });
+        }
+
         // The iterable is CONSUMED by the loop (IntoIterator::into_iter),
         // so a name reused later is cloned here — Python's for loop does
         // not consume its iterable (issue #109, M2: iteration over

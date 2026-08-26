@@ -22,6 +22,9 @@ top: the x3
 longest: quick
 chars: 16
 tweet-sized: True
+word: fox
+count: 12
+something else
 ```
 
 Keeping the program running under CPython is the workflow: rython
@@ -94,12 +97,33 @@ All in [`generated/src/wordstats.rs`](generated/src/wordstats.rs):
       B: PyLe<A, Output = bool>,
   ```
 
+- **isinstance dispatch → compile-time specialization.** `label(value)`
+  switches on `isinstance` — inherently dynamic typing — and the
+  converter turns the checks into compile-time flags: it emits
+  `label_str`, `label_int`, `label_bool` (bool ⊂ int in Python, so a
+  bool takes the int arm — while `str(x)` still renders `True`), and a
+  generic `label_any`, each with the
+  dead arms pruned before they are ever rendered, and binds every call
+  site to the variant matching its argument's static type. Class
+  targets fold through the inheritance tree (a `Cat` argument takes an
+  `isinstance(x, Animal)` arm while keeping its own overrides), and
+  every class also carries `impl PyInherits<Ancestor> for Class` — a
+  type-level copy of the same tree that generic Rust code can bound on.
+- **A dynamic router for runtime-typed values.** Alongside the morphs,
+  the converter emits `label` itself as a router: an argument enum
+  (`LabelArg`) with one variant per morph plus `Other(PyValue)`,
+  `From<T>` for each variant, and the signature
+  `pub fn label(x: impl Into<LabelArg>)` — so hand-written Rust calls
+  `label("word")?` or `label(7)?` with plain values, and a boxed
+  `PyValue` (a `str | int` union) routes to its morph at runtime in
+  Python's first-true-test order.
 - **Exceptions → Result.** Every fallible function returns
   `Result<T, PyException>`; the `__main__` block becomes `fn main()`
   that prints the exception and exits 1, exactly like the interpreter.
-- **Readable output.** The crate is rustfmt-formatted, warning-clean,
-  and marked "Edit freely" — it is a starting point for a port, not an
-  opaque artifact.
+- **Readable output.** The crate is rustfmt-formatted, builds without
+  errors (a few benign `unused_braces` lints aside), and is marked
+  "Edit freely" — it is a starting point for a port, not an opaque
+  artifact.
 
 ## Variations
 

@@ -79,6 +79,18 @@ def within(value, low, high):
     return low <= value and value <= high
 
 
+def label(value):
+    """isinstance dispatch - inherently dynamic typing - becomes a
+    COMPILE-TIME flag: the converter emits label_str, label_int, and a
+    generic label_any, each with the dead arms pruned, and binds every
+    call site to the variant matching its argument's static type."""
+    if isinstance(value, str):
+        return "word: " + value
+    if isinstance(value, int):
+        return "count: " + str(value)
+    return "something else"
+
+
 if __name__ == "__main__":
     tally = WordTally()
     tally.add_text("the quick brown fox jumps over the lazy dog")
@@ -88,3 +100,6 @@ if __name__ == "__main__":
     print(f"longest: {longest('the quick brown fox'.split())}")
     print(f"chars: {total_chars('the quick brown fox'.split())}")
     print(f"tweet-sized: {within(tally.total, 1, 280)}")
+    print(label("fox"))
+    print(label(12))
+    print(label(1.5))

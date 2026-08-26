@@ -667,6 +667,30 @@ impl ClassDef {
         chain
     }
 
+    /// THE conversion-time inheritance-tree lookup: whether `child` names
+    /// a class that IS `ancestor` or transitively inherits from it.
+    /// `isinstance(x, C)` folds through this — `isinstance(dog, Animal)`
+    /// is true because Dog's base chain contains Animal, exactly like
+    /// CPython's subclass check. Non-class names answer false.
+    pub(crate) fn class_extends(
+        child: &str,
+        ancestor: &str,
+        symbols: &SymbolTableScopes,
+    ) -> bool {
+        if child == ancestor {
+            // Reflexive even when the name isn't resolvable in scope (an
+            // annotated parameter of an imported class).
+            return true;
+        }
+        match symbols.get(child) {
+            Some(crate::SymbolTableNode::ClassDef(c)) => c
+                .base_chain(symbols)
+                .iter()
+                .any(|a| a.name == ancestor),
+            _ => false,
+        }
+    }
+
     /// The class name that closes an inheritance cycle (`class A(A)`), or
     /// None for a valid chain. Walks bases like base_chain but reports the
     /// repeat instead of silently stopping.
@@ -2366,12 +2390,29 @@ impl CodeGen for ClassDef {
             None => quote!(),
         };
 
+        // ---- The type-level inheritance tree ----
+        // One `impl PyInherits<Ancestor> for Class` per entry in the base
+        // chain (reflexive included): generic Rust code can bound on
+        // Python ancestry (`fn pet<T: PyInherits<Animal>>(x: T)`), and the
+        // entries are derived from the SAME base_chain the conversion-time
+        // `class_extends` lookup walks, so the two trees cannot drift.
+        let inherits_tree = if options.with_std_python {
+            let entries = self.base_chain(&symbols).into_iter().map(|a| {
+                let ancestor = crate::safe_ident(&a.name);
+                quote!(impl PyInherits<#ancestor> for #class_name {})
+            });
+            quote!(#(#entries)*)
+        } else {
+            quote!()
+        };
+
         Ok(quote! {
             #docs
             #[derive(Clone, Default)]
             pub struct #class_name {
                 #(#field_defs),*
             }
+            #inherits_tree
             #trait_stream
             impl #class_name {
                 #class_constants

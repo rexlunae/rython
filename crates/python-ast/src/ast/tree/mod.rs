@@ -138,3 +138,6 @@ pub use aliasing::*;
 
 pub mod param_infer;
 pub use param_infer::*;
+
+pub mod specialize;
+pub use specialize::*;

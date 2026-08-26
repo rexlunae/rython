@@ -7,6 +7,7 @@ pub struct Tally {
     pub label: String,
     pub total: i64,
 }
+impl PyInherits<Tally> for Tally {}
 pub trait TallyTrait {
     fn label(&self) -> String;
     fn label_mut(&mut self) -> &mut String;
@@ -79,6 +80,8 @@ pub struct WordTally {
     pub freq: PyDict<String, i64>,
     pub __rython_base: Tally,
 }
+impl PyInherits<WordTally> for WordTally {}
+impl PyInherits<Tally> for WordTally {}
 pub trait WordTallyTrait: TallyTrait {
     fn base(&self) -> &Tally;
     fn base_mut(&mut self) -> &mut Tally;
@@ -274,7 +277,7 @@ where
             best = w;
         };
     }
-    return Ok(best);
+    return Ok((best).to_string());
 }
 #[doc = "No annotations: an integer-seeded accumulator over an inferred\\n    iterable, with `len(w)` bounding the elements."]
 pub fn total_chars<A, B>(words: A) -> Result<i64, PyException>
@@ -297,6 +300,76 @@ where
     B: PyLe<A, Output = bool>,
 {
     return Ok(((low).py_le(&(value))) && ((value).py_le(&(high))));
+}
+#[doc = "isinstance dispatch - inherently dynamic typing - becomes a\\n    COMPILE-TIME flag: the converter emits label_str, label_int, and a\\n    generic label_any, each with the dead arms pruned, and binds every\\n    call site to the variant matching its argument's static type."]
+pub fn label_str(value: impl Into<String>) -> Result<String, PyException> {
+    let value: String = value.into();
+    return Ok(("word: ").py_add(&(value)));
+}
+#[doc = "isinstance dispatch - inherently dynamic typing - becomes a\\n    COMPILE-TIME flag: the converter emits label_str, label_int, and a\\n    generic label_any, each with the dead arms pruned, and binds every\\n    call site to the variant matching its argument's static type."]
+pub fn label_int(value: i64) -> Result<String, PyException> {
+    return Ok(("count: ").py_add(&(str(value))));
+}
+#[doc = "isinstance dispatch - inherently dynamic typing - becomes a\\n    COMPILE-TIME flag: the converter emits label_str, label_int, and a\\n    generic label_any, each with the dead arms pruned, and binds every\\n    call site to the variant matching its argument's static type."]
+pub fn label_bool(value: bool) -> Result<String, PyException> {
+    return Ok(("count: ").py_add(&(str(value))));
+}
+#[doc = "isinstance dispatch - inherently dynamic typing - becomes a\\n    COMPILE-TIME flag: the converter emits label_str, label_int, and a\\n    generic label_any, each with the dead arms pruned, and binds every\\n    call site to the variant matching its argument's static type."]
+pub fn label_any<T>(_value: T) -> Result<String, PyException> {
+    return Ok(("something else").to_string());
+}
+#[doc = "The dispatch argument for `label`'s parameter `value`: one variant per compile-time morph, `Other` for everything else."]
+#[derive(Clone)]
+pub enum LabelArg {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    Other(stdpython::PyValue),
+}
+impl From<String> for LabelArg {
+    fn from(v: String) -> Self {
+        LabelArg::Str(v)
+    }
+}
+impl From<&str> for LabelArg {
+    fn from(v: &str) -> Self {
+        LabelArg::Str(v.to_string())
+    }
+}
+impl From<i64> for LabelArg {
+    fn from(v: i64) -> Self {
+        LabelArg::Int(v)
+    }
+}
+impl From<bool> for LabelArg {
+    fn from(v: bool) -> Self {
+        LabelArg::Bool(v)
+    }
+}
+impl LabelArg {
+    #[doc = r" Route a BOXED runtime value to its morph."]
+    pub fn from_py_value(v: stdpython::PyValue) -> Self {
+        match v {
+            stdpython::PyValue::Str(v) => LabelArg::Str(v),
+            stdpython::PyValue::Int(v) => LabelArg::Int(v),
+            stdpython::PyValue::Bool(v) => LabelArg::Bool(v),
+            other => LabelArg::Other(other),
+        }
+    }
+}
+impl From<stdpython::PyValue> for LabelArg {
+    fn from(v: stdpython::PyValue) -> Self {
+        Self::from_py_value(v)
+    }
+}
+#[doc = "Dynamic router for `label`: dispatches runtime-typed argument(s) to the compile-time morphs, in Python's first-true-test order per parameter."]
+pub fn label(value: impl Into<LabelArg>) -> Result<String, PyException> {
+    match value.into() {
+        LabelArg::Str(v1) => label_str(v1),
+        LabelArg::Int(v1) => label_int(v1),
+        LabelArg::Bool(v1) => label_bool(v1),
+        LabelArg::Other(v1) => label_any(v1),
+    }
 }
 fn main() {
     let __rython_result = (|| -> Result<(), PyException> {
@@ -328,6 +401,9 @@ fn main() {
                 py_display(&(within(tally.__rython_base.total, 1, 280)?))
             )),
         );
+        print(&((label_str("fox"))?));
+        print(&((label_int(12))?));
+        print(&((label_any(1.5))?));
         Ok(())
     })();
     if let Err(e) = __rython_result {

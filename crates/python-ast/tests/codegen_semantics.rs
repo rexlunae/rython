@@ -2741,10 +2741,6 @@ fn negative_strided_slice_assignment_assigns_in_slot_order() {
     let out = compile("ys = [0, 1, 2]\nys[::-2] = [7, 8]\n", "negassign.py");
     assert!(
         out.contains("py_slice_assign_step"),
-        "generated: {}",
-        out
-    );
-}
 
 #[test]
 fn isinstance_type_call_resolves_statically() {
@@ -5694,6 +5690,352 @@ fn aliased_import_resolves_through_module_intercept() {
 }
 
 #[test]
+fn isinstance_folds_through_the_inheritance_tree() {
+    // python3: isinstance(d, Animal) is True for d: Dog — the fold walks
+    // the class tree instead of requiring an exact class match, and the
+    // constant condition prunes the dead branch (no `if true` residue).
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "class Robot:\n",
+        "    def __init__(self, tag: int):\n",
+        "        self.tag = tag\n",
+        "\n",
+        "def check(d: Dog) -> None:\n",
+        "    if isinstance(d, Animal):\n",
+        "        print(\"animal\")\n",
+        "    if isinstance(d, Robot):\n",
+        "        print(\"robot\")\n",
+    );
+    let out = compile(src, "inhtree.py");
+    let check_part = out.split("fn check").nth(1).expect("check fn");
+    assert!(
+        check_part.contains("\"animal\""),
+        "the Animal branch must survive (Dog extends Animal): {}",
+        out
+    );
+    assert!(
+        !check_part.contains("\"robot\""),
+        "the Robot branch is dead and must be pruned: {}",
+        out
+    );
+    assert!(
+        !check_part.contains("if (true)") && !check_part.contains("if (false)"),
+        "constant isinstance conditions must not remain as if-tests: {}",
+        out
+    );
+}
+
+#[test]
+fn constructor_locals_carry_their_class_for_isinstance() {
+    // python3: a constructor-assigned local knows its class — isinstance
+    // folds true for it (previously the local was untyped and the check
+    // silently folded false).
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "def go() -> None:\n",
+        "    a = Animal(\"blob\")\n",
+        "    if isinstance(a, Animal):\n",
+        "        print(\"yes\")\n",
+    );
+    let out = compile(src, "ctorlocal.py");
+    let go_part = out.split("fn go").nth(1).expect("go fn");
+    assert!(
+        go_part.contains("\"yes\""),
+        "the constructor local's class must fold the check true: {}",
+        out
+    );
+}
+
+#[test]
+fn isinstance_dispatch_specializes_by_input_type() {
+    // The isinstance-dispatch idiom monomorphizes: one Rust function per
+    // tested type (class variants per CONCRETE class in the tested
+    // subtree) plus a generic residual, and call sites bind the variant
+    // matching the argument's static type.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "def describe(x):\n",
+        "    if isinstance(x, int):\n",
+        "        return \"int\"\n",
+        "    if isinstance(x, Animal):\n",
+        "        return \"animal\"\n",
+        "    return \"other\"\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(describe(5))\n",
+        "    print(describe(Dog(\"rex\")))\n",
+        "    print(describe(2.5))\n",
+    );
+    let out = compile(src, "specialize.py");
+    for variant in [
+        "fn describe_int",
+        "fn describe_animal",
+        "fn describe_dog",
+        "fn describe_any",
+    ] {
+        assert!(out.contains(variant), "missing {variant}: {}", out);
+    }
+    assert!(
+        out.contains("describe_int (5)"),
+        "int literal must dispatch to the int variant: {}",
+        out
+    );
+    assert!(
+        out.contains("describe_dog ("),
+        "a Dog argument must dispatch to Dog's own variant: {}",
+        out
+    );
+    assert!(
+        out.contains("describe_any (2.5)"),
+        "an untested type must dispatch to the residual: {}",
+        out
+    );
+}
+
+#[test]
+fn router_threads_extra_parameters_and_diverging_returns() {
+    // Two generalizations of the dynamic router: a NON-tested parameter
+    // passes through the router positionally (no enum needed for it),
+    // and morphs with DIVERGING return types still get a router — it
+    // returns an output enum (`FlipOut`) with `From<T>` per member, and
+    // `From<FlipOut> for PyValue` when every member boxes, so a boxed
+    // call site consumes the result as Python's union value.
+    let src = concat!(
+        "def pick(flag: bool) -> str | int:\n",
+        "    if flag:\n",
+        "        return \"fox\"\n",
+        "    return 42\n",
+        "\n",
+        "def tag(x, prefix: str):\n",
+        "    if isinstance(x, str):\n",
+        "        return prefix + \": \" + x\n",
+        "    if isinstance(x, int):\n",
+        "        return prefix + \" #\" + str(x)\n",
+        "    return prefix + \"?\"\n",
+        "\n",
+        "def flip(x):\n",
+        "    if isinstance(x, str):\n",
+        "        return len(x)\n",
+        "    if isinstance(x, int):\n",
+        "        return str(x)\n",
+        "    return 0\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(tag(pick(True), \"dyn\"))\n",
+        "    print(flip(pick(True)))\n",
+    );
+    let out = compile(src, "routergen.py");
+    for entry in [
+        // The untested `prefix` parameter passes through positionally.
+        "pub fn tag (x : impl Into < TagArg > , prefix : impl Into < String > ,)",
+        // The output enum, its From impls, and the PyValue landing.
+        "enum FlipOut",
+        "impl From < i64 > for FlipOut",
+        "impl From < String > for FlipOut",
+        "impl From < FlipOut > for stdpython :: PyValue",
+        // Router arms wrap diverging morph results into the enum.
+        "Ok (FlipOut :: from (",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+    // A boxed call site consumes the enum result as the boxed union.
+    assert!(
+        out.contains("stdpython :: PyValue :: from ((flip ("),
+        "a boxed call site must box the output-enum result: {}",
+        out
+    );
+}
+
+#[test]
+fn isinstance_dispatch_specializes_over_multiple_axes() {
+    // SEVERAL isinstance-tested parameters: the morphs are the cartesian
+    // product over each axis of (its variants + Any), named
+    // `pair_str_int` / `pair_str_any` / `pair_any_any` / ..., static
+    // call sites dispatch each argument independently, and the router
+    // takes one NUMBERED argument enum per tested parameter and
+    // tuple-matches them.
+    let src = concat!(
+        "def pick(flag: bool) -> str | int:\n",
+        "    if flag:\n",
+        "        return \"fox\"\n",
+        "    return 42\n",
+        "\n",
+        "def pair(a, b):\n",
+        "    if isinstance(a, str):\n",
+        "        if isinstance(b, int):\n",
+        "            return a + \" x\" + str(b)\n",
+        "        return a + \" ?\"\n",
+        "    if isinstance(a, int):\n",
+        "        if isinstance(b, int):\n",
+        "            return str(a * b)\n",
+        "        return str(a)\n",
+        "    return \"neither\"\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(pair(\"fox\", 3))\n",
+        "    print(pair(2.5, 1))\n",
+        "    print(pair(pick(True), 3))\n",
+    );
+    let out = compile(src, "multiaxis.py");
+    for entry in [
+        // Cross-product morphs (bool auto-added per int-tested axis).
+        "fn pair_str_int",
+        "fn pair_str_any",
+        "fn pair_int_int",
+        "fn pair_bool_int",
+        "fn pair_any_int",
+        "fn pair_any_any",
+        // One numbered argument enum per axis; the router tuple-matches.
+        "enum PairArg1",
+        "enum PairArg2",
+        "pub fn pair (a : impl Into < PairArg1 > , b : impl Into < PairArg2 > ,)",
+        "(PairArg1 :: Str (v1) , PairArg2 :: Int (v2)) => pair_str_int (v1 , v2)",
+        "(PairArg1 :: Other (v1) , PairArg2 :: Other (v2)) => pair_any_any (v1 , v2)",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+    // Static sites dispatch each argument independently...
+    assert!(
+        out.contains("pair_str_int (\"fox\" , 3)"),
+        "static cross dispatch must bind both axes: {}",
+        out
+    );
+    assert!(
+        out.contains("pair_any_int ("),
+        "an untested type on one axis takes that axis's residual: {}",
+        out
+    );
+    // ...and a boxed axis routes the whole call through the router, the
+    // static axis passing as a plain value via From<T>.
+    assert!(
+        out.contains("pair ((pick") || out.contains("pair (pick"),
+        "a boxed axis must dispatch through the router: {}",
+        out
+    );
+}
+
+#[test]
+fn isinstance_dispatch_emits_a_dynamic_router() {
+    // A single-parameter specialized function whose morphs share a return
+    // type also gets a RUNTIME router under the original name: a closed
+    // argument enum (one variant per morph + `Other(PyValue)`), `From<T>`
+    // per morph so callers pass plain values through `impl Into`, and
+    // `From<PyValue>` routing a boxed value in Python's first-true-test
+    // order. A call site whose argument is boxed (a `str | int` return)
+    // dispatches through the router instead of failing.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "def label(x):\n",
+        "    if isinstance(x, str):\n",
+        "        return \"word\"\n",
+        "    if isinstance(x, int):\n",
+        "        return \"count\"\n",
+        "    if isinstance(x, Animal):\n",
+        "        return \"pet\"\n",
+        "    return \"mystery\"\n",
+        "\n",
+        "def pick(flag: bool) -> str | int:\n",
+        "    if flag:\n",
+        "        return \"fox\"\n",
+        "    return 42\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(label(pick(True)))\n",
+        "    print(label(True))\n",
+    );
+    let out = compile(src, "router.py");
+    for entry in [
+        "enum LabelArg",
+        "Other (stdpython :: PyValue)",
+        "impl From < String > for LabelArg",
+        "impl From < & str > for LabelArg",
+        "impl From < i64 > for LabelArg",
+        "impl From < bool > for LabelArg",
+        "impl From < Animal > for LabelArg",
+        "impl From < Dog > for LabelArg",
+        "impl From < stdpython :: PyValue > for LabelArg",
+        "pub fn label (x : impl Into < LabelArg > ,)",
+        "fn from_py_value",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+    // bool ⊂ int in Python: an int-tested axis carries a bool MORPH of
+    // its own (`label_bool(x: bool)`, body folded through the int arm
+    // with x kept bool so str(x) renders True/False), a statically-bool
+    // call site dispatches to it, and a boxed bool routes to it.
+    assert!(
+        out.contains("fn label_bool (_x : bool)"),
+        "an int-tested axis must carry a bool morph: {}",
+        out
+    );
+    assert!(
+        out.contains("label_bool (true)"),
+        "a statically-bool argument must dispatch to the bool morph: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: PyValue :: Bool (v) => LabelArg :: Bool (v)"),
+        "a boxed bool must route to the bool morph: {}",
+        out
+    );
+    // The boxed call site goes through the router (the original name), not
+    // a compile-time variant and not a loud error.
+    assert!(
+        out.contains("label ((pick") || out.contains("label (pick"),
+        "a boxed argument must dispatch through the router: {}",
+        out
+    );
+}
+
+#[test]
+fn classes_emit_the_type_level_inheritance_tree() {
+    // Every class carries `impl PyInherits<Ancestor> for Class` for its
+    // full base chain (reflexive included) — the generic inheritance tree
+    // generic Rust code can bound on.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+    );
+    let out = compile(src, "pyinherits.py");
+    for entry in [
+        "impl PyInherits < Animal > for Animal",
+        "impl PyInherits < Dog > for Dog",
+        "impl PyInherits < Animal > for Dog",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+}
+
+#[test]
 fn literal_seeded_local_concretizes_the_loop_element() {
     // Inference: `best = ""` then `best = w` inside `for w in words` — the
     // local keeps ONE type, so the seed's concrete type (String) forces
@@ -8213,4 +8555,198 @@ fn threading_thread_daemon_flag_lowers_from_bool_constants() {
         "daemon=False must reach Thread::new: {}",
         out
     );
+}
+
+// ---- Module attribute protocol (PEP 562) — issue #119 ----
+
+#[test]
+fn module_getattr_is_a_loud_error() {
+    // A module-level `__getattr__` (dateutil's lazy submodule loading) is
+    // the PEP 562 dynamic-attribute fallback: rython resolves module
+    // attributes statically, so the definition is a loud error naming the
+    // dunder — not an inference error, and never a silently dead function.
+    let err = compile_err(
+        concat!(
+            "def __getattr__(name):\n",
+            "    raise AttributeError(name)\n",
+        ),
+        "modgetattr.py",
+    );
+    assert!(err.contains("module attribute protocol"), "err: {}", err);
+    assert!(err.contains("__getattr__"), "err: {}", err);
+    assert!(err.contains("issue #119"), "err: {}", err);
+}
+
+#[test]
+fn module_dir_is_a_loud_error() {
+    let err = compile_err("def __dir__():\n    return []\n", "moddir.py");
+    assert!(err.contains("module attribute protocol"), "err: {}", err);
+    assert!(err.contains("__dir__"), "err: {}", err);
+}
+
+// ---- Mutable module globals (`global` writes) — issue #115 ----
+
+#[test]
+fn global_write_lowers_to_a_mutable_static() {
+    // A module scalar written through `global` becomes `static name:
+    // Mutex<T>`: writes go through py_global_write, reads through
+    // py_global_read, and the write-drop warning is gone.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "count = 0\n",
+            "def bump():\n",
+            "    global count\n",
+            "    count += 1\n",
+            "def peek() -> int:\n",
+            "    return count\n",
+        ),
+        "global_mut.py",
+    );
+    assert!(
+        out.contains("pub static count : std :: sync :: Mutex < i64 >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("py_global_write"), "generated: {}", out);
+    assert!(out.contains("py_global_read (& count)"), "generated: {}", out);
+    assert!(
+        warnings.iter().all(|w| !w.contains("writes to module-level name")),
+        "the supported write must not warn: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn global_none_singleton_boxes_to_a_pyvalue_static() {
+    // The None-initialized singleton pattern (boto3's DEFAULT_SESSION):
+    // the static boxes to Mutex<PyValue>; scalar stores wrap in
+    // PyValue::from.
+    let out = compile(
+        concat!(
+            "DEFAULT = None\n",
+            "def setup(v: int):\n",
+            "    global DEFAULT\n",
+            "    DEFAULT = v\n",
+            "def is_set() -> bool:\n",
+            "    return DEFAULT is not None\n",
+        ),
+        "global_none.py",
+    );
+    assert!(
+        out.contains("pub static DEFAULT : std :: sync :: Mutex < stdpython :: PyValue >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: from (v)"),
+        "scalar stores must box: {}",
+        out
+    );
+}
+
+#[test]
+fn global_shadowed_by_a_plain_local_disqualifies_the_static() {
+    // A function that binds the name WITHOUT `global` has a plain local;
+    // the name must not become a mutable static (the local read would be
+    // misread as the module global) — the write keeps the documented
+    // drop-with-warning divergence.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "flag = False\n",
+            "def set_local():\n",
+            "    flag = True\n",
+            "def set_global():\n",
+            "    global flag\n",
+            "    flag = True\n",
+        ),
+        "global_shadow.py",
+    );
+    assert!(!out.contains("py_global_write"), "generated: {}", out);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("writes to module-level name `flag`")),
+        "the unsupported write must still warn: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn deepcopy_memo_kwarg_is_dropped_with_a_warning() {
+    // Issue #154: copy.deepcopy(x, memo=...) — boto3's dynamodb transform
+    // passes a forgetful memo dict. rython's value semantics already copy
+    // everything fresh, so the kwarg drops with a -W note instead of the
+    // unexpected-keyword error.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import copy\n",
+            "def f(params: dict[str, int]) -> dict[str, int]:\n",
+            "    return copy.deepcopy(params, memo={})\n",
+        ),
+        "dc_memo.py",
+    );
+    assert!(out.contains("copy :: deepcopy"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("deepcopy(memo=...)")),
+        "the dropped memo must be reported through -W: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn iter_sentinel_outside_a_for_loop_is_loud() {
+    // Issue #155: the two-argument iter() lowers only in for-loop
+    // iterable position; a bare value would need an iterator object.
+    let err = compile_err(
+        concat!(
+            "def f() -> str:\n",
+            "    return \"\"\n",
+            "it = iter(f, \"\")\n",
+        ),
+        "itersent_bare.py",
+    );
+    assert!(err.contains("for-loop iterable"), "err: {err}");
+    assert!(err.contains("issue #155"), "err: {err}");
+}
+
+// ---- Variadic parameters (issue #120) ----
+
+#[test]
+fn varargs_lower_to_a_boxed_vector() {
+    // Issue #120: `*args` is Vec<PyValue>; extras box at the call site,
+    // an empty call still passes the vector, and `f(*args)` forwards it.
+    let out = compile(
+        concat!(
+            "def tag(*args) -> int:\n",
+            "    return len(args)\n",
+            "def fwd(*args) -> int:\n",
+            "    return tag(*args)\n",
+            "def run() -> int:\n",
+            "    return tag(1, \"x\") + tag() + fwd(True)\n",
+        ),
+        "varargs.py",
+    );
+    assert!(
+        out.contains("args : Vec < stdpython :: PyValue >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+    assert!(out.contains("tag (vec ! [])"), "generated: {}", out);
+    assert!(out.contains("__rython_varargs"), "generated: {}", out);
+}
+
+#[test]
+fn keyword_to_pure_varargs_callee_is_a_python_type_error() {
+    // Python raises TypeError for `f(x=1)` when f takes only *args; the
+    // conversion reports the same shape loudly.
+    let err = compile_err(
+        concat!(
+            "def f(*args) -> int:\n",
+            "    return len(args)\n",
+            "f(x=1)\n",
+        ),
+        "vakw.py",
+    );
+    assert!(err.contains("unexpected keyword argument"), "err: {err}");
 }

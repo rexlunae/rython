@@ -1606,6 +1606,15 @@ impl PyInt for i64 {
     }
 }
 
+/// The type-level inheritance tree. The converter emits one
+/// `impl PyInherits<Ancestor> for Class` per (class, ancestor) pair in a
+/// generated crate — reflexive and transitive along the single-inheritance
+/// chain — so generic Rust code can bound on Python ancestry
+/// (`fn pet<T: PyInherits<Animal>>(x: T)`). The entries are derived from
+/// the same base-chain walk the conversion-time isinstance folding uses,
+/// keeping the type-level and conversion-time trees in lockstep.
+pub trait PyInherits<Base> {}
+
 impl PyInt for u8 {
     // A bytes element (`data[i]`) is a `u8` in the value model, but in
     // Python it is already an int — so `int(data[i])` is the identity
@@ -2589,6 +2598,25 @@ impl From<()> for PyValue {
     fn from(_: ()) -> Self {
         PyValue::None_
     }
+}
+
+/// Read a mutable module global (issue #115: a module-level name written by
+/// functions through `global` lowers to a `static Mutex<T>`). The guard is
+/// dropped inside this function, so two reads in one statement never hold
+/// two locks at once (a bare `NAME.lock().unwrap().clone()` at the call
+/// site would keep the guard temporary alive to the end of the statement
+/// and deadlock on the second read).
+#[cfg(feature = "std")]
+pub fn py_global_read<T: Clone>(cell: &std::sync::Mutex<T>) -> T {
+    cell.lock().unwrap().clone()
+}
+
+/// Write a mutable module global (issue #115). The value argument is fully
+/// evaluated before the lock is taken (Rust argument order), so a
+/// right-hand side that reads the same global cannot deadlock.
+#[cfg(feature = "std")]
+pub fn py_global_write<T>(cell: &std::sync::Mutex<T>, value: T) {
+    *cell.lock().unwrap() = value;
 }
 
 /// Python str() of a boxed heterogeneous value (issue #121): ints, floats,
@@ -4050,6 +4078,45 @@ impl<K: Eq + Hash + Debug, V> PyPop<K> for HashMap<K, V> {
     }
 }
 
+/// Python's slice-bound normalization for RANGE operations (issue #153):
+/// a negative bound counts from the end, both bounds clamp to [0, len],
+/// and a stop before start collapses to start (the insertion point —
+/// `xs[5:2] = R` inserts R at 5 without removing anything).
+fn py_range_bounds(len: usize, start: Option<i64>, stop: Option<i64>) -> (usize, usize) {
+    let n = len as i64;
+    let norm = |bound: Option<i64>, default: i64| -> i64 {
+        match bound {
+            None => default,
+            Some(i) if i < 0 => (i + n).clamp(0, n),
+            Some(i) => i.clamp(0, n),
+        }
+    };
+    let a = norm(start, 0);
+    let b = norm(stop, n).max(a);
+    (a as usize, b as usize)
+}
+
+/// `xs[a:b] = replacement` (issue #153): replace the range IN PLACE — a
+/// different-length replacement inserts or removes elements, exactly
+/// CPython. `None` bounds are the open ends (`xs[:b]`, `xs[a:]`, `xs[:]`).
+pub fn py_splice<T>(
+    xs: &mut Vec<T>,
+    start: Option<i64>,
+    stop: Option<i64>,
+    replacement: Vec<T>,
+) {
+    let (a, b) = py_range_bounds(xs.len(), start, stop);
+    xs.splice(a..b, replacement);
+}
+
+/// `del xs[a:b]` (issue #153): remove the range IN PLACE (Python's
+/// `xs[a:b] = []`). Out-of-range bounds clamp; an empty or inverted
+/// range removes nothing.
+pub fn py_del_range<T>(xs: &mut Vec<T>, start: Option<i64>, stop: Option<i64>) {
+    let (a, b) = py_range_bounds(xs.len(), start, stop);
+    xs.drain(a..b);
+}
+
 /// dict.pop(k, default): remove and return, or the default when missing.
 pub trait PyPopDefault<K, V> {
     fn py_pop_default(&mut self, key: K, default: V) -> V;
@@ -4346,6 +4413,53 @@ numeric_add!(
     f64, f64 => f64,
     i64, f64 => f64,
     f64, i64 => f64,
+);
+
+// bool ⊂ int (CPython): booleans participate in arithmetic as 0/1 —
+// `True + 1 == 2`, `True * 3 == 3`, `True * 2.5 == 2.5`. The isinstance
+// specializer's auto bool morphs (a bool argument taking an int-tested
+// arm with its parameter kept bool) rely on these, as does any bool
+// value flowing into arithmetic.
+macro_rules! bool_arith {
+    ($($trait:ident, $method:ident, $op:tt);* $(;)?) => {
+        $(
+            impl $trait<i64> for bool {
+                type Output = i64;
+                fn $method(&self, rhs: &i64) -> i64 {
+                    (*self as i64) $op *rhs
+                }
+            }
+            impl $trait<bool> for i64 {
+                type Output = i64;
+                fn $method(&self, rhs: &bool) -> i64 {
+                    *self $op (*rhs as i64)
+                }
+            }
+            impl $trait<bool> for bool {
+                type Output = i64;
+                fn $method(&self, rhs: &bool) -> i64 {
+                    (*self as i64) $op (*rhs as i64)
+                }
+            }
+            impl $trait<f64> for bool {
+                type Output = f64;
+                fn $method(&self, rhs: &f64) -> f64 {
+                    ((*self as i64) as f64) $op *rhs
+                }
+            }
+            impl $trait<bool> for f64 {
+                type Output = f64;
+                fn $method(&self, rhs: &bool) -> f64 {
+                    *self $op ((*rhs as i64) as f64)
+                }
+            }
+        )*
+    };
+}
+bool_arith!(
+    PyAdd, py_add, +;
+    PySub, py_sub, -;
+    PyMul, py_mul, *;
 );
 
 macro_rules! string_add {
@@ -5800,9 +5914,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[cfg(not(feature = "std"))]
     use alloc::vec;
+
+    #[test]
+    fn bool_arithmetic_is_zero_one() {
+        // CPython: bool ⊂ int, so booleans compute as 0/1 —
+        // `True + 1 == 2`, `True * 3 == 3`, `2 - True == 1`,
+        // `True * 2.5 == 2.5` — verified against python3.
+        assert_eq!(true.py_add(&1i64), 2);
+        assert_eq!(true.py_mul(&3i64), 3);
+        assert_eq!(2i64.py_sub(&true), 1);
+        assert_eq!(3i64.py_mul(&false), 0);
+        assert_eq!(true.py_add(&true), 2);
+        assert_eq!(true.py_mul(&2.5f64), 2.5);
+        assert_eq!(2.5f64.py_add(&false), 2.5);
+    }
 
     #[test]
     fn test_python_functions() {

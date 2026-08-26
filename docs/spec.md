@@ -78,8 +78,9 @@ assignment, annotated assignment, augmented assignment, `if`/`elif`/`else`,
 `with`.
 
 **Statement kinds rejected at conversion time** (loud error naming the
-statement and its line/column): `match`, `del`, `global`, `nonlocal`,
-and any other statement kind without a lowering. The error text is of
+statement and its line/column): `match`, `del`, `nonlocal`,
+and any other statement kind without a lowering. (`global` is accepted;
+see §5.1 for what its writes support.) The error text is of
 the form ``the `X` statement is not yet supported by rython``, with the
 parser adding: *"Rewrite it using supported constructs, or file an
 issue."*
@@ -274,8 +275,13 @@ Indexing goes through checked helpers that raise
 key with Rust's `Debug` quoting (`KeyError: "name"`) where CPython uses
 repr quoting (`KeyError: 'name'`) — a message-shape divergence on the
 ledger (§12.3). Negative indices and slice *reads* follow Python
-semantics. Slice **assignment** (`x[a:b] = …`) and augmented assignment
-to a slice are loud errors.
+semantics. Slice **assignment** `xs[a:b] = R` and **range delete**
+`del xs[a:b]` on lists replace/remove the range in place with CPython's
+exact bound rules (issue #153): a different-length RHS inserts or
+removes elements, an inverted range is an insertion point, negatives
+count from the end, out-of-range bounds clamp. Stepped forms
+(`xs[a:b:s] = …`, `del xs[a:b:s]`) and augmented assignment to a slice
+are loud errors.
 
 ---
 
@@ -299,6 +305,20 @@ through subscript/attribute stores marks the chain's base variable.
 - Names first assigned inside a `try` body (which lowers to a closure)
   are pre-initialized with `Default::default()` to satisfy rustc's
   capture rules; behavior is unchanged on the paths Python defines.
+- **`global` (issue #115).** `global name` declares module scope; reads
+  resolve to the module statics. A module-level name written through
+  `global` lowers to a MUTABLE static (`static name: Mutex<T>`) when it
+  has exactly one module-level store of an int/float/bool literal
+  (`Mutex<i64>`/…) or `None` (`Mutex<stdpython::PyValue>`, scalar stores
+  boxed via `PyValue::from`), and no function binds the name as a plain
+  local (parameters included). Reads render `py_global_read(&name)`,
+  writes in owning scopes `py_global_write(&name, v)` — each takes the
+  lock briefly, so compound assignment is CPython's non-atomic
+  LOAD/op/STORE. Storing a container or class instance into a boxed
+  global is a loud error; any `global` write outside this shape (string
+  or computed initializers, multiple module stores, shadowing locals,
+  no_std) keeps the documented divergence: the write is dropped and
+  reported through the `-W` channel.
 
 ### 5.2 Control flow
 
@@ -395,11 +415,20 @@ conversion time:
   unknown callee are a loud error. (Keyword `replace()` on the datetime
   family is special-cased in the runtime.)
 
-`*args`/`**kwargs` are effectively unsupported: signatures containing
-them generate uncallable parameter types, and every concrete use site
-(calls with `**kwargs`, keyword calls against such signatures,
-`__init__`/methods/`lru_cache` with them) is rejected loudly. Starred
-unpacking `f(*xs)` is likewise a loud error.
+`*args`/`**kwargs` on module functions lower to the boxed heterogeneous
+containers (issue #120): `*args` is `Vec<stdpython::PyValue>` and
+`**kwargs` is `PyDict<String, stdpython::PyValue>`. Call sites with a
+known callee pack the extras boxed (`PyValue::from` per value; a call
+with none still passes the empty container), `f(*args)` forwards the
+vector, and the body reads them like any list/dict (len, indexing,
+iteration, membership — elements are `PyValue`, narrowed by isinstance
+where a concrete type is needed; arithmetic directly on an un-narrowed
+element fails in rustc). A keyword argument that matches no parameter of
+a callee without `**kwargs` is a loud error, as in Python. Methods and
+`__init__` with variadic parameters keep their existing per-site
+handling; a `*t` spread to a NON-variadic callee still fills missing
+positional parameters with the spread value (the spread-argument
+divergence).
 
 ### 6.3 Decorators
 
@@ -560,6 +589,12 @@ exception escaping a lambda (§4.5).
   binary.
 - Packages without an entry point convert to library crates and cannot
   be `rypip install`ed (loud error naming the fix).
+- The module attribute protocol (PEP 562) is not supported: a
+  module-level `__getattr__` or `__dir__` definition is a loud
+  conversion error naming the dunder and the fix (issue #119). Module
+  attributes resolve statically, so the dynamic fallback could never
+  run; lowering it as an ordinary function would misstate the module's
+  behavior.
 
 ---
 
@@ -576,11 +611,37 @@ sort), `min`/`max` (Python's NaN-fold semantics), `sum`, `abs`, `round`
 `enumerate`, `zip`, `map`/`filter`, `all`/`any`, `repr`, `hash`
 (CPython's algorithms under `PYTHONHASHSEED=0`, including siphash13 for
 strings over the internal representation), `ord`/`chr`, `isinstance`
-(on statically-known types only — otherwise a loud error), and the
+(decided at conversion time on statically-known types, walking the class
+inheritance tree — `isinstance(dog, Animal)` folds true for `dog: Dog` —
+with constant branches pruned; a module function whose unannotated
+parameter(s) are isinstance-dispatched in plain `if` tests
+monomorphizes — one specialized Rust function per input type, and with
+SEVERAL tested parameters one per combination in their cartesian
+product (`f_str_int`, `f_str_any`, ..., capped at 32 morphs) — plus
+the generic residual, with call sites dispatching each argument
+independently by static type (an int-tested parameter also gets a bool
+morph of its own — bool ⊂ int in Python — so a bool argument takes the
+int arm while `str(x)` still renders True/False); a dynamic router is
+also emitted under the original name — one argument enum per tested
+parameter (`FArg`, or `FArg1`/`FArg2`/... numbered by position), each
+with one variant per morph plus `Other(PyValue)` and `From<T>` per
+variant, taken as `impl Into<Enum>` parameters and tuple-matched — so
+plain values pass through unchanged, untested parameters pass through
+positionally, and a boxed `PyValue` argument routes at runtime in
+Python's first-true-test order; morphs whose return types differ route
+through an output enum (`FOut`, one variant per distinct return type,
+`From<T>` per member, and `From<FOut> for PyValue` when every member
+boxes, so a runtime-dispatched result lands as Python's union value);
+other
+inferred-generic shapes lower to false with the class-as-value
+divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
 (`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
 they lower unresolved and fail in rustc, §12.1; set and tuple
-*literals* work.)
+*literals* work.) `iter(callable, sentinel)` (issue #155) is supported
+as a for-loop iterable — `for x in iter(f, sentinel):` desugars to a
+loop calling `f()` until the result equals the sentinel (bound once,
+before the loop); anywhere else the two-argument form is a loud error.
 
 String, list, dict, and set methods cover the CPython surface for the
 supported types, pinned to CPython edge cases (code-point `len`,
@@ -643,11 +704,19 @@ The parser specification must be literal: the toolchain evaluates
 `ArgumentParser(...)`/`add_argument(...)`/`parse_args()` **at conversion
 time**, deletes those statements, and emits a typed namespace struct
 plus a runtime parse whose usage line, help layout, error messages,
-exit codes, and streams are byte-identical to CPython's. Supported:
-`str`/`int`/`float` positionals, `--long` options with `default=`,
+exit codes, and streams are byte-identical to CPython's (3.11 help
+format). The rewrite runs in function bodies AND at module level
+(certifi's `__main__.py` builds its parser at top level — issue #118);
+a module-level namespace lives in `__module_init__`, so only later
+module-level statements can read it (a function read is loud in
+rustc). Supported: `str`/`int`/`float` positionals, `--long` options
+with `default=`, `-short, --long` alias pairs (exact and
+attached-value forms at runtime; an unknown option-like token is an
+"unrecognized arguments" error, never a positional),
 `action="store_true"`, `help=`, `prog=`, `description=`. Loud errors:
-short options, `nargs`, `choices`, subcommands, dynamic specs, a
-value-taking option without `default=`.
+a short option without a long alias, `nargs`, `choices`, subcommands,
+dynamic specs, a value-taking option without `default=`. Not
+reproduced: short-flag bundling (`-cv`) and `--opt=value` on shorts.
 
 ### 10.4 File objects
 

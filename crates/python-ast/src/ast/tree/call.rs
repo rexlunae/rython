@@ -1900,6 +1900,39 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
+                        // The RESIDUAL variant of a specialized function
+                        // (specialize.rs): its axis parameter is only ever
+                        // bound to types OUTSIDE the tested set, so its
+                        // isinstance checks are false by construction —
+                        // silently, unlike the divergences below.
+                        if let ExprType::Name(n) = &self.args[0]
+                            && options.residual_fold_false.contains(&n.id)
+                        {
+                            return Ok(quote!(false));
+                        }
+                        // An isinstance test on an INFERRED-GENERIC
+                        // parameter in a shape the specializer does not
+                        // cover (a non-if-test use, a second tested
+                        // parameter, defaults/varargs, a method): there is
+                        // no runtime type to dispatch on and no variant to
+                        // fold in — the documented class-as-value
+                        // divergence, false with a warning naming the
+                        // specializable shape.
+                        if let ExprType::Name(n) = &self.args[0]
+                            && options.param_type_vars.contains_key(&n.id)
+                        {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "isinstance({0}, ...) on an inferred-generic \
+                                 parameter lowers to false (the class-as-value \
+                                 divergence). rython specializes a module \
+                                 function whose unannotated parameter is tested \
+                                 only in plain `if isinstance({0}, T):` \
+                                 statements with builtin or class targets; \
+                                 restructure into that shape, or annotate `{0}`",
+                                n.id
+                            ));
+                            return Ok(quote!(false));
+                        }
                         // Exception-class isinstance: `isinstance(e,
                         // LookupError)` where e is a caught exception tests
                         // the PyException's name string — the same match
@@ -1961,13 +1994,17 @@ impl<'a> CodeGen for Call {
                                 _ => None,
                             };
                             if let Some(cname) = inner_class {
+                                // isinstance also accepts subclasses of the
+                                // resolved class: walk the inheritance tree.
                                 let same_class = matches!(
                                     &self.args[0],
                                     ExprType::Name(n)
                                         if options.name_types.get(&n.id).is_some_and(|ty| {
                                             matches!(
                                                 ty,
-                                                crate::TypeInfo::Class(cc) if cc == &cname
+                                                crate::TypeInfo::Class(cc)
+                                                    if crate::ast::tree::class_def::ClassDef
+                                                        ::class_extends(cc, &cname, &symbols)
                                             )
                                         })
                                 );
@@ -1984,27 +2021,47 @@ impl<'a> CodeGen for Call {
                         // A NON-exception class target (`isinstance(other,
                         // CompatibleFamillyRange)`, or an alias/import of one
                         // like `TimeoutSauce`): statically decidable in
-                        // rython's value model — true only when the first
-                        // argument is typed as that class, false otherwise
-                        // (an object of another type cannot be an instance;
-                        // `other: object` never is). The class-as-value
-                        // divergence: the class itself is not a runtime
-                        // value, so the check cannot dispatch dynamically.
+                        // rython's value model through the INHERITANCE TREE —
+                        // true when the first argument's class is the target
+                        // or transitively inherits from it (`isinstance(dog,
+                        // Animal)` with dog: Dog is true, like CPython's
+                        // subclass check), false otherwise. A value whose
+                        // type is unknown cannot dispatch dynamically (the
+                        // class-as-value divergence) — that case is false
+                        // WITH a warning, never silently.
                         if let ExprType::Name(t) = &self.args[1]
                             && is_class_target(&t.id, &symbols, &options, 0)
                         {
-                            let same_class = matches!(
-                                &self.args[0],
-                                ExprType::Name(n)
-                                    if options
-                                        .name_types
-                                        .get(&n.id)
-                                        .is_some_and(|ty| matches!(
-                                            ty,
-                                            crate::TypeInfo::Class(c) if c == &t.id
-                                        ))
-                            );
-                            return Ok(quote!(#same_class));
+                            let arg_class = match &self.args[0] {
+                                ExprType::Name(n) => {
+                                    match options.name_types.get(&n.id) {
+                                        Some(crate::TypeInfo::Class(c)) => {
+                                            Some(c.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                            let result = match &arg_class {
+                                Some(c) => {
+                                    crate::ast::tree::class_def::ClassDef::class_extends(
+                                        c, &t.id, &symbols,
+                                    )
+                                }
+                                None => {
+                                    options.definition_warnings.borrow_mut().push(
+                                        format!(
+                                            "isinstance(x, {}) with x not statically \
+                                             typed as a class lowers to false (the \
+                                             class-as-value divergence)",
+                                            t.id
+                                        ),
+                                    );
+                                    false
+                                }
+                            };
+                            return Ok(quote!(#result));
                         }
                         // Resolve a name that aliases a TUPLE of builtin
                         // type names (`basestring = (str, bytes)` in
@@ -2482,6 +2539,22 @@ impl<'a> CodeGen for Call {
                     "iter" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if rendered.len() == 2 {
+                            // Issue #155: iter(callable, sentinel) is
+                            // supported only as a for-loop iterable, where
+                            // it desugars to a call-until-sentinel loop
+                            // (for_stmt.rs). As a bare value it would need
+                            // an iterator object, which the value model
+                            // does not have.
+                            return Err(
+                                "iter(callable, sentinel) is only supported as a \
+                                 for-loop iterable (`for x in iter(f, sentinel):`), \
+                                 where it lowers to a call-until-sentinel loop \
+                                 (issue #155)"
+                                    .to_string()
+                                    .into(),
+                            );
                         }
                         if rendered.len() != 1 {
                             return Err("iter() takes exactly one argument".to_string().into());
@@ -3414,6 +3487,26 @@ impl<'a> CodeGen for Call {
                             if matches!(fname.as_str(), "md5" | "sha1" | "sha256" | "sha512") =>
                         {
                             &mut _usedforsecurity_kw
+                        }
+                        // deepcopy's `memo=` keyword (issue #154:
+                        // `copy.deepcopy(params, memo=_ForgetfulDict())` —
+                        // boto3's dynamodb transform) is dropped: rython's
+                        // value model has no shared references, so every
+                        // deepcopy already produces fresh objects — the
+                        // forgetful-memo behavior. A REAL memo's
+                        // dedup-within-one-call (shared refs inside `params`
+                        // mapping to ONE new object) is not reproduced;
+                        // that's the §12.3 aliasing divergence, surfaced
+                        // through -W.
+                        Some("memo") if fname == "deepcopy" => {
+                            options.definition_warnings.borrow_mut().push(
+                                "deepcopy(memo=...) is dropped: rython's value \
+                                 semantics copy everything fresh (the forgetful-memo \
+                                 behavior); a real memo's shared-reference dedup is \
+                                 not reproduced (issue #154, the aliasing divergence)"
+                                    .to_string(),
+                            );
+                            continue;
                         }
                         // csv reader/writer: a `**d` SPREAD of the class-level
                         // dialect defaults (`csv.reader(self.stream,
@@ -5643,6 +5736,291 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // A call to a SPECIALIZED function (specialize.rs): dispatch to
+        // the variant matching the axis argument's static type — Python's
+        // first-true-test order through the inheritance tree — or to the
+        // `__any` residual for a type outside the tested set. An argument
+        // whose type is not statically known cannot be dispatched: loud
+        // conversion error, never a silently-wrong branch.
+        if let ExprType::Name(callee_name) = self.func.as_ref()
+            && let Some(spec) = options.specialized_fns.get(&callee_name.id).cloned()
+        {
+            if !self.keywords.is_empty() {
+                return Err(format!(
+                    "`{}` is specialized on its isinstance-tested parameter; \
+                     calls take positional arguments only",
+                    callee_name.id
+                )
+                .into());
+            }
+            let type_info_py_name = |t: &crate::TypeInfo| -> Option<String> {
+                match t {
+                    crate::TypeInfo::Int => Some("int".into()),
+                    crate::TypeInfo::Float => Some("float".into()),
+                    crate::TypeInfo::Bool => Some("bool".into()),
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                        Some("str".into())
+                    }
+                    crate::TypeInfo::Bytes => Some("bytes".into()),
+                    _ => None,
+                }
+            };
+            // A BOXED argument (PyValue — a heterogeneous-union value, a
+            // call whose mixed returns unified to the box) has no static
+            // type to dispatch on; when the dynamic router exists, the
+            // dispatch happens at RUNTIME through it instead.
+            let arg_is_boxed = |arg: &ExprType| -> bool {
+                match arg {
+                    ExprType::Name(n) => matches!(
+                        options.name_types.get(&n.id),
+                        Some(crate::TypeInfo::PyValue)
+                    ),
+                    ExprType::Call(c) => matches!(
+                        crate::ast::tree::type_ctx::call_return_typeinfo(
+                            c,
+                            Some(&symbols),
+                            Some(&options),
+                        ),
+                        Some(crate::TypeInfo::PyValue)
+                    ),
+                    _ => false,
+                }
+            };
+            // The static (py type name, is_class) of an axis argument.
+            let classify = |arg: &ExprType| -> (Option<String>, bool) {
+                match arg {
+                    ExprType::Name(n) => match options.name_types.get(&n.id) {
+                        Some(crate::TypeInfo::Class(c)) => (Some(c.clone()), true),
+                        Some(t) => (type_info_py_name(t), false),
+                        None => (options.local_types.get(&n.id).cloned(), false),
+                    },
+                    // A call argument: a constructor
+                    // (`describe(Dog("rex"))`) is an instance of its
+                    // class; a known function resolves through its
+                    // return type.
+                    ExprType::Call(c) => {
+                        let ctor = matches!(
+                            c.func.as_ref(),
+                            ExprType::Name(f)
+                                if matches!(
+                                    symbols.get(&f.id),
+                                    Some(SymbolTableNode::ClassDef(_))
+                                )
+                        );
+                        if ctor {
+                            let ExprType::Name(f) = c.func.as_ref() else {
+                                unreachable!()
+                            };
+                            (Some(f.id.clone()), true)
+                        } else {
+                            match crate::ast::tree::type_ctx::call_return_typeinfo(
+                                c,
+                                Some(&symbols),
+                                Some(&options),
+                            ) {
+                                Some(crate::TypeInfo::Class(cn)) => (Some(cn), true),
+                                Some(t) => (type_info_py_name(&t), false),
+                                None => (None, false),
+                            }
+                        }
+                    }
+                    lit => (
+                        crate::ast::tree::function_def::simple_expr_type(lit)
+                            .and_then(|ty| {
+                                crate::ast::tree::function_def::rust_type_to_py_name(&ty)
+                                    .map(str::to_string)
+                            }),
+                        false,
+                    ),
+                }
+            };
+            // Type every axis argument.
+            struct AxisSite<'a> {
+                axis: &'a crate::ast::tree::specialize::SpecAxis,
+                boxed: bool,
+                py_ty: Option<String>,
+                is_class: bool,
+            }
+            let mut sites: Vec<AxisSite> = Vec::new();
+            for axis in &spec.axes {
+                let Some(arg) = self.args.get(axis.index) else {
+                    return Err(format!(
+                        "`{}` needs at least {} positional argument(s)",
+                        callee_name.id,
+                        axis.index + 1
+                    )
+                    .into());
+                };
+                let boxed = arg_is_boxed(arg);
+                let (py_ty, is_class) =
+                    if boxed { (None, false) } else { classify(arg) };
+                sites.push(AxisSite { axis, boxed, py_ty, is_class });
+            }
+            if sites.iter().any(|s| s.boxed) {
+                let Some(router) = &spec.router else {
+                    return Err(format!(
+                        "cannot dispatch `{}` on a boxed value: its dynamic \
+                         router is unavailable (a parameter without a concrete \
+                         annotation, or an underivable morph return type); \
+                         annotate the value with a concrete type",
+                        callee_name.id
+                    )
+                    .into());
+                };
+                // Route the whole call through the router: each axis
+                // parameter is `impl Into<Enum>`, so a boxed argument
+                // passes unadorned (From<PyValue>, first-true-test
+                // routing), a static argument matching a variant passes
+                // as a plain value (From<T>), and a static argument
+                // OUTSIDE the tested set boxes so it lands in `Other` —
+                // the residual arm for that axis, exactly Python.
+                use crate::ast::tree::specialize::{
+                    axis_dispatch_suffix, py_id_boxable, RouterReturn,
+                };
+                let orig = crate::safe_ident(&callee_name.id);
+                let mut rendered = Vec::new();
+                for (i, arg) in self.args.iter().enumerate() {
+                    let a = arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let Some(site) =
+                        sites.iter().find(|s| s.axis.index == i)
+                    else {
+                        rendered.push(a);
+                        continue;
+                    };
+                    if site.boxed {
+                        rendered.push(a);
+                        continue;
+                    }
+                    let Some(py_ty) = &site.py_ty else {
+                        return Err(format!(
+                            "cannot dispatch the call to `{}`: the type of an \
+                             isinstance-dispatched argument is not statically \
+                             known — annotate the value (or the enclosing \
+                             parameter) so the converter can pick the right \
+                             specialization",
+                            callee_name.id
+                        )
+                        .into());
+                    };
+                    if axis_dispatch_suffix(site.axis, py_ty, site.is_class)
+                        .is_some()
+                        || site.is_class
+                    {
+                        // A class inside the tested subtree has its own
+                        // From impl; one outside it cannot box — loud
+                        // below via the From-less build if ever reached,
+                        // so keep classes on the plain path only when a
+                        // variant exists.
+                        if site.is_class
+                            && axis_dispatch_suffix(site.axis, py_ty, true)
+                                .is_none()
+                        {
+                            return Err(format!(
+                                "cannot dispatch `{}`: argument {} is a class \
+                                 outside the isinstance-tested set, which has \
+                                 no boxed representation for runtime routing",
+                                callee_name.id,
+                                i + 1
+                            )
+                            .into());
+                        }
+                        rendered.push(a);
+                    } else if py_id_boxable(py_ty) {
+                        rendered.push(quote!(stdpython::PyValue::from(#a)));
+                    } else {
+                        return Err(format!(
+                            "cannot dispatch `{}`: argument {} has type `{}`, \
+                             outside the isinstance-tested set, with no boxed \
+                             representation for runtime routing",
+                            callee_name.id,
+                            i + 1,
+                            py_ty
+                        )
+                        .into());
+                    }
+                }
+                let call = quote!(#orig(#(#rendered),*));
+                // An output-enum router (diverging morph returns):
+                // Python's value here is the union — the boxed PyValue —
+                // so the result converts on the way out. Members that
+                // cannot box (a class) have no Python-faithful landing
+                // at a boxed call site: loud.
+                let boxes = match &router.ret {
+                    RouterReturn::Unified(_) => None,
+                    RouterReturn::Enum { members, .. } => {
+                        if !members.iter().all(|m| py_id_boxable(m)) {
+                            return Err(format!(
+                                "cannot dispatch `{}` on a boxed value: its \
+                                 morphs' return types include a class, so the \
+                                 result has no boxed representation; annotate \
+                                 the argument with a concrete type",
+                                callee_name.id
+                            )
+                            .into());
+                        }
+                        Some(())
+                    }
+                };
+                return Ok(match (boxes, propagates_exceptions) {
+                    (None, true) => quote!((#call)?),
+                    (None, false) => call,
+                    (Some(()), true) => {
+                        quote!(stdpython::PyValue::from((#call)?))
+                    }
+                    (Some(()), false) => {
+                        return Err(format!(
+                            "cannot dispatch `{}` on a boxed value in a \
+                             context that does not propagate exceptions",
+                            callee_name.id
+                        )
+                        .into());
+                    }
+                });
+            }
+            // Fully static: each axis picks its variant (or its "any"
+            // residual), joined into the morph's suffix.
+            let mut suffixes: Vec<String> = Vec::new();
+            for site in &sites {
+                let Some(py_ty) = &site.py_ty else {
+                    return Err(format!(
+                        "cannot dispatch the call to `{}`: the type of its \
+                         isinstance-dispatched argument is not statically known — \
+                         annotate the value (or the enclosing parameter) so the \
+                         converter can pick the right specialization",
+                        callee_name.id
+                    )
+                    .into());
+                };
+                suffixes.push(
+                    crate::ast::tree::specialize::axis_dispatch_suffix(
+                        site.axis, py_ty, site.is_class,
+                    )
+                    .unwrap_or("any")
+                    .to_lowercase(),
+                );
+            }
+            let suffix = suffixes.join("_");
+            let mangled = crate::safe_ident(&crate::ast::tree::specialize::mangled_name(&callee_name.id, &suffix));
+            let mut rendered = Vec::new();
+            for arg in &self.args {
+                rendered.push(arg.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            let call = quote!(#mangled(#(#rendered),*));
+            return Ok(if propagates_exceptions {
+                quote!((#call)?)
+            } else {
+                call
+            });
+        }
+
         // Keyword arguments and omitted defaulted parameters resolve
         // against the callee's signature: keywords map to their parameter
         // positions and missing parameters fill from their default values,
@@ -5694,14 +6072,16 @@ impl<'a> CodeGen for Call {
                         .as_deref()
                         .is_some_and(crate::is_optional_annotation)
                 });
-            // A **kwargs callee always routes through map_call_arguments,
-            // which appends the boxed kwargs dict (issue #120).
+            // A **kwargs or *args callee always routes through
+            // map_call_arguments, which packs the extras into the boxed
+            // PyDict / Vec<PyValue> (issue #120).
             let needs_mapping = !self.keywords.is_empty()
                 || !callee_def.args.kwonlyargs.is_empty()
                 || self.args.len() < pos_param_count
                 || has_optional_params
-                || callee_def.args.kwarg.is_some();
-            if !callee_def.args.vararg.is_some() && needs_mapping {
+                || callee_def.args.kwarg.is_some()
+                || callee_def.args.vararg.is_some();
+            if needs_mapping {
                 let MappedArguments { prelude, args } = map_call_arguments(
                     callee_def,
                     &self.args,
@@ -5723,21 +6103,6 @@ impl<'a> CodeGen for Call {
                 } else {
                     call
                 });
-            }
-            // A *args callee called with keywords: if it ALSO takes
-            // **kwargs (a fallback stub like requests' SOCKSProxyManager
-            // `def f(*args, **kwargs): raise ...`), the keywords lower
-            // positionally below; only a pure *args signature is loud.
-            if !callee_def.args.vararg.is_none()
-                && callee_def.args.kwarg.is_none()
-                && !self.keywords.is_empty()
-            {
-                return Err(format!(
-                    "keyword arguments in a call to `{}` are not supported yet: \
-                     its signature takes *args",
-                    callee_def.name
-                )
-                .into());
             }
         } else if !self.keywords.is_empty() {
             // An unknown callee. A name that exists as a Python variable
@@ -7440,36 +7805,47 @@ fn map_call_arguments_inner(
     let mut slot_temp: Vec<Option<usize>> = vec![None; total];
 
     let mut slots: Vec<Option<TokenStream>> = vec![None; n];
-    let mut vararg_slot: Option<TokenStream> = None;
-    let mut vararg_temp: Option<usize> = None;
+    // Issue #120: extra positionals for a *args callee, boxed one by one
+    // (PyValue-yielding values pass through), plus `*t` spreads forwarded
+    // into the vector in source order. Each records its eval_order index
+    // so the keyword-reorder path can reference the temps.
+    let mut vararg_extras: Vec<(usize, TokenStream, bool)> = Vec::new(); // (temp, value, is_spread)
     // `*t` positional spreads and `**d` keyword spreads collected
     // separately: only the POSITIONAL spreads can fill missing params.
     let mut spreads: Vec<TokenStream> = Vec::new();
     let mut kw_spreads: Vec<TokenStream> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
-        // A `*t` SPREAD argument (`build_netloc(*host_port)` — pip's
-        // package_finder): the tuple's elements cannot be unpacked
-        // statically — the spread value fills each missing positional
-        // parameter (the spread-argument divergence).
+        // A `*t` SPREAD argument. To a *args callee it FORWARDS into the
+        // vararg vector (`g(*args)` passthrough — the elements box via
+        // PyValue::from, an identity for an already-boxed Vec<PyValue>).
+        // Otherwise (`build_netloc(*host_port)` — pip's package_finder)
+        // the elements cannot be unpacked statically — the spread value
+        // fills each missing positional parameter (the spread-argument
+        // divergence).
         if let ExprType::Starred(st) = arg {
             let value = st
                 .value
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             eval_order.push(value.clone());
-            spreads.push(value);
+            if vararg_param.is_some() && i >= n {
+                vararg_extras.push((eval_order.len() - 1, value, true));
+            } else {
+                spreads.push(value);
+            }
             continue;
         }
         if i >= n {
-            // Extra positionals collect into the *args slot.
-            let value = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // Extra positionals collect into the *args slot, boxed.
+            let value = crate::render_typed(
+                arg,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(crate::TypeInfo::PyValue),
+            )?;
             eval_order.push(value.clone());
-            vararg_slot = Some(if let Some(existing) = &vararg_slot {
-                quote!(vec![#existing, #value])
-            } else {
-                quote!(vec![#value])
-            });
-            vararg_temp = Some(eval_order.len() - 1);
+            vararg_extras.push((eval_order.len() - 1, value, false));
             continue;
         }
         let value = fill(pos_params[i], arg)?;
@@ -7673,18 +8049,56 @@ fn map_call_arguments_inner(
         }
     }
 
-    let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total);
-    for s in slots.into_iter() {
-        final_slots.push(s.expect("all argument slots filled"));
-    }
+    // Issue #120: the *args vector — plain extras as vec![..] elements,
+    // spreads extended in source order (PyValue::from is the identity for
+    // an already-boxed forwarded Vec<PyValue>). Empty when the call has
+    // no extras: the callee's parameter still needs its vector.
+    let build_vararg = |items: &[(TokenStream, bool)]| -> TokenStream {
+        if items.iter().all(|(_, is_spread)| !is_spread) {
+            let vals: Vec<&TokenStream> = items.iter().map(|(v, _)| v).collect();
+            quote!(vec![#(#vals),*])
+        } else {
+            let mut stmts =
+                quote!(let mut __rython_varargs: Vec<stdpython::PyValue> = Vec::new(););
+            for (v, is_spread) in items {
+                if *is_spread {
+                    stmts.extend(quote!(__rython_varargs.extend(
+                        (#v).into_iter().map(stdpython::PyValue::from)
+                    );));
+                } else {
+                    stmts.extend(quote!(__rython_varargs.push(#v);));
+                }
+            }
+            quote!({ #stmts __rython_varargs })
+        }
+    };
+
+    // Parameter-ordered VALUES, kept in two lists so both emission paths
+    // below assemble the signature order — [positional, *args, kwonly,
+    // **kwargs] — without index arithmetic across the inserted vararg
+    // element (Devin review on PR #157: the old flat list shifted the
+    // keyword-only defaults by one and appended the vector last).
+    let pos_values: Vec<TokenStream> = slots
+        .into_iter()
+        .map(|s| s.expect("all argument slots filled"))
+        .collect();
+    let kwonly_values: Vec<TokenStream> = kwonly_slots
+        .into_iter()
+        .map(|s| s.expect("all argument slots filled"))
+        .collect();
+
+    let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total + 2);
+    final_slots.extend(pos_values.iter().cloned());
     // The *args slot (collected extra positionals) sits between the
     // positional params and the keyword-only params.
-    if let Some(v) = vararg_slot {
-        final_slots.push(v);
+    if vararg_param.is_some() {
+        let items: Vec<(TokenStream, bool)> = vararg_extras
+            .iter()
+            .map(|(_, v, s)| (v.clone(), *s))
+            .collect();
+        final_slots.push(build_vararg(&items));
     }
-    for s in kwonly_slots {
-        final_slots.push(s.expect("all argument slots filled"));
-    }
+    final_slots.extend(kwonly_values.iter().cloned());
     // Issue #120: append the **kwargs dict — explicit extra keywords boxed
     // in PyValue::from, then `**d` spreads merged in source order. When
     // keywords reorder the emission, the element values are bound to temps
@@ -7734,23 +8148,38 @@ fn map_call_arguments_inner(
         let tid = format_ident!("__rython_arg_{}", i);
         prelude.extend(quote!(let #tid = #value;));
     }
-    let mut args: Vec<TokenStream> = (0..total)
-        .map(|i| match slot_temp[i] {
+    // Signature order: positional temps, the *args vector, keyword-only
+    // temps, the **kwargs dict — mirroring the non-reorder layout above.
+    // A slot with no temp holds a constant default (verified by
+    // `check_default_constant`), so inlining it in parameter position
+    // cannot reorder or duplicate side effects.
+    let temp_or = |i: usize, value: &TokenStream| -> TokenStream {
+        match slot_temp[i] {
             Some(ti) => {
                 let tid = format_ident!("__rython_arg_{}", ti);
                 quote!(#tid)
             }
-            // A default fills the slot: it is a constant (verified by
-            // `check_default_constant`), so inlining it in parameter
-            // position cannot reorder or duplicate side effects.
-            None => final_slots[i].clone(),
-        })
-        .collect();
-    // The *args slot references its prelude temp (collected extra
-    // positionals were bound to the last eval_order temp).
-    if let Some(ti) = vararg_temp {
-        let tid = format_ident!("__rython_arg_{}", ti);
-        args.push(quote!(#tid));
+            None => value.clone(),
+        }
+    };
+    let mut args: Vec<TokenStream> = Vec::with_capacity(total + 2);
+    for (i, v) in pos_values.iter().enumerate() {
+        args.push(temp_or(i, v));
+    }
+    // The *args vector references its prelude temps (each collected
+    // extra was bound in source order).
+    if vararg_param.is_some() {
+        let items: Vec<(TokenStream, bool)> = vararg_extras
+            .iter()
+            .map(|(ti, _, s)| {
+                let tid = format_ident!("__rython_arg_{}", ti);
+                (quote!(#tid), *s)
+            })
+            .collect();
+        args.push(build_vararg(&items));
+    }
+    for (i, v) in kwonly_values.iter().enumerate() {
+        args.push(temp_or(n + i, v));
     }
     if let Some(kw) = &kw_expr {
         args.push(kw.clone());
