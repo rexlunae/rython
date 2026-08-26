@@ -6217,6 +6217,12 @@ fn varargs_pack_forward_and_index_match_python_at_runtime() {
             "def stub(*args, **kwargs) -> int:\n",
             "    return len(args) + len(kwargs)\n",
             "\n",
+            "def mixed(a: int, *args, b: int = 5) -> int:\n",
+            "    return a * 100 + len(args) * 10 + b\n",
+            "\n",
+            "def required(a: int, *args, b: int) -> int:\n",
+            "    return a * 100 + len(args) * 10 + b\n",
+            "\n",
             "def main() -> None:\n",
             "    print(tag(1, \"x\", True))\n",
             "    print(fwd(1, \"x\"))\n",
@@ -6224,6 +6230,9 @@ fn varargs_pack_forward_and_index_match_python_at_runtime() {
             "    print(first(\"v=\"))\n",
             "    print(first(\"v=\", 7, 8))\n",
             "    print(stub(1, 2, x=3))\n",
+            "    print(mixed(1, 2, b=9))\n",
+            "    print(mixed(1, 2, 3))\n",
+            "    print(required(1, 2, b=3))\n",
             "\n",
             "if __name__ == \"__main__\":\n",
             "    main()\n",
@@ -6245,7 +6254,7 @@ fn varargs_pack_forward_and_index_match_python_at_runtime() {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        vec!["3", "2", "0", "v=", "v=7", "3"],
+        vec!["3", "2", "0", "v=", "v=7", "3", "119", "125", "113"],
         "*args semantics diverged from CPython"
     );
 }

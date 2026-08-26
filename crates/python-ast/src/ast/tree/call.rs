@@ -8073,10 +8073,22 @@ fn map_call_arguments_inner(
         }
     };
 
-    let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total);
-    for s in slots.into_iter() {
-        final_slots.push(s.expect("all argument slots filled"));
-    }
+    // Parameter-ordered VALUES, kept in two lists so both emission paths
+    // below assemble the signature order — [positional, *args, kwonly,
+    // **kwargs] — without index arithmetic across the inserted vararg
+    // element (Devin review on PR #157: the old flat list shifted the
+    // keyword-only defaults by one and appended the vector last).
+    let pos_values: Vec<TokenStream> = slots
+        .into_iter()
+        .map(|s| s.expect("all argument slots filled"))
+        .collect();
+    let kwonly_values: Vec<TokenStream> = kwonly_slots
+        .into_iter()
+        .map(|s| s.expect("all argument slots filled"))
+        .collect();
+
+    let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total + 2);
+    final_slots.extend(pos_values.iter().cloned());
     // The *args slot (collected extra positionals) sits between the
     // positional params and the keyword-only params.
     if vararg_param.is_some() {
@@ -8086,9 +8098,7 @@ fn map_call_arguments_inner(
             .collect();
         final_slots.push(build_vararg(&items));
     }
-    for s in kwonly_slots {
-        final_slots.push(s.expect("all argument slots filled"));
-    }
+    final_slots.extend(kwonly_values.iter().cloned());
     // Issue #120: append the **kwargs dict — explicit extra keywords boxed
     // in PyValue::from, then `**d` spreads merged in source order. When
     // keywords reorder the emission, the element values are bound to temps
@@ -8138,18 +8148,24 @@ fn map_call_arguments_inner(
         let tid = format_ident!("__rython_arg_{}", i);
         prelude.extend(quote!(let #tid = #value;));
     }
-    let mut args: Vec<TokenStream> = (0..total)
-        .map(|i| match slot_temp[i] {
+    // Signature order: positional temps, the *args vector, keyword-only
+    // temps, the **kwargs dict — mirroring the non-reorder layout above.
+    // A slot with no temp holds a constant default (verified by
+    // `check_default_constant`), so inlining it in parameter position
+    // cannot reorder or duplicate side effects.
+    let temp_or = |i: usize, value: &TokenStream| -> TokenStream {
+        match slot_temp[i] {
             Some(ti) => {
                 let tid = format_ident!("__rython_arg_{}", ti);
                 quote!(#tid)
             }
-            // A default fills the slot: it is a constant (verified by
-            // `check_default_constant`), so inlining it in parameter
-            // position cannot reorder or duplicate side effects.
-            None => final_slots[i].clone(),
-        })
-        .collect();
+            None => value.clone(),
+        }
+    };
+    let mut args: Vec<TokenStream> = Vec::with_capacity(total + 2);
+    for (i, v) in pos_values.iter().enumerate() {
+        args.push(temp_or(i, v));
+    }
     // The *args vector references its prelude temps (each collected
     // extra was bound in source order).
     if vararg_param.is_some() {
@@ -8161,6 +8177,9 @@ fn map_call_arguments_inner(
             })
             .collect();
         args.push(build_vararg(&items));
+    }
+    for (i, v) in kwonly_values.iter().enumerate() {
+        args.push(temp_or(n + i, v));
     }
     if let Some(kw) = &kw_expr {
         args.push(kw.clone());
