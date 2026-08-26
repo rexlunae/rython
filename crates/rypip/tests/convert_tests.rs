@@ -5917,3 +5917,69 @@ fn global_writes_mutate_module_state_at_runtime() {
     );
 }
 
+#[test]
+fn field_from_cross_module_call_result_attribute() {
+    // Issue #123: `self.bin_dir = scheme.scripts` where `scheme` is the
+    // result of a call into a SIBLING module returning a frozen dataclass
+    // (pip's Prefix over get_scheme -> Scheme). Needs call-return typing,
+    // dataclass __init__ synthesis, AND the stored-parameter clone
+    // (`self.path = path` followed by a later read of `path`).
+    let scratch = Scratch::new("xmodfield");
+    let root = scratch.path().join("pkg");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("__init__.py"),
+        concat!(
+            "from locations import get_scheme\n",
+            "\n",
+            "class Prefix:\n",
+            "    def __init__(self, path: str) -> None:\n",
+            "        self.path = path\n",
+            "        scheme = get_scheme(path)\n",
+            "        self.bin_dir = scheme.scripts\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = Prefix(\"x\")\n",
+            "    print(p.bin_dir)\n",
+            "    print(p.path)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("locations.py"),
+        concat!(
+            "from dataclasses import dataclass\n",
+            "\n",
+            "@dataclass(frozen=True)\n",
+            "class Scheme:\n",
+            "    platlib: str\n",
+            "    purelib: str\n",
+            "    scripts: str\n",
+            "\n",
+            "def get_scheme(x: str) -> Scheme:\n",
+            "    return Scheme(\"a\", \"b\", \"c\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&root).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["c", "x"],
+        "cross-module field typing diverged from CPython"
+    );
+}
