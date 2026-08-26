@@ -2669,33 +2669,32 @@ fn del_full_slice_clears_in_place() {
 }
 
 #[test]
-fn bounded_slice_delete_is_a_loud_error() {
-    // Python: `del xs[1:3]` on [1,2,3,4] leaves [1,4]. rython has no
-    // range removal, and dropping the statement would silently keep the
-    // elements — loud conversion error naming the working rebuild.
-    let err = compile_err("xs = [1, 2, 3, 4]\ndel xs[1:3]\n", "bounedel.py");
-    assert!(
-        err.contains("`del` with a bounded slice target"),
-        "err: {err}"
-    );
-    assert!(err.contains("xs = xs[:start] + xs[end:]"), "err: {err}");
+fn bounded_slice_delete_lowers_to_py_del_range() {
+    // Issue #153: `del xs[1:3]` on [1,2,3,4] leaves [1,4] — the runtime's
+    // py_del_range removes the range in place (bounds clamp, negatives
+    // count from the end). A STEPPED slice delete stays loud.
+    let out = compile("xs = [1, 2, 3, 4]\ndel xs[1:3]\n", "bounedel.py");
+    assert!(out.contains("py_del_range"), "generated: {}", out);
+    let err = compile_err("xs = [1, 2, 3, 4]\ndel xs[0:4:2]\n", "stepdel.py");
+    assert!(err.contains("stepped slice"), "err: {err}");
 }
 
 #[test]
-fn slice_assignment_is_a_loud_error() {
-    // Python: `xs[1:3] = []` on [1,2,3,4] leaves [1,4] — range-replace
-    // with a different-length RHS inserts/removes. Dropping it would
-    // silently leave the container untouched — loud error naming the
-    // supported rebuild instead.
-    let err = compile_err("xs = [1, 2, 3, 4]\nxs[1:3] = []\n", "sliceassign.py");
+fn slice_assignment_lowers_to_py_splice() {
+    // Issue #153: `xs[1:3] = R` replaces the range in place — a
+    // different-length RHS inserts or removes elements (pip's
+    // cmdoptions). Open bounds pass None; a STEPPED slice assignment
+    // stays loud.
+    let out = compile("xs = [1, 2, 3, 4]\nxs[1:3] = [9]\n", "sliceassign.py");
+    assert!(out.contains("py_splice"), "generated: {}", out);
+    let out = compile("xs = [1, 2, 3, 4]\nxs[2:] = [7, 8]\n", "sliceopen.py");
     assert!(
-        err.contains("slice assignment to"),
-        "err: {err}"
+        out.contains("py_splice") && out.contains("None"),
+        "generated: {}",
+        out
     );
-    assert!(
-        err.contains("rebuild the container instead"),
-        "err: {err}"
-    );
+    let err = compile_err("xs = [1, 2, 3, 4]\nxs[0:4:2] = [7, 8]\n", "stepassign.py");
+    assert!(err.contains("slice assignment with a step"), "err: {err}");
 }
 
 #[test]

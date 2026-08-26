@@ -712,25 +712,47 @@ impl CodeGen for StatementType {
                                     // runtime's clear (Python's `xs[:] = []`).
                                     if lower.is_none() && upper.is_none() && step.is_none() {
                                         stmts.push(quote!((#receiver).clear();));
-                                    } else {
-                                        // A BOUNDED slice delete (`del
-                                        // xs[start:end]`) removes a range of
-                                        // elements IN PLACE in Python; rython's
-                                        // value model has no range removal, so
-                                        // dropping the statement would silently
-                                        // leave them in the container — never
-                                        // silent: loud conversion error naming
-                                        // the working rewrite (slice
-                                        // assignment IS supported).
+                                    } else if step.is_some() {
+                                        // An EXTENDED slice delete (`del
+                                        // xs[a:b:2]`) removes every step-th
+                                        // element — unmodeled; loud.
                                         return Err(
-                                            "`del` with a bounded slice target is not \
-                                             supported: removing a range of elements is \
-                                             unmodeled, and skipping the statement would \
-                                             silently keep them in the container; rebuild \
-                                             the list instead (`xs = xs[:start] + xs[end:]`)"
+                                            "`del` with a stepped slice target \
+                                             (`del xs[a:b:s]`) is not supported; \
+                                             delete the step-1 range or rebuild the \
+                                             list"
                                                 .to_string()
                                                 .into(),
                                         );
+                                    } else {
+                                        // A BOUNDED slice delete (`del
+                                        // xs[start:end]` — pip's cmdoptions,
+                                        // issue #153) removes the range IN
+                                        // PLACE via the runtime's
+                                        // py_del_range (Python's
+                                        // `xs[a:b] = []`: bounds clamp,
+                                        // negatives count from the end).
+                                        let bound = |b: &Option<Box<ExprType>>| -> Result<
+                                            TokenStream,
+                                            Box<dyn std::error::Error>,
+                                        > {
+                                            Ok(match b {
+                                                None => quote!(None),
+                                                Some(e) => {
+                                                    let t = e.clone().to_rust(
+                                                        ctx.clone(),
+                                                        options.clone(),
+                                                        symbols.clone(),
+                                                    )?;
+                                                    quote!(Some((#t) as i64))
+                                                }
+                                            })
+                                        };
+                                        let lo = bound(lower)?;
+                                        let hi = bound(upper)?;
+                                        stmts.push(quote!(
+                                            py_del_range(&mut (#receiver), #lo, #hi);
+                                        ));
                                     }
                                 }
                             }

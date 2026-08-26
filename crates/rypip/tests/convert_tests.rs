@@ -6069,3 +6069,73 @@ fn module_level_argparse_with_short_aliases_matches_python() {
         "error output diverged from CPython"
     );
 }
+
+#[test]
+fn range_replace_and_range_delete_match_python_at_runtime() {
+    // Issue #153: `xs[a:b] = R` and `del xs[a:b]` — in-place range
+    // replacement with Python's exact bound rules: different-length RHS
+    // inserts/removes, an inverted range is an insertion point, negatives
+    // count from the end, out-of-range bounds clamp, `xs[:] = R` replaces
+    // everything.
+    let scratch = Scratch::new("splice");
+    let file = scratch.path().join("splice.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    xs = [1, 2, 3, 4]\n",
+            "    xs[1:3] = [9]\n",
+            "    print(xs)\n",
+            "    xs[1:1] = [7, 8]\n",
+            "    print(xs)\n",
+            "    xs[-2:] = [0]\n",
+            "    print(xs)\n",
+            "    xs[10:20] = [5]\n",
+            "    print(xs)\n",
+            "    xs[3:1] = [6]\n",
+            "    print(xs)\n",
+            "    del xs[1:3]\n",
+            "    print(xs)\n",
+            "    del xs[-2:]\n",
+            "    print(xs)\n",
+            "    del xs[5:9]\n",
+            "    print(xs)\n",
+            "    ys = [1, 2, 3]\n",
+            "    ys[:] = [4]\n",
+            "    print(ys)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/splice"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "[1, 9, 4]",
+            "[1, 7, 8, 9, 4]",
+            "[1, 7, 8, 0]",
+            "[1, 7, 8, 0, 5]",
+            "[1, 7, 8, 6, 0, 5]",
+            "[1, 6, 0, 5]",
+            "[1, 6]",
+            "[1, 6]",
+            "[4]",
+        ],
+        "range-replace semantics diverged from CPython"
+    );
+}

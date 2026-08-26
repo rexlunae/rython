@@ -275,8 +275,13 @@ Indexing goes through checked helpers that raise
 key with Rust's `Debug` quoting (`KeyError: "name"`) where CPython uses
 repr quoting (`KeyError: 'name'`) — a message-shape divergence on the
 ledger (§12.3). Negative indices and slice *reads* follow Python
-semantics. Slice **assignment** (`x[a:b] = …`) and augmented assignment
-to a slice are loud errors.
+semantics. Slice **assignment** `xs[a:b] = R` and **range delete**
+`del xs[a:b]` on lists replace/remove the range in place with CPython's
+exact bound rules (issue #153): a different-length RHS inserts or
+removes elements, an inverted range is an insertion point, negatives
+count from the end, out-of-range bounds clamp. Stepped forms
+(`xs[a:b:s] = …`, `del xs[a:b:s]`) and augmented assignment to a slice
+are loud errors.
 
 ---
 
