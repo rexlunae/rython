@@ -325,25 +325,11 @@ impl ExprType {
                         // subversion) boxes the same way. Primitive mixes
                         // without tuples/optionals ([1, 'a']) stay a loud
                         // error.
-                        if distinct.iter().any(|t| {
-                            matches!(
-                                t,
-                                crate::TypeInfo::Tuple(_)
-                                    | crate::TypeInfo::Option(_)
-                                    // A NESTED list mixing (`[["apple",
-                                    // ...], 1.123]` — rich's logging demo):
-                                    // a list-of-container element boxes
-                                    // (documented divergence).
-                                    | crate::TypeInfo::Vec(_)
-                            )
-                        })
-                            // A WIDE primitive mix (`[1, 2, 3, None, 4,
-                            // True, False, "Hello World"]` — rich's scope
-                            // demo): three or more distinct scalar kinds —
-                            // boxed PyValue (the boxed-container
-                            // divergence, #130).
-                            || distinct.len() >= 3
-                        {
+                        // Issue #130: ANY mix whose element types are all
+                        // boxable (`[1, "a"]`, `[None, "x", 2, b"y"]`, ...)
+                        // boxes to Vec<PyValue> - not just the >=3-kind and
+                        // tuple/optional shapes this branch used to cover.
+                        if distinct.iter().all(crate::is_boxable_value_type) {
                             expected = crate::TypeInfo::PyValue;
                         } else {
                             let kinds = distinct

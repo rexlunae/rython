@@ -2574,6 +2574,17 @@ impl From<StrOrBytes> for PyValue {
     }
 }
 
+impl From<Option<PyValue>> for PyValue {
+    // A mixed-literal element whose own lowering produced an Option
+    // (a None member) flattens into the boxed value.
+    fn from(value: Option<PyValue>) -> Self {
+        match value {
+            Some(v) => v,
+            None => PyValue::None_,
+        }
+    }
+}
+
 impl From<()> for PyValue {
     fn from(_: ()) -> Self {
         PyValue::None_
@@ -2611,6 +2622,46 @@ pub fn py_value_repr(v: &PyValue) -> String {
         other => py_value_str(other),
     }
 }
+
+/// Structural equality is already derived; `Eq` plus a matching
+/// structural [`Hash`] let boxed values serve as dict KEYS and set
+/// members (`{"k": 1, 2: "v"}` boxes to `PyDict<PyValue, PyValue>`).
+/// Any consistent hash is correct for Rust's maps — CPython's
+/// type-differentiated hashes are not required for agreement between
+/// Hash and PartialEq.
+impl core::hash::Hash for PyValue {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            PyValue::Int(i) => {
+                core::hash::Hash::hash(&0u8, state);
+                core::hash::Hash::hash(i, state);
+            }
+            PyValue::Float(f) => {
+                core::hash::Hash::hash(&1u8, state);
+                core::hash::Hash::hash(&f.to_bits(), state);
+            }
+            PyValue::Bool(b) => {
+                core::hash::Hash::hash(&2u8, state);
+                core::hash::Hash::hash(b, state);
+            }
+            PyValue::Str(s) => {
+                core::hash::Hash::hash(&3u8, state);
+                core::hash::Hash::hash(s, state);
+            }
+            PyValue::Bytes(b) => {
+                core::hash::Hash::hash(&4u8, state);
+                core::hash::Hash::hash(b, state);
+            }
+            PyValue::Tuple(items) => {
+                core::hash::Hash::hash(&5u8, state);
+                core::hash::Hash::hash(items.as_ref(), state);
+            }
+            PyValue::None_ => core::hash::Hash::hash(&6u8, state),
+        }
+    }
+}
+
+impl Eq for PyValue {}
 
 impl PyToString for PyValue {
     fn py_str(self) -> String {
