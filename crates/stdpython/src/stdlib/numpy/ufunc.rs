@@ -310,8 +310,7 @@ fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(op: BinOp, a: L, b: R
     };
     let a = bool_array(&a);
     let b = bool_array(&b);
-    let mut out = vec![false; a.size];
-    engine::binary_bool(op, &a.bool(), &b.bool(), &mut out);
+    let out = engine::binary_bool(op, &a.bool(), &b.bool());
     NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(out))
 }
 

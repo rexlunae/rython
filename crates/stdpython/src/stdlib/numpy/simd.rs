@@ -1,23 +1,26 @@
 //! The `numpy-simd` backend.
 //!
-//! Stable Rust has no portable SIMD, so this backend's kernels are the
-//! SAME sequential kernels the scalar backend runs — LLVM auto-vectorizes
-//! those loops on x86-64/aarch64. The docs therefore promise exactly
-//! that (issue #164): no runtime cpuid dispatch exists yet, and adding
-//! hand-written AVX2/NEON intrinsics here later must keep these entry
+//! Stable Rust has no portable SIMD, but it does not need any: the scalar
+//! kernels are now structured so the op dispatch happens ONCE per call and
+//! each arm is a tight inner loop LLVM auto-vectorizes to NEON (aarch64)
+//! / SSE2-AVX2 (x86-64) — verified by disassembling the release build
+//! (`fadd.2d`/`fmul.2d` etc. appear in the hot kernels). This backend is
+//! therefore an alias of `scalar`, kept as a separate entry point so
+//! `--numpy-backend simd` and `set_backend(Simd)` build and run, with a
+//! place to drop hand-written intrinsics later if any measured gap ever
+//! justifies them (issue #164). Any such intrinsics must keep these entry
 //! points' signatures and per-element semantics.
 //!
 //! Selecting `simd` is indistinguishable from `scalar` today, by design:
-//! it exists so `--numpy-backend simd` and `set_backend(Simd)` build and
-//! run rather than failing, with measured performance equal to scalar.
+//! both compile to the same auto-vectorized loops.
 
 use super::scalar;
 use super::{BinOp, UnOp};
 
 macro_rules! alias {
     ($name:ident, $t:ty) => {
-        pub(crate) fn $name(op: BinOp, a: &[$t], b: &[$t], out: &mut [$t]) {
-            scalar::$name(op, a, b, out)
+        pub(crate) fn $name(op: BinOp, a: &[$t], b: &[$t]) -> Vec<$t> {
+            scalar::$name(op, a, b)
         }
     };
 }
@@ -30,8 +33,8 @@ alias!(binary_bool, bool);
 
 macro_rules! alias_un {
     ($name:ident, $t:ty) => {
-        pub(crate) fn $name(op: UnOp, a: &[$t], out: &mut [$t]) {
-            scalar::$name(op, a, out)
+        pub(crate) fn $name(op: UnOp, a: &[$t]) -> Vec<$t> {
+            scalar::$name(op, a)
         }
     };
 }

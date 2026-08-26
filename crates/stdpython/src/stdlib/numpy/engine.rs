@@ -164,27 +164,26 @@ pub fn active_backend() -> Backend {
 }
 
 fn auto_backend() -> Backend {
-    #[cfg(feature = "numpy-cuda")]
-    {
-        if cuda::available() {
-            return Backend::Cuda;
-        }
-    }
+    // Ranked by measured performance (issue #164): hardware backends that
+    // are actually present outrank the CPU kernels; among the software
+    // kernels, multithreaded rayon beats the single-threaded simd/scalar
+    // loops at every benchmarked size, so it outranks simd.
+    let software: Backend = if cfg!(feature = "numpy-rayon") {
+        Backend::Rayon
+    } else if cfg!(feature = "numpy-simd") {
+        Backend::Simd
+    } else {
+        Backend::Scalar
+    };
     #[cfg(feature = "numpy-vulkan")]
-    {
-        if vulkan::available() {
-            return Backend::Vulkan;
-        }
+    if vulkan::available() {
+        return Backend::Vulkan;
     }
-    #[cfg(feature = "numpy-simd")]
-    {
-        return Backend::Simd;
+    #[cfg(feature = "numpy-cuda")]
+    if cuda::available() {
+        return Backend::Cuda;
     }
-    #[cfg(feature = "numpy-rayon")]
-    {
-        return Backend::Rayon;
-    }
-    Backend::Scalar
+    software
 }
 
 /// A one-line description of the resolved backend, for diagnostics.
@@ -274,65 +273,71 @@ pub(crate) mod cuda;
 pub(crate) mod vulkan;
 
 macro_rules! dispatch_binary {
-    ($f:ident, $op:expr, $a:expr, $b:expr, $out:expr) => {{
+    ($f:ident, $op:expr, $a:expr, $b:expr) => {{
         match active_backend() {
             #[cfg(feature = "numpy-cuda")]
-            Backend::Cuda => cuda::$f($op, $a, $b, $out),
+            Backend::Cuda => cuda::$f($op, $a, $b),
             #[cfg(feature = "numpy-vulkan")]
-            Backend::Vulkan => vulkan::$f($op, $a, $b, $out),
+            Backend::Vulkan => vulkan::$f($op, $a, $b),
             #[cfg(feature = "numpy-simd")]
-            Backend::Simd => simd::$f($op, $a, $b, $out),
+            Backend::Simd => simd::$f($op, $a, $b),
             #[cfg(feature = "numpy-rayon")]
-            Backend::Rayon => rayon_eng::$f($op, $a, $b, $out),
-            _ => scalar::$f($op, $a, $b, $out),
+            Backend::Rayon => rayon_eng::$f($op, $a, $b),
+            _ => scalar::$f($op, $a, $b),
         }
     }};
 }
 
 macro_rules! dispatch_unary {
-    ($f:ident, $op:expr, $a:expr, $out:expr) => {{
+    ($f:ident, $op:expr, $a:expr) => {{
         match active_backend() {
             #[cfg(feature = "numpy-cuda")]
-            Backend::Cuda => cuda::$f($op, $a, $out),
+            Backend::Cuda => cuda::$f($op, $a),
             #[cfg(feature = "numpy-vulkan")]
-            Backend::Vulkan => vulkan::$f($op, $a, $out),
+            Backend::Vulkan => vulkan::$f($op, $a),
             #[cfg(feature = "numpy-simd")]
-            Backend::Simd => simd::$f($op, $a, $out),
+            Backend::Simd => simd::$f($op, $a),
             #[cfg(feature = "numpy-rayon")]
-            Backend::Rayon => rayon_eng::$f($op, $a, $out),
-            _ => scalar::$f($op, $a, $out),
+            Backend::Rayon => rayon_eng::$f($op, $a),
+            _ => scalar::$f($op, $a),
         }
     }};
 }
 
-pub(crate) fn binary_f64(op: BinOp, a: &[f64], b: &[f64], out: &mut [f64]) {
-    dispatch_binary!(binary_f64, op, a, b, out);
+/// Every kernel takes the input slices and RETURNS a freshly allocated
+/// output vector (never written into a caller buffer): rython arrays are
+/// values, every call site builds a new array, and returning a `Vec` lets
+/// the kernels grow it directly — no zero-fill pass over the output
+/// (a full `vec![0.0; n]` write is pure waste when the kernel overwrites
+/// every element anyway). It also makes aliasing structurally impossible.
+pub(crate) fn binary_f64(op: BinOp, a: &[f64], b: &[f64]) -> Vec<f64> {
+    dispatch_binary!(binary_f64, op, a, b)
 }
-pub(crate) fn binary_f32(op: BinOp, a: &[f32], b: &[f32], out: &mut [f32]) {
-    dispatch_binary!(binary_f32, op, a, b, out);
+pub(crate) fn binary_f32(op: BinOp, a: &[f32], b: &[f32]) -> Vec<f32> {
+    dispatch_binary!(binary_f32, op, a, b)
 }
-pub(crate) fn binary_i64(op: BinOp, a: &[i64], b: &[i64], out: &mut [i64]) {
-    dispatch_binary!(binary_i64, op, a, b, out);
+pub(crate) fn binary_i64(op: BinOp, a: &[i64], b: &[i64]) -> Vec<i64> {
+    dispatch_binary!(binary_i64, op, a, b)
 }
-pub(crate) fn binary_i32(op: BinOp, a: &[i32], b: &[i32], out: &mut [i32]) {
-    dispatch_binary!(binary_i32, op, a, b, out);
+pub(crate) fn binary_i32(op: BinOp, a: &[i32], b: &[i32]) -> Vec<i32> {
+    dispatch_binary!(binary_i32, op, a, b)
 }
-pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool], out: &mut [bool]) {
-    dispatch_binary!(binary_bool, op, a, b, out);
+pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool]) -> Vec<bool> {
+    dispatch_binary!(binary_bool, op, a, b)
 }
 
-pub(crate) fn unary_f64(op: UnOp, a: &[f64], out: &mut [f64]) {
-    dispatch_unary!(unary_f64, op, a, out);
+pub(crate) fn unary_f64(op: UnOp, a: &[f64]) -> Vec<f64> {
+    dispatch_unary!(unary_f64, op, a)
 }
-pub(crate) fn unary_f32(op: UnOp, a: &[f32], out: &mut [f32]) {
-    dispatch_unary!(unary_f32, op, a, out);
+pub(crate) fn unary_f32(op: UnOp, a: &[f32]) -> Vec<f32> {
+    dispatch_unary!(unary_f32, op, a)
 }
-pub(crate) fn unary_i64(op: UnOp, a: &[i64], out: &mut [i64]) {
-    dispatch_unary!(unary_i64, op, a, out);
+pub(crate) fn unary_i64(op: UnOp, a: &[i64]) -> Vec<i64> {
+    dispatch_unary!(unary_i64, op, a)
 }
-pub(crate) fn unary_i32(op: UnOp, a: &[i32], out: &mut [i32]) {
-    dispatch_unary!(unary_i32, op, a, out);
+pub(crate) fn unary_i32(op: UnOp, a: &[i32]) -> Vec<i32> {
+    dispatch_unary!(unary_i32, op, a)
 }
-pub(crate) fn unary_bool(op: UnOp, a: &[bool], out: &mut [bool]) {
-    dispatch_unary!(unary_bool, op, a, out);
+pub(crate) fn unary_bool(op: UnOp, a: &[bool]) -> Vec<bool> {
+    dispatch_unary!(unary_bool, op, a)
 }
