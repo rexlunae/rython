@@ -6399,3 +6399,70 @@ fn string_and_computed_globals_mutate_at_runtime() {
         "string/computed global semantics diverged from CPython"
     );
 }
+
+#[test]
+fn mixed_return_boxing_matches_python_at_runtime() {
+    // Issue #133: returns that mix types box to PyValue — a parameter
+    // returned as-is alongside a comparison result (botocore's
+    // ensure_boolean shape), literal/None mixes under annotated
+    // parameters, a value return with a fall-through path, and
+    // element-boxed list returns. Each must print exactly what CPython
+    // prints.
+    let scratch = Scratch::new("retbox");
+    let file = scratch.path().join("retbox.py");
+    fs::write(
+        &file,
+        concat!(
+            "def flagify(val):\n",
+            "    if val:\n",
+            "        return val == \"yes\"\n",
+            "    return val\n",
+            "\n",
+            "def pick(flag: bool):\n",
+            "    if flag:\n",
+            "        return 1\n",
+            "    return None\n",
+            "\n",
+            "def partial(flag: bool):\n",
+            "    if flag:\n",
+            "        return 2\n",
+            "\n",
+            "def mixed_list(flag: bool):\n",
+            "    if flag:\n",
+            "        return [1, \"a\"]\n",
+            "    return []\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(flagify(\"yes\"))\n",
+            "    print(flagify(\"no\"))\n",
+            "    print(pick(True))\n",
+            "    print(pick(False))\n",
+            "    print(partial(True))\n",
+            "    print(partial(False))\n",
+            "    print(mixed_list(True))\n",
+            "    print(mixed_list(False))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/retbox"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["True", "False", "1", "None", "2", "None", "[1, 'a']", "[]"],
+        "mixed-return boxing semantics diverged from CPython"
+    );
+}

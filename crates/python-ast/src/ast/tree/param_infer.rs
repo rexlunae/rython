@@ -949,6 +949,37 @@ pub fn infer_unannotated_signature(
         inferred
     };
 
+    // Issue #133: when the returns unify to the boxed PyValue, the
+    // codegen wraps every return site in `PyValue::from(...)` — a return
+    // whose own type involves a TYPE VARIABLE (a parameter returned
+    // as-is, `return val` in botocore's ensure_boolean, or an operator
+    // result like `<T as PyEq<&'static str>>::Output`) then needs
+    // `stdpython::PyValue: From<that type>` in the where clause, which
+    // rustc will not invent. Fully concrete return types (bool, i64,
+    // String) already have concrete From impls and need no bound.
+    if matches!(&return_type, Some(t) if t.to_string() == "stdpython :: PyValue") {
+        let tv_set: HashSet<String> = tv_names.values().cloned().collect();
+        let returns: Vec<ExprType> = collector.returns.clone();
+        for ret in &returns {
+            let Ok(ty) = return_type_of(ret, &mut collector, &param_types) else {
+                continue;
+            };
+            let s = ty.to_string();
+            let involves_tv = s
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|tok| tv_set.contains(tok));
+            if involves_tv && !s.contains("PyValue") {
+                let bound = quote!(stdpython::PyValue: From<#ty>);
+                if !where_bounds
+                    .iter()
+                    .any(|b| b.to_string() == bound.to_string())
+                {
+                    where_bounds.push(bound);
+                }
+            }
+        }
+    }
+
     // M5 definition-time warning: a bound set no known type satisfies
     // (`p.upper()` + `p.pop()` → PyStrOps + PyPop) is a well-formed
     // Python definition — it never blocks conversion, but it is reported
@@ -992,6 +1023,11 @@ fn render_rhs(
     same: &TokenStream,
 ) -> Result<TokenStream, String> {
     Ok(match rhs {
+        // A `&str` operand in a BOUND position (`val == "yes"` →
+        // `T: PyEq<&str>`) needs a named lifetime (E0637); the operand is
+        // a string literal, so `&'static str` names it exactly — and the
+        // runtime's `impl<'a> PyEq<&'a str>` impls satisfy it (issue #133).
+        RhsType::Concrete(t) if t.to_string() == "& str" => quote!(&'static str),
         RhsType::Concrete(t) => t.clone(),
         RhsType::Param(name) => match param_types.get(name) {
             Some(ty) => ty.clone(),
@@ -1851,6 +1887,17 @@ fn return_type_of(
                             if matches!(&cn.0, Some(litrs::Literal::Integer(_)))
                     ) {
                         left.clone()
+                    } else if matches!(
+                        r,
+                        ExprType::Constant(cn)
+                            if matches!(&cn.0, Some(litrs::Literal::String(_)))
+                    ) {
+                        // A str-literal comparator compares as `&'static
+                        // str` — the type the emitted `py_eq(&("yes"))`
+                        // call and the `T: PyEq<&'static str>` bound use
+                        // (a `String` here would name a different trait
+                        // instantiation than the code exercises).
+                        quote!(&'static str)
                     } else {
                         return_type_of(r, collector, param_types)?
                     }
