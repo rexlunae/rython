@@ -4754,10 +4754,13 @@ impl<T: Clone> PySliceReplace for Vec<T> {
         stop: Option<i64>,
         step: i64,
     ) -> Result<(), PyException> {
-        // extended_slice_indices walks DESCENDING for a negative step,
-        // so removing in emitted order keeps later slots valid. (A
-        // positive step never reaches this method.)
-        for slot in extended_slice_indices(self.len() as i64, start, stop, step)? {
+        // Remove the highest slot first so earlier removals don't shift
+        // the slots still to be removed. A positive extended step DOES
+        // reach this method (via `del xs[a:b:c]`), whose indices are
+        // ascending, so sort before reversing.
+        let mut idxs = extended_slice_indices(self.len() as i64, start, stop, step)?;
+        idxs.sort_unstable();
+        for slot in idxs.into_iter().rev() {
             self.remove(slot);
         }
         Ok(())
