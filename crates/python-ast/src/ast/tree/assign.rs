@@ -642,23 +642,48 @@ impl<'a> CodeGen for Assign {
                         (#receiver).py_set_index(#index, __rython_val)?;
                     }))
                 }
-                crate::SubscriptKind::Slice { .. } => {
-                    // Slice assignment (`memoryview(byte_obj)[0:n] =
-                    // subarray` — urllib3's emscripten fetch loop; `xs[a:b]
-                    // = [...]`) replaces a range in place in Python —
-                    // different-length RHS inserts or removes elements.
-                    // rython has no range-replace lowering, and dropping
-                    // the statement would silently leave the container
-                    // untouched: loud conversion error naming the working
-                    // rebuild (read-side slices ARE supported).
-                    return Err(format!(
-                        "slice assignment to `{:?}[a:b]` is not supported: rython has \
-                         no range-replace lowering, and skipping it would silently keep \
-                         the container unchanged; rebuild the container instead \
-                         (`xs = xs[:a] + replacement + xs[b:]`)",
-                        sub.value
-                    )
-                    .into());
+                crate::SubscriptKind::Slice { lower, upper, step, .. } => {
+                    // Slice assignment (`xs[a:b] = [...]`,
+                    // `memoryview(byte_obj)[0:n] = sub` — urllib3's
+                    // emscripten fetch loop) replaces a range in place: a
+                    // different-length RHS inserts or removes elements. The
+                    // runtime's py_slice_assign clamps/negativizes bounds
+                    // exactly like reads (issue #153).
+                    let step_is_one = crate::ast::tree::subscript::is_step_one(
+                        step.as_deref(),
+                    );
+                    let receiver = crate::subscript_receiver_place(
+                        sub.value.as_ref(),
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let bound_tok = |b: &Option<Box<ExprType>>| -> Result<TokenStream, Box<dyn std::error::Error>> {
+                        match b {
+                            Some(e) => {
+                                let t = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                Ok(quote!(Some(#t)))
+                            }
+                            None => Ok(quote!(None)),
+                        }
+                    };
+                    let lo_tok = bound_tok(lower)?;
+                    let up_tok = bound_tok(upper)?;
+                    // step == 1 (explicit or omitted): contiguous splice.
+                    // Any other nonzero step: extended replacement - the
+                    // runtime checks that the replacement matches the
+                    // selected slot count and raises ValueError otherwise
+                    // (exactly like CPython's list_ass_subscript).
+                    if step_is_one {
+                        Ok(quote!({
+                            (#receiver).py_slice_assign(#lo_tok, #up_tok, #value);
+                        }))
+                    } else {
+                        let st_tok = step.clone().unwrap().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        Ok(quote!({
+                            (#receiver).py_slice_assign_step(#lo_tok, #up_tok, #st_tok, #value)?;
+                        }))
+                    }
                 }
             }
         };

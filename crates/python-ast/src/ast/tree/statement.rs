@@ -710,27 +710,70 @@ impl CodeGen for StatementType {
                                     // (`del self._buffer[:]` — botocore's
                                     // AWSConnection._send_output): the
                                     // runtime's clear (Python's `xs[:] = []`).
-                                    if lower.is_none() && upper.is_none() && step.is_none() {
+                                    // An explicit step of 1 is the same
+                                    // operation.
+                                    let step_is_one = crate::ast::tree::subscript::is_step_one(
+                                        step.as_deref(),
+                                    );
+                                    if lower.is_none()
+                                        && upper.is_none()
+                                        && (step.is_none() || step_is_one)
+                                    {
                                         stmts.push(quote!((#receiver).clear();));
+                                    } else if !step_is_one && step.is_some() {
+                                        // An extended-slice delete (`del
+                                        // xs[a:b:c]`, c != 0) removes the
+                                        // selected slots in place.
+                                        let lo_tok = match lower {
+                                            Some(e) => {
+                                                let t = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                                quote!(Some(#t))
+                                            }
+                                            None => quote!(None),
+                                        };
+                                        let up_tok = match upper {
+                                            Some(e) => {
+                                                let t = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                                quote!(Some(#t))
+                                            }
+                                            None => quote!(None),
+                                        };
+                                        let st_tok = step.clone().unwrap().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                        stmts.push(quote!(
+                                            (#receiver).py_slice_delete_step(#lo_tok, #up_tok, #st_tok)?;
+                                        ));
                                     } else {
                                         // A BOUNDED slice delete (`del
                                         // xs[start:end]`) removes a range of
-                                        // elements IN PLACE in Python; rython's
-                                        // value model has no range removal, so
-                                        // dropping the statement would silently
-                                        // leave them in the container — never
-                                        // silent: loud conversion error naming
-                                        // the working rewrite (slice
-                                        // assignment IS supported).
-                                        return Err(
-                                            "`del` with a bounded slice target is not \
-                                             supported: removing a range of elements is \
-                                             unmodeled, and skipping the statement would \
-                                             silently keep them in the container; rebuild \
-                                             the list instead (`xs = xs[:start] + xs[end:]`)"
-                                                .to_string()
-                                                .into(),
-                                        );
+                                        // elements in place (issue #153).
+                                        // Bounds clamp like reads: negatives
+                                        // count from the end, out-of-range
+                                        // clamps to the edges.
+                                        let lo_tok = match lower {
+                                            Some(e) => {
+                                                let t = e.clone().to_rust(
+                                                    ctx.clone(),
+                                                    options.clone(),
+                                                    symbols.clone(),
+                                                )?;
+                                                quote!(Some(#t))
+                                            }
+                                            None => quote!(None),
+                                        };
+                                        let up_tok = match upper {
+                                            Some(e) => {
+                                                let t = e.clone().to_rust(
+                                                    ctx.clone(),
+                                                    options.clone(),
+                                                    symbols.clone(),
+                                                )?;
+                                                quote!(Some(#t))
+                                            }
+                                            None => quote!(None),
+                                        };
+                                        stmts.push(quote!(
+                                            (#receiver).py_slice_delete(#lo_tok, #up_tok);
+                                        ));
                                     }
                                 }
                             }

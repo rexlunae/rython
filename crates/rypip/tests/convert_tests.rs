@@ -2797,6 +2797,71 @@ fn heterogeneous_union_annotations_match_python_at_runtime() {
 }
 
 #[test]
+fn range_replace_matches_python_at_runtime() {
+    // Issue #153: bounded del / slice assignment / strided variants all
+    // match CPython. Verified against python3:
+    //   [0,3,4,5] / [0,10,20,30,4,5] / [0,10,20,30] /
+    //   [7,0,10,20,30] / [7,0] / [9,1,9] / ['Z','c','d']
+    let scratch = Scratch::new("range-replace");
+    let file = scratch.path().join("seqs.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    xs = [0, 1, 2, 3, 4, 5]\n",
+            "    del xs[1:3]\n",
+            "    print(xs)\n",
+            "    xs[1:2] = [10, 20, 30]\n",
+            "    print(xs)\n",
+            "    del xs[-2:]\n",
+            "    print(xs)\n",
+            "    xs[0:0] = [7]\n",
+            "    print(xs)\n",
+            "    xs[2:99] = []\n",
+            "    print(xs)\n",
+            "    ys = [0, 1, 2]\n",
+            "    ys[::2] = [9, 9]\n",
+            "    print(ys)\n",
+            "    words = [\"a\", \"b\", \"c\", \"d\"]\n",
+            "    del words[0:2]\n",
+            "    words[0:0] = [\"Z\"]\n",
+            "    print(words)\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/seqs"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "[0, 3, 4, 5]",
+            "[0, 10, 20, 30, 4, 5]",
+            "[0, 10, 20, 30]",
+            "[7, 0, 10, 20, 30]",
+            "[7, 0]",
+            "[9, 1, 9]",
+            "['Z', 'c', 'd']",
+        ],
+        "range-replace semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn heterogeneous_container_literals_box_and_match_python() {
     // Issue #130: mixed-element list literals and mixed-key/value dict
     // literals box into Vec<PyValue> / PyDict<PyValue, PyValue> instead of

@@ -3173,3 +3173,42 @@ mod bytesio {
         assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
     }
 }
+
+#[test]
+fn range_replace_mechanics_match_python() {
+    // Issue #153: Python semantics verified against python3 3.14 -
+    //   xs=[0,1,2,3]; xs[1:3]=["a","b"] -> [0,"a","b",3]   (replace)
+    //   xs[1:1]=["q"]                   -> insert          (zero-width)
+    //   del xs[1:3]                     -> removes range
+    //   strided: ys[::2]=[9,9] on [0,1,2] -> [9,1,9]
+    //   mismatched stride length raises ValueError
+    use stdpython::{py_value_str, PySliceReplace, PyValue};
+    let mut v = vec![
+        PyValue::Int(0),
+        PyValue::Int(1),
+        PyValue::Int(2),
+        PyValue::Int(3),
+    ];
+    v.py_slice_assign(
+        Some(1),
+        Some(3),
+        vec![PyValue::Str("a".into()), PyValue::Str("b".into())],
+    );
+    assert_eq!(
+        py_value_str(&PyValue::Tuple(std::sync::Arc::new(v.clone()))),
+        "(0, 'a', 'b', 3)"
+    );
+    v.py_slice_assign(Some(1), Some(1), vec![PyValue::Int(9)]);
+    assert_eq!(v.len(), 5);
+    v.py_slice_delete(Some(1), Some(3));
+    assert_eq!(v.len(), 3);
+    let mut ys = vec![PyValue::Int(0), PyValue::Int(1), PyValue::Int(2)];
+    ys.py_slice_assign_step(None, None, 2, vec![PyValue::Int(9), PyValue::Int(9)])
+        .unwrap();
+    assert_eq!(ys.len(), 3);
+    assert!(matches!(ys[0], PyValue::Int(9)));
+    let err = ys
+        .py_slice_assign_step(None, None, 2, vec![PyValue::Int(1)])
+        .unwrap_err();
+    assert_eq!(err.exception_type, "ValueError");
+}
