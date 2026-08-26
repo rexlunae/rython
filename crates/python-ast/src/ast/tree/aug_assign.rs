@@ -83,9 +83,10 @@ impl CodeGen for AugAssign {
         // an operand reading the same global cannot deadlock.
         if let ExprType::Name(n) = &self.target
             && options.scope_global_writables.contains(&n.id)
-            && options.mutable_statics.contains_key(&n.id)
+            && let Some(kind) = options.mutable_statics.get(&n.id)
         {
             let ident = crate::safe_ident(&n.id);
+            let global_ref = kind.static_ref(&ident);
             let value = self
                 .value
                 .clone()
@@ -94,8 +95,8 @@ impl CodeGen for AugAssign {
             let combined = combine_op(&self.op, &elem, &value)?;
             return Ok(quote! {
                 {
-                    let __rython_g = stdpython::py_global_read(&#ident);
-                    stdpython::py_global_write(&#ident, #combined);
+                    let __rython_g = stdpython::py_global_read(#global_ref);
+                    stdpython::py_global_write(#global_ref, #combined);
                 }
             });
         }

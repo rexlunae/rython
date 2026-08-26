@@ -202,15 +202,17 @@ impl CodeGen for Module {
         count_module_stores(&self.raw.body, &mut module_assign_counts);
 
         // Issue #115: module-level names written by functions through
-        // `global` lower as MUTABLE statics (`static name: Mutex<T>`).
-        // Reads render as py_global_read(&name); writes in owning scopes
-        // as py_global_write(&name, v). Names that don't qualify keep the
-        // documented write-drop divergence (function_def.rs warns).
-        let global_mutables = module_global_mutable_names(
+        // `global` lower as MUTABLE statics (`static name: Mutex<T>` /
+        // `LazyLock<Mutex<T>>`). Reads render as py_global_read; writes in
+        // owning scopes as py_global_write. Names that don't qualify keep
+        // the documented write-drop divergence (function_def.rs warns).
+        // Computed kinds carry a placeholder boxedness here — refined
+        // below, once the module-init type analysis has run.
+        let mut global_mutables = module_global_mutable_names(
             &self.raw.body,
             &module_assign_counts,
             &symbols,
-            options.no_std,
+            &options,
         );
 
         // Issue #118: MODULE-LEVEL argparse (certifi's __main__.py builds
@@ -386,7 +388,18 @@ impl CodeGen for Module {
                     }
                     // A mutable static's single module store IS its
                     // initializer (issue #115) — not a runtime store.
-                    if names.iter().all(|n| global_mutables.contains_key(n)) {
+                    // COMPUTED initializers stay in the analysis body so
+                    // the type inference sees them (their default lowering
+                    // is preempted in the emit loop, and the hoist skips
+                    // them); const-shaped kinds need no analysis.
+                    if names.iter().all(|n| {
+                        matches!(
+                            global_mutables.get(n),
+                            Some(crate::MutableGlobalKind::Scalar)
+                                | Some(crate::MutableGlobalKind::Boxed)
+                                | Some(crate::MutableGlobalKind::Str)
+                        )
+                    }) {
                         continue;
                     }
                 }
@@ -578,15 +591,6 @@ impl CodeGen for Module {
         // every scope rendered below (module init, __main__, functions) sees
         // the set through the cloned options.
         options.promoted_statics = std::rc::Rc::new(promoted_statics.clone());
-        // Issue #115: every scope rendered below sees the mutable statics
-        // (reads render py_global_read); MODULE scope owns all of them for
-        // writes (module init and the __main__ body are module scope —
-        // no `global` needed there). Function scopes re-narrow
-        // scope_global_writables to their own `global` declarations
-        // (function_def.rs).
-        options.mutable_statics = std::rc::Rc::new(global_mutables.clone());
-        options.scope_global_writables =
-            std::rc::Rc::new(global_mutables.keys().cloned().collect());
 
         // Module-level code gets no per-function analysis pass, so run the
         // same type inference / empty-container pinning here: without it,
@@ -600,6 +604,30 @@ impl CodeGen for Module {
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
+        // Issue #115: with the init analysis done, a COMPUTED mutable
+        // global's boxedness is decidable — the static holds the inferred
+        // type when one exists (module_init_static_ty), else the boxed
+        // PyValue with stores wrapped in PyValue::from. Then every scope
+        // rendered below sees the mutable statics (reads render
+        // py_global_read); MODULE scope owns all of them for writes
+        // (module init and the __main__ body are module scope — no
+        // `global` needed there). Function scopes re-narrow
+        // scope_global_writables to their own `global` declarations
+        // (function_def.rs).
+        for s in &self.raw.body {
+            if let crate::StatementType::Assign(a) = &s.statement
+                && let [crate::ExprType::Name(n)] = a.targets.as_slice()
+                && let Some(kind) = global_mutables.get_mut(&n.id)
+                && matches!(kind, crate::MutableGlobalKind::Computed { .. })
+            {
+                *kind = crate::MutableGlobalKind::Computed {
+                    boxed: module_init_static_ty(&n.id, &a.value, &options).is_none(),
+                };
+            }
+        }
+        options.mutable_statics = std::rc::Rc::new(global_mutables.clone());
+        options.scope_global_writables =
+            std::rc::Rc::new(global_mutables.keys().cloned().collect());
         // Module-level aliasing (`b = a` on a container, later mutated) is
         // the same divergence the function-level guard rejects (issue #79).
         crate::check_aliasing(
@@ -901,34 +929,100 @@ impl CodeGen for Module {
                     continue;
                 }
                 // Issue #115: a `global`-written module value becomes a
-                // MUTABLE static — `static name: Mutex<T>` with the single
-                // module store as its initializer. `Mutex::new` is const,
-                // and the initializer is a literal, so no LazyLock or
-                // module-init ordering is involved. Reads everywhere render
-                // as py_global_read(&name); writes in owning scopes as
-                // py_global_write(&name, v).
+                // MUTABLE static with the single module store as its
+                // initializer. Const-expressible initializers (scalar
+                // literals, None) use a plain `static name: Mutex<T>`;
+                // string literals and computed expressions wrap in a
+                // LazyLock (their construction is not const), with a TOUCH
+                // in __module_init__ for a computed initializer so its
+                // side effects still run at import time, in order. Reads
+                // everywhere render as py_global_read; writes in owning
+                // scopes as py_global_write.
                 if let [crate::ExprType::Name(target)] = a.targets.as_slice()
-                    && let Some(boxed) = global_mutables.get(&target.id)
+                    && let Some(kind) = global_mutables.get(&target.id)
                 {
+                    use crate::MutableGlobalKind as Kind;
                     let ident = crate::safe_ident(&target.id);
-                    if *boxed {
-                        stream.extend(quote! {
-                            pub static #ident: std::sync::Mutex<stdpython::PyValue> =
-                                std::sync::Mutex::new(stdpython::PyValue::None_);
-                        });
-                    } else {
-                        // Eligibility guarantees a const scalar literal.
-                        let ty = const_static_type(&a.value)
-                            .expect("mutable static initializer must be a const scalar");
-                        let value = a.value.clone().to_rust(
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                        )?;
-                        stream.extend(quote! {
-                            pub static #ident: std::sync::Mutex<#ty> =
-                                std::sync::Mutex::new(#value);
-                        });
+                    match kind {
+                        Kind::Boxed => {
+                            stream.extend(quote! {
+                                pub static #ident: std::sync::Mutex<stdpython::PyValue> =
+                                    std::sync::Mutex::new(stdpython::PyValue::None_);
+                            });
+                        }
+                        Kind::Scalar => {
+                            let ty = const_static_type(&a.value)
+                                .expect("mutable static initializer must be a const scalar");
+                            let value = a.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            stream.extend(quote! {
+                                pub static #ident: std::sync::Mutex<#ty> =
+                                    std::sync::Mutex::new(#value);
+                            });
+                        }
+                        Kind::Str => {
+                            let value = a.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            stream.extend(quote! {
+                                pub static #ident:
+                                    std::sync::LazyLock<std::sync::Mutex<String>> =
+                                    std::sync::LazyLock::new(|| {
+                                        std::sync::Mutex::new((#value).to_string())
+                                    });
+                            });
+                        }
+                        Kind::Computed { boxed } => {
+                            // Mirrors the promoted-static machinery: a
+                            // fallible initializer (rendered with a
+                            // trailing `?`) unwraps inside the closure,
+                            // panicking on failure — the import-time raise
+                            // becomes an abort (the §12.2 divergence).
+                            let rhs = a.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            let stripped =
+                                crate::ast::tree::call::strip_trailing_question(&rhs);
+                            let is_fallible = stripped.to_string() != rhs.to_string();
+                            let value_tokens = if is_fallible {
+                                quote!(match #stripped {
+                                    Ok(__rython_v) => __rython_v,
+                                    Err(__rython_e) => panic!(
+                                        "module-level `{}` initialization failed: {}",
+                                        stringify!(#ident),
+                                        __rython_e
+                                    ),
+                                })
+                            } else {
+                                stripped
+                            };
+                            let (ty, wrapped) = if *boxed {
+                                (
+                                    quote!(stdpython::PyValue),
+                                    quote!(stdpython::PyValue::from(#value_tokens)),
+                                )
+                            } else {
+                                let ty = module_init_static_ty(&target.id, &a.value, &options)
+                                    .expect("Computed{boxed:false} implies an inferred type");
+                                (ty, value_tokens)
+                            };
+                            stream.extend(quote! {
+                                pub static #ident:
+                                    std::sync::LazyLock<std::sync::Mutex<#ty>> =
+                                    std::sync::LazyLock::new(|| {
+                                        std::sync::Mutex::new(#wrapped)
+                                    });
+                            });
+                            module_init_stmts.push(quote!(let _ = &*#ident;));
+                            has_module_init_code = true;
+                        }
                     }
                     continue;
                 }
@@ -1286,12 +1380,20 @@ impl CodeGen for Module {
         // Hoist assigned names to declarations at the top of each generated
         // scope (assignments themselves lower to plain stores). Promoted
         // LazyLock statics are excluded — they have no `let` in the body.
+        // Promoted LazyLock statics and mutable statics (issue #115) have
+        // no `let` in the init body — their COMPUTED initializers stay in
+        // module_init_raw only for the type analysis.
+        let init_hoist_skip: std::collections::HashSet<String> = promoted_statics
+            .iter()
+            .cloned()
+            .chain(global_mutables.keys().cloned())
+            .collect();
         let init_decls = hoisted_declarations(
             &module_init_raw,
             &ctx,
             &symbols,
             &options,
-            &promoted_statics,
+            &init_hoist_skip,
         );
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
@@ -2402,23 +2504,29 @@ pub(crate) fn module_global_write_sets(
     (global_written, bound_without_global)
 }
 
-/// Issue #115: the module-level names lowered as MUTABLE statics
-/// (`static name: Mutex<T>`), mapped to boxedness (true =
-/// `Mutex<stdpython::PyValue>`, false = a concrete scalar Mutex). A name
-/// qualifies when a function writes it through `global`, it is never
-/// bound as a plain local anywhere (parameters included), it has exactly
-/// one module-level store, and that store is a `None` literal (boxed) or
-/// an int/float/bool literal (concrete). Everything else — string
-/// initializers, computed initializers, conditional stores, the no_std
-/// profile (Mutex is std) — keeps the documented write-drop divergence.
+/// Issue #115: the module-level names lowered as MUTABLE statics, mapped
+/// to their [`crate::MutableGlobalKind`]. A name qualifies when a
+/// function writes it through `global`, it is never bound as a plain
+/// local anywhere (parameters included), and it has exactly one
+/// module-level store. The initializer decides the kind: int/float/bool
+/// literal → `Scalar` (const Mutex), `None` → `Boxed`
+/// (Mutex<PyValue>), string literal → `Str` (LazyLock<Mutex<String>>),
+/// any other runtime expression → `Computed` (LazyLock<Mutex<T>>, boxed
+/// when no type infers — refined by the module generator once the init
+/// analysis has run). Declaration-shaped assigns (type aliases,
+/// rust.bind, lru_cache factories, class/function references) and
+/// import-owned names are excluded; conditional/multiple stores and the
+/// no_std profile (Mutex is std) keep the documented write-drop
+/// divergence.
 pub(crate) fn module_global_mutable_names(
     body: &[crate::Statement],
     module_assign_counts: &std::collections::HashMap<String, usize>,
     symbols: &crate::SymbolTableScopes,
-    no_std: bool,
-) -> std::collections::HashMap<String, bool> {
+    options: &crate::PythonOptions,
+) -> std::collections::HashMap<String, crate::MutableGlobalKind> {
+    use crate::MutableGlobalKind as Kind;
     let mut out = std::collections::HashMap::new();
-    if no_std {
+    if options.no_std {
         return out;
     }
     let (global_written, bound_without_global) = module_global_write_sets(body);
@@ -2447,18 +2555,40 @@ pub(crate) fn module_global_mutable_names(
         ) {
             continue;
         }
-        let boxed = if crate::is_none_expr(&a.value) {
-            true
-        } else {
-            match const_static_type(&a.value) {
-                // Strings would need a LazyLock<Mutex<String>> (String::from
-                // is not const) — out of scope for now; they keep the
-                // write-drop divergence.
-                Some(ty) if ty.to_string() != quote!(&'static str).to_string() => false,
-                _ => continue,
+        let kind = if crate::is_none_expr(&a.value) {
+            Kind::Boxed
+        } else if let Some(ty) = const_static_type(&a.value) {
+            if ty.to_string() == quote!(&'static str).to_string() {
+                Kind::Str
+            } else {
+                Kind::Scalar
             }
+        } else {
+            // A COMPUTED initializer — only real runtime stores qualify.
+            // Declaration-shaped assigns keep their existing lowerings,
+            // and a class/function REFERENCE as the value is the
+            // callable-as-value divergence, not a mutable value.
+            if is_type_alias_value(&a.value)
+                || crate::ast::tree::assign::builtin_scalar_alias_type(&a.value).is_some()
+                || crate::is_rust_bind_call(&a.value)
+                || crate::try_lru_cache_factory(a, Some(options), symbols).is_some()
+                || matches!(
+                    &a.value,
+                    crate::ExprType::Name(v) if matches!(
+                        symbols.get(&v.id),
+                        Some(crate::SymbolTableNode::ClassDef(_))
+                            | Some(crate::SymbolTableNode::FunctionDef(_))
+                            | Some(crate::SymbolTableNode::Alias(_))
+                    )
+                )
+            {
+                continue;
+            }
+            // Boxedness is refined by the module generator once the
+            // module-init type analysis has run (module_init_static_ty).
+            Kind::Computed { boxed: true }
         };
-        out.insert(n.id.clone(), boxed);
+        out.insert(n.id.clone(), kind);
     }
     out
 }

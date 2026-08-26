@@ -432,10 +432,10 @@ impl<'a> CodeGen for Assign {
             // a plain assignment elsewhere stays a local, as in Python.
             if let ExprType::Name(name) = target
                 && options.scope_global_writables.contains(&name.id)
-                && let Some(boxed) = options.mutable_statics.get(&name.id)
+                && let Some(kind) = options.mutable_statics.get(&name.id)
             {
                 let ident = crate::safe_ident(&name.id);
-                let stored = if *boxed {
+                let stored = if kind.boxed() {
                     if value_is_none_early {
                         quote!(stdpython::PyValue::None_)
                     } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {
@@ -461,19 +461,23 @@ impl<'a> CodeGen for Assign {
                         return Err(format!(
                             "`global {}` stores a value with no boxed \
                              representation (a container or class instance); \
-                             mutable module globals hold scalars and None \
-                             only — rython refuses to silently ignore the \
-                             write (issue #115)",
+                             a BOXED mutable module global holds scalars, \
+                             strings, and None — rython refuses to silently \
+                             ignore the write (issue #115)",
                             name.id
                         )
                         .into());
                     } else {
                         quote!(stdpython::PyValue::from(#value))
                     }
+                } else if matches!(kind, crate::MutableGlobalKind::Str) && value_is_str_literal {
+                    // A String static stores literals owned.
+                    quote!((#value).to_string())
                 } else {
                     quote!(#value)
                 };
-                return Ok(quote!(stdpython::py_global_write(&#ident, #stored);));
+                let global_ref = kind.static_ref(&ident);
+                return Ok(quote!(stdpython::py_global_write(#global_ref, #stored);));
             }
             // An attribute store target renders in place flavor: in a
             // generic trait default, `self.f = v` must store through the

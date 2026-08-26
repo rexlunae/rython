@@ -307,18 +307,25 @@ through subscript/attribute stores marks the chain's base variable.
   capture rules; behavior is unchanged on the paths Python defines.
 - **`global` (issue #115).** `global name` declares module scope; reads
   resolve to the module statics. A module-level name written through
-  `global` lowers to a MUTABLE static (`static name: Mutex<T>`) when it
-  has exactly one module-level store of an int/float/bool literal
-  (`Mutex<i64>`/…) or `None` (`Mutex<stdpython::PyValue>`, scalar stores
-  boxed via `PyValue::from`), and no function binds the name as a plain
-  local (parameters included). Reads render `py_global_read(&name)`,
-  writes in owning scopes `py_global_write(&name, v)` — each takes the
-  lock briefly, so compound assignment is CPython's non-atomic
-  LOAD/op/STORE. Storing a container or class instance into a boxed
-  global is a loud error; any `global` write outside this shape (string
-  or computed initializers, multiple module stores, shadowing locals,
-  no_std) keeps the documented divergence: the write is dropped and
-  reported through the `-W` channel.
+  `global` lowers to a MUTABLE static when it has exactly one
+  module-level store and no function binds the name as a plain local
+  (parameters included). The initializer decides the static's shape:
+  an int/float/bool literal → `static name: Mutex<T>`; `None` →
+  `Mutex<stdpython::PyValue>` (scalar/string stores boxed via
+  `PyValue::from`); a string literal → `LazyLock<Mutex<String>>`; any
+  other single-store expression → `LazyLock<Mutex<T>>` with the
+  inferred type, or the boxed PyValue when none infers — with a touch
+  in `__module_init__` so a computed initializer's side effects still
+  run at import time, in order (a fallible initializer panics on
+  failure, §12.2). Reads render `py_global_read(&name)` (`&*name` for
+  the LazyLock forms), writes in owning scopes `py_global_write` —
+  each takes the lock briefly, so compound assignment is CPython's
+  non-atomic LOAD/op/STORE, and `+` on a boxed global dispatches at
+  runtime (PyValue arithmetic; a member mismatch panics CPython's
+  TypeError, §12.2). Storing a container or class instance into a
+  boxed global is a loud error; multiple/conditional module stores,
+  shadowing locals, and no_std keep the documented divergence: the
+  write is dropped and reported through the `-W` channel.
 
 ### 5.2 Control flow
 

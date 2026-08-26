@@ -143,8 +143,9 @@ impl CodeGen for Name {
             // function binds WITHOUT `global` never enter mutable_statics
             // (module.rs disqualifies them), so a bare read here is always
             // the module global, as in Python.
-            if options.mutable_statics.contains_key(&self.id) {
-                return Ok(quote!(stdpython::py_global_read(&#name)));
+            if let Some(kind) = options.mutable_statics.get(&self.id) {
+                let global_ref = kind.static_ref(&name);
+                return Ok(quote!(stdpython::py_global_read(#global_ref)));
             }
             // A module-level value promoted to a LazyLock static (module.rs):
             // a static does not auto-deref in value/borrow position (only as

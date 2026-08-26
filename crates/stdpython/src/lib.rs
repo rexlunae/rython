@@ -2600,6 +2600,83 @@ impl From<()> for PyValue {
     }
 }
 
+impl PyValue {
+    /// The Python type name of the boxed member, for CPython-shaped
+    /// operator error messages.
+    pub fn py_type_name(&self) -> &'static str {
+        match self {
+            PyValue::Int(_) => "int",
+            PyValue::Float(_) => "float",
+            PyValue::Bool(_) => "bool",
+            PyValue::Str(_) => "str",
+            PyValue::Bytes(_) => "bytes",
+            PyValue::Tuple(_) => "tuple",
+            PyValue::None_ => "NoneType",
+        }
+    }
+}
+
+/// `+` on BOXED values (issues #115/#120: a mutable module global or a
+/// varargs element holds a PyValue): dispatches on the runtime members
+/// exactly as CPython's operator — numeric promotion (bool ⊂ int), str
+/// and bytes concatenation, tuple concatenation — and a member mismatch
+/// panics with CPython's TypeError message (§12.2 loud-by-panic: the
+/// operator position has no Result channel).
+impl PyAdd<PyValue> for PyValue {
+    type Output = PyValue;
+    fn py_add(&self, rhs: &PyValue) -> PyValue {
+        use PyValue as V;
+        match (self, rhs) {
+            (V::Int(a), V::Int(b)) => V::Int(a + b),
+            (V::Int(a), V::Float(b)) => V::Float(*a as f64 + b),
+            (V::Float(a), V::Int(b)) => V::Float(a + *b as f64),
+            (V::Float(a), V::Float(b)) => V::Float(a + b),
+            (V::Bool(a), V::Bool(b)) => V::Int(*a as i64 + *b as i64),
+            (V::Bool(a), V::Int(b)) => V::Int(*a as i64 + b),
+            (V::Int(a), V::Bool(b)) => V::Int(a + *b as i64),
+            (V::Bool(a), V::Float(b)) => V::Float((*a as i64) as f64 + b),
+            (V::Float(a), V::Bool(b)) => V::Float(a + (*b as i64) as f64),
+            (V::Str(a), V::Str(b)) => V::Str(format!("{}{}", a, b)),
+            (V::Bytes(a), V::Bytes(b)) => {
+                let mut out = a.clone();
+                out.extend_from_slice(b);
+                V::Bytes(out)
+            }
+            (V::Tuple(a), V::Tuple(b)) => {
+                let mut out: Vec<PyValue> = a.as_ref().clone();
+                out.extend(b.iter().cloned());
+                V::Tuple(Arc::new(out))
+            }
+            (a, b) => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    format!(
+                        "unsupported operand type(s) for +: '{}' and '{}'",
+                        a.py_type_name(),
+                        b.py_type_name()
+                    )
+                )
+            ),
+        }
+    }
+}
+
+/// Convenience `+` where the right operand is a concrete value: box it
+/// and delegate to the PyValue dispatch above (a mismatch panics the
+/// same TypeError).
+macro_rules! pyvalue_add_rhs {
+    ($($t:ty),* $(,)?) => {
+        $(impl PyAdd<$t> for PyValue {
+            type Output = PyValue;
+            fn py_add(&self, rhs: &$t) -> PyValue {
+                PyAdd::<PyValue>::py_add(self, &PyValue::from(rhs.clone()))
+            }
+        })*
+    };
+}
+pyvalue_add_rhs!(i64, f64, bool, String, &str);
+
 /// Read a mutable module global (issue #115: a module-level name written by
 /// functions through `global` lowers to a `static Mutex<T>`). The guard is
 /// dropped inside this function, so two reads in one statement never hold

@@ -140,6 +140,48 @@ pub enum CrossModuleClasses {
     ),
 }
 
+/// Issue #115: how a `global`-written module value lowers as a mutable
+/// static, decided by its single module-level initializer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutableGlobalKind {
+    /// An int/float/bool literal: `static name: Mutex<T> = Mutex::new(v)`.
+    Scalar,
+    /// A `None` literal: `static name: Mutex<PyValue> =
+    /// Mutex::new(PyValue::None_)` — scalar stores box via PyValue::from.
+    Boxed,
+    /// A string literal: `static name: LazyLock<Mutex<String>>`
+    /// (String::from is not const, hence the LazyLock).
+    Str,
+    /// Any other single-store initializer expression:
+    /// `static name: LazyLock<Mutex<T>>` where T is the inferred type, or
+    /// the boxed PyValue when none infers (`boxed` records which — stores
+    /// wrap in PyValue::from exactly when the static is boxed).
+    Computed { boxed: bool },
+}
+
+impl MutableGlobalKind {
+    /// Whether the static is wrapped in a LazyLock (reads/writes must
+    /// deref: `&*name` instead of `&name`).
+    pub fn lazy(&self) -> bool {
+        matches!(self, MutableGlobalKind::Str | MutableGlobalKind::Computed { .. })
+    }
+    /// Whether stores must box their value in `PyValue::from`.
+    pub fn boxed(&self) -> bool {
+        matches!(
+            self,
+            MutableGlobalKind::Boxed | MutableGlobalKind::Computed { boxed: true }
+        )
+    }
+    /// The `&name` / `&*name` reference the py_global helpers take.
+    pub fn static_ref(&self, ident: &proc_macro2::Ident) -> proc_macro2::TokenStream {
+        if self.lazy() {
+            quote::quote!(&*#ident)
+        } else {
+            quote::quote!(&#ident)
+        }
+    }
+}
+
 /// The global context for Python compilation.
 #[derive(Clone, Debug)]
 pub struct PythonOptions {
@@ -358,14 +400,14 @@ pub struct PythonOptions {
     /// auto-deref in value/borrow position, only as a method receiver.
     pub promoted_statics: std::rc::Rc<std::collections::HashSet<String>>,
     /// Issue #115: module-level names WRITTEN by functions through
-    /// `global`, lowered as MUTABLE statics (`static name: Mutex<T>`).
-    /// Maps the name to its boxedness: true = `Mutex<stdpython::PyValue>`
-    /// (a None-initialized value), false = a concrete scalar Mutex
-    /// (i64/f64/bool from the module store's literal). Reads render as
-    /// `py_global_read(&name)` everywhere; writes render as
-    /// `py_global_write(&name, v)` in scopes that own the module binding
-    /// (see `scope_global_writables`). Set by the module generator.
-    pub mutable_statics: std::rc::Rc<std::collections::HashMap<String, bool>>,
+    /// `global`, lowered as MUTABLE statics. Reads render as
+    /// `py_global_read(<ref>)` everywhere; writes render as
+    /// `py_global_write(<ref>, v)` in scopes that own the module binding
+    /// (see `scope_global_writables`), where `<ref>` is `&name` for a
+    /// plain Mutex static and `&*name` for a LazyLock-wrapped one
+    /// (`MutableGlobalKind::static_ref`). Set by the module generator.
+    pub mutable_statics:
+        std::rc::Rc<std::collections::HashMap<String, MutableGlobalKind>>,
     /// The subset of `mutable_statics` the CURRENT scope may write: every
     /// one of them at module scope (module init / `__main__` body); inside
     /// a function, exactly the names its `global` statements declare — an

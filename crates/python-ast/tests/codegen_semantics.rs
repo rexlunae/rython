@@ -6963,31 +6963,83 @@ fn global_declaration_with_read_converts() {
 }
 
 #[test]
-fn global_write_warns_and_drops_the_module_write() {
-    // `global x; x = v` needs mutable module state, which rython does not
-    // model: the write to the module static is dropped (issue #115) and
-    // the -W channel reports it; the module static keeps its initializer.
+fn global_string_write_lowers_to_a_lazylock_static() {
+    // Issue #115 completion: a STRING-initialized global written through
+    // `global` becomes `static name: LazyLock<Mutex<String>>` (String
+    // construction is not const); reads/writes deref the LazyLock
+    // (`&*name`), literal stores own themselves, and the old write-drop
+    // warning is gone.
     let (out, warnings) = compile_with_warnings(
         concat!(
             "DEFAULT_SESSION = \"initial\"\n",
             "def set_it():\n",
             "    global DEFAULT_SESSION\n",
             "    DEFAULT_SESSION = \"new\"\n",
+            "def show() -> str:\n",
+            "    return DEFAULT_SESSION\n",
         ),
         "global_write.py",
     );
     assert!(
-        out.contains("pub static DEFAULT_SESSION"),
-        "the module static must keep its initializer: {}",
+        out.contains(
+            "pub static DEFAULT_SESSION : std :: sync :: LazyLock < std :: sync :: Mutex < String >>"
+        ),
+        "generated: {}",
         out
     );
     assert!(
+        out.contains("py_global_write (& * DEFAULT_SESSION , (\"new\") . to_string ())"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("py_global_read (& * DEFAULT_SESSION)"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        warnings.iter().all(|w| !w.contains("writes to module-level name")),
+        "the supported write must not warn: {:?}",
         warnings
-            .iter()
-            .any(|w| w.contains("writes to module-level name `DEFAULT_SESSION`")
-                && w.contains("dropped")),
-        "the dropped module write must be reported through -W: {:?}",
-        warnings
+    );
+}
+
+#[test]
+fn global_computed_initializer_lowers_to_a_lazylock_static() {
+    // Issue #115 completion: a COMPUTED single-store initializer becomes
+    // `static name: LazyLock<Mutex<T>>` with the inferred type, a
+    // panic-on-Err closure for a fallible initializer, and a touch in
+    // __module_init__ so its side effects still run at import time.
+    let out = compile(
+        concat!(
+            "def compute() -> int:\n",
+            "    return 2\n",
+            "limit = compute()\n",
+            "def raise_limit():\n",
+            "    global limit\n",
+            "    limit = limit + 10\n",
+        ),
+        "global_computed.py",
+    );
+    assert!(
+        out.contains("pub static limit : std :: sync :: LazyLock < std :: sync :: Mutex < i64 >>"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("initialization failed"),
+        "fallible init must panic on Err: {}",
+        out
+    );
+    assert!(
+        out.contains("let _ = & * limit"),
+        "__module_init__ must touch the static: {}",
+        out
+    );
+    assert!(
+        out.contains("py_global_write (& * limit"),
+        "generated: {}",
+        out
     );
 }
 
