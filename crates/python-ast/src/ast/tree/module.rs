@@ -213,6 +213,16 @@ impl CodeGen for Module {
             options.no_std,
         );
 
+        // Issue #118: MODULE-LEVEL argparse (certifi's __main__.py builds
+        // its parser at top level). The same conversion-time rewrite the
+        // function path runs: parser-building statements vanish, and the
+        // parse_args assignment becomes the typed-namespace destructure
+        // inside __module_init__ (later module-level statements read the
+        // namespace there; functions cannot — a module-init local, loud
+        // in rustc).
+        let module_argparse = crate::ast::tree::function_def::scan_argparse(&self.raw.body)
+            .map_err(|e| wrap_module_error(&module_filename, e))?;
+
         // Classes that participate in an inheritance hierarchy (have a real
         // base, or are used as a base) lower with the trait machinery; every
         // other class stays a plain struct. Computed once so both sides of a
@@ -322,7 +332,15 @@ impl CodeGen for Module {
         // binding, never a shadowing fresh binding (issue #80). The render
         // pass below repeats this classification (cheap); the raw lists
         // drive both the hoisted sets and hoisted_declarations.
-        for s in &self.raw.body {
+        for (stmt_index, s) in self.raw.body.iter().enumerate() {
+            // Issue #118: module-level argparse statements are consumed by
+            // the conversion-time rewrite — the parser statements vanish
+            // and the parse_args assignment is replaced in the emit loop.
+            if let Some(rw) = &module_argparse
+                && (rw.skip.contains(&stmt_index) || stmt_index == rw.parse_index)
+            {
+                continue;
+            }
             if let crate::StatementType::If(if_stmt) = &s.statement {
                 // `if TYPE_CHECKING:` never runs at runtime — skip the
                 // whole block (imports, type-only classes).
@@ -433,6 +451,11 @@ impl CodeGen for Module {
                             // compile-time bindings, not runtime stores: the
                             // Assign codegen handles them (issue #79 family).
                             && !crate::is_rust_bind_call(&a.value)
+                            // The argparse namespace is rewritten into
+                            // __module_init__ (issue #118), never a static.
+                            && !module_argparse
+                                .as_ref()
+                                .is_some_and(|rw| rw.args_var == *n)
                             && function_free_reads.contains(n)
                             // A name ALSO bound by an import (see
                             // module_promoted_static_names): the import owns
@@ -620,7 +643,28 @@ impl CodeGen for Module {
         let mut pending_docstring = self.get_module_docstring().is_some()
             && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
         let mut seen_non_doc_statement = false;
-        for s in self.raw.body {
+        for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
+            // Issue #118: module-level argparse. Parser-building statements
+            // vanish; the parse_args assignment becomes the typed-namespace
+            // destructure inside __module_init__, at its original position.
+            if let Some(rw) = &module_argparse {
+                if rw.skip.contains(&stmt_index) {
+                    continue;
+                }
+                if stmt_index == rw.parse_index {
+                    let args_ident = crate::safe_ident(&rw.args_var);
+                    let tokens = crate::ast::tree::function_def::lower_parse_args(
+                        rw, &ctx, &options, &symbols,
+                    )
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    module_init_stmts.push(quote! {
+                        let #args_ident;
+                        #tokens
+                    });
+                    has_module_init_code = true;
+                    continue;
+                }
+            }
             if pending_docstring
                 && matches!(
                     &s.statement,

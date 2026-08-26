@@ -687,11 +687,19 @@ The parser specification must be literal: the toolchain evaluates
 `ArgumentParser(...)`/`add_argument(...)`/`parse_args()` **at conversion
 time**, deletes those statements, and emits a typed namespace struct
 plus a runtime parse whose usage line, help layout, error messages,
-exit codes, and streams are byte-identical to CPython's. Supported:
-`str`/`int`/`float` positionals, `--long` options with `default=`,
+exit codes, and streams are byte-identical to CPython's (3.11 help
+format). The rewrite runs in function bodies AND at module level
+(certifi's `__main__.py` builds its parser at top level — issue #118);
+a module-level namespace lives in `__module_init__`, so only later
+module-level statements can read it (a function read is loud in
+rustc). Supported: `str`/`int`/`float` positionals, `--long` options
+with `default=`, `-short, --long` alias pairs (exact and
+attached-value forms at runtime; an unknown option-like token is an
+"unrecognized arguments" error, never a positional),
 `action="store_true"`, `help=`, `prog=`, `description=`. Loud errors:
-short options, `nargs`, `choices`, subcommands, dynamic specs, a
-value-taking option without `default=`.
+a short option without a long alias, `nargs`, `choices`, subcommands,
+dynamic specs, a value-taking option without `default=`. Not
+reproduced: short-flag bundling (`-cv`) and `--opt=value` on shorts.
 
 ### 10.4 File objects
 

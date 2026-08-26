@@ -50,8 +50,11 @@ impl PyStatementTrait for FunctionDef {
 }
 
 /// One add_argument spec collected at conversion time.
-struct ArgparseSpec {
+pub(crate) struct ArgparseSpec {
     name: String,
+    /// The short alias of `add_argument("-c", "--contents", ...)`
+    /// (issue #118 — certifi's __main__); None otherwise.
+    short: Option<String>,
     kind: &'static str, // "Str" | "Int" | "Float" | "StoreTrue"
     default: Option<ExprType>,
     help: Option<String>,
@@ -62,10 +65,10 @@ struct ArgparseSpec {
 /// literal specs. ArgumentParser/add_argument/parse_args are evaluated
 /// HERE, at conversion time — only literal specs can shape the typed
 /// namespace struct, so anything dynamic is a loud error.
-struct ArgparseRewrite {
-    skip: std::collections::HashSet<usize>,
-    parse_index: usize,
-    args_var: String,
+pub(crate) struct ArgparseRewrite {
+    pub(crate) skip: std::collections::HashSet<usize>,
+    pub(crate) parse_index: usize,
+    pub(crate) args_var: String,
     prog: Option<String>,
     description: Option<String>,
     specs: Vec<ArgparseSpec>,
@@ -81,7 +84,7 @@ fn literal_str(e: &ExprType) -> Option<String> {
     }
 }
 
-fn scan_argparse(
+pub(crate) fn scan_argparse(
     body: &[Statement],
 ) -> Result<Option<ArgparseRewrite>, Box<dyn std::error::Error>> {
     // Find `<var> = argparse.ArgumentParser(...)`.
@@ -169,23 +172,48 @@ fn scan_argparse(
                 if parse.is_some() {
                     return Err("add_argument after parse_args is not supported".into());
                 }
-                let [name_expr] = call.args.as_slice() else {
-                    return Err(
-                        "add_argument takes exactly one name (short aliases are not \
-                         supported yet)"
-                            .into(),
-                    );
+                // One name (`"count"`, `"--verbose"`), or a short+long
+                // alias pair (`"-c", "--contents"` — certifi, issue #118).
+                let (short, name) = match call.args.as_slice() {
+                    [name_expr] => {
+                        let name = literal_str(name_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        if name.starts_with('-') && !name.starts_with("--") {
+                            return Err(format!(
+                                "add_argument: short option '{}' needs a --long \
+                                 alias (the long name is the namespace attribute)",
+                                name
+                            )
+                            .into());
+                        }
+                        (None, name)
+                    }
+                    [short_expr, long_expr] => {
+                        let short = literal_str(short_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        let long = literal_str(long_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        if !short.starts_with('-')
+                            || short.starts_with("--")
+                            || !long.starts_with("--")
+                        {
+                            return Err(format!(
+                                "add_argument('{}', '{}'): a two-name argument must \
+                                 be a -short, --long alias pair",
+                                short, long
+                            )
+                            .into());
+                        }
+                        (Some(short), long)
+                    }
+                    _ => {
+                        return Err(
+                            "add_argument takes one name, or a -short, --long alias \
+                             pair"
+                                .into(),
+                        );
+                    }
                 };
-                let name = literal_str(name_expr)
-                    .ok_or("add_argument: the name must be a string literal")?;
-                if name.starts_with('-') && !name.starts_with("--") {
-                    return Err(format!(
-                        "add_argument: short option '{}' is not supported yet; use the \
-                         --long form",
-                        name
-                    )
-                    .into());
-                }
                 let mut kind: Option<&'static str> = None;
                 let mut default = None;
                 let mut help = None;
@@ -268,6 +296,7 @@ fn scan_argparse(
                 }
                 specs.push(ArgparseSpec {
                     name,
+                    short,
                     kind,
                     default,
                     help,
@@ -321,7 +350,7 @@ fn scan_argparse(
 /// Emit the parse_args replacement: a namespace struct typed from the
 /// specs, the run_parser call, and the destructuring assignment into
 /// the (hoisted) namespace variable.
-fn lower_parse_args(
+pub(crate) fn lower_parse_args(
     rw: &ArgparseRewrite,
     ctx: &CodeGenContext,
     options: &PythonOptions,
@@ -363,8 +392,13 @@ fn lower_parse_args(
             Some(h) => quote!(Some(#h)),
             None => quote!(None),
         };
+        let short = match &spec.short {
+            Some(s) => quote!(Some(#s)),
+            None => quote!(None),
+        };
         spec_tokens.push(quote!(argparse::ArgSpec {
             name: #name,
+            short: #short,
             kind: argparse::ArgKind::#kind,
             default: #default,
             help: #help,

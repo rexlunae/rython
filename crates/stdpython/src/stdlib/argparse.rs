@@ -58,6 +58,9 @@ impl ParsedValue {
 pub struct ArgSpec {
     /// "count" for a positional, "--verbose" for an option.
     pub name: &'static str,
+    /// The short alias of an option ("-c" for `add_argument("-c",
+    /// "--contents")`); None for positionals and long-only options.
+    pub short: Option<&'static str>,
     pub kind: ArgKind,
     /// Required for value-taking options (Python's None default cannot
     /// inhabit a typed field); positionals and store_true have implied
@@ -74,16 +77,41 @@ impl ArgSpec {
     fn dest(&self) -> String {
         self.name.trim_start_matches('-').replace('-', "_")
     }
-    /// How the argument appears in the help list: positionals by name,
-    /// value-taking options with their uppercase metavar.
-    fn invocation(&self) -> String {
+    /// The uppercase metavar of a value-taking option.
+    fn metavar(&self) -> String {
+        self.dest().to_uppercase()
+    }
+    /// How the argument appears in the USAGE line: positionals by name,
+    /// options by their SHORT alias when they have one (Python's
+    /// formatter uses the first option string).
+    fn usage_invocation(&self) -> String {
         if self.is_positional() {
             self.name.to_string()
-        } else if self.kind == ArgKind::StoreTrue {
-            self.name.to_string()
         } else {
-            format!("{} {}", self.name, self.dest().to_uppercase())
+            let lead = self.short.unwrap_or(self.name);
+            if self.kind == ArgKind::StoreTrue {
+                lead.to_string()
+            } else {
+                format!("{} {}", lead, self.metavar())
+            }
         }
+    }
+    /// How the argument appears in the HELP list: positionals by name;
+    /// options list every alias, value-taking ones with the metavar after
+    /// each ("-s SCALE, --scale SCALE" — Python 3.11's format).
+    fn invocation(&self) -> String {
+        if self.is_positional() {
+            return self.name.to_string();
+        }
+        let mut parts = Vec::new();
+        for alias in self.short.iter().chain([&self.name]) {
+            if self.kind == ArgKind::StoreTrue {
+                parts.push(alias.to_string());
+            } else {
+                parts.push(format!("{} {}", alias, self.metavar()));
+            }
+        }
+        parts.join(", ")
     }
 }
 
@@ -101,7 +129,7 @@ fn prog_name(explicit: Option<&str>) -> String {
 fn usage_line(prog: &str, specs: &[ArgSpec]) -> String {
     let mut parts = vec![format!("usage: {} [-h]", prog)];
     for s in specs.iter().filter(|s| !s.is_positional()) {
-        parts.push(format!("[{}]", s.invocation()));
+        parts.push(format!("[{}]", s.usage_invocation()));
     }
     for s in specs.iter().filter(|s| s.is_positional()) {
         parts.push(s.name.to_string());
@@ -113,15 +141,16 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     // Python's help column: two-space indent + the longest invocation
     // (capped at 24) + two spaces. Longer invocations push their help
     // onto the next line at that column.
+    // Python's formula (HelpFormatter): the help column is indent(2) +
+    // longest invocation + 2, capped at max_help_position=24.
     let help_spec = "-h, --help".to_string();
     let max_len = specs
         .iter()
         .map(|s| s.invocation().chars().count())
         .chain([help_spec.chars().count()])
         .max()
-        .unwrap_or(0)
-        .min(24);
-    let help_col = 2 + max_len + 2;
+        .unwrap_or(0);
+    let help_col = (2 + max_len + 2).min(24);
 
     let mut out = usage_line(prog, specs);
     out.push('\n');
@@ -292,6 +321,48 @@ pub fn run_parser(
                 convert(&prog, specs, spec, &raw)
             };
             values[idx] = Some(value);
+        } else if token.starts_with('-')
+            && token.len() > 1
+            && token.parse::<f64>().is_err()
+        {
+            // A SHORT option (-c, -s 2.5, -s2.5). Like Python, a token
+            // that looks like an option (leading '-', not a negative
+            // number) never fills a positional — an unknown one is an
+            // "unrecognized arguments" error.
+            let exact = specs
+                .iter()
+                .position(|s| s.short == Some(token.as_str()));
+            if let Some(idx) = exact {
+                let spec = &specs[idx];
+                let value = if spec.kind == ArgKind::StoreTrue {
+                    ParsedValue::Flag(true)
+                } else {
+                    i += 1;
+                    match argv.get(i) {
+                        Some(v) => convert(&prog, specs, spec, v),
+                        None => exit_error(
+                            &prog,
+                            specs,
+                            &format!("argument {}: expected one argument", spec.name),
+                        ),
+                    }
+                };
+                values[idx] = Some(value);
+            } else {
+                // Attached-value form (-s2.5) for value-taking shorts.
+                let head: String = token.chars().take(2).collect();
+                let attached = specs.iter().position(|s| {
+                    s.short.as_deref() == Some(head.as_str())
+                        && s.kind != ArgKind::StoreTrue
+                });
+                match attached {
+                    Some(idx) => {
+                        let raw: String = token.chars().skip(2).collect();
+                        values[idx] = Some(convert(&prog, specs, &specs[idx], &raw));
+                    }
+                    None => extras.push(token.clone()),
+                }
+            }
         } else if next_positional < positional_indices.len() {
             let idx = positional_indices[next_positional];
             values[idx] = Some(convert(&prog, specs, &specs[idx], token));

@@ -5983,3 +5983,89 @@ fn field_from_cross_module_call_result_attribute() {
         "cross-module field typing diverged from CPython"
     );
 }
+
+#[test]
+fn module_level_argparse_with_short_aliases_matches_python() {
+    // Issue #118: certifi's __main__.py shape — the parser built at
+    // MODULE level (not inside a function), with -short/--long alias
+    // pairs. The conversion-time rewrite moves the typed-namespace
+    // destructure into __module_init__; the runtime handles short
+    // options (exact, attached value) and rejects unknown option-like
+    // tokens instead of consuming them as positionals.
+    let scratch = Scratch::new("argmod");
+    let file = scratch.path().join("argmod.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "parser = argparse.ArgumentParser(prog=\"certifi\")\n",
+            "parser.add_argument(\"-c\", \"--contents\", action=\"store_true\", help=\"print contents\")\n",
+            "parser.add_argument(\"-s\", \"--scale\", type=float, default=1.0)\n",
+            "args = parser.parse_args()\n",
+            "if args.contents:\n",
+            "    print(\"contents\", args.scale)\n",
+            "else:\n",
+            "    print(\"where\", args.scale)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/argmod");
+
+    // --help: python3's exact text (3.11 format), exit 0.
+    let output = Command::new(&bin).arg("--help").output().expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: certifi [-h] [-c] [-s SCALE]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -c, --contents        print contents\n",
+            "  -s SCALE, --scale SCALE\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    // Verified against python3.
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "where 1.0\n"),
+        (&["-c"], "contents 1.0\n"),
+        (&["-s", "2.5"], "where 2.5\n"),
+        (&["-s2.5", "--contents"], "contents 2.5\n"),
+    ];
+    for (argv, expected) in cases {
+        let output = Command::new(&bin).args(*argv).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "args: {:?}", argv);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            *expected,
+            "args: {:?}",
+            argv
+        );
+    }
+
+    // An unknown option-like token is an error, never a positional.
+    // Verified against python3.
+    let output = Command::new(&bin).arg("-x").output().expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: certifi [-h] [-c] [-s SCALE]\n",
+            "certifi: error: unrecognized arguments: -x\n",
+        ),
+        "error output diverged from CPython"
+    );
+}
