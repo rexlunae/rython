@@ -1270,6 +1270,7 @@ fn isinstance_dynamic_router_routes_boxed_values_at_runtime() {
             "    print(label(2.5))\n",
             "    print(label(pick(True)))\n",
             "    print(label(pick(False)))\n",
+            "    print(label(True))\n",
         ),
     )
     .unwrap();
@@ -1301,6 +1302,9 @@ fn isinstance_dynamic_router_routes_boxed_values_at_runtime() {
             "mystery",
             "word: fox",
             "count: 42",
+            // bool ⊂ int: True takes the int arm but str(x) still renders
+            // True — the auto-emitted bool morph keeps the Rust bool.
+            "count: True",
         ],
         "dynamic router dispatch diverged from CPython"
     );

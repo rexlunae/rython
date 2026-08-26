@@ -5796,14 +5796,16 @@ fn isinstance_dispatch_emits_a_dynamic_router() {
         "\n",
         "def main() -> None:\n",
         "    print(label(pick(True)))\n",
+        "    print(label(True))\n",
     );
-    let (out, warnings) = compile_with_warnings(src, "router.py");
+    let out = compile(src, "router.py");
     for entry in [
         "enum LabelArg",
         "Other (stdpython :: PyValue)",
         "impl From < String > for LabelArg",
         "impl From < & str > for LabelArg",
         "impl From < i64 > for LabelArg",
+        "impl From < bool > for LabelArg",
         "impl From < Animal > for LabelArg",
         "impl From < Dog > for LabelArg",
         "impl From < stdpython :: PyValue > for LabelArg",
@@ -5812,17 +5814,24 @@ fn isinstance_dispatch_emits_a_dynamic_router() {
     ] {
         assert!(out.contains(entry), "missing {entry}: {}", out);
     }
-    // A boxed bool routes to the int morph (bool ⊂ int in Python) — the
-    // recorded divergence.
+    // bool ⊂ int in Python: an int-tested axis carries a bool MORPH of
+    // its own (`label_bool(x: bool)`, body folded through the int arm
+    // with x kept bool so str(x) renders True/False), a statically-bool
+    // call site dispatches to it, and a boxed bool routes to it.
     assert!(
-        out.contains("stdpython :: PyValue :: Bool (v) => LabelArg :: Int (v as i64)"),
-        "boxed bool must map to the int morph: {}",
+        out.contains("fn label_bool (_x : bool)"),
+        "an int-tested axis must carry a bool morph: {}",
         out
     );
     assert!(
-        warnings.iter().any(|w| w.contains("maps a boxed bool to the int morph")),
-        "the bool→int routing divergence must be reported: {:?}",
-        warnings
+        out.contains("label_bool (true)"),
+        "a statically-bool argument must dispatch to the bool morph: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: PyValue :: Bool (v) => LabelArg :: Bool (v)"),
+        "a boxed bool must route to the bool morph: {}",
+        out
     );
     // The boxed call site goes through the router (the original name), not
     // a compile-time variant and not a loud error.

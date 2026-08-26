@@ -663,22 +663,14 @@ impl FunctionDef {
                     }
                 }
             }
-            // bool ⊂ int: a BOXED True with an int-tested axis takes
-            // Python's int arm. The morph sees an i64, so `str(x)` inside
-            // it renders 1, not True — recorded as a divergence warning.
-            if !has_bool_morph && has_int_morph {
-                let int_ident = crate::safe_ident(&to_pascal("int"));
-                boxed_arms.extend(quote! {
-                    stdpython::PyValue::Bool(v) =>
-                        #enum_ident::#int_ident(v as i64),
-                });
-                options.definition_warnings.borrow_mut().push(format!(
-                    "`{}`'s dynamic router maps a boxed bool to the int \
-                     morph (bool is a subclass of int); str(x) inside that \
-                     arm renders the integer, not True/False",
-                    self.name
-                ));
-            }
+            // bool ⊂ int is handled at DETECTION time: an int-tested axis
+            // always carries a bool morph of its own (detect_specializable),
+            // so a boxed bool routes to a genuine bool-typed body and
+            // `str(x)` renders True/False exactly like CPython.
+            debug_assert!(
+                has_bool_morph || !has_int_morph,
+                "an int morph implies a bool morph (detect_specializable)"
+            );
 
             let enum_doc = format!(
                 "The dispatch argument for `{}`: one variant per \

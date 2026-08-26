@@ -581,14 +581,16 @@ inheritance tree — `isinstance(dog, Animal)` folds true for `dog: Dog` —
 with constant branches pruned; a module function whose unannotated
 parameter is isinstance-dispatched in plain `if` tests monomorphizes
 into one specialized Rust function per input type plus a generic
-residual, with call sites bound by static argument type; when the
+residual, with call sites bound by static argument type (an int-tested
+parameter also gets a bool morph of its own — bool ⊂ int in Python —
+so a bool argument takes the int arm while `str(x)` still renders
+True/False); when the
 function takes a single parameter and its morphs share a return type,
 a dynamic router is also emitted under the original name — an argument
 enum with one variant per morph plus `Other(PyValue)`, `From<T>` per
 morph, and an `impl Into<Enum>` parameter — so plain values pass
 through unchanged and a boxed `PyValue` argument routes at runtime in
-Python's first-true-test order (a boxed `bool` routes to the `int`
-morph, bool ⊂ int, reported as a divergence warning); other
+Python's first-true-test order; other
 inferred-generic shapes lower to false with the class-as-value
 divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.

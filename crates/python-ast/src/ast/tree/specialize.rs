@@ -291,6 +291,21 @@ pub fn detect_specializable(
     if targets.is_empty() {
         return None;
     }
+    // bool ⊂ int (CPython: `isinstance(True, int)` is True): an int test
+    // also captures bool arguments, so an int-tested axis gets a bool
+    // morph of its own even when bool is never tested by name. Its folded
+    // body takes the int arms while the parameter STAYS a Rust bool, so
+    // `str(x)` renders True/False exactly like CPython — and a boxed bool
+    // routes through the router to this morph, not a coerced int.
+    let tests_int = targets
+        .iter()
+        .any(|t| matches!(t, SpecTarget::Builtin(b) if b == "int"));
+    let tests_bool = targets
+        .iter()
+        .any(|t| matches!(t, SpecTarget::Builtin(b) if b == "bool"));
+    if tests_int && !tests_bool {
+        targets.push(SpecTarget::Builtin("bool".to_string()));
+    }
     // Every concrete module class inside the tested subtrees gets its own
     // variant (see `class_variants` on SpecializedFn).
     let class_variants: Vec<String> = module_classes

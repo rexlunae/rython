@@ -311,6 +311,10 @@ pub fn label_int(value: i64) -> Result<String, PyException> {
     return Ok(("count: ").py_add(&(str(value))));
 }
 #[doc = "isinstance dispatch - inherently dynamic typing - becomes a\\n    COMPILE-TIME flag: the converter emits label_str, label_int, and a\\n    generic label_any, each with the dead arms pruned, and binds every\\n    call site to the variant matching its argument's static type."]
+pub fn label_bool(value: bool) -> Result<String, PyException> {
+    return Ok(("count: ").py_add(&(str(value))));
+}
+#[doc = "isinstance dispatch - inherently dynamic typing - becomes a\\n    COMPILE-TIME flag: the converter emits label_str, label_int, and a\\n    generic label_any, each with the dead arms pruned, and binds every\\n    call site to the variant matching its argument's static type."]
 pub fn label_any<T>(_value: T) -> Result<String, PyException> {
     return Ok(("something else").to_string());
 }
@@ -319,6 +323,7 @@ pub fn label_any<T>(_value: T) -> Result<String, PyException> {
 pub enum LabelArg {
     Str(String),
     Int(i64),
+    Bool(bool),
     Other(stdpython::PyValue),
 }
 impl From<String> for LabelArg {
@@ -336,13 +341,18 @@ impl From<i64> for LabelArg {
         LabelArg::Int(v)
     }
 }
+impl From<bool> for LabelArg {
+    fn from(v: bool) -> Self {
+        LabelArg::Bool(v)
+    }
+}
 impl LabelArg {
     #[doc = r" Route a BOXED runtime value to its morph."]
     pub fn from_py_value(v: stdpython::PyValue) -> Self {
         match v {
             stdpython::PyValue::Str(v) => LabelArg::Str(v),
             stdpython::PyValue::Int(v) => LabelArg::Int(v),
-            stdpython::PyValue::Bool(v) => LabelArg::Int(v as i64),
+            stdpython::PyValue::Bool(v) => LabelArg::Bool(v),
             other => LabelArg::Other(other),
         }
     }
@@ -357,6 +367,7 @@ pub fn label(x: impl Into<LabelArg>) -> Result<String, PyException> {
     match x.into() {
         LabelArg::Str(v) => label_str(v),
         LabelArg::Int(v) => label_int(v),
+        LabelArg::Bool(v) => label_bool(v),
         LabelArg::Other(v) => label_any(v),
     }
 }

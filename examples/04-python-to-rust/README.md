@@ -100,7 +100,9 @@ All in [`generated/src/wordstats.rs`](generated/src/wordstats.rs):
 - **isinstance dispatch → compile-time specialization.** `label(value)`
   switches on `isinstance` — inherently dynamic typing — and the
   converter turns the checks into compile-time flags: it emits
-  `label_str`, `label_int`, and a generic `label_any`, each with the
+  `label_str`, `label_int`, `label_bool` (bool ⊂ int in Python, so a
+  bool takes the int arm — while `str(x)` still renders `True`), and a
+  generic `label_any`, each with the
   dead arms pruned before they are ever rendered, and binds every call
   site to the variant matching its argument's static type. Class
   targets fold through the inheritance tree (a `Cat` argument takes an
