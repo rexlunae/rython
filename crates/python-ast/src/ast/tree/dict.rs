@@ -89,11 +89,17 @@ impl CodeGen for Dict {
                 .map(|d| d.display())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format!(
-                "dict literal mixes incompatible key types ({kinds}); keys must \
-                 share a common type"
-            )
-            .into());
+            // Issue #130: a mix whose key types are all boxable
+            // (`{"k": 1, 2: "v"}`) boxes to PyDict<PyValue, PyValue>
+            // instead of refusing.
+            if !k_distinct.iter().all(crate::is_boxable_value_type) {
+                return Err(format!(
+                    "dict literal mixes incompatible key types ({kinds}); keys must \
+                     share a common type"
+                )
+                .into());
+            }
+            k_expected = crate::TypeInfo::PyValue;
         }
         if forced_kv.is_none()
             && v_distinct.len() > 1
@@ -121,26 +127,7 @@ impl CodeGen for Dict {
                 // dict: `socks_version` (Optional), `rdns` (bool)):
                 // the values box into the heterogeneous PyValue, matching
                 // `dict[str, Any]` lowering (issue #121).
-                let boxable = v_distinct.iter().all(|t| match t {
-                    crate::TypeInfo::Option(_)
-                    | crate::TypeInfo::Bool
-                    | crate::TypeInfo::Int
-                    | crate::TypeInfo::Float
-                    | crate::TypeInfo::String
-                    | crate::TypeInfo::StrRef
-                    | crate::TypeInfo::Bytes
-                    | crate::TypeInfo::PyValue
-                    // A container value (`exclude_input: underlying_
-                    // operation_members` — a list — boto3's collection
-                    // docs): boxed too. A CLASS instance value
-                    // (`"handlers": [RichPipStreamHandler(...)]` — pip's
-                    // logging dictConfig): boxed too.
-                    | crate::TypeInfo::Vec(_)
-                    | crate::TypeInfo::Dict(_, _)
-                    | crate::TypeInfo::Tuple(_)
-                    | crate::TypeInfo::Class(_) => true,
-                    _ => false,
-                });
+                let boxable = v_distinct.iter().all(crate::is_boxable_value_type);
                 if !boxable {
                     let kinds = v_distinct
                         .iter()

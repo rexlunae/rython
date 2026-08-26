@@ -3081,6 +3081,47 @@ fn heterogeneous_union_annotations_match_python_at_runtime() {
 }
 
 #[test]
+fn heterogeneous_container_literals_box_and_match_python() {
+    // Issue #130: mixed-element list literals and mixed-key/value dict
+    // literals box into Vec<PyValue> / PyDict<PyValue, PyValue> instead of
+    // refusing. Verified against python3: [1, 'a', None] / 2.
+    let scratch = Scratch::new("hetero-boxing");
+    let file = scratch.path().join("boxed.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    xs = [1, \"a\", None]\n",
+            "    d = {\"k\": 1, 2: \"v\"}\n",
+            "    print(xs)\n",
+            "    print(len(d))\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/boxed"))
+        .output()
+        .expect("running generated binary");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["[1, 'a', None]", "2"],
+        "heterogeneous container boxing diverged from CPython"
+    );
+}
+
+#[test]
 fn isinstance_type_call_matches_python_at_runtime() {
     // Issue #134 (charset_normalizer): `isinstance(x, type(self))`
     // resolves `type(...)` to the statically-known class — true for the

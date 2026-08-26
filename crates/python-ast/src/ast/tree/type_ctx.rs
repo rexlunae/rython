@@ -535,6 +535,12 @@ pub fn render_typed(
     let Some(expected) = expected else {
         return Ok(tokens);
     };
+    // A None literal destined for a boxed slot IS the boxed None — the
+    // unit fallback below would render a bare `None` token that only
+    // coincidentally compiles outside expression position.
+    if matches!(expected, TypeInfo::PyValue) && crate::is_none_expr(expr) {
+        return Ok(quote!(stdpython::PyValue::None_));
+    }
     let actual = infer_type(expr, &options, &symbols);
     match coerce_tokens(tokens.clone(), &actual, &expected) {
         Some(coerced) => Ok(coerced),
@@ -637,6 +643,29 @@ pub fn is_builtin_type_annotation(ann: &ExprType) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether a Rust-side element type can live inside the boxed
+/// heterogeneous container (`Vec<stdpython::PyValue>` /
+/// `PyDict<PyValue, PyValue>` / `PySet<PyValue>`): exactly the types
+/// [`PyValue`](stdpython::PyValue) has variants or `From` impls for.
+/// Class instances, dicts-as-elements, sets-as-elements, ranges and
+/// ndarrays have no boxed variant and stay refused loudly (issue #130).
+pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
+    matches!(
+        t,
+        TypeInfo::Int
+            | TypeInfo::Float
+            | TypeInfo::Bool
+            | TypeInfo::String
+            | TypeInfo::StrRef
+            | TypeInfo::Bytes
+            | TypeInfo::Tuple(_)
+            | TypeInfo::Option(_)
+            | TypeInfo::Vec(_)
+            | TypeInfo::StrOrBytes
+            | TypeInfo::PyValue
+    )
 }
 
 pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {

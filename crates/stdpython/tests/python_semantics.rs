@@ -900,6 +900,16 @@ fn heterogeneous_union_values_str_repr_and_display() {
     assert_eq!(py_value_repr(&PyValue::Str("s".into())), "'s'");
     assert_eq!(py_value_repr(&PyValue::Int(7)), "7");
 
+    // Boxed floats as KEYS: 0.0 and -0.0 are the SAME key in Python
+    // ({0.0: 'a'}[-0.0] == 'a' - verified against python3 3.14), so their
+    // hashes must agree even though the bit patterns differ.
+    use std::collections::HashSet;
+    let mut keys = HashSet::new();
+    keys.insert(PyValue::Float(0.0));
+    assert!(keys.contains(&PyValue::Float(-0.0)));
+    keys.insert(PyValue::Float(-0.0));
+    assert_eq!(keys.len(), 1);
+
     // print() uses the same rendering as str().
     use stdpython::PyDisplay;
     assert_eq!(PyDisplay::py_display(&StrOrBytes::from("s")), "s");

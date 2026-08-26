@@ -1061,7 +1061,10 @@ fn mixed_numeric_list_unifies_to_float() {
 
 #[test]
 fn incompatible_list_elements_are_a_loud_error() {
-    let err = compile_err("[1, 'a']", "badlist.py");
+    // Issue #130: primitive mixes ([1, "a"]) BOX to Vec<PyValue>; a mix
+    // involving an UNBOXABLE element (a dict literal has no PyValue
+    // variant) stays a loud conversion error.
+    let err = compile_err("[1, {'a': 2}]", "badlist.py");
     assert!(
         err.contains("mixes incompatible element types"),
         "expected loud conversion error, got: {}",
