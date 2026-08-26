@@ -4746,6 +4746,141 @@ impl PySlice for String {
     }
 }
 
+/// Python's in-place range replacement `xs[a:b] = replacement` and range
+/// removal `del xs[a:b]` (step == 1 only — extended-slice replacement
+/// with a step is handled by [`PySliceReplace::py_slice_assign_step`]).
+/// Bounds behave like reads: negatives count from the end, out-of-range
+/// clamps to the edges, so a longer replacement INSERTS elements and an
+/// empty range is a no-op.
+pub trait PySliceReplace {
+    type Item;
+    fn py_slice_assign(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        replacement: Vec<Self::Item>,
+    );
+    fn py_slice_assign_step(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: i64,
+        replacement: Vec<Self::Item>,
+    ) -> Result<(), PyException>;
+    fn py_slice_delete(&mut self, start: Option<i64>, stop: Option<i64>);
+
+    /// Extended-slice removal `del xs[a:b:c]`: removes the selected slots
+    /// (c != 0).
+    fn py_slice_delete_step(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: i64,
+    ) -> Result<(), PyException>;
+}
+
+/// Normalizes one Python slice bound against `len`: negatives count from
+/// the end, everything clamps into `[0, len]`.
+fn slice_bound(len: i64, bound: i64) -> usize {
+    let i = if bound < 0 { bound + len } else { bound };
+    i.clamp(0, len) as usize
+}
+
+fn slice_range(len: i64, start: Option<i64>, stop: Option<i64>) -> (usize, usize) {
+    let a = start.map(|b| slice_bound(len, b)).unwrap_or(0);
+    let b = stop.map(|b| slice_bound(len, b)).unwrap_or(len as usize);
+    let (a, b) = (a as usize, b.max(a) as usize);
+    (a, b)
+}
+
+/// Computes the selected indices for an extended slice assignment
+/// (CPython list_ass_subscript normalization, verified against python3
+/// 3.14 across positive/negative steps, omitted bounds, and clamping).
+fn extended_slice_indices(
+    len: i64,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: i64,
+) -> Result<Vec<usize>, PyException> {
+    if step == 0 {
+        return Err(value_error("slice step cannot be zero"));
+    }
+    let clamp = |i: i64, low: i64, high: i64| i.max(low).min(high);
+    let (mut i, end) = if step > 0 {
+        let s = start.map(|v| if v < 0 { v + len } else { v }).unwrap_or(0);
+        let e = stop.map(|v| if v < 0 { v + len } else { v }).unwrap_or(len);
+        (clamp(s, 0, len), clamp(e, 0, len))
+    } else {
+        let s = start
+            .map(|v| if v < 0 { v + len } else { v })
+            .unwrap_or(len - 1);
+        let e = stop
+            .map(|v| if v < 0 { v + len } else { v })
+            .unwrap_or(-1);
+        (clamp(s, -1, len - 1), clamp(e, -1, len))
+    };
+    let mut idxs = Vec::new();
+    while (step > 0 && i < end) || (step < 0 && i > end) {
+        idxs.push(i as usize);
+        i += step;
+    }
+    Ok(idxs)
+}
+
+impl<T: Clone> PySliceReplace for Vec<T> {
+    type Item = T;
+    fn py_slice_assign(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        replacement: Vec<Self::Item>,
+    ) {
+        let (a, b) = slice_range(self.len() as i64, start, stop);
+        self.splice(a..b, replacement);
+    }
+    fn py_slice_assign_step(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: i64,
+        replacement: Vec<Self::Item>,
+    ) -> Result<(), PyException> {
+        let idxs = extended_slice_indices(self.len() as i64, start, stop, step)?;
+        if replacement.len() != idxs.len() {
+            return Err(value_error(format!(
+                "attempt to assign sequence of size {} to extended slice of size {}",
+                replacement.len(),
+                idxs.len()
+            )));
+        }
+        for (slot, item) in idxs.into_iter().zip(replacement.into_iter()) {
+            self[slot] = item;
+        }
+        Ok(())
+    }
+    fn py_slice_delete(&mut self, start: Option<i64>, stop: Option<i64>) {
+        let (a, b) = slice_range(self.len() as i64, start, stop);
+        self.drain(a..b);
+    }
+    fn py_slice_delete_step(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: i64,
+    ) -> Result<(), PyException> {
+        // Remove the highest slot first so earlier removals don't shift
+        // the slots still to be removed. A positive extended step DOES
+        // reach this method (via `del xs[a:b:c]`), whose indices are
+        // ascending, so sort before reversing.
+        let mut idxs = extended_slice_indices(self.len() as i64, start, stop, step)?;
+        idxs.sort_unstable();
+        for slot in idxs.into_iter().rev() {
+            self.remove(slot);
+        }
+        Ok(())
+    }
+}
+
 // ============================================================================
 // MEMBERSHIP (the `in` operator)
 // ============================================================================

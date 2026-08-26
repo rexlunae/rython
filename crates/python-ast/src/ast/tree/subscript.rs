@@ -201,3 +201,18 @@ mod tests {
     create_parse_test!(test_dict_subscript, "d['key']", "subscript_test.py");
     create_parse_test!(test_nested_subscript, "matrix[i][j]", "subscript_test.py");
 }
+
+/// Whether an optional slice `step` expression is the literal `1` (or
+/// absent): the only step value range-replacement supports — anything
+/// else is a strided selection the caller must reject loudly.
+pub fn is_step_one(step: Option<&ExprType>) -> bool {
+    match step {
+        None => true,
+        Some(e) => matches!(
+            e,
+            ExprType::Constant(c)
+                if matches!(&c.0, Some(litrs::Literal::Integer(i)) if i.to_string() == "1")
+        ),
+    }
+}
+
