@@ -2741,6 +2741,10 @@ fn negative_strided_slice_assignment_assigns_in_slot_order() {
     let out = compile("ys = [0, 1, 2]\nys[::-2] = [7, 8]\n", "negassign.py");
     assert!(
         out.contains("py_slice_assign_step"),
+        "generated: {}",
+        out
+    );
+}
 
 #[test]
 fn isinstance_type_call_resolves_statically() {
