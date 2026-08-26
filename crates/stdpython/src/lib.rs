@@ -2638,7 +2638,11 @@ impl core::hash::Hash for PyValue {
             }
             PyValue::Float(f) => {
                 core::hash::Hash::hash(&1u8, state);
-                core::hash::Hash::hash(&f.to_bits(), state);
+                // 0.0 and -0.0 compare equal (derived PartialEq), so they
+                // must hash IDENTICALLY or equal keys miss in HashMaps
+                // (CPython: {0.0: 'a'}[-0.0] == 'a'). Normalize -0.0.
+                let bits = if *f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
+                core::hash::Hash::hash(&bits, state);
             }
             PyValue::Bool(b) => {
                 core::hash::Hash::hash(&2u8, state);
