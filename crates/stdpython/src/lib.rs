@@ -4703,7 +4703,7 @@ fn extended_slice_indices(
         let e = stop
             .map(|v| if v < 0 { v + len } else { v })
             .unwrap_or(-1);
-        (clamp(s, 0, len - 1), clamp(e, -1, len))
+        (clamp(s, -1, len - 1), clamp(e, -1, len))
     };
     let mut idxs = Vec::new();
     while (step > 0 && i < end) || (step < 0 && i > end) {
