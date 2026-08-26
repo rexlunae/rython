@@ -552,6 +552,19 @@ impl<'a> CodeGen for Assign {
                     }
                 }
             };
+            // Issue #123 family: `self.path = path` followed by a later
+            // read of `path` (pip's Prefix stores the parameter, then
+            // passes it to get_scheme). Python shares by reference; the
+            // Rust move would poison the later use (E0382). Cloning the
+            // store is faithful ONLY for values Python cannot mutate
+            // (str/bytes) — mutable containers keep the move, so aliasing
+            // stays loud (issue #79).
+            let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
+                if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
+                    && matches!(
+                        crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
+                        crate::TypeInfo::String | crate::TypeInfo::Bytes
+                    ));
             Ok(match target {
                 ExprType::Name(name) => {
                     // Issue #121: a name holding a boxed PyValue (wider
@@ -597,6 +610,9 @@ impl<'a> CodeGen for Assign {
                 }
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
+                }
+                ExprType::Attribute(_) if stored_name_needs_clone => {
+                    quote!(#target_code = (#value).clone();)
                 }
                 _ => quote!(#target_code = #value;),
             })
