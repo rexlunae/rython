@@ -559,6 +559,14 @@ impl CodeGen for Parameter {
             // uncallable. If no variable was inferred, the function
             // generator already failed loudly with the reason.
             match options.param_type_vars.get(&self.arg) {
+                // A value-pinned free-function parameter (inferred boxed
+                // PyValue — issue #161): `impl Into<stdpython::PyValue>`,
+                // boxed by the function prologue, so call sites pass plain
+                // values (String, bytes, an already-boxed PyValue) exactly
+                // like Python.
+                Some(_) if options.pyvalue_into_params.contains(&self.arg) => {
+                    Ok(quote!(#param_name: impl Into<stdpython::PyValue>))
+                }
                 Some(tv) => Ok(quote!(#param_name: #tv)),
                 // No type var (the constructor synthesis renders __init__
                 // params, or an unannotated method param): a boxed PyValue

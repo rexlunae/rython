@@ -403,6 +403,13 @@ pub fn scale(values: Vec<f64>, factor: f64) -> Result<Vec<f64>, PyException>
 - The declared return annotation is honored only when every path
   provably returns; a body that can fall through returns `()` — with a
   conversion *warning* recording the ignored annotation.
+- A VALUE-PINNED unannotated parameter — reassigned from a call result
+  (`path = os.path.expandvars(path)`, issue #161) — is the boxed
+  `stdpython::PyValue`: it takes `impl Into<stdpython::PyValue>` (so
+  call sites pass plain values exactly like Python; bytes literals box
+  through `From<&[u8; N]>`), a prologue boxes it on entry, and stores
+  into it wrap in `PyValue::from`. It carries no type variable and no
+  bounds.
 - Parameters are owned values; `str` parameters are `impl Into<String>`
   converted on entry.
 - Visibility derives from Python naming: `_name` is private,
@@ -646,7 +653,15 @@ with one variant per morph plus `Other(PyValue)` and `From<T>` per
 variant, taken as `impl Into<Enum>` parameters and tuple-matched — so
 plain values pass through unchanged, untested parameters pass through
 positionally, and a boxed `PyValue` argument routes at runtime in
-Python's first-true-test order; morphs whose return types differ route
+Python's first-true-test order — an argument with NO statically-known
+type (a value-pinned parameter reassigned through an untyped call,
+issue #161's `path = os.path.expandvars(path)`) dispatches the same
+way, and a residual morph whose fall-through decodes
+(`path.decode(enc, errors)`) types as `str` and bounds `PyDecode`
+(implemented by `Vec<u8>` and the boxed PyValue; a non-bytes boxed
+value raises CPython's AttributeError, `errors="replace"` follows
+CPython for utf-8, other non-strict errors values decode strictly —
+the documented decode divergence); morphs whose return types differ route
 through an output enum (`FOut`, one variant per distinct return type,
 `From<T>` per member, and `From<FOut> for PyValue` when every member
 boxes, so a runtime-dispatched result lands as Python's union value);

@@ -570,11 +570,14 @@ impl<'a> CodeGen for Assign {
                     // Issue #121: a name holding a boxed PyValue (wider
                     // union or Any) wraps its stores — `PyValue::from(v)`,
                     // None as `PyValue::None_`. A value that already yields
-                    // a PyValue stores through unchanged.
+                    // a PyValue stores through unchanged. A VALUE-PINNED
+                    // parameter (`path = os.path.expandvars(path)` — issue
+                    // #161) is PyValue in the body the same way.
                     if options
                         .name_types
                         .get(&name.id)
                         .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
+                        || options.pyvalue_into_params.contains(&name.id)
                     {
                         if value_is_none_early {
                             quote!(#target_code = PyValue::None_;)

@@ -6466,3 +6466,60 @@ fn mixed_return_boxing_matches_python_at_runtime() {
         "mixed-return boxing semantics diverged from CPython"
     );
 }
+
+#[test]
+fn unknown_typed_isinstance_dispatch_matches_python_at_runtime() {
+    // Issue #161: an isinstance-dispatched call whose argument has no
+    // statically-known type (reassigned through an untyped call —
+    // botocore configloader's `path = os.path.expandvars(path)` before
+    // `_unicode_path(path)`) falls back to the dynamic router: a str
+    // routes to the str morph, bytes land in the residual, whose
+    // `decode(enc, "replace")` follows CPython (invalid utf-8 becomes
+    // U+FFFD).
+    let scratch = Scratch::new("isodyn");
+    let file = scratch.path().join("isodyn.py");
+    fs::write(
+        &file,
+        concat!(
+            "def _unicode_path(path):\n",
+            "    if isinstance(path, str):\n",
+            "        return path\n",
+            "    return path.decode(\"utf-8\", \"replace\")\n",
+            "\n",
+            "def norm(p):\n",
+            "    return p\n",
+            "\n",
+            "def load(path):\n",
+            "    path = norm(path)\n",
+            "    return _unicode_path(path)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(_unicode_path(\"direct\"))\n",
+            "    print(load(\"abc\"))\n",
+            "    print(load(b\"bytes-in\"))\n",
+            "    print(load(b\"bad\\xffbyte\"))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/isodyn"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["direct", "abc", "bytes-in", "bad\u{fffd}byte"],
+        "unknown-typed isinstance dispatch diverged from CPython"
+    );
+}
