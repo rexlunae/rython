@@ -271,12 +271,14 @@ fn test_complex_python_simulation() {
     println!("📋 Testing complex Python code simulation...");
     
     // Simulate: def calculate_stats(numbers): return {"sum": sum(numbers), "min": min(numbers), "max": max(numbers), "count": len(numbers)}
-    fn calculate_stats(numbers: &Vec<i32>) -> PyDictionary<String, i32> {
+    // Python ints are i64 in generated code (PySum is i64/f64-only —
+    // an i32 impl would leave integer-literal lists ambiguous, #133).
+    fn calculate_stats(numbers: &Vec<i64>) -> PyDictionary<String, i64> {
         let mut stats = PyDictionary::new();
         stats.set("sum".to_string(), sum(&numbers[..]));
         stats.set("min".to_string(), min(numbers).unwrap_or(0));
         stats.set("max".to_string(), max(numbers).unwrap_or(0));
-        stats.set("count".to_string(), len(numbers) as i32);
+        stats.set("count".to_string(), len(numbers) as i64);
         stats
     }
     

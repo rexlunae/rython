@@ -421,9 +421,15 @@ pub trait PyAbs {
     fn py_abs(self) -> Self::Output;
 }
 
-/// Trait for types that can be summed
-pub trait PySum<T> {
-    fn py_sum(self) -> T;
+/// Python sum() as a trait with the OUTPUT as an associated type: every
+/// iterable sums to exactly one result type, so generic bounds compose
+/// with the operator-Output machinery (`<T as PySum>::Output` in
+/// inferred signatures) and a use context can pin the result
+/// (`T: PySum<Output = i64>` — issue #133's calc, where the target list
+/// was already element-typed i64).
+pub trait PySum {
+    type Output;
+    fn py_sum(self) -> Self::Output;
 }
 
 /// Python abs() function - returns absolute value
@@ -683,10 +689,7 @@ pub fn reversed<T: Clone>(iterable: &[T]) -> Vec<T> {
 }
 
 /// Python sum() function
-pub fn sum<I, T>(iterable: I) -> T
-where
-    I: PySum<T>,
-{
+pub fn sum<I: PySum>(iterable: I) -> I::Output {
     iterable.py_sum()
 }
 
@@ -1214,35 +1217,57 @@ impl PyAbs for f32 {
     }
 }
 
-// Implementations for PySum trait
-impl PySum<i64> for &[i64] {
+// Implementations for PySum: owned and borrowed list forms per numeric
+// scalar (generated call sites pass whichever the expression yields —
+// an owned Vec local, a &Vec through a reference, a slice view).
+macro_rules! pysum_numeric {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl PySum for Vec<$t> {
+                type Output = $t;
+                fn py_sum(self) -> $t {
+                    self.iter().sum()
+                }
+            }
+            impl PySum for &Vec<$t> {
+                type Output = $t;
+                fn py_sum(self) -> $t {
+                    self.iter().sum()
+                }
+            }
+            impl PySum for &[$t] {
+                type Output = $t;
+                fn py_sum(self) -> $t {
+                    self.iter().sum()
+                }
+            }
+        )*
+    };
+}
+// i64/f64 only (rython's numeric types): an i32/f32 impl would leave
+// `sum(vec![1, 2, 3])` ambiguous over {integer} and rustc's i32 literal
+// fallback would then contradict an i64 use context.
+pysum_numeric!(i64, f64);
+
+// Python sum() of a bool list counts the Trues (bool ⊂ int).
+impl PySum for Vec<bool> {
+    type Output = i64;
     fn py_sum(self) -> i64 {
-        self.iter().sum()
+        self.iter().filter(|b| **b).count() as i64
+    }
+}
+impl PySum for &Vec<bool> {
+    type Output = i64;
+    fn py_sum(self) -> i64 {
+        self.iter().filter(|b| **b).count() as i64
     }
 }
 
-impl PySum<i32> for &[i32] {
-    fn py_sum(self) -> i32 {
-        self.iter().sum()
-    }
-}
-
-impl PySum<f64> for &[f64] {
-    fn py_sum(self) -> f64 {
-        self.iter().sum()
-    }
-}
-
-impl PySum<f32> for &[f32] {
-    fn py_sum(self) -> f32 {
-        self.iter().sum()
-    }
-}
-
-impl<T> PySum<T> for &PyList<T>
+impl<T> PySum for &PyList<T>
 where
     T: core::iter::Sum<T> + Clone,
 {
+    type Output = T;
     fn py_sum(self) -> T {
         self.inner.iter().cloned().sum()
     }
@@ -6110,16 +6135,20 @@ mod tests {
         assert_eq!(abs(-42i32), 42);
         assert_eq!(abs(-2.5f32), 2.5);
         
-        // Test generic sum function  
+        // Test generic sum function (i64/f64 only — an i32 impl would
+        // leave integer-literal lists ambiguous, issue #133): owned,
+        // borrowed, and slice forms all sum.
         let nums_i64 = vec![1i64, 2, 3, 4, 5];
         assert_eq!(sum(&nums_i64[..]), 15);
-        
+        assert_eq!(sum(&nums_i64), 15);
+        assert_eq!(sum(nums_i64.clone()), 15);
+
         let nums_f64 = vec![1.5f64, 2.5, 3.0];
         assert_eq!(sum(&nums_f64[..]), 7.0);
-        
-        let nums_i32 = vec![10i32, 20, 30];
-        assert_eq!(sum(&nums_i32[..]), 60);
-        
+
+        // Python sum() of a bool list counts the Trues (bool ⊂ int).
+        assert_eq!(sum(vec![true, false, true]), 2);
+
         // Test with PyList
         let pylist = PyList::from_vec(vec![1i64, 2, 3]);
         assert_eq!(sum(&pylist), 6);
