@@ -5855,3 +5855,217 @@ fn bytesio_and_stringio_match_python_at_runtime() {
         "in-memory buffer semantics diverged from CPython"
     );
 }
+
+#[test]
+fn global_writes_mutate_module_state_at_runtime() {
+    // Issue #115: a module-level scalar/None value written by functions
+    // through `global` lowers to a mutable static (`static name:
+    // Mutex<T>`): writes are visible to every later read, module-wide.
+    // `shadow`'s plain local (no `global`) must stay a local.
+    let scratch = Scratch::new("globalw");
+    let file = scratch.path().join("globalw.py");
+    fs::write(
+        &file,
+        concat!(
+            "DEFAULT = None\n",
+            "count = 0\n",
+            "\n",
+            "def setup(v: int) -> None:\n",
+            "    global DEFAULT\n",
+            "    DEFAULT = v\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    global count\n",
+            "    count += 1\n",
+            "\n",
+            "def shadow() -> int:\n",
+            "    total = 5\n",
+            "    return total\n",
+            "\n",
+            "def run() -> int:\n",
+            "    bump()\n",
+            "    bump()\n",
+            "    if DEFAULT is None:\n",
+            "        setup(7)\n",
+            "    print(count)\n",
+            "    print(DEFAULT)\n",
+            "    print(shadow())\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/globalw"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["2", "7", "5"],
+        "global-write semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn field_from_cross_module_call_result_attribute() {
+    // Issue #123: `self.bin_dir = scheme.scripts` where `scheme` is the
+    // result of a call into a SIBLING module returning a frozen dataclass
+    // (pip's Prefix over get_scheme -> Scheme). Needs call-return typing,
+    // dataclass __init__ synthesis, AND the stored-parameter clone
+    // (`self.path = path` followed by a later read of `path`).
+    let scratch = Scratch::new("xmodfield");
+    let root = scratch.path().join("pkg");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("__init__.py"),
+        concat!(
+            "from locations import get_scheme\n",
+            "\n",
+            "class Prefix:\n",
+            "    def __init__(self, path: str) -> None:\n",
+            "        self.path = path\n",
+            "        scheme = get_scheme(path)\n",
+            "        self.bin_dir = scheme.scripts\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = Prefix(\"x\")\n",
+            "    print(p.bin_dir)\n",
+            "    print(p.path)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("locations.py"),
+        concat!(
+            "from dataclasses import dataclass\n",
+            "\n",
+            "@dataclass(frozen=True)\n",
+            "class Scheme:\n",
+            "    platlib: str\n",
+            "    purelib: str\n",
+            "    scripts: str\n",
+            "\n",
+            "def get_scheme(x: str) -> Scheme:\n",
+            "    return Scheme(\"a\", \"b\", \"c\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&root).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["c", "x"],
+        "cross-module field typing diverged from CPython"
+    );
+}
+
+#[test]
+fn module_level_argparse_with_short_aliases_matches_python() {
+    // Issue #118: certifi's __main__.py shape — the parser built at
+    // MODULE level (not inside a function), with -short/--long alias
+    // pairs. The conversion-time rewrite moves the typed-namespace
+    // destructure into __module_init__; the runtime handles short
+    // options (exact, attached value) and rejects unknown option-like
+    // tokens instead of consuming them as positionals.
+    let scratch = Scratch::new("argmod");
+    let file = scratch.path().join("argmod.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "parser = argparse.ArgumentParser(prog=\"certifi\")\n",
+            "parser.add_argument(\"-c\", \"--contents\", action=\"store_true\", help=\"print contents\")\n",
+            "parser.add_argument(\"-s\", \"--scale\", type=float, default=1.0)\n",
+            "args = parser.parse_args()\n",
+            "if args.contents:\n",
+            "    print(\"contents\", args.scale)\n",
+            "else:\n",
+            "    print(\"where\", args.scale)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/argmod");
+
+    // --help: python3's exact text (3.11 format), exit 0.
+    let output = Command::new(&bin).arg("--help").output().expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: certifi [-h] [-c] [-s SCALE]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -c, --contents        print contents\n",
+            "  -s SCALE, --scale SCALE\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    // Verified against python3.
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "where 1.0\n"),
+        (&["-c"], "contents 1.0\n"),
+        (&["-s", "2.5"], "where 2.5\n"),
+        (&["-s2.5", "--contents"], "contents 2.5\n"),
+    ];
+    for (argv, expected) in cases {
+        let output = Command::new(&bin).args(*argv).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "args: {:?}", argv);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            *expected,
+            "args: {:?}",
+            argv
+        );
+    }
+
+    // An unknown option-like token is an error, never a positional.
+    // Verified against python3.
+    let output = Command::new(&bin).arg("-x").output().expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: certifi [-h] [-c] [-s SCALE]\n",
+            "certifi: error: unrecognized arguments: -x\n",
+        ),
+        "error output diverged from CPython"
+    );
+}

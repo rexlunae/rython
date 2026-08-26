@@ -50,8 +50,11 @@ impl PyStatementTrait for FunctionDef {
 }
 
 /// One add_argument spec collected at conversion time.
-struct ArgparseSpec {
+pub(crate) struct ArgparseSpec {
     name: String,
+    /// The short alias of `add_argument("-c", "--contents", ...)`
+    /// (issue #118 — certifi's __main__); None otherwise.
+    short: Option<String>,
     kind: &'static str, // "Str" | "Int" | "Float" | "StoreTrue"
     default: Option<ExprType>,
     help: Option<String>,
@@ -62,10 +65,10 @@ struct ArgparseSpec {
 /// literal specs. ArgumentParser/add_argument/parse_args are evaluated
 /// HERE, at conversion time — only literal specs can shape the typed
 /// namespace struct, so anything dynamic is a loud error.
-struct ArgparseRewrite {
-    skip: std::collections::HashSet<usize>,
-    parse_index: usize,
-    args_var: String,
+pub(crate) struct ArgparseRewrite {
+    pub(crate) skip: std::collections::HashSet<usize>,
+    pub(crate) parse_index: usize,
+    pub(crate) args_var: String,
     prog: Option<String>,
     description: Option<String>,
     specs: Vec<ArgparseSpec>,
@@ -81,7 +84,7 @@ fn literal_str(e: &ExprType) -> Option<String> {
     }
 }
 
-fn scan_argparse(
+pub(crate) fn scan_argparse(
     body: &[Statement],
 ) -> Result<Option<ArgparseRewrite>, Box<dyn std::error::Error>> {
     // Find `<var> = argparse.ArgumentParser(...)`.
@@ -169,23 +172,48 @@ fn scan_argparse(
                 if parse.is_some() {
                     return Err("add_argument after parse_args is not supported".into());
                 }
-                let [name_expr] = call.args.as_slice() else {
-                    return Err(
-                        "add_argument takes exactly one name (short aliases are not \
-                         supported yet)"
-                            .into(),
-                    );
+                // One name (`"count"`, `"--verbose"`), or a short+long
+                // alias pair (`"-c", "--contents"` — certifi, issue #118).
+                let (short, name) = match call.args.as_slice() {
+                    [name_expr] => {
+                        let name = literal_str(name_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        if name.starts_with('-') && !name.starts_with("--") {
+                            return Err(format!(
+                                "add_argument: short option '{}' needs a --long \
+                                 alias (the long name is the namespace attribute)",
+                                name
+                            )
+                            .into());
+                        }
+                        (None, name)
+                    }
+                    [short_expr, long_expr] => {
+                        let short = literal_str(short_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        let long = literal_str(long_expr)
+                            .ok_or("add_argument: the name must be a string literal")?;
+                        if !short.starts_with('-')
+                            || short.starts_with("--")
+                            || !long.starts_with("--")
+                        {
+                            return Err(format!(
+                                "add_argument('{}', '{}'): a two-name argument must \
+                                 be a -short, --long alias pair",
+                                short, long
+                            )
+                            .into());
+                        }
+                        (Some(short), long)
+                    }
+                    _ => {
+                        return Err(
+                            "add_argument takes one name, or a -short, --long alias \
+                             pair"
+                                .into(),
+                        );
+                    }
                 };
-                let name = literal_str(name_expr)
-                    .ok_or("add_argument: the name must be a string literal")?;
-                if name.starts_with('-') && !name.starts_with("--") {
-                    return Err(format!(
-                        "add_argument: short option '{}' is not supported yet; use the \
-                         --long form",
-                        name
-                    )
-                    .into());
-                }
                 let mut kind: Option<&'static str> = None;
                 let mut default = None;
                 let mut help = None;
@@ -268,6 +296,7 @@ fn scan_argparse(
                 }
                 specs.push(ArgparseSpec {
                     name,
+                    short,
                     kind,
                     default,
                     help,
@@ -321,7 +350,7 @@ fn scan_argparse(
 /// Emit the parse_args replacement: a namespace struct typed from the
 /// specs, the run_parser call, and the destructuring assignment into
 /// the (hoisted) namespace variable.
-fn lower_parse_args(
+pub(crate) fn lower_parse_args(
     rw: &ArgparseRewrite,
     ctx: &CodeGenContext,
     options: &PythonOptions,
@@ -363,8 +392,13 @@ fn lower_parse_args(
             Some(h) => quote!(Some(#h)),
             None => quote!(None),
         };
+        let short = match &spec.short {
+            Some(s) => quote!(Some(#s)),
+            None => quote!(None),
+        };
         spec_tokens.push(quote!(argparse::ArgSpec {
             name: #name,
+            short: #short,
             kind: argparse::ArgKind::#kind,
             default: #default,
             help: #help,
@@ -886,6 +920,32 @@ impl FunctionDef {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
 
+        // Issue #119: a MODULE-level `__getattr__` / `__dir__` implements
+        // the module attribute protocol (PEP 562) — a dynamic fallback for
+        // attribute reads that rython cannot model (module attributes
+        // resolve statically at conversion time). Lowering the definition
+        // as an ordinary function produces dead code that misstates the
+        // module's behavior, so the definition is a loud error naming the
+        // dunder and the fix.
+        let is_module_ctx = matches!(&ctx, CodeGenContext::Module(_))
+            || matches!(
+                &ctx,
+                CodeGenContext::Async(inner)
+                    if matches!(inner.as_ref(), CodeGenContext::Module(_))
+            );
+        if is_module_ctx && (self.name == "__getattr__" || self.name == "__dir__") {
+            return Err(format!(
+                "module-level `{}` implements the module attribute protocol \
+                 (PEP 562), which is not supported yet: rython resolves module \
+                 attributes statically at conversion time, so the dynamic \
+                 fallback could never run; define or import the module's \
+                 attributes explicitly and remove the `{}` definition — rython \
+                 refuses to silently ignore it (issue #119)",
+                self.name, self.name
+            )
+            .into());
+        }
+
         // A `@typing.overload` STUB (`def f(x: int = ...) -> int: ...`) is
         // compile-time metadata: its `...` defaults and `...` body are
         // placeholders, never runtime code. Skip it entirely — call sites
@@ -901,12 +961,15 @@ impl FunctionDef {
         }
 
         // Issue #115: `global x` declares module scope. Reads resolve to
-        // the module statics; WRITES need mutable module state, which
-        // rython does not model (module-level reassignment lowers to
-        // __module_init__ locals invisible to functions) — the writes are
-        // no-ops, surfaced through the -W channel (issue #115, a documented
-        // divergence; the read side still resolves the module static).
-        if let Some(name) = global_write_error(&self.body) {
+        // the module statics. A written global whose module binding
+        // qualified as a MUTABLE static (module.rs's
+        // module_global_mutable_names: a single scalar/None module store)
+        // writes THROUGH the static — py_global_write — with no warning.
+        // A write to any OTHER global keeps the documented divergence: the
+        // write is a no-op, surfaced through the -W channel.
+        if let Some(name) = global_write_error(&self.body)
+            && !options.mutable_statics.contains_key(&name)
+        {
             options.definition_warnings.borrow_mut().push(format!(
                 "function `{}` writes to module-level name `{name}`: the write is \
                  dropped (issue #115 — rython has no mutable module state visible \
@@ -914,6 +977,14 @@ impl FunctionDef {
                 self.name
             ));
         }
+        // The `global` names this function declares that ARE mutable
+        // statics: its stores route through py_global_write, and their
+        // bindings are the module statics — never hoisted locals.
+        let fn_mutable_globals: std::collections::HashSet<String> =
+            collect_global_decls(&self.body)
+                .into_iter()
+                .filter(|n| options.mutable_statics.contains_key(n))
+                .collect();
         // Issue #112: `del name` lowers to a no-op, which is faithful ONLY
         // while the name is never referenced afterwards — this pass makes
         // any such use a loud error (and a reassignment/import clears the
@@ -1234,15 +1305,22 @@ impl FunctionDef {
         // Optional annotation) are visible to every assignment in the body:
         // their non-None stores wrap in Some.
         let mut options = options;
+        // Issue #115: this function may write exactly the mutable statics
+        // its own `global` statements declare; every other scope's
+        // grant (the module's all-of-them default in particular) does not
+        // apply inside this body.
+        options.scope_global_writables = std::rc::Rc::new(fn_mutable_globals.clone());
         // Names managed by this function's prologue: hoisted assignments
         // plus mutable parameters. A `for`-loop target on one of these
         // lowers to a store into the hoisted binding, never a shadowing
-        // fresh binding (issue #80).
+        // fresh binding (issue #80). A `global`-declared mutable static is
+        // NOT a local — its binding is the module static (issue #115).
         options.hoisted_names = std::rc::Rc::new(
             scope
                 .assigned
                 .iter()
                 .chain(scope.needs_mut.iter())
+                .filter(|n| !fn_mutable_globals.contains(*n))
                 .cloned()
                 .collect(),
         );
@@ -1819,6 +1897,11 @@ impl FunctionDef {
             // parse_url(...)` — idna/urllib3): a wildcard, never a hoisted
             // binding — `let mut _;` is not legal Rust.
             if name == "_" {
+                continue;
+            }
+            // A `global`-declared mutable static has no local binding: its
+            // stores go through py_global_write (issue #115).
+            if fn_mutable_globals.contains(name) {
                 continue;
             }
             let ident = crate::safe_ident(name);
@@ -2560,6 +2643,49 @@ fn loop_target_name(target: &ExprType) -> String {
         ExprType::Name(n) => n.id.clone(),
         _ => String::new(),
     }
+}
+
+/// Issue #115: every name this function's body declares `global`,
+/// recursing through control flow but NOT into nested defs (each def is
+/// its own scope with its own declarations).
+fn collect_global_decls(body: &[Statement]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+        for stmt in stmts {
+            match &stmt.statement {
+                StatementType::Global(names) => out.extend(names.iter().cloned()),
+                StatementType::If(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::AsyncFor(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                StatementType::Try(s) => {
+                    walk(&s.body, out);
+                    for h in &s.handlers {
+                        walk(&h.body, out);
+                    }
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                }
+                StatementType::With(s) => walk(&s.body, out),
+                StatementType::AsyncWith(s) => walk(&s.body, out),
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
 }
 
 /// Issue #115: a module-level name WRITTEN from this function — a `global

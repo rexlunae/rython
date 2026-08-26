@@ -8512,3 +8512,117 @@ fn threading_thread_daemon_flag_lowers_from_bool_constants() {
         out
     );
 }
+
+// ---- Module attribute protocol (PEP 562) — issue #119 ----
+
+#[test]
+fn module_getattr_is_a_loud_error() {
+    // A module-level `__getattr__` (dateutil's lazy submodule loading) is
+    // the PEP 562 dynamic-attribute fallback: rython resolves module
+    // attributes statically, so the definition is a loud error naming the
+    // dunder — not an inference error, and never a silently dead function.
+    let err = compile_err(
+        concat!(
+            "def __getattr__(name):\n",
+            "    raise AttributeError(name)\n",
+        ),
+        "modgetattr.py",
+    );
+    assert!(err.contains("module attribute protocol"), "err: {}", err);
+    assert!(err.contains("__getattr__"), "err: {}", err);
+    assert!(err.contains("issue #119"), "err: {}", err);
+}
+
+#[test]
+fn module_dir_is_a_loud_error() {
+    let err = compile_err("def __dir__():\n    return []\n", "moddir.py");
+    assert!(err.contains("module attribute protocol"), "err: {}", err);
+    assert!(err.contains("__dir__"), "err: {}", err);
+}
+
+// ---- Mutable module globals (`global` writes) — issue #115 ----
+
+#[test]
+fn global_write_lowers_to_a_mutable_static() {
+    // A module scalar written through `global` becomes `static name:
+    // Mutex<T>`: writes go through py_global_write, reads through
+    // py_global_read, and the write-drop warning is gone.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "count = 0\n",
+            "def bump():\n",
+            "    global count\n",
+            "    count += 1\n",
+            "def peek() -> int:\n",
+            "    return count\n",
+        ),
+        "global_mut.py",
+    );
+    assert!(
+        out.contains("pub static count : std :: sync :: Mutex < i64 >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("py_global_write"), "generated: {}", out);
+    assert!(out.contains("py_global_read (& count)"), "generated: {}", out);
+    assert!(
+        warnings.iter().all(|w| !w.contains("writes to module-level name")),
+        "the supported write must not warn: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn global_none_singleton_boxes_to_a_pyvalue_static() {
+    // The None-initialized singleton pattern (boto3's DEFAULT_SESSION):
+    // the static boxes to Mutex<PyValue>; scalar stores wrap in
+    // PyValue::from.
+    let out = compile(
+        concat!(
+            "DEFAULT = None\n",
+            "def setup(v: int):\n",
+            "    global DEFAULT\n",
+            "    DEFAULT = v\n",
+            "def is_set() -> bool:\n",
+            "    return DEFAULT is not None\n",
+        ),
+        "global_none.py",
+    );
+    assert!(
+        out.contains("pub static DEFAULT : std :: sync :: Mutex < stdpython :: PyValue >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: from (v)"),
+        "scalar stores must box: {}",
+        out
+    );
+}
+
+#[test]
+fn global_shadowed_by_a_plain_local_disqualifies_the_static() {
+    // A function that binds the name WITHOUT `global` has a plain local;
+    // the name must not become a mutable static (the local read would be
+    // misread as the module global) — the write keeps the documented
+    // drop-with-warning divergence.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "flag = False\n",
+            "def set_local():\n",
+            "    flag = True\n",
+            "def set_global():\n",
+            "    global flag\n",
+            "    flag = True\n",
+        ),
+        "global_shadow.py",
+    );
+    assert!(!out.contains("py_global_write"), "generated: {}", out);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("writes to module-level name `flag`")),
+        "the unsupported write must still warn: {:?}",
+        warnings
+    );
+}

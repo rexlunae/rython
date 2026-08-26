@@ -75,6 +75,31 @@ impl CodeGen for AugAssign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // Issue #115: a compound assignment to a `global`-declared name
+        // whose module binding is a MUTABLE static is a read-modify-write
+        // through the static's helpers: load the global, evaluate the
+        // operand, combine, store — CPython's LOAD/op/STORE order, and
+        // just as non-atomic. Each helper call takes the lock briefly, so
+        // an operand reading the same global cannot deadlock.
+        if let ExprType::Name(n) = &self.target
+            && options.scope_global_writables.contains(&n.id)
+            && options.mutable_statics.contains_key(&n.id)
+        {
+            let ident = crate::safe_ident(&n.id);
+            let value = self
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let elem = quote!(__rython_g);
+            let combined = combine_op(&self.op, &elem, &value)?;
+            return Ok(quote! {
+                {
+                    let __rython_g = stdpython::py_global_read(&#ident);
+                    stdpython::py_global_write(&#ident, #combined);
+                }
+            });
+        }
+
         // Compound assignment to a subscript (`counts[k] += 1`) is a
         // read-modify-write: the Load lowering of the target is a cloned
         // temporary (py_index), not a place, so read via py_index, combine,

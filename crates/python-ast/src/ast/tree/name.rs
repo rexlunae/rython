@@ -136,6 +136,16 @@ impl CodeGen for Name {
                     _ => quote!((#name).clone().unwrap()),
                 });
             }
+            // Issue #115: a `global`-written module value is a MUTABLE
+            // static (`static name: Mutex<T>`); every read locks and clones
+            // through the helper — the guard drops inside py_global_read,
+            // so two reads in one statement never deadlock. Names that a
+            // function binds WITHOUT `global` never enter mutable_statics
+            // (module.rs disqualifies them), so a bare read here is always
+            // the module global, as in Python.
+            if options.mutable_statics.contains_key(&self.id) {
+                return Ok(quote!(stdpython::py_global_read(&#name)));
+            }
             // A module-level value promoted to a LazyLock static (module.rs):
             // a static does not auto-deref in value/borrow position (only as
             // a method receiver), so every READ clones the deref'd value.

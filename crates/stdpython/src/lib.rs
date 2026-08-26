@@ -2600,6 +2600,25 @@ impl From<()> for PyValue {
     }
 }
 
+/// Read a mutable module global (issue #115: a module-level name written by
+/// functions through `global` lowers to a `static Mutex<T>`). The guard is
+/// dropped inside this function, so two reads in one statement never hold
+/// two locks at once (a bare `NAME.lock().unwrap().clone()` at the call
+/// site would keep the guard temporary alive to the end of the statement
+/// and deadlock on the second read).
+#[cfg(feature = "std")]
+pub fn py_global_read<T: Clone>(cell: &std::sync::Mutex<T>) -> T {
+    cell.lock().unwrap().clone()
+}
+
+/// Write a mutable module global (issue #115). The value argument is fully
+/// evaluated before the lock is taken (Rust argument order), so a
+/// right-hand side that reads the same global cannot deadlock.
+#[cfg(feature = "std")]
+pub fn py_global_write<T>(cell: &std::sync::Mutex<T>, value: T) {
+    *cell.lock().unwrap() = value;
+}
+
 /// Python str() of a boxed heterogeneous value (issue #121): ints, floats,
 /// bools and None render as themselves; a str renders UNQUOTED; bytes use
 /// the `b'...'` repr form; tuple elements always render in REPR form

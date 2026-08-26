@@ -201,6 +201,28 @@ impl CodeGen for Module {
             std::collections::HashMap::new();
         count_module_stores(&self.raw.body, &mut module_assign_counts);
 
+        // Issue #115: module-level names written by functions through
+        // `global` lower as MUTABLE statics (`static name: Mutex<T>`).
+        // Reads render as py_global_read(&name); writes in owning scopes
+        // as py_global_write(&name, v). Names that don't qualify keep the
+        // documented write-drop divergence (function_def.rs warns).
+        let global_mutables = module_global_mutable_names(
+            &self.raw.body,
+            &module_assign_counts,
+            &symbols,
+            options.no_std,
+        );
+
+        // Issue #118: MODULE-LEVEL argparse (certifi's __main__.py builds
+        // its parser at top level). The same conversion-time rewrite the
+        // function path runs: parser-building statements vanish, and the
+        // parse_args assignment becomes the typed-namespace destructure
+        // inside __module_init__ (later module-level statements read the
+        // namespace there; functions cannot — a module-init local, loud
+        // in rustc).
+        let module_argparse = crate::ast::tree::function_def::scan_argparse(&self.raw.body)
+            .map_err(|e| wrap_module_error(&module_filename, e))?;
+
         // Classes that participate in an inheritance hierarchy (have a real
         // base, or are used as a base) lower with the trait machinery; every
         // other class stays a plain struct. Computed once so both sides of a
@@ -310,7 +332,15 @@ impl CodeGen for Module {
         // binding, never a shadowing fresh binding (issue #80). The render
         // pass below repeats this classification (cheap); the raw lists
         // drive both the hoisted sets and hoisted_declarations.
-        for s in &self.raw.body {
+        for (stmt_index, s) in self.raw.body.iter().enumerate() {
+            // Issue #118: module-level argparse statements are consumed by
+            // the conversion-time rewrite — the parser statements vanish
+            // and the parse_args assignment is replaced in the emit loop.
+            if let Some(rw) = &module_argparse
+                && (rw.skip.contains(&stmt_index) || stmt_index == rw.parse_index)
+            {
+                continue;
+            }
             if let crate::StatementType::If(if_stmt) = &s.statement {
                 // `if TYPE_CHECKING:` never runs at runtime — skip the
                 // whole block (imports, type-only classes).
@@ -352,6 +382,11 @@ impl CodeGen for Module {
                         && (const_static_type(&a.value).is_some()
                             || is_type_alias_value(&a.value))
                     {
+                        continue;
+                    }
+                    // A mutable static's single module store IS its
+                    // initializer (issue #115) — not a runtime store.
+                    if names.iter().all(|n| global_mutables.contains_key(n)) {
                         continue;
                     }
                 }
@@ -416,6 +451,11 @@ impl CodeGen for Module {
                             // compile-time bindings, not runtime stores: the
                             // Assign codegen handles them (issue #79 family).
                             && !crate::is_rust_bind_call(&a.value)
+                            // The argparse namespace is rewritten into
+                            // __module_init__ (issue #118), never a static.
+                            && !module_argparse
+                                .as_ref()
+                                .is_some_and(|rw| rw.args_var == *n)
                             && function_free_reads.contains(n)
                             // A name ALSO bound by an import (see
                             // module_promoted_static_names): the import owns
@@ -538,6 +578,15 @@ impl CodeGen for Module {
         // every scope rendered below (module init, __main__, functions) sees
         // the set through the cloned options.
         options.promoted_statics = std::rc::Rc::new(promoted_statics.clone());
+        // Issue #115: every scope rendered below sees the mutable statics
+        // (reads render py_global_read); MODULE scope owns all of them for
+        // writes (module init and the __main__ body are module scope —
+        // no `global` needed there). Function scopes re-narrow
+        // scope_global_writables to their own `global` declarations
+        // (function_def.rs).
+        options.mutable_statics = std::rc::Rc::new(global_mutables.clone());
+        options.scope_global_writables =
+            std::rc::Rc::new(global_mutables.keys().cloned().collect());
 
         // Module-level code gets no per-function analysis pass, so run the
         // same type inference / empty-container pinning here: without it,
@@ -594,7 +643,28 @@ impl CodeGen for Module {
         let mut pending_docstring = self.get_module_docstring().is_some()
             && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
         let mut seen_non_doc_statement = false;
-        for s in self.raw.body {
+        for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
+            // Issue #118: module-level argparse. Parser-building statements
+            // vanish; the parse_args assignment becomes the typed-namespace
+            // destructure inside __module_init__, at its original position.
+            if let Some(rw) = &module_argparse {
+                if rw.skip.contains(&stmt_index) {
+                    continue;
+                }
+                if stmt_index == rw.parse_index {
+                    let args_ident = crate::safe_ident(&rw.args_var);
+                    let tokens = crate::ast::tree::function_def::lower_parse_args(
+                        rw, &ctx, &options, &symbols,
+                    )
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    module_init_stmts.push(quote! {
+                        let #args_ident;
+                        #tokens
+                    });
+                    has_module_init_code = true;
+                    continue;
+                }
+            }
             if pending_docstring
                 && matches!(
                     &s.statement,
@@ -828,6 +898,38 @@ impl CodeGen for Module {
                             .to_rust(ctx.clone(), options.clone(), symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?,
                     );
+                    continue;
+                }
+                // Issue #115: a `global`-written module value becomes a
+                // MUTABLE static — `static name: Mutex<T>` with the single
+                // module store as its initializer. `Mutex::new` is const,
+                // and the initializer is a literal, so no LazyLock or
+                // module-init ordering is involved. Reads everywhere render
+                // as py_global_read(&name); writes in owning scopes as
+                // py_global_write(&name, v).
+                if let [crate::ExprType::Name(target)] = a.targets.as_slice()
+                    && let Some(boxed) = global_mutables.get(&target.id)
+                {
+                    let ident = crate::safe_ident(&target.id);
+                    if *boxed {
+                        stream.extend(quote! {
+                            pub static #ident: std::sync::Mutex<stdpython::PyValue> =
+                                std::sync::Mutex::new(stdpython::PyValue::None_);
+                        });
+                    } else {
+                        // Eligibility guarantees a const scalar literal.
+                        let ty = const_static_type(&a.value)
+                            .expect("mutable static initializer must be a const scalar");
+                        let value = a.value.clone().to_rust(
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?;
+                        stream.extend(quote! {
+                            pub static #ident: std::sync::Mutex<#ty> =
+                                std::sync::Mutex::new(#value);
+                        });
+                    }
                     continue;
                 }
                 if let Some(names) = assign_name_targets(a) {
@@ -1812,6 +1914,11 @@ pub(crate) fn module_promoted_static_names(
     count_module_stores(&module.raw.body, &mut counts);
     let free_reads = module_function_free_reads(&module.raw.body);
     let sibling = sibling_imported_names(&target);
+    // Issue #115: names written by functions through `global` are MUTABLE
+    // statics (Mutex), never immutable LazyLock promotions — an immutable
+    // promotion would freeze the initial value. (Function-bound names are
+    // already absent from free_reads; this guards the sibling-import path.)
+    let (global_written, _) = module_global_write_sets(&module.raw.body);
     let symbols = (**module).clone().find_symbols(crate::SymbolTableScopes::new());
     let mut names = std::collections::HashSet::new();
     // Module-level name → the module-level names its INITIALIZER reads.
@@ -1886,6 +1993,7 @@ pub(crate) fn module_promoted_static_names(
                         && const_static_type(&a.value).is_none()
                         && !is_type_alias_value(&a.value)
                         && !crate::is_rust_bind_call(&a.value)
+                        && !global_written.contains(n)
                         && (free_reads.contains(n) || sibling.contains(n))
                         // A name ALSO bound by an import (`SSLTransport =
                         // None` then `from .ssltransport import
@@ -2102,6 +2210,257 @@ fn module_package_path_from_defs(
     } else {
         path[..path.len().saturating_sub(1)].to_vec()
     }
+}
+
+/// Issue #115: per-function-scope `global` accounting over every function
+/// scope in the module (module-level defs, methods, nested defs). Returns
+/// `(global_written, bound_without_global)`:
+/// - `global_written`: names declared `global` in some function scope AND
+///   bound there — the writes the mutable-static lowering must carry;
+/// - `bound_without_global`: names bound in some function scope —
+///   parameters included — WITHOUT a `global` declaration in that scope.
+///   Such a binding is a plain local; a module global sharing the name is
+///   shadowed there, so the name is disqualified from the mutable-static
+///   lowering (a bare read must never mistake the local for the global).
+pub(crate) fn module_global_write_sets(
+    body: &[crate::Statement],
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    // Names BOUND by a target expression (assign/for/with targets): plain
+    // names and every name inside a destructuring tuple/list.
+    fn bind_target(e: &crate::ExprType, out: &mut std::collections::HashSet<String>) {
+        match e {
+            crate::ExprType::Name(n) => {
+                out.insert(n.id.clone());
+            }
+            crate::ExprType::Tuple(t) => {
+                for elt in &t.elts {
+                    bind_target(elt, out);
+                }
+            }
+            crate::ExprType::List(l) => {
+                for elt in l {
+                    bind_target(elt, out);
+                }
+            }
+            crate::ExprType::Starred(s) => bind_target(&s.value, out),
+            _ => {}
+        }
+    }
+
+    // One FUNCTION scope: its `global` declarations and bound names,
+    // through control flow but NOT into nested defs (each def is its own
+    // scope, visited separately by the outer walk).
+    fn scan_scope(
+        stmts: &[crate::Statement],
+        globals: &mut std::collections::HashSet<String>,
+        bound: &mut std::collections::HashSet<String>,
+    ) {
+        use crate::StatementType as ST;
+        for s in stmts {
+            match &s.statement {
+                ST::Global(names) => globals.extend(names.iter().cloned()),
+                ST::Assign(a) => {
+                    for t in &a.targets {
+                        bind_target(t, bound);
+                    }
+                }
+                ST::AugAssign(a) => bind_target(&a.target, bound),
+                ST::AnnotatedName { name, .. } => {
+                    bound.insert(name.clone());
+                }
+                ST::For(f) => {
+                    bind_target(&f.target, bound);
+                    scan_scope(&f.body, globals, bound);
+                    scan_scope(&f.orelse, globals, bound);
+                }
+                ST::AsyncFor(f) => {
+                    bind_target(&f.target, bound);
+                    scan_scope(&f.body, globals, bound);
+                    scan_scope(&f.orelse, globals, bound);
+                }
+                ST::While(w) => {
+                    scan_scope(&w.body, globals, bound);
+                    scan_scope(&w.orelse, globals, bound);
+                }
+                ST::If(i) => {
+                    scan_scope(&i.body, globals, bound);
+                    scan_scope(&i.orelse, globals, bound);
+                }
+                ST::Try(t) => {
+                    scan_scope(&t.body, globals, bound);
+                    for h in &t.handlers {
+                        if let Some(n) = &h.name {
+                            bound.insert(n.clone());
+                        }
+                        scan_scope(&h.body, globals, bound);
+                    }
+                    scan_scope(&t.orelse, globals, bound);
+                    scan_scope(&t.finalbody, globals, bound);
+                }
+                ST::With(w) => {
+                    for item in &w.items {
+                        if let Some(v) = &item.optional_vars {
+                            bind_target(v, bound);
+                        }
+                    }
+                    scan_scope(&w.body, globals, bound);
+                }
+                ST::AsyncWith(w) => {
+                    for item in &w.items {
+                        if let Some(v) = &item.optional_vars {
+                            bind_target(v, bound);
+                        }
+                    }
+                    scan_scope(&w.body, globals, bound);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Visit every function scope anywhere in the module (top-level defs,
+    // class methods, nested defs, defs under module-level control flow).
+    fn visit_defs(
+        stmts: &[crate::Statement],
+        global_written: &mut std::collections::HashSet<String>,
+        bound_without_global: &mut std::collections::HashSet<String>,
+    ) {
+        use crate::StatementType as ST;
+        for s in stmts {
+            let f = match &s.statement {
+                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => f,
+                ST::ClassDef(c) => {
+                    visit_defs(&c.body, global_written, bound_without_global);
+                    continue;
+                }
+                ST::If(i) => {
+                    visit_defs(&i.body, global_written, bound_without_global);
+                    visit_defs(&i.orelse, global_written, bound_without_global);
+                    continue;
+                }
+                ST::Try(t) => {
+                    visit_defs(&t.body, global_written, bound_without_global);
+                    for h in &t.handlers {
+                        visit_defs(&h.body, global_written, bound_without_global);
+                    }
+                    visit_defs(&t.orelse, global_written, bound_without_global);
+                    visit_defs(&t.finalbody, global_written, bound_without_global);
+                    continue;
+                }
+                ST::For(f) => {
+                    visit_defs(&f.body, global_written, bound_without_global);
+                    visit_defs(&f.orelse, global_written, bound_without_global);
+                    continue;
+                }
+                ST::While(w) => {
+                    visit_defs(&w.body, global_written, bound_without_global);
+                    visit_defs(&w.orelse, global_written, bound_without_global);
+                    continue;
+                }
+                ST::With(w) => {
+                    visit_defs(&w.body, global_written, bound_without_global);
+                    continue;
+                }
+                ST::AsyncWith(w) => {
+                    visit_defs(&w.body, global_written, bound_without_global);
+                    continue;
+                }
+                _ => continue,
+            };
+            let mut globals = std::collections::HashSet::new();
+            let mut bound = std::collections::HashSet::new();
+            for p in f
+                .args
+                .args
+                .iter()
+                .chain(f.args.posonlyargs.iter())
+                .chain(f.args.kwonlyargs.iter())
+                .chain(f.args.vararg.iter())
+                .chain(f.args.kwarg.iter())
+            {
+                bound.insert(p.arg.clone());
+            }
+            scan_scope(&f.body, &mut globals, &mut bound);
+            for n in &bound {
+                if globals.contains(n) {
+                    global_written.insert(n.clone());
+                } else {
+                    bound_without_global.insert(n.clone());
+                }
+            }
+            // Nested defs inside this function are their own scopes.
+            visit_defs(&f.body, global_written, bound_without_global);
+        }
+    }
+
+    let mut global_written = std::collections::HashSet::new();
+    let mut bound_without_global = std::collections::HashSet::new();
+    visit_defs(body, &mut global_written, &mut bound_without_global);
+    (global_written, bound_without_global)
+}
+
+/// Issue #115: the module-level names lowered as MUTABLE statics
+/// (`static name: Mutex<T>`), mapped to boxedness (true =
+/// `Mutex<stdpython::PyValue>`, false = a concrete scalar Mutex). A name
+/// qualifies when a function writes it through `global`, it is never
+/// bound as a plain local anywhere (parameters included), it has exactly
+/// one module-level store, and that store is a `None` literal (boxed) or
+/// an int/float/bool literal (concrete). Everything else — string
+/// initializers, computed initializers, conditional stores, the no_std
+/// profile (Mutex is std) — keeps the documented write-drop divergence.
+pub(crate) fn module_global_mutable_names(
+    body: &[crate::Statement],
+    module_assign_counts: &std::collections::HashMap<String, usize>,
+    symbols: &crate::SymbolTableScopes,
+    no_std: bool,
+) -> std::collections::HashMap<String, bool> {
+    let mut out = std::collections::HashMap::new();
+    if no_std {
+        return out;
+    }
+    let (global_written, bound_without_global) = module_global_write_sets(body);
+    if global_written.is_empty() {
+        return out;
+    }
+    for s in body {
+        let crate::StatementType::Assign(a) = &s.statement else {
+            continue;
+        };
+        // Single-target stores only: a chained `a = b = 0` couples two
+        // names to one statement — out of scope for the mutable lowering.
+        let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+            continue;
+        };
+        if !global_written.contains(&n.id)
+            || bound_without_global.contains(&n.id)
+            || module_assign_counts.get(&n.id) != Some(&1)
+        {
+            continue;
+        }
+        // The import owns import-bound names (see the promotion pass).
+        if matches!(
+            symbols.get(&n.id),
+            Some(crate::SymbolTableNode::ImportFrom(_)) | Some(crate::SymbolTableNode::Import(_))
+        ) {
+            continue;
+        }
+        let boxed = if crate::is_none_expr(&a.value) {
+            true
+        } else {
+            match const_static_type(&a.value) {
+                // Strings would need a LazyLock<Mutex<String>> (String::from
+                // is not const) — out of scope for now; they keep the
+                // write-drop divergence.
+                Some(ty) if ty.to_string() != quote!(&'static str).to_string() => false,
+                _ => continue,
+            }
+        };
+        out.insert(n.id.clone(), boxed);
+    }
+    out
 }
 
 /// Names READ as free variables inside function bodies anywhere in the

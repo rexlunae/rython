@@ -357,6 +357,22 @@ pub struct PythonOptions {
     /// Name reads of these render as `(*name).clone()` — a static does not
     /// auto-deref in value/borrow position, only as a method receiver.
     pub promoted_statics: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Issue #115: module-level names WRITTEN by functions through
+    /// `global`, lowered as MUTABLE statics (`static name: Mutex<T>`).
+    /// Maps the name to its boxedness: true = `Mutex<stdpython::PyValue>`
+    /// (a None-initialized value), false = a concrete scalar Mutex
+    /// (i64/f64/bool from the module store's literal). Reads render as
+    /// `py_global_read(&name)` everywhere; writes render as
+    /// `py_global_write(&name, v)` in scopes that own the module binding
+    /// (see `scope_global_writables`). Set by the module generator.
+    pub mutable_statics: std::rc::Rc<std::collections::HashMap<String, bool>>,
+    /// The subset of `mutable_statics` the CURRENT scope may write: every
+    /// one of them at module scope (module init / `__main__` body); inside
+    /// a function, exactly the names its `global` statements declare — an
+    /// assignment to the name in a function WITHOUT the declaration is a
+    /// plain local, as in Python. Set per scope by the function/module
+    /// generators.
+    pub scope_global_writables: std::rc::Rc<std::collections::HashSet<String>>,
     /// Callable names whose VALUE reads box to the boxed None: dropped
     /// nested functions (`hash_utf8 = sha256_utf8` — requests' auth) and
     /// `type`-annotated callable parameters. Distinct from `called_params`
@@ -478,6 +494,8 @@ impl Default for PythonOptions {
             hoisted_names: std::rc::Rc::new(std::collections::HashSet::new()),
             leaked_loop_targets: std::rc::Rc::new(std::collections::HashSet::new()),
             promoted_statics: std::rc::Rc::new(std::collections::HashSet::new()),
+            mutable_statics: std::rc::Rc::new(std::collections::HashMap::new()),
+            scope_global_writables: std::rc::Rc::new(std::collections::HashSet::new()),
             value_callables: std::rc::Rc::new(std::collections::HashSet::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
