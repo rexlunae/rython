@@ -142,7 +142,7 @@ Known gaps:
 - **Dynamic typing**: variables keep one type; heterogeneous lists and
   reassigning a name to a different type don't convert.
 - **Language features**: generators/`yield`, `async`/`await`,
-  `eval`/`exec`, `*args`/`**kwargs`, multiple inheritance and dunder
+  `eval`/`exec`, multiple inheritance and dunder
   protocols are not supported yet. Decorators are handled through a
   single systematic registry (decorator.rs) — like Rust's built-in
   attributes, rython consumes the decorator expression at conversion
@@ -174,10 +174,12 @@ Each is a deliberate boundary of rython's static, value-semantics model —
 a loud conversion error or build-time type error at the exact Python
 line, never a silent behaviour change:
 
-- **`*args`/`**kwargs` (variadic parameters)** — `def __init__(self,
-  num_pools=10, **connection_pool_kwargs)` is a loud error. Blocks
-  urllib3's `PoolManager` (and everything that depends on urllib3,
-  including botocore/boto3) and s3transfer's callback helpers.
+- **`*args`/`**kwargs` (variadic parameters)** — module functions box
+  them (`*args` → `Vec<PyValue>`, `**kwargs` → `PyDict<String,
+  PyValue>`, issue #120): call sites pack the extras, `f(*args)`
+  forwards, and bodies read them as ordinary containers of boxed
+  values. Methods/`__init__` with variadics (urllib3's `PoolManager`)
+  keep per-site handling and can still error loudly.
 - **Heterogeneous unions** — a parameter/field annotated with a union
   whose members map to different Rust types (`str | bytes`,
   `str | bytes | int | float`) has no single Rust type. The common

@@ -8663,3 +8663,45 @@ fn iter_sentinel_outside_a_for_loop_is_loud() {
     assert!(err.contains("for-loop iterable"), "err: {err}");
     assert!(err.contains("issue #155"), "err: {err}");
 }
+
+// ---- Variadic parameters (issue #120) ----
+
+#[test]
+fn varargs_lower_to_a_boxed_vector() {
+    // Issue #120: `*args` is Vec<PyValue>; extras box at the call site,
+    // an empty call still passes the vector, and `f(*args)` forwards it.
+    let out = compile(
+        concat!(
+            "def tag(*args) -> int:\n",
+            "    return len(args)\n",
+            "def fwd(*args) -> int:\n",
+            "    return tag(*args)\n",
+            "def run() -> int:\n",
+            "    return tag(1, \"x\") + tag() + fwd(True)\n",
+        ),
+        "varargs.py",
+    );
+    assert!(
+        out.contains("args : Vec < stdpython :: PyValue >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+    assert!(out.contains("tag (vec ! [])"), "generated: {}", out);
+    assert!(out.contains("__rython_varargs"), "generated: {}", out);
+}
+
+#[test]
+fn keyword_to_pure_varargs_callee_is_a_python_type_error() {
+    // Python raises TypeError for `f(x=1)` when f takes only *args; the
+    // conversion reports the same shape loudly.
+    let err = compile_err(
+        concat!(
+            "def f(*args) -> int:\n",
+            "    return len(args)\n",
+            "f(x=1)\n",
+        ),
+        "vakw.py",
+    );
+    assert!(err.contains("unexpected keyword argument"), "err: {err}");
+}

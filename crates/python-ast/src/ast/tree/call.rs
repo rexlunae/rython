@@ -6072,14 +6072,16 @@ impl<'a> CodeGen for Call {
                         .as_deref()
                         .is_some_and(crate::is_optional_annotation)
                 });
-            // A **kwargs callee always routes through map_call_arguments,
-            // which appends the boxed kwargs dict (issue #120).
+            // A **kwargs or *args callee always routes through
+            // map_call_arguments, which packs the extras into the boxed
+            // PyDict / Vec<PyValue> (issue #120).
             let needs_mapping = !self.keywords.is_empty()
                 || !callee_def.args.kwonlyargs.is_empty()
                 || self.args.len() < pos_param_count
                 || has_optional_params
-                || callee_def.args.kwarg.is_some();
-            if !callee_def.args.vararg.is_some() && needs_mapping {
+                || callee_def.args.kwarg.is_some()
+                || callee_def.args.vararg.is_some();
+            if needs_mapping {
                 let MappedArguments { prelude, args } = map_call_arguments(
                     callee_def,
                     &self.args,
@@ -6101,21 +6103,6 @@ impl<'a> CodeGen for Call {
                 } else {
                     call
                 });
-            }
-            // A *args callee called with keywords: if it ALSO takes
-            // **kwargs (a fallback stub like requests' SOCKSProxyManager
-            // `def f(*args, **kwargs): raise ...`), the keywords lower
-            // positionally below; only a pure *args signature is loud.
-            if !callee_def.args.vararg.is_none()
-                && callee_def.args.kwarg.is_none()
-                && !self.keywords.is_empty()
-            {
-                return Err(format!(
-                    "keyword arguments in a call to `{}` are not supported yet: \
-                     its signature takes *args",
-                    callee_def.name
-                )
-                .into());
             }
         } else if !self.keywords.is_empty() {
             // An unknown callee. A name that exists as a Python variable
@@ -7818,36 +7805,47 @@ fn map_call_arguments_inner(
     let mut slot_temp: Vec<Option<usize>> = vec![None; total];
 
     let mut slots: Vec<Option<TokenStream>> = vec![None; n];
-    let mut vararg_slot: Option<TokenStream> = None;
-    let mut vararg_temp: Option<usize> = None;
+    // Issue #120: extra positionals for a *args callee, boxed one by one
+    // (PyValue-yielding values pass through), plus `*t` spreads forwarded
+    // into the vector in source order. Each records its eval_order index
+    // so the keyword-reorder path can reference the temps.
+    let mut vararg_extras: Vec<(usize, TokenStream, bool)> = Vec::new(); // (temp, value, is_spread)
     // `*t` positional spreads and `**d` keyword spreads collected
     // separately: only the POSITIONAL spreads can fill missing params.
     let mut spreads: Vec<TokenStream> = Vec::new();
     let mut kw_spreads: Vec<TokenStream> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
-        // A `*t` SPREAD argument (`build_netloc(*host_port)` — pip's
-        // package_finder): the tuple's elements cannot be unpacked
-        // statically — the spread value fills each missing positional
-        // parameter (the spread-argument divergence).
+        // A `*t` SPREAD argument. To a *args callee it FORWARDS into the
+        // vararg vector (`g(*args)` passthrough — the elements box via
+        // PyValue::from, an identity for an already-boxed Vec<PyValue>).
+        // Otherwise (`build_netloc(*host_port)` — pip's package_finder)
+        // the elements cannot be unpacked statically — the spread value
+        // fills each missing positional parameter (the spread-argument
+        // divergence).
         if let ExprType::Starred(st) = arg {
             let value = st
                 .value
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             eval_order.push(value.clone());
-            spreads.push(value);
+            if vararg_param.is_some() && i >= n {
+                vararg_extras.push((eval_order.len() - 1, value, true));
+            } else {
+                spreads.push(value);
+            }
             continue;
         }
         if i >= n {
-            // Extra positionals collect into the *args slot.
-            let value = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // Extra positionals collect into the *args slot, boxed.
+            let value = crate::render_typed(
+                arg,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(crate::TypeInfo::PyValue),
+            )?;
             eval_order.push(value.clone());
-            vararg_slot = Some(if let Some(existing) = &vararg_slot {
-                quote!(vec![#existing, #value])
-            } else {
-                quote!(vec![#value])
-            });
-            vararg_temp = Some(eval_order.len() - 1);
+            vararg_extras.push((eval_order.len() - 1, value, false));
             continue;
         }
         let value = fill(pos_params[i], arg)?;
@@ -8051,14 +8049,42 @@ fn map_call_arguments_inner(
         }
     }
 
+    // Issue #120: the *args vector — plain extras as vec![..] elements,
+    // spreads extended in source order (PyValue::from is the identity for
+    // an already-boxed forwarded Vec<PyValue>). Empty when the call has
+    // no extras: the callee's parameter still needs its vector.
+    let build_vararg = |items: &[(TokenStream, bool)]| -> TokenStream {
+        if items.iter().all(|(_, is_spread)| !is_spread) {
+            let vals: Vec<&TokenStream> = items.iter().map(|(v, _)| v).collect();
+            quote!(vec![#(#vals),*])
+        } else {
+            let mut stmts =
+                quote!(let mut __rython_varargs: Vec<stdpython::PyValue> = Vec::new(););
+            for (v, is_spread) in items {
+                if *is_spread {
+                    stmts.extend(quote!(__rython_varargs.extend(
+                        (#v).into_iter().map(stdpython::PyValue::from)
+                    );));
+                } else {
+                    stmts.extend(quote!(__rython_varargs.push(#v);));
+                }
+            }
+            quote!({ #stmts __rython_varargs })
+        }
+    };
+
     let mut final_slots: Vec<TokenStream> = Vec::with_capacity(total);
     for s in slots.into_iter() {
         final_slots.push(s.expect("all argument slots filled"));
     }
     // The *args slot (collected extra positionals) sits between the
     // positional params and the keyword-only params.
-    if let Some(v) = vararg_slot {
-        final_slots.push(v);
+    if vararg_param.is_some() {
+        let items: Vec<(TokenStream, bool)> = vararg_extras
+            .iter()
+            .map(|(_, v, s)| (v.clone(), *s))
+            .collect();
+        final_slots.push(build_vararg(&items));
     }
     for s in kwonly_slots {
         final_slots.push(s.expect("all argument slots filled"));
@@ -8124,11 +8150,17 @@ fn map_call_arguments_inner(
             None => final_slots[i].clone(),
         })
         .collect();
-    // The *args slot references its prelude temp (collected extra
-    // positionals were bound to the last eval_order temp).
-    if let Some(ti) = vararg_temp {
-        let tid = format_ident!("__rython_arg_{}", ti);
-        args.push(quote!(#tid));
+    // The *args vector references its prelude temps (each collected
+    // extra was bound in source order).
+    if vararg_param.is_some() {
+        let items: Vec<(TokenStream, bool)> = vararg_extras
+            .iter()
+            .map(|(ti, _, s)| {
+                let tid = format_ident!("__rython_arg_{}", ti);
+                (quote!(#tid), *s)
+            })
+            .collect();
+        args.push(build_vararg(&items));
     }
     if let Some(kw) = &kw_expr {
         args.push(kw.clone());

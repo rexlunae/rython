@@ -6191,3 +6191,61 @@ fn iter_sentinel_form_matches_python_at_runtime() {
         "iter(callable, sentinel) semantics diverged from CPython"
     );
 }
+
+#[test]
+fn varargs_pack_forward_and_index_match_python_at_runtime() {
+    // Issue #120: `*args` is the boxed heterogeneous list (Vec<PyValue>).
+    // Call sites pack extra positionals boxed; `f(*args)` forwards the
+    // vector; len/index work in the body; a `*args, **kwargs` stub takes
+    // extra keywords into its dict.
+    let scratch = Scratch::new("varargs");
+    let file = scratch.path().join("varargs.py");
+    fs::write(
+        &file,
+        concat!(
+            "def tag(*args) -> int:\n",
+            "    return len(args)\n",
+            "\n",
+            "def fwd(*args) -> int:\n",
+            "    return tag(*args)\n",
+            "\n",
+            "def first(prefix: str, *args) -> str:\n",
+            "    if len(args) > 0:\n",
+            "        return prefix + str(args[0])\n",
+            "    return prefix\n",
+            "\n",
+            "def stub(*args, **kwargs) -> int:\n",
+            "    return len(args) + len(kwargs)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(tag(1, \"x\", True))\n",
+            "    print(fwd(1, \"x\"))\n",
+            "    print(tag())\n",
+            "    print(first(\"v=\"))\n",
+            "    print(first(\"v=\", 7, 8))\n",
+            "    print(stub(1, 2, x=3))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/varargs"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["3", "2", "0", "v=", "v=7", "3"],
+        "*args semantics diverged from CPython"
+    );
+}

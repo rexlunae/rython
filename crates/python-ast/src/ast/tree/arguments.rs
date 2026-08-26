@@ -649,10 +649,14 @@ impl CodeGen for Arguments {
             params.push(param);
         }
         
-        // Process *args
+        // Process *args (issue #120): a boxed heterogeneous list —
+        // callers pack extra positional arguments into PyValue::from
+        // values (mirroring **kwargs below). The body reads it like any
+        // list: len/index/iterate yield PyValue, and `callee(*args)`
+        // forwards the vector.
         if let Some(vararg) = self.vararg {
             let vararg_name = crate::safe_ident(&vararg.arg);
-            params.push(quote!(#vararg_name: impl IntoIterator<Item = impl Into<PyObject>>));
+            params.push(quote!(#vararg_name: Vec<stdpython::PyValue>));
         }
         
         // Process keyword-only arguments. Like positional defaults above,

@@ -415,11 +415,20 @@ conversion time:
   unknown callee are a loud error. (Keyword `replace()` on the datetime
   family is special-cased in the runtime.)
 
-`*args`/`**kwargs` are effectively unsupported: signatures containing
-them generate uncallable parameter types, and every concrete use site
-(calls with `**kwargs`, keyword calls against such signatures,
-`__init__`/methods/`lru_cache` with them) is rejected loudly. Starred
-unpacking `f(*xs)` is likewise a loud error.
+`*args`/`**kwargs` on module functions lower to the boxed heterogeneous
+containers (issue #120): `*args` is `Vec<stdpython::PyValue>` and
+`**kwargs` is `PyDict<String, stdpython::PyValue>`. Call sites with a
+known callee pack the extras boxed (`PyValue::from` per value; a call
+with none still passes the empty container), `f(*args)` forwards the
+vector, and the body reads them like any list/dict (len, indexing,
+iteration, membership — elements are `PyValue`, narrowed by isinstance
+where a concrete type is needed; arithmetic directly on an un-narrowed
+element fails in rustc). A keyword argument that matches no parameter of
+a callee without `**kwargs` is a loud error, as in Python. Methods and
+`__init__` with variadic parameters keep their existing per-site
+handling; a `*t` spread to a NON-variadic callee still fills missing
+positional parameters with the spread value (the spread-argument
+divergence).
 
 ### 6.3 Decorators
 
