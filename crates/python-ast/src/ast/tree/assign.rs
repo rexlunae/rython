@@ -709,23 +709,46 @@ impl<'a> CodeGen for Assign {
                         (#receiver).py_set_index(#index, __rython_val)?;
                     }))
                 }
-                crate::SubscriptKind::Slice { .. } => {
-                    // Slice assignment (`memoryview(byte_obj)[0:n] =
-                    // subarray` — urllib3's emscripten fetch loop; `xs[a:b]
-                    // = [...]`) replaces a range in place in Python —
-                    // different-length RHS inserts or removes elements.
-                    // rython has no range-replace lowering, and dropping
-                    // the statement would silently leave the container
-                    // untouched: loud conversion error naming the working
-                    // rebuild (read-side slices ARE supported).
-                    return Err(format!(
-                        "slice assignment to `{:?}[a:b]` is not supported: rython has \
-                         no range-replace lowering, and skipping it would silently keep \
-                         the container unchanged; rebuild the container instead \
-                         (`xs = xs[:a] + replacement + xs[b:]`)",
-                        sub.value
-                    )
-                    .into());
+                crate::SubscriptKind::Slice { lower, upper, step } => {
+                    // Slice assignment `xs[a:b] = R` (issue #153: pip's
+                    // cmdoptions, urllib3's fetch loop) replaces the range
+                    // IN PLACE — a different-length RHS inserts or removes
+                    // elements, bounds clamp, negatives count from the end.
+                    // The runtime's py_splice is CPython-exact for step-1
+                    // slices; an EXTENDED slice (`xs[a:b:2] = R`, which
+                    // Python only accepts for equal lengths) stays a loud
+                    // error.
+                    if step.is_some() {
+                        return Err(
+                            "slice assignment with a step (`xs[a:b:s] = ...`) is not \
+                             supported; assign to the step-1 slice or rebuild the \
+                             container"
+                                .to_string()
+                                .into(),
+                        );
+                    }
+                    let bound = |b: &Option<Box<ExprType>>| -> Result<
+                        TokenStream,
+                        Box<dyn std::error::Error>,
+                    > {
+                        Ok(match b {
+                            None => quote!(None),
+                            Some(e) => {
+                                let t = e.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                quote!(Some((#t) as i64))
+                            }
+                        })
+                    };
+                    let lo = bound(lower)?;
+                    let hi = bound(upper)?;
+                    Ok(quote!({
+                        let __rython_val = #value;
+                        py_splice(&mut (#receiver), #lo, #hi, __rython_val);
+                    }))
                 }
             }
         };

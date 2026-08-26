@@ -1613,6 +1613,15 @@ impl FunctionDef {
                         Box::new(crate::TypeInfo::PyValue),
                     ));
             }
+            // Issue #120: the *args parameter is the boxed heterogeneous
+            // list (`Vec<PyValue>`): extra positional arguments pack into
+            // it at call sites; len/index/iterate yield PyValue.
+            if let Some(vararg) = &self.args.vararg {
+                info.name_types.insert(
+                    vararg.arg.clone(),
+                    crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+                );
+            }
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);

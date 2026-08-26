@@ -2669,33 +2669,32 @@ fn del_full_slice_clears_in_place() {
 }
 
 #[test]
-fn bounded_slice_delete_is_a_loud_error() {
-    // Python: `del xs[1:3]` on [1,2,3,4] leaves [1,4]. rython has no
-    // range removal, and dropping the statement would silently keep the
-    // elements — loud conversion error naming the working rebuild.
-    let err = compile_err("xs = [1, 2, 3, 4]\ndel xs[1:3]\n", "bounedel.py");
-    assert!(
-        err.contains("`del` with a bounded slice target"),
-        "err: {err}"
-    );
-    assert!(err.contains("xs = xs[:start] + xs[end:]"), "err: {err}");
+fn bounded_slice_delete_lowers_to_py_del_range() {
+    // Issue #153: `del xs[1:3]` on [1,2,3,4] leaves [1,4] — the runtime's
+    // py_del_range removes the range in place (bounds clamp, negatives
+    // count from the end). A STEPPED slice delete stays loud.
+    let out = compile("xs = [1, 2, 3, 4]\ndel xs[1:3]\n", "bounedel.py");
+    assert!(out.contains("py_del_range"), "generated: {}", out);
+    let err = compile_err("xs = [1, 2, 3, 4]\ndel xs[0:4:2]\n", "stepdel.py");
+    assert!(err.contains("stepped slice"), "err: {err}");
 }
 
 #[test]
-fn slice_assignment_is_a_loud_error() {
-    // Python: `xs[1:3] = []` on [1,2,3,4] leaves [1,4] — range-replace
-    // with a different-length RHS inserts/removes. Dropping it would
-    // silently leave the container untouched — loud error naming the
-    // supported rebuild instead.
-    let err = compile_err("xs = [1, 2, 3, 4]\nxs[1:3] = []\n", "sliceassign.py");
+fn slice_assignment_lowers_to_py_splice() {
+    // Issue #153: `xs[1:3] = R` replaces the range in place — a
+    // different-length RHS inserts or removes elements (pip's
+    // cmdoptions). Open bounds pass None; a STEPPED slice assignment
+    // stays loud.
+    let out = compile("xs = [1, 2, 3, 4]\nxs[1:3] = [9]\n", "sliceassign.py");
+    assert!(out.contains("py_splice"), "generated: {}", out);
+    let out = compile("xs = [1, 2, 3, 4]\nxs[2:] = [7, 8]\n", "sliceopen.py");
     assert!(
-        err.contains("slice assignment to"),
-        "err: {err}"
+        out.contains("py_splice") && out.contains("None"),
+        "generated: {}",
+        out
     );
-    assert!(
-        err.contains("rebuild the container instead"),
-        "err: {err}"
-    );
+    let err = compile_err("xs = [1, 2, 3, 4]\nxs[0:4:2] = [7, 8]\n", "stepassign.py");
+    assert!(err.contains("slice assignment with a step"), "err: {err}");
 }
 
 #[test]
@@ -8625,4 +8624,84 @@ fn global_shadowed_by_a_plain_local_disqualifies_the_static() {
         "the unsupported write must still warn: {:?}",
         warnings
     );
+}
+
+#[test]
+fn deepcopy_memo_kwarg_is_dropped_with_a_warning() {
+    // Issue #154: copy.deepcopy(x, memo=...) — boto3's dynamodb transform
+    // passes a forgetful memo dict. rython's value semantics already copy
+    // everything fresh, so the kwarg drops with a -W note instead of the
+    // unexpected-keyword error.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import copy\n",
+            "def f(params: dict[str, int]) -> dict[str, int]:\n",
+            "    return copy.deepcopy(params, memo={})\n",
+        ),
+        "dc_memo.py",
+    );
+    assert!(out.contains("copy :: deepcopy"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("deepcopy(memo=...)")),
+        "the dropped memo must be reported through -W: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn iter_sentinel_outside_a_for_loop_is_loud() {
+    // Issue #155: the two-argument iter() lowers only in for-loop
+    // iterable position; a bare value would need an iterator object.
+    let err = compile_err(
+        concat!(
+            "def f() -> str:\n",
+            "    return \"\"\n",
+            "it = iter(f, \"\")\n",
+        ),
+        "itersent_bare.py",
+    );
+    assert!(err.contains("for-loop iterable"), "err: {err}");
+    assert!(err.contains("issue #155"), "err: {err}");
+}
+
+// ---- Variadic parameters (issue #120) ----
+
+#[test]
+fn varargs_lower_to_a_boxed_vector() {
+    // Issue #120: `*args` is Vec<PyValue>; extras box at the call site,
+    // an empty call still passes the vector, and `f(*args)` forwards it.
+    let out = compile(
+        concat!(
+            "def tag(*args) -> int:\n",
+            "    return len(args)\n",
+            "def fwd(*args) -> int:\n",
+            "    return tag(*args)\n",
+            "def run() -> int:\n",
+            "    return tag(1, \"x\") + tag() + fwd(True)\n",
+        ),
+        "varargs.py",
+    );
+    assert!(
+        out.contains("args : Vec < stdpython :: PyValue >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+    assert!(out.contains("tag (vec ! [])"), "generated: {}", out);
+    assert!(out.contains("__rython_varargs"), "generated: {}", out);
+}
+
+#[test]
+fn keyword_to_pure_varargs_callee_is_a_python_type_error() {
+    // Python raises TypeError for `f(x=1)` when f takes only *args; the
+    // conversion reports the same shape loudly.
+    let err = compile_err(
+        concat!(
+            "def f(*args) -> int:\n",
+            "    return len(args)\n",
+            "f(x=1)\n",
+        ),
+        "vakw.py",
+    );
+    assert!(err.contains("unexpected keyword argument"), "err: {err}");
 }

@@ -275,8 +275,13 @@ Indexing goes through checked helpers that raise
 key with Rust's `Debug` quoting (`KeyError: "name"`) where CPython uses
 repr quoting (`KeyError: 'name'`) — a message-shape divergence on the
 ledger (§12.3). Negative indices and slice *reads* follow Python
-semantics. Slice **assignment** (`x[a:b] = …`) and augmented assignment
-to a slice are loud errors.
+semantics. Slice **assignment** `xs[a:b] = R` and **range delete**
+`del xs[a:b]` on lists replace/remove the range in place with CPython's
+exact bound rules (issue #153): a different-length RHS inserts or
+removes elements, an inverted range is an insertion point, negatives
+count from the end, out-of-range bounds clamp. Stepped forms
+(`xs[a:b:s] = …`, `del xs[a:b:s]`) and augmented assignment to a slice
+are loud errors.
 
 ---
 
@@ -410,11 +415,20 @@ conversion time:
   unknown callee are a loud error. (Keyword `replace()` on the datetime
   family is special-cased in the runtime.)
 
-`*args`/`**kwargs` are effectively unsupported: signatures containing
-them generate uncallable parameter types, and every concrete use site
-(calls with `**kwargs`, keyword calls against such signatures,
-`__init__`/methods/`lru_cache` with them) is rejected loudly. Starred
-unpacking `f(*xs)` is likewise a loud error.
+`*args`/`**kwargs` on module functions lower to the boxed heterogeneous
+containers (issue #120): `*args` is `Vec<stdpython::PyValue>` and
+`**kwargs` is `PyDict<String, stdpython::PyValue>`. Call sites with a
+known callee pack the extras boxed (`PyValue::from` per value; a call
+with none still passes the empty container), `f(*args)` forwards the
+vector, and the body reads them like any list/dict (len, indexing,
+iteration, membership — elements are `PyValue`, narrowed by isinstance
+where a concrete type is needed; arithmetic directly on an un-narrowed
+element fails in rustc). A keyword argument that matches no parameter of
+a callee without `**kwargs` is a loud error, as in Python. Methods and
+`__init__` with variadic parameters keep their existing per-site
+handling; a `*t` spread to a NON-variadic callee still fills missing
+positional parameters with the spread value (the spread-argument
+divergence).
 
 ### 6.3 Decorators
 
@@ -624,7 +638,10 @@ divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
 (`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
 they lower unresolved and fail in rustc, §12.1; set and tuple
-*literals* work.)
+*literals* work.) `iter(callable, sentinel)` (issue #155) is supported
+as a for-loop iterable — `for x in iter(f, sentinel):` desugars to a
+loop calling `f()` until the result equals the sentinel (bound once,
+before the loop); anywhere else the two-argument form is a loud error.
 
 String, list, dict, and set methods cover the CPython surface for the
 supported types, pinned to CPython edge cases (code-point `len`,

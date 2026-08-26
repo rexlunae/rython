@@ -4078,6 +4078,45 @@ impl<K: Eq + Hash + Debug, V> PyPop<K> for HashMap<K, V> {
     }
 }
 
+/// Python's slice-bound normalization for RANGE operations (issue #153):
+/// a negative bound counts from the end, both bounds clamp to [0, len],
+/// and a stop before start collapses to start (the insertion point —
+/// `xs[5:2] = R` inserts R at 5 without removing anything).
+fn py_range_bounds(len: usize, start: Option<i64>, stop: Option<i64>) -> (usize, usize) {
+    let n = len as i64;
+    let norm = |bound: Option<i64>, default: i64| -> i64 {
+        match bound {
+            None => default,
+            Some(i) if i < 0 => (i + n).clamp(0, n),
+            Some(i) => i.clamp(0, n),
+        }
+    };
+    let a = norm(start, 0);
+    let b = norm(stop, n).max(a);
+    (a as usize, b as usize)
+}
+
+/// `xs[a:b] = replacement` (issue #153): replace the range IN PLACE — a
+/// different-length replacement inserts or removes elements, exactly
+/// CPython. `None` bounds are the open ends (`xs[:b]`, `xs[a:]`, `xs[:]`).
+pub fn py_splice<T>(
+    xs: &mut Vec<T>,
+    start: Option<i64>,
+    stop: Option<i64>,
+    replacement: Vec<T>,
+) {
+    let (a, b) = py_range_bounds(xs.len(), start, stop);
+    xs.splice(a..b, replacement);
+}
+
+/// `del xs[a:b]` (issue #153): remove the range IN PLACE (Python's
+/// `xs[a:b] = []`). Out-of-range bounds clamp; an empty or inverted
+/// range removes nothing.
+pub fn py_del_range<T>(xs: &mut Vec<T>, start: Option<i64>, stop: Option<i64>) {
+    let (a, b) = py_range_bounds(xs.len(), start, stop);
+    xs.drain(a..b);
+}
+
 /// dict.pop(k, default): remove and return, or the default when missing.
 pub trait PyPopDefault<K, V> {
     fn py_pop_default(&mut self, key: K, default: V) -> V;
