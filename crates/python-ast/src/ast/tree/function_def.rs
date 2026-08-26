@@ -886,6 +886,32 @@ impl FunctionDef {
         let mut streams = TokenStream::new();
         let fn_name = crate::safe_ident(&self.name);
 
+        // Issue #119: a MODULE-level `__getattr__` / `__dir__` implements
+        // the module attribute protocol (PEP 562) — a dynamic fallback for
+        // attribute reads that rython cannot model (module attributes
+        // resolve statically at conversion time). Lowering the definition
+        // as an ordinary function produces dead code that misstates the
+        // module's behavior, so the definition is a loud error naming the
+        // dunder and the fix.
+        let is_module_ctx = matches!(&ctx, CodeGenContext::Module(_))
+            || matches!(
+                &ctx,
+                CodeGenContext::Async(inner)
+                    if matches!(inner.as_ref(), CodeGenContext::Module(_))
+            );
+        if is_module_ctx && (self.name == "__getattr__" || self.name == "__dir__") {
+            return Err(format!(
+                "module-level `{}` implements the module attribute protocol \
+                 (PEP 562), which is not supported yet: rython resolves module \
+                 attributes statically at conversion time, so the dynamic \
+                 fallback could never run; define or import the module's \
+                 attributes explicitly and remove the `{}` definition — rython \
+                 refuses to silently ignore it (issue #119)",
+                self.name, self.name
+            )
+            .into());
+        }
+
         // A `@typing.overload` STUB (`def f(x: int = ...) -> int: ...`) is
         // compile-time metadata: its `...` defaults and `...` body are
         // placeholders, never runtime code. Skip it entirely — call sites

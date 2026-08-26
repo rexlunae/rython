@@ -560,6 +560,12 @@ exception escaping a lambda (§4.5).
   binary.
 - Packages without an entry point convert to library crates and cannot
   be `rypip install`ed (loud error naming the fix).
+- The module attribute protocol (PEP 562) is not supported: a
+  module-level `__getattr__` or `__dir__` definition is a loud
+  conversion error naming the dunder and the fix (issue #119). Module
+  attributes resolve statically, so the dynamic fallback could never
+  run; lowering it as an ordinary function would misstate the module's
+  behavior.
 
 ---
 

@@ -8512,3 +8512,30 @@ fn threading_thread_daemon_flag_lowers_from_bool_constants() {
         out
     );
 }
+
+// ---- Module attribute protocol (PEP 562) — issue #119 ----
+
+#[test]
+fn module_getattr_is_a_loud_error() {
+    // A module-level `__getattr__` (dateutil's lazy submodule loading) is
+    // the PEP 562 dynamic-attribute fallback: rython resolves module
+    // attributes statically, so the definition is a loud error naming the
+    // dunder — not an inference error, and never a silently dead function.
+    let err = compile_err(
+        concat!(
+            "def __getattr__(name):\n",
+            "    raise AttributeError(name)\n",
+        ),
+        "modgetattr.py",
+    );
+    assert!(err.contains("module attribute protocol"), "err: {}", err);
+    assert!(err.contains("__getattr__"), "err: {}", err);
+    assert!(err.contains("issue #119"), "err: {}", err);
+}
+
+#[test]
+fn module_dir_is_a_loud_error() {
+    let err = compile_err("def __dir__():\n    return []\n", "moddir.py");
+    assert!(err.contains("module attribute protocol"), "err: {}", err);
+    assert!(err.contains("__dir__"), "err: {}", err);
+}
