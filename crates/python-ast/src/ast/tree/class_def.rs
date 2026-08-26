@@ -1941,6 +1941,7 @@ impl CodeGen for ClassDef {
         // methods (dropped-default inlining, `cls.NAME`) deref-clone the
         // static (attribute.rs / call.rs consult the same shape).
         let mut class_lazylock_constants = TokenStream::new();
+        let mut class_const_accessors = TokenStream::new();
         for stmt in self.body.iter().skip(body_start) {
             match &stmt.statement {
                 StatementType::FunctionDef(_) | StatementType::Pass => {}
@@ -1973,7 +1974,14 @@ impl CodeGen for ClassDef {
                         && crate::ast::tree::module::const_static_type(&a.value).is_none()
                         && class_body_computed_constant(&a.value) =>
                 {
-                    let ident = crate::safe_ident(&n.id);
+                    // The static lives at MODULE level under a
+                    // class-mangled name — associated statics are not
+                    // legal Rust (issue #137: urllib3's
+                    // RequestMethods._encode_url_methods) — with the
+                    // VALUE's inferred type when one exists (a frozenset
+                    // of literals is a concrete set the boxed PyValue
+                    // cannot hold); the PyValue wrap only as a fallback.
+                    let ident = crate::class_const_static_ident(&self.name, &n.id);
                     let rhs = a
                         .value
                         .clone()
@@ -1992,9 +2000,30 @@ impl CodeGen for ClassDef {
                     } else {
                         stripped
                     };
+                    let ti = crate::infer_type(&a.value, &options, &symbols);
+                    let concrete = !matches!(ti, crate::TypeInfo::PyObject)
+                        && !crate::ast::tree::module::type_contains_uninferred(&ti);
+                    let (ty, init) = if concrete {
+                        (ti.to_rust_type(), value_tokens)
+                    } else {
+                        (
+                            quote!(stdpython::PyValue),
+                            quote!(stdpython::PyValue::from(#value_tokens)),
+                        )
+                    };
                     class_lazylock_constants.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
-                            std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
+                        pub static #ident: std::sync::LazyLock<#ty> =
+                            std::sync::LazyLock::new(|| #init);
+                    });
+                    // The associated ACCESSOR keeps `Class::NAME`-shaped
+                    // reads working — importable through the class alone,
+                    // no static import needed at cross-module call sites.
+                    let accessor = crate::safe_ident(&n.id);
+                    class_const_accessors.extend(quote! {
+                        #[allow(non_snake_case)]
+                        pub fn #accessor() -> #ty {
+                            (*#ident).clone()
+                        }
                     });
                 }
                 // A string-literal Expr anywhere in the body (a docstring
@@ -2412,11 +2441,15 @@ impl CodeGen for ClassDef {
             pub struct #class_name {
                 #(#field_defs),*
             }
+            // Class-level COMPUTED constants live at module scope under
+            // class-mangled names: associated statics are not legal Rust
+            // (issue #137).
+            #class_lazylock_constants
             #inherits_tree
             #trait_stream
             impl #class_name {
                 #class_constants
-                #class_lazylock_constants
+                #class_const_accessors
                 #constructor
                 #init_forwarder
                 #methods_stream
@@ -3494,6 +3527,13 @@ fn infer_field_type(
         // value instead of a typed Option. None arrives as NoneType,
         // Constant(None), or the bare Name "None".
         other if crate::is_none_expr(other) => Some(quote!(stdpython::PyValue)),
+        // An ATTRIBUTE READ off a call result (`self.type =
+        // urlparse(self._r.url).scheme` — requests' cookies.MockRequest,
+        // issue #137): a dynamic member of a foreign object — a boxed
+        // PyValue (the external-object divergence).
+        ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Call(_)) => {
+            Some(quote!(stdpython::PyValue))
+        }
         // A list comprehension of foreign objects (`self._decoders =
         // [_get_decoder(e) for e in ...]` — urllib3's MultiDecoder): the
         // element type is a boxed PyValue.

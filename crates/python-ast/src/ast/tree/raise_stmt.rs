@@ -214,6 +214,51 @@ pub fn is_builtin_exception_name(name: &str) -> bool {
     BUILTIN_EXCEPTION_NAMES.contains(&name)
 }
 
+/// CPython's stdlib exception ALIASES: `socket.timeout` IS TimeoutError
+/// and the socket error family IS OSError (Python ≥3.10 aliases the
+/// class objects), so raises and except-clauses through these names
+/// canonicalize to the builtin the runtime's hierarchy walk knows
+/// (urllib3's pyopenssl `raise timeout(...)` under `from socket import
+/// timeout` — issue #137).
+pub(crate) fn stdlib_exception_canonical(module: &str, name: &str) -> Option<&'static str> {
+    match (module, name) {
+        ("socket", "timeout") => Some("TimeoutError"),
+        ("socket", "error" | "gaierror" | "herror") => Some("OSError"),
+        _ => None,
+    }
+}
+
+/// Resolve a NAME bound by `from <stdlib module> import <exc> [as alias]`
+/// to its canonical builtin exception, when the (module, name) pair is a
+/// known stdlib exception alias.
+pub(crate) fn imported_exception_alias(
+    name: &str,
+    symbols: &SymbolTableScopes,
+) -> Option<&'static str> {
+    // An aliased import registers the asname as an Alias hop to the
+    // canonical name (`from socket import timeout as SocketTimeout`):
+    // follow it before reading the ImportFrom.
+    let mut current = name.to_string();
+    for _ in 0..8 {
+        match symbols.get(&current) {
+            Some(crate::SymbolTableNode::Alias(canonical)) => {
+                current = canonical.clone();
+            }
+            Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                let canonical = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(current.as_str()))
+                    .map(|a| a.name.as_str())
+                    .unwrap_or(current.as_str());
+                return stdlib_exception_canonical(&ifm.module, canonical);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub fn is_exception_class_name(name: &str) -> bool {
     is_builtin_exception_name(name)
         // The naming convention covers user-defined exception classes
@@ -237,6 +282,19 @@ fn exception_value(
     match exc {
         ExprType::Call(call) => {
             if let ExprType::Name(name) = call.func.as_ref() {
+                if let Some(kind) = imported_exception_alias(&name.id, &symbols) {
+                    // `raise timeout(...)` under `from socket import
+                    // timeout`: the canonical builtin (TimeoutError).
+                    let msg = match call.args.len() {
+                        0 => quote!(String::new()),
+                        _ => {
+                            let arg =
+                                call.args[0].clone().to_rust(ctx, options, symbols)?;
+                            quote!(format!("{}", #arg))
+                        }
+                    };
+                    return Ok(quote!(PyException::new(#kind, #msg)));
+                }
                 if is_exception_class_name(&name.id)
                     || resolved_is_exception_class(&name.id, &options, &symbols)
                 {
@@ -269,6 +327,12 @@ fn exception_value(
             }
             let tokens = exc.clone().to_rust(ctx, options, symbols)?;
             Ok(quote!(#tokens))
+        }
+        ExprType::Name(name)
+            if imported_exception_alias(&name.id, &symbols).is_some() =>
+        {
+            let kind = imported_exception_alias(&name.id, &symbols).unwrap();
+            Ok(quote!(PyException::new(#kind, String::new())))
         }
         ExprType::Name(name)
             if is_exception_class_name(&name.id)

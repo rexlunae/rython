@@ -493,8 +493,15 @@ impl Point {
 - **Fields** are inferred from `self.attr = …` stores in `__init__`
   (recursing through control flow); types come from annotated
   parameters, literals, or construction of another known class.
-  Conflicting or uninferable field types (`self.x = None`) are loud
-  errors.
+  Conflicting field types are loud errors; a `self.x = None` store and
+  an attribute read off a call result (`urlparse(...).scheme`) box to
+  PyValue (the external-object divergence).
+- **Class-level computed constants** (`_encode_url_methods =
+  frozenset([...])`) lower to a MODULE-level LazyLock static under a
+  class-mangled name (`Class_name` — associated statics are not legal
+  Rust) typed from the value when inferable, plus an associated accessor
+  `Class::name()` that reads clone it through — so `self.name`,
+  `cls.name`, and cross-module `Class.name` reads all work (issue #137).
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -536,7 +543,11 @@ catches the whole file-exception subtree, and — like CPython —
 `except Exception:` does NOT catch `SystemExit`, `KeyboardInterrupt` or
 `GeneratorExit` (they hang off `BaseException` directly). The tree is
 generated from python3 3.14 `__mro__` dumps; the `EnvironmentError`/
-`IOError` aliases resolve to `OSError` for matching. An exception type
+`IOError` aliases resolve to `OSError` for matching, and the stdlib
+exception aliases (`socket.timeout` IS `TimeoutError`, the
+`socket.error`/`gaierror`/`herror` family IS `OSError` — CPython aliases
+the class objects) canonicalize at conversion time on both the raise and
+the except side, however they were imported or renamed (issue #137). An exception type
 outside the built-in tree is caught only by `Exception`,
 `BaseException`, or its exact name. `except (A, B)` ORs the names; a
 dotted name matches on its final attribute; a bare `except:` catches

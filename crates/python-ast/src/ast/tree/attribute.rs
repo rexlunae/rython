@@ -147,6 +147,56 @@ impl<'a> CodeGen for Attribute {
                 }),
             _ => None,
         };
+        // A class-level COMPUTED constant read
+        // (`self._encode_url_methods`, `cls.X`, `RequestMethods.X` —
+        // urllib3's RequestMethods): the LazyLock static lives at MODULE
+        // level under the class-mangled name (associated statics are not
+        // legal Rust — issue #137); the read deref-clones it.
+        {
+            let attr_is_lazy_const = |class: &crate::ClassDef| -> bool {
+                class.body.iter().any(|bs| {
+                    matches!(
+                        &bs.statement,
+                        crate::StatementType::Assign(a)
+                            if a.targets.len() == 1
+                                && matches!(&a.targets[0], ExprType::Name(n) if n.id == self.attr)
+                                && crate::ast::tree::module::const_static_type(&a.value).is_none()
+                                && crate::ast::tree::class_def::class_body_computed_constant(&a.value)
+                    )
+                })
+            };
+            let owning_class: Option<String> = match self.value.as_ref() {
+                ExprType::Name(receiver)
+                    if receiver.id == "self" || receiver.id == "cls" =>
+                {
+                    ctx.enclosing_class_name()
+                        .and_then(|c| match symbols.get(c) {
+                            Some(crate::SymbolTableNode::ClassDef(cd))
+                                if attr_is_lazy_const(cd) =>
+                            {
+                                Some(cd.name.clone())
+                            }
+                            _ => None,
+                        })
+                }
+                ExprType::Name(receiver) => match symbols.get(&receiver.id) {
+                    Some(crate::SymbolTableNode::ClassDef(cd))
+                        if attr_is_lazy_const(cd) =>
+                    {
+                        Some(cd.name.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(class) = owning_class {
+                // Through the associated ACCESSOR, so reads work from any
+                // module the class is imported into.
+                let class_ident = crate::safe_ident(&class);
+                let accessor = crate::safe_ident(&self.attr);
+                return Ok(quote!(#class_ident::#accessor()));
+            }
+        }
         // A receiver that IS a class (a @classmethod's `cls`, or a bare
         // class name read as a value): an attribute on it that is NOT a
         // class-body constant (`cls.DEFAULT` where `Retry.DEFAULT =

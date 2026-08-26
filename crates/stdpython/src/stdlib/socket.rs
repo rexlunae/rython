@@ -29,6 +29,16 @@ pub const AF_INET6: i64 = 10;
 pub const SOCK_STREAM: i64 = 1;
 pub const SOCK_DGRAM: i64 = 2;
 
+/// socket.shutdown() how-values (POSIX numeric values, as CPython).
+pub const SHUT_RD: i64 = 0;
+pub const SHUT_WR: i64 = 1;
+pub const SHUT_RDWR: i64 = 2;
+
+/// socket.has_ipv6 — the runtime's socket layer supports IPv6 (Rust std
+/// does on every tier this module builds for).
+#[allow(non_upper_case_globals)]
+pub const has_ipv6: bool = true;
+
 /// Map an I/O failure onto the exception CPython raises, with CPython's
 /// "[Errno N] text" message shape (std's Display appends " (os error N)" —
 /// stripped here).

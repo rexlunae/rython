@@ -173,6 +173,16 @@ pub fn safe_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
+/// The MODULE-level static identifier for a class-level COMPUTED constant
+/// (`RequestMethods._encode_url_methods` →
+/// `RequestMethods__encode_url_methods`): associated statics are not
+/// legal Rust, so the LazyLock lives at module scope under a
+/// class-mangled name that emitter and read sites derive identically
+/// (issue #137).
+pub fn class_const_static_ident(class: &str, name: &str) -> proc_macro2::Ident {
+    quote::format_ident!("{}_{}", class, name)
+}
+
 /// Build a PyErr for a failed AST-node conversion, carrying the node's source
 /// position so the error can be reported against the user's Python code
 /// instead of panicking with an internal dump.
