@@ -597,17 +597,28 @@ impl CodeGen for StatementType {
             // the closure: it becomes Ok(PyFlow::Return(value)), which
             // the try lowering turns back into a function return — after
             // running the finally body, as Python requires.
-            StatementType::Return(None) => Ok(return_tokens(&ctx, quote!(()))),
+            StatementType::Return(None) => {
+                // A bare `return` in a PyValue-returning function returns
+                // the boxed None (Python's implicit None); otherwise unit.
+                if options.fn_return_is_pyvalue {
+                    Ok(return_tokens(&ctx, quote!(PyValue::None_)))
+                } else {
+                    Ok(return_tokens(&ctx, quote!(())))
+                }
+            }
             StatementType::Return(Some(e)) => {
-                let value = if matches!(e.value, ExprType::NoneType(_)) {
-                    // A `return None` in a PyValue-returning function is
-                    // the boxed None (the None-mixing unification); a
-                    // plain-None function returns the unit value.
-                    if options.fn_return_is_pyvalue {
-                        quote!(PyValue::None_)
-                    } else {
-                        quote!(())
-                    }
+                // A `return None` in a PyValue-returning function is the
+                // boxed None (the None-mixing unification), whichever AST
+                // shape the parser surfaced None as (issue #133: the
+                // annotated-path repro surfaces it as the NAME `None`, not
+                // the NoneType variant); a plain-None function returns the
+                // unit value.
+                let value = if options.fn_return_is_pyvalue
+                    && crate::is_none_expr(&e.value)
+                {
+                    quote!(PyValue::None_)
+                } else if matches!(e.value, ExprType::NoneType(_)) {
+                    quote!(())
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns
                     // (the identity From passes already-boxed values).

@@ -389,6 +389,17 @@ pub fn scale(values: Vec<f64>, factor: f64) -> Result<Vec<f64>, PyException>
 - **Every generated function returns `Result<T, PyException>`**; `T` is
   `()` when nothing (or nothing provable) is returned. Calls to user
   functions take `?`, so exceptions propagate exactly like Python's.
+- **Mixed returns box** (issue #133): when an unannotated function's
+  return paths have no single concrete type — `return 1` / `return None`,
+  a value return with a possible fall-through (Python returns `None`
+  there), or a parameter returned as-is alongside a comparison result —
+  `T` is the boxed `stdpython::PyValue`, every return site wraps in
+  `PyValue::from` (`None` becomes `PyValue::None_`), and generic
+  signatures carry the `PyValue: From<…>` bounds the wrapping needs. A
+  returned list literal whose elements the list lowering boxes (§3.2's
+  all-boxable union) gets the agreeing `Vec<stdpython::PyValue>`. This is
+  the §3.2 boxed-union divergence applied to returns; consistent returns
+  keep their concrete type.
 - The declared return annotation is honored only when every path
   provably returns; a body that can fall through returns `()` — with a
   conversion *warning* recording the ignored annotation.

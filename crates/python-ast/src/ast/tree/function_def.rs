@@ -1978,15 +1978,35 @@ impl FunctionDef {
                 class: ctx.enclosing_class_name().map(str::to_string),
             },
         };
-        // A function whose resolved return type is the boxed PyValue:
-        // `return None` lowers to `PyValue::None_` and other returns wrap
-        // in PyValue::from (the None-mixing unification — botocore's
+        // A function whose return type is the boxed PyValue: `return None`
+        // lowers to `PyValue::None_` and other returns wrap in
+        // PyValue::from (the None-mixing unification — botocore's
         // docs.client._allowlist_generate_presigned_url). Set BEFORE the
         // body statements render (they clone options per statement).
+        // Issue #133: the flag must agree with WHICHEVER inference writes
+        // the signature below — resolved_return_type for annotated/simple
+        // functions, the collector unification for the generic path
+        // (previously only the former was consulted, so a generic
+        // `Result<PyValue, _>` signature carried unwrapped `Ok(val)`
+        // bodies — E0308 on the issue's flagify shape).
         options.fn_return_is_pyvalue = matches!(
             self.resolved_return_type(&symbols, &options),
             Some(ref ty) if ty.to_string() == "stdpython :: PyValue"
-        );
+        ) || (self.returns.is_none()
+            && inferred_signature.is_generic()
+            && guarantees_return(&self.body)
+            && matches!(
+                &inferred_signature.return_type,
+                Some(ty) if ty.to_string() == "stdpython :: PyValue"
+            ))
+            // The NON-generic disconnect (annotated params, mixed
+            // `return 1`/`return None` literal bodies — the issue's pick
+            // shape): the generic collector never ran (no unannotated
+            // params), resolved_return_type has no answer — box.
+            || (self.returns.is_none()
+                && !inferred_signature.is_generic()
+                && self.resolved_return_type(&symbols, &options).is_none()
+                && literal_returns_need_boxing(&self.body));
 
         // Issue #125: thread narrowed-Option state through the body. After
         // `if x is not None: <body> else: <else>` where BOTH branches leave
@@ -2112,6 +2132,15 @@ impl FunctionDef {
         } else {
             match self.resolved_return_type(&symbols, &options) {
                 Some(ty) => quote!(-> Result<#ty, PyException>),
+                // Mixed literal returns (`return 1` / `return None` under
+                // annotated params) box to PyValue; the body statements
+                // were rendered with fn_return_is_pyvalue set above, so
+                // the signature must agree (issue #133).
+                None if self.returns.is_none()
+                    && literal_returns_need_boxing(&self.body) =>
+                {
+                    quote!(-> Result<stdpython::PyValue, PyException>)
+                }
                 None => quote!(-> Result<(), PyException>),
             }
         };
@@ -2349,6 +2378,40 @@ fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>
             _ => {}
         }
     }
+}
+
+/// Whether an unannotated-return function whose return values are all
+/// LITERALS mixes kinds only the boxed PyValue can hold: a `return None`
+/// (or bare `return`, or a possible fall-through — Python returns None
+/// there) alongside a value literal, or value literals of two different
+/// types (`return 1` / `return "x"`). Any non-literal return value bails
+/// to false — the collector-based generic inference owns those shapes,
+/// and a single consistent literal kind stays concrete (issue #133: the
+/// annotated-parameter `pick(flag: bool)` shape, whose `return 1` /
+/// `return None` mix previously rendered against a `Result<(), _>`
+/// signature).
+fn literal_returns_need_boxing(body: &[Statement]) -> bool {
+    let mut returns = Vec::new();
+    collect_returns(body, &mut returns);
+    let mut kinds: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut has_none = !guarantees_return(body);
+    for r in &returns {
+        match r {
+            None => has_none = true,
+            Some(e) if is_none_expr(e) => has_none = true,
+            Some(ExprType::Constant(c)) => {
+                kinds.insert(match &c.0 {
+                    Some(litrs::Literal::Integer(_)) => "int",
+                    Some(litrs::Literal::Float(_)) => "float",
+                    Some(litrs::Literal::Bool(_)) => "bool",
+                    Some(litrs::Literal::String(_)) => "str",
+                    _ => return false,
+                });
+            }
+            _ => return false,
+        }
+    }
+    !kinds.is_empty() && (has_none || kinds.len() > 1)
 }
 
 /// The names of NESTED function definitions inside a statement list
@@ -3197,7 +3260,64 @@ impl FunctionDef {
         {
             return Some(quote!(Self));
         }
-        self.inferred_return_type().or(annotated)
+        self.inferred_return_type()
+            .or(annotated)
+            .or_else(|| self.boxed_list_return_type(symbols, options))
+    }
+
+    /// The `Vec<stdpython::PyValue>` return type for an unannotated
+    /// function whose returns are all LIST LITERALS of constants that the
+    /// list lowering element-boxes (a mix of boxable kinds — issue #130's
+    /// `[1, "a"]`), plus possibly empty lists (`vec![]` coerces). This
+    /// mirrors the `ExprType::List` lowering's boxing decision so the
+    /// SIGNATURE agrees with the rendered body — previously the boxed
+    /// `vec![PyValue::from(1), ...]` returns rendered against a
+    /// `Result<(), _>` signature (issue #133). Anything else — a
+    /// concrete-element list, a non-constant element, a bare/None return,
+    /// a possible fall-through — bails to None (unchanged behavior).
+    fn boxed_list_return_type(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
+        if self.returns.is_some() || !guarantees_return(&self.body) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        collect_returns(&self.body, &mut returns);
+        let mut any_boxed = false;
+        for r in &returns {
+            let Some(ExprType::List(l)) = r else {
+                return None;
+            };
+            if l.is_empty() {
+                continue;
+            }
+            let mut distinct: Vec<crate::TypeInfo> = Vec::new();
+            let mut expected = crate::TypeInfo::PyObject;
+            for li in l {
+                if !matches!(li, ExprType::Constant(_)) {
+                    return None;
+                }
+                let t = crate::infer_type(li, options, symbols);
+                if matches!(t, crate::TypeInfo::PyObject) {
+                    continue;
+                }
+                if !distinct.contains(&t) {
+                    distinct.push(t.clone());
+                }
+                expected = crate::unify(expected, t);
+            }
+            if distinct.len() > 1
+                && matches!(expected, crate::TypeInfo::PyObject)
+                && distinct.iter().all(crate::is_boxable_value_type)
+            {
+                any_boxed = true;
+            } else {
+                return None;
+            }
+        }
+        any_boxed.then(|| quote!(Vec<stdpython::PyValue>))
     }
 
     /// Whether any `return` in this body is `return cls(...)` — a call to

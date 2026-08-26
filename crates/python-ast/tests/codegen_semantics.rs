@@ -1626,16 +1626,20 @@ fn return_type_inferred_from_string_literal() {
 }
 
 #[test]
-fn mixed_returns_get_no_annotation() {
+fn mixed_returns_box_to_pyvalue() {
+    // `return 1` / `return "s"` has no single concrete type: the returns
+    // box to PyValue and the signature agrees (issue #133 — the previous
+    // `Result<(), _>` signature made the generated body unbuildable).
     let out = compile(
         "def f(c: bool):\n    if c:\n        return 1\n    return \"s\"\n",
         "ret4.py",
     );
     assert!(
-        out.contains("-> Result < () , PyException >"),
+        out.contains("-> Result < stdpython :: PyValue , PyException >"),
         "generated: {}",
         out
     );
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
 }
 
 #[test]
@@ -8805,4 +8809,157 @@ fn keyword_to_pure_varargs_callee_is_a_python_type_error() {
         "vakw.py",
     );
     assert!(err.contains("unexpected keyword argument"), "err: {err}");
+}
+
+// ---- Issue #133: return-unification boxing agrees with the signature ----
+
+#[test]
+fn generic_mixed_returns_box_and_wrap() {
+    // Inference: `return val == "yes"` on one path and `return val` on the
+    // other (botocore's ensure_boolean shape) unify to the boxed PyValue —
+    // the signature AND the body must agree: every return site wraps in
+    // PyValue::from, and the where clause carries the From bounds rustc
+    // will not invent (PyValue: From<T> for the bare parameter return,
+    // PyValue: From<<T as PyEq<&'static str>>::Output> for the comparison
+    // return).
+    let out = compile(
+        concat!(
+            "def flagify(val):\n",
+            "    if val:\n",
+            "        return val == \"yes\"\n",
+            "    return val\n",
+        ),
+        "flagify.py",
+    );
+    assert!(
+        out.contains("Result < stdpython :: PyValue , PyException >"),
+        "mixed returns must box the signature: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: from (val)"),
+        "the bare-parameter return must wrap: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: PyValue : From < T >"),
+        "the bare type-variable return needs a From bound: {}",
+        out
+    );
+    assert!(
+        out.contains(":: Output >"),
+        "the comparison return needs a From bound on the operator Output: {}",
+        out
+    );
+    // The str-literal comparison bound must use the runtime's
+    // `impl<'a> PyEq<&'a str>` shape (a `String` here would name a trait
+    // instantiation the emitted `py_eq(&("yes"))` call never exercises).
+    assert!(
+        out.contains("PyEq < & 'static str >"),
+        "the str-literal comparison must bound PyEq<&'static str>: {}",
+        out
+    );
+}
+
+#[test]
+fn annotated_params_mixed_literal_returns_box() {
+    // The NON-generic path (annotated parameter, unannotated return):
+    // `return 1` / `return None` has no single concrete type — the
+    // signature boxes to PyValue and the returns wrap (previously the
+    // signature said Result<(), _> while the body returned Ok(1)/Ok(None)).
+    let out = compile(
+        concat!(
+            "def pick(flag: bool):\n",
+            "    if flag:\n",
+            "        return 1\n",
+            "    return None\n",
+        ),
+        "pick.py",
+    );
+    assert!(
+        out.contains("Result < stdpython :: PyValue , PyException >"),
+        "mixed literal/None returns must box the signature: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: from (1)"),
+        "the literal return must wrap: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: None_"),
+        "the None return must box: {}",
+        out
+    );
+}
+
+#[test]
+fn partial_literal_return_boxes_with_none_tail() {
+    // A value return on one path and a FALL-THROUGH on the other returns
+    // `1 | None` in Python: the signature boxes and the implicit tail is
+    // the boxed None.
+    let out = compile(
+        concat!(
+            "def partial(flag: bool):\n",
+            "    if flag:\n",
+            "        return 1\n",
+        ),
+        "partial.py",
+    );
+    assert!(
+        out.contains("Result < stdpython :: PyValue , PyException >"),
+        "a partial literal return must box the signature: {}",
+        out
+    );
+    assert!(
+        out.contains("Ok (PyValue :: None_)"),
+        "the fall-through tail must be the boxed None: {}",
+        out
+    );
+}
+
+#[test]
+fn same_kind_literal_returns_stay_concrete() {
+    // Consistent literal returns keep their concrete type — boxing is only
+    // for mixes the concrete system cannot express.
+    let out = compile(
+        concat!(
+            "def same(flag: bool):\n",
+            "    if flag:\n",
+            "        return 1\n",
+            "    return 2\n",
+        ),
+        "same.py",
+    );
+    assert!(
+        out.contains("Result < i64 , PyException >"),
+        "consistent literal returns must stay concrete: {}",
+        out
+    );
+    assert!(
+        !out.contains("PyValue"),
+        "no boxing for a consistent return type: {}",
+        out
+    );
+}
+
+#[test]
+fn mixed_element_list_returns_get_vec_pyvalue_signature() {
+    // A returned list literal whose elements mix boxable kinds renders
+    // element-boxed (`vec![PyValue::from(1), PyValue::from("a")]` — issue
+    // #130); the SIGNATURE must agree (previously it said Result<(), _>).
+    let out = compile(
+        concat!(
+            "def mixed_list(flag: bool):\n",
+            "    if flag:\n",
+            "        return [1, \"a\"]\n",
+            "    return [2, \"b\"]\n",
+        ),
+        "mixedlist.py",
+    );
+    assert!(
+        out.contains("Result < Vec < stdpython :: PyValue >"),
+        "element-boxed list returns must box the signature's element: {}",
+        out
+    );
 }
