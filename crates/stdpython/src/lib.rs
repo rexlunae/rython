@@ -1606,6 +1606,15 @@ impl PyInt for i64 {
     }
 }
 
+/// The type-level inheritance tree. The converter emits one
+/// `impl PyInherits<Ancestor> for Class` per (class, ancestor) pair in a
+/// generated crate — reflexive and transitive along the single-inheritance
+/// chain — so generic Rust code can bound on Python ancestry
+/// (`fn pet<T: PyInherits<Animal>>(x: T)`). The entries are derived from
+/// the same base-chain walk the conversion-time isinstance folding uses,
+/// keeping the type-level and conversion-time trees in lockstep.
+pub trait PyInherits<Base> {}
+
 impl PyInt for u8 {
     // A bytes element (`data[i]`) is a `u8` in the value model, but in
     // Python it is already an int — so `int(data[i])` is the identity

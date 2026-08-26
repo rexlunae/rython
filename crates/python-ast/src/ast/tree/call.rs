@@ -1900,6 +1900,39 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
+                        // The RESIDUAL variant of a specialized function
+                        // (specialize.rs): its axis parameter is only ever
+                        // bound to types OUTSIDE the tested set, so its
+                        // isinstance checks are false by construction —
+                        // silently, unlike the divergences below.
+                        if let ExprType::Name(n) = &self.args[0]
+                            && options.residual_fold_false.contains(&n.id)
+                        {
+                            return Ok(quote!(false));
+                        }
+                        // An isinstance test on an INFERRED-GENERIC
+                        // parameter in a shape the specializer does not
+                        // cover (a non-if-test use, a second tested
+                        // parameter, defaults/varargs, a method): there is
+                        // no runtime type to dispatch on and no variant to
+                        // fold in — the documented class-as-value
+                        // divergence, false with a warning naming the
+                        // specializable shape.
+                        if let ExprType::Name(n) = &self.args[0]
+                            && options.param_type_vars.contains_key(&n.id)
+                        {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "isinstance({0}, ...) on an inferred-generic \
+                                 parameter lowers to false (the class-as-value \
+                                 divergence). rython specializes a module \
+                                 function whose unannotated parameter is tested \
+                                 only in plain `if isinstance({0}, T):` \
+                                 statements with builtin or class targets; \
+                                 restructure into that shape, or annotate `{0}`",
+                                n.id
+                            ));
+                            return Ok(quote!(false));
+                        }
                         // Exception-class isinstance: `isinstance(e,
                         // LookupError)` where e is a caught exception tests
                         // the PyException's name string — the same match
@@ -1961,13 +1994,17 @@ impl<'a> CodeGen for Call {
                                 _ => None,
                             };
                             if let Some(cname) = inner_class {
+                                // isinstance also accepts subclasses of the
+                                // resolved class: walk the inheritance tree.
                                 let same_class = matches!(
                                     &self.args[0],
                                     ExprType::Name(n)
                                         if options.name_types.get(&n.id).is_some_and(|ty| {
                                             matches!(
                                                 ty,
-                                                crate::TypeInfo::Class(cc) if cc == &cname
+                                                crate::TypeInfo::Class(cc)
+                                                    if crate::ast::tree::class_def::ClassDef
+                                                        ::class_extends(cc, &cname, &symbols)
                                             )
                                         })
                                 );
@@ -1984,27 +2021,47 @@ impl<'a> CodeGen for Call {
                         // A NON-exception class target (`isinstance(other,
                         // CompatibleFamillyRange)`, or an alias/import of one
                         // like `TimeoutSauce`): statically decidable in
-                        // rython's value model — true only when the first
-                        // argument is typed as that class, false otherwise
-                        // (an object of another type cannot be an instance;
-                        // `other: object` never is). The class-as-value
-                        // divergence: the class itself is not a runtime
-                        // value, so the check cannot dispatch dynamically.
+                        // rython's value model through the INHERITANCE TREE —
+                        // true when the first argument's class is the target
+                        // or transitively inherits from it (`isinstance(dog,
+                        // Animal)` with dog: Dog is true, like CPython's
+                        // subclass check), false otherwise. A value whose
+                        // type is unknown cannot dispatch dynamically (the
+                        // class-as-value divergence) — that case is false
+                        // WITH a warning, never silently.
                         if let ExprType::Name(t) = &self.args[1]
                             && is_class_target(&t.id, &symbols, &options, 0)
                         {
-                            let same_class = matches!(
-                                &self.args[0],
-                                ExprType::Name(n)
-                                    if options
-                                        .name_types
-                                        .get(&n.id)
-                                        .is_some_and(|ty| matches!(
-                                            ty,
-                                            crate::TypeInfo::Class(c) if c == &t.id
-                                        ))
-                            );
-                            return Ok(quote!(#same_class));
+                            let arg_class = match &self.args[0] {
+                                ExprType::Name(n) => {
+                                    match options.name_types.get(&n.id) {
+                                        Some(crate::TypeInfo::Class(c)) => {
+                                            Some(c.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                            let result = match &arg_class {
+                                Some(c) => {
+                                    crate::ast::tree::class_def::ClassDef::class_extends(
+                                        c, &t.id, &symbols,
+                                    )
+                                }
+                                None => {
+                                    options.definition_warnings.borrow_mut().push(
+                                        format!(
+                                            "isinstance(x, {}) with x not statically \
+                                             typed as a class lowers to false (the \
+                                             class-as-value divergence)",
+                                            t.id
+                                        ),
+                                    );
+                                    false
+                                }
+                            };
+                            return Ok(quote!(#result));
                         }
                         // Resolve a name that aliases a TUPLE of builtin
                         // type names (`basestring = (str, bytes)` in
@@ -5641,6 +5698,119 @@ impl<'a> CodeGen for Call {
                     }
                 }
             }
+        }
+
+        // A call to a SPECIALIZED function (specialize.rs): dispatch to
+        // the variant matching the axis argument's static type — Python's
+        // first-true-test order through the inheritance tree — or to the
+        // `__any` residual for a type outside the tested set. An argument
+        // whose type is not statically known cannot be dispatched: loud
+        // conversion error, never a silently-wrong branch.
+        if let ExprType::Name(callee_name) = self.func.as_ref()
+            && let Some(spec) = options.specialized_fns.get(&callee_name.id).cloned()
+        {
+            if !self.keywords.is_empty() {
+                return Err(format!(
+                    "`{}` is specialized on its isinstance-tested parameter; \
+                     calls take positional arguments only",
+                    callee_name.id
+                )
+                .into());
+            }
+            let Some(axis_arg) = self.args.get(spec.axis) else {
+                return Err(format!(
+                    "`{}` needs at least {} positional argument(s)",
+                    callee_name.id,
+                    spec.axis + 1
+                )
+                .into());
+            };
+            let type_info_py_name = |t: &crate::TypeInfo| -> Option<String> {
+                match t {
+                    crate::TypeInfo::Int => Some("int".into()),
+                    crate::TypeInfo::Float => Some("float".into()),
+                    crate::TypeInfo::Bool => Some("bool".into()),
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                        Some("str".into())
+                    }
+                    crate::TypeInfo::Bytes => Some("bytes".into()),
+                    _ => None,
+                }
+            };
+            let (py_ty, is_class): (Option<String>, bool) = match axis_arg {
+                ExprType::Name(n) => match options.name_types.get(&n.id) {
+                    Some(crate::TypeInfo::Class(c)) => (Some(c.clone()), true),
+                    Some(t) => (type_info_py_name(t), false),
+                    None => (options.local_types.get(&n.id).cloned(), false),
+                },
+                // A call argument: a constructor (`describe(Dog("rex"))`)
+                // is an instance of its class; a known function resolves
+                // through its return type.
+                ExprType::Call(c) => {
+                    let ctor = matches!(
+                        c.func.as_ref(),
+                        ExprType::Name(f)
+                            if matches!(
+                                symbols.get(&f.id),
+                                Some(SymbolTableNode::ClassDef(_))
+                            )
+                    );
+                    if ctor {
+                        let ExprType::Name(f) = c.func.as_ref() else {
+                            unreachable!()
+                        };
+                        (Some(f.id.clone()), true)
+                    } else {
+                        match crate::ast::tree::type_ctx::call_return_typeinfo(
+                            c,
+                            Some(&symbols),
+                            Some(&options),
+                        ) {
+                            Some(crate::TypeInfo::Class(cn)) => (Some(cn), true),
+                            Some(t) => (type_info_py_name(&t), false),
+                            None => (None, false),
+                        }
+                    }
+                }
+                lit => (
+                    crate::ast::tree::function_def::simple_expr_type(lit)
+                        .and_then(|ty| {
+                            crate::ast::tree::function_def::rust_type_to_py_name(&ty)
+                                .map(str::to_string)
+                        }),
+                    false,
+                ),
+            };
+            let Some(py_ty) = py_ty else {
+                return Err(format!(
+                    "cannot dispatch the call to `{}`: the type of its \
+                     isinstance-dispatched argument is not statically known — \
+                     annotate the value (or the enclosing parameter) so the \
+                     converter can pick the right specialization",
+                    callee_name.id
+                )
+                .into());
+            };
+            let suffix = crate::ast::tree::specialize::dispatch_suffix(
+                &spec, &py_ty, is_class,
+            )
+            .unwrap_or("any")
+            .to_string();
+            let mangled = crate::safe_ident(&crate::ast::tree::specialize::mangled_name(&callee_name.id, &suffix));
+            let mut rendered = Vec::new();
+            for arg in &self.args {
+                rendered.push(arg.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            let call = quote!(#mangled(#(#rendered),*));
+            return Ok(if propagates_exceptions {
+                quote!((#call)?)
+            } else {
+                call
+            });
         }
 
         // Keyword arguments and omitted defaulted parameters resolve

@@ -502,13 +502,99 @@ impl CodeGen for FunctionDef {
         if depth > 50 && depth % 10 == 0 {
         }
         FN_DEPTH.with(|d| d.set(depth + 1));
-        let result = self.to_rust_inner(ctx, options, symbols);
+        // A module function registered for isinstance specialization
+        // (specialize.rs) renders as its variants + residual instead of
+        // one generic definition. Methods and nested defs never register.
+        let result = if !options.rendering_specialization
+            && matches!(ctx, CodeGenContext::Module(_))
+            && options.specialized_fns.contains_key(&self.name)
+        {
+            let spec = options.specialized_fns.get(&self.name).unwrap().clone();
+            self.render_specializations(spec, ctx, options, symbols)
+        } else {
+            self.to_rust_inner(ctx, options, symbols)
+        };
         FN_DEPTH.with(|d| d.set(depth));
         return result;
     }
 }
 
 impl FunctionDef {
+    /// Emit the monomorphized variants of an isinstance-dispatched
+    /// function (specialize.rs): one definition per tested type with the
+    /// axis parameter ANNOTATED as that type — the isinstance checks fold
+    /// to constants through the inheritance tree and dead arms are pruned
+    /// before rendering — plus the `__any` residual, whose axis stays
+    /// generic and whose tested arms are removed at the AST level.
+    fn render_specializations(
+        self,
+        spec: crate::ast::tree::specialize::SpecializedFn,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let mut out = TokenStream::new();
+        let mut vopts = options.clone();
+        vopts.rendering_specialization = true;
+        // One variant per tested BUILTIN type, plus one per concrete
+        // class in the tested subtrees (a Cat argument gets describe_Cat
+        // with `x: Cat`, keeping Cat's own overrides — Rust structs have
+        // no subtyping to flow through an Animal-typed variant).
+        let variant_types: Vec<crate::ast::tree::specialize::SpecTarget> = spec
+            .targets
+            .iter()
+            .filter(|t| {
+                matches!(t, crate::ast::tree::specialize::SpecTarget::Builtin(_))
+            })
+            .cloned()
+            .chain(spec.class_variants.iter().map(|c| {
+                crate::ast::tree::specialize::SpecTarget::Class(c.clone())
+            }))
+            .collect();
+        for target in &variant_types {
+            let mut variant = self.clone();
+            variant.name = crate::ast::tree::specialize::mangled_name(&self.name, target.suffix());
+            variant.args.args[spec.axis].annotation =
+                Some(Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
+                    id: target.suffix().to_string(),
+                })));
+            variant.body = crate::ast::tree::specialize::fold_variant_body(
+                &self.body,
+                &spec.axis_name,
+                target,
+                &symbols,
+            );
+            // The original carries no return annotation (its params were
+            // unannotated); the folded variant needs one so the annotated
+            // machinery types the returns.
+            if variant.returns.is_none() {
+                variant.returns = crate::ast::tree::specialize::derive_return_annotation(
+                    &variant.body,
+                    &spec.axis_name,
+                    target,
+                    &options,
+                    &symbols,
+                )
+                .map(Box::new);
+            }
+            crate::ast::tree::specialize::underscore_unused_params(&mut variant);
+            out.extend(variant.to_rust(ctx.clone(), vopts.clone(), symbols.clone())?);
+        }
+        let mut residual = self.clone();
+        residual.name = crate::ast::tree::specialize::mangled_name(&self.name, "any");
+        residual.body = crate::ast::tree::specialize::prune_axis_isinstance(
+            &self.body,
+            &spec.axis_name,
+        );
+        crate::ast::tree::specialize::underscore_unused_params(&mut residual);
+        let mut ropts = vopts;
+        let mut fold = options.residual_fold_false.as_ref().clone();
+        fold.insert(spec.axis_name.clone());
+        ropts.residual_fold_false = std::rc::Rc::new(fold);
+        out.extend(residual.to_rust(ctx, ropts, symbols)?);
+        Ok(out)
+    }
+
     fn to_rust_inner(
         self,
         ctx: CodeGenContext,
@@ -1358,6 +1444,30 @@ impl FunctionDef {
             final_param_types.insert(name.clone(), quote!(Option<()>));
         }
         options.param_type_vars = std::rc::Rc::new(final_param_types);
+        // An INFERRED String return needs the same literal-owning
+        // treatment as an annotated `-> str`: `return "pos"` in a generic
+        // function whose return type unified to String must own the
+        // &'static str (to_string), or the declared Result<String>
+        // mismatches at build time.
+        if inferred_signature
+            .return_type
+            .as_ref()
+            .is_some_and(|t| t.to_string() == "String")
+            && !options.clone_str_attribute_returns
+        {
+            options.clone_str_attribute_returns = true;
+            let mut locals = std::collections::HashMap::new();
+            collect_local_types(&effective_body, &mut locals);
+            options.str_literal_locals = std::rc::Rc::new(
+                locals
+                    .into_iter()
+                    .filter(|(_, ty)| {
+                        ty.to_string() == quote!(&'static str).to_string()
+                    })
+                    .map(|(name, _)| name)
+                    .collect(),
+            );
+        }
         options.param_method_params =
             std::rc::Rc::new(inferred_signature.method_params.clone());
         options.duck_methods_on_params =

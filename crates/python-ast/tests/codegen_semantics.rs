@@ -5643,6 +5643,150 @@ fn aliased_import_resolves_through_module_intercept() {
 }
 
 #[test]
+fn isinstance_folds_through_the_inheritance_tree() {
+    // python3: isinstance(d, Animal) is True for d: Dog — the fold walks
+    // the class tree instead of requiring an exact class match, and the
+    // constant condition prunes the dead branch (no `if true` residue).
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "class Robot:\n",
+        "    def __init__(self, tag: int):\n",
+        "        self.tag = tag\n",
+        "\n",
+        "def check(d: Dog) -> None:\n",
+        "    if isinstance(d, Animal):\n",
+        "        print(\"animal\")\n",
+        "    if isinstance(d, Robot):\n",
+        "        print(\"robot\")\n",
+    );
+    let out = compile(src, "inhtree.py");
+    let check_part = out.split("fn check").nth(1).expect("check fn");
+    assert!(
+        check_part.contains("\"animal\""),
+        "the Animal branch must survive (Dog extends Animal): {}",
+        out
+    );
+    assert!(
+        !check_part.contains("\"robot\""),
+        "the Robot branch is dead and must be pruned: {}",
+        out
+    );
+    assert!(
+        !check_part.contains("if (true)") && !check_part.contains("if (false)"),
+        "constant isinstance conditions must not remain as if-tests: {}",
+        out
+    );
+}
+
+#[test]
+fn constructor_locals_carry_their_class_for_isinstance() {
+    // python3: a constructor-assigned local knows its class — isinstance
+    // folds true for it (previously the local was untyped and the check
+    // silently folded false).
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "def go() -> None:\n",
+        "    a = Animal(\"blob\")\n",
+        "    if isinstance(a, Animal):\n",
+        "        print(\"yes\")\n",
+    );
+    let out = compile(src, "ctorlocal.py");
+    let go_part = out.split("fn go").nth(1).expect("go fn");
+    assert!(
+        go_part.contains("\"yes\""),
+        "the constructor local's class must fold the check true: {}",
+        out
+    );
+}
+
+#[test]
+fn isinstance_dispatch_specializes_by_input_type() {
+    // The isinstance-dispatch idiom monomorphizes: one Rust function per
+    // tested type (class variants per CONCRETE class in the tested
+    // subtree) plus a generic residual, and call sites bind the variant
+    // matching the argument's static type.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "def describe(x):\n",
+        "    if isinstance(x, int):\n",
+        "        return \"int\"\n",
+        "    if isinstance(x, Animal):\n",
+        "        return \"animal\"\n",
+        "    return \"other\"\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(describe(5))\n",
+        "    print(describe(Dog(\"rex\")))\n",
+        "    print(describe(2.5))\n",
+    );
+    let out = compile(src, "specialize.py");
+    for variant in [
+        "fn describe_int",
+        "fn describe_animal",
+        "fn describe_dog",
+        "fn describe_any",
+    ] {
+        assert!(out.contains(variant), "missing {variant}: {}", out);
+    }
+    assert!(
+        out.contains("describe_int (5)"),
+        "int literal must dispatch to the int variant: {}",
+        out
+    );
+    assert!(
+        out.contains("describe_dog ("),
+        "a Dog argument must dispatch to Dog's own variant: {}",
+        out
+    );
+    assert!(
+        out.contains("describe_any (2.5)"),
+        "an untested type must dispatch to the residual: {}",
+        out
+    );
+}
+
+#[test]
+fn classes_emit_the_type_level_inheritance_tree() {
+    // Every class carries `impl PyInherits<Ancestor> for Class` for its
+    // full base chain (reflexive included) — the generic inheritance tree
+    // generic Rust code can bound on.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+    );
+    let out = compile(src, "pyinherits.py");
+    for entry in [
+        "impl PyInherits < Animal > for Animal",
+        "impl PyInherits < Dog > for Dog",
+        "impl PyInherits < Animal > for Dog",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+}
+
+#[test]
 fn literal_seeded_local_concretizes_the_loop_element() {
     // Inference: `best = ""` then `best = w` inside `for w in words` — the
     // local keeps ONE type, so the seed's concrete type (String) forces

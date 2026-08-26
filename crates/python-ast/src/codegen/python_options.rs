@@ -297,6 +297,22 @@ pub struct PythonOptions {
     /// trait. Set once per module; empty outside module generation.
     pub hierarchy_classes: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// Module functions monomorphized over an isinstance-tested parameter
+    /// (see `specialize.rs`): the renderer emits one variant per tested
+    /// type plus a residual, and call sites dispatch by the argument's
+    /// static type. Built once per module.
+    pub specialized_fns: std::rc::Rc<crate::ast::tree::specialize::SpecRegistry>,
+
+    /// Set while rendering one specialization variant, so the function
+    /// renderer does not recurse into the registry for the variant itself.
+    pub rendering_specialization: bool,
+
+    /// Parameter names whose isinstance checks fold to false SILENTLY:
+    /// the residual variant of a specialized function is only ever called
+    /// with types outside the tested set, so its axis checks are false by
+    /// construction, not by divergence.
+    pub residual_fold_false: std::rc::Rc<std::collections::HashSet<String>>,
+
     /// Trait method names whose signature must be `&mut self`, keyed by the
     /// owning (root) class of the trait. A method's trait signature widens
     /// to `&mut self` when ANY definition in the hierarchy mutates self:
@@ -452,6 +468,9 @@ impl Default for PythonOptions {
             no_std: false,
             numpy_backend: None,
             hierarchy_classes: std::rc::Rc::new(std::collections::HashSet::new()),
+            specialized_fns: std::rc::Rc::new(std::collections::HashMap::new()),
+            rendering_specialization: false,
+            residual_fold_false: std::rc::Rc::new(std::collections::HashSet::new()),
             trait_mut_self: std::rc::Rc::new(std::collections::HashMap::new()),
             use_counts: std::rc::Rc::new(std::collections::HashMap::new()),
             name_types: std::rc::Rc::new(std::collections::HashMap::new()),

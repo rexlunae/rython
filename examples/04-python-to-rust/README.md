@@ -22,6 +22,9 @@ top: the x3
 longest: quick
 chars: 16
 tweet-sized: True
+word: fox
+count: 12
+something else
 ```
 
 Keeping the program running under CPython is the workflow: rython
@@ -94,6 +97,16 @@ All in [`generated/src/wordstats.rs`](generated/src/wordstats.rs):
       B: PyLe<A, Output = bool>,
   ```
 
+- **isinstance dispatch → compile-time specialization.** `label(value)`
+  switches on `isinstance` — inherently dynamic typing — and the
+  converter turns the checks into compile-time flags: it emits
+  `label_str`, `label_int`, and a generic `label_any`, each with the
+  dead arms pruned before they are ever rendered, and binds every call
+  site to the variant matching its argument's static type. Class
+  targets fold through the inheritance tree (a `Cat` argument takes an
+  `isinstance(x, Animal)` arm while keeping its own overrides), and
+  every class also carries `impl PyInherits<Ancestor> for Class` — a
+  type-level copy of the same tree that generic Rust code can bound on.
 - **Exceptions → Result.** Every fallible function returns
   `Result<T, PyException>`; the `__main__` block becomes `fn main()`
   that prints the exception and exits 1, exactly like the interpreter.

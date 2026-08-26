@@ -1866,6 +1866,12 @@ pub fn call_return_typeinfo(
     // decorator-factory assignment.
     let fn_name = match symbols.get(&callee.id) {
         Some(SymbolTableNode::FunctionDef(_)) => callee.id.clone(),
+        // A class-construction call (`d = Dog("rex")`) produces an instance
+        // of the class — this is what lets isinstance fold through the
+        // inheritance tree for constructor-typed locals.
+        Some(SymbolTableNode::ClassDef(_)) => {
+            return Some(TypeInfo::Class(callee.id.clone()));
+        }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
             let (f, _) = crate::module_function_def(options, &path, &callee.id)?;

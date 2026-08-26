@@ -1145,6 +1145,84 @@ fn classes_match_python_at_runtime() {
 }
 
 #[test]
+fn isinstance_dispatch_specializes_and_matches_python_at_runtime() {
+    // The isinstance-dispatch idiom end to end: the converter emits one
+    // specialized function per input type (classes get per-CONCRETE-class
+    // variants folded through the inheritance tree, so a Cat argument
+    // takes the `isinstance(x, Animal)` arm while keeping Cat's own
+    // speak() override) plus a generic residual, and call sites dispatch
+    // statically. Output must match CPython exactly.
+    let scratch = Scratch::new("isinstance-dispatch");
+    let file = scratch.path().join("animals.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"...\"\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "class Cat(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"meow\"\n",
+            "\n",
+            "def describe(x):\n",
+            "    if isinstance(x, Dog):\n",
+            "        return x.name + \" is a dog: \" + x.speak()\n",
+            "    if isinstance(x, Animal):\n",
+            "        return x.name + \" is some animal: \" + x.speak()\n",
+            "    if isinstance(x, int):\n",
+            "        return \"the number \" + str(x)\n",
+            "    return \"unknown\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(describe(Dog(\"rex\")))\n",
+            "    print(describe(Cat(\"tom\")))\n",
+            "    print(describe(Animal(\"blob\")))\n",
+            "    print(describe(7))\n",
+            "    print(describe(2.5))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/animals"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "rex is a dog: woof",
+            "tom is some animal: meow",
+            "blob is some animal: ...",
+            "the number 7",
+            "unknown",
+        ],
+        "isinstance dispatch diverged from CPython"
+    );
+}
+
+#[test]
 fn inference_seed_unification_and_return_unification_at_runtime() {
     // Parameter type inference end to end: a literal-seeded accumulator
     // concretizes the loop element (`best = ""` → Item = String; `s = 0`

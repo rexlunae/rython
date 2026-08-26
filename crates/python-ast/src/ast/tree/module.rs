@@ -230,6 +230,30 @@ impl CodeGen for Module {
             options.hierarchy_classes = std::rc::Rc::new(hierarchy);
         }
 
+        // Functions whose unannotated parameter is isinstance-dispatched
+        // monomorphize at conversion time (specialize.rs): one variant per
+        // tested type plus a residual, with call sites dispatched by the
+        // argument's static type. The registry is computed once so the
+        // renderer and every call site agree.
+        {
+            let mut classes = Vec::new();
+            collect_class_defs(&self.raw.body, &mut classes);
+            let class_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
+            let mut registry = crate::ast::tree::specialize::SpecRegistry::new();
+            for stmt in &self.raw.body {
+                if let crate::ast::tree::StatementType::FunctionDef(f) = &stmt.statement {
+                    if let Some(spec) = crate::ast::tree::specialize::detect_specializable(
+                        f,
+                        &symbols,
+                        &class_names,
+                    ) {
+                        registry.insert(f.name.clone(), spec);
+                    }
+                }
+            }
+            options.specialized_fns = std::rc::Rc::new(registry);
+        }
+
         // Trait method signatures widen to `&mut self` when ANY definition
         // in the hierarchy mutates self: overrides re-emit into the ROOT
         // class's trait (the first class in the chain that defines the

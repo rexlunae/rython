@@ -576,7 +576,14 @@ sort), `min`/`max` (Python's NaN-fold semantics), `sum`, `abs`, `round`
 `enumerate`, `zip`, `map`/`filter`, `all`/`any`, `repr`, `hash`
 (CPython's algorithms under `PYTHONHASHSEED=0`, including siphash13 for
 strings over the internal representation), `ord`/`chr`, `isinstance`
-(on statically-known types only — otherwise a loud error), and the
+(decided at conversion time on statically-known types, walking the class
+inheritance tree — `isinstance(dog, Animal)` folds true for `dog: Dog` —
+with constant branches pruned; a module function whose unannotated
+parameter is isinstance-dispatched in plain `if` tests monomorphizes
+into one specialized Rust function per input type plus a generic
+residual, with call sites bound by static argument type; other
+inferred-generic shapes lower to false with the class-as-value
+divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
 (`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
 they lower unresolved and fail in rustc, §12.1; set and tuple
