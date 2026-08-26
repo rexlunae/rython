@@ -5763,6 +5763,77 @@ fn isinstance_dispatch_specializes_by_input_type() {
 }
 
 #[test]
+fn isinstance_dispatch_emits_a_dynamic_router() {
+    // A single-parameter specialized function whose morphs share a return
+    // type also gets a RUNTIME router under the original name: a closed
+    // argument enum (one variant per morph + `Other(PyValue)`), `From<T>`
+    // per morph so callers pass plain values through `impl Into`, and
+    // `From<PyValue>` routing a boxed value in Python's first-true-test
+    // order. A call site whose argument is boxed (a `str | int` return)
+    // dispatches through the router instead of failing.
+    let src = concat!(
+        "class Animal:\n",
+        "    def __init__(self, name: str):\n",
+        "        self.name = name\n",
+        "\n",
+        "class Dog(Animal):\n",
+        "    def __init__(self, name: str):\n",
+        "        super().__init__(name)\n",
+        "\n",
+        "def label(x):\n",
+        "    if isinstance(x, str):\n",
+        "        return \"word\"\n",
+        "    if isinstance(x, int):\n",
+        "        return \"count\"\n",
+        "    if isinstance(x, Animal):\n",
+        "        return \"pet\"\n",
+        "    return \"mystery\"\n",
+        "\n",
+        "def pick(flag: bool) -> str | int:\n",
+        "    if flag:\n",
+        "        return \"fox\"\n",
+        "    return 42\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(label(pick(True)))\n",
+    );
+    let (out, warnings) = compile_with_warnings(src, "router.py");
+    for entry in [
+        "enum LabelArg",
+        "Other (stdpython :: PyValue)",
+        "impl From < String > for LabelArg",
+        "impl From < & str > for LabelArg",
+        "impl From < i64 > for LabelArg",
+        "impl From < Animal > for LabelArg",
+        "impl From < Dog > for LabelArg",
+        "impl From < stdpython :: PyValue > for LabelArg",
+        "pub fn label (x : impl Into < LabelArg > ,)",
+        "fn from_py_value",
+    ] {
+        assert!(out.contains(entry), "missing {entry}: {}", out);
+    }
+    // A boxed bool routes to the int morph (bool ⊂ int in Python) — the
+    // recorded divergence.
+    assert!(
+        out.contains("stdpython :: PyValue :: Bool (v) => LabelArg :: Int (v as i64)"),
+        "boxed bool must map to the int morph: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("maps a boxed bool to the int morph")),
+        "the bool→int routing divergence must be reported: {:?}",
+        warnings
+    );
+    // The boxed call site goes through the router (the original name), not
+    // a compile-time variant and not a loud error.
+    assert!(
+        out.contains("label ((pick") || out.contains("label (pick"),
+        "a boxed argument must dispatch through the router: {}",
+        out
+    );
+}
+
+#[test]
 fn classes_emit_the_type_level_inheritance_tree() {
     // Every class carries `impl PyInherits<Ancestor> for Class` for its
     // full base chain (reflexive included) — the generic inheritance tree

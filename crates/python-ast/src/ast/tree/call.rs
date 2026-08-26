@@ -5725,6 +5725,52 @@ impl<'a> CodeGen for Call {
                 )
                 .into());
             };
+            // A BOXED argument (PyValue — a heterogeneous-union value, a
+            // call whose mixed returns unified to the box) has no static
+            // type to dispatch on; when the dynamic router exists, the
+            // dispatch happens at RUNTIME through it instead.
+            let is_boxed = match axis_arg {
+                ExprType::Name(n) => matches!(
+                    options.name_types.get(&n.id),
+                    Some(crate::TypeInfo::PyValue)
+                ),
+                ExprType::Call(c) => matches!(
+                    crate::ast::tree::type_ctx::call_return_typeinfo(
+                        c,
+                        Some(&symbols),
+                        Some(&options),
+                    ),
+                    Some(crate::TypeInfo::PyValue)
+                ),
+                _ => false,
+            };
+            if is_boxed {
+                if spec.router.is_some() {
+                    // The router takes `impl Into<Enum>`, and the enum
+                    // implements From<PyValue> (first-true-test routing),
+                    // so the boxed value passes through unadorned.
+                    let orig = crate::safe_ident(&callee_name.id);
+                    let a = axis_arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let call = quote!(#orig(#a));
+                    return Ok(if propagates_exceptions {
+                        quote!((#call)?)
+                    } else {
+                        call
+                    });
+                }
+                return Err(format!(
+                    "cannot dispatch `{}` on a boxed value: its dynamic \
+                     router is unavailable (the morphs' return types \
+                     differ, or the function takes more than one \
+                     parameter); annotate the value with a concrete type",
+                    callee_name.id
+                )
+                .into());
+            }
             let type_info_py_name = |t: &crate::TypeInfo| -> Option<String> {
                 match t {
                     crate::TypeInfo::Int => Some("int".into()),

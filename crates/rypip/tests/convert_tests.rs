@@ -1223,6 +1223,90 @@ fn isinstance_dispatch_specializes_and_matches_python_at_runtime() {
 }
 
 #[test]
+fn isinstance_dynamic_router_routes_boxed_values_at_runtime() {
+    // The dynamic router end to end: statically-typed call sites still
+    // bind their compile-time morph directly, while a BOXED argument (a
+    // `str | int` return, PyValue at runtime) passes through the
+    // `impl Into<LabelArg>` router under the original function name and
+    // is routed by From<PyValue> in Python's first-true-test order.
+    // Output must match CPython exactly.
+    let scratch = Scratch::new("isinstance-router");
+    let file = scratch.path().join("router.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"...\"\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        super().__init__(name)\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "def label(x):\n",
+            "    if isinstance(x, str):\n",
+            "        return \"word: \" + x\n",
+            "    if isinstance(x, int):\n",
+            "        return \"count: \" + str(x)\n",
+            "    if isinstance(x, Animal):\n",
+            "        return \"pet \" + x.name + \": \" + x.speak()\n",
+            "    return \"mystery\"\n",
+            "\n",
+            "def pick(flag: bool) -> str | int:\n",
+            "    if flag:\n",
+            "        return \"fox\"\n",
+            "    return 42\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(label(\"fox\"))\n",
+            "    print(label(12))\n",
+            "    print(label(Dog(\"rex\")))\n",
+            "    print(label(2.5))\n",
+            "    print(label(pick(True)))\n",
+            "    print(label(pick(False)))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let generated = fs::read_to_string(krate.root.join("src/router.rs")).unwrap();
+    assert!(
+        generated.contains("impl Into<LabelArg>"),
+        "the router must take impl Into<LabelArg>: {}",
+        generated
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/router"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "word: fox",
+            "count: 12",
+            "pet rex: woof",
+            "mystery",
+            "word: fox",
+            "count: 42",
+        ],
+        "dynamic router dispatch diverged from CPython"
+    );
+}
+
+#[test]
 fn inference_seed_unification_and_return_unification_at_runtime() {
     // Parameter type inference end to end: a literal-seeded accumulator
     // concretizes the loop element (`best = ""` → Item = String; `s = 0`

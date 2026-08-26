@@ -86,6 +86,54 @@ pub struct SpecializedFn {
     /// each isinstance folds through the inheritance tree and `x.speak()`
     /// keeps Cat's own override, exactly like CPython.
     pub class_variants: Vec<String>,
+    /// The DYNAMIC router, when every morph's return type unifies: a
+    /// closed-world argument enum (`DescribeArg`, one variant per morph
+    /// plus `Other(PyValue)`) and a function under the ORIGINAL Python
+    /// name that matches on it — runtime dispatch over the compile-time
+    /// morphs, for boxed values and for Rust callers with runtime-varying
+    /// data. None when the morphs' return types disagree or a name would
+    /// collide; static call-site dispatch is unaffected either way.
+    pub router: Option<RouterPlan>,
+}
+
+/// The emitted shape of a dynamic router (see `SpecializedFn::router`).
+#[derive(Clone, Debug)]
+pub struct RouterPlan {
+    /// The argument-enum name (`DescribeArg`).
+    pub enum_name: String,
+    /// The unified Python return-type id of every morph ("str", "int",
+    /// a class name, ...).
+    pub return_id: String,
+}
+
+/// snake_case → PascalCase for the router enum and its variants.
+pub fn to_pascal(name: &str) -> String {
+    name.split('_')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            let mut c = seg.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// The Rust type a Python type id lowers to in router positions.
+pub fn py_type_tokens(id: &str) -> proc_macro2::TokenStream {
+    use quote::quote;
+    match id {
+        "int" => quote!(i64),
+        "float" => quote!(f64),
+        "bool" => quote!(bool),
+        "str" => quote!(String),
+        "bytes" => quote!(Vec<u8>),
+        class => {
+            let ident = crate::safe_ident(class);
+            quote!(#ident)
+        }
+    }
 }
 
 /// The registry of specializable module functions, built once per module
@@ -181,6 +229,7 @@ pub fn detect_specializable(
     f: &crate::FunctionDef,
     symbols: &SymbolTableScopes,
     module_classes: &[String],
+    options: &crate::PythonOptions,
 ) -> Option<SpecializedFn> {
     // Plain positional signatures only: dispatch rewrites call sites
     // positionally.
@@ -272,11 +321,13 @@ pub fn detect_specializable(
     if mangled.iter().any(|m| symbols.get(m).is_some() || !seen.insert(m.clone())) {
         return None;
     }
+    let router = plan_router(f, &axis.1, &targets, &class_variants, symbols, options);
     Some(SpecializedFn {
         axis: axis.0,
         axis_name: axis.1.clone(),
         targets,
         class_variants,
+        router,
     })
 }
 
@@ -368,6 +419,68 @@ fn visit_statement_exprs(stmt: &StatementType, f: &mut impl FnMut(&ExprType)) {
 /// the tested set.
 pub fn prune_axis_isinstance(body: &[Statement], axis: &str) -> Vec<Statement> {
     fold_axis_tests(body, axis, &|_| false)
+}
+
+/// Decide whether the dynamic router can exist: every morph (builtin
+/// variants, per-class variants, and the residual) must derive the SAME
+/// return type, and the enum/variant names must be free. Disagreeing
+/// returns disable only the router — static dispatch is unaffected.
+fn plan_router(
+    f: &crate::FunctionDef,
+    axis: &str,
+    targets: &[SpecTarget],
+    class_variants: &[String],
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<RouterPlan> {
+    // Single-parameter functions only: a router for a multi-parameter
+    // function would have to thread the other (possibly generic)
+    // parameters through the enum signature.
+    if f.args.args.len() != 1 {
+        return None;
+    }
+    let morphs: Vec<SpecTarget> = targets
+        .iter()
+        .filter(|t| matches!(t, SpecTarget::Builtin(_)))
+        .cloned()
+        .chain(class_variants.iter().map(|c| SpecTarget::Class(c.clone())))
+        .collect();
+    let mut return_id: Option<String> = None;
+    for morph in &morphs {
+        let folded = fold_variant_body(&f.body, axis, morph, symbols);
+        let id = derive_return_type_id(&folded, axis, Some(morph), options, symbols)?;
+        match &return_id {
+            None => return_id = Some(id),
+            Some(prev) if *prev == id => {}
+            Some(_) => return None,
+        }
+    }
+    let residual = prune_axis_isinstance(&f.body, axis);
+    let residual_id = derive_return_type_id(&residual, axis, None, options, symbols)?;
+    let return_id = return_id?;
+    if residual_id != return_id {
+        return None;
+    }
+    let enum_name = format!("{}Arg", to_pascal(&f.name));
+    if symbols.get(&enum_name).is_some() {
+        return None;
+    }
+    // Variant idents must be distinct (two classes differing only in
+    // case would collide after Pascal-casing the builtins).
+    let mut idents = std::collections::HashSet::new();
+    for morph in &morphs {
+        let ident = match morph {
+            SpecTarget::Builtin(b) => to_pascal(b),
+            SpecTarget::Class(c) => c.clone(),
+        };
+        if !idents.insert(ident) {
+            return None;
+        }
+    }
+    if idents.contains("Other") {
+        return None;
+    }
+    Some(RouterPlan { enum_name, return_id })
 }
 
 /// The compile-time truth of `isinstance(<axis>: <variant type>, T)` —
@@ -485,20 +598,38 @@ pub fn derive_return_annotation(
     options: &crate::PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<ExprType> {
+    derive_return_type_id(body, axis, Some(variant), options, symbols)
+        .map(|id| ExprType::Name(crate::ast::tree::name::Name { id }))
+}
+
+/// The unified Python type NAME of a morph body's returns ("str", "int",
+/// a class name, ...), used both to annotate the emitted variant and to
+/// decide whether the DYNAMIC ROUTER can exist (all morphs must agree).
+/// `variant: None` types the residual, whose axis is unknown — returns
+/// involving the axis then fail to unify, correctly disabling the router.
+pub fn derive_return_type_id(
+    body: &[Statement],
+    axis: &str,
+    variant: Option<&SpecTarget>,
+    options: &crate::PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
     let mut opts = options.clone();
     let mut name_types = opts.name_types.as_ref().clone();
-    let axis_ti = match variant {
-        SpecTarget::Builtin(b) => match b.as_str() {
-            "int" => crate::TypeInfo::Int,
-            "float" => crate::TypeInfo::Float,
-            "bool" => crate::TypeInfo::Bool,
-            "str" => crate::TypeInfo::String,
-            "bytes" => crate::TypeInfo::Bytes,
-            _ => return None,
-        },
-        SpecTarget::Class(c) => crate::TypeInfo::Class(c.clone()),
-    };
-    name_types.insert(axis.to_string(), axis_ti);
+    if let Some(variant) = variant {
+        let axis_ti = match variant {
+            SpecTarget::Builtin(b) => match b.as_str() {
+                "int" => crate::TypeInfo::Int,
+                "float" => crate::TypeInfo::Float,
+                "bool" => crate::TypeInfo::Bool,
+                "str" => crate::TypeInfo::String,
+                "bytes" => crate::TypeInfo::Bytes,
+                _ => return None,
+            },
+            SpecTarget::Class(c) => crate::TypeInfo::Class(c.clone()),
+        };
+        name_types.insert(axis.to_string(), axis_ti);
+    }
     let info = crate::analyze_function_types(body, Some(&opts), Some(symbols));
     for (k, v) in info.name_types {
         name_types.entry(k).or_insert(v);
@@ -529,7 +660,7 @@ pub fn derive_return_annotation(
         crate::TypeInfo::Class(c) => c,
         _ => return None,
     };
-    Some(ExprType::Name(crate::ast::tree::name::Name { id }))
+    Some(id)
 }
 
 /// `infer_type` plus one rule it cannot state: `a + b` where EITHER side

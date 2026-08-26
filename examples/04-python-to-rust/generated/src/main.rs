@@ -314,6 +314,52 @@ pub fn label_int(value: i64) -> Result<String, PyException> {
 pub fn label_any<T>(_value: T) -> Result<String, PyException> {
     return Ok(("something else").to_string());
 }
+#[doc = "The dispatch argument for `label`: one variant per compile-time morph, `Other` for everything else."]
+#[derive(Clone)]
+pub enum LabelArg {
+    Str(String),
+    Int(i64),
+    Other(stdpython::PyValue),
+}
+impl From<String> for LabelArg {
+    fn from(v: String) -> Self {
+        LabelArg::Str(v)
+    }
+}
+impl From<&str> for LabelArg {
+    fn from(v: &str) -> Self {
+        LabelArg::Str(v.to_string())
+    }
+}
+impl From<i64> for LabelArg {
+    fn from(v: i64) -> Self {
+        LabelArg::Int(v)
+    }
+}
+impl LabelArg {
+    #[doc = r" Route a BOXED runtime value to its morph."]
+    pub fn from_py_value(v: stdpython::PyValue) -> Self {
+        match v {
+            stdpython::PyValue::Str(v) => LabelArg::Str(v),
+            stdpython::PyValue::Int(v) => LabelArg::Int(v),
+            stdpython::PyValue::Bool(v) => LabelArg::Int(v as i64),
+            other => LabelArg::Other(other),
+        }
+    }
+}
+impl From<stdpython::PyValue> for LabelArg {
+    fn from(v: stdpython::PyValue) -> Self {
+        Self::from_py_value(v)
+    }
+}
+#[doc = "Dynamic router for `label`: dispatches a runtime-typed argument to the compile-time morphs, in Python's first-true-test order."]
+pub fn label(x: impl Into<LabelArg>) -> Result<String, PyException> {
+    match x.into() {
+        LabelArg::Str(v) => label_str(v),
+        LabelArg::Int(v) => label_int(v),
+        LabelArg::Other(v) => label_any(v),
+    }
+}
 fn main() {
     let __rython_result = (|| -> Result<(), PyException> {
         let mut tally;

@@ -591,7 +591,139 @@ impl FunctionDef {
         let mut fold = options.residual_fold_false.as_ref().clone();
         fold.insert(spec.axis_name.clone());
         ropts.residual_fold_false = std::rc::Rc::new(fold);
-        out.extend(residual.to_rust(ctx, ropts, symbols)?);
+        out.extend(residual.to_rust(ctx, ropts, symbols.clone())?);
+
+        // ---- The dynamic router ----
+        // A closed-world argument enum (one variant per morph, plus a
+        // boxed Other) and a function under the ORIGINAL Python name that
+        // matches on it: runtime dispatch over the compile-time morphs,
+        // for boxed values and for Rust callers with runtime-varying
+        // data. Emitted only when every morph derived the same return
+        // type (planned at detection time).
+        if let Some(router) = &spec.router
+            && options.with_std_python
+        {
+            use crate::ast::tree::specialize::{py_type_tokens, to_pascal, SpecTarget};
+            let enum_ident = crate::safe_ident(&router.enum_name);
+            let orig_ident = crate::safe_ident(&self.name);
+            let ret_ty = py_type_tokens(&router.return_id);
+            let any_ident = crate::safe_ident(
+                &crate::ast::tree::specialize::mangled_name(&self.name, "any"),
+            );
+
+            let mut enum_variants = TokenStream::new();
+            let mut from_impls = TokenStream::new();
+            let mut match_arms = TokenStream::new();
+            let mut boxed_arms = TokenStream::new();
+            let mut has_bool_morph = false;
+            let mut has_int_morph = false;
+            for target in &variant_types {
+                let var_ident = crate::safe_ident(&match target {
+                    SpecTarget::Builtin(b) => to_pascal(b),
+                    SpecTarget::Class(c) => c.clone(),
+                });
+                let ty = py_type_tokens(target.suffix());
+                let morph = crate::safe_ident(
+                    &crate::ast::tree::specialize::mangled_name(
+                        &self.name,
+                        target.suffix(),
+                    ),
+                );
+                enum_variants.extend(quote!(#var_ident(#ty),));
+                from_impls.extend(quote! {
+                    impl From<#ty> for #enum_ident {
+                        fn from(v: #ty) -> Self {
+                            #enum_ident::#var_ident(v)
+                        }
+                    }
+                });
+                match_arms.extend(quote! {
+                    #enum_ident::#var_ident(v) => #morph(v),
+                });
+                if let SpecTarget::Builtin(b) = target {
+                    match b.as_str() {
+                        "bool" => has_bool_morph = true,
+                        "int" => has_int_morph = true,
+                        _ => {}
+                    }
+                    let pv_variant = crate::safe_ident(&to_pascal(b));
+                    boxed_arms.extend(quote! {
+                        stdpython::PyValue::#pv_variant(v) =>
+                            #enum_ident::#var_ident(v),
+                    });
+                    if b == "str" {
+                        // Convenience for Rust callers with &str literals.
+                        from_impls.extend(quote! {
+                            impl From<&str> for #enum_ident {
+                                fn from(v: &str) -> Self {
+                                    #enum_ident::#var_ident(v.to_string())
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            // bool ⊂ int: a BOXED True with an int-tested axis takes
+            // Python's int arm. The morph sees an i64, so `str(x)` inside
+            // it renders 1, not True — recorded as a divergence warning.
+            if !has_bool_morph && has_int_morph {
+                let int_ident = crate::safe_ident(&to_pascal("int"));
+                boxed_arms.extend(quote! {
+                    stdpython::PyValue::Bool(v) =>
+                        #enum_ident::#int_ident(v as i64),
+                });
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`{}`'s dynamic router maps a boxed bool to the int \
+                     morph (bool is a subclass of int); str(x) inside that \
+                     arm renders the integer, not True/False",
+                    self.name
+                ));
+            }
+
+            let enum_doc = format!(
+                "The dispatch argument for `{}`: one variant per \
+                 compile-time morph, `Other` for everything else.",
+                self.name
+            );
+            let router_doc = format!(
+                "Dynamic router for `{}`: dispatches a runtime-typed \
+                 argument to the compile-time morphs, in Python's \
+                 first-true-test order.",
+                self.name
+            );
+            out.extend(quote! {
+                #[doc = #enum_doc]
+                #[derive(Clone)]
+                pub enum #enum_ident {
+                    #enum_variants
+                    Other(stdpython::PyValue),
+                }
+                #from_impls
+                impl #enum_ident {
+                    /// Route a BOXED runtime value to its morph.
+                    pub fn from_py_value(v: stdpython::PyValue) -> Self {
+                        match v {
+                            #boxed_arms
+                            other => #enum_ident::Other(other),
+                        }
+                    }
+                }
+                impl From<stdpython::PyValue> for #enum_ident {
+                    fn from(v: stdpython::PyValue) -> Self {
+                        Self::from_py_value(v)
+                    }
+                }
+                #[doc = #router_doc]
+                pub fn #orig_ident(
+                    x: impl Into<#enum_ident>,
+                ) -> Result<#ret_ty, PyException> {
+                    match x.into() {
+                        #match_arms
+                        #enum_ident::Other(v) => #any_ident(v),
+                    }
+                }
+            });
+        }
         Ok(out)
     }
 

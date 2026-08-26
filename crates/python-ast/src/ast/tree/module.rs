@@ -246,6 +246,7 @@ impl CodeGen for Module {
                         f,
                         &symbols,
                         &class_names,
+                        &options,
                     ) {
                         registry.insert(f.name.clone(), spec);
                     }
