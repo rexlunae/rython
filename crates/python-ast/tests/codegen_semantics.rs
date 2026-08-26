@@ -9065,3 +9065,52 @@ fn two_arg_decode_on_bytes_receiver_lowers_through_pydecode() {
         out
     );
 }
+
+// ---- Issue #133 (completion): sum() on generic arguments ----
+
+#[test]
+fn generic_sum_return_projects_the_output() {
+    // `return sum(p)` on an unannotated parameter: the bound is the
+    // associated-Output PySum and the return type is its projection, so
+    // one generic function serves int AND float lists.
+    let out = compile("def total(xs):\n    return sum(xs)\n", "sumret.py");
+    assert!(
+        out.contains("T : PySum"),
+        "sum on a parameter must bound PySum: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < < T as PySum > :: Output , PyException >"),
+        "the return must project the Output: {}",
+        out
+    );
+}
+
+#[test]
+fn sum_into_a_typed_slot_pins_the_output() {
+    // The issue's calc: `chunks = [sum(xs)]` where chunks was seeded
+    // Vec<i64> by `chunks.append(len(xs))` — the slot's element type
+    // pins the trait's Output (`T: PySum<Output = i64>`), which rustc
+    // will not infer across the generic boundary; the plain PySum bound
+    // is subsumed.
+    let out = compile(
+        concat!(
+            "def calc(xs):\n",
+            "    chunks = []\n",
+            "    chunks.append(len(xs))\n",
+            "    chunks = [sum(xs)]\n",
+            "    return chunks\n",
+        ),
+        "sumpin.py",
+    );
+    assert!(
+        out.contains("T : PySum < Output = i64 >"),
+        "the typed slot must pin the Output: {}",
+        out
+    );
+    assert!(
+        !out.contains("T : PySum ,"),
+        "the plain bound is subsumed by the pinned one: {}",
+        out
+    );
+}

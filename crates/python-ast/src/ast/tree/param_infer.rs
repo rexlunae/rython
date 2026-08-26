@@ -994,6 +994,113 @@ pub fn infer_unannotated_signature(
         }
     }
 
+    // Issue #133 (calc): a sum() result stored into an ALREADY-TYPED slot
+    // pins the trait's associated Output — `chunks = [sum(xs)]` after the
+    // i64-seeded `chunks.append(len(xs))` needs `T: PySum<Output = i64>`,
+    // which rustc will not infer across the generic boundary. The
+    // per-body type analysis carries the target's FINAL type (the same
+    // source the empty-list store renders from).
+    {
+        let sum_on_param = |e: &ExprType, collector: &Collector| -> Option<String> {
+            if let ExprType::Call(c) = e
+                && let ExprType::Name(f) = c.func.as_ref()
+                && f.id == "sum"
+                && !matches!(
+                    symbols.get("sum"),
+                    Some(crate::SymbolTableNode::FunctionDef(_))
+                )
+                && let Some(ExprType::Name(p)) = c.args.first()
+            {
+                let root = collector.alias_root_of(&p.id);
+                if tv_names.contains_key(&root) {
+                    return Some(root);
+                }
+            }
+            None
+        };
+        let scalar = |ti: &TypeInfo| -> Option<TokenStream> {
+            match ti {
+                TypeInfo::Int => Some(quote!(i64)),
+                TypeInfo::Float => Some(quote!(f64)),
+                _ => None,
+            }
+        };
+        let mut pins: Vec<(String, TokenStream)> = Vec::new();
+        let info = crate::analyze_function_types(body, Some(options), Some(symbols));
+        let mut stack: Vec<&[Statement]> = vec![body];
+        while let Some(stmts) = stack.pop() {
+            for stmt in stmts {
+                match &stmt.statement {
+                    crate::StatementType::Assign(a) => {
+                        let [ExprType::Name(t)] = a.targets.as_slice() else {
+                            continue;
+                        };
+                        match &a.value {
+                            ExprType::List(elts) => {
+                                let Some(TypeInfo::Vec(inner)) = info.name_types.get(&t.id)
+                                else {
+                                    continue;
+                                };
+                                let Some(ety) = scalar(inner) else { continue };
+                                for e in elts {
+                                    if let Some(p) = sum_on_param(e, &collector) {
+                                        pins.push((p, ety.clone()));
+                                    }
+                                }
+                            }
+                            other => {
+                                if let Some(p) = sum_on_param(other, &collector)
+                                    && let Some(ety) =
+                                        info.name_types.get(&t.id).and_then(&scalar)
+                                {
+                                    pins.push((p, ety));
+                                }
+                            }
+                        }
+                    }
+                    crate::StatementType::If(s) => {
+                        stack.push(&s.body);
+                        stack.push(&s.orelse);
+                    }
+                    crate::StatementType::For(s) => {
+                        stack.push(&s.body);
+                        stack.push(&s.orelse);
+                    }
+                    crate::StatementType::While(s) => {
+                        stack.push(&s.body);
+                        stack.push(&s.orelse);
+                    }
+                    crate::StatementType::With(s) => stack.push(&s.body),
+                    crate::StatementType::Try(s) => {
+                        stack.push(&s.body);
+                        stack.push(&s.orelse);
+                        stack.push(&s.finalbody);
+                        for h in &s.handlers {
+                            stack.push(&h.body);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (p, ety) in pins {
+            if let Some(tv) = tv_names.get(&p) {
+                let tv = quote::format_ident!("{}", tv);
+                let bound = quote!(#tv: PySum<Output = #ety>);
+                // The pinned bound subsumes the plain `T: PySum` the
+                // builtin requirement emitted.
+                let plain = quote!(#tv: PySum).to_string();
+                where_bounds.retain(|b| b.to_string() != plain);
+                if !where_bounds
+                    .iter()
+                    .any(|b| b.to_string() == bound.to_string())
+                {
+                    where_bounds.push(bound);
+                }
+            }
+        }
+    }
+
     // M5 definition-time warning: a bound set no known type satisfies
     // (`p.upper()` + `p.pop()` → PyStrOps + PyPop) is a well-formed
     // Python definition — it never blocks conversion, but it is reported
@@ -1541,6 +1648,16 @@ fn return_type_of(
                             && let Some(tv) = param_tv(&n.id)
                         {
                             return Ok(quote!(<#tv as PyAbs>::Output));
+                        }
+                    }
+                    // `return sum(p)` on an unannotated parameter: the
+                    // trait's associated Output (issue #133's calc).
+                    "sum" => {
+                        if let Some(arg) = c.args.first()
+                            && let ExprType::Name(n) = arg
+                            && let Some(tv) = param_tv(&n.id)
+                        {
+                            return Ok(quote!(<#tv as PySum>::Output));
                         }
                     }
                     _ => {}
@@ -2593,6 +2710,15 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
         // CPython's AttributeError, loud here. (A Bytes argument answers
         // through the permissive `uncertain` arm above.)
         "PyDecode" => matches!(ty, TypeInfo::Bytes),
+        // sum(p): numeric (and bool — bool ⊂ int) lists sum; a str/dict
+        // argument is CPython's TypeError, loud here.
+        "PySum" => matches!(
+            ty,
+            TypeInfo::Vec(inner) if matches!(
+                **inner,
+                TypeInfo::Int | TypeInfo::Float | TypeInfo::Bool
+            )
+        ),
         "PyListOps" => matches!(ty, TypeInfo::Vec(_)),
         "PyPop" => match (ty, rhs) {
             (TypeInfo::Vec(_), Some(TypeInfo::Int)) => true,
@@ -3613,6 +3739,11 @@ impl<'a> Collector<'a> {
                             "bool" => Some(ParamReq::Conversion("PyBool")),
                             "str" => Some(ParamReq::Conversion("PyToString")),
                             "abs" => Some(ParamReq::Conversion("PyAbs")),
+                            // sum(p): the associated-Output trait — a use
+                            // context may further pin the Output (issue
+                            // #133's calc, where the target list is
+                            // already element-typed).
+                            "sum" => Some(ParamReq::Conversion("PySum")),
                             "len" => Some(ParamReq::Len),
                             "repr" => Some(ParamReq::Repr),
                             "hash" => Some(ParamReq::Hash),

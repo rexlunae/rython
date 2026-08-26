@@ -6523,3 +6523,55 @@ fn unknown_typed_isinstance_dispatch_matches_python_at_runtime() {
         "unknown-typed isinstance dispatch diverged from CPython"
     );
 }
+
+#[test]
+fn generic_sum_matches_python_at_runtime() {
+    // Issue #133 (completion): sum() on generic and concrete arguments —
+    // the associated-Output PySum serves int and float lists through one
+    // generic function, a bool list counts the Trues (bool ⊂ int), and
+    // the issue's calc shape pins the Output through its typed slot.
+    let scratch = Scratch::new("sumgen");
+    let file = scratch.path().join("sumgen.py");
+    fs::write(
+        &file,
+        concat!(
+            "def calc(xs):\n",
+            "    chunks = []\n",
+            "    chunks.append(len(xs))\n",
+            "    chunks = [sum(xs)]\n",
+            "    return chunks\n",
+            "\n",
+            "def total(xs):\n",
+            "    return sum(xs)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(calc([1, 2, 3]))\n",
+            "    print(total([1, 2, 3]))\n",
+            "    print(total([1.5, 2.5]))\n",
+            "    print(total([True, False, True]))\n",
+            "    print(sum([10, 20, 30]))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/sumgen"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["[6]", "6", "4.0", "2", "60"],
+        "sum() semantics diverged from CPython"
+    );
+}

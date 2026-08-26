@@ -631,7 +631,11 @@ Available without import (implemented in `stdpython`, re-exported into
 every generated module): `print` (with `sep`/`end`; `file=` is a loud
 error), `len`, `range` (lazy), `open`, `input`, `sorted`/`sort` (stable;
 `key=` evaluated once per element; `reverse=` is a stable descending
-sort), `min`/`max` (Python's NaN-fold semantics), `sum`, `abs`, `round`
+sort), `min`/`max` (Python's NaN-fold semantics), `sum` (the
+associated-Output `PySum` trait — int, float, and bool lists, bool
+counting the Trues; on a generic parameter the return projects
+`<T as PySum>::Output`, and a sum stored into an already-typed slot
+pins the Output, issue #133), `abs`, `round`
 (half-to-even; `round(x, n)` decimal-correct), `pow`, `divmod`,
 `enumerate`, `zip`, `map`/`filter`, `all`/`any`, `repr`, `hash`
 (CPython's algorithms under `PYTHONHASHSEED=0`, including siphash13 for
