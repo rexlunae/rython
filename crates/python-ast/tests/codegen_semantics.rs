@@ -10025,3 +10025,28 @@ fn plain_import_of_external_root_is_not_aliased_onto_crate_modules() {
         warnings.borrow()
     );
 }
+/// Issue #163: an annotated empty dict keeps its element types when the
+/// subscript stores are inside a loop. The loop-variable store
+/// (`d[i] = i`, with `i` untyped) previously produced an unknown-key /
+/// unknown-value pinning suggestion whose PyValue value absorbed the
+/// annotated `dict[int, int]` in `unify`, downgrading the literal to
+/// `PyDict<String, PyValue>` (and the i64-key store then failed to
+/// compile). An existing container type must win over unknown
+/// suggestions.
+#[test]
+fn annotated_empty_dict_keeps_types_inside_loop() {
+    let out = compile(
+        "def main() -> int:\n\
+         \x20   d: dict[int, int] = {}\n\
+         \x20   for i in range(2):\n\
+         \x20       d[i] = i\n\
+         \x20   print(d[0])\n\
+         \x20   return 0\n",
+        "dictloop.py",
+    );
+    assert!(
+        out.contains("PyDict :: < i64 , i64 > :: from ([])"),
+        "the annotated element types must survive the loop: {}",
+        out
+    );
+}
