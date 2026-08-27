@@ -205,6 +205,15 @@ impl CodeGen for Constant {
                     .to_string()
                     .parse()
                     .map_err(|e| format!("cannot render constant `{}` as Rust tokens: {}", c, e))?;
+                // A bytes literal is an OWNED value in Python; the typed
+                // paths already declare it Vec<u8> (simple_expr_type), so
+                // the rendering must agree — a bare `b".."` is a
+                // `&[u8; N]` that fails every Vec-typed position
+                // (`return Ok(b"")` — urllib3's emscripten response).
+                // AsRef<[u8]> receivers accept the Vec the same.
+                if matches!(&c, Literal::ByteString(_)) {
+                    return Ok(quote!(#v.to_vec()));
+                }
                 Ok(quote!(#v))
             }
             None => Ok(quote!(None)),

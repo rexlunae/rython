@@ -10394,3 +10394,37 @@ fn mixed_dict_literal_with_nested_dict_boxes_values() {
         out
     );
 }
+
+/// Issue #137 round 21: a bytes literal is an OWNED value — the typed
+/// paths declare it Vec<u8>, so the rendering agrees (`b"".to_vec()`),
+/// and `return Ok(b"")` against a Result<Vec<u8>> signature compiles
+/// (urllib3's emscripten response).
+#[test]
+fn bytes_literals_render_owned() {
+    let out = compile(
+        "def empty() -> bytes:\n    return b\"\"\n",
+        "ownedbytes.py",
+    );
+    assert!(
+        out.contains("b\"\" . to_vec ()"),
+        "the bytes literal must render owned: {}",
+        out
+    );
+}
+
+/// Issue #137 round 21: a class defining `__len__` participates in the
+/// len() protocol — `len(x)` lowers to `stdpython::len(&x)` bound on
+/// `Len`, so the impl must exist (urllib3's BytesQueueBuffer).
+#[test]
+fn class_with_dunder_len_implements_len() {
+    let out = compile(
+        "class Buf:\n    def __init__(self):\n        self._size = 0\n\n\
+         \x20   def __len__(self) -> int:\n        return self._size\n",
+        "lenbuf.py",
+    );
+    assert!(
+        out.contains("impl stdpython :: Len for Buf"),
+        "__len__ must produce the Len impl: {}",
+        out
+    );
+}

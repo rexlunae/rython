@@ -2794,6 +2794,28 @@ impl CodeGen for ClassDef {
             quote!()
         };
 
+        // A class with `__len__` participates in the len() protocol:
+        // `len(x)` lowers to `stdpython::len(&x)` bound on `Len`.
+        // stdpython's len() is infallible like Rust's, so a raising
+        // `__len__` becomes a loud abort (the §12.2 raise-in-infallible
+        // divergence) — never a silent 0.
+        let len_impl = if options.with_std_python
+            && self.methods().any(|m| m.name == "__len__")
+        {
+            quote! {
+                impl stdpython::Len for #class_name {
+                    fn len(&self) -> usize {
+                        match self.__len__() {
+                            Ok(n) => n as usize,
+                            Err(e) => panic!("{}", e),
+                        }
+                    }
+                }
+            }
+        } else {
+            quote!()
+        };
+
         Ok(quote! {
             #docs
             #[derive(Clone, Default)]
@@ -2805,6 +2827,7 @@ impl CodeGen for ClassDef {
             // (issue #137).
             #class_lazylock_constants
             #inherits_tree
+            #len_impl
             #trait_stream
             impl #class_name {
                 #class_constants
