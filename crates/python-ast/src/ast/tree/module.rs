@@ -845,11 +845,18 @@ impl CodeGen for Module {
                 // nothing — their annotations resolve to the boxed PyValue.
                 if Self::is_type_checking_test(&if_stmt.test) {
                     for body_stmt in &if_stmt.body {
-                        let render_import = match &body_stmt.statement {
+                        // Filtered PER NAME, not all-or-nothing: `from
+                        // .ssl_ import _TYPE_PEER_CERT_RET,
+                        // _TYPE_PEER_CERT_RET_DICT` (urllib3's
+                        // ssltransport) pairs a generated type alias with
+                        // a TYPE_CHECKING-only TypedDict stub — the alias
+                        // still needs its `use` (annotations reference
+                        // it) while the stub must not emit one (E0432).
+                        let renderable = match &body_stmt.statement {
                             crate::StatementType::ImportFrom(i) => {
                                 let root = i.module.split('.').next().unwrap_or("");
                                 if matches!(root, "typing" | "typing_extensions") {
-                                    false
+                                    None
                                 } else if crate::ast::tree::import::is_stdpython_module(root) {
                                     // A stdpython-module import whose ITEM
                                     // may not exist in the runtime module
@@ -860,31 +867,51 @@ impl CodeGen for Module {
                                     // the `use` only for names with a
                                     // known runtime counterpart, else the
                                     // generated build fails E0432.
-                                    i.names
+                                    let names: Vec<_> = i
+                                        .names
                                         .iter()
-                                        .all(|a| crate::ast::tree::import::stdpython_module_item(
-                                            root,
-                                            &a.name,
-                                        ))
+                                        .filter(|a| {
+                                            crate::ast::tree::import::stdpython_module_item(
+                                                root, &a.name,
+                                            )
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    (!names.is_empty()).then(|| {
+                                        let mut filtered = i.clone();
+                                        filtered.names = names;
+                                        filtered
+                                    })
                                 } else {
                                     // Only sibling-module imports whose
                                     // names are actually GENERATED (not
                                     // TYPE_CHECKING stubs) emit `use`s.
                                     let path = i.resolved_module_path(&options);
-                                    i.names.iter().all(|a| {
-                                        crate::ast::tree::module::module_def_has_runtime_item(
-                                            &options,
-                                            &path,
-                                            &a.name,
-                                        )
+                                    let names: Vec<_> = i
+                                        .names
+                                        .iter()
+                                        .filter(|a| {
+                                            crate::ast::tree::module::module_def_has_runtime_item(
+                                                &options, &path, &a.name,
+                                            )
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    (!names.is_empty()).then(|| {
+                                        let mut filtered = i.clone();
+                                        filtered.names = names;
+                                        filtered
                                     })
                                 }
                             }
-                            _ => false,
+                            _ => None,
                         };
-                        if render_import {
-                            let stmt_token = body_stmt
-                                .clone()
+                        if let Some(filtered) = renderable {
+                            let stmt = crate::Statement {
+                                statement: crate::StatementType::ImportFrom(filtered),
+                                ..body_stmt.clone()
+                            };
+                            let stmt_token = stmt
                                 .to_rust(ctx.clone(), options.clone(), symbols.clone())
                                 .map_err(|e| wrap_module_error(&module_filename, e))?;
                             if !stmt_token.to_string().trim().is_empty() {
@@ -2803,6 +2830,38 @@ pub(crate) fn module_global_mutable_names(
         return out;
     }
     let (global_written, bound_without_global) = module_global_write_sets(body);
+    // Issue #137 (urllib3's emscripten fetch): a module value INITIALIZED
+    // None at top level, REASSIGNED only inside module-level control flow
+    // (`if worker_available(): _fetcher = _StreamingFetcher()` — no
+    // function ever writes it, so no `global` appears), and READ by
+    // function bodies. Without a static, the init-localized value is
+    // invisible to the functions (E0425 on every read). The boxed mutable
+    // static carries it: reads render py_global_read (PyValue), module-init
+    // stores write through, and a store with no boxed representation warns
+    // and stores None (§12 divergence) — here that branch is behind an
+    // always-false worker check, so the None matches the runtime value.
+    let free_reads = module_function_free_reads(body);
+    for s in body {
+        let crate::StatementType::Assign(a) = &s.statement else {
+            continue;
+        };
+        let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+            continue;
+        };
+        if crate::is_none_expr(&a.value)
+            && free_reads.contains(&n.id)
+            && module_assign_counts.get(&n.id).copied().unwrap_or(0) > 1
+            && !global_written.contains(&n.id)
+            && !bound_without_global.contains(&n.id)
+            && !matches!(
+                symbols.get(&n.id),
+                Some(crate::SymbolTableNode::ImportFrom(_))
+                    | Some(crate::SymbolTableNode::Import(_))
+            )
+        {
+            out.insert(n.id.clone(), Kind::Boxed);
+        }
+    }
     if global_written.is_empty() {
         return out;
     }

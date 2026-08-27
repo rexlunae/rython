@@ -10025,3 +10025,125 @@ fn plain_import_of_external_root_is_not_aliased_onto_crate_modules() {
         warnings.borrow()
     );
 }
+
+/// Issue #137 round 19 (urllib3's emscripten fetch): a module value
+/// initialized None at top level, reassigned only inside module-level
+/// control flow, and read by functions promotes to a BOXED mutable
+/// static — reads render py_global_read everywhere instead of E0425
+/// against an init-local. The class-instance branch's store has no boxed
+/// representation: None is stored and the -W channel carries the
+/// divergence.
+#[test]
+fn none_initialized_module_global_rebound_in_module_if_is_boxed_static() {
+    let src = "class Thing:\n    def __init__(self):\n        self.x = 1\n\n\
+               def cond() -> bool:\n    return False\n\n\
+               _holder = None\n\
+               if cond():\n    _holder = Thing()\nelse:\n    _holder = None\n\n\
+               def has_holder() -> bool:\n    if _holder:\n        return True\n    return False\n";
+    let module = parse(src, "holder.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions::default();
+    let warnings = options.definition_warnings.clone();
+    let out = module
+        .to_rust(
+            CodeGenContext::Module("holder".to_string()),
+            options,
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        out.contains("pub static _holder : std :: sync :: Mutex < stdpython :: PyValue >"),
+        "the None-initialized, module-if-rebound global must become a boxed static: {}",
+        out
+    );
+    assert!(
+        out.contains("py_global_read (& _holder)"),
+        "function reads must go through the static: {}",
+        out
+    );
+    assert!(
+        warnings
+            .borrow()
+            .iter()
+            .any(|w| w.contains("no boxed representation")),
+        "the class-instance store must be loud: {:?}",
+        warnings.borrow()
+    );
+}
+
+/// `-> T` where `T = typing.TypeVar("T")` lowers to the boxed PyValue in
+/// return position, matching the parameter-position lowering (urllib3's
+/// http2 `_LockedObject.__enter__`) — a bare `T` names nothing in Rust.
+#[test]
+fn typevar_return_annotation_lowers_to_pyvalue() {
+    let src = "import typing\n\nT = typing.TypeVar(\"T\")\n\n\
+               class Box:\n    def __init__(self, obj: T):\n        self._obj = obj\n\n\
+               \x20   def get(self) -> T:\n        return self._obj\n";
+    let module = parse(src, "boxmod.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            CodeGenContext::Module("boxmod".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        !out.contains("Result < T ,"),
+        "the raw TypeVar must not leak into a signature: {}",
+        out
+    );
+    assert!(
+        out.contains("fn get (& self ,) -> Result < stdpython :: PyValue"),
+        "the TypeVar return must box: {}",
+        out
+    );
+}
+
+/// A TYPE_CHECKING import mixing a GENERATED name with a stub-only one
+/// (urllib3's `from .ssl_ import _TYPE_PEER_CERT_RET,
+/// _TYPE_PEER_CERT_RET_DICT`, where the DICT is a TYPE_CHECKING-only
+/// TypedDict) emits the `use` for the generated name alone — previously
+/// the all-or-nothing check dropped both, leaving annotations unresolved.
+#[test]
+fn type_checking_import_filters_per_name() {
+    let sib = parse(
+        "import typing\n\n_RET = typing.Union[bytes, None]\n\n\
+         if typing.TYPE_CHECKING:\n    class _RET_DICT:\n        pass\n",
+        "sib.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["sib".to_string()], std::rc::Rc::new(sib));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let user = parse(
+        "import typing\n\nif typing.TYPE_CHECKING:\n    from sib import _RET, _RET_DICT\n\n\
+         def f() -> bool:\n    return True\n",
+        "user.py",
+    )
+    .unwrap();
+    let symbols = user.clone().find_symbols(SymbolTableScopes::new());
+    let out = user
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        out.contains("_RET"),
+        "the generated alias keeps its use: {}",
+        out
+    );
+    assert!(
+        !out.contains("_RET_DICT"),
+        "the TYPE_CHECKING-only stub must not emit a use (E0432): {}",
+        out
+    );
+}

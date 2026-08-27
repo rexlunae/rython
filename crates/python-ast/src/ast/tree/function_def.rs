@@ -3335,6 +3335,17 @@ impl FunctionDef {
                                         // PyValue.
                                         Some(quote!(stdpython::PyValue))
                                     }
+                                } else if matches!(
+                                    symbols.get(&n.id),
+                                    Some(SymbolTableNode::Assign { value, .. })
+                                        if crate::ast::tree::type_ctx::is_typevar_call(value)
+                                ) {
+                                    // `-> T` where `T = TypeVar("T")`
+                                    // (urllib3's http2 _LockedObject):
+                                    // the boxed PyValue, matching the
+                                    // parameter-position lowering — a
+                                    // bare `T` names nothing in Rust.
+                                    Some(quote!(stdpython::PyValue))
                                 } else {
                                     let ident = crate::safe_ident(&n.id);
                                     Some(quote!(#ident))

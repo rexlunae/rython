@@ -27,6 +27,8 @@ use crate::PyException;
 pub const AF_UNSPEC: i64 = 0;
 pub const AF_INET: i64 = 2;
 pub const AF_INET6: i64 = 10;
+pub const IPPROTO_TCP: i64 = 6;
+pub const IPPROTO_UDP: i64 = 17;
 pub const SOCK_STREAM: i64 = 1;
 pub const SOCK_DGRAM: i64 = 2;
 
@@ -444,6 +446,81 @@ pub fn setdefaulttimeout(timeout: Option<f64>) {
     *DEFAULT_TIMEOUT.lock().expect("default-timeout lock poisoned") = timeout;
 }
 
+/// Python `socket.socket(family, type, proto)` — the 3-argument spelling
+/// (the `getaddrinfo` loop passes each result's proto through). The proto
+/// is validated against the kind — CPython raises OSError on a mismatch —
+/// then the handle constructs exactly as the 2-argument form.
+pub fn socket3(family: i64, kind: i64, proto: i64) -> Result<Socket, PyException> {
+    let expected = match kind {
+        SOCK_STREAM => IPPROTO_TCP,
+        SOCK_DGRAM => IPPROTO_UDP,
+        _ => 0,
+    };
+    if proto != 0 && proto != expected {
+        // Verified against python3: socket.socket(2, 1, 17) raises
+        // OSError('[Errno 93] Protocol not supported').
+        return Err(PyException::new(
+            "OSError",
+            "[Errno 93] Protocol not supported",
+        ));
+    }
+    socket(family, kind)
+}
+
+/// Python `socket.getaddrinfo(host, port, family, type)` — resolve through
+/// the OS resolver (`std::net`). Returns CPython's 5-tuples `(family, type,
+/// proto, canonname, sockaddr)`: canonname is always "" (CPython's default
+/// without AI_CANONNAME) and sockaddr is `(ip, port)` — the IPv6
+/// flowinfo/scopeid tail is not modeled (documented divergence; the
+/// address/port pair is what `connect()` consumes).
+pub fn getaddrinfo<S: AsRef<str>>(
+    host: S,
+    port: i64,
+    family: i64,
+    kind: i64,
+) -> Result<Vec<(i64, i64, i64, String, (String, i64))>, PyException> {
+    // Verified against python3: an unresolvable host raises
+    // gaierror('[Errno -2] Name or service not known'), IS-A OSError.
+    let gaierror = || {
+        PyException::new(
+            "OSError",
+            "[Errno -2] Name or service not known",
+        )
+    };
+    let addrs = (host.as_ref(), port as u16)
+        .to_socket_addrs()
+        .map_err(|_| gaierror())?;
+    let proto = if kind == SOCK_DGRAM { IPPROTO_UDP } else { IPPROTO_TCP };
+    let mut out = Vec::new();
+    for a in addrs {
+        let af = match a {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        if family != AF_UNSPEC && family != af {
+            continue;
+        }
+        out.push((af, kind, proto, String::new(), (a.ip().to_string(), a.port() as i64)));
+    }
+    if out.is_empty() {
+        return Err(gaierror());
+    }
+    Ok(out)
+}
+
+/// Python `socket.SocketIO(sock, mode)` — the raw-IO wrapper `makefile()`
+/// builds file objects over. Not modeled by the runtime: the construction
+/// raises a catchable NotImplementedError instead of handing back a
+/// silently broken file object (documented divergence).
+#[allow(non_snake_case)]
+pub fn SocketIO<T, S: AsRef<str>>(_sock: T, _mode: S) -> Result<crate::PyValue, PyException> {
+    Err(PyException::new(
+        "NotImplementedError",
+        "socket.SocketIO is not modeled by the stdpython runtime \
+         (makefile() over a wrapped socket; documented divergence)",
+    ))
+}
+
 /// Python `socket.gethostname()`.
 pub fn gethostname() -> String {
     #[cfg(unix)]
@@ -475,5 +552,53 @@ mod default_timeout_tests {
         assert_eq!(super::getdefaulttimeout(), Some(2.5));
         super::setdefaulttimeout(None);
         assert_eq!(super::getdefaulttimeout(), None);
+    }
+}
+
+#[cfg(test)]
+mod getaddrinfo_tests {
+    use super::*;
+
+    #[test]
+    fn getaddrinfo_resolves_localhost_as_5_tuples() {
+        // Verified against python3: getaddrinfo('localhost', 80, AF_UNSPEC,
+        // SOCK_STREAM) → [(AF_INET, SOCK_STREAM, 6, '', ('127.0.0.1', 80))]
+        // (order/family set is resolver-dependent; the tuple SHAPE is not).
+        let res = getaddrinfo("localhost", 80, AF_UNSPEC, SOCK_STREAM).unwrap();
+        assert!(!res.is_empty());
+        for (af, kind, proto, canon, (ip, port)) in res {
+            assert!(af == AF_INET || af == AF_INET6);
+            assert_eq!(kind, SOCK_STREAM);
+            assert_eq!(proto, IPPROTO_TCP);
+            assert_eq!(canon, "");
+            assert!(!ip.is_empty());
+            assert_eq!(port, 80);
+        }
+    }
+
+    #[test]
+    fn getaddrinfo_unresolvable_host_raises_catchable_oserror() {
+        // Verified against python3: gaierror('[Errno -2] Name or service
+        // not known'), IS-A OSError.
+        let err = getaddrinfo("no.such.host.invalid", 80, AF_UNSPEC, SOCK_STREAM).unwrap_err();
+        assert_eq!(err.exception_type, "OSError");
+    }
+
+    #[test]
+    fn socket3_validates_proto_against_kind() {
+        // Verified against python3: socket.socket(AF_INET, SOCK_STREAM, 17)
+        // raises OSError('[Errno 93] Protocol not supported'); proto 0 and
+        // the matching proto both construct.
+        assert!(socket3(AF_INET, SOCK_STREAM, 0).is_ok());
+        assert!(socket3(AF_INET, SOCK_STREAM, IPPROTO_TCP).is_ok());
+        let err = socket3(AF_INET, SOCK_STREAM, IPPROTO_UDP).unwrap_err();
+        assert_eq!(err.exception_type, "OSError");
+        assert!(err.message.contains("Protocol not supported"));
+    }
+
+    #[test]
+    fn socketio_raises_not_implemented() {
+        let err = SocketIO(0i64, "rw").unwrap_err();
+        assert_eq!(err.exception_type, "NotImplementedError");
     }
 }

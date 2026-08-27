@@ -474,15 +474,35 @@ impl<'a> CodeGen for Assign {
                         // A container or class instance has no PyValue
                         // representation — the store cannot round-trip
                         // through the boxed global (issue #115 scope).
-                        return Err(format!(
-                            "`global {}` stores a value with no boxed \
-                             representation (a container or class instance); \
-                             a BOXED mutable module global holds scalars, \
-                             strings, and None — rython refuses to silently \
-                             ignore the write (issue #115)",
-                            name.id
-                        )
-                        .into());
+                        // At MODULE scope (init-time control flow — the
+                        // emscripten `_fetcher = _StreamingFetcher()`
+                        // branch, behind an always-false worker check)
+                        // the store warns and stores None instead of
+                        // failing the conversion: the read sites stay
+                        // compilable and the -W channel carries the
+                        // divergence. A `global`-declared FUNCTION store
+                        // keeps the loud conversion error.
+                        if matches!(ctx, crate::CodeGenContext::Module(_)) {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "module-level store of a container or class \
+                                 instance into the boxed global `{}` is \
+                                 dropped (None is stored): the value has no \
+                                 boxed representation (the §12 boxed-global \
+                                 divergence)",
+                                name.id
+                            ));
+                            quote!(stdpython::PyValue::None_)
+                        } else {
+                            return Err(format!(
+                                "`global {}` stores a value with no boxed \
+                                 representation (a container or class instance); \
+                                 a BOXED mutable module global holds scalars, \
+                                 strings, and None — rython refuses to silently \
+                                 ignore the write (issue #115)",
+                                name.id
+                            )
+                            .into());
+                        }
                     } else {
                         quote!(stdpython::PyValue::from(#value))
                     }
