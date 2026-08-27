@@ -10539,3 +10539,53 @@ fn boxed_self_field_method_drop_warns_with_a_readable_spelling() {
     );
 }
 
+
+/// Issue #137 round 22: a method call whose NAME receiver is bound to a
+/// call into an EXTERNAL module (`conn = zlib.compressobj()` — the value
+/// lowered to the boxed None) drops through the -W channel like the
+/// field-chain case; a receiver that is merely unknown (a socket, a
+/// generic parameter) keeps its calls.
+#[test]
+fn method_call_on_external_bound_name_drops_loudly() {
+    let src = "import zlib\n\ndef f() -> None:\n    conn = zlib.compressobj()\n    conn.compress(b\"x\")\n";
+    let module = parse(src, "extname.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    // Two module_defs entries make the sibling check authoritative, so
+    // zlib resolves EXTERNAL (a single-module conversion would assume it
+    // is a crate sibling).
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["extname".to_string()],
+        std::rc::Rc::new(module.clone()),
+    );
+    defs.insert(
+        vec!["other".to_string()],
+        std::rc::Rc::new(parse("A = 1\n", "other.py").unwrap()),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let warnings = options.definition_warnings.clone();
+    let out = module
+        .to_rust(
+            CodeGenContext::Module("extname".to_string()),
+            options,
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        !out.contains(". compress ("),
+        "the dynamic method must not be emitted: {}",
+        out
+    );
+    assert!(
+        warnings
+            .borrow()
+            .iter()
+            .any(|w| w.contains("dynamic-method divergence") && w.contains("compress")),
+        "the drop must be loud: {:?}",
+        warnings.borrow()
+    );
+}
