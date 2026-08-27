@@ -2761,17 +2761,59 @@ impl CodeGen for ClassDef {
             quote!()
         };
 
+        // A class with `__len__` participates in the len() protocol:
+        // `len(x)` lowers to `stdpython::len(&x)` bound on `Len`.
+        // stdpython's len() is infallible like Rust's, so a raising
+        // `__len__` becomes a loud abort (the §12.2 raise-in-infallible
+        // divergence) — never a silent 0.
+        let len_impl = if options.with_std_python
+            && self.methods().any(|m| m.name == "__len__")
+        {
+            quote! {
+                impl stdpython::Len for #class_name {
+                    fn len(&self) -> usize {
+                        match self.__len__() {
+                            Ok(n) => n as usize,
+                            Err(e) => panic!("{}", e),
+                        }
+                    }
+                }
+            }
+        } else {
+            quote!()
+        };
+
+        // An instance is never None (only None is None in Python), so `x
+        // is None` on a class-typed value lowers through PyIsNone to a
+        // constant false — the same never-None contract the scalar types
+        // carry (stdpython's never_none! macro).
+        let is_none_impl = if options.with_std_python {
+            quote!(impl stdpython::PyIsNone for #class_name {
+                fn py_is_none(&self) -> bool {
+                    false
+                }
+            })
+        } else {
+            quote!()
+        };
+
         Ok(quote! {
             #docs
             #[derive(Clone, Default)]
             pub struct #class_name {
                 #(#field_defs),*
             }
+            // A class instance is never None (CPython: only None is None),
+            // so `x is None` on an instance lowers through PyIsNone to
+            // false — same contract the PyInherits tree carries for
+            // ancestry bounds.
+            #is_none_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
             #class_lazylock_constants
             #inherits_tree
+            #len_impl
             #trait_stream
             impl #class_name {
                 #class_constants

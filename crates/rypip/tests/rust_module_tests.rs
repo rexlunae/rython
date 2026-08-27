@@ -107,11 +107,11 @@ fn rust_module_import_infers_signatures_and_runs() {
     // path. No `use rustlib;` — the crate is a dependency, not a sibling.
     let main_rs = fs::read_to_string(out.join("src/main.rs")).unwrap();
     for expected in [
-        "rustlib::crc8(b\"hello\".as_ref(), 7 as u32) as i64",
+        "rustlib::crc8(b\"hello\".to_vec().as_ref(), 7 as u32) as i64",
         "rustlib::add(20 as i64, 22 as i64)",
         "rustlib::shout(\"hi\".as_ref())",
         "rustlib::half(9.0)",
-        "rustlib::crc8(b\"abc\".as_ref(), 0 as u32) as i64",
+        "rustlib::crc8(b\"abc\".to_vec().as_ref(), 0 as u32) as i64",
         "rustlib::add(1 as i64, 2 as i64)",
     ] {
         assert!(
@@ -174,7 +174,7 @@ fn rust_module_stub_wins_and_unknown_fns_fail_loudly() {
     // src/app.rs behind `pub mod app;` in lib.rs.
     let app_rs = fs::read_to_string(out.join("src/app.rs")).unwrap();
     assert!(
-        app_rs.contains("rustlib::crc8(b\"x\".as_ref(), 3 as u32) as i64"),
+        app_rs.contains("rustlib::crc8(b\"x\".to_vec().as_ref(), 3 as u32) as i64"),
         "stub crc8 types must be used: {}",
         app_rs
     );

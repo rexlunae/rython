@@ -139,7 +139,7 @@ pub enum CrossModuleClasses {
 
 /// Issue #115: how a `global`-written module value lowers as a mutable
 /// static, decided by its single module-level initializer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutableGlobalKind {
     /// An int/float/bool literal: `static name: Mutex<T> = Mutex::new(v)`.
     Scalar,
@@ -154,6 +154,14 @@ pub enum MutableGlobalKind {
     /// the boxed PyValue when none infers (`boxed` records which — stores
     /// wrap in PyValue::from exactly when the static is boxed).
     Computed { boxed: bool },
+    /// Issue #189: a None-initialized module global whose `global`-writing
+    /// functions store exactly one local class instance (`HISTORY_RECORDER
+    /// = HistoryRecorder()` — botocore's history.py) among None stores:
+    /// `static name: Mutex<Option<Class>> = Mutex::new(None)`. Reads are
+    /// the INSTANCE (a read while None is a loud runtime panic, §12.2);
+    /// `is None` compares read the Option (compare.rs); stores are None
+    /// and `Some(instance)` — anything else is a loud conversion error.
+    Class { class: String },
 }
 
 impl MutableGlobalKind {

@@ -870,6 +870,22 @@ fn np_path(name: &str) -> (String, TokenStream) {
     }
 }
 
+/// A readable source-like spelling of a (short) expression chain for -W
+/// messages: `self.items.append` — Name/Attribute chains join with dots, a
+/// call renders as `f(...)`, and anything else falls back to the Debug form
+/// (terminal). The -W channel is for humans; a raw AST Debug dump is not a
+/// diagnostic (issue #209).
+fn expr_chain_spelling(e: &ExprType) -> String {
+    match e {
+        ExprType::Name(n) => n.id.clone(),
+        ExprType::Attribute(a) => {
+            format!("{}.{}", expr_chain_spelling(&a.value), a.attr)
+        }
+        ExprType::Call(c) => format!("{}(...)", expr_chain_spelling(c.func.as_ref())),
+        _ => format!("{:?}", e),
+    }
+}
+
 /// Lower `np.<fname>(args, kwargs)` onto the stdpython numpy module.
 #[allow(clippy::too_many_lines)]
 fn lower_numpy_call(
@@ -1511,6 +1527,29 @@ impl<'a> CodeGen for Call {
         {
             return Ok(quote!(threading::Semaphore(1)));
         }
+        // A keyword call through a functools.partial-bound name: the
+        // generated closure has no named parameters, so the keyword would
+        // be silently dropped and the call mis-arity'd — loud at
+        // conversion (the callable-as-value divergence, issue #122,
+        // tracks the general model; botocore's
+        // `self._action(attempts=attempts)` is the real-world shape).
+        if let ExprType::Name(n) = self.func.as_ref()
+            && !self.keywords.is_empty()
+            && symbols.get(&n.id).is_some_and(|s| {
+                matches!(
+                    s,
+                    SymbolTableNode::Assign {
+                        value: ExprType::Call(c),
+                        ..
+                    } if is_partial_target(c.func.as_ref(), &symbols)
+                )
+            })
+        {
+            return Err("keyword call through a functools.partial-bound name is not \
+                        supported yet (the callable-as-value divergence, issue #122)"
+                .to_string()
+                .into());
+        }
         // Calls to functions that return Result<T, PyException> get `?` so
         // exceptions propagate to the caller (or an enclosing try block),
         // as in Python: user-defined functions (known from the symbol
@@ -1676,9 +1715,9 @@ impl<'a> CodeGen for Call {
             )
         {
             options.definition_warnings.borrow_mut().push(format!(
-                "`{:?}.{}(...)` is dropped: the receiver is a boxed PyValue \
+                "`{}.{}(...)` is dropped: the receiver is a boxed PyValue \
                  (dynamic-method divergence)",
-                attr.value, attr.attr
+                expr_chain_spelling(&attr.value), attr.attr
             ));
             return Ok(quote!(stdpython::PyValue::None_));
         }
@@ -3538,48 +3577,36 @@ impl<'a> CodeGen for Call {
                             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     kw_bindings.push((kname.clone(), value));
                 }
-                // Unbound tail parameters become the closure's parameters.
-                let mut rest: Vec<proc_macro2::Ident> = Vec::new();
-                for p in &params[bound_n..] {
-                    if !kw_bindings.iter().any(|(k, _)| k == p) {
-                        rest.push(crate::safe_ident(p));
-                    }
-                }
-                // The call keeps parameter order: positionals, then the
-                // keyword bindings, then the unbound names — valid only
-                // when the keyword-bound parameters form a SUFFIX of the
-                // tail (no positional may follow a named argument).
-                let kw_only_idx: Vec<usize> = params[bound_n..]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| kw_bindings.iter().any(|(k, _)| k == *p))
-                    .map(|(j, _)| bound_n + j)
-                    .collect();
-                if let Some(first_kw) = kw_only_idx.first()
-                    && params[bound_n..].iter().enumerate().any(|(j, p)| {
-                        bound_n + j > *first_kw && !kw_bindings.iter().any(|(k, _)| k == p)
-                    })
-                {
-                    return Err("functools.partial: a keyword-bound parameter precedes an \
-                         unbound one; reorder the parameters"
-                        .to_string()
-                        .into());
-                }
+                // The call emits arguments in the CALLEE'S DECLARED
+                // ORDER — for each declared parameter: its positional
+                // value, else its keyword value, else the closure
+                // parameter. Python's keyword bindings may bind any
+                // subset in any order
+                // (`partial(delay_exponential, base=base,
+                // growth_factor=growth_factor)` leaves only `attempts`
+                // unbound — botocore's retryhandler); emitting in the
+                // callee's order is what makes the Rust call valid. (The
+                // previous spelling placed keyword-bound values as
+                // `ident: value` call arguments — not Rust — and required
+                // them to form a suffix of the tail.)
                 let fident = crate::safe_ident(&f.id);
-                let closure_params = rest.iter();
-                let kw_calls: Vec<(proc_macro2::Ident, TokenStream)> = kw_bindings
-                    .iter()
-                    .map(|(k, v)| (crate::safe_ident(k), v.clone()))
-                    .collect();
-                let kw_call_idents = kw_calls.iter().map(|(i, _)| i);
-                let kw_call_values = kw_calls.iter().map(|(_, v)| v);
-                let closure_calls = rest.iter();
+                let mut call_args: Vec<TokenStream> = Vec::with_capacity(params.len());
+                let mut closure_params: Vec<proc_macro2::Ident> = Vec::new();
+                for (i, p) in params.iter().enumerate() {
+                    if i < bound.len() {
+                        call_args.push(bound[i].clone());
+                        continue;
+                    }
+                    if let Some((_, value)) = kw_bindings.iter().find(|(k, _)| k == p) {
+                        call_args.push(value.clone());
+                        continue;
+                    }
+                    let ident = crate::safe_ident(p);
+                    closure_params.push(ident.clone());
+                    call_args.push(quote!(#ident));
+                }
                 return Ok(quote!(
-                    move |#(#closure_params),*| #fident(
-                        #(#bound,)*
-                        #(#kw_call_idents: #kw_call_values),*
-                        #(#closure_calls),*
-                    )
+                    move |#(#closure_params),*| #fident(#(#call_args),*)
                 ));
             }
             // Any OTHER target — a class (`partial(AWSHTTPResponse,
@@ -7377,7 +7404,24 @@ pub(crate) fn receiver_class(
                 value: ExprType::Call(call),
                 ..
             }) => match call.func.as_ref() {
-                ExprType::Name(cn) => (cn.id.clone(), symbols.clone()),
+                ExprType::Name(cn) => {
+                    if let Some(SymbolTableNode::FunctionDef(f)) = symbols.get(&cn.id) {
+                        // A local factory call: `c = make()` where `def
+                        // make() -> Counter` (or the unannotated
+                        // lazy-singleton getter, issue #189) — the
+                        // receiver's class comes from the function's
+                        // return.
+                        match f.return_class_name(options) {
+                            Some(class) => (class, symbols.clone()),
+                            None => return None,
+                        }
+                    } else {
+                        // A constructor (local or imported — the tail
+                        // resolves an imported class through its defining
+                        // module).
+                        (cn.id.clone(), symbols.clone())
+                    }
+                }
                 _ => return None,
             },
             // A TYPED PARAMETER receiver (`def f(c: C): return c.x` — the

@@ -2507,6 +2507,15 @@ pub enum PyValue {
     None_,
 }
 
+/// The codegen hoists uninitialized locals and derives `Default` on
+/// generated structs with boxed fields; None is the honest empty value
+/// (a fresh Python binding holds nothing).
+impl Default for PyValue {
+    fn default() -> Self {
+        PyValue::None_
+    }
+}
+
 /// Python iteration over a boxed value (`for field in iterable:` where
 /// the argument's type is unknown — urllib3's filepost): tuples yield
 /// their elements, strings their characters (as 1-char strings, like
@@ -2971,6 +2980,19 @@ impl PyRepr for PyValue {
     }
 }
 
+/// Python str() of the boxed value — f-strings and `"{}".format(...)`
+/// print boxed operands directly. A str member prints unquoted (str() of
+/// a str); every other member's str() IS its repr() (int, float, bool,
+/// None, bytes, tuple, dict — verified against python3).
+impl core::fmt::Display for PyValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PyValue::Str(s) => write!(f, "{}", s),
+            other => write!(f, "{}", py_value_repr(other)),
+        }
+    }
+}
+
 /// Python `bytes.decode(encoding, errors)` as a trait, so receivers
 /// without a statically-known type can decode: an unannotated parameter
 /// (`T: PyDecode` — the isinstance-residual morphs of issue #161's
@@ -3078,6 +3100,22 @@ impl IntoBytesLike for &[u8] {
         self.to_vec()
     }
 }
+/// The boxed value's bytes(x): a str member's UTF-8, bytes themselves.
+/// Any other member is CPython's TypeError — a loud panic (§12.2), never
+/// a silent empty buffer.
+impl IntoBytesLike for PyValue {
+    fn into_bytes_like(self) -> Vec<u8> {
+        match self {
+            PyValue::Str(s) => s.into_bytes(),
+            PyValue::Bytes(b) => b,
+            other => panic!(
+                "TypeError: cannot convert '{}' object to bytes",
+                py_value_type_name(&other)
+            ),
+        }
+    }
+}
+
 impl IntoBytesLike for StrOrBytes {
     fn into_bytes_like(self) -> Vec<u8> {
         match self {
@@ -6625,5 +6663,45 @@ mod tests {
         // Test py_tuple
         let tuple = py_tuple(vec![1, 2, 3]);
         assert_eq!(tuple.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod pyvalue_round21_tests {
+    use super::*;
+
+    #[test]
+    fn pyvalue_default_is_none() {
+        // The codegen derives Default on structs with boxed fields; a
+        // fresh Python binding holds nothing.
+        assert_eq!(PyValue::default(), PyValue::None_);
+    }
+
+    #[test]
+    fn pyvalue_display_matches_python_str() {
+        // Verified against python3: str('x')='x' (unquoted), str(True)=
+        // 'True', str(None)='None', str(b'hi')="b'hi'", str(1.0)='1.0'.
+        assert_eq!(format!("{}", PyValue::Str("x".into())), "x");
+        assert_eq!(format!("{}", PyValue::Bool(true)), "True");
+        assert_eq!(format!("{}", PyValue::None_), "None");
+        assert_eq!(format!("{}", PyValue::Bytes(b"hi".to_vec())), "b'hi'");
+        assert_eq!(format!("{}", PyValue::Float(1.0)), "1.0");
+    }
+
+    #[test]
+    fn pyvalue_into_bytes_like_covers_str_and_bytes() {
+        assert_eq!(PyValue::Str("ab".into()).into_bytes_like(), b"ab".to_vec());
+        assert_eq!(
+            PyValue::Bytes([1u8, 2].to_vec()).into_bytes_like(),
+            [1u8, 2].to_vec()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeError")]
+    fn pyvalue_into_bytes_like_is_loud_on_non_bytes() {
+        // CPython's TypeError — a loud panic (§12.2), never a silent
+        // empty buffer.
+        let _ = PyValue::Int(1).into_bytes_like();
     }
 }

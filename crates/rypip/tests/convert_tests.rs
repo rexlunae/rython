@@ -723,6 +723,108 @@ fn dict_methods_match_python_at_runtime() {
 }
 
 #[test]
+fn class_instance_global_singleton_matches_python_at_runtime() {
+    // Issue #189: the lazy-singleton shape (botocore's history.py) — a
+    // None-initialized module global whose `global`-writing getter stores
+    // exactly one local class construction — lowers to a typed
+    // `Mutex<Option<Class>>` static: the None check reads the Option, the
+    // store wraps in Some, and the getter returns the instance. Identity
+    // across reads follows rython's by-design value semantics (#79): the
+    // observable output here is identical to CPython's.
+    let scratch = Scratch::new("singleglobal");
+    let file = scratch.path().join("singleglobal.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Recorder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.events: list[str] = []\n",
+            "\n",
+            "    def record(self, event: str) -> None:\n",
+            "        self.events.append(event)\n",
+            "\n",
+            "RECORDER = None\n",
+            "\n",
+            "def get_recorder():\n",
+            "    global RECORDER\n",
+            "    if RECORDER is None:\n",
+            "        RECORDER = Recorder()\n",
+            "    return RECORDER\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    r = get_recorder()\n",
+            "    r.record(\"kept\")\n",
+            "    print(r.events)\n",
+            "    print(get_recorder() is None)\n",
+            "    print(RECORDER is None)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/singleglobal"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["['kept']", "False", "False"],
+        "class-instance global semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn functools_partial_keyword_bindings_match_python_at_runtime() {
+    // Keyword bindings emitting in the callee's declared order
+    // (botocore's `partial(delay_exponential, base=base,
+    // growth_factor=growth_factor)` — issue #189 family): the suffix
+    // keyword shape (`x=` bound, `hi` unbound) is called POSITIONALLY,
+    // exactly like CPython's partial protocol allows.
+    let scratch = Scratch::new("partialkw");
+    let file = scratch.path().join("partialkw.py");
+    fs::write(
+        &file,
+        concat!(
+            "import functools\n",
+            "\n",
+            "def clamp(lo: int, hi: int, x: int) -> int:\n",
+            "    return 1000 * lo + hi + x\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unit = functools.partial(clamp, 0, x=5)\n",
+            "    print(unit(100))\n",
+            "    print(unit(-7))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/partialkw"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["105", "-2"],
+        "functools.partial keyword bindings diverged from CPython"
+    );
+}
+
+#[test]
 fn optional_from_dict_get_matches_python_at_runtime() {
     // A None-seeded variable reassigned from dict.get must NOT double-wrap:
     // an absent key would become Some(None) and the `is None` branch below

@@ -5128,7 +5128,7 @@ fn partial_lowers_to_a_move_closure_with_remaining_params() {
         "    return g()\n",
     );
     let out = compile(src, "part2.py");
-    assert!(out.contains("move | | add (2 , 3 ,)"), "generated: {}", out);
+    assert!(out.contains("move | | add (2 , 3)"), "generated: {}", out);
 
     // The functools.partial attribute spelling works too.
     let src = concat!(
@@ -9019,17 +9019,20 @@ fn global_none_singleton_boxes_to_a_pyvalue_static() {
 }
 
 #[test]
-fn global_class_instance_store_is_loud_at_function_scope() {
-    // The remaining boxed-global edge (issue #189): a `global`-declared
-    // store of a CLASS INSTANCE (`HISTORY_RECORDER = HistoryRecorder()`
-    // — botocore's history.py) has no PyValue representation, so the
-    // function-scope write is a loud conversion error naming the rewrite.
-    let err = compile_err(
+fn global_class_instance_lowers_to_a_typed_static() {
+    // Issue #189: the lazy-singleton shape (botocore's history.py) — a
+    // None-initialized global whose `global`-writing function stores
+    // exactly one LOCAL class construction — lowers to
+    // `Mutex<Option<Class>>`: None / `Some(instance)` stores, the `is
+    // None` compare reading the Option, value reads unwrapping with a
+    // loud panic while None, and the getter's return type is the class.
+    let out = compile(
         concat!(
             "class HistoryRecorder:\n",
-            "    pass\n",
+            "    def __init__(self) -> None:\n",
+            "        self.events = []\n",
             "RECORDER = None\n",
-            "def get():\n",
+            "def get_recorder() -> HistoryRecorder:\n",
             "    global RECORDER\n",
             "    if RECORDER is None:\n",
             "        RECORDER = HistoryRecorder()\n",
@@ -9038,8 +9041,58 @@ fn global_class_instance_store_is_loud_at_function_scope() {
         "global_class_store.py",
     );
     assert!(
+        out.contains("pub static RECORDER : std :: sync :: Mutex < Option < HistoryRecorder >> = std :: sync :: Mutex :: new (None)"),
+        "the static must be typed Option<HistoryRecorder>: {}",
+        out
+    );
+    assert!(
+        out.contains("py_global_write (& RECORDER , Some ({ HistoryRecorder :: new () ? }))"),
+        "the class store must wrap in Some: {}",
+        out
+    );
+    assert!(
+        out.contains("(stdpython :: py_global_read (& RECORDER)) . py_is_none ()"),
+        "the None check must read the Option: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: py_global_read (& RECORDER) . expect ("),
+        "the value read must unwrap the instance: {}",
+        out
+    );
+    assert!(
+        out.contains("fn get_recorder () -> Result < HistoryRecorder , PyException >"),
+        "the getter returns the instance: {}",
+        out
+    );
+}
+
+#[test]
+fn global_class_instance_stays_loud_for_unsupported_stores() {
+    // Outside the recognized pattern the store is still a loud conversion
+    // error: a container literal into a None-initialized Boxed global, and
+    // a class instance into a global the detection disqualified (two
+    // different classes). Correct-or-loud, never silently None.
+    let err = compile_err(
+        concat!(
+            "class A:\n",
+            "    pass\n",
+            "class B:\n",
+            "    pass\n",
+            "X = None\n",
+            "def set_x(flag: bool) -> None:\n",
+            "    global X\n",
+            "    if flag:\n",
+            "        X = A()\n",
+            "    else:\n",
+            "        X = B()\n",
+            "    return None\n",
+        ),
+        "global_class_loud.py",
+    );
+    assert!(
         err.contains("no boxed representation") && err.contains("issue #189"),
-        "the loud error must cite the tracked gap: {}",
+        "two different classes disqualify the pattern: {}",
         err
     );
 }
@@ -10670,3 +10723,152 @@ fn mixed_dict_literal_with_nested_dict_boxes_values() {
         out
     );
 }
+
+/// Issue #137 round 21: a bytes literal is an OWNED value — the typed
+/// paths declare it Vec<u8>, so the rendering agrees (`b"".to_vec()`),
+/// and `return Ok(b"")` against a Result<Vec<u8>> signature compiles
+/// (urllib3's emscripten response).
+#[test]
+fn bytes_literals_render_owned() {
+    let out = compile(
+        "def empty() -> bytes:\n    return b\"\"\n",
+        "ownedbytes.py",
+    );
+    assert!(
+        out.contains("b\"\" . to_vec ()"),
+        "the bytes literal must render owned: {}",
+        out
+    );
+}
+
+/// Issue #137 round 21: a class defining `__len__` participates in the
+/// len() protocol — `len(x)` lowers to `stdpython::len(&x)` bound on
+/// `Len`, so the impl must exist (urllib3's BytesQueueBuffer).
+#[test]
+fn class_with_dunder_len_implements_len() {
+    let out = compile(
+        "class Buf:\n    def __init__(self):\n        self._size = 0\n\n\
+         \x20   def __len__(self) -> int:\n        return self._size\n",
+        "lenbuf.py",
+    );
+    assert!(
+        out.contains("impl stdpython :: Len for Buf"),
+        "__len__ must produce the Len impl: {}",
+        out
+    );
+}
+
+#[test]
+fn functools_partial_keyword_bindings_emit_in_callee_order() {
+    // Issue #189-family (botocore's retryhandler): keyword bindings may
+    // bind ANY subset of the callee's parameters in any order — the
+    // closure's call emits arguments in the CALLEE'S DECLARED ORDER, so
+    // `partial(delay_exponential, base=base, growth_factor=growth_factor)`
+    // (keyword-bound parameters BEFORE the unbound one) lowers instead of
+    // demanding a parameter reorder.
+    let out = compile(
+        concat!(
+            "import functools\n",
+            "\n",
+            "def delay_exponential(base: int, growth_factor: int, attempts: int) -> int:\n",
+            "    return base * growth_factor ** (attempts - 1)\n",
+            "\n",
+            "def create_delay(base: int, growth_factor: int):\n",
+            "    return functools.partial(\n",
+            "        delay_exponential, base=base, growth_factor=growth_factor\n",
+            "    )\n",
+        ),
+        "partial_kw.py",
+    );
+    assert!(
+        out.contains("move | attempts | delay_exponential (base , growth_factor , attempts)"),
+        "the closure emits the callee's declared order: {}",
+        out
+    );
+}
+
+#[test]
+fn functools_partial_keyword_call_through_the_bound_name_is_loud() {
+    // A keyword call through a partial-bound name (`unit(x=-4)`) has no
+    // named closure parameters to map onto — the keyword would be silently
+    // dropped and the call mis-arity'd — so it is a loud conversion error
+    // (the callable-as-value divergence, issue #122).
+    let err = compile_err(
+        concat!(
+            "import functools\n",
+            "\n",
+            "def clamp(lo: int, hi: int, x: int) -> int:\n",
+            "    return lo + hi + x\n",
+            "\n",
+            "unit = functools.partial(clamp, lo=0, hi=100)\n",
+            "\n",
+            "def f() -> int:\n",
+            "    return unit(x=-4)\n",
+        ),
+        "partial_kw_call.py",
+    );
+    assert!(
+        err.contains("keyword call through a functools.partial-bound name")
+            && err.contains("issue #122"),
+        "the keyword call must be loud: {}",
+        err
+    );
+}
+
+#[test]
+fn boxed_self_field_method_drop_warns_with_a_readable_spelling() {
+    // Issue #209: `self.items.append(x)` on an UNTYPED list field (the
+    // empty literal types the field as the boxed PyValue) cannot lower —
+    // the boxed value's methods are unmodeled — so the call drops through
+    // the -W channel with a READABLE spelling of the dropped call, not an
+    // AST Debug dump. (Annotating the field — `self.items: list[str] = []`
+    // — lowers append to Vec::push; that is the rewrite the message
+    // names.)
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items = []\n",
+            "\n",
+            "    def add(self, x: str) -> None:\n",
+            "        self.items.append(x)\n",
+        ),
+        "bag.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w
+            .contains("`self.items.append(...)` is dropped: the receiver is a boxed \
+                       PyValue (dynamic-method divergence)")),
+        "the drop must warn with a readable source spelling: {:?}",
+        warnings
+    );
+    // The dropped call is a no-op in the generated body.
+    assert!(
+        out.contains("stdpython :: PyValue :: None_ ; Ok (())"),
+        "the dropped call lowers to the boxed None: {}",
+        out
+    );
+    // The pinned shape lowers for real: append becomes Vec::push.
+    let (pinned, pinned_warnings) = compile_with_warnings(
+        concat!(
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[str] = []\n",
+            "\n",
+            "    def add(self, x: str) -> None:\n",
+            "        self.items.append(x)\n",
+        ),
+        "bag_pinned.py",
+    );
+    assert!(
+        pinned.contains("(self . items) . push (x)"),
+        "the annotated field lowers append to push: {}",
+        pinned
+    );
+    assert!(
+        pinned_warnings.is_empty(),
+        "the pinned shape must not warn: {:?}",
+        pinned_warnings
+    );
+}
+

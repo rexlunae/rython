@@ -236,6 +236,26 @@ impl CodeGen for Module {
         let mut global_mutables =
             module_global_mutable_names(&self.raw.body, &module_assign_counts, &symbols, &options);
 
+        // Issue #189: a None-initialized Boxed global whose `global`-writing
+        // function stores are all None except exactly one LOCAL class
+        // construction (`HISTORY_RECORDER = HistoryRecorder()` — botocore's
+        // history.py lazy singleton) becomes a typed class-instance static:
+        // `Mutex<Option<Class>>`. The Option is the representation; reads
+        // unwrap (loud runtime panic while None, §12.2), `is None` compares
+        // read the Option (compare.rs), and stores are None / `Some(instance)`.
+        // Any other store shape (a container, a second class, a computed
+        // value) keeps the plain Boxed static and its loud conversion error.
+        {
+            let class_stores = module_global_class_stores(&self.raw.body, &symbols);
+            for (name, kind) in global_mutables.iter_mut() {
+                if matches!(kind, crate::MutableGlobalKind::Boxed)
+                    && let Some(class) = class_stores.get(name)
+                {
+                    *kind = crate::MutableGlobalKind::Class { class: class.clone() };
+                }
+            }
+        }
+
         // Statically-decided module names (issue #137): a single-store
         // None or False constant — typically the folded handler of a
         // failed import guard above — makes `if brotli is not None:` /
@@ -708,6 +728,19 @@ impl CodeGen for Module {
         options.mutable_statics = std::rc::Rc::new(global_mutables.clone());
         options.scope_global_writables =
             std::rc::Rc::new(global_mutables.keys().cloned().collect());
+        // Issue #189: a class-instance global reads as the INSTANCE (the
+        // Option is the static's representation, unwrapped at the read), so
+        // the name's type everywhere is the class — return inference, method
+        // receivers, and call-site checks all see `TypeInfo::Class`.
+        {
+            let mut nt = (*options.name_types).clone();
+            for (name, kind) in global_mutables.iter() {
+                if let crate::MutableGlobalKind::Class { class } = kind {
+                    nt.insert(name.clone(), crate::TypeInfo::Class(class.clone()));
+                }
+            }
+            options.name_types = std::rc::Rc::new(nt);
+        }
         // Module-level aliasing (`b = a` on a container, later mutated) is
         // the same divergence the function-level guard rejects (issue #79).
         crate::check_aliasing(
@@ -1043,6 +1076,19 @@ impl CodeGen for Module {
                             stream.extend(quote! {
                                 pub static #ident: std::sync::Mutex<stdpython::PyValue> =
                                     std::sync::Mutex::new(stdpython::PyValue::None_);
+                            });
+                        }
+                        Kind::Class { class } => {
+                            // Issue #189: the class-instance global — the
+                            // module store is the None state; the singleton
+                            // construction lives in the `global`-writing
+                            // function. Const None init; the Option is the
+                            // representation, unwrapped at value reads
+                            // (name.rs) and matched by `is None` (compare.rs).
+                            let cls = crate::safe_ident(class);
+                            stream.extend(quote! {
+                                pub static #ident: std::sync::Mutex<Option<#cls>> =
+                                    std::sync::Mutex::new(None);
                             });
                         }
                         Kind::Scalar => {
@@ -2655,6 +2701,139 @@ pub(crate) fn module_global_write_sets(
     let mut bound_without_global = std::collections::HashSet::new();
     visit_defs(body, &mut global_written, &mut bound_without_global);
     (global_written, bound_without_global)
+}
+
+/// Issue #189: for each name a top-level function writes through `global`,
+/// classify the function-scope stores. `None` literals are the empty
+/// state; a call to a LOCAL class (a `ClassDef` in the module symbols) is
+/// the singleton construction. A name qualifies for the typed
+/// class-instance static when every store is None except exactly one
+/// construction of the SAME class — the map carries name → class for the
+/// qualifiers. Any other store shape (a container literal, a second
+/// class, a computed value, an augmented assignment) disqualifies the
+/// name, keeping the plain Boxed static and its loud conversion error.
+fn module_global_class_stores(
+    body: &[crate::Statement],
+    symbols: &crate::SymbolTableScopes,
+) -> std::collections::HashMap<String, String> {
+    use crate::StatementType as ST;
+
+    #[derive(Default)]
+    struct Stores {
+        /// A store of a local class construction (the singleton shape).
+        class: Option<String>,
+        /// Any store shape the typed static cannot hold.
+        other: bool,
+    }
+
+    impl Stores {
+        fn record(&mut self, value: &crate::ExprType, symbols: &crate::SymbolTableScopes) {
+            if crate::is_none_expr(value) {
+                return;
+            }
+            if let crate::ExprType::Call(c) = value
+                && let crate::ExprType::Name(f) = c.func.as_ref()
+                && matches!(symbols.get(&f.id), Some(crate::SymbolTableNode::ClassDef(_)))
+            {
+                match &self.class {
+                    // A second class (or the same one twice) cannot share
+                    // the Option<Class> slot — disqualified below when the
+                    // classes disagree; two stores of the SAME class are
+                    // still one type (the lazy-init idiom re-derives it).
+                    Some(existing) if existing != &f.id => self.other = true,
+                    _ => self.class = Some(f.id.clone()),
+                }
+                return;
+            }
+            self.other = true;
+        }
+    }
+
+    // One function scope: its `global` declarations and the stores to
+    // them, through control flow but NOT into nested defs (each def is
+    // its own scope, and rython's closures drop anyway).
+    fn scan_scope(
+        stmts: &[crate::Statement],
+        globals: &mut std::collections::HashSet<String>,
+        stores: &mut std::collections::HashMap<String, Stores>,
+        symbols: &crate::SymbolTableScopes,
+    ) {
+        for s in stmts {
+            match &s.statement {
+                ST::Global(names) => globals.extend(names.iter().cloned()),
+                ST::Assign(a) => {
+                    if let [crate::ExprType::Name(n)] = a.targets.as_slice()
+                        && globals.contains(&n.id)
+                    {
+                        stores
+                            .entry(n.id.clone())
+                            .or_default()
+                            .record(&a.value, symbols);
+                    }
+                }
+                ST::AugAssign(a) => {
+                    if let crate::ExprType::Name(n) = &a.target && globals.contains(&n.id) {
+                        stores.entry(n.id.clone()).or_default().other = true;
+                    }
+                }
+                ST::If(i) => {
+                    scan_scope(&i.body, globals, stores, symbols);
+                    scan_scope(&i.orelse, globals, stores, symbols);
+                }
+                ST::While(w) => {
+                    scan_scope(&w.body, globals, stores, symbols);
+                    scan_scope(&w.orelse, globals, stores, symbols);
+                }
+                ST::For(f) => {
+                    if let crate::ExprType::Name(n) = &f.target && globals.contains(&n.id) {
+                        stores.entry(n.id.clone()).or_default().other = true;
+                    }
+                    scan_scope(&f.body, globals, stores, symbols);
+                    scan_scope(&f.orelse, globals, stores, symbols);
+                }
+                ST::AsyncFor(f) => {
+                    if let crate::ExprType::Name(n) = &f.target && globals.contains(&n.id) {
+                        stores.entry(n.id.clone()).or_default().other = true;
+                    }
+                    scan_scope(&f.body, globals, stores, symbols);
+                    scan_scope(&f.orelse, globals, stores, symbols);
+                }
+                ST::Try(t) => {
+                    scan_scope(&t.body, globals, stores, symbols);
+                    for h in &t.handlers {
+                        scan_scope(&h.body, globals, stores, symbols);
+                    }
+                    scan_scope(&t.orelse, globals, stores, symbols);
+                    scan_scope(&t.finalbody, globals, stores, symbols);
+                }
+                ST::With(w) => scan_scope(&w.body, globals, stores, symbols),
+                ST::AsyncWith(w) => scan_scope(&w.body, globals, stores, symbols),
+                _ => {}
+            }
+        }
+    }
+
+    let mut out: std::collections::HashMap<String, Stores> = std::collections::HashMap::new();
+    for stmt in body {
+        // Top-level defs only: each is its own scope with its own `global`
+        // declarations (module_global_write_sets' visit_defs walk).
+        let fn_body = match &stmt.statement {
+            ST::FunctionDef(f) => &f.body,
+            ST::AsyncFunctionDef(f) => &f.body,
+            _ => continue,
+        };
+        let mut globals = std::collections::HashSet::new();
+        scan_scope(fn_body, &mut globals, &mut out, symbols);
+    }
+    out.into_iter()
+        .filter_map(|(name, stores)| {
+            if stores.other {
+                None
+            } else {
+                stores.class.map(|class| (name, class))
+            }
+        })
+        .collect()
 }
 
 /// Issue #115: the module-level names lowered as MUTABLE statics, mapped
