@@ -451,7 +451,31 @@ impl<'a> CodeGen for Assign {
                 && let Some(kind) = options.mutable_statics.get(&name.id)
             {
                 let ident = crate::safe_ident(&name.id);
-                let stored = if kind.boxed() {
+                let stored = if let crate::MutableGlobalKind::Class { class } = kind {
+                    // Issue #189: the class-instance global holds exactly
+                    // None and the detected class construction. The call's
+                    // `?` propagates from the enclosing scope's Result.
+                    if value_is_none_early {
+                        quote!(None)
+                    } else if matches!(
+                        &value_expr,
+                        ExprType::Call(c)
+                            if matches!(
+                                c.func.as_ref(),
+                                ExprType::Name(f) if f.id == *class
+                            )
+                    ) {
+                        quote!(Some(#value))
+                    } else {
+                        return Err(format!(
+                            "`global {}` stores a value that is neither `None` nor \
+                             a `{}` instance; the class-instance module global \
+                             holds exactly that (issue #189)",
+                            name.id, class
+                        )
+                        .into());
+                    }
+                } else if kind.boxed() {
                     if value_is_none_early {
                         quote!(stdpython::PyValue::None_)
                     } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {

@@ -80,7 +80,11 @@ impl CodeGen for AugAssign {
         // through the static's helpers: load the global, evaluate the
         // operand, combine, store — CPython's LOAD/op/STORE order, and
         // just as non-atomic. Each helper call takes the lock briefly, so
-        // an operand reading the same global cannot deadlock.
+        // an operand reading the same global cannot deadlock. (A
+        // class-instance global — issue #189 — never reaches here: any
+        // augmented assignment disqualifies the name from the typed
+        // pattern in module.rs, leaving the boxed static and its loud
+        // conversion error.)
         if let ExprType::Name(n) = &self.target
             && options.scope_global_writables.contains(&n.id)
             && let Some(kind) = options.mutable_statics.get(&n.id)

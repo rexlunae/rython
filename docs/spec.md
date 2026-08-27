@@ -322,10 +322,18 @@ through subscript/attribute stores marks the chain's base variable.
   each takes the lock briefly, so compound assignment is CPython's
   non-atomic LOAD/op/STORE, and `+` on a boxed global dispatches at
   runtime (PyValue arithmetic; a member mismatch panics CPython's
-  TypeError, §12.2). Storing a container or class instance into a
-  boxed global is a loud error; multiple/conditional module stores,
-  shadowing locals, and no_std keep the documented divergence: the
-  write is dropped and reported through the `-W` channel.
+  TypeError, §12.2). One boxed-global shape is typed instead: a
+  None-initialized global whose `global`-writing functions store
+  exactly one LOCAL class construction among `None` stores (the
+  lazy-singleton idiom — `HISTORY_RECORDER = HistoryRecorder()`,
+  botocore's history.py) lowers to `Mutex<Option<Class>>`; value reads
+  unwrap the instance (a read while None is a loud runtime panic,
+  §12.2), `is None` compares read the Option, and the getter's return
+  type is the class. Storing any other container or class instance
+  into a boxed global is a loud error (issue #189); multiple/
+  conditional module stores, shadowing locals, and no_std keep the
+  documented divergence: the write is dropped and reported through the
+  `-W` channel.
 
 ### 5.2 Control flow
 
