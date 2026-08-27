@@ -734,6 +734,22 @@ fn np_path(name: &str) -> (String, TokenStream) {
     }
 }
 
+/// A readable source-like spelling of a (short) expression chain for -W
+/// messages: `self.items.append` — Name/Attribute chains join with dots, a
+/// call renders as `f(...)`, and anything else falls back to the Debug form
+/// (terminal). The -W channel is for humans; a raw AST Debug dump is not a
+/// diagnostic (issue #209).
+fn expr_chain_spelling(e: &ExprType) -> String {
+    match e {
+        ExprType::Name(n) => n.id.clone(),
+        ExprType::Attribute(a) => {
+            format!("{}.{}", expr_chain_spelling(&a.value), a.attr)
+        }
+        ExprType::Call(c) => format!("{}(...)", expr_chain_spelling(c.func.as_ref())),
+        _ => format!("{:?}", e),
+    }
+}
+
 /// Lower `np.<fname>(args, kwargs)` onto the stdpython numpy module.
 #[allow(clippy::too_many_lines)]
 fn lower_numpy_call(
@@ -1500,9 +1516,9 @@ impl<'a> CodeGen for Call {
             )
         {
             options.definition_warnings.borrow_mut().push(format!(
-                "`{:?}.{}(...)` is dropped: the receiver is a boxed PyValue \
+                "`{}.{}(...)` is dropped: the receiver is a boxed PyValue \
                  (dynamic-method divergence)",
-                attr.value, attr.attr
+                expr_chain_spelling(&attr.value), attr.attr
             ));
             return Ok(quote!(stdpython::PyValue::None_));
         }
