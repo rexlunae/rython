@@ -276,6 +276,12 @@ pub struct PythonOptions {
     /// from xs` as `extend(xs)`; the function codegen emits the collector
     /// Vec and returns it (a generator builds-and-returns its list).
     pub generator_collector: std::rc::Rc<Option<String>>,
+
+    /// Whether the generator collector's element type is the boxed
+    /// PyValue (the yield type did not resolve): yields wrap in
+    /// PyValue::from, a bare `yield` pushes PyValue::None_, and
+    /// `yield from` boxes each element.
+    pub generator_boxes: bool,
     /// When rendering a dict literal, force its key/value types (issue
     /// #121): a store into a `dict[str, Any]` name sets this to
     /// (String, PyValue) so mixed values wrap per element, and a
@@ -545,6 +551,7 @@ impl Default for PythonOptions {
             narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
             dict_forced_kv: std::rc::Rc::new(None),
             generator_collector: std::rc::Rc::new(None),
+            generator_boxes: false,
             clone_str_attribute_returns: false,
             fn_return_is_pyvalue: false,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),

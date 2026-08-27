@@ -109,10 +109,19 @@ impl CodeGen for Yield {
         // (issue #122-family — generators build-and-return a list).
         if let Some(collector) = options.generator_collector.as_ref() {
             let collector = proc_macro2::Ident::new(collector, proc_macro2::Span::call_site());
+            let boxes = options.generator_boxes;
             let value = match self.value.as_ref() {
                 Some(v) => v.clone().to_rust(ctx, options, symbols)?,
+                None if boxes => {
+                    // A bare `yield` (the @contextmanager shape) yields
+                    // None — the boxed None in a PyValue collector.
+                    return Ok(quote!(#collector . push (stdpython::PyValue::None_)));
+                }
                 None => return Ok(quote!(#collector)),
             };
+            if boxes {
+                return Ok(quote!(#collector . push (stdpython::PyValue::from(#value))));
+            }
             return Ok(quote!(#collector . push (#value)));
         }
         Err(
@@ -146,7 +155,16 @@ impl CodeGen for YieldFrom {
         // collection directly.
         if let Some(collector) = options.generator_collector.as_ref() {
             let collector = proc_macro2::Ident::new(collector, proc_macro2::Span::call_site());
+            let boxes = options.generator_boxes;
             let value = self.value.to_rust(ctx, options.clone(), symbols)?;
+            if boxes {
+                // A boxed collector: each yielded-from element boxes too
+                // (a concrete inner Vec fails Into<PyValue> loudly when
+                // the element cannot box).
+                return Ok(quote!(#collector . extend (
+                    (#value).into_iter().map(stdpython::PyValue::from)
+                )));
+            }
             return Ok(quote!(#collector . extend (#value)));
         }
         let value = self.value.to_rust(ctx, options, symbols)?;

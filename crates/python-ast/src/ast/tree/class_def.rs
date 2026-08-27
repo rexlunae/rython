@@ -1858,7 +1858,18 @@ impl CodeGen for ClassDef {
                             crate::resolve_imported_class(&options, &path, canonical, 0)
                                 .map(|(c, _)| c)
                         }
-                        Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                        // The canonical name can be SHADOWED by the class
+                        // being defined (`from http.client import
+                        // HTTPConnection as _HTTPConnection` then `class
+                        // HTTPConnection(_HTTPConnection)` — urllib3): the
+                        // alias meant the import, not the later class, so
+                        // a self-resolution is the shadowed EXTERNAL base
+                        // — metadata (the inherited behavior is the
+                        // documented divergence), never a self-supertrait
+                        // and an infinitely-sized embedded struct.
+                        Some(SymbolTableNode::ClassDef(c)) if c.name != self.name => {
+                            Some(c.clone())
+                        }
                         _ => None,
                     }
                 }
@@ -2649,9 +2660,20 @@ impl ClassDef {
         // accessors reaching through `self.__rython_base` (repeated per
         // level), plus this class's overrides of the methods that ancestor
         // defined, written against the concrete struct.
+        //
+        // KNOWN LIMIT (next round): the chain is symbols-only, so a
+        // CROSS-MODULE derived class (`SOCKSConnection(HTTPConnection)`
+        // with the base in ..connection) does not implement its imported
+        // ancestors' traits — E0277 on the supertrait bound. Following
+        // the import here (resolve_base_with_options) makes the impls
+        // emit, but their field-accessor types then resolve and infer in
+        // the WRONG module scope (E0053 signature mismatches against the
+        // defining module's trait, E0425 on its private type names);
+        // the re-emission needs the defining module's inference context.
         let mut ancestor_impls = TokenStream::new();
         let chain = self.base_chain(symbols);
         for (depth, ancestor) in chain.iter().enumerate().skip(1).rev() {
+            let a_syms = symbols;
             let ancestor_trait = format_ident!("{}Trait", ancestor.name);
             let mut chain_tokens = TokenStream::new();
             for _ in 0..depth {
@@ -2662,11 +2684,11 @@ impl ClassDef {
             // its base owns declares no accessor for it, because the field
             // physically lives in the ancestor's base struct and the
             // ancestor's trait only declares accessors for fields it owns.
-            let a_fields = ancestor.own_fields(symbols, options)?;
+            let a_fields = ancestor.own_fields(a_syms, options)?;
             let mut accessor_impls = TokenStream::new();
             // The ancestor's own base accessors, if it has a base: from the
             // derived struct, its base struct is one level deeper.
-            if let Some(a_base) = ancestor.base_class(symbols) {
+            if let Some(a_base) = ancestor.base_class(a_syms) {
                 let ab_ident = crate::safe_ident(&a_base.name);
                 let mut base_self = quote!(self);
                 base_self.extend(chain_tokens.clone());
@@ -2703,13 +2725,13 @@ impl ClassDef {
             // only strictly-lower definers need re-emission against this
             // class's struct — and `super()` inside such a re-emitted
             // override must target the DEFINER's base, not this class's base.
-            let a_base = ancestor.base_class(symbols);
+            let a_base = ancestor.base_class(a_syms);
             let ancestor_members: Vec<&FunctionDef> = ancestor
                 .methods()
                 .filter(|am| {
                     am.name != "__init__"
                         && a_base.as_ref().map_or(true, |b| {
-                            b.method_on_mro(&am.name, symbols).is_none()
+                            b.method_on_mro(&am.name, a_syms).is_none()
                         })
                 })
                 .collect();
