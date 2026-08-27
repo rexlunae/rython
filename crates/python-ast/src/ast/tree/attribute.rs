@@ -769,17 +769,19 @@ pub(crate) fn is_module_path_chain(
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
                     let mut sub = ifm.resolved_module_path(options);
                     sub.push(n.id.clone());
-                    if options.module_defs.contains_key(&sub) {
+                    if crate::module_defs_contains(options, &sub) {
                         return true;
                     }
                     let path = ifm.resolved_module_path(options);
-                    options.module_defs.contains_key(&path)
-                        && crate::ast::tree::module::module_reexports_stdpython_module(
-                            options,
-                            &path,
-                            &n.id,
-                        )
-                        .is_some()
+                    crate::module_defs_key(options, &path)
+                        .is_some_and(|key| {
+                            crate::ast::tree::module::module_reexports_stdpython_module(
+                                options,
+                                key,
+                                &n.id,
+                            )
+                            .is_some()
+                        })
                 }
                 // An ABSOLUTE import whose name resolves to a crate
                 // SUBMODULE (`from urllib3.contrib import pyopenssl` —
@@ -792,7 +794,7 @@ pub(crate) fn is_module_path_chain(
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
                     let mut sub = ifm.resolved_module_path(options);
                     sub.push(n.id.clone());
-                    options.module_defs.contains_key(&sub)
+                    crate::module_defs_contains(options, &sub)
                 }
                 _ => false,
             }
@@ -953,7 +955,7 @@ pub(crate) fn external_module_root(
     if crate::ast::tree::import::is_stdpython_module(first) {
         return None;
     }
-    if options.module_defs.contains_key(&path) {
+    if crate::module_defs_contains(options, &path) {
         return None;
     }
     if options.python_modules.contains(first) {

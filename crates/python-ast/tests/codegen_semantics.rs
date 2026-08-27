@@ -316,6 +316,7 @@ fn imported_function_keyword_args_resolve_cross_module() {
     );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
         ..Default::default()
     };
     let caller = parse(
@@ -9824,6 +9825,202 @@ fn covariant_cross_module_override_is_dropped_with_warning() {
             .borrow()
             .iter()
             .any(|w| w.contains("covariant-override divergence")),
+        "the drop must be loud: {:?}",
+        warnings.borrow()
+    );
+}
+
+/// Absolute imports of same-crate modules must resolve for src-layout
+/// sdists, whose `module_defs` keys are RELATIVE to the package root
+/// (pip, boto3): `from pkg.reqmod import with_cleanup` resolves to
+/// ["pkg", "reqmod"] while the key is ["reqmod"]. Without the
+/// two-form lookup, the local-wrapper decorator bypass missed and the
+/// conversion failed with "decorator `with_cleanup` is not supported
+/// yet" (pip's `_internal/commands/download.py`).
+#[test]
+fn absolute_import_of_src_layout_sibling_decorator_resolves() {
+    let reqmod = parse(
+        "def with_cleanup(func):\n    return func\n",
+        "reqmod.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["reqmod".to_string()],
+        std::rc::Rc::new(reqmod),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        // The stripped-prefix lookup applies only to the package's OWN
+        // root-qualified name.
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.reqmod import with_cleanup\n\
+         \n\
+         class DownloadCommand:\n\
+         \x20   @with_cleanup\n\
+         \x20   def run(self, options, args):\n\
+         \x20       return 0\n",
+        "usemod.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(
+            CodeGenContext::Module("usemod".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        !out.contains("is not supported yet"),
+        "the local-wrapper decorator must lower directly: {}",
+        out
+    );
+    assert!(out.contains("fn run"), "method must be emitted: {}", out);
+}
+
+/// The generated `use` for an absolute sibling import must match the
+/// crate's mod tree (relative keys): `crate::session::make`, not
+/// `crate::pkg::session::make` (which would fail E0432).
+#[test]
+fn absolute_import_of_src_layout_sibling_emits_relative_use() {
+    let session = parse(
+        "def make() -> int:\n    return 42\n",
+        "session.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["session".to_string()],
+        std::rc::Rc::new(session),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let caller = parse(
+        "from pkg.session import make\n\
+         \n\
+         def answer() -> int:\n\
+         \x20   return make()\n",
+        "caller.py",
+    )
+    .unwrap();
+    let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
+    let out = caller
+        .to_rust(
+            CodeGenContext::Module("caller".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains("session :: make")
+            && !out.contains("pkg :: session"),
+        "use must reference the crate-relative module: {}",
+        out
+    );
+
+    assert!(
+        out.contains("make ("),
+        "the cross-module call must lower: {}",
+        out
+    );
+}
+
+/// A plain `import pkg.connection` inside the pkg conversion binds only
+/// the ROOT name in Python — never the leaf. Emitting `use
+/// crate::connection;` would bind a name Python doesn't and collide with
+/// a sibling's own `connection` submodule (urllib3's
+/// `contrib/emscripten`, E0255); `use crate::pkg::connection;` names a
+/// module the crate doesn't contain (E0432). Unaliased emits nothing;
+/// aliased binds the crate-relative path.
+#[test]
+fn plain_import_of_root_qualified_sibling_binds_root_only() {
+    let connection = parse("A = 1\n", "connection.py").unwrap();
+    let other = parse("B = 2\n", "other.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["connection".to_string()], std::rc::Rc::new(connection));
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let user = parse(
+        "import pkg.connection\nimport pkg.connection as conn\n",
+        "user.py",
+    )
+    .unwrap();
+    let symbols = user.clone().find_symbols(SymbolTableScopes::new());
+    let out = user
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        !out.contains("crate :: pkg"),
+        "the crate has no `pkg` module: {}",
+        out
+    );
+    assert!(
+        !out.contains("use crate :: connection ;"),
+        "the unaliased form must not bind the leaf: {}",
+        out
+    );
+    assert!(
+        out.contains("use crate :: connection as conn"),
+        "the aliased form binds the crate-relative path: {}",
+        out
+    );
+}
+
+/// The stripped-prefix lookup covers ONLY the package's own
+/// root-qualified name: `import h2.connection` must not resolve to a
+/// same-named crate module (urllib3's connection.py) — it is an external
+/// module, dropped with the divergence warning.
+#[test]
+fn plain_import_of_external_root_is_not_aliased_onto_crate_modules() {
+    let connection = parse("A = 1\n", "connection.py").unwrap();
+    let other = parse("B = 2\n", "other.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["connection".to_string()], std::rc::Rc::new(connection));
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let warnings = options.definition_warnings.clone();
+    let user = parse("import h2.connection\n", "user.py").unwrap();
+    let symbols = user.clone().find_symbols(SymbolTableScopes::new());
+    let out = user
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        !out.contains("use crate"),
+        "an external module must not resolve into the crate: {}",
+        out
+    );
+    assert!(
+        warnings
+            .borrow()
+            .iter()
+            .any(|w| w.contains("external-module divergence")),
         "the drop must be loud: {:?}",
         warnings.borrow()
     );

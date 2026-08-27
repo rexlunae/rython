@@ -1964,6 +1964,7 @@ pub fn convert(
         &python_module_names,
         &module_defs,
         async_runtime_dep,
+        &package.name,
     );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -2408,6 +2409,7 @@ fn convert_driver(
         &python_module_names,
         &module_defs,
         package_uses_async,
+        &package.name,
     );
     let code = transpile(module, &mut warnings, &base_options)?;
 
@@ -2968,6 +2970,7 @@ fn conversion_base_options(
     python_module_names: &std::collections::HashSet<String>,
     module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
     async_runtime_dep: bool,
+    package_name: &str,
 ) -> PythonOptions {
     PythonOptions {
         lossy_warnings: opts.warnings != WarningMode::Allow,
@@ -2976,6 +2979,11 @@ fn conversion_base_options(
         python_modules: std::rc::Rc::new(python_module_names.clone()),
         module_defs: std::rc::Rc::new(module_defs.clone()),
         async_runtime_dep,
+        // The package's own name: root-qualified absolute self-imports
+        // (`from urllib3.connection import ...`, pip's src-layout paths)
+        // strip exactly this leading segment when matching module_defs'
+        // relative keys — never an external root like `h2`.
+        python_namespace: package_name.to_string(),
         ..Default::default()
     }
 }
