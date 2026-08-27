@@ -1,0 +1,4041 @@
+[
+ {
+  "case": "01_creation_basic",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "[0.   0.25 0.5  0.75 1.  ]",
+      "rython": "[0. 0.25 0.5 0.75 1.]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "[0.   0.25 0.5  0.75 1.  ]",
+      "rython": "[0. 0.25 0.5 0.75 1.]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "[0.   0.25 0.5  0.75 1.  ]",
+      "rython": "[0. 0.25 0.5 0.75 1.]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "[0.   0.25 0.5  0.75 1.  ]",
+      "rython": "[0. 0.25 0.5 0.75 1.]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "[0.   0.25 0.5  0.75 1.  ]",
+      "rython": "[0. 0.25 0.5 0.75 1.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "02_creation_2d",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "03_dtypes",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int64\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Bool\"`"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int64\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Bool\"`"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int64\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Bool\"`"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int64\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Bool\"`"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int64\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Bool\"`"
+    ]
+   }
+  }
+ },
+ {
+  "case": "04_print_floats",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[  1.5    22.25  333.125]",
+      "rython": "[  1.5  22.25 333.125]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1.   2.  -3.5]",
+      "rython": "[-  1.   2. -  3.5]"
+     },
+     {
+      "line": 3,
+      "cpython": "[1.e-09 1.e+00 1.e+09]",
+      "rython": null
+     },
+     {
+      "line": 4,
+      "cpython": "[0.1 0.2 0.3]",
+      "rython": null
+     },
+     {
+      "line": 5,
+      "cpython": "[1.e+16 2.e+16]",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": "[ 0. -0.]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[1. 2. 3.]",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "[1.e+05 2.e+00]",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "[1.e-05 1.e+00]",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "[0.  0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1. ]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (28565) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[  1.5    22.25  333.125]",
+      "rython": "[  1.5  22.25 333.125]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1.   2.  -3.5]",
+      "rython": "[-  1.   2. -  3.5]"
+     },
+     {
+      "line": 3,
+      "cpython": "[1.e-09 1.e+00 1.e+09]",
+      "rython": null
+     },
+     {
+      "line": 4,
+      "cpython": "[0.1 0.2 0.3]",
+      "rython": null
+     },
+     {
+      "line": 5,
+      "cpython": "[1.e+16 2.e+16]",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": "[ 0. -0.]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[1. 2. 3.]",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "[1.e+05 2.e+00]",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "[1.e-05 1.e+00]",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "[0.  0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1. ]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (28618) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[  1.5    22.25  333.125]",
+      "rython": "[  1.5  22.25 333.125]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1.   2.  -3.5]",
+      "rython": "[-  1.   2. -  3.5]"
+     },
+     {
+      "line": 3,
+      "cpython": "[1.e-09 1.e+00 1.e+09]",
+      "rython": null
+     },
+     {
+      "line": 4,
+      "cpython": "[0.1 0.2 0.3]",
+      "rython": null
+     },
+     {
+      "line": 5,
+      "cpython": "[1.e+16 2.e+16]",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": "[ 0. -0.]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[1. 2. 3.]",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "[1.e+05 2.e+00]",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "[1.e-05 1.e+00]",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "[0.  0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1. ]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (28671) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-simd": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[  1.5    22.25  333.125]",
+      "rython": "[  1.5  22.25 333.125]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1.   2.  -3.5]",
+      "rython": "[-  1.   2. -  3.5]"
+     },
+     {
+      "line": 3,
+      "cpython": "[1.e-09 1.e+00 1.e+09]",
+      "rython": null
+     },
+     {
+      "line": 4,
+      "cpython": "[0.1 0.2 0.3]",
+      "rython": null
+     },
+     {
+      "line": 5,
+      "cpython": "[1.e+16 2.e+16]",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": "[ 0. -0.]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[1. 2. 3.]",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "[1.e+05 2.e+00]",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "[1.e-05 1.e+00]",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "[0.  0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1. ]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (28724) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[  1.5    22.25  333.125]",
+      "rython": "[  1.5  22.25 333.125]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1.   2.  -3.5]",
+      "rython": "[-  1.   2. -  3.5]"
+     },
+     {
+      "line": 3,
+      "cpython": "[1.e-09 1.e+00 1.e+09]",
+      "rython": null
+     },
+     {
+      "line": 4,
+      "cpython": "[0.1 0.2 0.3]",
+      "rython": null
+     },
+     {
+      "line": 5,
+      "cpython": "[1.e+16 2.e+16]",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": "[ 0. -0.]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[1. 2. 3.]",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "[1.e+05 2.e+00]",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "[1.e-05 1.e+00]",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "[0.  0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1. ]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (28867) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   }
+  }
+ },
+ {
+  "case": "05_print_ints_bools",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_05_print_ints_bools_default_auto` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_05_print_ints_bools_cpu_scalar` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_05_print_ints_bools_cpu_rayon` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_05_print_ints_bools_cpu_simd` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_05_print_ints_bools_cpu_auto` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "06_ufunc_binary",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 6,
+      "cpython": "[2.5 2.5 3.  4. ]",
+      "rython": "[2.5 2.5 3. 4.]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.  2.  2.5 2.5]",
+      "rython": "[1. 2. 2.5 2.5]"
+     },
+     {
+      "line": 9,
+      "cpython": "[-1. -2. -3. -4.]",
+      "rython": "[-  1. -  2. -  3. -  4.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[1.         0.5        0.33333333 0.25      ]",
+      "rython": "[1. 0.5 0.3333333333333333 0.25]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 6,
+      "cpython": "[2.5 2.5 3.  4. ]",
+      "rython": "[2.5 2.5 3. 4.]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.  2.  2.5 2.5]",
+      "rython": "[1. 2. 2.5 2.5]"
+     },
+     {
+      "line": 9,
+      "cpython": "[-1. -2. -3. -4.]",
+      "rython": "[-  1. -  2. -  3. -  4.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[1.         0.5        0.33333333 0.25      ]",
+      "rython": "[1. 0.5 0.3333333333333333 0.25]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 6,
+      "cpython": "[2.5 2.5 3.  4. ]",
+      "rython": "[2.5 2.5 3. 4.]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.  2.  2.5 2.5]",
+      "rython": "[1. 2. 2.5 2.5]"
+     },
+     {
+      "line": 9,
+      "cpython": "[-1. -2. -3. -4.]",
+      "rython": "[-  1. -  2. -  3. -  4.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[1.         0.5        0.33333333 0.25      ]",
+      "rython": "[1. 0.5 0.3333333333333333 0.25]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 6,
+      "cpython": "[2.5 2.5 3.  4. ]",
+      "rython": "[2.5 2.5 3. 4.]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.  2.  2.5 2.5]",
+      "rython": "[1. 2. 2.5 2.5]"
+     },
+     {
+      "line": 9,
+      "cpython": "[-1. -2. -3. -4.]",
+      "rython": "[-  1. -  2. -  3. -  4.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[1.         0.5        0.33333333 0.25      ]",
+      "rython": "[1. 0.5 0.3333333333333333 0.25]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 6,
+      "cpython": "[2.5 2.5 3.  4. ]",
+      "rython": "[2.5 2.5 3. 4.]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.  2.  2.5 2.5]",
+      "rython": "[1. 2. 2.5 2.5]"
+     },
+     {
+      "line": 9,
+      "cpython": "[-1. -2. -3. -4.]",
+      "rython": "[-  1. -  2. -  3. -  4.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[1.         0.5        0.33333333 0.25      ]",
+      "rython": "[1. 0.5 0.3333333333333333 0.25]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "07_ufunc_unary",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 1.  2.  3. ]",
+      "rython": "[0.5 1. 2. 3.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[1.         2.71828183 7.3890561 ]",
+      "rython": "[1. 2.718281828459045 7.38905609893065]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-1.38629436  0.          1.38629436  2.19722458]",
+      "rython": "[-  1.3862943611198906   0.   1.3862943611198906   2.1972245773362196]"
+     },
+     {
+      "line": 6,
+      "cpython": "[0.         0.47942554 0.84147098]",
+      "rython": "[0. 0.479425538604203 0.8414709848078965]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.         0.87758256 0.54030231]",
+      "rython": "[1. 0.8775825618903728 0.5403023058681398]"
+     },
+     {
+      "line": 8,
+      "cpython": "[0.         0.54630249 1.55740772]",
+      "rython": "[0. 0.5463024898437905 1.5574077246549023]"
+     },
+     {
+      "line": 9,
+      "cpython": "[0.         0.46211716 0.76159416]",
+      "rython": "[0. 0.46211715726000974 0.7615941559557649]"
+     },
+     {
+      "line": 10,
+      "cpython": "[ 1. -2.  2.]",
+      "rython": "[  1. -  2.   2.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[ 2. -1.  2.]",
+      "rython": "[  2. -  1.   2.]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.  2.  3.5]",
+      "rython": "[1. 2. 3.5]"
+     },
+     {
+      "line": 13,
+      "cpython": "[-0.25 -1.   -4.   -9.  ]",
+      "rython": "[-  0.25 -  1. -  4. -  9.]"
+     },
+     {
+      "line": 15,
+      "cpython": "[-1.  0.  1.]",
+      "rython": "[-  1.   0.   1.]"
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (29437) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 1.  2.  3. ]",
+      "rython": "[0.5 1. 2. 3.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[1.         2.71828183 7.3890561 ]",
+      "rython": "[1. 2.718281828459045 7.38905609893065]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-1.38629436  0.          1.38629436  2.19722458]",
+      "rython": "[-  1.3862943611198906   0.   1.3862943611198906   2.1972245773362196]"
+     },
+     {
+      "line": 6,
+      "cpython": "[0.         0.47942554 0.84147098]",
+      "rython": "[0. 0.479425538604203 0.8414709848078965]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.         0.87758256 0.54030231]",
+      "rython": "[1. 0.8775825618903728 0.5403023058681398]"
+     },
+     {
+      "line": 8,
+      "cpython": "[0.         0.54630249 1.55740772]",
+      "rython": "[0. 0.5463024898437905 1.5574077246549023]"
+     },
+     {
+      "line": 9,
+      "cpython": "[0.         0.46211716 0.76159416]",
+      "rython": "[0. 0.46211715726000974 0.7615941559557649]"
+     },
+     {
+      "line": 10,
+      "cpython": "[ 1. -2.  2.]",
+      "rython": "[  1. -  2.   2.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[ 2. -1.  2.]",
+      "rython": "[  2. -  1.   2.]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.  2.  3.5]",
+      "rython": "[1. 2. 3.5]"
+     },
+     {
+      "line": 13,
+      "cpython": "[-0.25 -1.   -4.   -9.  ]",
+      "rython": "[-  0.25 -  1. -  4. -  9.]"
+     },
+     {
+      "line": 15,
+      "cpython": "[-1.  0.  1.]",
+      "rython": "[-  1.   0.   1.]"
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (29490) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 1.  2.  3. ]",
+      "rython": "[0.5 1. 2. 3.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[1.         2.71828183 7.3890561 ]",
+      "rython": "[1. 2.718281828459045 7.38905609893065]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-1.38629436  0.          1.38629436  2.19722458]",
+      "rython": "[-  1.3862943611198906   0.   1.3862943611198906   2.1972245773362196]"
+     },
+     {
+      "line": 6,
+      "cpython": "[0.         0.47942554 0.84147098]",
+      "rython": "[0. 0.479425538604203 0.8414709848078965]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.         0.87758256 0.54030231]",
+      "rython": "[1. 0.8775825618903728 0.5403023058681398]"
+     },
+     {
+      "line": 8,
+      "cpython": "[0.         0.54630249 1.55740772]",
+      "rython": "[0. 0.5463024898437905 1.5574077246549023]"
+     },
+     {
+      "line": 9,
+      "cpython": "[0.         0.46211716 0.76159416]",
+      "rython": "[0. 0.46211715726000974 0.7615941559557649]"
+     },
+     {
+      "line": 10,
+      "cpython": "[ 1. -2.  2.]",
+      "rython": "[  1. -  2.   2.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[ 2. -1.  2.]",
+      "rython": "[  2. -  1.   2.]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.  2.  3.5]",
+      "rython": "[1. 2. 3.5]"
+     },
+     {
+      "line": 13,
+      "cpython": "[-0.25 -1.   -4.   -9.  ]",
+      "rython": "[-  0.25 -  1. -  4. -  9.]"
+     },
+     {
+      "line": 15,
+      "cpython": "[-1.  0.  1.]",
+      "rython": "[-  1.   0.   1.]"
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (29543) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-simd": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 1.  2.  3. ]",
+      "rython": "[0.5 1. 2. 3.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[1.         2.71828183 7.3890561 ]",
+      "rython": "[1. 2.718281828459045 7.38905609893065]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-1.38629436  0.          1.38629436  2.19722458]",
+      "rython": "[-  1.3862943611198906   0.   1.3862943611198906   2.1972245773362196]"
+     },
+     {
+      "line": 6,
+      "cpython": "[0.         0.47942554 0.84147098]",
+      "rython": "[0. 0.479425538604203 0.8414709848078965]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.         0.87758256 0.54030231]",
+      "rython": "[1. 0.8775825618903728 0.5403023058681398]"
+     },
+     {
+      "line": 8,
+      "cpython": "[0.         0.54630249 1.55740772]",
+      "rython": "[0. 0.5463024898437905 1.5574077246549023]"
+     },
+     {
+      "line": 9,
+      "cpython": "[0.         0.46211716 0.76159416]",
+      "rython": "[0. 0.46211715726000974 0.7615941559557649]"
+     },
+     {
+      "line": 10,
+      "cpython": "[ 1. -2.  2.]",
+      "rython": "[  1. -  2.   2.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[ 2. -1.  2.]",
+      "rython": "[  2. -  1.   2.]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.  2.  3.5]",
+      "rython": "[1. 2. 3.5]"
+     },
+     {
+      "line": 13,
+      "cpython": "[-0.25 -1.   -4.   -9.  ]",
+      "rython": "[-  0.25 -  1. -  4. -  9.]"
+     },
+     {
+      "line": 15,
+      "cpython": "[-1.  0.  1.]",
+      "rython": "[-  1.   0.   1.]"
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (29600) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 1.  2.  3. ]",
+      "rython": "[0.5 1. 2. 3.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[1.         2.71828183 7.3890561 ]",
+      "rython": "[1. 2.718281828459045 7.38905609893065]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-1.38629436  0.          1.38629436  2.19722458]",
+      "rython": "[-  1.3862943611198906   0.   1.3862943611198906   2.1972245773362196]"
+     },
+     {
+      "line": 6,
+      "cpython": "[0.         0.47942554 0.84147098]",
+      "rython": "[0. 0.479425538604203 0.8414709848078965]"
+     },
+     {
+      "line": 7,
+      "cpython": "[1.         0.87758256 0.54030231]",
+      "rython": "[1. 0.8775825618903728 0.5403023058681398]"
+     },
+     {
+      "line": 8,
+      "cpython": "[0.         0.54630249 1.55740772]",
+      "rython": "[0. 0.5463024898437905 1.5574077246549023]"
+     },
+     {
+      "line": 9,
+      "cpython": "[0.         0.46211716 0.76159416]",
+      "rython": "[0. 0.46211715726000974 0.7615941559557649]"
+     },
+     {
+      "line": 10,
+      "cpython": "[ 1. -2.  2.]",
+      "rython": "[  1. -  2.   2.]"
+     },
+     {
+      "line": 11,
+      "cpython": "[ 2. -1.  2.]",
+      "rython": "[  2. -  1.   2.]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.  2.  3.5]",
+      "rython": "[1. 2. 3.5]"
+     },
+     {
+      "line": 13,
+      "cpython": "[-0.25 -1.   -4.   -9.  ]",
+      "rython": "[-  0.25 -  1. -  4. -  9.]"
+     },
+     {
+      "line": 15,
+      "cpython": "[-1.  0.  1.]",
+      "rython": "[-  1.   0.   1.]"
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (29653) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   }
+  }
+ },
+ {
+  "case": "08_ufunc_int",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "09_comparisons",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "10_reductions",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "11_reductions_int",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "10",
+      "rython": "10.0"
+     },
+     {
+      "line": 2,
+      "cpython": "24",
+      "rython": "24.0"
+     },
+     {
+      "line": 4,
+      "cpython": "4",
+      "rython": "4.0"
+     },
+     {
+      "line": 5,
+      "cpython": "1",
+      "rython": "1.0"
+     },
+     {
+      "line": 8,
+      "cpython": "15",
+      "rython": "15.0"
+     },
+     {
+      "line": 9,
+      "cpython": "5",
+      "rython": "5.0"
+     },
+     {
+      "line": 10,
+      "cpython": "2",
+      "rython": "2.0"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "10",
+      "rython": "10.0"
+     },
+     {
+      "line": 2,
+      "cpython": "24",
+      "rython": "24.0"
+     },
+     {
+      "line": 4,
+      "cpython": "4",
+      "rython": "4.0"
+     },
+     {
+      "line": 5,
+      "cpython": "1",
+      "rython": "1.0"
+     },
+     {
+      "line": 8,
+      "cpython": "15",
+      "rython": "15.0"
+     },
+     {
+      "line": 9,
+      "cpython": "5",
+      "rython": "5.0"
+     },
+     {
+      "line": 10,
+      "cpython": "2",
+      "rython": "2.0"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "10",
+      "rython": "10.0"
+     },
+     {
+      "line": 2,
+      "cpython": "24",
+      "rython": "24.0"
+     },
+     {
+      "line": 4,
+      "cpython": "4",
+      "rython": "4.0"
+     },
+     {
+      "line": 5,
+      "cpython": "1",
+      "rython": "1.0"
+     },
+     {
+      "line": 8,
+      "cpython": "15",
+      "rython": "15.0"
+     },
+     {
+      "line": 9,
+      "cpython": "5",
+      "rython": "5.0"
+     },
+     {
+      "line": 10,
+      "cpython": "2",
+      "rython": "2.0"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "10",
+      "rython": "10.0"
+     },
+     {
+      "line": 2,
+      "cpython": "24",
+      "rython": "24.0"
+     },
+     {
+      "line": 4,
+      "cpython": "4",
+      "rython": "4.0"
+     },
+     {
+      "line": 5,
+      "cpython": "1",
+      "rython": "1.0"
+     },
+     {
+      "line": 8,
+      "cpython": "15",
+      "rython": "15.0"
+     },
+     {
+      "line": 9,
+      "cpython": "5",
+      "rython": "5.0"
+     },
+     {
+      "line": 10,
+      "cpython": "2",
+      "rython": "2.0"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "10",
+      "rython": "10.0"
+     },
+     {
+      "line": 2,
+      "cpython": "24",
+      "rython": "24.0"
+     },
+     {
+      "line": 4,
+      "cpython": "4",
+      "rython": "4.0"
+     },
+     {
+      "line": 5,
+      "cpython": "1",
+      "rython": "1.0"
+     },
+     {
+      "line": 8,
+      "cpython": "15",
+      "rython": "15.0"
+     },
+     {
+      "line": 9,
+      "cpython": "5",
+      "rython": "5.0"
+     },
+     {
+      "line": 10,
+      "cpython": "2",
+      "rython": "2.0"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "12_shape_ops",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "CONVERT_FAIL",
+    "rc": null,
+    "errors": [
+     "Error: compiling /tmp/npeval2/12_shape_ops.default-auto.py: code generation error at _12_shape_ops_default_auto.py:5:1-21:28 [location=_12_shape_ops_default_auto.py:5:1-21:28, message=code generation error at <module>:13:5-36 [location=<module>:13:5-36, message=np.concatenate() takes exactly 1 positional argument (2 given), help=], help=]"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "CONVERT_FAIL",
+    "rc": null,
+    "errors": [
+     "Error: compiling /tmp/npeval2/12_shape_ops.cpu-scalar.py: code generation error at _12_shape_ops_cpu_scalar.py:5:1-22:28 [location=_12_shape_ops_cpu_scalar.py:5:1-22:28, message=code generation error at <module>:14:5-36 [location=<module>:14:5-36, message=np.concatenate() takes exactly 1 positional argument (2 given), help=], help=]"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "CONVERT_FAIL",
+    "rc": null,
+    "errors": [
+     "Error: compiling /tmp/npeval2/12_shape_ops.cpu-rayon.py: code generation error at _12_shape_ops_cpu_rayon.py:5:1-22:28 [location=_12_shape_ops_cpu_rayon.py:5:1-22:28, message=code generation error at <module>:14:5-36 [location=<module>:14:5-36, message=np.concatenate() takes exactly 1 positional argument (2 given), help=], help=]"
+    ]
+   },
+   "cpu-simd": {
+    "status": "CONVERT_FAIL",
+    "rc": null,
+    "errors": [
+     "Error: compiling /tmp/npeval2/12_shape_ops.cpu-simd.py: code generation error at _12_shape_ops_cpu_simd.py:5:1-22:28 [location=_12_shape_ops_cpu_simd.py:5:1-22:28, message=code generation error at <module>:14:5-36 [location=<module>:14:5-36, message=np.concatenate() takes exactly 1 positional argument (2 given), help=], help=]"
+    ]
+   },
+   "cpu-auto": {
+    "status": "CONVERT_FAIL",
+    "rc": null,
+    "errors": [
+     "Error: compiling /tmp/npeval2/12_shape_ops.cpu-auto.py: code generation error at _12_shape_ops_cpu_auto.py:5:1-21:28 [location=_12_shape_ops_cpu_auto.py:5:1-21:28, message=code generation error at <module>:13:5-36 [location=<module>:13:5-36, message=np.concatenate() takes exactly 1 positional argument (2 given), help=], help=]"
+    ]
+   }
+  }
+ },
+ {
+  "case": "13_sort_argsort",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "14_linalg",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "-2.0000000000000004",
+      "rython": "-2.0"
+     },
+     {
+      "line": 9,
+      "cpython": "[[-2.   1. ]",
+      "rython": "[[-  1.9999999999999996   0.9999999999999998]"
+     },
+     {
+      "line": 10,
+      "cpython": " [ 1.5 -0.5]]",
+      "rython": " [  1.4999999999999998 -  0.49999999999999994]]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "-2.0000000000000004",
+      "rython": "-2.0"
+     },
+     {
+      "line": 9,
+      "cpython": "[[-2.   1. ]",
+      "rython": "[[-  1.9999999999999996   0.9999999999999998]"
+     },
+     {
+      "line": 10,
+      "cpython": " [ 1.5 -0.5]]",
+      "rython": " [  1.4999999999999998 -  0.49999999999999994]]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "-2.0000000000000004",
+      "rython": "-2.0"
+     },
+     {
+      "line": 9,
+      "cpython": "[[-2.   1. ]",
+      "rython": "[[-  1.9999999999999996   0.9999999999999998]"
+     },
+     {
+      "line": 10,
+      "cpython": " [ 1.5 -0.5]]",
+      "rython": " [  1.4999999999999998 -  0.49999999999999994]]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "-2.0000000000000004",
+      "rython": "-2.0"
+     },
+     {
+      "line": 9,
+      "cpython": "[[-2.   1. ]",
+      "rython": "[[-  1.9999999999999996   0.9999999999999998]"
+     },
+     {
+      "line": 10,
+      "cpython": " [ 1.5 -0.5]]",
+      "rython": " [  1.4999999999999998 -  0.49999999999999994]]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 8,
+      "cpython": "-2.0000000000000004",
+      "rython": "-2.0"
+     },
+     {
+      "line": 9,
+      "cpython": "[[-2.   1. ]",
+      "rython": "[[-  1.9999999999999996   0.9999999999999998]"
+     },
+     {
+      "line": 10,
+      "cpython": " [ 1.5 -0.5]]",
+      "rython": " [  1.4999999999999998 -  0.49999999999999994]]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "15_clip_where",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.  0.5 3.  5. ]",
+      "rython": "[0. 0.5 3. 5.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.  0.5 1.  1. ]",
+      "rython": "[0. 0.5 1. 1.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-1. -1.  1.  1.]",
+      "rython": "[-  1. -  1.   1.   1.]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.  0.5 3.  5. ]",
+      "rython": "[0. 0.5 3. 5.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.  0.5 1.  1. ]",
+      "rython": "[0. 0.5 1. 1.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-1. -1.  1.  1.]",
+      "rython": "[-  1. -  1.   1.   1.]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.  0.5 3.  5. ]",
+      "rython": "[0. 0.5 3. 5.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.  0.5 1.  1. ]",
+      "rython": "[0. 0.5 1. 1.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-1. -1.  1.  1.]",
+      "rython": "[-  1. -  1.   1.   1.]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.  0.5 3.  5. ]",
+      "rython": "[0. 0.5 3. 5.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.  0.5 1.  1. ]",
+      "rython": "[0. 0.5 1. 1.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-1. -1.  1.  1.]",
+      "rython": "[-  1. -  1.   1.   1.]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.  0.5 3.  5. ]",
+      "rython": "[0. 0.5 3. 5.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.  0.5 1.  1. ]",
+      "rython": "[0. 0.5 1. 1.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-1. -1.  1.  1.]",
+      "rython": "[-  1. -  1.   1.   1.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "16_indexing",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "17_operators",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: borrow of moved value: `a`",
+     "error: could not compile `_17_operators_default_auto` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: borrow of moved value: `a`",
+     "error: could not compile `_17_operators_cpu_scalar` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: borrow of moved value: `a`",
+     "error: could not compile `_17_operators_cpu_rayon` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: borrow of moved value: `a`",
+     "error: could not compile `_17_operators_cpu_simd` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: borrow of moved value: `a`",
+     "error: could not compile `_17_operators_cpu_auto` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "18_special_values",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[ inf  nan -inf]",
+      "rython": "[inf. nan. -inf.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[nan  2.]",
+      "rython": "[nan. 2.]"
+     },
+     {
+      "line": 6,
+      "cpython": "[-inf   0.]",
+      "rython": "[-inf. 0.]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[ inf  nan -inf]",
+      "rython": "[inf. nan. -inf.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[nan  2.]",
+      "rython": "[nan. 2.]"
+     },
+     {
+      "line": 6,
+      "cpython": "[-inf   0.]",
+      "rython": "[-inf. 0.]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[ inf  nan -inf]",
+      "rython": "[inf. nan. -inf.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[nan  2.]",
+      "rython": "[nan. 2.]"
+     },
+     {
+      "line": 6,
+      "cpython": "[-inf   0.]",
+      "rython": "[-inf. 0.]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[ inf  nan -inf]",
+      "rython": "[inf. nan. -inf.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[nan  2.]",
+      "rython": "[nan. 2.]"
+     },
+     {
+      "line": 6,
+      "cpython": "[-inf   0.]",
+      "rython": "[-inf. 0.]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[ inf  nan -inf]",
+      "rython": "[inf. nan. -inf.]"
+     },
+     {
+      "line": 5,
+      "cpython": "[nan  2.]",
+      "rython": "[nan. 2.]"
+     },
+     {
+      "line": 6,
+      "cpython": "[-inf   0.]",
+      "rython": "[-inf. 0.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "19_dtype_promotion",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 3,
+      "cpython": "[0.5 1.  1.5]",
+      "rython": "[0.5 1. 1.5]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-0.5 -0.5 -0.5]",
+      "rython": "[-  0.5 -  0.5 -  0.5]"
+     },
+     {
+      "line": 7,
+      "cpython": "6",
+      "rython": "6.0"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 3,
+      "cpython": "[0.5 1.  1.5]",
+      "rython": "[0.5 1. 1.5]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-0.5 -0.5 -0.5]",
+      "rython": "[-  0.5 -  0.5 -  0.5]"
+     },
+     {
+      "line": 7,
+      "cpython": "6",
+      "rython": "6.0"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 3,
+      "cpython": "[0.5 1.  1.5]",
+      "rython": "[0.5 1. 1.5]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-0.5 -0.5 -0.5]",
+      "rython": "[-  0.5 -  0.5 -  0.5]"
+     },
+     {
+      "line": 7,
+      "cpython": "6",
+      "rython": "6.0"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 3,
+      "cpython": "[0.5 1.  1.5]",
+      "rython": "[0.5 1. 1.5]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-0.5 -0.5 -0.5]",
+      "rython": "[-  0.5 -  0.5 -  0.5]"
+     },
+     {
+      "line": 7,
+      "cpython": "6",
+      "rython": "6.0"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 3,
+      "cpython": "[0.5 1.  1.5]",
+      "rython": "[0.5 1. 1.5]"
+     },
+     {
+      "line": 5,
+      "cpython": "[-0.5 -0.5 -0.5]",
+      "rython": "[-  0.5 -  0.5 -  0.5]"
+     },
+     {
+      "line": 7,
+      "cpython": "6",
+      "rython": "6.0"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "20_empty_and_edge",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "21_functions_typed",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0277]: the trait bound `stdpython::PyValue: From<NdArray>` is not satisfied",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0277]: the trait bound `stdpython::PyValue: From<NdArray>` is not satisfied",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0277]: the trait bound `stdpython::PyValue: From<NdArray>` is not satisfied",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0277]: the trait bound `stdpython::PyValue: From<NdArray>` is not satisfied",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0277]: the trait bound `stdpython::PyValue: From<NdArray>` is not satisfied",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types",
+     "error[E0308]: mismatched types"
+    ]
+   }
+  }
+ },
+ {
+  "case": "22_loops_accumulate",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "23_float32",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: could not compile `_23_float32_default_auto` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: could not compile `_23_float32_cpu_scalar` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: could not compile `_23_float32_cpu_rayon` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: could not compile `_23_float32_cpu_simd` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Float32\"`",
+     "error: expected identifier, found `\"Float32\"`",
+     "error: could not compile `_23_float32_cpu_auto` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "24_int32",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: could not compile `_24_int32_default_auto` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: could not compile `_24_int32_cpu_scalar` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: could not compile `_24_int32_cpu_rayon` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: could not compile `_24_int32_cpu_simd` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Int32\"`",
+     "error: expected identifier, found `\"Int32\"`",
+     "error: could not compile `_24_int32_cpu_auto` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "25_bool_ops",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_25_bool_ops_default_auto` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_25_bool_ops_cpu_scalar` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_25_bool_ops_cpu_rayon` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_25_bool_ops_cpu_simd` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_25_bool_ops_cpu_auto` (lib) due to 2 previous errors; 3 warnings emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "26_std_ddof_positional",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 0.5]",
+      "rython": "1.2909944487358056"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.25 0.25]",
+      "rython": "1.6666666666666667"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 0.5]",
+      "rython": "1.2909944487358056"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.25 0.25]",
+      "rython": "1.6666666666666667"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 0.5]",
+      "rython": "1.2909944487358056"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.25 0.25]",
+      "rython": "1.6666666666666667"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 0.5]",
+      "rython": "1.2909944487358056"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.25 0.25]",
+      "rython": "1.6666666666666667"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.5 0.5]",
+      "rython": "1.2909944487358056"
+     },
+     {
+      "line": 2,
+      "cpython": "[0.25 0.25]",
+      "rython": "1.6666666666666667"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "27_large_reduction",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "499999500000",
+      "rython": "499999500000.0"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "499999500000",
+      "rython": "499999500000.0"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "499999500000",
+      "rython": "499999500000.0"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "499999500000",
+      "rython": "499999500000.0"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "499999500000",
+      "rython": "499999500000.0"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "28_matmul_bigger",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 7,
+      "cpython": "3.6000000000000005",
+      "rython": "3.6"
+     },
+     {
+      "line": 8,
+      "cpython": "[[ 1.12777778  0.03333333 -0.06111111 -0.15555556]",
+      "rython": "[[  1.1277777777777778   0.033333333333333326 -  0.06111111111111123 -  0.15555555555555545]"
+     },
+     {
+      "line": 9,
+      "cpython": " [-0.05        0.9        -0.15       -0.2       ]",
+      "rython": " [-  0.04999999999999992   0.9 -  0.14999999999999997 -  0.2]"
+     },
+     {
+      "line": 10,
+      "cpython": " [-0.22777778 -0.23333333  0.76111111 -0.24444444]",
+      "rython": " [-  0.22777777777777763 -  0.23333333333333317   0.7611111111111111 -  0.24444444444444463]"
+     },
+     {
+      "line": 11,
+      "cpython": " [-0.40555556 -0.36666667 -0.32777778  0.71111111]]",
+      "rython": " [-  0.4055555555555558 -  0.3666666666666668 -  0.32777777777777783   0.7111111111111112]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[ 0.94444444  0.5         0.05555556 -0.38888889]",
+      "rython": "[  0.9444444444444442   0.49999999999999994   0.05555555555555572 -  0.3888888888888891]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 7,
+      "cpython": "3.6000000000000005",
+      "rython": "3.6"
+     },
+     {
+      "line": 8,
+      "cpython": "[[ 1.12777778  0.03333333 -0.06111111 -0.15555556]",
+      "rython": "[[  1.1277777777777778   0.033333333333333326 -  0.06111111111111123 -  0.15555555555555545]"
+     },
+     {
+      "line": 9,
+      "cpython": " [-0.05        0.9        -0.15       -0.2       ]",
+      "rython": " [-  0.04999999999999992   0.9 -  0.14999999999999997 -  0.2]"
+     },
+     {
+      "line": 10,
+      "cpython": " [-0.22777778 -0.23333333  0.76111111 -0.24444444]",
+      "rython": " [-  0.22777777777777763 -  0.23333333333333317   0.7611111111111111 -  0.24444444444444463]"
+     },
+     {
+      "line": 11,
+      "cpython": " [-0.40555556 -0.36666667 -0.32777778  0.71111111]]",
+      "rython": " [-  0.4055555555555558 -  0.3666666666666668 -  0.32777777777777783   0.7111111111111112]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[ 0.94444444  0.5         0.05555556 -0.38888889]",
+      "rython": "[  0.9444444444444442   0.49999999999999994   0.05555555555555572 -  0.3888888888888891]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 7,
+      "cpython": "3.6000000000000005",
+      "rython": "3.6"
+     },
+     {
+      "line": 8,
+      "cpython": "[[ 1.12777778  0.03333333 -0.06111111 -0.15555556]",
+      "rython": "[[  1.1277777777777778   0.033333333333333326 -  0.06111111111111123 -  0.15555555555555545]"
+     },
+     {
+      "line": 9,
+      "cpython": " [-0.05        0.9        -0.15       -0.2       ]",
+      "rython": " [-  0.04999999999999992   0.9 -  0.14999999999999997 -  0.2]"
+     },
+     {
+      "line": 10,
+      "cpython": " [-0.22777778 -0.23333333  0.76111111 -0.24444444]",
+      "rython": " [-  0.22777777777777763 -  0.23333333333333317   0.7611111111111111 -  0.24444444444444463]"
+     },
+     {
+      "line": 11,
+      "cpython": " [-0.40555556 -0.36666667 -0.32777778  0.71111111]]",
+      "rython": " [-  0.4055555555555558 -  0.3666666666666668 -  0.32777777777777783   0.7111111111111112]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[ 0.94444444  0.5         0.05555556 -0.38888889]",
+      "rython": "[  0.9444444444444442   0.49999999999999994   0.05555555555555572 -  0.3888888888888891]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 7,
+      "cpython": "3.6000000000000005",
+      "rython": "3.6"
+     },
+     {
+      "line": 8,
+      "cpython": "[[ 1.12777778  0.03333333 -0.06111111 -0.15555556]",
+      "rython": "[[  1.1277777777777778   0.033333333333333326 -  0.06111111111111123 -  0.15555555555555545]"
+     },
+     {
+      "line": 9,
+      "cpython": " [-0.05        0.9        -0.15       -0.2       ]",
+      "rython": " [-  0.04999999999999992   0.9 -  0.14999999999999997 -  0.2]"
+     },
+     {
+      "line": 10,
+      "cpython": " [-0.22777778 -0.23333333  0.76111111 -0.24444444]",
+      "rython": " [-  0.22777777777777763 -  0.23333333333333317   0.7611111111111111 -  0.24444444444444463]"
+     },
+     {
+      "line": 11,
+      "cpython": " [-0.40555556 -0.36666667 -0.32777778  0.71111111]]",
+      "rython": " [-  0.4055555555555558 -  0.3666666666666668 -  0.32777777777777783   0.7111111111111112]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[ 0.94444444  0.5         0.05555556 -0.38888889]",
+      "rython": "[  0.9444444444444442   0.49999999999999994   0.05555555555555572 -  0.3888888888888891]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 7,
+      "cpython": "3.6000000000000005",
+      "rython": "3.6"
+     },
+     {
+      "line": 8,
+      "cpython": "[[ 1.12777778  0.03333333 -0.06111111 -0.15555556]",
+      "rython": "[[  1.1277777777777778   0.033333333333333326 -  0.06111111111111123 -  0.15555555555555545]"
+     },
+     {
+      "line": 9,
+      "cpython": " [-0.05        0.9        -0.15       -0.2       ]",
+      "rython": " [-  0.04999999999999992   0.9 -  0.14999999999999997 -  0.2]"
+     },
+     {
+      "line": 10,
+      "cpython": " [-0.22777778 -0.23333333  0.76111111 -0.24444444]",
+      "rython": " [-  0.22777777777777763 -  0.23333333333333317   0.7611111111111111 -  0.24444444444444463]"
+     },
+     {
+      "line": 11,
+      "cpython": " [-0.40555556 -0.36666667 -0.32777778  0.71111111]]",
+      "rython": " [-  0.4055555555555558 -  0.3666666666666668 -  0.32777777777777783   0.7111111111111112]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[ 0.94444444  0.5         0.05555556 -0.38888889]",
+      "rython": "[  0.9444444444444442   0.49999999999999994   0.05555555555555572 -  0.3888888888888891]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "29_pi_integration",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "30_mixed_pipeline",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[[1.         1.18181818 1.36363636 1.54545455]",
+      "rython": "[[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454]"
+     },
+     {
+      "line": 2,
+      "cpython": " [1.72727273 1.90909091 2.09090909 2.27272727]",
+      "rython": " [1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725]"
+     },
+     {
+      "line": 3,
+      "cpython": " [2.45454545 2.63636364 2.81818182 3.        ]]",
+      "rython": " [2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]]"
+     },
+     {
+      "line": 4,
+      "cpython": "[[1.         1.72727273 2.45454545]",
+      "rython": "[[1. 1.7272727272727273 2.4545454545454546]"
+     },
+     {
+      "line": 5,
+      "cpython": " [1.18181818 1.90909091 2.63636364]",
+      "rython": " [1.1818181818181819 1.9090909090909092 2.6363636363636367]"
+     },
+     {
+      "line": 6,
+      "cpython": " [1.36363636 2.09090909 2.81818182]",
+      "rython": " [1.3636363636363638 2.090909090909091 2.8181818181818183]"
+     },
+     {
+      "line": 7,
+      "cpython": " [1.54545455 2.27272727 3.        ]]",
+      "rython": " [1.5454545454545454 2.2727272727272725 3.]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.         1.18181818 1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 13,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.63636364 2.81818182 3.        ]",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]"
+     },
+     {
+      "line": 14,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]",
+      "rython": "[1.2 1.2 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.5 2.5 2.5]"
+     },
+     {
+      "line": 15,
+      "cpython": "[1.2        1.2        1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[0. 0. 0. 0. 0. 0. 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 16,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.5        2.5        2.5       ]",
+      "rython": "0.6276459144608478"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[[1.         1.18181818 1.36363636 1.54545455]",
+      "rython": "[[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454]"
+     },
+     {
+      "line": 2,
+      "cpython": " [1.72727273 1.90909091 2.09090909 2.27272727]",
+      "rython": " [1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725]"
+     },
+     {
+      "line": 3,
+      "cpython": " [2.45454545 2.63636364 2.81818182 3.        ]]",
+      "rython": " [2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]]"
+     },
+     {
+      "line": 4,
+      "cpython": "[[1.         1.72727273 2.45454545]",
+      "rython": "[[1. 1.7272727272727273 2.4545454545454546]"
+     },
+     {
+      "line": 5,
+      "cpython": " [1.18181818 1.90909091 2.63636364]",
+      "rython": " [1.1818181818181819 1.9090909090909092 2.6363636363636367]"
+     },
+     {
+      "line": 6,
+      "cpython": " [1.36363636 2.09090909 2.81818182]",
+      "rython": " [1.3636363636363638 2.090909090909091 2.8181818181818183]"
+     },
+     {
+      "line": 7,
+      "cpython": " [1.54545455 2.27272727 3.        ]]",
+      "rython": " [1.5454545454545454 2.2727272727272725 3.]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.         1.18181818 1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 13,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.63636364 2.81818182 3.        ]",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]"
+     },
+     {
+      "line": 14,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]",
+      "rython": "[1.2 1.2 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.5 2.5 2.5]"
+     },
+     {
+      "line": 15,
+      "cpython": "[1.2        1.2        1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[0. 0. 0. 0. 0. 0. 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 16,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.5        2.5        2.5       ]",
+      "rython": "0.6276459144608478"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[[1.         1.18181818 1.36363636 1.54545455]",
+      "rython": "[[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454]"
+     },
+     {
+      "line": 2,
+      "cpython": " [1.72727273 1.90909091 2.09090909 2.27272727]",
+      "rython": " [1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725]"
+     },
+     {
+      "line": 3,
+      "cpython": " [2.45454545 2.63636364 2.81818182 3.        ]]",
+      "rython": " [2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]]"
+     },
+     {
+      "line": 4,
+      "cpython": "[[1.         1.72727273 2.45454545]",
+      "rython": "[[1. 1.7272727272727273 2.4545454545454546]"
+     },
+     {
+      "line": 5,
+      "cpython": " [1.18181818 1.90909091 2.63636364]",
+      "rython": " [1.1818181818181819 1.9090909090909092 2.6363636363636367]"
+     },
+     {
+      "line": 6,
+      "cpython": " [1.36363636 2.09090909 2.81818182]",
+      "rython": " [1.3636363636363638 2.090909090909091 2.8181818181818183]"
+     },
+     {
+      "line": 7,
+      "cpython": " [1.54545455 2.27272727 3.        ]]",
+      "rython": " [1.5454545454545454 2.2727272727272725 3.]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.         1.18181818 1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 13,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.63636364 2.81818182 3.        ]",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]"
+     },
+     {
+      "line": 14,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]",
+      "rython": "[1.2 1.2 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.5 2.5 2.5]"
+     },
+     {
+      "line": 15,
+      "cpython": "[1.2        1.2        1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[0. 0. 0. 0. 0. 0. 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 16,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.5        2.5        2.5       ]",
+      "rython": "0.6276459144608478"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[[1.         1.18181818 1.36363636 1.54545455]",
+      "rython": "[[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454]"
+     },
+     {
+      "line": 2,
+      "cpython": " [1.72727273 1.90909091 2.09090909 2.27272727]",
+      "rython": " [1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725]"
+     },
+     {
+      "line": 3,
+      "cpython": " [2.45454545 2.63636364 2.81818182 3.        ]]",
+      "rython": " [2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]]"
+     },
+     {
+      "line": 4,
+      "cpython": "[[1.         1.72727273 2.45454545]",
+      "rython": "[[1. 1.7272727272727273 2.4545454545454546]"
+     },
+     {
+      "line": 5,
+      "cpython": " [1.18181818 1.90909091 2.63636364]",
+      "rython": " [1.1818181818181819 1.9090909090909092 2.6363636363636367]"
+     },
+     {
+      "line": 6,
+      "cpython": " [1.36363636 2.09090909 2.81818182]",
+      "rython": " [1.3636363636363638 2.090909090909091 2.8181818181818183]"
+     },
+     {
+      "line": 7,
+      "cpython": " [1.54545455 2.27272727 3.        ]]",
+      "rython": " [1.5454545454545454 2.2727272727272725 3.]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.         1.18181818 1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 13,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.63636364 2.81818182 3.        ]",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]"
+     },
+     {
+      "line": 14,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]",
+      "rython": "[1.2 1.2 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.5 2.5 2.5]"
+     },
+     {
+      "line": 15,
+      "cpython": "[1.2        1.2        1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[0. 0. 0. 0. 0. 0. 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 16,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.5        2.5        2.5       ]",
+      "rython": "0.6276459144608478"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[[1.         1.18181818 1.36363636 1.54545455]",
+      "rython": "[[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454]"
+     },
+     {
+      "line": 2,
+      "cpython": " [1.72727273 1.90909091 2.09090909 2.27272727]",
+      "rython": " [1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725]"
+     },
+     {
+      "line": 3,
+      "cpython": " [2.45454545 2.63636364 2.81818182 3.        ]]",
+      "rython": " [2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]]"
+     },
+     {
+      "line": 4,
+      "cpython": "[[1.         1.72727273 2.45454545]",
+      "rython": "[[1. 1.7272727272727273 2.4545454545454546]"
+     },
+     {
+      "line": 5,
+      "cpython": " [1.18181818 1.90909091 2.63636364]",
+      "rython": " [1.1818181818181819 1.9090909090909092 2.6363636363636367]"
+     },
+     {
+      "line": 6,
+      "cpython": " [1.36363636 2.09090909 2.81818182]",
+      "rython": " [1.3636363636363638 2.090909090909091 2.8181818181818183]"
+     },
+     {
+      "line": 7,
+      "cpython": " [1.54545455 2.27272727 3.        ]]",
+      "rython": " [1.5454545454545454 2.2727272727272725 3.]]"
+     },
+     {
+      "line": 12,
+      "cpython": "[1.         1.18181818 1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[1. 1.1818181818181819 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 13,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.63636364 2.81818182 3.        ]",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]"
+     },
+     {
+      "line": 14,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11]",
+      "rython": "[1.2 1.2 1.3636363636363638 1.5454545454545454 1.7272727272727273 1.9090909090909092 2.090909090909091 2.2727272727272725 2.4545454545454546 2.5 2.5 2.5]"
+     },
+     {
+      "line": 15,
+      "cpython": "[1.2        1.2        1.36363636 1.54545455 1.72727273 1.90909091",
+      "rython": "[0. 0. 0. 0. 0. 0. 2.090909090909091 2.2727272727272725 2.4545454545454546 2.6363636363636367 2.8181818181818183 3.]"
+     },
+     {
+      "line": 16,
+      "cpython": " 2.09090909 2.27272727 2.45454545 2.5        2.5        2.5       ]",
+      "rython": "0.6276459144608478"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "31_linewrap",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.         0.05263158 0.10526316 0.15789474 0.21052632 0.26315789",
+      "rython": "[0. 0.05263157894736842 0.10526315789473684 0.15789473684210525 0.21052631578947367 0.2631578947368421 0.3157894736842105 0.3684210526315789 0.42105263157894735 0.47368421052631576 0.5263157894736842 0.5789473684210527 0.631578947368421 0.6842105263157894 0.7368421052631579 0.7894736842105263 0.8421052631578947 0.894736842105263 0.9473684210526315 1.]"
+     },
+     {
+      "line": 2,
+      "cpython": " 0.31578947 0.36842105 0.42105263 0.47368421 0.52631579 0.57894737",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]"
+     },
+     {
+      "line": 3,
+      "cpython": " 0.63157895 0.68421053 0.73684211 0.78947368 0.84210526 0.89473684",
+      "rython": "[[0. 0.02564102564102564 0.05128205128205128 0.07692307692307693 0.10256410256410256 0.1282051282051282 0.15384615384615385 0.1794871794871795 0.20512820512820512 0.23076923076923075 0.2564102564102564 0.28205128205128205 0.3076923076923077 0.3333333333333333 0.358974358974359 0.3846153846153846 0.41025641025641024 0.4358974358974359 0.4615384615384615 0.48717948717948717]"
+     },
+     {
+      "line": 4,
+      "cpython": " 0.94736842 1.        ]",
+      "rython": " [0.5128205128205128 0.5384615384615384 0.5641025641025641 0.5897435897435898 0.6153846153846154 0.641025641025641 0.6666666666666666 0.6923076923076923 0.717948717948718 0.7435897435897436 0.7692307692307692 0.7948717948717948 0.8205128205128205 0.8461538461538461 0.8717948717948718 0.8974358974358974 0.923076923076923 0.9487179487179487 0.9743589743589743 1.]]"
+     },
+     {
+      "line": 5,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[[0.         0.02564103 0.05128205 0.07692308 0.1025641  0.12820513",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "  0.15384615 0.17948718 0.20512821 0.23076923 0.25641026 0.28205128",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "  0.30769231 0.33333333 0.35897436 0.38461538 0.41025641 0.43589744",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "  0.46153846 0.48717949]",
+      "rython": null
+     },
+     {
+      "line": 11,
+      "cpython": " [0.51282051 0.53846154 0.56410256 0.58974359 0.61538462 0.64102564",
+      "rython": null
+     },
+     {
+      "line": 12,
+      "cpython": "  0.66666667 0.69230769 0.71794872 0.74358974 0.76923077 0.79487179",
+      "rython": null
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.         0.05263158 0.10526316 0.15789474 0.21052632 0.26315789",
+      "rython": "[0. 0.05263157894736842 0.10526315789473684 0.15789473684210525 0.21052631578947367 0.2631578947368421 0.3157894736842105 0.3684210526315789 0.42105263157894735 0.47368421052631576 0.5263157894736842 0.5789473684210527 0.631578947368421 0.6842105263157894 0.7368421052631579 0.7894736842105263 0.8421052631578947 0.894736842105263 0.9473684210526315 1.]"
+     },
+     {
+      "line": 2,
+      "cpython": " 0.31578947 0.36842105 0.42105263 0.47368421 0.52631579 0.57894737",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]"
+     },
+     {
+      "line": 3,
+      "cpython": " 0.63157895 0.68421053 0.73684211 0.78947368 0.84210526 0.89473684",
+      "rython": "[[0. 0.02564102564102564 0.05128205128205128 0.07692307692307693 0.10256410256410256 0.1282051282051282 0.15384615384615385 0.1794871794871795 0.20512820512820512 0.23076923076923075 0.2564102564102564 0.28205128205128205 0.3076923076923077 0.3333333333333333 0.358974358974359 0.3846153846153846 0.41025641025641024 0.4358974358974359 0.4615384615384615 0.48717948717948717]"
+     },
+     {
+      "line": 4,
+      "cpython": " 0.94736842 1.        ]",
+      "rython": " [0.5128205128205128 0.5384615384615384 0.5641025641025641 0.5897435897435898 0.6153846153846154 0.641025641025641 0.6666666666666666 0.6923076923076923 0.717948717948718 0.7435897435897436 0.7692307692307692 0.7948717948717948 0.8205128205128205 0.8461538461538461 0.8717948717948718 0.8974358974358974 0.923076923076923 0.9487179487179487 0.9743589743589743 1.]]"
+     },
+     {
+      "line": 5,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[[0.         0.02564103 0.05128205 0.07692308 0.1025641  0.12820513",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "  0.15384615 0.17948718 0.20512821 0.23076923 0.25641026 0.28205128",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "  0.30769231 0.33333333 0.35897436 0.38461538 0.41025641 0.43589744",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "  0.46153846 0.48717949]",
+      "rython": null
+     },
+     {
+      "line": 11,
+      "cpython": " [0.51282051 0.53846154 0.56410256 0.58974359 0.61538462 0.64102564",
+      "rython": null
+     },
+     {
+      "line": 12,
+      "cpython": "  0.66666667 0.69230769 0.71794872 0.74358974 0.76923077 0.79487179",
+      "rython": null
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.         0.05263158 0.10526316 0.15789474 0.21052632 0.26315789",
+      "rython": "[0. 0.05263157894736842 0.10526315789473684 0.15789473684210525 0.21052631578947367 0.2631578947368421 0.3157894736842105 0.3684210526315789 0.42105263157894735 0.47368421052631576 0.5263157894736842 0.5789473684210527 0.631578947368421 0.6842105263157894 0.7368421052631579 0.7894736842105263 0.8421052631578947 0.894736842105263 0.9473684210526315 1.]"
+     },
+     {
+      "line": 2,
+      "cpython": " 0.31578947 0.36842105 0.42105263 0.47368421 0.52631579 0.57894737",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]"
+     },
+     {
+      "line": 3,
+      "cpython": " 0.63157895 0.68421053 0.73684211 0.78947368 0.84210526 0.89473684",
+      "rython": "[[0. 0.02564102564102564 0.05128205128205128 0.07692307692307693 0.10256410256410256 0.1282051282051282 0.15384615384615385 0.1794871794871795 0.20512820512820512 0.23076923076923075 0.2564102564102564 0.28205128205128205 0.3076923076923077 0.3333333333333333 0.358974358974359 0.3846153846153846 0.41025641025641024 0.4358974358974359 0.4615384615384615 0.48717948717948717]"
+     },
+     {
+      "line": 4,
+      "cpython": " 0.94736842 1.        ]",
+      "rython": " [0.5128205128205128 0.5384615384615384 0.5641025641025641 0.5897435897435898 0.6153846153846154 0.641025641025641 0.6666666666666666 0.6923076923076923 0.717948717948718 0.7435897435897436 0.7692307692307692 0.7948717948717948 0.8205128205128205 0.8461538461538461 0.8717948717948718 0.8974358974358974 0.923076923076923 0.9487179487179487 0.9743589743589743 1.]]"
+     },
+     {
+      "line": 5,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[[0.         0.02564103 0.05128205 0.07692308 0.1025641  0.12820513",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "  0.15384615 0.17948718 0.20512821 0.23076923 0.25641026 0.28205128",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "  0.30769231 0.33333333 0.35897436 0.38461538 0.41025641 0.43589744",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "  0.46153846 0.48717949]",
+      "rython": null
+     },
+     {
+      "line": 11,
+      "cpython": " [0.51282051 0.53846154 0.56410256 0.58974359 0.61538462 0.64102564",
+      "rython": null
+     },
+     {
+      "line": 12,
+      "cpython": "  0.66666667 0.69230769 0.71794872 0.74358974 0.76923077 0.79487179",
+      "rython": null
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.         0.05263158 0.10526316 0.15789474 0.21052632 0.26315789",
+      "rython": "[0. 0.05263157894736842 0.10526315789473684 0.15789473684210525 0.21052631578947367 0.2631578947368421 0.3157894736842105 0.3684210526315789 0.42105263157894735 0.47368421052631576 0.5263157894736842 0.5789473684210527 0.631578947368421 0.6842105263157894 0.7368421052631579 0.7894736842105263 0.8421052631578947 0.894736842105263 0.9473684210526315 1.]"
+     },
+     {
+      "line": 2,
+      "cpython": " 0.31578947 0.36842105 0.42105263 0.47368421 0.52631579 0.57894737",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]"
+     },
+     {
+      "line": 3,
+      "cpython": " 0.63157895 0.68421053 0.73684211 0.78947368 0.84210526 0.89473684",
+      "rython": "[[0. 0.02564102564102564 0.05128205128205128 0.07692307692307693 0.10256410256410256 0.1282051282051282 0.15384615384615385 0.1794871794871795 0.20512820512820512 0.23076923076923075 0.2564102564102564 0.28205128205128205 0.3076923076923077 0.3333333333333333 0.358974358974359 0.3846153846153846 0.41025641025641024 0.4358974358974359 0.4615384615384615 0.48717948717948717]"
+     },
+     {
+      "line": 4,
+      "cpython": " 0.94736842 1.        ]",
+      "rython": " [0.5128205128205128 0.5384615384615384 0.5641025641025641 0.5897435897435898 0.6153846153846154 0.641025641025641 0.6666666666666666 0.6923076923076923 0.717948717948718 0.7435897435897436 0.7692307692307692 0.7948717948717948 0.8205128205128205 0.8461538461538461 0.8717948717948718 0.8974358974358974 0.923076923076923 0.9487179487179487 0.9743589743589743 1.]]"
+     },
+     {
+      "line": 5,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[[0.         0.02564103 0.05128205 0.07692308 0.1025641  0.12820513",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "  0.15384615 0.17948718 0.20512821 0.23076923 0.25641026 0.28205128",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "  0.30769231 0.33333333 0.35897436 0.38461538 0.41025641 0.43589744",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "  0.46153846 0.48717949]",
+      "rython": null
+     },
+     {
+      "line": 11,
+      "cpython": " [0.51282051 0.53846154 0.56410256 0.58974359 0.61538462 0.64102564",
+      "rython": null
+     },
+     {
+      "line": 12,
+      "cpython": "  0.66666667 0.69230769 0.71794872 0.74358974 0.76923077 0.79487179",
+      "rython": null
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.         0.05263158 0.10526316 0.15789474 0.21052632 0.26315789",
+      "rython": "[0. 0.05263157894736842 0.10526315789473684 0.15789473684210525 0.21052631578947367 0.2631578947368421 0.3157894736842105 0.3684210526315789 0.42105263157894735 0.47368421052631576 0.5263157894736842 0.5789473684210527 0.631578947368421 0.6842105263157894 0.7368421052631579 0.7894736842105263 0.8421052631578947 0.894736842105263 0.9473684210526315 1.]"
+     },
+     {
+      "line": 2,
+      "cpython": " 0.31578947 0.36842105 0.42105263 0.47368421 0.52631579 0.57894737",
+      "rython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]"
+     },
+     {
+      "line": 3,
+      "cpython": " 0.63157895 0.68421053 0.73684211 0.78947368 0.84210526 0.89473684",
+      "rython": "[[0. 0.02564102564102564 0.05128205128205128 0.07692307692307693 0.10256410256410256 0.1282051282051282 0.15384615384615385 0.1794871794871795 0.20512820512820512 0.23076923076923075 0.2564102564102564 0.28205128205128205 0.3076923076923077 0.3333333333333333 0.358974358974359 0.3846153846153846 0.41025641025641024 0.4358974358974359 0.4615384615384615 0.48717948717948717]"
+     },
+     {
+      "line": 4,
+      "cpython": " 0.94736842 1.        ]",
+      "rython": " [0.5128205128205128 0.5384615384615384 0.5641025641025641 0.5897435897435898 0.6153846153846154 0.641025641025641 0.6666666666666666 0.6923076923076923 0.717948717948718 0.7435897435897436 0.7692307692307692 0.7948717948717948 0.8205128205128205 0.8461538461538461 0.8717948717948718 0.8974358974358974 0.923076923076923 0.9487179487179487 0.9743589743589743 1.]]"
+     },
+     {
+      "line": 5,
+      "cpython": "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23",
+      "rython": null
+     },
+     {
+      "line": 6,
+      "cpython": " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]",
+      "rython": null
+     },
+     {
+      "line": 7,
+      "cpython": "[[0.         0.02564103 0.05128205 0.07692308 0.1025641  0.12820513",
+      "rython": null
+     },
+     {
+      "line": 8,
+      "cpython": "  0.15384615 0.17948718 0.20512821 0.23076923 0.25641026 0.28205128",
+      "rython": null
+     },
+     {
+      "line": 9,
+      "cpython": "  0.30769231 0.33333333 0.35897436 0.38461538 0.41025641 0.43589744",
+      "rython": null
+     },
+     {
+      "line": 10,
+      "cpython": "  0.46153846 0.48717949]",
+      "rython": null
+     },
+     {
+      "line": 11,
+      "cpython": " [0.51282051 0.53846154 0.56410256 0.58974359 0.61538462 0.64102564",
+      "rython": null
+     },
+     {
+      "line": 12,
+      "cpython": "  0.66666667 0.69230769 0.71794872 0.74358974 0.76923077 0.79487179",
+      "rython": null
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "32_summarize",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[   0    1    2 ...  998  999 1000]",
+      "rython": "[   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32   33   34   35   36   37   38   39   40   41   42   43   44   45   46   47   48   49   50   51   52   53   54   55   56   57   58   59   60   61   62   63   64   65   66   67   68   69   70   71   72   73   74   75   76   77   78   79   80   81   82   83   84   85   86   87   88   89   90   91   92   93   94   95   96   97   98   99  100  101  102  103  104  105  106  107  108  109  110  111  112  113  114  115  116  117  118  119  120  121  122  123  124  125  126  127  128  129  130  131  132  133  134  135  136  137  138  139  140  141  142  143  144  145  146  147  148  149  150  151  152  153  154  155  156  157  158  159  160  161  162  163  164  165  166  167  168  169  170  171  172  173  174  175  176  177  178  179  180  181  182  183  184  185  186  187  188  189  190  191  192  193  194  195  196  197  198  199  200  201  202  203  204  205  206  207  208  209  210  211  212  213  214  215  216  217  218  219  220  221  222  223  224  225  226  227  228  229  230  231  232  233  234  235  236  237  238  239  240  241  242  243  244  245  246  247  248  249  250  251  252  253  254  255  256  257  258  259  260  261  262  263  264  265  266  267  268  269  270  271  272  273  274  275  276  277  278  279  280  281  282  283  284  285  286  287  288  289  290  291  292  293  294  295  296  297  298  299  300  301  302  303  304  305  306  307  308  309  310  311  312  313  314  315  316  317  318  319  320  321  322  323  324  325  326  327  328  329  330  331  332  333  334  335  336  337  338  339  340  341  342  343  344  345  346  347  348  349  350  351  352  353  354  355  356  357  358  359  360  361  362  363  364  365  366  367  368  369  370  371  372  373  374  375  376  377  378  379  380  381  382  383  384  385  386  387  388  389  390  391  392  393  394  395  396  397  398  399  400  401  402  403  404  405  406  407  408  409  410  411  412  413  414  415  416  417  418  419  420  421  422  423  424  425  426  427  428  429  430  431  432  433  434  435  436  437  438  439  440  441  442  443  444  445  446  447  448  449  450  451  452  453  454  455  456  457  458  459  460  461  462  463  464  465  466  467  468  469  470  471  472  473  474  475  476  477  478  479  480  481  482  483  484  485  486  487  488  489  490  491  492  493  494  495  496  497  498  499  500  501  502  503  504  505  506  507  508  509  510  511  512  513  514  515  516  517  518  519  520  521  522  523  524  525  526  527  528  529  530  531  532  533  534  535  536  537  538  539  540  541  542  543  544  545  546  547  548  549  550  551  552  553  554  555  556  557  558  559  560  561  562  563  564  565  566  567  568  569  570  571  572  573  574  575  576  577  578  579  580  581  582  583  584  585  586  587  588  589  590  591  592  593  594  595  596  597  598  599  600  601  602  603  604  605  606  607  608  609  610  611  612  613  614  615  616  617  618  619  620  621  622  623  624  625  626  627  628  629  630  631  632  633  634  635  636  637  638  639  640  641  642  643  644  645  646  647  648  649  650  651  652  653  654  655  656  657  658  659  660  661  662  663  664  665  666  667  668  669  670  671  672  673  674  675  676  677  678  679  680  681  682  683  684  685  686  687  688  689  690  691  692  693  694  695  696  697  698  699  700  701  702  703  704  705  706  707  708  709  710  711  712  713  714  715  716  717  718  719  720  721  722  723  724  725  726  727  728  729  730  731  732  733  734  735  736  737  738  739  740  741  742  743  744  745  746  747  748  749  750  751  752  753  754  755  756  757  758  759  760  761  762  763  764  765  766  767  768  769  770  771  772  773  774  775  776  777  778  779  780  781  782  783  784  785  786  787  788  789  790  791  792  793  794  795  796  797  798  799  800  801  802  803  804  805  806  807  808  809  810  811  812  813  814  815  816  817  818  819  820  821  822  823  824  825  826  827  828  829  830  831  832  833  834  835  836  837  838  839  840  841  842  843  844  845  846  847  848  849  850  851  852  853  854  855  856  857  858  859  860  861  862  863  864  865  866  867  868  869  870  871  872  873  874  875  876  877  878  879  880  881  882  883  884  885  886  887  888  889  890  891  892  893  894  895  896  897  898  899  900  901  902  903  904  905  906  907  908  909  910  911  912  913  914  915  916  917  918  919  920  921  922  923  924  925  926  927  928  929  930  931  932  933  934  935  936  937  938  939  940  941  942  943  944  945  946  947  948  949  950  951  952  953  954  955  956  957  958  959  960  961  962  963  964  965  966  967  968  969  970  971  972  973  974  975  976  977  978  979  980  981  982  983  984  985  986  987  988  989  990  991  992  993  994  995  996  997  998  999 1000]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0. 0. 0. ... 0. 0. 0.]",
+      "rython": "[0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[   0    1    2 ...  998  999 1000]",
+      "rython": "[   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32   33   34   35   36   37   38   39   40   41   42   43   44   45   46   47   48   49   50   51   52   53   54   55   56   57   58   59   60   61   62   63   64   65   66   67   68   69   70   71   72   73   74   75   76   77   78   79   80   81   82   83   84   85   86   87   88   89   90   91   92   93   94   95   96   97   98   99  100  101  102  103  104  105  106  107  108  109  110  111  112  113  114  115  116  117  118  119  120  121  122  123  124  125  126  127  128  129  130  131  132  133  134  135  136  137  138  139  140  141  142  143  144  145  146  147  148  149  150  151  152  153  154  155  156  157  158  159  160  161  162  163  164  165  166  167  168  169  170  171  172  173  174  175  176  177  178  179  180  181  182  183  184  185  186  187  188  189  190  191  192  193  194  195  196  197  198  199  200  201  202  203  204  205  206  207  208  209  210  211  212  213  214  215  216  217  218  219  220  221  222  223  224  225  226  227  228  229  230  231  232  233  234  235  236  237  238  239  240  241  242  243  244  245  246  247  248  249  250  251  252  253  254  255  256  257  258  259  260  261  262  263  264  265  266  267  268  269  270  271  272  273  274  275  276  277  278  279  280  281  282  283  284  285  286  287  288  289  290  291  292  293  294  295  296  297  298  299  300  301  302  303  304  305  306  307  308  309  310  311  312  313  314  315  316  317  318  319  320  321  322  323  324  325  326  327  328  329  330  331  332  333  334  335  336  337  338  339  340  341  342  343  344  345  346  347  348  349  350  351  352  353  354  355  356  357  358  359  360  361  362  363  364  365  366  367  368  369  370  371  372  373  374  375  376  377  378  379  380  381  382  383  384  385  386  387  388  389  390  391  392  393  394  395  396  397  398  399  400  401  402  403  404  405  406  407  408  409  410  411  412  413  414  415  416  417  418  419  420  421  422  423  424  425  426  427  428  429  430  431  432  433  434  435  436  437  438  439  440  441  442  443  444  445  446  447  448  449  450  451  452  453  454  455  456  457  458  459  460  461  462  463  464  465  466  467  468  469  470  471  472  473  474  475  476  477  478  479  480  481  482  483  484  485  486  487  488  489  490  491  492  493  494  495  496  497  498  499  500  501  502  503  504  505  506  507  508  509  510  511  512  513  514  515  516  517  518  519  520  521  522  523  524  525  526  527  528  529  530  531  532  533  534  535  536  537  538  539  540  541  542  543  544  545  546  547  548  549  550  551  552  553  554  555  556  557  558  559  560  561  562  563  564  565  566  567  568  569  570  571  572  573  574  575  576  577  578  579  580  581  582  583  584  585  586  587  588  589  590  591  592  593  594  595  596  597  598  599  600  601  602  603  604  605  606  607  608  609  610  611  612  613  614  615  616  617  618  619  620  621  622  623  624  625  626  627  628  629  630  631  632  633  634  635  636  637  638  639  640  641  642  643  644  645  646  647  648  649  650  651  652  653  654  655  656  657  658  659  660  661  662  663  664  665  666  667  668  669  670  671  672  673  674  675  676  677  678  679  680  681  682  683  684  685  686  687  688  689  690  691  692  693  694  695  696  697  698  699  700  701  702  703  704  705  706  707  708  709  710  711  712  713  714  715  716  717  718  719  720  721  722  723  724  725  726  727  728  729  730  731  732  733  734  735  736  737  738  739  740  741  742  743  744  745  746  747  748  749  750  751  752  753  754  755  756  757  758  759  760  761  762  763  764  765  766  767  768  769  770  771  772  773  774  775  776  777  778  779  780  781  782  783  784  785  786  787  788  789  790  791  792  793  794  795  796  797  798  799  800  801  802  803  804  805  806  807  808  809  810  811  812  813  814  815  816  817  818  819  820  821  822  823  824  825  826  827  828  829  830  831  832  833  834  835  836  837  838  839  840  841  842  843  844  845  846  847  848  849  850  851  852  853  854  855  856  857  858  859  860  861  862  863  864  865  866  867  868  869  870  871  872  873  874  875  876  877  878  879  880  881  882  883  884  885  886  887  888  889  890  891  892  893  894  895  896  897  898  899  900  901  902  903  904  905  906  907  908  909  910  911  912  913  914  915  916  917  918  919  920  921  922  923  924  925  926  927  928  929  930  931  932  933  934  935  936  937  938  939  940  941  942  943  944  945  946  947  948  949  950  951  952  953  954  955  956  957  958  959  960  961  962  963  964  965  966  967  968  969  970  971  972  973  974  975  976  977  978  979  980  981  982  983  984  985  986  987  988  989  990  991  992  993  994  995  996  997  998  999 1000]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0. 0. 0. ... 0. 0. 0.]",
+      "rython": "[0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[   0    1    2 ...  998  999 1000]",
+      "rython": "[   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32   33   34   35   36   37   38   39   40   41   42   43   44   45   46   47   48   49   50   51   52   53   54   55   56   57   58   59   60   61   62   63   64   65   66   67   68   69   70   71   72   73   74   75   76   77   78   79   80   81   82   83   84   85   86   87   88   89   90   91   92   93   94   95   96   97   98   99  100  101  102  103  104  105  106  107  108  109  110  111  112  113  114  115  116  117  118  119  120  121  122  123  124  125  126  127  128  129  130  131  132  133  134  135  136  137  138  139  140  141  142  143  144  145  146  147  148  149  150  151  152  153  154  155  156  157  158  159  160  161  162  163  164  165  166  167  168  169  170  171  172  173  174  175  176  177  178  179  180  181  182  183  184  185  186  187  188  189  190  191  192  193  194  195  196  197  198  199  200  201  202  203  204  205  206  207  208  209  210  211  212  213  214  215  216  217  218  219  220  221  222  223  224  225  226  227  228  229  230  231  232  233  234  235  236  237  238  239  240  241  242  243  244  245  246  247  248  249  250  251  252  253  254  255  256  257  258  259  260  261  262  263  264  265  266  267  268  269  270  271  272  273  274  275  276  277  278  279  280  281  282  283  284  285  286  287  288  289  290  291  292  293  294  295  296  297  298  299  300  301  302  303  304  305  306  307  308  309  310  311  312  313  314  315  316  317  318  319  320  321  322  323  324  325  326  327  328  329  330  331  332  333  334  335  336  337  338  339  340  341  342  343  344  345  346  347  348  349  350  351  352  353  354  355  356  357  358  359  360  361  362  363  364  365  366  367  368  369  370  371  372  373  374  375  376  377  378  379  380  381  382  383  384  385  386  387  388  389  390  391  392  393  394  395  396  397  398  399  400  401  402  403  404  405  406  407  408  409  410  411  412  413  414  415  416  417  418  419  420  421  422  423  424  425  426  427  428  429  430  431  432  433  434  435  436  437  438  439  440  441  442  443  444  445  446  447  448  449  450  451  452  453  454  455  456  457  458  459  460  461  462  463  464  465  466  467  468  469  470  471  472  473  474  475  476  477  478  479  480  481  482  483  484  485  486  487  488  489  490  491  492  493  494  495  496  497  498  499  500  501  502  503  504  505  506  507  508  509  510  511  512  513  514  515  516  517  518  519  520  521  522  523  524  525  526  527  528  529  530  531  532  533  534  535  536  537  538  539  540  541  542  543  544  545  546  547  548  549  550  551  552  553  554  555  556  557  558  559  560  561  562  563  564  565  566  567  568  569  570  571  572  573  574  575  576  577  578  579  580  581  582  583  584  585  586  587  588  589  590  591  592  593  594  595  596  597  598  599  600  601  602  603  604  605  606  607  608  609  610  611  612  613  614  615  616  617  618  619  620  621  622  623  624  625  626  627  628  629  630  631  632  633  634  635  636  637  638  639  640  641  642  643  644  645  646  647  648  649  650  651  652  653  654  655  656  657  658  659  660  661  662  663  664  665  666  667  668  669  670  671  672  673  674  675  676  677  678  679  680  681  682  683  684  685  686  687  688  689  690  691  692  693  694  695  696  697  698  699  700  701  702  703  704  705  706  707  708  709  710  711  712  713  714  715  716  717  718  719  720  721  722  723  724  725  726  727  728  729  730  731  732  733  734  735  736  737  738  739  740  741  742  743  744  745  746  747  748  749  750  751  752  753  754  755  756  757  758  759  760  761  762  763  764  765  766  767  768  769  770  771  772  773  774  775  776  777  778  779  780  781  782  783  784  785  786  787  788  789  790  791  792  793  794  795  796  797  798  799  800  801  802  803  804  805  806  807  808  809  810  811  812  813  814  815  816  817  818  819  820  821  822  823  824  825  826  827  828  829  830  831  832  833  834  835  836  837  838  839  840  841  842  843  844  845  846  847  848  849  850  851  852  853  854  855  856  857  858  859  860  861  862  863  864  865  866  867  868  869  870  871  872  873  874  875  876  877  878  879  880  881  882  883  884  885  886  887  888  889  890  891  892  893  894  895  896  897  898  899  900  901  902  903  904  905  906  907  908  909  910  911  912  913  914  915  916  917  918  919  920  921  922  923  924  925  926  927  928  929  930  931  932  933  934  935  936  937  938  939  940  941  942  943  944  945  946  947  948  949  950  951  952  953  954  955  956  957  958  959  960  961  962  963  964  965  966  967  968  969  970  971  972  973  974  975  976  977  978  979  980  981  982  983  984  985  986  987  988  989  990  991  992  993  994  995  996  997  998  999 1000]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0. 0. 0. ... 0. 0. 0.]",
+      "rython": "[0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[   0    1    2 ...  998  999 1000]",
+      "rython": "[   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32   33   34   35   36   37   38   39   40   41   42   43   44   45   46   47   48   49   50   51   52   53   54   55   56   57   58   59   60   61   62   63   64   65   66   67   68   69   70   71   72   73   74   75   76   77   78   79   80   81   82   83   84   85   86   87   88   89   90   91   92   93   94   95   96   97   98   99  100  101  102  103  104  105  106  107  108  109  110  111  112  113  114  115  116  117  118  119  120  121  122  123  124  125  126  127  128  129  130  131  132  133  134  135  136  137  138  139  140  141  142  143  144  145  146  147  148  149  150  151  152  153  154  155  156  157  158  159  160  161  162  163  164  165  166  167  168  169  170  171  172  173  174  175  176  177  178  179  180  181  182  183  184  185  186  187  188  189  190  191  192  193  194  195  196  197  198  199  200  201  202  203  204  205  206  207  208  209  210  211  212  213  214  215  216  217  218  219  220  221  222  223  224  225  226  227  228  229  230  231  232  233  234  235  236  237  238  239  240  241  242  243  244  245  246  247  248  249  250  251  252  253  254  255  256  257  258  259  260  261  262  263  264  265  266  267  268  269  270  271  272  273  274  275  276  277  278  279  280  281  282  283  284  285  286  287  288  289  290  291  292  293  294  295  296  297  298  299  300  301  302  303  304  305  306  307  308  309  310  311  312  313  314  315  316  317  318  319  320  321  322  323  324  325  326  327  328  329  330  331  332  333  334  335  336  337  338  339  340  341  342  343  344  345  346  347  348  349  350  351  352  353  354  355  356  357  358  359  360  361  362  363  364  365  366  367  368  369  370  371  372  373  374  375  376  377  378  379  380  381  382  383  384  385  386  387  388  389  390  391  392  393  394  395  396  397  398  399  400  401  402  403  404  405  406  407  408  409  410  411  412  413  414  415  416  417  418  419  420  421  422  423  424  425  426  427  428  429  430  431  432  433  434  435  436  437  438  439  440  441  442  443  444  445  446  447  448  449  450  451  452  453  454  455  456  457  458  459  460  461  462  463  464  465  466  467  468  469  470  471  472  473  474  475  476  477  478  479  480  481  482  483  484  485  486  487  488  489  490  491  492  493  494  495  496  497  498  499  500  501  502  503  504  505  506  507  508  509  510  511  512  513  514  515  516  517  518  519  520  521  522  523  524  525  526  527  528  529  530  531  532  533  534  535  536  537  538  539  540  541  542  543  544  545  546  547  548  549  550  551  552  553  554  555  556  557  558  559  560  561  562  563  564  565  566  567  568  569  570  571  572  573  574  575  576  577  578  579  580  581  582  583  584  585  586  587  588  589  590  591  592  593  594  595  596  597  598  599  600  601  602  603  604  605  606  607  608  609  610  611  612  613  614  615  616  617  618  619  620  621  622  623  624  625  626  627  628  629  630  631  632  633  634  635  636  637  638  639  640  641  642  643  644  645  646  647  648  649  650  651  652  653  654  655  656  657  658  659  660  661  662  663  664  665  666  667  668  669  670  671  672  673  674  675  676  677  678  679  680  681  682  683  684  685  686  687  688  689  690  691  692  693  694  695  696  697  698  699  700  701  702  703  704  705  706  707  708  709  710  711  712  713  714  715  716  717  718  719  720  721  722  723  724  725  726  727  728  729  730  731  732  733  734  735  736  737  738  739  740  741  742  743  744  745  746  747  748  749  750  751  752  753  754  755  756  757  758  759  760  761  762  763  764  765  766  767  768  769  770  771  772  773  774  775  776  777  778  779  780  781  782  783  784  785  786  787  788  789  790  791  792  793  794  795  796  797  798  799  800  801  802  803  804  805  806  807  808  809  810  811  812  813  814  815  816  817  818  819  820  821  822  823  824  825  826  827  828  829  830  831  832  833  834  835  836  837  838  839  840  841  842  843  844  845  846  847  848  849  850  851  852  853  854  855  856  857  858  859  860  861  862  863  864  865  866  867  868  869  870  871  872  873  874  875  876  877  878  879  880  881  882  883  884  885  886  887  888  889  890  891  892  893  894  895  896  897  898  899  900  901  902  903  904  905  906  907  908  909  910  911  912  913  914  915  916  917  918  919  920  921  922  923  924  925  926  927  928  929  930  931  932  933  934  935  936  937  938  939  940  941  942  943  944  945  946  947  948  949  950  951  952  953  954  955  956  957  958  959  960  961  962  963  964  965  966  967  968  969  970  971  972  973  974  975  976  977  978  979  980  981  982  983  984  985  986  987  988  989  990  991  992  993  994  995  996  997  998  999 1000]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0. 0. 0. ... 0. 0. 0.]",
+      "rython": "[0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[   0    1    2 ...  998  999 1000]",
+      "rython": "[   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32   33   34   35   36   37   38   39   40   41   42   43   44   45   46   47   48   49   50   51   52   53   54   55   56   57   58   59   60   61   62   63   64   65   66   67   68   69   70   71   72   73   74   75   76   77   78   79   80   81   82   83   84   85   86   87   88   89   90   91   92   93   94   95   96   97   98   99  100  101  102  103  104  105  106  107  108  109  110  111  112  113  114  115  116  117  118  119  120  121  122  123  124  125  126  127  128  129  130  131  132  133  134  135  136  137  138  139  140  141  142  143  144  145  146  147  148  149  150  151  152  153  154  155  156  157  158  159  160  161  162  163  164  165  166  167  168  169  170  171  172  173  174  175  176  177  178  179  180  181  182  183  184  185  186  187  188  189  190  191  192  193  194  195  196  197  198  199  200  201  202  203  204  205  206  207  208  209  210  211  212  213  214  215  216  217  218  219  220  221  222  223  224  225  226  227  228  229  230  231  232  233  234  235  236  237  238  239  240  241  242  243  244  245  246  247  248  249  250  251  252  253  254  255  256  257  258  259  260  261  262  263  264  265  266  267  268  269  270  271  272  273  274  275  276  277  278  279  280  281  282  283  284  285  286  287  288  289  290  291  292  293  294  295  296  297  298  299  300  301  302  303  304  305  306  307  308  309  310  311  312  313  314  315  316  317  318  319  320  321  322  323  324  325  326  327  328  329  330  331  332  333  334  335  336  337  338  339  340  341  342  343  344  345  346  347  348  349  350  351  352  353  354  355  356  357  358  359  360  361  362  363  364  365  366  367  368  369  370  371  372  373  374  375  376  377  378  379  380  381  382  383  384  385  386  387  388  389  390  391  392  393  394  395  396  397  398  399  400  401  402  403  404  405  406  407  408  409  410  411  412  413  414  415  416  417  418  419  420  421  422  423  424  425  426  427  428  429  430  431  432  433  434  435  436  437  438  439  440  441  442  443  444  445  446  447  448  449  450  451  452  453  454  455  456  457  458  459  460  461  462  463  464  465  466  467  468  469  470  471  472  473  474  475  476  477  478  479  480  481  482  483  484  485  486  487  488  489  490  491  492  493  494  495  496  497  498  499  500  501  502  503  504  505  506  507  508  509  510  511  512  513  514  515  516  517  518  519  520  521  522  523  524  525  526  527  528  529  530  531  532  533  534  535  536  537  538  539  540  541  542  543  544  545  546  547  548  549  550  551  552  553  554  555  556  557  558  559  560  561  562  563  564  565  566  567  568  569  570  571  572  573  574  575  576  577  578  579  580  581  582  583  584  585  586  587  588  589  590  591  592  593  594  595  596  597  598  599  600  601  602  603  604  605  606  607  608  609  610  611  612  613  614  615  616  617  618  619  620  621  622  623  624  625  626  627  628  629  630  631  632  633  634  635  636  637  638  639  640  641  642  643  644  645  646  647  648  649  650  651  652  653  654  655  656  657  658  659  660  661  662  663  664  665  666  667  668  669  670  671  672  673  674  675  676  677  678  679  680  681  682  683  684  685  686  687  688  689  690  691  692  693  694  695  696  697  698  699  700  701  702  703  704  705  706  707  708  709  710  711  712  713  714  715  716  717  718  719  720  721  722  723  724  725  726  727  728  729  730  731  732  733  734  735  736  737  738  739  740  741  742  743  744  745  746  747  748  749  750  751  752  753  754  755  756  757  758  759  760  761  762  763  764  765  766  767  768  769  770  771  772  773  774  775  776  777  778  779  780  781  782  783  784  785  786  787  788  789  790  791  792  793  794  795  796  797  798  799  800  801  802  803  804  805  806  807  808  809  810  811  812  813  814  815  816  817  818  819  820  821  822  823  824  825  826  827  828  829  830  831  832  833  834  835  836  837  838  839  840  841  842  843  844  845  846  847  848  849  850  851  852  853  854  855  856  857  858  859  860  861  862  863  864  865  866  867  868  869  870  871  872  873  874  875  876  877  878  879  880  881  882  883  884  885  886  887  888  889  890  891  892  893  894  895  896  897  898  899  900  901  902  903  904  905  906  907  908  909  910  911  912  913  914  915  916  917  918  919  920  921  922  923  924  925  926  927  928  929  930  931  932  933  934  935  936  937  938  939  940  941  942  943  944  945  946  947  948  949  950  951  952  953  954  955  956  957  958  959  960  961  962  963  964  965  966  967  968  969  970  971  972  973  974  975  976  977  978  979  980  981  982  983  984  985  986  987  988  989  990  991  992  993  994  995  996  997  998  999 1000]"
+     },
+     {
+      "line": 2,
+      "cpython": "[0. 0. 0. ... 0. 0. 0.]",
+      "rython": "[0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "33_repr",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_33_repr_default_auto` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_33_repr_cpu_scalar` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_33_repr_cpu_rayon` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_33_repr_cpu_simd` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error: expected identifier, found `\"Bool\"`",
+     "error: could not compile `_33_repr_cpu_auto` (lib) due to 1 previous error; 1 warning emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "34_exp_mode",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[1.e-09 1.e+00]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (6117) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[1.e-09 1.e+00]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (6170) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[1.e-09 1.e+00]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (6223) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-simd": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[1.e-09 1.e+00]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (6276) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   },
+   "cpu-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[1.e-09 1.e+00]",
+      "rython": null
+     }
+    ],
+    "stderr_head": [
+     "thread 'main' (6329) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ndarray.rs:570:48:",
+     "exp mode implies e"
+    ]
+   }
+  }
+ },
+ {
+  "case": "35_inf_nan_print",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[inf]",
+      "rython": "[inf.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[nan]",
+      "rython": "[nan.]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-inf]",
+      "rython": "[-inf.]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[inf]",
+      "rython": "[inf.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[nan]",
+      "rython": "[nan.]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-inf]",
+      "rython": "[-inf.]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[inf]",
+      "rython": "[inf.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[nan]",
+      "rython": "[nan.]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-inf]",
+      "rython": "[-inf.]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[inf]",
+      "rython": "[inf.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[nan]",
+      "rython": "[nan.]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-inf]",
+      "rython": "[-inf.]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[inf]",
+      "rython": "[inf.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[nan]",
+      "rython": "[nan.]"
+     },
+     {
+      "line": 3,
+      "cpython": "[-inf]",
+      "rython": "[-inf.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "36_precision",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.33333333]",
+      "rython": "[0.3333333333333333]"
+     },
+     {
+      "line": 2,
+      "cpython": "[2.71828183]",
+      "rython": "[2.718281828459045]"
+     },
+     {
+      "line": 3,
+      "cpython": "[0.1        0.12345679]",
+      "rython": "[0.1 0.123456789012345]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.33333333]",
+      "rython": "[0.3333333333333333]"
+     },
+     {
+      "line": 2,
+      "cpython": "[2.71828183]",
+      "rython": "[2.718281828459045]"
+     },
+     {
+      "line": 3,
+      "cpython": "[0.1        0.12345679]",
+      "rython": "[0.1 0.123456789012345]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.33333333]",
+      "rython": "[0.3333333333333333]"
+     },
+     {
+      "line": 2,
+      "cpython": "[2.71828183]",
+      "rython": "[2.718281828459045]"
+     },
+     {
+      "line": 3,
+      "cpython": "[0.1        0.12345679]",
+      "rython": "[0.1 0.123456789012345]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.33333333]",
+      "rython": "[0.3333333333333333]"
+     },
+     {
+      "line": 2,
+      "cpython": "[2.71828183]",
+      "rython": "[2.718281828459045]"
+     },
+     {
+      "line": 3,
+      "cpython": "[0.1        0.12345679]",
+      "rython": "[0.1 0.123456789012345]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[0.33333333]",
+      "rython": "[0.3333333333333333]"
+     },
+     {
+      "line": 2,
+      "cpython": "[2.71828183]",
+      "rython": "[2.718281828459045]"
+     },
+     {
+      "line": 3,
+      "cpython": "[0.1        0.12345679]",
+      "rython": "[0.1 0.123456789012345]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "37_negative_pad",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[-1.  2.]",
+      "rython": "[-  1.   2.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1. 22.]",
+      "rython": "[-  1.  22.]"
+     }
+    ]
+   },
+   "cpu-scalar": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[-1.  2.]",
+      "rython": "[-  1.   2.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1. 22.]",
+      "rython": "[-  1.  22.]"
+     }
+    ]
+   },
+   "cpu-rayon": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[-1.  2.]",
+      "rython": "[-  1.   2.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1. 22.]",
+      "rython": "[-  1.  22.]"
+     }
+    ]
+   },
+   "cpu-simd": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[-1.  2.]",
+      "rython": "[-  1.   2.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1. 22.]",
+      "rython": "[-  1.  22.]"
+     }
+    ]
+   },
+   "cpu-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[-1.  2.]",
+      "rython": "[-  1.   2.]"
+     },
+     {
+      "line": 2,
+      "cpython": "[-1. 22.]",
+      "rython": "[-  1.  22.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "38_concat_axis_kw",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: use of moved value: `p`",
+     "error[E0382]: use of moved value: `q`",
+     "error: could not compile `_38_concat_axis_kw_default_auto` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-scalar": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: use of moved value: `p`",
+     "error[E0382]: use of moved value: `q`",
+     "error: could not compile `_38_concat_axis_kw_cpu_scalar` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-rayon": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: use of moved value: `p`",
+     "error[E0382]: use of moved value: `q`",
+     "error: could not compile `_38_concat_axis_kw_cpu_rayon` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-simd": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: use of moved value: `p`",
+     "error[E0382]: use of moved value: `q`",
+     "error: could not compile `_38_concat_axis_kw_cpu_simd` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   },
+   "cpu-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0382]: use of moved value: `p`",
+     "error[E0382]: use of moved value: `q`",
+     "error: could not compile `_38_concat_axis_kw_cpu_auto` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "39_ndarray_return",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "40_operator_reuse",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-scalar": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-rayon": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-simd": {
+    "status": "PASS",
+    "rc": 0
+   },
+   "cpu-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "41_shape_mismatch",
+  "cpython_rc": 1,
+  "variants": {
+   "default-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "stderr_head": [
+     "thread 'main' (4400) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/ufunc.rs:234:37:",
+     "ValueError: operands could not be broadcast together with shapes [2] [3]"
+    ]
+   }
+  }
+ },
+ {
+  "case": "42_index_error",
+  "cpython_rc": 1,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 1,
+    "stderr_head": [
+     "Error: PyException { message: \"index out of bounds\", exception_type: \"IndexError\" }"
+    ]
+   }
+  }
+ },
+ {
+  "case": "43_singular_inv",
+  "cpython_rc": 1,
+  "variants": {
+   "default-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "stderr_head": [
+     "thread 'main' (4624) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/linalg.rs:235:13:",
+     "LinAlgError: Singular matrix (det == 0); cannot invert"
+    ]
+   }
+  }
+ },
+ {
+  "case": "44_max_empty",
+  "cpython_rc": 1,
+  "variants": {
+   "default-auto": {
+    "status": "RUN_FAIL",
+    "rc": 101,
+    "stderr_head": [
+     "thread 'main' (4737) panicked at /home/user/rython/crates/stdpython/src/stdlib/numpy/reduce.rs:116:9:",
+     "ValueError: maximum of empty array"
+    ]
+   }
+  }
+ },
+ {
+  "case": "45_div_zero_int",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "46_attributes",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0277]: the trait bound `Dtype: PyDisplay` is not satisfied",
+     "error[E0609]: no field `T` on type `NdArray`",
+     "error: could not compile `_46_attributes_default_auto` (lib) due to 2 previous errors; 1 warning emitted"
+    ]
+   }
+  }
+ },
+ {
+  "case": "47_methods",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0425]: cannot find value `int64` in module `np`",
+     "error: could not compile `_47_methods_default_auto` (lib) due to 1 previous error"
+    ]
+   }
+  }
+ },
+ {
+  "case": "48_slicing",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "[7 8 9]",
+      "rython": "[0 1 2 3 4 5 6 7 8 9]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "49_bool_mask",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "50_item_assign",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "[ 5.   0.  -1.5  0. ]",
+      "rython": "[  5.   0. -  1.5   0.]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "51_broadcasting",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "52_random",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "BUILD_FAIL",
+    "rc": null,
+    "errors": [
+     "error[E0433]: cannot find `random` in `np`",
+     "error[E0433]: cannot find `random` in `np`",
+     "error: could not compile `_52_random_default_auto` (lib) due to 2 previous errors"
+    ]
+   }
+  }
+ },
+ {
+  "case": "53_inplace",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "54_iterate",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "55_literal_lists",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 5,
+      "cpython": "[0.   0.25 0.5  0.75]",
+      "rython": "[0. 0.25 0.5 0.75]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "56_attrs_shape",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 1,
+      "cpython": "(3,)",
+      "rython": "[3]"
+     },
+     {
+      "line": 4,
+      "cpython": "(2, 3)",
+      "rython": "[2, 3]"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "case": "57_methods_core",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "PASS",
+    "rc": 0
+   }
+  }
+ },
+ {
+  "case": "58_slice_negative",
+  "cpython_rc": 0,
+  "variants": {
+   "default-auto": {
+    "status": "DIVERGE",
+    "rc": 0,
+    "diff": [
+     {
+      "line": 3,
+      "cpython": "[7 8 9]",
+      "rython": "[0 1 2 3 4 5 6 7 8 9]"
+     },
+     {
+      "line": 4,
+      "cpython": "[0 1 2 3 4 5 6]",
+      "rython": "[]"
+     },
+     {
+      "line": 5,
+      "cpython": "[5 6 7]",
+      "rython": "[]"
+     }
+    ]
+   }
+  }
+ }
+]
