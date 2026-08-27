@@ -564,8 +564,13 @@ fn numpy_target(func: &ExprType, symbols: &SymbolTableScopes) -> Option<String> 
         ExprType::Attribute(attr) => match attr.value.as_ref() {
             ExprType::Attribute(inner) => {
                 if let ExprType::Name(m) = inner.value.as_ref() {
-                    if crate::is_numpy_alias(&m.id) && inner.attr == "linalg" {
-                        return Some(format!("linalg.{}", attr.attr));
+                    if crate::is_numpy_alias(&m.id) {
+                        // `linalg` is the one modeled submodule. Any other
+                        // (`np.random.rand`) used to lower to a bare
+                        // `np::random::rand` path and fail in rustc; route
+                        // it to the numpy lowering so it is refused by name
+                        // at conversion time (issue #204).
+                        return Some(format!("{}.{}", inner.attr, attr.attr));
                     }
                 }
                 None
@@ -604,10 +609,40 @@ fn np_render(expr: &ExprType, ctx: &NpCtx) -> Result<TokenStream, Box<dyn std::e
     // The numpy runtime functions take their array/scalar arguments BY
     // VALUE (no borrows, unlike the Python-operator traits), while Python
     // value semantics let a variable be re-used freely after the call.
-    // Clone every argument so `a = np.sum(x); b = np.mean(x)` still
+    // Clone PLACE arguments so `a = np.sum(x); b = np.mean(x)` still
     // compiles. Every generated value type (NdArray, i64, f64, bool,
     // String, Vec, Option, tuples) is Clone, so this is always safe.
-    Ok(quote!((#tokens).clone()))
+    //
+    // A temporary — the result of another call, a literal, an operator
+    // expression — has no name to survive the move, so cloning it only
+    // copies an array nobody can observe again: `np.sum(np.multiply(x, x))`
+    // paid for a full extra copy of the intermediate (issue #200).
+    match expr {
+        ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_) => {
+            Ok(quote!((#tokens).clone()))
+        }
+        _ => Ok(quote!((#tokens))),
+    }
+}
+
+/// Render an ARRAY-LIST argument (`np.concatenate([p, q], ...)`).
+///
+/// A list literal lowers to `vec![p, q]`, which MOVES each element — so a
+/// second `np.concatenate([p, q], ...)` on the same arrays failed to
+/// compile (issue #201). Cloning the whole `vec!` (what np_render does)
+/// is too late; each element needs its own clone, which is also the right
+/// value semantics: Python's list holds references, rython's holds copies.
+fn np_render_array_list(
+    expr: &ExprType,
+    ctx: &NpCtx,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let ExprType::List(items) = expr {
+        let elems: Result<Vec<TokenStream>, Box<dyn std::error::Error>> =
+            items.iter().map(|e| np_render(e, ctx)).collect();
+        let elems = elems?;
+        return Ok(quote!(vec![#(#elems),*]));
+    }
+    np_render(expr, ctx)
 }
 
 fn np_kw<'a>(keywords: &'a [Keyword], name: &str) -> Option<&'a ExprType> {
@@ -640,6 +675,98 @@ fn np_no_extra_kw(
         }
     }
     Ok(())
+}
+
+/// numpy functions whose runtime form returns `Result<_, PyException>`.
+///
+/// These are the operations CPython raises from — a broadcast mismatch, a
+/// singular matrix, a reduction with no identity over an empty array — so
+/// the call site propagates with `?` and the exception is catchable
+/// instead of aborting the process (issue #205). The OPERATOR spellings
+/// (`a + b`) still panic: the operator traits have no fallible form
+/// (spec §12.2).
+fn np_is_fallible(name: &str) -> bool {
+    matches!(
+        name,
+        // Binary ufuncs: broadcasting can raise ValueError.
+        "add"
+            | "subtract"
+            | "multiply"
+            | "divide"
+            | "floor_divide"
+            | "mod"
+            | "remainder"
+            | "power"
+            | "maximum"
+            | "minimum"
+            | "equal"
+            | "not_equal"
+            | "less"
+            | "less_equal"
+            | "greater"
+            | "greater_equal"
+            | "bitwise_and"
+            | "bitwise_or"
+            | "bitwise_xor"
+            | "logical_and"
+            | "logical_or"
+            | "logical_xor"
+            // Reductions with no identity raise on an empty array.
+            | "max"
+            | "min"
+            | "argmax"
+            | "argmin"
+            // np.where broadcasts its two branches.
+            | "where"
+            // A singular matrix raises LinAlgError.
+            | "linalg.inv"
+            | "linalg.solve"
+    )
+}
+
+/// Is this expression PROVABLY a 1-D array?
+///
+/// numpy's `np.dot` returns a scalar for 1-D x 1-D and an array otherwise;
+/// rython has one static type per expression, so the vector case is routed
+/// to `vdot` (which returns f64) when — and only when — both operands can
+/// be shown 1-D from the creation call itself (issue #206). Anything not
+/// provable keeps the array-returning `dot`, which prints identically; the
+/// check never guesses, so it can only turn a build error into working
+/// code, never a right answer into a wrong one.
+fn np_is_1d(expr: &ExprType, options: &PythonOptions, symbols: &SymbolTableScopes) -> bool {
+    match expr {
+        // A local whose recorded assignment is itself provably 1-D.
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::Assign { value, .. }) => np_is_1d(&value, options, symbols),
+            _ => false,
+        },
+        ExprType::Call(call) => {
+            let Some(fname) = numpy_target(call.func.as_ref(), symbols) else {
+                return false;
+            };
+            match fname.as_str() {
+                // Always 1-D regardless of arguments.
+                "linspace" | "arange" => true,
+                // 1-D exactly when the shape argument is a scalar, not a
+                // tuple/list of dimensions.
+                "zeros" | "ones" | "empty" | "full" => call
+                    .args
+                    .first()
+                    .is_some_and(|s| !matches!(s, ExprType::Tuple(_) | ExprType::List(_))),
+                // A flat list literal of numbers.
+                "array" | "asarray" => call.args.first().is_some_and(|a| match a {
+                    ExprType::List(items) => !items
+                        .iter()
+                        .any(|e| matches!(e, ExprType::List(_) | ExprType::Tuple(_))),
+                    _ => false,
+                }),
+                // Elementwise results keep their operand's rank.
+                "ravel" => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Is this expression a float literal (possibly under unary +/-)?
@@ -719,6 +846,9 @@ fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::E
             .into());
         }
     };
+    // An IDENT, not the `&str`: interpolating the string would render a
+    // string literal (`numpy::Dtype::"Int64"`), which is not valid Rust.
+    let variant = crate::safe_ident(variant);
     Ok(quote!(numpy::Dtype::#variant))
 }
 
@@ -762,6 +892,19 @@ fn lower_numpy_call(
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let npc = (ctx, options, symbols);
     let fname = fname.to_string();
+    // An unmodeled numpy SUBMODULE (`np.random.rand`) is refused before
+    // anything tries to build a Rust path out of the dotted name — that
+    // used to emit a bare `np::random::rand` and fail in rustc (issue
+    // #204), and the ident builder cannot represent the dot at all.
+    if fname.contains('.') && !fname.starts_with("linalg.") {
+        let submodule = fname.split('.').next().unwrap_or(&fname);
+        return Err(format!(
+            "np.{submodule} is not supported by rython's numpy subset (the only \
+             modeled numpy submodule is np.linalg, with inv, det and solve); \
+             rython refuses to emit a call it cannot reproduce"
+        )
+        .into());
+    }
     let (plain_name, path) = np_path(&fname);
 
     // np.float64(x) / np.int64(x) / np.float32(x) / np.int32(x) / np.bool_(x)
@@ -1015,23 +1158,33 @@ fn lower_numpy_call(
                 .into());
             }
             let a = np_render(&args[0], &npc)?;
+            if np_is_fallible(&fname) {
+                return Ok(quote!(#path(#a)?));
+            }
             Ok(quote!(#path(#a)))
         }
 
         "std" | "var" => {
             np_no_extra_kw(&plain_name, keywords, &["ddof"])?;
-            if !(1..=2).contains(&args.len()) {
+            if args.len() != 1 {
+                // numpy's second POSITIONAL parameter is `axis`, not `ddof`
+                // — `np.std(a, 1)` is a per-axis reduction there. Binding it
+                // to ddof made the same call mean something else with no
+                // diagnostic (issue #196), so the positional form is refused
+                // and ddof is keyword-only.
                 return Err(format!(
-                    "np.{}() takes 1 or 2 arguments ({} given)",
+                    "np.{}() takes exactly 1 positional argument ({} given); numpy's \
+                     second positional parameter is `axis`, which is not supported in \
+                     rython's numpy subset — pass ddof as a keyword (np.{}(a, ddof=1))",
                     plain_name,
-                    args.len()
+                    args.len(),
+                    plain_name
                 )
                 .into());
             }
             let a = np_render(&args[0], &npc)?;
             let ddof = match np_kw(keywords, "ddof") {
                 Some(d) => Some(np_render(d, &npc)?),
-                None if args.len() == 2 => Some(np_render(&args[1], &npc)?),
                 None => None,
             };
             let ddof = match ddof {
@@ -1088,20 +1241,22 @@ fn lower_numpy_call(
                 np_render(&args[1], &npc)?,
                 np_render(&args[2], &npc)?,
             );
-            Ok(quote!(numpy::where_(#c, #a, #b)))
+            Ok(quote!(numpy::where_(#c, #a, #b)?))
         }
 
         "concatenate" => {
             np_no_extra_kw("concatenate", keywords, &["axis"])?;
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(format!(
-                    "np.concatenate() takes exactly 1 positional argument ({} given)",
+                    "np.concatenate() takes 1 or 2 positional arguments ({} given)",
                     args.len()
                 )
                 .into());
             }
-            let arrays = np_render(&args[0], &npc)?;
-            let axis = match np_kw(keywords, "axis") {
+            let arrays = np_render_array_list(&args[0], &npc)?;
+            // numpy's `axis` is the second POSITIONAL parameter as well as a
+            // keyword — `np.concatenate([p, q], 1)` is ordinary numpy.
+            let axis = match np_kw(keywords, "axis").or_else(|| args.get(1)) {
                 Some(a) => np_render(a, &npc)?,
                 None => quote!(0i64),
             };
@@ -1155,12 +1310,23 @@ fn lower_numpy_call(
                 .into());
             }
             let (a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?);
+            // np.dot on two provably 1-D operands is numpy's inner product,
+            // which returns a SCALAR — `vdot` is that function here.
+            if plain_name == "dot"
+                && np_is_1d(&args[0], &npc.1, &npc.2)
+                && np_is_1d(&args[1], &npc.1, &npc.2)
+            {
+                return Ok(quote!(numpy::vdot(#a, #b)));
+            }
             let name = if plain_name == "mod" {
                 "mod_"
             } else {
                 plain_name.as_str()
             };
             let path = crate::safe_ident(name);
+            if np_is_fallible(&fname) {
+                return Ok(quote!(numpy::#path(#a, #b)?));
+            }
             Ok(quote!(numpy::#path(#a, #b)))
         }
 
@@ -1174,7 +1340,7 @@ fn lower_numpy_call(
                 )
                 .into());
             }
-            let a = np_render(&args[0], &npc)?;
+            let a = np_render_array_list(&args[0], &npc)?;
             Ok(quote!(#path(#a)))
         }
 
@@ -1190,6 +1356,9 @@ fn lower_numpy_call(
                 .into());
             }
             let a = np_render(&args[0], &npc)?;
+            if np_is_fallible(&fname) {
+                return Ok(quote!(#path(#a)?));
+            }
             Ok(quote!(#path(#a)))
         }
         "linalg.solve" => {
@@ -1202,7 +1371,7 @@ fn lower_numpy_call(
                 .into());
             }
             let (a, b) = (np_render(&args[0], &npc)?, np_render(&args[1], &npc)?);
-            Ok(quote!(#path(#a, #b)))
+            Ok(quote!(#path(#a, #b)?))
         }
 
         other => Err(format!(
@@ -1214,7 +1383,7 @@ fn lower_numpy_call(
              divide, floor_divide, mod, power, sqrt, exp, log, sin, cos, ...), the \
              comparisons (equal, not_equal, less, greater, ...), the dtype casts \
              (np.float64, np.int64, np.bool_, ...), and np.linalg.{{inv,det,solve}}. \
-             See the numpy README for details."
+             The accepted surface is docs/spec.md §10.6."
         )
         .into()),
     }
@@ -1613,6 +1782,44 @@ impl<'a> CodeGen for Call {
                     )
                     .into());
                 }
+            }
+        }
+
+        // Fallible numpy METHODS (`a.max()` on an empty array) propagate
+        // the same catchable exception their function spelling does.
+        if let ExprType::Attribute(attr) = self.func.as_ref() {
+            if matches!(attr.attr.as_str(), "max" | "min" | "argmax" | "argmin")
+                && self.args.is_empty()
+                && self.keywords.is_empty()
+                && crate::ast::tree::type_ctx::is_ndarray_expr(&attr.value, &options, &symbols)
+            {
+                let recv = attr.value.as_ref().clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                let m = crate::safe_ident(&attr.attr);
+                return Ok(quote!((#recv).#m()?));
+            }
+        }
+
+        // `a.astype(np.int64)` — a METHOD on an array whose argument is a
+        // dtype. The runtime method exists; only the argument needed
+        // mapping, since `np.int64` is otherwise a cast CALL and not a
+        // value (issue #204).
+        if let ExprType::Attribute(attr) = self.func.as_ref() {
+            if attr.attr == "astype"
+                && self.args.len() == 1
+                && self.keywords.is_empty()
+                && crate::ast::tree::type_ctx::is_ndarray_expr(&attr.value, &options, &symbols)
+            {
+                let recv = attr.value.as_ref().clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                let dtype = np_dtype_tokens(&self.args[0])?;
+                return Ok(quote!((#recv).astype(#dtype)));
             }
         }
 
@@ -5299,7 +5506,7 @@ impl<'a> CodeGen for Call {
                             }
                             _ => None,
                         }) else {
-                            
+
                                 options.definition_warnings.borrow_mut().push(
                                     "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"

@@ -200,6 +200,26 @@ impl<'a> CodeGen for Attribute {
                 return Ok(quote!(#class_ident::#accessor()));
             }
         }
+        // numpy attribute reads on a value the inference knows is an
+        // array. `ndim`/`size` are plain field reads that already print
+        // like Python ints; `shape` and `T` need the runtime's accessors
+        // (issues #197, #204).
+        // (`root_shadowed` is not consulted: it marks a name BOUND by user
+        // code, which every array local is.)
+        if crate::ast::tree::type_ctx::is_ndarray_expr(&self.value, &options, &symbols) {
+            let recv = self
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            match self.attr.as_str() {
+                // A Python tuple, not the backing Vec: `(3,)`, not `[3]`.
+                "shape" => return Ok(quote!((#recv).shape_tuple())),
+                // numpy's transpose view; rython's arrays are values, so
+                // this is the same copy `np.transpose(a)` makes.
+                "T" => return Ok(quote!((#recv).transpose())),
+                _ => {}
+            }
+        }
         // A receiver that IS a class (a @classmethod's `cls`, or a bare
         // class name read as a value): an attribute on it that is NOT a
         // class-body constant (`cls.DEFAULT` where `Retry.DEFAULT =

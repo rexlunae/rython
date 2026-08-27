@@ -91,3 +91,17 @@ pub fn dtype_from_str(s: &str) -> Result<Dtype, PyException> {
         }
     })
 }
+
+/// numpy's `print(a.dtype)` — the dtype's name.
+impl crate::PyDisplay for Dtype {
+    fn py_display(&self) -> String {
+        self.name().to_string()
+    }
+}
+
+/// numpy's `repr(a.dtype)` — `dtype('float64')`.
+impl crate::PyRepr for Dtype {
+    fn py_repr(&self) -> String {
+        format!("dtype('{}')", self.name())
+    }
+}

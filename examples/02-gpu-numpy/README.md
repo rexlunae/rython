@@ -32,12 +32,17 @@ Requesting an engine the binary wasn't built with raises
 built without its feature (`numpy-cuda`)` — rython's usual contract:
 correct or loud, never silently different.
 
-> **Status**: the `scalar` engine is complete and is what `auto` resolves
-> to in a default build. The accelerated engines are the wired-in
-> dispatch targets above — the feature gates, `np.set_backend` surface,
-> and loud-failure paths shown here are how a program opts in — but their
-> kernel implementations are still being brought up, so a default build
-> today runs on the CPU.
+> **Status**: `scalar` is complete and is what `auto` resolves to in a
+> default build. `rayon` is complete too — its kernels match the scalar
+> ones element for element, and it falls back to the sequential loop
+> below a size floor, since thread dispatch costs more than the work on
+> small arrays. `simd` is currently an alias of `scalar`: the scalar
+> kernels already auto-vectorize, and no hand-written intrinsics have
+> been needed. `cuda` and `vulkan` are the wired-in dispatch targets —
+> the feature gates, `np.set_backend` surface and loud-failure paths
+> shown here are how a program opts in — but no GPU kernels ship yet, so
+> selecting one is a loud `RuntimeError`, never a silent fallback to the
+> CPU.
 
 ## Run it
 
@@ -56,17 +61,17 @@ cargo build --manifest-path /tmp/simulate-rs/Cargo.toml --release
 /tmp/simulate-rs/target/release/simulate --gpu
 ```
 
-Expected output with `--samples 10000`:
+Expected output with `--samples 10000`, from both:
 
 ```
-pi ~= 3.14147731828716            # CPython + numpy
-pi ~= 3.141477318287153           # the rython binary
+pi ~= 3.14147731828716
+oscillator <x^2> after 500 steps: 0.02779515904224993
 ```
 
-The final couple of digits of a reduction differ between the two: real
-numpy reduces with pairwise summation, rython's scalar engine
-accumulates sequentially. Everything else — argparse handling, `--help`
-text, error output — matches byte for byte.
+The two agree byte for byte, reductions included: `np.sum`/`np.mean`
+replicate numpy's `npy_pairwise_sum` exactly rather than accumulating
+sequentially, so even the last bits match. argparse handling, `--help`
+text and error output match byte for byte too.
 
 ## Notes on the numpy subset
 

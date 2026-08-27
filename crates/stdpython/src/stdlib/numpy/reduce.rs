@@ -10,6 +10,8 @@
 //! `np.argmax` / `np.argmin` return `i64` — those are single-typed in
 //! numpy too.
 
+use std::borrow::Cow;
+
 use super::dtype::Dtype;
 use super::ndarray::{Data, NdArray};
 use crate::PyException;
@@ -31,8 +33,16 @@ fn nan_propagating_min(a: f64, b: f64) -> f64 {
 }
 
 /// The array's elements as f64 (the reduction domain).
-fn vals(a: &NdArray) -> Vec<f64> {
-    a.as_f64()
+///
+/// Borrowed for a float64 array, which is the overwhelmingly common case:
+/// `as_f64()` is a full `Vec` clone even when no conversion is needed, so
+/// every reduction used to allocate and copy the whole array before
+/// touching it — invisible in cache, dominant out of it (issue #200).
+fn vals(a: &NdArray) -> Cow<'_, [f64]> {
+    match &a.data {
+        Data::F64(v) => Cow::Borrowed(v),
+        _ => Cow::Owned(a.as_f64()),
+    }
 }
 
 /// numpy's `npy_pairwise_sum` (loops_utils.h.src), replicated exactly so
@@ -96,7 +106,7 @@ pub fn sum(a: NdArray) -> f64 {
 /// pairwise), so the sequential order below is already bit-identical.
 pub fn prod(a: NdArray) -> f64 {
     let mut acc = 1.0f64;
-    for x in vals(&a) {
+    for &x in vals(&a).iter() {
         acc *= x;
     }
     acc
@@ -110,35 +120,39 @@ pub fn mean(a: NdArray) -> f64 {
 }
 
 /// `np.max(a)` — NaN-propagating, like numpy.
-pub fn max(a: NdArray) -> f64 {
+pub fn max(a: NdArray) -> Result<f64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "maximum of empty array")
-        );
+        // numpy's own wording, and a CATCHABLE exception rather than a
+        // panic (issue #205).
+        return Err(PyException::new(
+            "ValueError",
+            "zero-size array to reduction operation maximum which has no identity",
+        ));
     }
     let mut m = v[0];
     for &x in &v[1..] {
         m = nan_propagating_max(m, x);
     }
-    m
+    Ok(m)
 }
 
 /// `np.min(a)` — NaN-propagating, like numpy.
-pub fn min(a: NdArray) -> f64 {
+pub fn min(a: NdArray) -> Result<f64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "minimum of empty array")
-        );
+        // numpy's own wording, and a CATCHABLE exception rather than a
+        // panic (issue #205).
+        return Err(PyException::new(
+            "ValueError",
+            "zero-size array to reduction operation minimum which has no identity",
+        ));
     }
     let mut m = v[0];
     for &x in &v[1..] {
         m = nan_propagating_min(m, x);
     }
-    m
+    Ok(m)
 }
 
 /// `np.std(a, ddof=0)` — population standard deviation (numpy default).
@@ -175,49 +189,49 @@ pub fn any(a: NdArray) -> bool {
 
 /// `np.argmax(a)` — index of the first maximum; a NaN anywhere wins the
 /// index of the first NaN, exactly like numpy.
-pub fn argmax(a: NdArray) -> i64 {
+pub fn argmax(a: NdArray) -> Result<i64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "attempt to get argmax of an empty sequence")
-        );
+        return Err(PyException::new(
+            "ValueError",
+            "attempt to get argmax of an empty sequence",
+        ));
     }
     let mut best = 0usize;
     let mut best_v = v[0];
     for (i, &x) in v.iter().enumerate().skip(1) {
         if x.is_nan() {
-            return i as i64;
+            return Ok(i as i64);
         }
         if nan_propagating_max(best_v, x) == x {
             best = i;
             best_v = x;
         }
     }
-    best as i64
+    Ok(best as i64)
 }
 
 /// `np.argmin(a)` — index of the first minimum; NaN wins like numpy.
-pub fn argmin(a: NdArray) -> i64 {
+pub fn argmin(a: NdArray) -> Result<i64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "attempt to get argmin of an empty sequence")
-        );
+        return Err(PyException::new(
+            "ValueError",
+            "attempt to get argmin of an empty sequence",
+        ));
     }
     let mut best = 0usize;
     let mut best_v = v[0];
     for (i, &x) in v.iter().enumerate().skip(1) {
         if x.is_nan() {
-            return i as i64;
+            return Ok(i as i64);
         }
         if nan_propagating_min(best_v, x) == x {
             best = i;
             best_v = x;
         }
     }
-    best as i64
+    Ok(best as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -234,10 +248,10 @@ impl NdArray {
     pub fn mean(&self) -> f64 {
         mean(self.clone())
     }
-    pub fn max(&self) -> f64 {
+    pub fn max(&self) -> Result<f64, PyException> {
         max(self.clone())
     }
-    pub fn min(&self) -> f64 {
+    pub fn min(&self) -> Result<f64, PyException> {
         min(self.clone())
     }
     pub fn std(&self) -> f64 {
@@ -252,10 +266,10 @@ impl NdArray {
     pub fn any(&self) -> bool {
         any(self.clone())
     }
-    pub fn argmax(&self) -> i64 {
+    pub fn argmax(&self) -> Result<i64, PyException> {
         argmax(self.clone())
     }
-    pub fn argmin(&self) -> i64 {
+    pub fn argmin(&self) -> Result<i64, PyException> {
         argmin(self.clone())
     }
 }

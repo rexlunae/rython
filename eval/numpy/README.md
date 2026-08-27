@@ -39,10 +39,10 @@ The harnesses pin the engine by rewriting the program to call
 `np.set_backend("<name>")` as `main()`'s first statement, and by adding the
 matching stdpython features to the generated crate's `Cargo.toml`.
 
-That is the only selection path that works: the `RYPY_NUMPY_BACKEND`
-environment variable is documented in `engine.rs`, `rythonc --help` and
-`python_options.rs`, but nothing in the runtime ever reads it (see finding
-B1 in `REPORT.md`), so setting it silently leaves the engine on `auto`.
+`RYPY_NUMPY_BACKEND` also works (it did not when this harness was written
+— see finding B1 in `REPORT.md` and issue #198); the harness keeps using
+`np.set_backend` because it pins the engine in the program itself, which
+is what the generated binaries do.
 
 ## Notes
 

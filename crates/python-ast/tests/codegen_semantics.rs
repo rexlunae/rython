@@ -5690,6 +5690,35 @@ fn starred_list_lowers_through_list_building() {
 }
 
 #[test]
+fn numpy_dtype_keyword_renders_an_enum_variant_not_a_string() {
+    // The dtype variant is an IDENT: interpolating the `&str` rendered
+    // `numpy :: Dtype :: "Int64"`, which is not valid Rust, so every
+    // `dtype=` on zeros/ones/empty failed in rustc (issue #193).
+    for (spelling, variant) in [
+        ("np.float64", "Float64"),
+        ("np.float32", "Float32"),
+        ("np.int64", "Int64"),
+        ("np.int32", "Int32"),
+        ("np.bool_", "Bool"),
+        ("\"int64\"", "Int64"),
+        ("\"float32\"", "Float32"),
+    ] {
+        let out = compile(
+            &format!("import numpy as np\nx = np.zeros(3, dtype={spelling})\n"),
+            "npdtype.py",
+        );
+        assert!(
+            out.contains(&format!("numpy :: Dtype :: {variant}")),
+            "dtype={spelling} generated: {out}"
+        );
+        assert!(
+            !out.contains(&format!("Dtype :: \"{variant}\"")),
+            "dtype={spelling} rendered a string literal: {out}"
+        );
+    }
+}
+
+#[test]
 fn aliased_import_resolves_through_module_intercept() {
     // F10: `import numpy as np` bound `np` as an Alias symbol, which
     // module_name_shadowed treated as a user variable, so `np.zeros` never
@@ -6140,6 +6169,169 @@ fn chained_operator_expressions_get_intermediate_output_bounds() {
         "the intermediate operator Output must be bounded: {}",
         out
     );
+}
+
+#[test]
+fn numpy_attributes_use_the_runtime_accessors() {
+    // `a.shape` is a Python TUPLE and `a.T` a transpose; both used to fall
+    // through to a plain field read, which printed a list and failed in
+    // rustc respectively (issues #197, #204).
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    a = np.array([1.0, 2.0])\n    \
+         s = a.shape\n    t = a.T\n",
+        "npattr.py",
+    );
+    assert!(out.contains("shape_tuple ()"), "generated: {}", out);
+    assert!(out.contains("transpose ()"), "generated: {}", out);
+    assert!(
+        !out.contains("a . T"),
+        "a.T must not be a field read: {}",
+        out
+    );
+}
+
+#[test]
+fn numpy_astype_maps_its_dtype_argument() {
+    // `np.int64` is a CAST call elsewhere; as astype's argument it names a
+    // dtype (issue #204).
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    a = np.array([1.0, 2.0])\n    \
+         b = a.astype(np.int64)\n",
+        "npastype.py",
+    );
+    assert!(
+        out.contains("astype (numpy :: Dtype :: Int64)"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn numpy_submodules_other_than_linalg_are_refused() {
+    // `np.random.rand(3)` used to lower to a bare `np :: random :: rand`
+    // path and fail in rustc (issue #204).
+    let err = compile_err("import numpy as np\nx = np.random.rand(3)\n", "nprandom.py");
+    assert!(err.contains("np.random"), "must name the submodule: {err}");
+    assert!(
+        err.contains("np.linalg"),
+        "must name what IS modeled: {err}"
+    );
+    // linalg still lowers.
+    let out = compile(
+        "import numpy as np\nx = np.linalg.det(np.eye(2))\n",
+        "nplinalg.py",
+    );
+    assert!(out.contains("numpy :: linalg :: det"), "generated: {}", out);
+}
+
+#[test]
+fn numpy_operator_and_list_arguments_do_not_move_their_operands() {
+    // `py_div`/`py_mod`/... take their operands BY VALUE, so a variable
+    // used again afterwards was a borrow-checker error in the generated
+    // crate; the same for a list literal's elements (issue #201).
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    a = np.array([1.0])\n    \
+         b = np.array([2.0])\n    c = b / a\n    d = a * 2.0\n",
+        "npops.py",
+    );
+    assert!(out.contains("py_div ((b) . clone ()"), "generated: {}", out);
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    p = np.zeros(2)\n    \
+         q = np.ones(2)\n    r = np.concatenate([p, q], axis=0)\n",
+        "npconcat.py",
+    );
+    assert!(
+        out.contains("vec ! [(p) . clone () , (q) . clone ()]"),
+        "list elements must clone individually: {}",
+        out
+    );
+}
+
+#[test]
+fn numpy_fallible_calls_propagate_with_question_mark() {
+    // A broadcast mismatch, a singular matrix and an empty reduction are
+    // CATCHABLE exceptions now, so their call sites propagate (issue #205).
+    for (src, needle) in [
+        ("x = np.add(np.zeros(2), np.zeros(3))", "numpy :: add"),
+        ("x = np.max(np.zeros(0))", "numpy :: max"),
+        ("x = np.linalg.inv(np.eye(2))", "numpy :: linalg :: inv"),
+    ] {
+        let out = compile(
+            &format!("import numpy as np\ndef f() -> None:\n    {src}\n"),
+            "npfallible.py",
+        );
+        assert!(out.contains(needle), "generated: {out}");
+        assert!(
+            out.contains(&format!("{needle} ((")) && out.contains(") ?"),
+            "the fallible call must propagate: {out}"
+        );
+    }
+    // An infallible one does NOT grow a stray `?`.
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    x = np.sum(np.zeros(2))\n",
+        "npsum.py",
+    );
+    assert!(out.contains("numpy :: sum"), "generated: {}", out);
+}
+
+#[test]
+fn ndarray_returning_functions_type_their_callers_local() {
+    // A local assigned from a `-> np.ndarray` function was boxed into
+    // PyValue (which has no From<NdArray>), so every use failed in rustc
+    // (issue #203).
+    let out = compile(
+        "import numpy as np\ndef build(n: int) -> np.ndarray:\n    \
+         return np.zeros(n)\ndef f() -> None:\n    v = build(5)\n    \
+         print(np.sum(v))\n",
+        "ndret.py",
+    );
+    assert!(
+        !out.contains("PyValue :: from (build"),
+        "an ndarray result must not box: {}",
+        out
+    );
+}
+
+#[test]
+fn np_dot_on_provable_vectors_returns_a_scalar() {
+    // numpy's inner product is a SCALAR; rython routes the provably-1-D
+    // case to vdot, which returns f64 (issue #206).
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    a = np.linspace(0.0, 1.0, 4)\n    \
+         b = np.ones(4)\n    s = np.dot(a, b)\n",
+        "npdot.py",
+    );
+    assert!(out.contains("numpy :: vdot"), "generated: {}", out);
+    // A matrix operand keeps the array-returning `dot`.
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    m = np.eye(2)\n    \
+         s = np.dot(m, m)\n",
+        "npdotm.py",
+    );
+    assert!(out.contains("numpy :: dot"), "generated: {}", out);
+}
+
+#[test]
+fn np_std_var_reject_the_axis_positional() {
+    // numpy's second positional parameter of std/var is `axis`, not
+    // `ddof`: `np.std(a, 1)` reduces per row there. Binding it to ddof
+    // made the same call silently mean something else (issue #196).
+    for fname in ["std", "var"] {
+        let err = compile_err(
+            &format!("import numpy as np\nx = np.{fname}(np.zeros(4), 1)\n"),
+            "npstd.py",
+        );
+        assert!(
+            err.contains("second positional parameter is `axis`"),
+            "np.{fname}(a, 1) must be refused by name: {err}"
+        );
+    }
+    // The keyword form is the supported spelling and still lowers.
+    let out = compile(
+        "import numpy as np\nx = np.std(np.zeros(4), ddof=1)\n",
+        "npstdkw.py",
+    );
+    assert!(out.contains("numpy :: std"), "generated: {}", out);
 }
 
 #[test]
