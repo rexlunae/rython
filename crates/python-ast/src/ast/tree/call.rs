@@ -7206,7 +7206,24 @@ pub(crate) fn receiver_class(
                 value: ExprType::Call(call),
                 ..
             }) => match call.func.as_ref() {
-                ExprType::Name(cn) => (cn.id.clone(), symbols.clone()),
+                ExprType::Name(cn) => {
+                    if let Some(SymbolTableNode::FunctionDef(f)) = symbols.get(&cn.id) {
+                        // A local factory call: `c = make()` where `def
+                        // make() -> Counter` (or the unannotated
+                        // lazy-singleton getter, issue #189) — the
+                        // receiver's class comes from the function's
+                        // return.
+                        match f.return_class_name(options) {
+                            Some(class) => (class, symbols.clone()),
+                            None => return None,
+                        }
+                    } else {
+                        // A constructor (local or imported — the tail
+                        // resolves an imported class through its defining
+                        // module).
+                        (cn.id.clone(), symbols.clone())
+                    }
+                }
                 _ => return None,
             },
             // A TYPED PARAMETER receiver (`def f(c: C): return c.x` — the

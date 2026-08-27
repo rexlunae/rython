@@ -2794,12 +2794,31 @@ impl CodeGen for ClassDef {
             quote!()
         };
 
+        // An instance is never None (only None is None in Python), so `x
+        // is None` on a class-typed value lowers through PyIsNone to a
+        // constant false — the same never-None contract the scalar types
+        // carry (stdpython's never_none! macro).
+        let is_none_impl = if options.with_std_python {
+            quote!(impl stdpython::PyIsNone for #class_name {
+                fn py_is_none(&self) -> bool {
+                    false
+                }
+            })
+        } else {
+            quote!()
+        };
+
         Ok(quote! {
             #docs
             #[derive(Clone, Default)]
             pub struct #class_name {
                 #(#field_defs),*
             }
+            // A class instance is never None (CPython: only None is None),
+            // so `x is None` on an instance lowers through PyIsNone to
+            // false — same contract the PyInherits tree carries for
+            // ancestry bounds.
+            #is_none_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
