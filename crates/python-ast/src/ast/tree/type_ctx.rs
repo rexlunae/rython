@@ -663,6 +663,11 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             | TypeInfo::Tuple(_)
             | TypeInfo::Option(_)
             | TypeInfo::Vec(_)
+            // A nested DICT value (`{'ProviderType': 'sso', 'Credentials':
+            // {...}}` — botocore's credentials.py): the mixed-value dict
+            // widens to PyDict<String, PyValue> and the nested dict boxes
+            // via PyValue::from(PyDict) (issue #180).
+            | TypeInfo::Dict(_, _)
             | TypeInfo::StrOrBytes
             | TypeInfo::PyValue
     )
@@ -1107,7 +1112,7 @@ fn is_empty_container(expr: &ExprType) -> bool {
 
 /// The syntactic type of an expression, ignoring the analysis maps (used
 /// while building them).
-fn syntactic_type(expr: &ExprType) -> TypeInfo {
+pub(crate) fn syntactic_type(expr: &ExprType) -> TypeInfo {
     match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
