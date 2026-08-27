@@ -126,7 +126,9 @@ fn rust_bind_generates_direct_calls_and_dependencies() {
     // declaration assignments and their names vanish from the runtime code.
     let main_rs = fs::read_to_string(out.join("src/main.rs")).unwrap();
     assert!(
-        main_rs.contains("rustlib::crc8(b\"hello\".as_ref(), 7 as u32) as i64"),
+        // The bytes literal renders OWNED (issue #137 round 21) and the
+        // binding's type-directed conversion borrows it back down.
+        main_rs.contains("rustlib::crc8(b\"hello\".to_vec().as_ref(), 7 as u32) as i64"),
         "&[u8] + u32 args and u32 -> i64 return: {}",
         main_rs
     );
