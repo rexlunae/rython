@@ -6518,8 +6518,8 @@ mod pyvalue_round21_tests {
     fn pyvalue_into_bytes_like_covers_str_and_bytes() {
         assert_eq!(PyValue::Str("ab".into()).into_bytes_like(), b"ab".to_vec());
         assert_eq!(
-            PyValue::Bytes(vec![1, 2]).into_bytes_like(),
-            vec![1, 2]
+            PyValue::Bytes([1u8, 2].to_vec()).into_bytes_like(),
+            [1u8, 2].to_vec()
         );
     }
 
