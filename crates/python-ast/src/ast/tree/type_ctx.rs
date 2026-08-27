@@ -1242,10 +1242,27 @@ fn collect_use_suggestions(
                         // (`modeled_action.name` — an attribute on a foreign
                         // object, boto3's document_actions) is a String in
                         // practice.
-                        let k = match resolve_type(idx, info, symbols, options) {
+                        let k_raw = resolve_type(idx, info, symbols, options);
+                        let key_unknown = matches!(k_raw, TypeInfo::PyObject);
+                        let val_unknown = matches!(v, TypeInfo::PyObject);
+                        let k = match k_raw {
                             TypeInfo::StrRef | TypeInfo::PyObject => TypeInfo::String,
                             other => other,
                         };
+                        // An EXISTING container type wins over a suggestion
+                        // whose key or value is unknown: `d: dict[int, int]
+                        // = {}` followed by `d[i] = i` (the loop variable is
+                        // untyped) must stay `dict[int, int]` — the unknown
+                        // suggestion would otherwise downgrade the
+                        // annotation to a boxed dict (issue #163; unify
+                        // lets PyValue absorb Int). Unknown components only
+                        // type an as-yet-UNTYPED container (boto3's
+                        // document_actions).
+                        if info.name_types.contains_key(&recv.id)
+                            && (key_unknown || val_unknown)
+                        {
+                            return;
+                        }
                         let ty = TypeInfo::Dict(Box::new(k), Box::new(v));
                         // An UNKNOWN value type (`modeled_actions[
                         // modeled_action.name] = modeled_action` where the
