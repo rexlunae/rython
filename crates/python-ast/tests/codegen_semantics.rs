@@ -9740,3 +9740,91 @@ fn bare_yield_contextmanager_pushes_boxed_none() {
         out
     );
 }
+
+// ---- issue #137 round 18: cross-module ancestor-trait impls ----
+
+/// Two-module fixture: module `animals` defines a hierarchy; the module
+/// under test subclasses the imported Dog.
+fn cross_module_subclass_options() -> PythonOptions {
+    let a = parse(
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return self.name\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        self.tricks = 0\n",
+            "\n",
+            "    def grow(self) -> None:\n",
+            "        pass\n",
+        ),
+        "animals.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["animals".to_string()], std::rc::Rc::new(a));
+    PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cross_module_subclass_implements_imported_ancestor_traits() {
+    // `class Puppy(Dog)` with Dog imported from another module (urllib3's
+    // SOCKSConnection(HTTPConnection) shape): Puppy must implement the
+    // imported ancestors' traits — named by their crate paths (this
+    // module need not import them) — with accessor types resolved in the
+    // DEFINING module's scope.
+    let src = "from animals import Dog\n\nclass Puppy(Dog):\n    def fetch(self) -> int:\n        return 1\n";
+    let out = compile_with_options(src, "puppy.py", cross_module_subclass_options())
+        .expect("converts");
+    assert!(
+        out.contains("impl crate :: animals :: DogTrait for Puppy"),
+        "the imported base's trait must be implemented by crate path: {}",
+        out
+    );
+    assert!(
+        out.contains("impl crate :: animals :: AnimalTrait for Puppy"),
+        "the whole imported chain implements, root included: {}",
+        out
+    );
+}
+
+#[test]
+fn covariant_cross_module_override_is_dropped_with_warning() {
+    // An override whose signature disagrees with the imported base's
+    // trait declaration (`grow() -> int` over `-> None` — the SOCKS
+    // `_new_conn` shape): dropped with the divergence warning, never a
+    // mismatched impl (E0053).
+    let src = "from animals import Dog\n\nclass Puppy(Dog):\n    def grow(self) -> int:\n        return 1\n";
+    let module = parse(src, "puppy2.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = cross_module_subclass_options();
+    let warnings = options.definition_warnings.clone();
+    let out = module
+        .to_rust(
+            CodeGenContext::Module("puppy2".to_string()),
+            options,
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        !out.contains("fn grow (& self) -> Result < i64"),
+        "the disagreeing override must not land in the ancestor impl: {}",
+        out
+    );
+    assert!(
+        warnings
+            .borrow()
+            .iter()
+            .any(|w| w.contains("covariant-override divergence")),
+        "the drop must be loud: {:?}",
+        warnings.borrow()
+    );
+}

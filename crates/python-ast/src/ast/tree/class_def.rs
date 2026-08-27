@@ -648,6 +648,95 @@ impl ClassDef {
 
     /// The class itself followed by every ancestor, nearest base first.
     /// Returns just `[self]` when the class has no base.
+    /// The base chain FOLLOWING IMPORTED BASES, each ancestor paired with
+    /// the symbol table of its DEFINING module (the scope its trait's
+    /// accessor types and method sets were declared in). Mirrors the
+    /// options-aware `base` resolution in to_rust: aliases follow to their
+    /// canonical unless the canonical is shadowed by the deriving class
+    /// itself (the external-alias pattern), and imported bases resolve
+    /// through module_defs — an unresolvable base ends the chain
+    /// (external: metadata).
+    pub(crate) fn cross_module_chain(
+        &self,
+        symbols: &SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Vec<(ClassDef, SymbolTableScopes, crate::PythonOptions, Option<Vec<String>>)> {
+        // Each entry carries the scope its class's TRAIT was declared in:
+        // the defining module's symbols AND an options clone whose
+        // module_path/this_module_path point there, so relative imports
+        // and annotations in that module's field types resolve exactly as
+        // they did when the trait was emitted. `Some(path)` marks a
+        // CROSS-MODULE ancestor (its module path, for the type-visibility
+        // glob use at the emit site).
+        let mut chain = vec![(self.clone(), symbols.clone(), options.clone(), None)];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(self.name.clone());
+        loop {
+            let (last, last_syms, last_opts, last_path) = chain.last().unwrap();
+            let Some(base_name) = last.bases.iter().find_map(|b| match b {
+                ExprType::Name(n)
+                    if n.id != "object" && !is_metadata_base_name(&n.id) =>
+                {
+                    Some(n.id.clone())
+                }
+                _ => None,
+            }) else {
+                break;
+            };
+            let resolve_import = |i: &crate::ImportFrom, name: &str| {
+                let path = i.resolved_module_path(last_opts);
+                crate::resolve_imported_class_with_path(options, &path, name, 0)
+                    .map(|(c, s, defining)| {
+                        let mut o = options.clone();
+                        // The package context: an __init__ module IS its
+                        // own package (mirrors resolve_imported_class).
+                        let is_package = options.module_defs.keys().any(|k| {
+                            k.len() > defining.len() && k[..defining.len()] == defining[..]
+                        });
+                        o.module_path = if is_package {
+                            defining.clone()
+                        } else {
+                            defining[..defining.len().saturating_sub(1)].to_vec()
+                        };
+                        o.this_module_path = defining.clone();
+                        (c, s, o, Some(defining))
+                    },
+                )
+            };
+            // A base resolved LOCALLY within an already-imported module
+            // (ConnectionPool inside connectionpool.py, reached from
+            // SOCKS) stays in that module: it inherits the path.
+            let next = match last_syms.get(&base_name) {
+                Some(SymbolTableNode::ClassDef(c)) => Some((
+                    c.clone(),
+                    last_syms.clone(),
+                    last_opts.clone(),
+                    last_path.clone(),
+                )),
+                Some(SymbolTableNode::Alias(canonical)) => match last_syms.get(canonical) {
+                    Some(SymbolTableNode::ImportFrom(i)) => resolve_import(i, canonical),
+                    Some(SymbolTableNode::ClassDef(c)) if c.name != last.name => Some((
+                        c.clone(),
+                        last_syms.clone(),
+                        last_opts.clone(),
+                        last_path.clone(),
+                    )),
+                    _ => None,
+                },
+                Some(SymbolTableNode::ImportFrom(i)) => resolve_import(i, &base_name),
+                _ => None,
+            };
+            let Some(entry) = next else {
+                break;
+            };
+            if !seen.insert(entry.0.name.clone()) {
+                break;
+            }
+            chain.push(entry);
+        }
+        chain
+    }
+
     pub(crate) fn base_chain(&self, symbols: &SymbolTableScopes) -> Vec<ClassDef> {
         let mut chain = vec![self.clone()];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1426,6 +1515,255 @@ impl ClassDef {
             .filter(|(name, _)| !base_owned.contains(name))
             .collect())
     }
+}
+
+/// Qualify CROSS-MODULE type names in rendered tokens: an accessor type
+/// computed in an ancestor's defining module (`Option<Url>` — urllib3's
+/// connection.py) names classes bare, which the DERIVING module need not
+/// import. Each uppercase ident that positively resolves in the defining
+/// module — a class defined there, or one it imports from another crate
+/// module — is rewritten to its `crate::<module>::<Name>` path; anything
+/// unresolved (primitives, std/stdpython types, enum variants) passes
+/// through, as does any ident already behind a `::`.
+pub(crate) fn qualify_cross_module_types(
+    tokens: TokenStream,
+    definer_path: &[String],
+    a_syms: &SymbolTableScopes,
+    a_opts: &PythonOptions,
+    options: &PythonOptions,
+) -> TokenStream {
+    // Names BOUND inside the stream (let-bindings and everything in
+    // parameter groups): a lowercase module-level match must not shadow
+    // them — locals win in Python.
+    let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_bound_idents(&tokens, &mut bound);
+    qualify_tokens(tokens, definer_path, a_syms, a_opts, options, &bound)
+}
+
+fn collect_bound_idents(tokens: &TokenStream, out: &mut std::collections::HashSet<String>) {
+    use proc_macro2::TokenTree;
+    let mut prev_word: Option<String> = None;
+    let mut prev_prev: Option<String> = None;
+    for tt in tokens.clone() {
+        match &tt {
+            TokenTree::Group(g) => {
+                // Parameter groups and bodies alike: any ident inside a
+                // group that could bind (over-collection is safe — it
+                // only suppresses qualification).
+                collect_bound_idents(&g.stream(), out);
+                prev_prev = None;
+                prev_word = None;
+            }
+            TokenTree::Ident(i) => {
+                let w = i.to_string();
+                // `let x`, `let mut x`, `for x` bind; a bare `mut` (the
+                // `&mut T` position) does not.
+                if prev_word.as_deref() == Some("let")
+                    || prev_word.as_deref() == Some("for")
+                    || (prev_word.as_deref() == Some("mut")
+                        && prev_prev.as_deref() == Some("let"))
+                {
+                    out.insert(w.clone());
+                }
+                prev_prev = prev_word.take();
+                prev_word = Some(w);
+            }
+            _ => {
+                prev_prev = None;
+                prev_word = None;
+            }
+        }
+    }
+}
+
+fn qualify_tokens(
+    tokens: TokenStream,
+    definer_path: &[String],
+    a_syms: &SymbolTableScopes,
+    a_opts: &PythonOptions,
+    options: &PythonOptions,
+    bound: &std::collections::HashSet<String>,
+) -> TokenStream {
+    use proc_macro2::{TokenTree, Spacing};
+    let mut out: Vec<TokenTree> = Vec::new();
+    let mut after_path_sep = false;
+    let mut prev_colon_joint = false;
+    let mut prev_blocker = false;
+    for tt in tokens {
+        match tt {
+            TokenTree::Group(g) => {
+                let inner = qualify_tokens(
+                    g.stream(),
+                    definer_path,
+                    a_syms,
+                    a_opts,
+                    options,
+                    bound,
+                );
+                let mut ng = proc_macro2::Group::new(g.delimiter(), inner);
+                ng.set_span(g.span());
+                out.push(TokenTree::Group(ng));
+                after_path_sep = false;
+                prev_colon_joint = false;
+                prev_blocker = false;
+            }
+            TokenTree::Punct(p) => {
+                if p.as_char() == ':' {
+                    if prev_colon_joint {
+                        after_path_sep = true;
+                        prev_colon_joint = false;
+                    } else if p.spacing() == Spacing::Joint {
+                        prev_colon_joint = true;
+                    } else {
+                        after_path_sep = false;
+                        prev_colon_joint = false;
+                    }
+                } else {
+                    after_path_sep = false;
+                    prev_colon_joint = false;
+                }
+                // A field/method access position: the following ident is
+                // a MEMBER, never a module path root.
+                prev_blocker = p.as_char() == '.';
+                out.push(TokenTree::Punct(p));
+            }
+            TokenTree::Ident(id) => {
+                let name = id.to_string();
+                // Declaration positions (`fn close`, `let conn`, …) and
+                // member accesses never qualify.
+                let blocked = after_path_sep || prev_blocker;
+                // `mut` is NOT a blocker: `&mut Type` positions must still
+                // qualify (let-mut locals are handled by the bound set).
+                prev_blocker = matches!(
+                    name.as_str(),
+                    "fn" | "let" | "for" | "impl" | "trait" | "struct" | "mod" | "use"
+                        | "pub"
+                );
+                // Class names are CapWords, possibly private-prefixed
+                // (`_ResponseOptions` — urllib3's _base_connection).
+                let is_capword = name
+                    .trim_start_matches('_')
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase());
+                let target: Option<Vec<String>> = if blocked
+                    || matches!(
+                        name.as_str(),
+                        "Self" | "Some" | "None" | "Ok" | "Err" | "Default" | "self"
+                    ) {
+                    None
+                } else if is_capword {
+                    if crate::ast::tree::module::module_class_traits(a_opts, definer_path)
+                        .contains_key(&name)
+                        || crate::module_class_def(a_opts, definer_path, &name).is_some()
+                    {
+                        Some(definer_path.to_vec())
+                    } else {
+                        match a_syms.get(&name) {
+                            // Follow RE-EXPORT chains to the class's real
+                            // module (`from .connection import ProxyConfig`
+                            // where connection.py re-exports it from
+                            // _base_connection — urllib3).
+                            Some(SymbolTableNode::ImportFrom(i)) => {
+                                let p = i.resolved_module_path(a_opts);
+                                options
+                                    .module_defs
+                                    .contains_key(&p)
+                                    .then(|| {
+                                        crate::resolve_imported_class_with_path(
+                                            a_opts, &p, &name, 0,
+                                        )
+                                        .map(|(_, _, terminal)| terminal)
+                                    })
+                                    .flatten()
+                            }
+                            _ => None,
+                        }
+                    }
+                } else if !bound.contains(&name) {
+                    // A lowercase MODULE-LEVEL item of the defining module
+                    // (`_close_pool_connections(...)`, the `log` static —
+                    // urllib3's connectionpool, referenced from re-emitted
+                    // override bodies). Locals win in Python, so anything
+                    // bound in this stream stays untouched.
+                    match a_syms.get(&name) {
+                        Some(SymbolTableNode::FunctionDef(_))
+                        | Some(SymbolTableNode::Assign { .. }) => {
+                            Some(definer_path.to_vec())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match target {
+                    Some(path) => {
+                        let segs: Vec<_> =
+                            path.iter().map(|p| crate::safe_ident(p)).collect();
+                        let ident = crate::safe_ident(&name);
+                        out.extend(quote!(crate #(::#segs)* :: #ident));
+                    }
+                    None => out.push(TokenTree::Ident(id)),
+                }
+                after_path_sep = false;
+                prev_colon_joint = false;
+            }
+            other => {
+                out.push(other);
+                after_path_sep = false;
+                prev_colon_joint = false;
+                prev_blocker = false;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The comparable SIGNATURE of the first `fn` item in rendered tokens:
+/// (parameter tokens, return-type tokens), whitespace-normalized. Used to
+/// decide whether a cross-module override agrees with its trait's
+/// declaration — Python allows covariant overrides (`_new_conn() ->
+/// socks.socksocket` over `-> socket.socket`), Rust trait impls do not.
+pub(crate) fn fn_signature_key(tokens: &TokenStream) -> Option<(String, String)> {
+    use proc_macro2::{Delimiter, TokenTree};
+    let mut iter = tokens.clone().into_iter().peekable();
+    // Find `fn <name>`.
+    while let Some(tt) = iter.next() {
+        if matches!(&tt, TokenTree::Ident(i) if i == "fn") {
+            let _name = iter.next()?;
+            // Optional generics `<...>` then the parameter group.
+            let mut params: Option<String> = None;
+            let mut ret = String::new();
+            let mut in_ret = false;
+            for tt in iter.by_ref() {
+                match &tt {
+                    TokenTree::Group(g)
+                        if g.delimiter() == Delimiter::Parenthesis && params.is_none() =>
+                    {
+                        params = Some(g.stream().to_string());
+                    }
+                    TokenTree::Group(g)
+                        if g.delimiter() == Delimiter::Brace && params.is_some() =>
+                    {
+                        break;
+                    }
+                    _ if params.is_some() => {
+                        if in_ret {
+                            ret.push_str(&tt.to_string());
+                            ret.push(' ');
+                        } else if matches!(&tt, TokenTree::Punct(p) if p.as_char() == '>') {
+                            // The `->`'s closing half (the '-' preceded).
+                            in_ret = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Some((norm(&params?), norm(&ret)));
+        }
+    }
+    None
 }
 
 /// A `self.field = field` statement for a dataclass-synthesized __init__.
@@ -2640,10 +2978,19 @@ impl ClassDef {
         // that calls an inherited method (`def bar(self): self.foo()` where
         // foo lives on the base) resolves `foo` through the supertrait
         // bound; ancestor methods are not on the concrete `Self` otherwise.
-        let supertrait = base.as_ref().map(|b| {
-            let b_trait = format_ident!("{}Trait", b.name);
-            quote!(: #b_trait)
-        });
+        // The chain is needed here already: a base whose OWN module never
+        // emits its trait (RequestMethods — a plain struct subclassed only
+        // cross-module, urllib3) cannot be a supertrait; the embedding and
+        // its base() accessors still stand, and the chain (which follows
+        // only trait-bearing bases) is empty past self.
+        let chain = self.cross_module_chain(symbols, options);
+        let supertrait = base
+            .as_ref()
+            .filter(|b| chain.get(1).is_some_and(|(c, _, _, _)| c.name == b.name))
+            .map(|b| {
+                let b_trait = format_ident!("{}Trait", b.name);
+                quote!(: #b_trait)
+            });
         let own_trait = quote! {
             pub trait #trait_name #supertrait {
                 #own_accessor_decls
@@ -2661,19 +3008,19 @@ impl ClassDef {
         // level), plus this class's overrides of the methods that ancestor
         // defined, written against the concrete struct.
         //
-        // KNOWN LIMIT (next round): the chain is symbols-only, so a
-        // CROSS-MODULE derived class (`SOCKSConnection(HTTPConnection)`
-        // with the base in ..connection) does not implement its imported
-        // ancestors' traits — E0277 on the supertrait bound. Following
-        // the import here (resolve_base_with_options) makes the impls
-        // emit, but their field-accessor types then resolve and infer in
-        // the WRONG module scope (E0053 signature mismatches against the
-        // defining module's trait, E0425 on its private type names);
-        // the re-emission needs the defining module's inference context.
+        // The chain follows IMPORTED bases (`SOCKSConnection(
+        // HTTPConnection)` with the base in ..connection — urllib3's
+        // contrib modules), carrying each ancestor's DEFINING-module
+        // symbol table: its field-accessor types and method sets must
+        // resolve in the module that declared its trait, or the impl's
+        // signatures disagree with the trait's (E0053) and its local
+        // type names don't resolve here (E0425).
         let mut ancestor_impls = TokenStream::new();
-        let chain = self.base_chain(symbols);
-        for (depth, ancestor) in chain.iter().enumerate().skip(1).rev() {
-            let a_syms = symbols;
+        for (depth, (ancestor, a_syms_owned, a_opts_owned, a_path)) in
+            chain.iter().enumerate().skip(1).rev()
+        {
+            let a_syms = a_syms_owned;
+            let a_opts = a_opts_owned;
             let ancestor_trait = format_ident!("{}Trait", ancestor.name);
             let mut chain_tokens = TokenStream::new();
             for _ in 0..depth {
@@ -2684,11 +3031,13 @@ impl ClassDef {
             // its base owns declares no accessor for it, because the field
             // physically lives in the ancestor's base struct and the
             // ancestor's trait only declares accessors for fields it owns.
-            let a_fields = ancestor.own_fields(a_syms, options)?;
+            let a_fields = ancestor.own_fields(a_syms, a_opts)?;
             let mut accessor_impls = TokenStream::new();
-            // The ancestor's own base accessors, if it has a base: from the
-            // derived struct, its base struct is one level deeper.
-            if let Some(a_base) = ancestor.base_class(a_syms) {
+            // The ancestor's own base accessors, if it has a base (the
+            // NEXT chain entry — the chain already resolved imported
+            // bases): from the derived struct, its base struct is one
+            // level deeper.
+            if let Some((a_base, _, _, _)) = chain.get(depth + 1) {
                 let ab_ident = crate::safe_ident(&a_base.name);
                 let mut base_self = quote!(self);
                 base_self.extend(chain_tokens.clone());
@@ -2725,13 +3074,13 @@ impl ClassDef {
             // only strictly-lower definers need re-emission against this
             // class's struct — and `super()` inside such a re-emitted
             // override must target the DEFINER's base, not this class's base.
-            let a_base = ancestor.base_class(a_syms);
+            let a_base = chain.get(depth + 1);
             let ancestor_members: Vec<&FunctionDef> = ancestor
                 .methods()
                 .filter(|am| {
                     am.name != "__init__"
-                        && a_base.as_ref().map_or(true, |b| {
-                            b.method_on_mro(&am.name, a_syms).is_none()
+                        && a_base.map_or(true, |(b, b_syms, _, _)| {
+                            b.method_on_mro(&am.name, b_syms).is_none()
                         })
                 })
                 .collect();
@@ -2739,17 +3088,25 @@ impl ClassDef {
             for am in &ancestor_members {
                 let mut definer: Option<FunctionDef> = None;
                 let mut definer_name: Option<String> = None;
-                for c in chain.iter() {
+                let mut definer_syms: Option<&SymbolTableScopes> = None;
+                let mut definer_opts: Option<&crate::PythonOptions> = None;
+                for (c, c_syms, c_opts, _) in chain.iter() {
                     if c.name == ancestor.name {
                         break;
                     }
                     if let Some(m) = c.methods().find(|m| m.name == am.name) {
                         definer = Some(m.clone());
                         definer_name = Some(c.name.clone());
+                        // An override defined by an INTERMEDIATE imported
+                        // ancestor renders in ITS module's scope.
+                        definer_syms = Some(c_syms);
+                        definer_opts = Some(c_opts);
                         break;
                     }
                 }
-                if let (Some(m), Some(dname)) = (definer, definer_name) {
+                if let (Some(m), Some(dname), Some(dsyms), Some(dopts)) =
+                    (definer, definer_name, definer_syms, definer_opts)
+                {
                     let trait_ctx = CodeGenContext::Trait {
                         class: self.name.clone(),
                         generic: false,
@@ -2766,13 +3123,80 @@ impl ClassDef {
                     if self.is_property_setter(&am.name) {
                         emitted.name = self.emitted_method_name(&am);
                     }
-                    override_stream.extend(
-                        emitted.to_rust(trait_ctx, options.clone(), symbols.clone())?,
-                    );
+                    let rendered =
+                        emitted.to_rust(trait_ctx, dopts.clone(), dsyms.clone())?;
+                    // An override must agree with the trait's declared
+                    // signature: Python's covariant overrides
+                    // (`_new_conn() -> socks.socksocket` over the base's
+                    // `-> socket.socket` — urllib3's SOCKS classes; the
+                    // same-module `decompress`/property-setter shapes) have
+                    // no Rust trait lowering. A disagreeing override is
+                    // DROPPED — the base implementation is what runs (the
+                    // documented divergence) — never a mismatched impl
+                    // (E0053/E0050/E0049).
+                    {
+                        // Rendered as the ANCESTOR's own method in its own
+                        // scope — only the signature is compared.
+                        let ref_ctx = CodeGenContext::Trait {
+                            class: ancestor.name.clone(),
+                            generic: false,
+                            super_target: None,
+                            force_mut_self: options
+                                .trait_mut_self
+                                .get(&ancestor.name)
+                                .is_some_and(|s| s.contains(&am.name)),
+                        };
+                        let reference = (*am)
+                            .clone()
+                            .to_rust(ref_ctx, a_opts.clone(), a_syms.clone())?;
+                        if fn_signature_key(&rendered) != fn_signature_key(&reference) {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "`{}.{}` overrides `{}.{}` with a different \
+                                 signature; the override is dropped and the base \
+                                 implementation runs (covariant-override \
+                                 divergence)",
+                                self.name, am.name, ancestor.name, am.name
+                            ));
+                            continue;
+                        }
+                    }
+                    override_stream.extend(rendered);
                 }
             }
+            // A CROSS-MODULE ancestor's accessor types and re-emitted
+            // bodies name classes of its defining module bare: qualify
+            // them to their crate paths (this module need not import
+            // them).
+            let (accessor_impls, override_stream) = match a_path {
+                Some(path) => (
+                    qualify_cross_module_types(
+                        accessor_impls,
+                        path,
+                        a_syms,
+                        a_opts,
+                        options,
+                    ),
+                    qualify_cross_module_types(
+                        override_stream,
+                        path,
+                        a_syms,
+                        a_opts,
+                        options,
+                    ),
+                ),
+                None => (accessor_impls, override_stream),
+            };
+            // A CROSS-MODULE ancestor's trait is named by its crate path
+            // (this module need not import it).
+            let trait_path = match a_path {
+                Some(path) => {
+                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    quote!(crate #(::#segs)* :: #ancestor_trait)
+                }
+                None => quote!(#ancestor_trait),
+            };
             ancestor_impls.extend(quote! {
-                impl #ancestor_trait for #class_name {
+                impl #trait_path for #class_name {
                     #accessor_impls
                     #override_stream
                 }
