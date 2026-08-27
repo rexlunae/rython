@@ -1011,3 +1011,117 @@ mod divmod_tests {
         assert!(z[0] == 0.0 && z[0].is_sign_negative());
     }
 }
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+
+    fn bools(a: &NdArray) -> Vec<bool> {
+        match &a.data {
+            Data::Bool(v) => v.clone(),
+            _ => panic!("expected bool data"),
+        }
+    }
+
+    /// Verified against python3 + numpy 2.x.
+    #[test]
+    fn predicates_match_numpy() {
+        let f = array(vec![1.0f64, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 0.0, -0.0, -2.5]);
+        assert_eq!(bools(&isfinite(f.clone())), vec![true, false, false, false, true, true, true]);
+        assert_eq!(bools(&isinf(f.clone())), vec![false, true, true, false, false, false, false]);
+        assert_eq!(bools(&isnan(f.clone())), vec![false, false, false, true, false, false, false]);
+        // NaN is truthy, so logical_not(NaN) is False; only exact 0.0 is True
+        assert_eq!(bools(&logical_not(f)), vec![false, false, false, false, true, true, false]);
+        // ints are always finite, never inf/nan; logical_not(x) = (x == 0)
+        let i = array(vec![1i64, -5, 0]);
+        assert_eq!(bools(&isfinite(i.clone())), vec![true, true, true]);
+        assert_eq!(bools(&isinf(i.clone())), vec![false, false, false]);
+        assert_eq!(bools(&isnan(i.clone())), vec![false, false, false]);
+        assert_eq!(bools(&logical_not(i)), vec![false, false, true]);
+        // bool arrays: finite, never inf/nan; logical_not flips
+        let b = array(vec![true, false]);
+        assert_eq!(bools(&isfinite(b.clone())), vec![true, true]);
+        assert_eq!(bools(&logical_not(b)), vec![false, true]);
+        // float32 path
+        let f32a = array(vec![1.0f64, f64::INFINITY]).astype(Dtype::Float32);
+        assert_eq!(bools(&isfinite(f32a)), vec![true, false]);
+    }
+}
+
+#[cfg(test)]
+mod reduce_tests {
+    use super::*;
+
+    /// Verified against python3 + numpy 2.x (numpy's pairwise summation).
+    #[test]
+    fn sum_mean_std_var_match_numpy() {
+        // np.linspace(0, 1, 1_000_000) aggregates
+        let l = linspace(0.0, 1.0, 1_000_000);
+        assert_eq!(sum(l.clone()), 499999.99999999994);
+        assert_eq!(mean(l.clone()), 0.49999999999999994);
+        assert_eq!(std(l.clone(), 0.0), 0.28867542327009177);
+        assert_eq!(var(l, 0.0), 0.08333350000016665);
+        // boundary sizes exercise the pairwise blocks (<8, <=128, recursive)
+        let x = |n: i64| multiply(subtract(divide(arange_f(n as f64), 7.0), 3.0), 1.0000001);
+        assert_eq!(sum(x(8)), -20.000002000000002);
+        assert_eq!(sum(x(128)), 777.1429348571429);
+        assert_eq!(sum(x(129)), 792.4286506714286);
+        assert_eq!(sum(x(256)), 3894.857532342857);
+        assert_eq!(sum(x(1000)), 68357.14969285714);
+        // special values
+        assert_eq!(sum(array(vec![-0.0f64, -0.0])), 0.0);
+        assert_eq!(sum(array(vec![1e308f64, 1e308, -1e308, -1e308])), f64::INFINITY);
+        assert!(sum(array(vec![f64::NAN, 1.0])).is_nan());
+        assert_eq!(sum(array(vec![5e-324f64, 5e-324, 5e-324])), 1.5e-323);
+        // ddof edges: numpy returns inf/nan (with a warning), not an error
+        assert_eq!(std(array(vec![1.0f64, 2.0, 3.0, 4.0]), 4.0), f64::INFINITY);
+        assert_eq!(std(array(vec![1.0f64, 2.0, 3.0, 4.0]), 3.0), 2.23606797749979);
+        assert!(mean(array(Vec::<f64>::new())).is_nan());
+        assert!(var(array(Vec::<f64>::new()), 0.0).is_nan());
+        assert_eq!(sum(array(Vec::<f64>::new())), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod weak_promotion_tests {
+    use super::*;
+
+    /// NEP 50 weak Python-scalar promotion, verified against numpy 2.x:
+    /// Python scalars no longer widen f32/i32 arrays.
+    #[test]
+    fn python_scalars_are_weak() {
+        let f32a = array(vec![1.0f64, 2.0]).astype(Dtype::Float32);
+        let i32a = array(vec![1i64, 2]).astype(Dtype::Int32);
+        let i64a = array(vec![1i64, 2]);
+        let b = array(vec![true, false]);
+        // Python float + f32 array stays f32
+        assert!(matches!(add(f32a.clone(), 0.0f64).dtype, Dtype::Float32));
+        assert!(matches!(add(0.0f64, f32a.clone()).dtype, Dtype::Float32));
+        assert!(matches!(divide(f32a.clone(), 0.0f64).dtype, Dtype::Float32));
+        // Python int + i32 array stays i32; + f32 stays f32
+        assert!(matches!(add(i32a.clone(), 1i64).dtype, Dtype::Int32));
+        assert!(matches!(add(f32a.clone(), 1i64).dtype, Dtype::Float32));
+        // Python float + int array -> f64
+        assert!(matches!(add(i32a.clone(), 0.0f64).dtype, Dtype::Float64));
+        assert!(matches!(add(i64a.clone(), 0.0f64).dtype, Dtype::Float64));
+        // bool arrays: + Python int -> int64, + Python bool stays bool
+        assert!(matches!(add(b.clone(), 1i64).dtype, Dtype::Int64));
+        assert!(matches!(add(b.clone(), true).dtype, Dtype::Bool));
+        assert!(matches!(add(f32a.clone(), true).dtype, Dtype::Float32));
+        // int64 + Python int stays int64; comparison outputs are bool anyway
+        assert!(matches!(add(i64a, 1i64).dtype, Dtype::Int64));
+        assert!(matches!(equal(f32a.clone(), 1i64).dtype, Dtype::Bool));
+        // a large-but-fitting Python int scalar stays int32
+        let r = add(i32a, 1i64 << 30);
+        assert!(matches!(r.dtype, Dtype::Int32));
+        // (int32 arithmetic overflow wraps in release, matching numpy; in
+        // debug builds it panics — documented ledger §12.2, out of contract)
+    }
+
+    #[test]
+    #[should_panic(expected = "OverflowError: Python integer 1099511627776 out of bounds for int32")]
+    fn int_scalar_out_of_int32_bounds_raises() {
+        let i32a = array(vec![1i64, 2]).astype(Dtype::Int32);
+        add(i32a, 1i64 << 40);
+    }
+}

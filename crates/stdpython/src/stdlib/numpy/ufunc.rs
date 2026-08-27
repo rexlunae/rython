@@ -110,6 +110,82 @@ fn scalar_arr_f64(v: f64) -> NdArray {
 fn scalar_arr_bool(v: bool) -> NdArray {
     NdArray::new(vec![], Dtype::Bool, Data::Bool(vec![v]))
 }
+fn scalar_arr_i32(v: i32) -> NdArray {
+    NdArray::new(vec![], Dtype::Int32, Data::I32(vec![v]))
+}
+fn scalar_arr_f32(v: f32) -> NdArray {
+    NdArray::new(vec![], Dtype::Float32, Data::F32(vec![v]))
+}
+
+/// NEP 50 weak promotion of a Python scalar against an array dtype: a
+/// Python float never widens a float32 array (f32 + 0.0 stays f32) and a
+/// Python int never widens an int32 array (i32 + 1 stays i32), while a
+/// Python float does widen integer arrays to float64 (verified against
+/// numpy 2; `bool_arr + 1` is int64, `bool_arr + True` stays bool).
+fn weak_promote(d: Dtype, scalar: &BinaryOperand) -> Dtype {
+    use Dtype::*;
+    match scalar {
+        BinaryOperand::F64(_) => match d {
+            Bool | Int32 | Int64 => Float64,
+            Float32 => Float32,
+            Float64 => Float64,
+        },
+        BinaryOperand::I64(_) => match d {
+            Bool => Int64,
+            Int32 => Int32,
+            Int64 => Int64,
+            Float32 => Float32,
+            Float64 => Float64,
+        },
+        BinaryOperand::Bool(_) => match d {
+            Bool => Bool,
+            Int32 => Int32,
+            Int64 => Int64,
+            Float32 => Float32,
+            Float64 => Float64,
+        },
+        BinaryOperand::Array(_) => unreachable!("weak_promote needs a scalar"),
+    }
+}
+
+/// Build a 0-d array holding `v` cast to `dtype` — the weak-promoted target.
+/// A Python int that does not fit an int32 target raises numpy's
+/// `OverflowError` ("Python integer ... out of bounds for int32").
+fn scalar_to_dtype(v: BinaryOperand, dtype: Dtype) -> NdArray {
+    match v {
+        BinaryOperand::I64(x) => match dtype {
+            Dtype::Int32 => match i32::try_from(x) {
+                Ok(v) => scalar_arr_i32(v),
+                Err(_) => panic!(
+                    "{}",
+                    crate::PyException::new(
+                        "OverflowError",
+                        format!("Python integer {x} out of bounds for int32")
+                    )
+                ),
+            },
+            Dtype::Int64 => scalar_arr_i64(x),
+            Dtype::Float32 => scalar_arr_f32(x as f32),
+            Dtype::Float64 => scalar_arr_f64(x as f64),
+            Dtype::Bool => unreachable!("weak int never promotes to bool"),
+        },
+        BinaryOperand::F64(x) => match dtype {
+            Dtype::Float32 => scalar_arr_f32(x as f32),
+            Dtype::Float64 => scalar_arr_f64(x),
+            Dtype::Bool | Dtype::Int32 | Dtype::Int64 => {
+                unreachable!("weak float never promotes to int/bool")
+            }
+        },
+        BinaryOperand::Bool(x) => match dtype {
+            Dtype::Bool => scalar_arr_bool(x),
+            Dtype::Int32 => scalar_arr_i32(x as i32),
+            Dtype::Int64 => scalar_arr_i64(x as i64),
+            Dtype::Float32 => scalar_arr_f32(if x { 1.0 } else { 0.0 }),
+            Dtype::Float64 => scalar_arr_f64(if x { 1.0 } else { 0.0 }),
+        },
+        BinaryOperand::Array(_) => unreachable!("scalar_to_dtype needs a scalar"),
+    }
+}
 
 /// The two operands of a binary op, normalized to a common broadcast shape.
 /// Accepts arrays and the three scalar kinds in any position.
@@ -160,27 +236,33 @@ pub(crate) fn binary<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
         }
         (BinaryOperand::Array(a), BinaryOperand::I64(v)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (a, scalar_arr_i64(v), shape)
+            let d = weak_promote(a.dtype, &BinaryOperand::I64(v));
+            (a, scalar_to_dtype(BinaryOperand::I64(v), d), shape)
         }
         (BinaryOperand::I64(v), BinaryOperand::Array(a)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (scalar_arr_i64(v), a, shape)
+            let d = weak_promote(a.dtype, &BinaryOperand::I64(v));
+            (scalar_to_dtype(BinaryOperand::I64(v), d), a, shape)
         }
         (BinaryOperand::Array(a), BinaryOperand::F64(v)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (a, scalar_arr_f64(v), shape)
+            let d = weak_promote(a.dtype, &BinaryOperand::F64(v));
+            (a, scalar_to_dtype(BinaryOperand::F64(v), d), shape)
         }
         (BinaryOperand::F64(v), BinaryOperand::Array(a)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (scalar_arr_f64(v), a, shape)
+            let d = weak_promote(a.dtype, &BinaryOperand::F64(v));
+            (scalar_to_dtype(BinaryOperand::F64(v), d), a, shape)
         }
         (BinaryOperand::Array(a), BinaryOperand::Bool(v)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (a, scalar_arr_bool(v), shape)
+            let d = weak_promote(a.dtype, &BinaryOperand::Bool(v));
+            (a, scalar_to_dtype(BinaryOperand::Bool(v), d), shape)
         }
         (BinaryOperand::Bool(v), BinaryOperand::Array(a)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (scalar_arr_bool(v), a, shape)
+            let d = weak_promote(a.dtype, &BinaryOperand::Bool(v));
+            (scalar_to_dtype(BinaryOperand::Bool(v), d), a, shape)
         }
         (BinaryOperand::I64(x), BinaryOperand::I64(y)) => {
             let a = scalar_arr_i64(x);
