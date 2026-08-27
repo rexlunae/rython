@@ -4353,7 +4353,7 @@ def foo():
 /// an `if __name__ == "__main__":` guard take part in the same hierarchy
 /// and trait-signature precomputes as top-level classes — their class
 /// statements lower through the same machinery.
-fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>) {
+pub(crate) fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>) {
     for s in stmts {
         match &s.statement {
             crate::StatementType::ClassDef(c) => out.push(c.clone()),
@@ -4441,11 +4441,23 @@ pub fn resolve_imported_class(
     name: &str,
     depth: usize,
 ) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    resolve_imported_class_with_path(options, path, name, depth).map(|(c, s, _)| (c, s))
+}
+
+/// [`resolve_imported_class`], also returning the DEFINING module's path
+/// (the module the chain terminated in) — the scope its relative imports
+/// and annotations resolve in.
+pub fn resolve_imported_class_with_path(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+    depth: usize,
+) -> Option<(crate::ClassDef, SymbolTableScopes, Vec<String>)> {
     if depth > 16 {
         return None;
     }
-    if let Some(c) = module_class_def(options, path, name) {
-        return Some(c);
+    if let Some((c, s)) = module_class_def(options, path, name) {
+        return Some((c, s, path.to_vec()));
     }
     let module = options.module_defs.get(path)?;
     let module: &crate::Module = module;
@@ -4480,14 +4492,14 @@ pub fn resolve_imported_class(
                 path[..path.len().saturating_sub(1)].to_vec()
             };
             let path2 = i.resolved_module_path(&ctx);
-            resolve_imported_class(options, &path2, &defining, depth + 1)
+            resolve_imported_class_with_path(options, &path2, &defining, depth + 1)
         }
         // A RE-EXPORT alias (`from ._base_connection import ProxyConfig
         // as ProxyConfig` in connection.py — urllib3): the canonical name
         // resolves in the same module; a self-alias would recurse forever,
         // so stop there.
         Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
-            resolve_imported_class(options, path, canonical, depth + 1)
+            resolve_imported_class_with_path(options, path, canonical, depth + 1)
         }
         _ => None,
     }
@@ -4546,7 +4558,15 @@ pub fn module_defs_key<'a>(
 ) -> Option<&'a [String]> {
     if options.module_defs.contains_key(path) {
         Some(path)
-    } else if path.len() > 1 && options.module_defs.contains_key(&path[1..]) {
+    } else if path.len() > 1
+        // The stripped form covers ONLY the package's own root-qualified
+        // name (`pip._internal...` inside the pip conversion): stripping
+        // an arbitrary external root would alias foreign packages onto
+        // same-named crate modules (`import h2.connection` resolving to
+        // urllib3's connection.py — issue #137 round 18's merge).
+        && path[0] == options.python_namespace
+        && options.module_defs.contains_key(&path[1..])
+    {
         Some(&path[1..])
     } else {
         None

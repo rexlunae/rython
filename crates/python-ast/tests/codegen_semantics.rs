@@ -316,6 +316,7 @@ fn imported_function_keyword_args_resolve_cross_module() {
     );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
         ..Default::default()
     };
     let caller = parse(
@@ -9741,6 +9742,94 @@ fn bare_yield_contextmanager_pushes_boxed_none() {
     );
 }
 
+// ---- issue #137 round 18: cross-module ancestor-trait impls ----
+
+/// Two-module fixture: module `animals` defines a hierarchy; the module
+/// under test subclasses the imported Dog.
+fn cross_module_subclass_options() -> PythonOptions {
+    let a = parse(
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return self.name\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def __init__(self, name: str):\n",
+            "        self.tricks = 0\n",
+            "\n",
+            "    def grow(self) -> None:\n",
+            "        pass\n",
+        ),
+        "animals.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["animals".to_string()], std::rc::Rc::new(a));
+    PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cross_module_subclass_implements_imported_ancestor_traits() {
+    // `class Puppy(Dog)` with Dog imported from another module (urllib3's
+    // SOCKSConnection(HTTPConnection) shape): Puppy must implement the
+    // imported ancestors' traits — named by their crate paths (this
+    // module need not import them) — with accessor types resolved in the
+    // DEFINING module's scope.
+    let src = "from animals import Dog\n\nclass Puppy(Dog):\n    def fetch(self) -> int:\n        return 1\n";
+    let out = compile_with_options(src, "puppy.py", cross_module_subclass_options())
+        .expect("converts");
+    assert!(
+        out.contains("impl crate :: animals :: DogTrait for Puppy"),
+        "the imported base's trait must be implemented by crate path: {}",
+        out
+    );
+    assert!(
+        out.contains("impl crate :: animals :: AnimalTrait for Puppy"),
+        "the whole imported chain implements, root included: {}",
+        out
+    );
+}
+
+#[test]
+fn covariant_cross_module_override_is_dropped_with_warning() {
+    // An override whose signature disagrees with the imported base's
+    // trait declaration (`grow() -> int` over `-> None` — the SOCKS
+    // `_new_conn` shape): dropped with the divergence warning, never a
+    // mismatched impl (E0053).
+    let src = "from animals import Dog\n\nclass Puppy(Dog):\n    def grow(self) -> int:\n        return 1\n";
+    let module = parse(src, "puppy2.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = cross_module_subclass_options();
+    let warnings = options.definition_warnings.clone();
+    let out = module
+        .to_rust(
+            CodeGenContext::Module("puppy2".to_string()),
+            options,
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        !out.contains("fn grow (& self) -> Result < i64"),
+        "the disagreeing override must not land in the ancestor impl: {}",
+        out
+    );
+    assert!(
+        warnings
+            .borrow()
+            .iter()
+            .any(|w| w.contains("covariant-override divergence")),
+        "the drop must be loud: {:?}",
+        warnings.borrow()
+    );
+}
+
 /// Absolute imports of same-crate modules must resolve for src-layout
 /// sdists, whose `module_defs` keys are RELATIVE to the package root
 /// (pip, boto3): `from pkg.reqmod import with_cleanup` resolves to
@@ -9762,6 +9851,9 @@ fn absolute_import_of_src_layout_sibling_decorator_resolves() {
     );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
+        // The stripped-prefix lookup applies only to the package's OWN
+        // root-qualified name.
+        python_namespace: "pkg".to_string(),
         ..Default::default()
     };
     let usemod = parse(
@@ -9808,6 +9900,7 @@ fn absolute_import_of_src_layout_sibling_emits_relative_use() {
     );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
         ..Default::default()
     };
     let caller = parse(
@@ -9838,5 +9931,97 @@ fn absolute_import_of_src_layout_sibling_emits_relative_use() {
         out.contains("make ("),
         "the cross-module call must lower: {}",
         out
+    );
+}
+
+/// A plain `import pkg.connection` inside the pkg conversion binds only
+/// the ROOT name in Python — never the leaf. Emitting `use
+/// crate::connection;` would bind a name Python doesn't and collide with
+/// a sibling's own `connection` submodule (urllib3's
+/// `contrib/emscripten`, E0255); `use crate::pkg::connection;` names a
+/// module the crate doesn't contain (E0432). Unaliased emits nothing;
+/// aliased binds the crate-relative path.
+#[test]
+fn plain_import_of_root_qualified_sibling_binds_root_only() {
+    let connection = parse("A = 1\n", "connection.py").unwrap();
+    let other = parse("B = 2\n", "other.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["connection".to_string()], std::rc::Rc::new(connection));
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let user = parse(
+        "import pkg.connection\nimport pkg.connection as conn\n",
+        "user.py",
+    )
+    .unwrap();
+    let symbols = user.clone().find_symbols(SymbolTableScopes::new());
+    let out = user
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        !out.contains("crate :: pkg"),
+        "the crate has no `pkg` module: {}",
+        out
+    );
+    assert!(
+        !out.contains("use crate :: connection ;"),
+        "the unaliased form must not bind the leaf: {}",
+        out
+    );
+    assert!(
+        out.contains("use crate :: connection as conn"),
+        "the aliased form binds the crate-relative path: {}",
+        out
+    );
+}
+
+/// The stripped-prefix lookup covers ONLY the package's own
+/// root-qualified name: `import h2.connection` must not resolve to a
+/// same-named crate module (urllib3's connection.py) — it is an external
+/// module, dropped with the divergence warning.
+#[test]
+fn plain_import_of_external_root_is_not_aliased_onto_crate_modules() {
+    let connection = parse("A = 1\n", "connection.py").unwrap();
+    let other = parse("B = 2\n", "other.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["connection".to_string()], std::rc::Rc::new(connection));
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let warnings = options.definition_warnings.clone();
+    let user = parse("import h2.connection\n", "user.py").unwrap();
+    let symbols = user.clone().find_symbols(SymbolTableScopes::new());
+    let out = user
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        !out.contains("use crate"),
+        "an external module must not resolve into the crate: {}",
+        out
+    );
+    assert!(
+        warnings
+            .borrow()
+            .iter()
+            .any(|w| w.contains("external-module divergence")),
+        "the drop must be loud: {:?}",
+        warnings.borrow()
     );
 }

@@ -563,6 +563,17 @@ impl CodeGen for Import {
                     // uses of its names become loud errors or boxed drops).
                     let path: Vec<String> =
                         alias.name.split('.').map(|s| s.to_string()).collect();
+                    // The crate path may differ from the dotted Python name:
+                    // a root-qualified absolute self-import (`import
+                    // urllib3.connection` inside the urllib3 conversion)
+                    // resolves under the STRIPPED key, and rendering the
+                    // full path would emit `use crate::urllib3::connection;`
+                    // — a module the crate doesn't contain.
+                    let crate_path: Vec<String> =
+                        match crate::module_defs_key(&options, &path) {
+                            Some(key) => key.to_vec(),
+                            None => path.clone(),
+                        };
                     let is_sibling = crate::module_defs_contains(&options, &path)
                         || options.python_modules.contains(
                             &path.first().cloned().unwrap_or_default(),
@@ -582,17 +593,22 @@ impl CodeGen for Import {
                         ));
                         quote! {}
                     } else {
-                        let names = if alias.name.contains('.') {
-                            let parts: Vec<&str> = alias.name.split('.').collect();
-                            let idents: Vec<_> =
-                                parts.iter().map(|part| crate::safe_ident(part)).collect();
-                            quote!(#(#idents)::*)
-                        } else {
-                            let single_name = crate::safe_ident(&alias.name);
-                            quote!(#single_name)
-                        };
+                        let idents: Vec<_> = crate_path
+                            .iter()
+                            .map(|part| crate::safe_ident(part))
+                            .collect();
+                        let names = quote!(#(#idents)::*);
 
                         match &alias.asname {
+                            // An unaliased dotted import binds only the ROOT
+                            // name in Python; when that root is the package
+                            // itself (the stripped-key resolution), the
+                            // "bound module" is the crate — a leaf `use`
+                            // would bind a name Python doesn't (`import
+                            // urllib3.connection` clashing with emscripten's
+                            // own `connection` submodule), so nothing is
+                            // emitted.
+                            None if crate_path.len() < path.len() => quote! {},
                             None => {
                                 quote! {use crate::#names;}
                             }
