@@ -18,6 +18,9 @@ use alloc::vec::Vec;
 
 use crate::{PyException, PyFile};
 
+/// io.DEFAULT_BUFFER_SIZE (CPython: 8192).
+pub const DEFAULT_BUFFER_SIZE: i64 = 8192;
+
 /// io.StringIO(): an empty in-memory text buffer.
 #[allow(non_snake_case)]
 pub fn StringIO() -> PyFile {

@@ -26,8 +26,11 @@ pub(crate) fn module_access_token(value_str: &str) -> bool {
         // spelling) and the comment-only xml placeholder module.
         "np" | "xml" => true,
         // Nested runtime module paths (os.path.join, urllib.request.
-        // urlopen, np.linalg.inv).
-        "os::path" | "urllib::request" | "numpy::linalg" | "np::linalg" => true,
+        // urlopen, np.linalg.inv). TLSVersion is ssl's nested constants
+        // module — both the dotted (`ssl.TLSVersion.TLSv1_2`) and the
+        // from-import (`TLSVersion.TLSv1_2`) spellings are paths.
+        "os::path" | "urllib::request" | "numpy::linalg" | "np::linalg" | "ssl::TLSVersion"
+        | "TLSVersion" => true,
         name => crate::StdModule::from_name(name).is_some_and(|m| m.bare_token_access()),
     }
 }
@@ -794,7 +797,20 @@ pub(crate) fn is_module_path_chain(
                 _ => false,
             }
         }
-        ExprType::Attribute(a) => is_module_path_chain(&a.value, symbols, options),
+        ExprType::Attribute(a) => {
+            // A SCREAMING_SNAKE terminal segment is a module CONSTANT,
+            // not a submodule (`ssl.OPENSSL_VERSION.startswith(...)` —
+            // urllib3's __init__): the chain ends at the constant, and a
+            // further attribute is a method on its VALUE, not a path
+            // segment.
+            if !a.attr.is_empty()
+                && a.attr.chars().any(|c| c.is_ascii_uppercase())
+                && !a.attr.chars().any(|c| c.is_ascii_lowercase())
+            {
+                return false;
+            }
+            is_module_path_chain(&a.value, symbols, options)
+        }
         _ => false,
     }
 }

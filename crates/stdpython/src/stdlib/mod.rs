@@ -132,6 +132,12 @@ pub mod threading;
 #[cfg(feature = "std")]
 pub mod socket;
 
+/// Python ssl module - client-side TLS wrapped over the rustls crate.
+/// Feature-gated per the platform-surface convention (`ssl-rustls`),
+/// but ON by default: TLS is load-bearing for the top converted packages.
+#[cfg(feature = "ssl-rustls")]
+pub mod ssl;
+
 /// Python urllib package (urllib.request) - HTTP(S) client wrapped over
 /// the ureq crate. Feature-gated per the platform-surface convention:
 /// only crates that import urllib.request enable `http-ureq` (rypip does

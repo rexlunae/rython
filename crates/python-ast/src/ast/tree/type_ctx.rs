@@ -730,6 +730,8 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             "bool" => Some(TypeInfo::Bool),
             "str" => Some(TypeInfo::String),
             "bytes" => Some(TypeInfo::Bytes),
+            // ssl.TLSVersion is an IntEnum: plain ints in the runtime.
+            "TLSVersion" => Some(TypeInfo::Int),
             // `Any` (typing.Any) and `object`: a value of unknown type —
             // the boxed heterogeneous value.
             "Any" | "object" => Some(TypeInfo::PyValue),

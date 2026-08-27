@@ -369,6 +369,27 @@ Consequences, all enforced loudly:
   spelling.
 - Imports of user modules within the converted package resolve to the
   generated Rust modules.
+- **Import guards are decided statically.** A module-level
+  `try: import X … except ImportError:` (bare, or a tuple of
+  ImportError/AttributeError) folds at conversion time, because
+  rython's imports either always succeed or always fail. When every
+  import in the try body is *unresolvable* (external to the crate,
+  the runtime, and the vendored python-modules), the handler branch
+  IS the module's body — its `brotli = None` / `HAS_ZSTD = False`
+  fallbacks then make `if brotli is not None:`-style gates fold too
+  (statically-decided names). When every import *resolves*, the try
+  body splices in place and the dead handler never emits; a name
+  bound by a resolvable `import ssl` is statically truthy and never
+  None, so `if not ssl:` fallback classes fold away. Both decisions
+  need the whole crate in view (a single-module conversion assumes
+  unknown absolute imports are siblings). Stdlib exception aliases
+  in such bodies (`BaseSSLError = ssl.SSLError`) register as
+  aliases: `raise`/`except` sites canonicalize — including through a
+  sibling's `from .connection import BaseSSLError` — and the store
+  itself emits nothing (classes-as-values divergence). A
+  `getattr(<stdlib module>, "NAME", default)` with a literal name is
+  the same static decision: the runtime item when it exists
+  (promoted to a `pub use` alias at module level), else the default.
 
 ---
 
@@ -743,6 +764,13 @@ feature wraps the ureq crate (with rustls, so `https://` works) and
 `import urllib.request` in a converted package puts
 `features = ["http-ureq"]` on the generated stdpython dependency.
 
+The second is `ssl`: stdpython's `ssl-rustls` feature wraps the
+rustls crate (client-side TLS). Unlike the other surfaces it is ON
+by default — TLS is load-bearing for the top converted packages
+(urllib3, requests) — so generated crates get it through the default
+features; `--no-default-features` (plus the features kept) turns it
+off, and the alloc/no_std tiers never see it.
+
 Known stdlib divergences from CPython that are verified but not yet
 fixed are tracked in issue #82; they are defects, not spec.
 
@@ -803,6 +831,31 @@ the real CPython hierarchy (`ConnectionRefusedError` IS-A
 `TimeoutError('timed out')`) with CPython's `[Errno N] text` message
 shape. Not modeled (loud rustc error): `setsockopt`, `makefile`, the
 address families beyond AF_INET/AF_INET6.
+
+**`ssl`** (std tier, `ssl-rustls` feature — ON by default; §10.2.1):
+client-side TLS over rustls (ring provider, webpki/Mozilla roots).
+`SSLContext(protocol)` / `create_default_context()` with CPython's
+PROTOCOL_TLS_CLIENT defaults (CERT_REQUIRED + check_hostname);
+`load_default_certs`, `load_verify_locations(cafile)` (PEM, loud on
+an empty bundle), `set_alpn_protocols`, `wrap_socket(sock,
+server_hostname=...)` → `SSLSocket` with `send`/`sendall`/`recv`
+(ragged EOF reads as `b""`), `version()`,
+`selected_alpn_protocol()`, `close()` (close_notify). The module
+constants match python3 (CERT_*/PROTOCOL_*/OP_NO_*/VERIFY_X509_*/
+SSL_ERROR_*, `TLSVersion` as a nested constants module), and the ssl
+exception family (`SSLError` IS-A `OSError`; `SSLCertVerificationError`
+also IS-A `ValueError`, `CertificateError` its alias) is wired into
+the runtime hierarchy. Divergences, all deliberate: `OPENSSL_VERSION`
+reports `"rustls …"` (never an "OpenSSL" string, so version-sniffing
+code takes its generic path) with `OPENSSL_VERSION_NUMBER = 0` and a
+3-tuple all-zero `OPENSSL_VERSION_INFO` (§12.3); `set_ciphers` and
+`keylog_filename` are stored-only no-ops (rustls's policy governs);
+the OP_*/VERIFY_* bits are stored and readable, but rustls's own
+policy decides the handshake, with `minimum_version`/
+`maximum_version` and the OP_NO_TLSv1_2/1_3 bits clamping the
+negotiated range; `CERT_NONE` installs a no-verification path
+exactly like CPython's unverified context. Not modeled (loud rustc
+error): `MemoryBIO`/`wrap_bio` (TLS-in-TLS), server-side sockets.
 
 **`urllib.request`** (std tier, `http-ureq` feature; §10.2.1):
 `urlopen(url)` for http/https with redirects, returning a response

@@ -95,12 +95,24 @@ impl CodeGen for Module {
     }
 
     fn to_rust(
-        self,
+        mut self,
         ctx: Self::Context,
         mut options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
+
+        // Issue #137: a module-level `try/except ImportError` guard whose
+        // try body's imports are ALL statically unresolvable (external to
+        // the crate, the runtime, and the vendored deps) FAILS at runtime
+        // exactly as rython drops it — the handler branch is the module's
+        // real body (`try: import brotli except ImportError: brotli =
+        // None` — urllib3's response.py; `except (ImportError,
+        // AttributeError): ssl = None; class BaseSSLError(...)` —
+        // connection.py). Fold before every body analysis below so store
+        // counts, mutable-global detection, and emission all see the
+        // branch that actually runs.
+        self.raw.body = fold_static_import_trys(&self.raw.body, &options);
 
         // Capture the module's source filename before fields of `self` are
         // moved, so statement errors can point at the user's Python file.
@@ -214,6 +226,64 @@ impl CodeGen for Module {
             &symbols,
             &options,
         );
+
+        // Statically-decided module names (issue #137): a single-store
+        // None or False constant — typically the folded handler of a
+        // failed import guard above — makes `if brotli is not None:` /
+        // `if HAS_ZSTD:` branches fold at conversion time, exactly the
+        // branches CPython would never enter. Names written through
+        // `global` are excluded (they are mutable statics, not
+        // constants).
+        {
+            let mut none_names = std::collections::HashSet::new();
+            let mut false_names = std::collections::HashSet::new();
+            for stmt in &self.raw.body {
+                if let crate::StatementType::Assign(a) = &stmt.statement
+                    && a.targets.len() == 1
+                    && let ExprType::Name(n) = &a.targets[0]
+                    && module_assign_counts.get(&n.id).copied().unwrap_or(0) == 1
+                    && !global_mutables.contains_key(&n.id)
+                {
+                    if crate::is_none_expr(&a.value) {
+                        none_names.insert(n.id.clone());
+                    } else if matches!(
+                        &a.value,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value())
+                    ) {
+                        false_names.insert(n.id.clone());
+                    }
+                }
+            }
+            // A RESOLVABLE top-level `import X` never reassigned is a
+            // statically-truthy module name: `if not ssl:` fallbacks
+            // (urllib3's connection.py DummyConnection) fold away, the
+            // branches CPython never enters when the import succeeds.
+            let mut module_names = std::collections::HashSet::new();
+            for stmt in &self.raw.body {
+                if let crate::StatementType::Import(imp) = &stmt.statement {
+                    for al in &imp.names {
+                        let root = al.name.split('.').next().unwrap_or("");
+                        let bound = al.asname.clone().unwrap_or_else(|| root.to_string());
+                        let resolvable = crate::ast::tree::import::is_stdpython_module(root)
+                            || options.python_modules.contains(&root.to_string())
+                            || options
+                                .module_defs
+                                .keys()
+                                .any(|k| k.first().map(String::as_str) == Some(root));
+                        if resolvable
+                            && module_assign_counts.get(&bound).copied().unwrap_or(0) == 0
+                            && !global_mutables.contains_key(&bound)
+                        {
+                            module_names.insert(bound);
+                        }
+                    }
+                }
+            }
+            options.statically_none_names = std::rc::Rc::new(none_names);
+            options.statically_false_names = std::rc::Rc::new(false_names);
+            options.statically_module_names = std::rc::Rc::new(module_names);
+        }
 
         // Issue #118: MODULE-LEVEL argparse (certifi's __main__.py builds
         // its parser at top level). The same conversion-time rewrite the
@@ -1034,6 +1104,27 @@ impl CodeGen for Module {
                         .iter()
                         .all(|n| module_assign_counts.get(n) == Some(&1))
                     {
+                        // A single-store binding of a STDPYTHON-module
+                        // constant (`VERIFY_X509_PARTIAL_CHAIN =
+                        // getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", ...)`
+                        // after the getattr fold — urllib3's ssl_.py):
+                        // a `pub use ... as name` aliases the runtime item
+                        // so functions and sibling importers see it,
+                        // without needing to know its type.
+                        if names.len() == 1
+                            && let Some((module, item)) = stdlib_const_attr(&a.value)
+                        {
+                            let runtime = crate::safe_ident(&options.stdpython);
+                            let module_ident = crate::safe_ident(&module);
+                            let item_ident = crate::safe_ident(&item);
+                            let ident = crate::safe_ident(&names[0]);
+                            stream.extend(if names[0] == item {
+                                quote!(pub use #runtime::#module_ident::#item_ident;)
+                            } else {
+                                quote!(pub use #runtime::#module_ident::#item_ident as #ident;)
+                            });
+                            continue;
+                        }
                         if let Some(ty) = const_static_type(&a.value) {
                             let value = a.value.clone().to_rust(
                                 ctx.clone(),
@@ -1277,32 +1368,64 @@ impl CodeGen for Module {
                         .flatten()
                         .collect();
                     for body_stmt in &t.body {
+                        // Handler-reassigned names drop from the import
+                        // PER NAME: urllib3's ssl_.py handler stores
+                        // PROTOCOL_TLS (among others) while the try's
+                        // from-import also binds CERT_REQUIRED and
+                        // TLSVersion — those unaffected names keep their
+                        // `use`s (dropping the whole import left them
+                        // unresolved, E0425).
+                        let mut body_stmt = body_stmt.clone();
+                        if let crate::StatementType::ImportFrom(i) = &mut body_stmt.statement
+                        {
+                            let root = i.module.split('.').next().unwrap_or("").to_string();
+                            let mut dropped: Vec<(String, String)> = Vec::new();
+                            i.names.retain(|a| {
+                                let bound = a.asname.as_deref().unwrap_or(&a.name);
+                                if handler_assigned.contains(bound) {
+                                    dropped.push((a.name.clone(), bound.to_string()));
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            // A dropped STDPYTHON name still carries its
+                            // imported value: the try body may read it
+                            // (`PROTOCOL_SSLv23 = PROTOCOL_TLS` — ssl_.py)
+                            // and the handler never runs, so store the
+                            // runtime item into the hoisted init local.
+                            if i.module == root
+                                && crate::ast::tree::import::is_stdpython_module(&root)
+                            {
+                                for (name, bound) in &dropped {
+                                    if crate::ast::tree::import::stdpython_module_item(
+                                        &root, name,
+                                    ) {
+                                        let root_ident = format_ident!("{}", root);
+                                        let name_ident = crate::safe_ident(name);
+                                        let bound_ident = crate::safe_ident(bound);
+                                        module_init_stmts.push(quote! {
+                                            #bound_ident = stdpython::#root_ident::#name_ident;
+                                        });
+                                        has_module_init_code = true;
+                                    }
+                                }
+                            }
+                            if i.names.is_empty() {
+                                continue;
+                            }
+                        }
                         let body_is_decl =
                             Self::is_declaration_statement(&body_stmt.statement);
                         let body_tokens = body_stmt
-                            .clone()
                             .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
                         if body_tokens.to_string() != "" {
-                            // The IMPORTED name is reassigned in a handler:
-                            // drop the emitted `use` (see above).
-                            let import_dropped = if let crate::StatementType::ImportFrom(i) =
-                                &body_stmt.statement
-                            {
-                                i.names.iter().any(|a| {
-                                    let bound = a.asname.as_deref().unwrap_or(&a.name);
-                                    handler_assigned.contains(bound)
-                                })
+                            if body_is_decl {
+                                stream.extend(body_tokens);
                             } else {
-                                false
-                            };
-                            if !import_dropped {
-                                if body_is_decl {
-                                    stream.extend(body_tokens);
-                                } else {
-                                    module_init_stmts.push(body_tokens);
-                                    has_module_init_code = true;
-                                }
+                                module_init_stmts.push(body_tokens);
+                                has_module_init_code = true;
                             }
                         }
                     }
@@ -2518,6 +2641,132 @@ pub(crate) fn module_global_write_sets(
 /// import-owned names are excluded; conditional/multiple stores and the
 /// no_std profile (Mutex is std) keep the documented write-drop
 /// divergence.
+/// Fold module-level `try/except ImportError` guards whose try body's
+/// imports are ALL statically unresolvable — external to the generated
+/// crate, the stdpython runtime, and the vendored `[python-modules]`
+/// deps. Such an import FAILS at runtime exactly as rython drops it, so
+/// the HANDLER branch is the module's real body (`try: import brotli
+/// except ImportError: brotli = None` — urllib3's response.py, whose
+/// guarded BrotliDecoder class then folds away with its `if brotli is
+/// not None:` guard; `except (ImportError, AttributeError): ssl = None;
+/// class BaseSSLError(...)` — connection.py, whose handler CLASS then
+/// emits at module level where sibling imports expect it). A try with
+/// any resolvable import keeps the current lowering (the imports
+/// succeed). Issue #137.
+pub(crate) fn fold_static_import_trys(
+    body: &[crate::Statement],
+    options: &crate::PythonOptions,
+) -> Vec<crate::Statement> {
+    fn collect_imports<'a>(
+        stmts: &'a [crate::Statement],
+        out: &mut Vec<&'a crate::StatementType>,
+    ) {
+        for s in stmts {
+            match &s.statement {
+                st @ (crate::StatementType::Import(_)
+                | crate::StatementType::ImportFrom(_)) => out.push(st),
+                crate::StatementType::Try(t) => {
+                    collect_imports(&t.body, out);
+                    for h in &t.handlers {
+                        collect_imports(&h.body, out);
+                    }
+                    collect_imports(&t.orelse, out);
+                    collect_imports(&t.finalbody, out);
+                }
+                crate::StatementType::If(i) => {
+                    collect_imports(&i.body, out);
+                    collect_imports(&i.orelse, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let root_resolvable = |root: &str| -> bool {
+        crate::ast::tree::import::is_stdpython_module(root)
+            || options.python_modules.contains(&root.to_string())
+            || options
+                .module_defs
+                .keys()
+                .any(|k| k.first().map(String::as_str) == Some(root))
+    };
+    let unresolvable = |st: &crate::StatementType| -> bool {
+        match st {
+            crate::StatementType::Import(imp) => imp.names.iter().all(|al| {
+                let root = al.name.split('.').next().unwrap_or("");
+                !root_resolvable(root)
+            }),
+            crate::StatementType::ImportFrom(ifm) => {
+                // Relative imports are crate siblings — resolvable.
+                if ifm.level > 0 {
+                    return false;
+                }
+                let root = ifm.module.split('.').next().unwrap_or("");
+                !root_resolvable(root)
+                    && !options
+                        .module_defs
+                        .contains_key(&ifm.resolved_module_path(options))
+            }
+            _ => false,
+        }
+    };
+    // The dual decision: an import whose EVERY name resolves statically
+    // (stdpython, a vendored python-module, or a crate sibling) always
+    // succeeds, so the ImportError handler is dead.
+    let resolvable = |st: &crate::StatementType| -> bool {
+        match st {
+            crate::StatementType::Import(imp) => imp.names.iter().all(|al| {
+                let root = al.name.split('.').next().unwrap_or("");
+                root_resolvable(root)
+            }),
+            crate::StatementType::ImportFrom(ifm) => {
+                ifm.level > 0
+                    || root_resolvable(ifm.module.split('.').next().unwrap_or(""))
+                    || options
+                        .module_defs
+                        .contains_key(&ifm.resolved_module_path(options))
+            }
+            _ => false,
+        }
+    };
+    let mut out = Vec::new();
+    for stmt in body {
+        if let crate::StatementType::Try(t) = &stmt.statement
+            && t.handlers.len() == 1
+            && t.finalbody.is_empty()
+            && (t.handlers[0].exception_type.is_none()
+                || crate::ast::tree::try_stmt::is_bare_import_error(
+                    &t.handlers[0].exception_type,
+                ))
+        {
+            let mut imports = Vec::new();
+            collect_imports(&t.body, &mut imports);
+            // Like the `external` import check, the failure decision is
+            // only meaningful in a multi-module conversion: a lone module
+            // must assume an unknown absolute import is a crate sibling.
+            if options.module_defs.len() > 1
+                && !imports.is_empty()
+                && imports.iter().all(|st| unresolvable(st))
+            {
+                out.extend(t.handlers[0].body.iter().cloned());
+                continue;
+            }
+            // ALL imports resolve → the try path is the real body: splice
+            // it (and the else clause, which runs when nothing raised) in
+            // place, dropping the dead handler — whose assigns would
+            // otherwise hoist module-init locals that collide with the
+            // imports' `use` bindings (urllib3's ssl_.py redefines
+            // OP_NO_COMPRESSION and friends in its handler).
+            if !imports.is_empty() && imports.iter().all(|st| resolvable(st)) {
+                out.extend(t.body.iter().cloned());
+                out.extend(t.orelse.iter().cloned());
+                continue;
+            }
+        }
+        out.push(stmt.clone());
+    }
+    out
+}
+
 pub(crate) fn module_global_mutable_names(
     body: &[crate::Statement],
     module_assign_counts: &std::collections::HashMap<String, usize>,
@@ -3124,6 +3373,90 @@ pub(crate) fn module_def_has_runtime_item(
     // importer's `from .util import SKIP_HEADER` resolves. Follow the
     // chain to the defining module's item.
     module_reexports_item(options, path, name, &mut std::collections::HashSet::new())
+}
+
+/// Whether the module at `path` binds `name` as a stdlib EXCEPTION ALIAS
+/// (`BaseSSLError = ssl.SSLError` — urllib3's connection.py, at top level
+/// or inside a try body whose import statically succeeds): such a name
+/// has no runtime item — an importer's `use` would fail E0432 — but
+/// raise/except guards canonicalize through the returned builtin name.
+/// Handler bodies are NOT scanned: rython's imports are static, so a
+/// try/except-ImportError always takes the try path.
+/// A value expression that statically resolves to a STDPYTHON-module
+/// item: the dotted read (`ssl.VERIFY_X509_PARTIAL_CHAIN`) or the
+/// version-probing getattr spelling with a literal name (`getattr(ssl,
+/// "VERIFY_X509_PARTIAL_CHAIN", 0x80000)` — urllib3's ssl_.py; the fold
+/// in call.rs makes the same decision at render time). Returns the
+/// (module, item) pair when the runtime module has the item.
+pub(crate) fn stdlib_const_attr(value: &crate::ExprType) -> Option<(String, String)> {
+    let (module, item) = match value {
+        crate::ExprType::Attribute(attr) => {
+            let crate::ExprType::Name(m) = attr.value.as_ref() else {
+                return None;
+            };
+            (m.id.clone(), attr.attr.clone())
+        }
+        crate::ExprType::Call(call) => {
+            let crate::ExprType::Name(f) = call.func.as_ref() else {
+                return None;
+            };
+            if f.id != "getattr" || call.args.len() < 2 {
+                return None;
+            }
+            let crate::ExprType::Name(m) = &call.args[0] else {
+                return None;
+            };
+            let crate::ExprType::Constant(c) = &call.args[1] else {
+                return None;
+            };
+            let Some(litrs::Literal::String(s)) = &c.0 else {
+                return None;
+            };
+            (m.id.clone(), s.value().to_string())
+        }
+        _ => return None,
+    };
+    (crate::ast::tree::import::is_stdpython_module(&module)
+        && crate::ast::tree::import::stdpython_module_item(&module, &item))
+    .then_some((module, item))
+}
+
+pub(crate) fn module_def_exception_alias(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<&'static str> {
+    let module = options.module_defs.get(path)?;
+    let module: &crate::Module = module;
+    fn scan(body: &[crate::Statement], name: &str) -> Option<&'static str> {
+        use crate::StatementType as ST;
+        for s in body {
+            match &s.statement {
+                ST::Assign(a) => {
+                    if a.targets
+                        .iter()
+                        .any(|t| matches!(t, crate::ExprType::Name(n) if n.id == name))
+                        && let crate::ExprType::Attribute(attr) = &a.value
+                        && let crate::ExprType::Name(m) = attr.value.as_ref()
+                        && let Some(c) =
+                            crate::ast::tree::raise_stmt::stdlib_exception_canonical(
+                                &m.id, &attr.attr,
+                            )
+                    {
+                        return Some(c);
+                    }
+                }
+                ST::Try(t) => {
+                    if let Some(c) = scan(&t.body, name) {
+                        return Some(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    scan(&module.raw.body, name)
 }
 
 /// Whether the module at `path` actually generates a PATH ITEM named

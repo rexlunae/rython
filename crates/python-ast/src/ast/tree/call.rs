@@ -2584,6 +2584,35 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
+                        // getattr on a STDLIB MODULE with a LITERAL name
+                        // resolves statically — the version-probing idiom
+                        // (`getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN",
+                        // 0x80000)` — urllib3's ssl_.py): the runtime item
+                        // when the module has it, else the default (this
+                        // mirrors the static import-guard decision).
+                        if let (
+                            ExprType::Name(m),
+                            ExprType::Constant(c),
+                        ) = (&self.args[0], &self.args[1])
+                            && crate::ast::tree::import::is_stdpython_module(&m.id)
+                            && let Some(litrs::Literal::String(slit)) = &c.0
+                        {
+                            let item = slit.value();
+                            if crate::ast::tree::import::stdpython_module_item(&m.id, item)
+                            {
+                                let module = crate::safe_ident(&m.id);
+                                let name = crate::safe_ident(item);
+                                return Ok(quote!(#module::#name));
+                            }
+                            if let Some(d) = rendered.get(2) {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "getattr({}, \"{}\", default): the runtime module \
+                                     has no such item — statically the default",
+                                    m.id, item
+                                ));
+                                return Ok(d.clone());
+                            }
+                        }
                         options.definition_warnings.borrow_mut().push(
                             "getattr(obj, name[, default]) is dropped; the default is \
                              returned (dynamic attribute lookup is unmodeled — the \

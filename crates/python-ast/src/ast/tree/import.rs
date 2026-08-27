@@ -26,7 +26,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         return false;
     };
     match module {
-        StdModule::Io => matches!(name, "StringIO" | "BytesIO"),
+        StdModule::Io => matches!(name, "StringIO" | "BytesIO" | "DEFAULT_BUFFER_SIZE"),
         // The type names come from the ThreadingType enum (one source of
         // truth); current_thread/active_count are module functions.
         StdModule::Threading => {
@@ -37,10 +37,45 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
             name,
             "socket"
                 | "gethostname"
+                | "AF_UNSPEC"
                 | "AF_INET"
                 | "AF_INET6"
                 | "SOCK_STREAM"
                 | "SOCK_DGRAM"
+        ),
+        // ssl: the rustls-backed surface — context/socket types plus the
+        // CPython module constants the runtime module actually defines.
+        // SSLError is a string-tagged exception (matched by name, no
+        // runtime item), so it is NOT here: its from-import drops with
+        // the annotation-only warning while except-matching still works.
+        StdModule::Ssl => matches!(
+            name,
+            "SSLContext"
+                | "SSLSocket"
+                | "create_default_context"
+                | "TLSVersion"
+                | "HAS_SNI"
+                | "HAS_NEVER_CHECK_COMMON_NAME"
+                | "OPENSSL_VERSION"
+                | "OPENSSL_VERSION_NUMBER"
+                | "OPENSSL_VERSION_INFO"
+                | "CERT_NONE"
+                | "CERT_OPTIONAL"
+                | "CERT_REQUIRED"
+                | "PROTOCOL_TLS"
+                | "PROTOCOL_SSLv23"
+                | "PROTOCOL_TLS_CLIENT"
+                | "OP_NO_SSLv2"
+                | "OP_NO_SSLv3"
+                | "OP_NO_TLSv1"
+                | "OP_NO_TLSv1_1"
+                | "OP_NO_TLSv1_2"
+                | "OP_NO_TLSv1_3"
+                | "OP_NO_COMPRESSION"
+                | "OP_NO_TICKET"
+                | "OP_NO_RENEGOTIATION"
+                | "VERIFY_X509_STRICT"
+                | "VERIFY_X509_PARTIAL_CHAIN"
         ),
         // urllib: the request submodule and its items. urllib.error's
         // URLError/HTTPError are string-tagged exceptions matched by name
@@ -891,17 +926,20 @@ impl CodeGen for ImportFrom {
                         crate::ast::tree::std_module::runtime_fn_variants(m, &alias.name)
                     })
                     .unwrap_or(&[]);
+                // `pub use`, matching the plain stdpython path below: the
+                // imported name is a module attribute a sibling's
+                // re-export chain may traverse (E0603 otherwise).
                 let import = match &alias.asname {
                     Some(asname) => {
                         let asname = crate::safe_ident(asname);
-                        quote! { use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
+                        quote! { pub use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
                     }
                     None if variants.is_empty() => {
-                        quote! { use #root #(::#base_parts)* #(::#module_path)*::#name; }
+                        quote! { pub use #root #(::#base_parts)* #(::#module_path)*::#name; }
                     }
                     None => quote! {
                         #[allow(unused_imports)]
-                        use #root #(::#base_parts)* #(::#module_path)*::#name;
+                        pub use #root #(::#base_parts)* #(::#module_path)*::#name;
                     },
                 };
                 present_tokens.extend(import);
@@ -944,6 +982,26 @@ impl CodeGen for ImportFrom {
                 options.definition_warnings.borrow_mut().push(format!(
                     "`from {} import {}`: `{}` is a type-name tuple alias \
                      (typing-only; consumed by isinstance resolution)",
+                    self.module, alias.name, alias.name
+                ));
+                continue;
+            }
+            // A name the SIBLING module binds as a stdlib EXCEPTION ALIAS
+            // (`BaseSSLError = ssl.SSLError` — urllib3's connection.py):
+            // no runtime item exists (the alias emits nothing), so the
+            // use would fail E0432. Drop it; raise/except guards
+            // canonicalize through imported_exception_alias, which
+            // follows the chain into the defining module.
+            if crate::ast::tree::module::module_def_exception_alias(
+                &options,
+                &resolved_path,
+                &alias.name,
+            )
+            .is_some()
+            {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`from {} import {}`: `{}` is a stdlib exception alias \
+                     (no runtime item; except/raise sites canonicalize)",
                     self.module, alias.name, alias.name
                 ));
                 continue;
@@ -1066,9 +1124,16 @@ impl CodeGen for ImportFrom {
             // defining module (`_wrap_proxy_error` — urllib3's
             // connection.py): the re-export must match, or Rust rejects a
             // `pub use` of a crate-only item (E0364).
+            // A stdpython from-import is also `pub use`: Python treats
+            // imported names as module attributes, so a sibling's
+            // re-export chain (`from .util.ssl_ import SSLContext` where
+            // ssl_.py did `from ssl import SSLContext` — urllib3) must
+            // find a public item, not a private use (E0603).
+            let stdpython_root = self.level == 0
+                && parts.first().is_some_and(|p| is_stdpython_module(p));
             let visibility = if self.level > 0 && alias.name.starts_with("_") {
                 quote!(pub(crate))
-            } else if self.level > 0 {
+            } else if self.level > 0 || stdpython_root {
                 quote!(pub)
             } else {
                 quote!()

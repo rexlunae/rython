@@ -7781,16 +7781,17 @@ fn next_builtin_returns_first_element_or_stopiteration() {
 
 #[test]
 fn external_import_value_read_boxes_to_none() {
-    // urllib3's ssl_.py: `from ssl import CERT_REQUIRED, PROTOCOL_TLS,
-    // OP_NO_SSLv2, ...` — the names are read as VALUES in function
-    // bodies. The import is external, so the reads lower to the boxed
-    // None with a warning (external-module divergence), not a bare
-    // unresolved identifier. Needs a multi-module conversion (an empty
-    // module_defs assumes any import may be a sibling).
-    let src = "from ssl import CERT_REQUIRED\ndef f() -> object:\n    return CERT_REQUIRED\n";
-    let m = parse(src, "sslread.py").unwrap();
+    // `from logging import DEBUG` — the name is read as a VALUE in a
+    // function body. The import is external (logging is unmodeled), so
+    // the read lowers to the boxed None with a warning (external-module
+    // divergence), not a bare unresolved identifier. Needs a
+    // multi-module conversion (an empty module_defs assumes any import
+    // may be a sibling). Previously exercised `from ssl import
+    // CERT_REQUIRED`; ssl is now a modeled runtime module (ssl-rustls).
+    let src = "from logging import DEBUG\ndef f() -> object:\n    return DEBUG\n";
+    let m = parse(src, "logread.py").unwrap();
     let mut defs = std::collections::HashMap::new();
-    defs.insert(vec!["sslread".to_string()], std::rc::Rc::new(m));
+    defs.insert(vec!["logread".to_string()], std::rc::Rc::new(m));
     // A second module makes this a multi-module conversion, so the
     // external-import analysis is active (a lone module assumes any
     // import may be a sibling).
@@ -7800,15 +7801,15 @@ fn external_import_value_read_boxes_to_none() {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
     };
-    let out = compile_with_options(src, "sslread.py", options).expect("converts");
+    let out = compile_with_options(src, "logread.py", options).expect("converts");
     assert!(
         out.contains("stdpython :: PyValue :: None_") || out.contains("stdpython::PyValue::None_"),
         "external-import value read must box to None: {}",
         out
     );
     assert!(
-        !out.contains("CERT_REQUIRED"),
-        "bare CERT_REQUIRED must not leak: {}",
+        !out.contains("DEBUG"),
+        "bare DEBUG must not leak: {}",
         out
     );
 }
@@ -7900,10 +7901,12 @@ fn id_builtin_lowers_to_address_cast() {
 
 #[test]
 fn tuple_import_error_handler_drops_with_import_body() {
-    // urllib3's connection.py: `try: import ssl; BaseSSLError =
-    // ssl.SSLError except (ImportError, AttributeError): ssl = None` — the
-    // tuple handler is the dead fallback of an import attempt (dropped),
-    // so its `ssl = None` must not shadow the try body's import symbol.
+    // urllib3's connection.py: `try: import ssl except (ImportError,
+    // AttributeError): ssl = None` — ssl resolves (the rustls-backed
+    // runtime module), so the tuple handler is the dead fallback of an
+    // import that statically succeeds: the try body splices in place,
+    // the handler's `ssl = None` never emits, and reads are real runtime
+    // paths.
     let src = "try:\n    import ssl\nexcept (ImportError, AttributeError):\n    ssl = None\n\ndef f() -> object:\n    return ssl.CERT_NONE\n";
     let m = parse(src, "ssltry.py").unwrap();
     let mut defs = std::collections::HashMap::new();
@@ -7921,8 +7924,8 @@ fn tuple_import_error_handler_drops_with_import_body() {
         out
     );
     assert!(
-        out.contains("stdpython :: PyValue :: None_") || out.contains("stdpython::PyValue::None_"),
-        "ssl.CERT_NONE (external module) must box to None: {}",
+        out.contains("ssl :: CERT_NONE"),
+        "ssl.CERT_NONE must read the runtime module's constant: {}",
         out
     );
 }
@@ -9267,6 +9270,194 @@ fn urllib_calls_without_runtime_items_drop_boxed() {
     assert!(
         !out.contains("urlencode :: new"),
         "no class construction for a dropped import: {}",
+        out
+    );
+}
+
+// ---- ssl module wiring: rustls-backed runtime surface (issue #137) ----
+
+#[test]
+fn ssl_imports_resolve_to_the_runtime_module() {
+    // `import ssl` / `from ssl import ...` resolve under stdpython's
+    // rustls-backed ssl module (the ssl-rustls feature, on by default).
+    // From-imports are `pub use` so sibling re-export chains resolve
+    // (E0603 otherwise), and TLSVersion attribute chains are paths.
+    let out = compile(
+        "import ssl\n\
+         from ssl import CERT_REQUIRED, SSLContext, TLSVersion\n\
+         \n\
+         def make() -> int:\n\
+         \x20   ctx = SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n\
+         \x20   ctx.minimum_version = TLSVersion.TLSv1_2\n\
+         \x20   return CERT_REQUIRED\n",
+        "sslmod.py",
+    );
+    assert!(
+        out.contains("pub use stdpython :: ssl :: SSLContext"),
+        "from-ssl imports must be pub-use of the runtime module: {}",
+        out
+    );
+    assert!(
+        out.contains("ssl :: PROTOCOL_TLS_CLIENT"),
+        "qualified ssl constants must render as runtime paths: {}",
+        out
+    );
+    assert!(
+        out.contains("TLSVersion :: TLSv1_2"),
+        "TLSVersion members must render as paths, not field reads: {}",
+        out
+    );
+}
+
+#[test]
+fn resolved_import_try_splices_body_and_drops_dead_handler() {
+    // The dual of the failed-import fold: a try/except-ImportError whose
+    // imports ALL resolve statically always takes the try path — the
+    // body splices in place and the handler (urllib3 connection.py's
+    // fallback BaseSSLError class) never emits. The alias assign
+    // `BaseSSLError = ssl.SSLError` registers an exception alias, so
+    // except sites canonicalize to the runtime's SSLError tag.
+    let out = compile(
+        "try:\n\
+         \x20   import ssl\n\
+         \n\
+         \x20   BaseSSLError = ssl.SSLError\n\
+         except (ImportError, AttributeError):\n\
+         \x20   ssl = None\n\
+         \n\
+         \x20   class BaseSSLError(Exception):\n\
+         \x20       pass\n\
+         \n\
+         def f() -> int:\n\
+         \x20   try:\n\
+         \x20       return 1\n\
+         \x20   except BaseSSLError:\n\
+         \x20       return 2\n",
+        "sslfold.py",
+    );
+    assert!(
+        !out.contains("struct BaseSSLError"),
+        "the dead handler's fallback class must not emit: {}",
+        out
+    );
+    assert!(
+        out.contains("matches (\"SSLError\")"),
+        "except BaseSSLError must canonicalize to the SSLError tag: {}",
+        out
+    );
+}
+
+#[test]
+fn exception_union_parameter_boxes_to_pyvalue() {
+    // `err: BaseSSLError | OSError | SocketTimeout` (urllib3's
+    // _raise_timeout): exception members — by naming convention or via
+    // the imported-alias table — box the parameter as PyValue instead of
+    // rendering the union literally (invalid Rust).
+    let out = compile(
+        "from socket import timeout as SocketTimeout\n\
+         \n\
+         def f(err: BaseSSLError | OSError | SocketTimeout) -> None:\n\
+         \x20   pass\n",
+        "excunion.py",
+    );
+    assert!(
+        out.contains("err : stdpython :: PyValue"),
+        "an all-exception union parameter must box: {}",
+        out
+    );
+    assert!(
+        !out.contains("| (SocketTimeout)"),
+        "the union must not render literally: {}",
+        out
+    );
+}
+
+#[test]
+fn getattr_on_stdlib_module_folds_statically() {
+    // The version-probing idiom (urllib3's ssl_.py): getattr over a
+    // stdlib module with a literal name resolves at conversion time —
+    // the runtime item when present (promoted to a pub use so functions
+    // see it), else the literal default.
+    let out = compile(
+        "import ssl\n\
+         \n\
+         VERIFY_X509_PARTIAL_CHAIN = getattr(ssl, \"VERIFY_X509_PARTIAL_CHAIN\", 0x80000)\n\
+         MISSING = getattr(ssl, \"NOT_A_REAL_CONSTANT\", 42)\n\
+         \n\
+         def f() -> int:\n\
+         \x20   return VERIFY_X509_PARTIAL_CHAIN\n",
+        "sslgetattr.py",
+    );
+    assert!(
+        out.contains("pub use stdpython :: ssl :: VERIFY_X509_PARTIAL_CHAIN"),
+        "a present item must alias the runtime constant: {}",
+        out
+    );
+    assert!(
+        out.contains("MISSING = 42"),
+        "a missing item must fold to the default: {}",
+        out
+    );
+}
+
+#[test]
+fn resolved_module_import_gates_fold_statically() {
+    // `if not ssl:` / `if ssl is None:` over a RESOLVED module import
+    // (urllib3 connection.py's DummyConnection fallback): the module is
+    // always truthy and never None, so the gates fold — a module object
+    // as a runtime value has no lowering (E0423 otherwise).
+    let out = compile(
+        "import ssl\n\
+         \n\
+         if not ssl:\n\
+         \x20   CHOSEN = 1\n\
+         else:\n\
+         \x20   CHOSEN = 2\n\
+         \n\
+         def f() -> int:\n\
+         \x20   if ssl is None:\n\
+         \x20       return 0\n\
+         \x20   return 1\n",
+        "sslgate.py",
+    );
+    assert!(
+        !out.contains("CHOSEN = 1"),
+        "the not-ssl branch is dead when the import resolves: {}",
+        out
+    );
+    assert!(
+        out.contains("CHOSEN = 2"),
+        "the else branch is the live one: {}",
+        out
+    );
+    assert!(
+        !out.contains("return Ok (0"),
+        "`ssl is None` folds false inside functions too: {}",
+        out
+    );
+}
+
+#[test]
+fn module_constant_method_call_is_a_value_call_not_a_path() {
+    // `ssl.OPENSSL_VERSION.startswith(...)` (urllib3's __init__): the
+    // SCREAMING_SNAKE segment ends the module path — the method call is
+    // on the constant's VALUE (`ssl::OPENSSL_VERSION.startswith(...)`),
+    // not a `::startswith` path item.
+    let out = compile(
+        "import ssl\n\
+         \n\
+         def f() -> bool:\n\
+         \x20   return ssl.OPENSSL_VERSION.startswith(\"OpenSSL \")\n",
+        "sslver.py",
+    );
+    assert!(
+        !out.contains("OPENSSL_VERSION :: startswith"),
+        "method on a module constant must not render as a path: {}",
+        out
+    );
+    assert!(
+        out.contains("startswith"),
+        "the method call itself must survive: {}",
         out
     );
 }

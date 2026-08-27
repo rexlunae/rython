@@ -224,16 +224,50 @@ pub(crate) fn stdlib_exception_canonical(module: &str, name: &str) -> Option<&'s
     match (module, name) {
         ("socket", "timeout") => Some("TimeoutError"),
         ("socket", "error" | "gaierror" | "herror") => Some("OSError"),
+        // The ssl exception family is in stdpython's runtime hierarchy
+        // under its own names (SSLError IS-A OSError), so the canonical
+        // form is the bare name; CertificateError is CPython's alias of
+        // SSLCertVerificationError. Verified against python3.
+        ("ssl", "SSLError") => Some("SSLError"),
+        ("ssl", "SSLZeroReturnError") => Some("SSLZeroReturnError"),
+        ("ssl", "SSLWantReadError") => Some("SSLWantReadError"),
+        ("ssl", "SSLWantWriteError") => Some("SSLWantWriteError"),
+        ("ssl", "SSLSyscallError") => Some("SSLSyscallError"),
+        ("ssl", "SSLEOFError") => Some("SSLEOFError"),
+        ("ssl", "SSLCertVerificationError" | "CertificateError") => {
+            Some("SSLCertVerificationError")
+        }
+        _ => None,
+    }
+}
+
+/// A canonical stdlib-MODULE exception name (the terminal of an alias
+/// chain that never passes through an ImportFrom — urllib3's
+/// `BaseSSLError = ssl.SSLError` registers `Alias("SSLError")`, and
+/// "SSLError" itself has no symbol entry). The runtime hierarchy knows
+/// these names directly.
+pub(crate) fn stdlib_module_exception_name(name: &str) -> Option<&'static str> {
+    match name {
+        "SSLError" => Some("SSLError"),
+        "SSLZeroReturnError" => Some("SSLZeroReturnError"),
+        "SSLWantReadError" => Some("SSLWantReadError"),
+        "SSLWantWriteError" => Some("SSLWantWriteError"),
+        "SSLSyscallError" => Some("SSLSyscallError"),
+        "SSLEOFError" => Some("SSLEOFError"),
+        "SSLCertVerificationError" | "CertificateError" => Some("SSLCertVerificationError"),
         _ => None,
     }
 }
 
 /// Resolve a NAME bound by `from <stdlib module> import <exc> [as alias]`
 /// to its canonical builtin exception, when the (module, name) pair is a
-/// known stdlib exception alias.
+/// known stdlib exception alias. With `options`, a SIBLING-module import
+/// (`from .connection import BaseSSLError` — urllib3) also resolves,
+/// through the defining module's own exception-alias assign.
 pub(crate) fn imported_exception_alias(
     name: &str,
     symbols: &SymbolTableScopes,
+    options: Option<&crate::PythonOptions>,
 ) -> Option<&'static str> {
     // An aliased import registers the asname as an Alias hop to the
     // canonical name (`from socket import timeout as SocketTimeout`):
@@ -251,9 +285,22 @@ pub(crate) fn imported_exception_alias(
                     .find(|a| a.asname.as_deref() == Some(current.as_str()))
                     .map(|a| a.name.as_str())
                     .unwrap_or(current.as_str());
-                return stdlib_exception_canonical(&ifm.module, canonical);
+                if let Some(c) = stdlib_exception_canonical(&ifm.module, canonical) {
+                    return Some(c);
+                }
+                // A sibling module's exception-alias binding.
+                if let Some(options) = options {
+                    let path = ifm.resolved_module_path(options);
+                    return crate::ast::tree::module::module_def_exception_alias(
+                        options, &path, canonical,
+                    );
+                }
+                return None;
             }
-            _ => return None,
+            // An alias chain can terminate at a canonical stdlib-module
+            // exception name with no symbol entry of its own
+            // (`BaseSSLError = ssl.SSLError` → Alias("SSLError")).
+            _ => return stdlib_module_exception_name(&current),
         }
     }
     None
@@ -282,7 +329,7 @@ fn exception_value(
     match exc {
         ExprType::Call(call) => {
             if let ExprType::Name(name) = call.func.as_ref() {
-                if let Some(kind) = imported_exception_alias(&name.id, &symbols) {
+                if let Some(kind) = imported_exception_alias(&name.id, &symbols, Some(&options)) {
                     // `raise timeout(...)` under `from socket import
                     // timeout`: the canonical builtin (TimeoutError).
                     let msg = match call.args.len() {
@@ -329,9 +376,9 @@ fn exception_value(
             Ok(quote!(#tokens))
         }
         ExprType::Name(name)
-            if imported_exception_alias(&name.id, &symbols).is_some() =>
+            if imported_exception_alias(&name.id, &symbols, Some(&options)).is_some() =>
         {
-            let kind = imported_exception_alias(&name.id, &symbols).unwrap();
+            let kind = imported_exception_alias(&name.id, &symbols, Some(&options)).unwrap();
             Ok(quote!(PyException::new(#kind, String::new())))
         }
         ExprType::Name(name)
