@@ -8715,6 +8715,70 @@ fn global_none_singleton_boxes_to_a_pyvalue_static() {
 }
 
 #[test]
+fn global_class_instance_store_is_loud_at_function_scope() {
+    // The remaining boxed-global edge (issue #189): a `global`-declared
+    // store of a CLASS INSTANCE (`HISTORY_RECORDER = HistoryRecorder()`
+    // — botocore's history.py) has no PyValue representation, so the
+    // function-scope write is a loud conversion error naming the rewrite.
+    let err = compile_err(
+        concat!(
+            "class HistoryRecorder:\n",
+            "    pass\n",
+            "RECORDER = None\n",
+            "def get():\n",
+            "    global RECORDER\n",
+            "    if RECORDER is None:\n",
+            "        RECORDER = HistoryRecorder()\n",
+            "    return RECORDER\n",
+        ),
+        "global_class_store.py",
+    );
+    assert!(
+        err.contains("no boxed representation") && err.contains("issue #189"),
+        "the loud error must cite the tracked gap: {}",
+        err
+    );
+}
+
+#[test]
+fn global_class_instance_store_warns_at_module_scope() {
+    // At MODULE scope the same store degrades to a -W drop (None is
+    // stored) so the module still converts — the §12 boxed-global
+    // divergence carried by the warning channel. This is the issue #137
+    // emscripten pattern (urllib3's `_fetcher = _StreamingFetcher()`
+    // init branch): a None-initialized module value, reassigned inside
+    // module-level control flow, read by function bodies.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class Fetcher:\n",
+            "    pass\n",
+            "def worker_available() -> bool:\n",
+            "    return False\n",
+            "_fetcher = None\n",
+            "def streaming_ready() -> bool:\n",
+            "    return _fetcher is not None\n",
+            "if worker_available():\n",
+            "    _fetcher = Fetcher()\n",
+            "else:\n",
+            "    _fetcher = None\n",
+        ),
+        "global_module_store.py",
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("no boxed representation")),
+        "the module-scope store must warn: {:?}",
+        warnings
+    );
+    assert!(
+        out.contains("PyValue :: None_"),
+        "the drop stores None: {}",
+        out
+    );
+}
+
+#[test]
 fn global_shadowed_by_a_plain_local_disqualifies_the_static() {
     // A function that binds the name WITHOUT `global` has a plain local;
     // the name must not become a mutable static (the local read would be
