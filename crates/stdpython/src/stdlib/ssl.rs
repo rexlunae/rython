@@ -39,6 +39,14 @@ pub const CERT_REQUIRED: i64 = 2;
 pub const PROTOCOL_TLS: i64 = 2;
 pub const PROTOCOL_SSLv23: i64 = 2;
 pub const PROTOCOL_TLS_CLIENT: i64 = 16;
+// The version-pinned protocols (deprecated in CPython but still
+// exported; urllib3's pyopenssl maps over them). A context built with
+// one clamps to that single version where rustls supports it (1.2);
+// 1.0/1.1 are below rustls's floor and fail loudly at handshake-config
+// time.
+pub const PROTOCOL_TLSv1: i64 = 3;
+pub const PROTOCOL_TLSv1_1: i64 = 4;
+pub const PROTOCOL_TLSv1_2: i64 = 5;
 
 pub const OP_NO_SSLv2: i64 = 0;
 pub const OP_NO_SSLv3: i64 = 0x0200_0000;
@@ -51,6 +59,7 @@ pub const OP_NO_TICKET: i64 = 0x4000;
 pub const OP_NO_RENEGOTIATION: i64 = 0x4000_0000;
 
 pub const VERIFY_X509_STRICT: i64 = 32;
+pub const VERIFY_X509_TRUSTED_FIRST: i64 = 0x8000;
 pub const VERIFY_X509_PARTIAL_CHAIN: i64 = 0x0008_0000;
 
 // The SSL_ERROR_* errno family (values from python3's ssl module) —

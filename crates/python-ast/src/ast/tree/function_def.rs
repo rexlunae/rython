@@ -1932,12 +1932,11 @@ impl FunctionDef {
             }
         }
         for name in &scope.assigned {
-            // Python's `_` discard target (`(scheme, _, host, port, _) =
-            // parse_url(...)` — idna/urllib3): a wildcard, never a hoisted
-            // binding — `let mut _;` is not legal Rust.
-            if name == "_" {
-                continue;
-            }
+            // `_` hoists like any name: safe_ident maps it to a real
+            // identifier (readable, like Python's `_`), so the old
+            // wildcard skip would leave tuple-destructure stores
+            // (`(scheme, _, host, port, _) = parse_url(...)` — urllib3)
+            // without a binding.
             // A `global`-declared mutable static has no local binding: its
             // stores go through py_global_write (issue #115).
             if fn_mutable_globals.contains(name) {
@@ -1967,7 +1966,26 @@ impl FunctionDef {
         // iterates the returned list just the same). The element type
         // comes from the `Generator[T, ...]` return annotation or the
         // first yielded value.
-        let gen_elt = if crate::body_has_yields(&effective_body) {
+        let returns_generator_annotation = matches!(
+            self.returns.as_deref(),
+            Some(ExprType::Subscript(sub)) if match sub.value.as_ref() {
+                ExprType::Name(n) => matches!(n.id.as_str(), "Generator" | "Iterator"),
+                ExprType::Attribute(a) => {
+                    matches!(a.value.as_ref(), ExprType::Name(m) if m.id == "typing")
+                        && matches!(a.attr.as_str(), "Generator" | "Iterator")
+                }
+                _ => false,
+            }
+        );
+        let gen_elt = if crate::body_has_yields(&effective_body)
+            // An abstract generator STUB (`def stream(...) ->
+            // typing.Iterator[bytes]: raise NotImplementedError()` —
+            // urllib3's BaseHTTPResponse) has no yields, but its
+            // annotation still decides the signature the trait
+            // declaration carries; otherwise overriding generators'
+            // Vec returns are E0053 against a () trait method.
+            || returns_generator_annotation
+        {
             // Even when the element type cannot be resolved (a
             // `typing.Iterator[str]` annotation), the generator must still
             // lower — Vec<_> infers from the pushes.
@@ -3062,21 +3080,32 @@ pub(crate) fn generator_element_type(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<crate::TypeInfo> {
+    // Both the bare and the typing-qualified spellings, with the yield
+    // type as a tuple's head (`Generator[bytes, None, None]`) or alone
+    // (`typing.Generator[bytes]` — urllib3's response.stream).
     if let Some(ann) = returns
         && let ExprType::Subscript(sub) = ann
-        && matches!(
-            sub.value.as_ref(),
-            ExprType::Name(n) if matches!(n.id.as_str(), "Generator" | "Iterator")
-        )
-        && let crate::SubscriptKind::Index(elt) = &sub.kind
-        && let ExprType::Tuple(t) = elt.as_ref()
-        && let Some(first) = t.elts.first()
-    {
-        if let Some(t) = crate::resolve_alias_typeinfo(first, symbols, options) {
-            return Some(t);
+        && match sub.value.as_ref() {
+            ExprType::Name(n) => matches!(n.id.as_str(), "Generator" | "Iterator"),
+            ExprType::Attribute(a) => {
+                matches!(a.value.as_ref(), ExprType::Name(m) if m.id == "typing")
+                    && matches!(a.attr.as_str(), "Generator" | "Iterator")
+            }
+            _ => false,
         }
-        if let Some(t) = crate::annotation_type_info(first) {
-            return Some(t);
+        && let crate::SubscriptKind::Index(elt) = &sub.kind
+    {
+        let first = match elt.as_ref() {
+            ExprType::Tuple(t) => t.elts.first(),
+            other => Some(other),
+        };
+        if let Some(first) = first {
+            if let Some(t) = crate::resolve_alias_typeinfo(first, symbols, options) {
+                return Some(t);
+            }
+            if let Some(t) = crate::annotation_type_info(first) {
+                return Some(t);
+            }
         }
     }
     first_yield_type(body, options, symbols)

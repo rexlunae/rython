@@ -2437,6 +2437,31 @@ pub enum PyValue {
     None_,
 }
 
+/// Python iteration over a boxed value (`for field in iterable:` where
+/// the argument's type is unknown — urllib3's filepost): tuples yield
+/// their elements, strings their characters (as 1-char strings, like
+/// Python), bytes their integer octets. Iterating a non-iterable member
+/// is CPython's TypeError — a loud panic (§12.2).
+impl IntoIterator for PyValue {
+    type Item = PyValue;
+    type IntoIter = alloc::vec::IntoIter<PyValue>;
+    fn into_iter(self) -> Self::IntoIter {
+        let items: Vec<PyValue> = match &self {
+            PyValue::Tuple(t) => t.iter().cloned().collect(),
+            PyValue::Str(s) => s
+                .chars()
+                .map(|c| PyValue::Str(c.to_string()))
+                .collect(),
+            PyValue::Bytes(b) => b.iter().map(|&o| PyValue::Int(o as i64)).collect(),
+            PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
+            PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
+            PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
+            PyValue::None_ => panic!("TypeError: 'NoneType' object is not iterable"),
+        };
+        items.into_iter()
+    }
+}
+
 impl PyValue {
     pub fn is_int(&self) -> bool {
         matches!(self, PyValue::Int(_))
@@ -6116,6 +6141,29 @@ mod tests {
 
     #[cfg(not(feature = "std"))]
     use alloc::vec;
+
+    /// Python iteration over boxed values, verified against python3:
+    /// tuples yield elements, strings 1-char strings, bytes ints; a
+    /// non-iterable member is the TypeError panic (§12.2).
+    #[test]
+    fn pyvalue_iteration_matches_python() {
+        let t = PyValue::Tuple(Arc::new(vec![PyValue::Int(1), PyValue::Str("x".into())]));
+        let items: Vec<PyValue> = t.into_iter().collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].as_int(), Some(1));
+        let s: Vec<PyValue> = PyValue::Str("ab".into()).into_iter().collect();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].as_str().map(|v| v.to_string()), Some("a".to_string()));
+        let b: Vec<PyValue> = PyValue::Bytes(vec![65, 66]).into_iter().collect();
+        assert_eq!(b[0].as_int(), Some(65));
+        assert_eq!(b[1].as_int(), Some(66));
+    }
+
+    #[test]
+    #[should_panic(expected = "'int' object is not iterable")]
+    fn pyvalue_int_iteration_is_type_error() {
+        let _ = PyValue::Int(3).into_iter();
+    }
 
     #[test]
     fn bool_arithmetic_is_zero_one() {

@@ -427,6 +427,23 @@ pub fn socket(family: i64, kind: i64) -> Result<Socket, PyException> {
     Ok(Socket::from_state(SockState::Fresh { kind }))
 }
 
+/// The process-wide default timeout `socket.setdefaulttimeout` stores
+/// and `socket.getdefaulttimeout` reads (None until set, like a fresh
+/// CPython interpreter). Seconds; bit-stored f64 with an occupancy flag
+/// folded into the NaN pattern would be overclever — a Mutex is fine at
+/// this call rate.
+static DEFAULT_TIMEOUT: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Python `socket.getdefaulttimeout()`.
+pub fn getdefaulttimeout() -> Option<f64> {
+    *DEFAULT_TIMEOUT.lock().expect("default-timeout lock poisoned")
+}
+
+/// Python `socket.setdefaulttimeout(timeout)`.
+pub fn setdefaulttimeout(timeout: Option<f64>) {
+    *DEFAULT_TIMEOUT.lock().expect("default-timeout lock poisoned") = timeout;
+}
+
 /// Python `socket.gethostname()`.
 pub fn gethostname() -> String {
     #[cfg(unix)]
@@ -444,5 +461,19 @@ pub fn gethostname() -> String {
     #[cfg(not(unix))]
     {
         "localhost".to_string()
+    }
+}
+
+#[cfg(test)]
+mod default_timeout_tests {
+    #[test]
+    fn default_timeout_round_trips_and_starts_none() {
+        // A fresh interpreter's socket.getdefaulttimeout() is None
+        // (verified against python3); set/get round-trips.
+        assert_eq!(super::getdefaulttimeout(), None);
+        super::setdefaulttimeout(Some(2.5));
+        assert_eq!(super::getdefaulttimeout(), Some(2.5));
+        super::setdefaulttimeout(None);
+        assert_eq!(super::getdefaulttimeout(), None);
     }
 }

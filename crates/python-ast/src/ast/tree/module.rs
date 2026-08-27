@@ -98,7 +98,7 @@ impl CodeGen for Module {
         mut self,
         ctx: Self::Context,
         mut options: Self::Options,
-        symbols: Self::SymbolTable,
+        mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
 
@@ -112,7 +112,16 @@ impl CodeGen for Module {
         // connection.py). Fold before every body analysis below so store
         // counts, mutable-global detection, and emission all see the
         // branch that actually runs.
-        self.raw.body = fold_static_import_trys(&self.raw.body, &options);
+        let (folded_body, newly_live) = fold_static_import_trys(&self.raw.body, &options);
+        self.raw.body = folded_body;
+        // Handler statements the fold made live were invisible to
+        // find_symbols (Try::find_symbols skips ImportError-handler
+        // bodies, correctly, for the resolvable case): register them now
+        // so their own imports resolve (`import warnings` inside socks.py's
+        // live fallback).
+        for s in &newly_live {
+            symbols = s.clone().find_symbols(symbols);
+        }
 
         // Capture the module's source filename before fields of `self` are
         // moved, so statement errors can point at the user's Python file.
@@ -2653,10 +2662,13 @@ pub(crate) fn module_global_write_sets(
 /// emits at module level where sibling imports expect it). A try with
 /// any resolvable import keeps the current lowering (the imports
 /// succeed). Issue #137.
+/// Returns the folded body plus the HANDLER statements the fold made
+/// live (spliced in place of a try whose imports all fail): those were
+/// skipped by Try::find_symbols and need registering.
 pub(crate) fn fold_static_import_trys(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
-) -> Vec<crate::Statement> {
+) -> (Vec<crate::Statement>, Vec<crate::Statement>) {
     fn collect_imports<'a>(
         stmts: &'a [crate::Statement],
         out: &mut Vec<&'a crate::StatementType>,
@@ -2729,7 +2741,18 @@ pub(crate) fn fold_static_import_trys(
         }
     };
     let mut out = Vec::new();
+    let mut newly_live = Vec::new();
     for stmt in body {
+        // A module-level SELF-ASSIGN (`__version__ = __version__` —
+        // urllib3's __init__, a typing/re-export idiom) is a no-op:
+        // dropped here so it neither hoists a module-init local that
+        // shadows the imported static (E0530) nor counts as a store.
+        if let crate::StatementType::Assign(a) = &stmt.statement
+            && let [crate::ExprType::Name(t)] = a.targets.as_slice()
+            && matches!(&a.value, crate::ExprType::Name(v) if v.id == t.id)
+        {
+            continue;
+        }
         if let crate::StatementType::Try(t) = &stmt.statement
             && t.handlers.len() == 1
             && t.finalbody.is_empty()
@@ -2748,6 +2771,7 @@ pub(crate) fn fold_static_import_trys(
                 && imports.iter().all(|st| unresolvable(st))
             {
                 out.extend(t.handlers[0].body.iter().cloned());
+                newly_live.extend(t.handlers[0].body.iter().cloned());
                 continue;
             }
             // ALL imports resolve → the try path is the real body: splice
@@ -2764,7 +2788,7 @@ pub(crate) fn fold_static_import_trys(
         }
         out.push(stmt.clone());
     }
-    out
+    (out, newly_live)
 }
 
 pub(crate) fn module_global_mutable_names(
@@ -4579,6 +4603,21 @@ fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
     }
     for c in class_list {
         if !hierarchy.contains(&c.name) {
+            continue;
+        }
+        // An EXCEPTION class (or a Protocol) lowers as a marker struct
+        // with no trait machinery (class_def.rs's early returns), so a
+        // bring-along `use crate::exceptions::HTTPErrorTrait;` at the
+        // import site would be E0432 — no entry.
+        if crate::ast::tree::class_def::is_exception_class(&c)
+            || c.bases.iter().any(|b| match b {
+                crate::ExprType::Name(n) => n.id == "Protocol",
+                crate::ExprType::Subscript(s) => {
+                    matches!(s.value.as_ref(), crate::ExprType::Name(n) if n.id == "Protocol")
+                }
+                _ => false,
+            })
+        {
             continue;
         }
         let t: Vec<String> = c
