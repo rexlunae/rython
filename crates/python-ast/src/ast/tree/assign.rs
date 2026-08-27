@@ -473,7 +473,7 @@ impl<'a> CodeGen for Assign {
                     ) {
                         // A container or class instance has no PyValue
                         // representation — the store cannot round-trip
-                        // through the boxed global (issue #115 scope).
+                        // through the boxed global (issue #189 scope).
                         // At MODULE scope (init-time control flow — the
                         // emscripten `_fetcher = _StreamingFetcher()`
                         // branch, behind an always-false worker check)
@@ -498,7 +498,7 @@ impl<'a> CodeGen for Assign {
                                  representation (a container or class instance); \
                                  a BOXED mutable module global holds scalars, \
                                  strings, and None — rython refuses to silently \
-                                 ignore the write (issue #115)",
+                                 ignore the write (issue #189)",
                                 name.id
                             )
                             .into());

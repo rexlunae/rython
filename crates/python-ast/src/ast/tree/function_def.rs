@@ -979,8 +979,8 @@ impl FunctionDef {
         {
             options.definition_warnings.borrow_mut().push(format!(
                 "function `{}` writes to module-level name `{name}`: the write is \
-                 dropped (issue #115 — rython has no mutable module state visible \
-                 to functions)",
+                 dropped (the §5.1 boxed-global divergence — rython has no \
+                 mutable module state visible to functions)",
                 self.name
             ));
         }
