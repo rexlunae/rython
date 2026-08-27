@@ -206,6 +206,20 @@ impl NdArray {
     /// Elementwise binary op over two **same-shape** arrays (already
     /// broadcast to a common shape by the caller).
     pub(crate) fn binary_same_shape(op: BinOp, a: &NdArray, b: &NdArray) -> NdArray {
+        // numpy's true_divide ALWAYS returns float64 when any operand is an
+        // integer (and float64 for bool+bool); it never performs integer
+        // division. Handle that before the general dtype dispatch.
+        if matches!(op, BinOp::Div) {
+            let any_int = matches!(a.dtype, Dtype::Int32 | Dtype::Int64)
+                || matches!(b.dtype, Dtype::Int32 | Dtype::Int64);
+            let both_bool = matches!((a.dtype, b.dtype), (Dtype::Bool, Dtype::Bool));
+            if any_int || both_bool {
+                let a = a.astype(Dtype::Float64);
+                let b = b.astype(Dtype::Float64);
+                let out = engine::binary_f64(op, a.f64(), b.f64());
+                return NdArray::new(a.shape.clone(), Dtype::Float64, Data::F64(out));
+            }
+        }
         let out_dtype = if matches!(
             op,
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne

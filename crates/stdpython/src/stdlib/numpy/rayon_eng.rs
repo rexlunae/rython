@@ -53,42 +53,158 @@ fn np_min_f32(a: f32, b: f32) -> f32 {
     }
 }
 
+/// numpy float `%` (npy_remainder via npy_divmod, copied from CPython
+/// 3.5): `m = fmod(a, b)` (Rust float `%` IS fmod) adjusted to the
+/// divisor's sign; a zero result takes the DIVISOR's sign
+/// (`copysign(0, b)` — so `mod(0.0, -2.0)` is `-0.0`); a zero divisor
+/// gives NaN.
 fn np_mod_f64(a: f64, b: f64) -> f64 {
-    a - b * (a / b).floor()
+    let m = a % b;
+    if m != 0.0 {
+        if (b < 0.0) != (m < 0.0) { m + b } else { m }
+    } else {
+        f64::copysign(0.0, b)
+    }
 }
 
 fn np_mod_f32(a: f32, b: f32) -> f32 {
-    a - b * (a / b).floor()
+    let m = a % b;
+    if m != 0.0 {
+        if (b < 0.0) != (m < 0.0) { m + b } else { m }
+    } else {
+        f32::copysign(0.0, b)
+    }
 }
 
+/// numpy float `//` (npy_floor_divide via npy_divmod): `div = (a - mod)/b`
+/// with the fmod remainder adjusted to the divisor's sign — NOT plain
+/// `floor(a/b)` (e.g. `floor_divide(1.0, 0.1)` is 9.0, while
+/// `floor(1.0/0.1)` = floor(10.0) is 10.0). A zero divisor yields `a/b`
+/// (inf/nan). Exact-zero results take the sign of `a/b`, matching the
+/// arm64 numpy build (whose FMA-contracted divmod produces +0.0 for
+/// `floor_divide(-1.0, -2.0)`); `floor(a/b)` agrees there too.
 fn np_floor_div_f64(a: f64, b: f64) -> f64 {
-    (a / b).floor()
+    if b == 0.0 {
+        return a / b;
+    }
+    let m = a % b;
+    let mut div = (a - m) / b;
+    if m != 0.0 && (b < 0.0) != (m < 0.0) {
+        div -= 1.0;
+    }
+    if div == 0.0 {
+        div = f64::copysign(0.0, a / b);
+    }
+    div
 }
 
 fn np_floor_div_f32(a: f32, b: f32) -> f32 {
-    (a / b).floor()
+    if b == 0.0 {
+        return a / b;
+    }
+    let m = a % b;
+    let mut div = (a - m) / b;
+    if m != 0.0 && (b < 0.0) != (m < 0.0) {
+        div -= 1.0;
+    }
+    if div == 0.0 {
+        div = f32::copysign(0.0, a / b);
+    }
+    div
 }
 
 fn np_int_pow(a: i64, b: i64) -> i64 {
-    if b >= 0 {
-        a.wrapping_pow(b as u32)
-    } else {
-        (a as f64).powi(b as i32) as i64
+    if b < 0 {
+        // numpy raises for ANY negative integer exponent (scalar or per
+        // element); it never computes int ** negative.
+        panic!(
+            "{}",
+            crate::PyException::new(
+                "ValueError",
+                "Integers to negative integer powers are not allowed."
+            )
+        );
     }
+    a.wrapping_pow(b as u32)
 }
 
 fn np_int32_pow(a: i32, b: i32) -> i32 {
-    if b >= 0 {
-        a.wrapping_pow(b as u32)
+    if b < 0 {
+        panic!(
+            "{}",
+            crate::PyException::new(
+                "ValueError",
+                "Integers to negative integer powers are not allowed."
+            )
+        );
+    }
+    a.wrapping_pow(b as u32)
+}
+
+
+/// numpy int `//` (floor division) — see scalar.rs; identical semantics.
+fn np_int_floor_div(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0;
+    }
+    let q = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    if r != 0 && (r < 0) != (b < 0) {
+        q.wrapping_sub(1)
     } else {
-        (a as f64).powi(b) as i32
+        q
     }
 }
 
-fn div_zero_int(ty: &str) -> ! {
+/// numpy int `%` (Python mod: sign of the divisor) — see scalar.rs.
+fn np_int_mod(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0;
+    }
+    let r = a.wrapping_rem(b);
+    if r != 0 && (r < 0) != (b < 0) {
+        r.wrapping_add(b)
+    } else {
+        r
+    }
+}
+
+fn np_int32_floor_div(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        return 0;
+    }
+    let q = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    if r != 0 && (r < 0) != (b < 0) {
+        q.wrapping_sub(1)
+    } else {
+        q
+    }
+}
+
+fn np_int32_mod(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        return 0;
+    }
+    let r = a.wrapping_rem(b);
+    if r != 0 && (r < 0) != (b < 0) {
+        r.wrapping_add(b)
+    } else {
+        r
+    }
+}
+
+/// True-divide on integer kernels is unreachable through the numpy API:
+/// `binary_same_shape` promotes int/bool division to float64 first (numpy
+/// always returns float64 for integer true_divide). A direct engine call is
+/// an internal bug — panic loudly rather than silently truncate.
+fn int_div_unreachable<T>(_a: T, _b: T) -> T {
     panic!(
         "{}",
-        crate::PyException::new("ZeroDivisionError", format!("integer {ty} by zero"))
+        crate::PyException::new(
+            "TypeError",
+            "integer true_divide must be promoted to float64 (numpy semantics)"
+        )
     )
 }
 
@@ -114,34 +230,20 @@ fn par_un_vec<T: Copy + Send + Sync, F: Fn(T) -> T + Sync>(a: &[T], f: F) -> Vec
 // ---------------------------------------------------------------------------
 
 macro_rules! binary_parallel {
-    ($name:ident, $t:ty, $mod:expr, $max:expr, $min:expr, $floordiv:expr, $pow:expr, $mod_fn:expr, $zero_msg:expr, $zero:expr) => {
+    ($name:ident, $t:ty, $mod:expr, $max:expr, $min:expr, $div:expr, $floordiv:expr, $mod_fn:expr, $pow:expr) => {
         pub(crate) fn $name(op: BinOp, a: &[$t], b: &[$t]) -> Vec<$t> {
             debug_assert_eq!(a.len(), b.len());
             match op {
                 BinOp::Add => par_bin_vec(a, b, |x, y| x + y),
                 BinOp::Sub => par_bin_vec(a, b, |x, y| x - y),
                 BinOp::Mul => par_bin_vec(a, b, |x, y| x * y),
-                BinOp::Div => par_bin_vec(a, b, |x, y| {
-                    if y == $zero {
-                        div_zero_int($zero_msg)
-                    } else {
-                        x / y
-                    }
-                }),
-                BinOp::FloorDiv => par_bin_vec(a, b, |x, y| {
-                    if y == $zero {
-                        div_zero_int($zero_msg)
-                    } else {
-                        $floordiv(x, y)
-                    }
-                }),
-                BinOp::Mod => par_bin_vec(a, b, |x, y| {
-                    if y == $zero {
-                        div_zero_int($zero_msg)
-                    } else {
-                        $mod_fn(x, y)
-                    }
-                }),
+                // numpy edge-case semantics per type (see scalar.rs):
+                // floats divide by zero with IEEE results, ints return 0
+                // for floordiv/mod by zero, int true_divide is promoted
+                // to float64 by the caller.
+                BinOp::Div => par_bin_vec(a, b, $div),
+                BinOp::FloorDiv => par_bin_vec(a, b, $floordiv),
+                BinOp::Mod => par_bin_vec(a, b, $mod_fn),
                 BinOp::Pow => par_bin_vec(a, b, $pow),
                 BinOp::Max => par_bin_vec(a, b, $max),
                 BinOp::Min => par_bin_vec(a, b, $min),
@@ -161,22 +263,28 @@ macro_rules! binary_parallel {
 }
 
 binary_parallel!(
-    binary_f64, f64, "float64", np_max_f64, np_min_f64, np_floor_div_f64,
-    |a: f64, b: f64| a.powf(b), np_mod_f64, "float64 division", 0.0
+    binary_f64, f64, "float64", np_max_f64, np_min_f64,
+    |x: f64, y: f64| x / y, np_floor_div_f64, np_mod_f64,
+    |a: f64, b: f64| a.powf(b)
 );
 binary_parallel!(
-    binary_f32, f32, "float32", np_max_f32, np_min_f32, np_floor_div_f32,
-    |a: f32, b: f32| a.powf(b), np_mod_f32, "float32 division", 0.0
+    binary_f32, f32, "float32", np_max_f32, np_min_f32,
+    |x: f32, y: f32| x / y, np_floor_div_f32, np_mod_f32,
+    |a: f32, b: f32| a.powf(b)
 );
 binary_parallel!(
     binary_i64, i64, "int64", |a: i64, b: i64| a.max(b), |a: i64, b: i64| a.min(b),
-    |a: i64, b: i64| a.div_euclid(b), np_int_pow,
-    |a: i64, b: i64| a.rem_euclid(b), "integer division", 0
+    int_div_unreachable,
+    np_int_floor_div,
+    np_int_mod,
+    np_int_pow
 );
 binary_parallel!(
     binary_i32, i32, "int32", |a: i32, b: i32| a.max(b), |a: i32, b: i32| a.min(b),
-    |a: i32, b: i32| a.div_euclid(b), np_int32_pow,
-    |a: i32, b: i32| a.rem_euclid(b), "integer division", 0
+    int_div_unreachable,
+    np_int32_floor_div,
+    np_int32_mod,
+    np_int32_pow
 );
 
 pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool]) -> Vec<bool> {
@@ -360,6 +468,9 @@ mod tests {
             BinOp::Add,
             BinOp::Sub,
             BinOp::Mul,
+            BinOp::Div,
+            BinOp::FloorDiv,
+            BinOp::Mod,
             BinOp::Pow,
             BinOp::Max,
             BinOp::Min,
