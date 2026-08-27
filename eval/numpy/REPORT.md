@@ -444,16 +444,45 @@ runs a triple loop; 0.02x is the expected gap and not a defect.
 
 ## Documentation and coverage observations
 
-- **`examples/02-gpu-numpy/README.md` is stale in rython's favour.** It
-  says the pi estimate differs in the last digits because "real numpy
-  reduces with pairwise summation, rython's scalar engine accumulates
-  sequentially", and prints two different numbers. `reduce.rs` now
-  replicates `npy_pairwise_sum` exactly, and the shipped example is
-  byte-identical today:
+- **`examples/02-gpu-numpy/README.md` is one commit out of date, in
+  rython's favour.** It says the pi estimate differs in the last digits
+  because "real numpy reduces with pairwise summation, rython's scalar
+  engine accumulates sequentially", and prints two numbers:
+
   ```
-  CPython:  pi ~= 3.14147731828716
-  rython:   pi ~= 3.14147731828716
+  pi ~= 3.14147731828716            # CPython + numpy
+  pi ~= 3.141477318287153           # the rython binary
   ```
+
+  Today the shipped example matches CPython byte-for-byte —
+  `pi ~= 3.14147731828716` from both. That is not a measurement
+  disagreement with whoever wrote the README; it is the documented effect
+  of a fix that landed the day after:
+
+  | | |
+  |---|---|
+  | `07a4598` (2026-08-25) | the example and its README are added |
+  | `23f2ded` (2026-08-26) | `fix(stdpython): numpy predicates, pairwise reductions, weak scalar promotion (closes #175, #174, #172)` |
+
+  [#174](https://github.com/rexlunae/rython/issues/174) was exactly
+  "sum/mean/std use sequential summation, low-bit differences vs numpy's
+  pairwise summation". Reproducing the old engine confirms the README's
+  number was right when written — a strict left-to-right accumulation of
+  the same `ys` gives `3.141477318287153` to the digit, while numpy's
+  pairwise reduction gives `3.14147731828716`:
+
+  ```python
+  acc = 0.0
+  for v in ys.tolist():      # what the pre-#174 scalar engine did
+      acc += v
+  4.0 * (acc / n)            # -> 3.141477318287153  (the README's rython line)
+  4.0 * np.mean(ys)          # -> 3.14147731828716   (the README's CPython line)
+  ```
+
+  So the README documents a divergence that `23f2ded` removed, and the
+  match measured here is evidence that fix works. The gap is ~7e-15
+  relative — the "final couple of digits" the README describes — not a
+  large difference. Only the prose and the second number need updating.
   (`--help` output matches byte-for-byte too, and `--gpu` fails loudly as
   documented.)
 - **`ndarray.rs` has no unit tests.** The numpy module has 22 tests, all
@@ -465,20 +494,44 @@ runs a triple loop; 0.02x is the expected gap and not a defect.
   the deliberate one (A10). §10's one-line mention ("`numpy` (a sizable
   subset …)") is all the spec says about it.
 
+## Filed issues
+
+Every finding below is filed. The letters are this report's section
+labels.
+
+| # | issue | findings |
+|---|---|---|
+| [#192](https://github.com/rexlunae/rython/issues/192) | negative slice bounds are clamped to 0 | A8 |
+| [#193](https://github.com/rexlunae/rython/issues/193) | `dtype=` generates invalid Rust | C1 |
+| [#194](https://github.com/rexlunae/rython/issues/194) | printing an exponent-mode float array panics | A-panic |
+| [#195](https://github.com/rexlunae/rython/issues/195) | float array printing diverges (precision, padding, sign, inf/nan, wrapping, summarization) | A1–A6 |
+| [#196](https://github.com/rexlunae/rython/issues/196) | `np.std(a, 1)` reads the positional as `ddof`, not `axis` | A9 |
+| [#197](https://github.com/rexlunae/rython/issues/197) | `a.shape` prints `[3]` instead of `(3,)` | A7 |
+| [#198](https://github.com/rexlunae/rython/issues/198) | `RYPY_NUMPY_BACKEND` is a silent no-op | B1 |
+| [#199](https://github.com/rexlunae/rython/issues/199) | `auto` prefers rayon, which is slower at every measured size | backend comparison |
+| [#200](https://github.com/rexlunae/rython/issues/200) | reduction buffer copy and scalar-operand materialization | S1–S3 |
+| [#201](https://github.com/rexlunae/rython/issues/201) | operators and list arguments move their operands | C2, C3 |
+| [#203](https://github.com/rexlunae/rython/issues/203) | `np.ndarray`-returning function's result is typed `PyValue` | C4 |
+| [#204](https://github.com/rexlunae/rython/issues/204) | `a.astype`/`a.T`/`a.dtype`/`np.random` convert then fail in rustc | C5, C6, C8 |
+| [#205](https://github.com/rexlunae/rython/issues/205) | numpy errors panic instead of raising; `IndexError` text differs | D1–D3 |
+| [#206](https://github.com/rexlunae/rython/issues/206) | `np.dot` returns an array for the 1-D × 1-D case | C7 |
+| [#207](https://github.com/rexlunae/rython/issues/207) | spec §12 ledger and gpu-numpy README | A10, A11, docs |
+| [#208](https://github.com/rexlunae/rython/issues/208) | no `rust-version` floor (does not build on 1.94) | environment note |
+
 ## Suggested priority
 
-1. **A8 (negative slice bounds)** — silently returns the wrong data.
-2. **C1 (`dtype=` generates invalid Rust)** — one-token fix, unblocks the
+1. **#192 (negative slice bounds)** — silently returns the wrong data.
+2. **#193 (`dtype=` generates invalid Rust)** — one-token fix, unblocks the
    entire dtype surface.
-3. **A1–A6 (float formatting) and the `exp mode implies e` panic** — one
-   area, one rewrite of `np_float_cell`/`float_layout` against numpy's
+3. **#195 and #194 (float formatting and its panic)** — one area, one
+   rewrite of `np_float_cell`/`float_layout` against numpy's
    `FloatingFormat`, and it converts most of the DIVERGE column to PASS.
    Needs the unit tests `ndarray.rs` currently lacks.
-4. **B1 (`RYPY_NUMPY_BACKEND`)** — either implement it or delete the three
+4. **#198 (`RYPY_NUMPY_BACKEND`)** — either implement it or delete the five
    places that promise it.
-5. **S1/S2 (reduction copy, scalar broadcast)** — the two changes that
-   would move array throughput most, and neither affects semantics.
-6. **A9 (`std(a, 1)` positional)** — reject the positional form loudly
+5. **#200 (reduction copy, scalar broadcast)** — the changes that would
+   move array throughput most, and none affects semantics.
+6. **#196 (`std(a, 1)` positional)** — reject the positional form loudly
    rather than reinterpreting it.
-7. **C4 (ndarray-returning helpers)** — the ergonomic blocker for real
+7. **#203 (ndarray-returning helpers)** — the ergonomic blocker for real
    numpy code.
