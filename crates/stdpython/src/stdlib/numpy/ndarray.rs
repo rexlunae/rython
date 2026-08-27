@@ -107,6 +107,50 @@ fn cmp_elems<T: PartialOrd + Copy>(op: BinOp, a: &[T], b: &[T]) -> Vec<bool> {
         .collect()
 }
 
+/// Predicate semantics per dtype, matching numpy (`np.isfinite/isinf/isnan`
+/// and `np.logical_not`). Ints are always finite and never inf/nan;
+/// `logical_not` inverts truthiness — NaN is truthy, so `logical_not(NaN)`
+/// is False and only exact `0.0`/`0` map to True.
+fn pred_f64(op: UnOp, x: f64) -> bool {
+    match op {
+        UnOp::IsFinite => x.is_finite(),
+        UnOp::IsInf => x.is_infinite(),
+        UnOp::IsNan => x.is_nan(),
+        UnOp::LogicalNot => !(x != 0.0),
+        _ => unreachable!("pred_f64 called with non-predicate op"),
+    }
+}
+
+fn pred_f32(op: UnOp, x: f32) -> bool {
+    match op {
+        UnOp::IsFinite => x.is_finite(),
+        UnOp::IsInf => x.is_infinite(),
+        UnOp::IsNan => x.is_nan(),
+        UnOp::LogicalNot => !(x != 0.0),
+        _ => unreachable!("pred_f32 called with non-predicate op"),
+    }
+}
+
+fn pred_int(op: UnOp, x: i64) -> bool {
+    match op {
+        UnOp::IsFinite => true,
+        UnOp::IsInf => false,
+        UnOp::IsNan => false,
+        UnOp::LogicalNot => x == 0,
+        _ => unreachable!("pred_int called with non-predicate op"),
+    }
+}
+
+fn pred_bool(op: UnOp, x: bool) -> bool {
+    match op {
+        UnOp::IsFinite => true,
+        UnOp::IsInf => false,
+        UnOp::IsNan => false,
+        UnOp::LogicalNot => !x,
+        _ => unreachable!("pred_bool called with non-predicate op"),
+    }
+}
+
 impl NdArray {
     pub(crate) fn new(shape: Vec<usize>, dtype: Dtype, data: Data) -> NdArray {
         let size: usize = shape.iter().product();
@@ -283,10 +327,26 @@ impl NdArray {
 
     /// Elementwise unary op.
     pub(crate) fn unary(op: UnOp, a: &NdArray) -> NdArray {
-        let out_dtype = match op {
-            UnOp::IsFinite | UnOp::IsInf | UnOp::IsNan | UnOp::LogicalNot => Dtype::Bool,
-            _ => a.dtype,
-        };
+        // Predicates produce BOOL arrays regardless of the input dtype; the
+        // typed engine buffers can't hold bools (same shape as the binary
+        // comparison ops), so evaluate them directly here. numpy semantics
+        // (verified against python3): ints are always finite, never
+        // inf/nan; `logical_not(x)` is truthiness-inverted, so NaN is
+        // truthy → False and only exact 0.0/0 is True.
+        if matches!(
+            op,
+            UnOp::IsFinite | UnOp::IsInf | UnOp::IsNan | UnOp::LogicalNot
+        ) {
+            let bools: Vec<bool> = match a.dtype {
+                Dtype::Float64 => a.f64().iter().map(|&x| pred_f64(op, x)).collect(),
+                Dtype::Float32 => a.f32().iter().map(|&x| pred_f32(op, x)).collect(),
+                Dtype::Int64 => a.i64().iter().map(|&x| pred_int(op, x)).collect(),
+                Dtype::Int32 => a.i32().iter().map(|&x| pred_int(op, x as i64)).collect(),
+                Dtype::Bool => a.bool().iter().map(|&x| pred_bool(op, x)).collect(),
+            };
+            return NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(bools));
+        }
+        let out_dtype = a.dtype;
         match a.dtype {
             Dtype::Float64 => {
                 let out = engine::unary_f64(op, a.f64());

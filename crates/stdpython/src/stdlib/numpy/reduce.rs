@@ -35,17 +35,65 @@ fn vals(a: &NdArray) -> Vec<f64> {
     a.as_f64()
 }
 
-/// `np.sum(a)` — full reduction, numpy semantics: NaN propagates, the
-/// result is f64 (see module docs).
-pub fn sum(a: NdArray) -> f64 {
-    let mut acc = 0.0f64;
-    for x in vals(&a) {
-        acc += x;
+/// numpy's `npy_pairwise_sum` (loops_utils.h.src), replicated exactly so
+/// results are bit-for-bit identical: base cases `< 8` (accumulator starts
+/// at `-0.0` so all-`-0.0` sums stay `-0.0`) and `<= 128` (eight parallel
+/// accumulators, combined `((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7))`, tail
+/// sequential); larger inputs recurse on `n/2 - (n/2 % 8)`.
+fn pairwise_sum(v: &[f64]) -> f64 {
+    let n = v.len();
+    if n < 8 {
+        let mut res = -0.0f64;
+        for &x in v {
+            res += x;
+        }
+        res
+    } else if n <= 128 {
+        let mut r = [0.0f64; 8];
+        for k in 0..8 {
+            r[k] = v[k];
+        }
+        let mut i = 8;
+        while i < n - (n % 8) {
+            for k in 0..8 {
+                r[k] += v[i + k];
+            }
+            i += 8;
+        }
+        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        while i < n {
+            res += v[i];
+            i += 1;
+        }
+        res
+    } else {
+        let mut n2 = n / 2;
+        n2 -= n2 % 8;
+        pairwise_sum(&v[..n2]) + pairwise_sum(&v[n2..])
     }
-    acc
 }
 
-/// `np.prod(a)`.
+/// `np.sum`'s reduce value: numpy's `add.reduce` seeds the accumulator with
+/// the identity `0.0` and adds the pairwise sum to it (`0.0 + s` — matters
+/// only for the sign of a `-0.0` result). An empty array yields the
+/// identity `0.0` (numpy never calls the loop for n == 0).
+fn reduce_sum(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        0.0
+    } else {
+        0.0 + pairwise_sum(v)
+    }
+}
+
+/// `np.sum(a)` — full reduction, numpy semantics: NaN propagates, the
+/// result is f64 (see module docs), computed with numpy's pairwise
+/// summation so the value matches `python3` bit-for-bit.
+pub fn sum(a: NdArray) -> f64 {
+    reduce_sum(&vals(&a))
+}
+
+/// `np.prod(a)` — numpy's multiply reduce is a plain sequential loop (no
+/// pairwise), so the sequential order below is already bit-identical.
 pub fn prod(a: NdArray) -> f64 {
     let mut acc = 1.0f64;
     for x in vals(&a) {
@@ -54,20 +102,11 @@ pub fn prod(a: NdArray) -> f64 {
     acc
 }
 
-/// `np.mean(a)`.
+/// `np.mean(a)` — numpy: `sum / n` (true division; an empty array gives
+/// `0.0 / 0.0 = nan`, matching numpy's warning-plus-nan).
 pub fn mean(a: NdArray) -> f64 {
     let v = vals(&a);
-    if v.is_empty() {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "mean of empty array")
-        );
-    }
-    let mut acc = 0.0f64;
-    for x in &v {
-        acc += x;
-    }
-    acc / v.len() as f64
+    reduce_sum(&v) / v.len() as f64
 }
 
 /// `np.max(a)` — NaN-propagating, like numpy.
@@ -107,29 +146,21 @@ pub fn std(a: NdArray, ddof: f64) -> f64 {
     var(a, ddof).sqrt()
 }
 
-/// `np.var(a, ddof=0)` — population variance (numpy default).
+/// `np.var(a, ddof=0)` — population variance (numpy default). Mirrors
+/// numpy 2's `_methods._var` exactly: pairwise-summed mean, pairwise sum of
+/// squared deviations, divided by `max(n - ddof, 0)` (a zero/negative
+/// degree-of-freedom count yields `inf`/`nan` like numpy, with its
+/// warning).
 pub fn var(a: NdArray, ddof: f64) -> f64 {
     let v = vals(&a);
     let n = v.len() as f64;
-    if v.is_empty() || n == ddof {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "degrees of freedom must be smaller than sample size")
-        );
-    }
-    let m = {
-        let mut acc = 0.0f64;
-        for x in &v {
-            acc += x;
-        }
-        acc / n
-    };
-    let mut acc = 0.0f64;
-    for x in &v {
-        let d = x - m;
-        acc += d * d;
-    }
-    acc / (n - ddof)
+    // mean = sum / n (0.0 / 0.0 = nan for an empty array, like numpy)
+    let m = reduce_sum(&v) / n;
+    // sum of squared deviations from the mean, pairwise
+    let squares: Vec<f64> = v.iter().map(|&x| (x - m) * (x - m)).collect();
+    let s2 = reduce_sum(&squares);
+    let rcount = (v.len() as f64 - ddof).max(0.0);
+    s2 / rcount
 }
 
 /// `np.all(a)` — true when every element is truthy.
