@@ -1694,12 +1694,57 @@ impl<'a> CodeGen for Call {
 
         // A method call on a receiver that is a BOXED-PyValue FIELD CHAIN
         // (`(self._response_mut().body).close()` — the emscripten response
-        // where `body` is a PyValue field): the method has no static shape —
-        // the call lowers to the boxed None (dynamic-method divergence).
-        // Plain PyValue-typed NAMES are exempt — their dynamic protocol
-        // methods (is_truthy, py_get, as_*, ...) resolve normally.
+        // where `body` is a PyValue field) OR a PyValue-typed NAME
+        // (`conn.data_to_send()` where conn is a boxed h2 connection —
+        // issue #137 round 22): the method has no static shape — the call
+        // lowers to the boxed None (dynamic-method divergence). The boxed
+        // value's own PROTOCOL surface stays exempt on name receivers —
+        // is_*/as_*/py_* and the rewrite-table names the later pipeline
+        // lowers (decode, encode, split, strip, ...) resolve normally.
+        let pyvalue_protocol_method = |name: &str| {
+            name.starts_with("is_")
+                || name.starts_with("as_")
+                || name.starts_with("py_")
+                || matches!(
+                    name,
+                    "decode" | "encode" | "into_bytes_like" | "clone" | "to_string"
+                        | "split" | "rsplit" | "strip" | "lstrip" | "rstrip" | "join"
+                        | "lower" | "upper" | "startswith" | "endswith" | "replace"
+                        | "format" | "count" | "find" | "group" | "items" | "keys"
+                        | "values" | "get" | "append" | "pop" | "read" | "readline"
+                        | "close" | "getvalue" | "write"
+                )
+        };
+        // A NAME receiver drops only on the PRECISE pattern: the name is
+        // bound to a call into an EXTERNAL module, which lowered to the
+        // boxed None (`conn = h2.connection.H2Connection(...)`, `log =
+        // logging.getLogger(...)`). A merely-unknown PyValue-typed name
+        // (a socket, a generic parameter, a class) keeps its calls — the
+        // TypeInfo::PyValue signal alone means "unknown", not "boxed".
+        let name_is_dropped_external_value = |e: &ExprType| -> bool {
+            let ExprType::Name(n) = e else { return false };
+            let Some(SymbolTableNode::Assign {
+                value: ExprType::Call(c),
+                ..
+            }) = symbols.get(&n.id)
+            else {
+                return false;
+            };
+            match c.func.as_ref() {
+                ExprType::Attribute(a) => crate::ast::tree::attribute::external_module_root(
+                    &a.value, &symbols, &options,
+                )
+                .is_some(),
+                ExprType::Name(f) => crate::ast::tree::import::resolves_to_external_import(
+                    &f.id, &options, &symbols,
+                ),
+                _ => false,
+            }
+        };
         if let ExprType::Attribute(attr) = self.func.as_ref()
-            && matches!(attr.value.as_ref(), ExprType::Attribute(_))
+            && (matches!(attr.value.as_ref(), ExprType::Attribute(_))
+                || (!pyvalue_protocol_method(&attr.attr)
+                    && name_is_dropped_external_value(attr.value.as_ref())))
             && crate::ast::tree::attribute::receiver_is_pyvalue(
                 &attr.value,
                 &ctx,
