@@ -10212,3 +10212,80 @@ fn annotated_empty_dict_keeps_types_inside_loop() {
         out
     );
 }
+
+/// Issue #137 round 20 (urllib3's RequestMethods): a plain-struct class
+/// subclassed ONLY cross-module emits an ACCESSOR-ONLY companion trait —
+/// the subclass modules' ancestor impls and supertrait bounds name
+/// `{Name}Trait`, so it must exist — while its methods stay INHERENT
+/// (trait-default methods would re-route the subclasses' inherited-call
+/// resolution).
+#[test]
+fn cross_module_only_base_emits_accessor_only_trait() {
+    let mixin_src = "class Mixin:\n    def __init__(self):\n        self.headers = \"\"\n\n\
+                     \x20   def ask(self) -> str:\n        return self.headers\n";
+    // Convert the DEFINING module with the subclassing module visible in
+    // module_defs and this module's own path set.
+    let user_mod = parse(
+        "from mixmod import Mixin\n\nclass Manager(Mixin):\n    def own(self) -> int:\n        return 1\n",
+        "user.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["user".to_string()], std::rc::Rc::new(user_mod));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        this_module_path: vec!["mixmod".to_string()],
+        ..Default::default()
+    };
+    let module = parse(mixin_src, "mixmod.py").unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            CodeGenContext::Module("mixmod".to_string()),
+            options,
+            symbols,
+        )
+        .expect("converts")
+        .to_string();
+    assert!(
+        out.contains("pub trait MixinTrait"),
+        "the cross-module-only base must emit its trait: {}",
+        out
+    );
+    assert!(
+        out.contains("fn headers (& self)"),
+        "the trait carries the field accessors: {}",
+        out
+    );
+    let trait_block = out
+        .split("pub trait MixinTrait")
+        .nth(1)
+        .and_then(|rest| rest.split("impl MixinTrait for Mixin").next())
+        .unwrap_or("");
+    assert!(
+        !trait_block.contains("fn ask"),
+        "methods must NOT become trait defaults (accessor-only): {}",
+        out
+    );
+    assert!(
+        out.contains("fn ask (& self ,)"),
+        "the method stays inherent on the struct: {}",
+        out
+    );
+}
+
+/// The supertrait bound on a subclass of a CROSS-MODULE base names the
+/// base's trait by its crate path — the subclass module imports the
+/// STRUCT, not the trait (`PoolManagerTrait:
+/// crate::_request_methods::RequestMethodsTrait`, urllib3).
+#[test]
+fn cross_module_base_supertrait_is_named_by_crate_path() {
+    let src = "from animals import Animal\n\nclass Keeper(Animal):\n    def feed(self) -> int:\n        return 1\n";
+    let out = compile_with_options(src, "keeper.py", cross_module_subclass_options())
+        .expect("converts");
+    assert!(
+        out.contains("pub trait KeeperTrait : crate :: animals :: AnimalTrait"),
+        "the cross-module supertrait must be crate-path-qualified: {}",
+        out
+    );
+}

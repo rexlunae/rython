@@ -2748,6 +2748,18 @@ impl CodeGen for ClassDef {
         // ---- Trait machinery (inheritance hierarchies only) ----
         let trait_stream = if in_hierarchy {
             self.emit_trait(&base, &fields, &methods, &options, &symbols)?
+        } else if options.with_std_python
+            && crate::ast::tree::module::class_subclassed_crate_wide(&self.name, &options)
+        {
+            // A plain-struct class subclassed only CROSS-MODULE
+            // (urllib3's RequestMethods): the subclass modules' ancestor
+            // impls and supertrait bounds name `{Name}Trait`, so the
+            // trait must exist — but ACCESSOR-ONLY. Flipping the full
+            // machinery on (methods as trait defaults) re-routes the
+            // subclasses' inherited-call inference, measured at ~2,700
+            // errors in issue #137 round 18; the class's methods stay
+            // inherent and dispatch exactly as before.
+            self.emit_accessor_trait(&fields)
         } else {
             quote!()
         };
@@ -2818,6 +2830,43 @@ impl ClassDef {
     ///   ancestor's field accessors (walking the embedded `__rython_base`
     ///   chain) and the class's overrides of the ancestor's methods, written
     ///   against the concrete struct.
+    /// The accessor-only trait for a class subclassed only cross-module
+    /// (see the call site): field accessors, no method defaults, no base
+    /// accessors (a class with a base is `in_hierarchy` and takes the
+    /// full machinery instead). The declarations mirror the subclass-side
+    /// ancestor impls, which iterate the same `own_fields` in this
+    /// module's scope — the two sides cannot drift.
+    fn emit_accessor_trait(&self, fields: &[(String, TokenStream)]) -> TokenStream {
+        let class_name = crate::safe_ident(&self.name);
+        let trait_name = format_ident!("{}Trait", self.name);
+        let mut decls = TokenStream::new();
+        let mut impls = TokenStream::new();
+        for (fname, fty) in fields {
+            let f = crate::safe_ident(fname);
+            let f_mut = format_ident!("{}_mut", fname);
+            decls.extend(quote! {
+                fn #f(&self) -> #fty;
+                fn #f_mut(&mut self) -> &mut #fty;
+            });
+            impls.extend(quote! {
+                fn #f(&self) -> #fty {
+                    self.#f.clone()
+                }
+                fn #f_mut(&mut self) -> &mut #fty {
+                    &mut self.#f
+                }
+            });
+        }
+        quote! {
+            pub trait #trait_name {
+                #decls
+            }
+            impl #trait_name for #class_name {
+                #impls
+            }
+        }
+    }
+
     fn emit_trait(
         &self,
         base: &Option<ClassDef>,
@@ -2989,7 +3038,18 @@ impl ClassDef {
             .filter(|b| chain.get(1).is_some_and(|(c, _, _, _)| c.name == b.name))
             .map(|b| {
                 let b_trait = format_ident!("{}Trait", b.name);
-                quote!(: #b_trait)
+                // A CROSS-MODULE base's trait is named by its crate path
+                // (this module imports the STRUCT, not its trait —
+                // `PoolManagerTrait: crate::_request_methods::
+                // RequestMethodsTrait`, urllib3).
+                match chain.get(1).and_then(|(_, _, _, p)| p.as_ref()) {
+                    Some(path) => {
+                        let segs: Vec<_> =
+                            path.iter().map(|p| crate::safe_ident(p)).collect();
+                        quote!(: crate #(::#segs)* :: #b_trait)
+                    }
+                    None => quote!(: #b_trait),
+                }
             });
         let own_trait = quote! {
             pub trait #trait_name #supertrait {
