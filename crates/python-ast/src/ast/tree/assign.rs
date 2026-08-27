@@ -3,9 +3,9 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableNode, SymbolTableScopes,
-    extraction_failure,
+use crate::{extraction_failure, 
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableNode,
+    SymbolTableScopes,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -29,13 +29,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
             .extract()
             .map_err(|e| extraction_failure("assignment targets", &ob, e))?;
 
-        let python_value = ob
-            .getattr("value")
-            .map_err(|e| extraction_failure("value", &ob, e))?;
+        let python_value = ob.getattr("value").map_err(|e| extraction_failure("value", &ob, e))?;
 
-        let value = python_value
-            .extract()
-            .map_err(|e| extraction_failure("python_value", &ob, e))?;
+        let value = python_value.extract().map_err(|e| extraction_failure("python_value", &ob, e))?;
 
         Ok(Assign {
             targets: targets,
@@ -54,10 +50,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
 /// `pub type` AND promoted a static of the same name (E0428), or skipped
 /// the store without ever declaring the alias (E0412).
 pub(crate) fn is_builtin_scalar_name(name: &str) -> bool {
-    matches!(
-        name,
-        "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
-    )
+    matches!(name, "str" | "bytes" | "bytearray" | "int" | "float" | "bool")
 }
 
 /// When `value` is a builtin-scalar type NAME, the Rust type its alias
@@ -91,8 +84,13 @@ impl<'a> CodeGen for Assign {
         // find_symbols has no options, so the cross-module resolution
         // (issue #123) can only happen when the factory's fn is defined in
         // this module; the codegen pass has options and covers the rest.
-        if let Some(synth) = crate::try_lru_cache_factory(&self, None, &symbols) {
-            symbols.insert(synth.name.clone(), SymbolTableNode::FunctionDef(synth));
+        if let Some(synth) =
+            crate::try_lru_cache_factory(&self, None, &symbols)
+        {
+            symbols.insert(
+                synth.name.clone(),
+                SymbolTableNode::FunctionDef(synth),
+            );
             return symbols;
         }
         let mut position = 0;
@@ -129,7 +127,9 @@ impl<'a> CodeGen for Assign {
                 if let ExprType::Attribute(attr) = &self.value
                     && let ExprType::Name(m) = attr.value.as_ref()
                     && let Some(canonical) =
-                        crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &attr.attr)
+                        crate::ast::tree::raise_stmt::stdlib_exception_canonical(
+                            &m.id, &attr.attr,
+                        )
                 {
                     symbols.insert(name.id, SymbolTableNode::Alias(canonical.to_string()));
                     continue;
@@ -175,12 +175,10 @@ impl<'a> CodeGen for Assign {
         // Everything about the declaration is validated here, loudly.
         if crate::is_rust_bind_call(&self.value) {
             if !matches!(ctx, CodeGenContext::Module(_)) {
-                return Err(
-                    "rust.bind declarations must be at module level, not inside \
+                return Err("rust.bind declarations must be at module level, not inside \
                             a function or class"
-                        .to_string()
-                        .into(),
-                );
+                    .to_string()
+                    .into());
             }
             if self.targets.len() != 1 || !matches!(self.targets[0], ExprType::Name(_)) {
                 return Err("rust.bind must be assigned to exactly one name"
@@ -218,7 +216,9 @@ impl<'a> CodeGen for Assign {
         // gets) instead of storing a callable value, which the value model
         // cannot represent. find_symbols registered `name` as the function,
         // so call sites already resolve; the assignment itself is consumed.
-        if let Some(synth) = crate::try_lru_cache_factory(&self, Some(&options), &symbols) {
+        if let Some(synth) =
+            crate::try_lru_cache_factory(&self, Some(&options), &symbols)
+        {
             return synth.to_rust(ctx, options, symbols);
         }
 
@@ -315,9 +315,7 @@ impl<'a> CodeGen for Assign {
                     Some(crate::TypeInfo::PyValue) if is_empty_dict => {
                         value = quote!(PyDict::<String, PyValue>::from([]));
                     }
-                    Some(crate::TypeInfo::Vec(inner))
-                        if !matches!(*inner, crate::TypeInfo::PyObject) =>
-                    {
+                    Some(crate::TypeInfo::Vec(inner)) if !matches!(*inner, crate::TypeInfo::PyObject) => {
                         let t = inner.to_rust_type();
                         value = quote!(Vec::<#t>::new());
                     }
@@ -484,12 +482,8 @@ impl<'a> CodeGen for Assign {
                         quote!(#value)
                     } else if matches!(
                         &value_expr,
-                        ExprType::List(_)
-                            | ExprType::Dict(_)
-                            | ExprType::Set(_)
-                            | ExprType::ListComp(_)
-                            | ExprType::DictComp(_)
-                            | ExprType::SetComp(_)
+                        ExprType::List(_) | ExprType::Dict(_) | ExprType::Set(_)
+                            | ExprType::ListComp(_) | ExprType::DictComp(_) | ExprType::SetComp(_)
                     ) || matches!(
                         &value_expr,
                         ExprType::Call(c)
@@ -626,11 +620,11 @@ impl<'a> CodeGen for Assign {
             // (str/bytes) — mutable containers keep the move, so aliasing
             // stays loud (issue #79).
             let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
-            if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
-                && matches!(
-                    crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
-                    crate::TypeInfo::String | crate::TypeInfo::Bytes
-                ));
+                if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
+                    && matches!(
+                        crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
+                        crate::TypeInfo::String | crate::TypeInfo::Bytes
+                    ));
             Ok(match target {
                 ExprType::Name(name) => {
                     // Issue #121: a name holding a boxed PyValue (wider
@@ -657,7 +651,8 @@ impl<'a> CodeGen for Assign {
                         && options.optional_names.contains(&name.id)
                     {
                         quote!(#target_code = Some(#value);)
-                    } else if value_is_str_literal && options.owned_str_literals.contains(&name.id)
+                    } else if value_is_str_literal
+                        && options.owned_str_literals.contains(&name.id)
                     {
                         // Issue #110: a string-literal binding that is later
                         // rebound by a String (`out += "x"`) must be owned
@@ -781,16 +776,16 @@ impl<'a> CodeGen for Assign {
                         (#receiver).py_set_index(#index, __rython_val)?;
                     }))
                 }
-                crate::SubscriptKind::Slice {
-                    lower, upper, step, ..
-                } => {
+                crate::SubscriptKind::Slice { lower, upper, step, .. } => {
                     // Slice assignment (`xs[a:b] = [...]`,
                     // `memoryview(byte_obj)[0:n] = sub` — urllib3's
                     // emscripten fetch loop) replaces a range in place: a
                     // different-length RHS inserts or removes elements. The
                     // runtime's py_slice_assign clamps/negativizes bounds
                     // exactly like reads (issue #153).
-                    let step_is_one = crate::ast::tree::subscript::is_step_one(step.as_deref());
+                    let step_is_one = crate::ast::tree::subscript::is_step_one(
+                        step.as_deref(),
+                    );
                     let receiver = crate::subscript_receiver_place(
                         sub.value.as_ref(),
                         ctx.clone(),
@@ -818,11 +813,7 @@ impl<'a> CodeGen for Assign {
                             (#receiver).py_slice_assign(#lo_tok, #up_tok, #value);
                         }))
                     } else {
-                        let st_tok = step.clone().unwrap().to_rust(
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                        )?;
+                        let st_tok = step.clone().unwrap().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                         Ok(quote!({
                             (#receiver).py_slice_assign_step(#lo_tok, #up_tok, #st_tok, #value)?;
                         }))
@@ -844,14 +835,16 @@ impl<'a> CodeGen for Assign {
             if let ExprType::Attribute(attr) = target {
                 let recv_name = crate::ast::tree::call::root_name(&attr.value);
                 if let Some(root) = &recv_name {
-                    let class_receiver =
-                        matches!(symbols.get(root), Some(crate::SymbolTableNode::ClassDef(_)))
-                            || crate::resolve_class_referenced(root, &symbols, &options).is_some();
-                    let module_receiver = crate::ast::tree::attribute::is_module_path_chain(
-                        &attr.value,
-                        &symbols,
-                        &options,
-                    );
+                    let class_receiver = matches!(
+                        symbols.get(root),
+                        Some(crate::SymbolTableNode::ClassDef(_))
+                    ) || crate::resolve_class_referenced(root, &symbols, &options).is_some();
+                    let module_receiver =
+                        crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value,
+                            &symbols,
+                            &options,
+                        );
                     if class_receiver || module_receiver {
                         options.definition_warnings.borrow_mut().push(format!(
                             "`{}.{} = ...` is dropped: {} attributes are not \
@@ -862,8 +855,7 @@ impl<'a> CodeGen for Assign {
                             if matches!(
                                 symbols.get(root),
                                 Some(crate::SymbolTableNode::ClassDef(_))
-                            ) || crate::resolve_class_referenced(root, &symbols, &options)
-                                .is_some()
+                            ) || crate::resolve_class_referenced(root, &symbols, &options).is_some()
                             {
                                 "class"
                             } else {
@@ -885,10 +877,11 @@ impl<'a> CodeGen for Assign {
                     crate::receiver_class(&attr.value, &ctx, &symbols, &options)
                 && class.is_property_setter(&attr.attr)
             {
-                let recv =
-                    attr.value
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let recv = attr.value.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
                 let setter = crate::safe_ident(&format!("{}_set", attr.attr));
                 return Ok(quote!(#recv.#setter(#value)?;));
             }
@@ -913,9 +906,11 @@ impl<'a> CodeGen for Assign {
                     let mut store_options = options.clone();
                     store_options.narrowed_names =
                         std::rc::Rc::new(std::collections::HashMap::new());
-                    self.targets[0]
-                        .clone()
-                        .to_rust(ctx.clone(), store_options, symbols.clone())?
+                    self.targets[0].clone().to_rust(
+                        ctx.clone(),
+                        store_options,
+                        symbols.clone(),
+                    )?
                 };
                 // An empty-container literal was already rendered with its
                 // pinned element type above (Vec::<T>::new()); reuse it so

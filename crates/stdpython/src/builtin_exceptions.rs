@@ -196,15 +196,9 @@ impl BuiltinException {
             | FileNotFoundError | InterruptedError | IsADirectoryError | NotADirectoryError
             | PermissionError | ProcessLookupError | TimeoutError | URLError | Gaierror
             | Herror | SSLError => OSError,
-            SSLZeroReturnError
-            | SSLWantReadError
-            | SSLWantWriteError
-            | SSLSyscallError
-            | SSLEOFError
-            | SSLCertVerificationError => SSLError,
-            BrokenPipeError
-            | ConnectionAbortedError
-            | ConnectionRefusedError
+            SSLZeroReturnError | SSLWantReadError | SSLWantWriteError | SSLSyscallError
+            | SSLEOFError | SSLCertVerificationError => SSLError,
+            BrokenPipeError | ConnectionAbortedError | ConnectionRefusedError
             | ConnectionResetError => ConnectionError,
             HTTPError | ContentTooShortError => URLError,
             NotImplementedError | RecursionError | PythonFinalizationError => RuntimeError,
@@ -213,17 +207,9 @@ impl BuiltinException {
             UnicodeError => ValueError,
             UnicodeDecodeError | UnicodeEncodeError | UnicodeTranslateError => UnicodeError,
             ExceptionGroup => BaseExceptionGroup,
-            BytesWarning
-            | DeprecationWarning
-            | EncodingWarning
-            | FutureWarning
-            | ImportWarning
-            | PendingDeprecationWarning
-            | ResourceWarning
-            | RuntimeWarning
-            | SyntaxWarning
-            | UnicodeWarning
-            | UserWarning => Warning,
+            BytesWarning | DeprecationWarning | EncodingWarning | FutureWarning | ImportWarning
+            | PendingDeprecationWarning | ResourceWarning | RuntimeWarning | SyntaxWarning
+            | UnicodeWarning | UserWarning => Warning,
         })
     }
 
@@ -260,8 +246,8 @@ impl BuiltinException {
     /// exceptions (OSErrors); each surfaces through that ancestor.
     #[cfg(feature = "std")]
     pub(crate) fn pyo3_err(self, msg: String) -> pyo3::PyErr {
-        use BuiltinException::*;
         use pyo3::exceptions::*;
+        use BuiltinException::*;
         match self {
             BaseException => PyBaseException::new_err(msg),
             Exception => PyException::new_err(msg),
@@ -311,18 +297,9 @@ impl BuiltinException {
             PermissionError => PyPermissionError::new_err(msg),
             ProcessLookupError => PyProcessLookupError::new_err(msg),
             TimeoutError => PyTimeoutError::new_err(msg),
-            URLError
-            | HTTPError
-            | ContentTooShortError
-            | Gaierror
-            | Herror
-            | SSLError
-            | SSLZeroReturnError
-            | SSLWantReadError
-            | SSLWantWriteError
-            | SSLSyscallError
-            | SSLEOFError
-            | SSLCertVerificationError => PyOSError::new_err(msg),
+            URLError | HTTPError | ContentTooShortError | Gaierror | Herror | SSLError
+            | SSLZeroReturnError | SSLWantReadError | SSLWantWriteError | SSLSyscallError
+            | SSLEOFError | SSLCertVerificationError => PyOSError::new_err(msg),
             NotImplementedError => PyNotImplementedError::new_err(msg),
             RecursionError => PyRecursionError::new_err(msg),
             PythonFinalizationError => PyRuntimeError::new_err(msg),

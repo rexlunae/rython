@@ -31,17 +31,16 @@ impl<'a, 'py> FromPyObject<'a, 'py> for AsyncFor {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract target
         let target: ExprType = ob.getattr("target")?.extract()?;
-
+        
         // Extract iter
         let iter: ExprType = ob.getattr("iter")?.extract()?;
-
+        
         // Extract body
         let body: Vec<Statement> = extract_list(&ob, "body", "async for body")?;
-
+        
         // Extract orelse (optional)
-        let orelse: Vec<Statement> =
-            extract_list(&ob, "orelse", "async for orelse").unwrap_or_default();
-
+        let orelse: Vec<Statement> = extract_list(&ob, "orelse", "async for orelse").unwrap_or_default();
+        
         Ok(AsyncFor {
             target,
             iter,
@@ -56,18 +55,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for AsyncFor {
 }
 
 impl Node for AsyncFor {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
 
 impl CodeGen for AsyncFor {
@@ -79,13 +70,8 @@ impl CodeGen for AsyncFor {
         // Process target, iter, body, and orelse
         let symbols = self.target.find_symbols(symbols);
         let symbols = self.iter.find_symbols(symbols);
-        let symbols = self
-            .body
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc));
-        self.orelse
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc))
+        let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
+        self.orelse.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc))
     }
 
     fn to_rust(
@@ -112,9 +98,7 @@ impl CodeGen for AsyncFor {
             has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
-        let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
-            .body
-            .into_iter()
+        let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_tokens = body_tokens?;
@@ -133,19 +117,12 @@ impl CodeGen for AsyncFor {
                 &mut stmts,
                 &mut counter,
             );
-            (
-                quote!(__rython_elt),
-                quote!({ #(#stmts)* #(#body_tokens;)* }),
-            )
+            (quote!(__rython_elt), quote!({ #(#stmts)* #(#body_tokens;)* }))
         } else {
-            let target = self
-                .target
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let target = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             (target, quote!(#(#body_tokens;)*))
         };
-        let iter_expr = self
-            .iter
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let iter_expr = self.iter.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         if !has_else {
             Ok(quote! {
@@ -154,9 +131,7 @@ impl CodeGen for AsyncFor {
                 }
             })
         } else {
-            let else_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
-                .orelse
-                .into_iter()
+            let else_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.orelse.into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_body_tokens = else_body_tokens?;

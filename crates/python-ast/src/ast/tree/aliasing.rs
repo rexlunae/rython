@@ -235,8 +235,12 @@ impl<'a> AliasingGuard<'a> {
                         // `a = a` is not an alias.
                         if t.id != source.id {
                             self.containers.insert(t.id.clone());
-                            self.aliases
-                                .push((t.id.clone(), source.id.clone(), lineno, self.pos));
+                            self.aliases.push((
+                                t.id.clone(),
+                                source.id.clone(),
+                                lineno,
+                                self.pos,
+                            ));
                         }
                     }
                 }
@@ -418,7 +422,11 @@ impl<'a> AliasingGuard<'a> {
         }
     }
 
-    fn visit_comprehension(&mut self, elt: &ExprType, generators: &[crate::Comprehension]) {
+    fn visit_comprehension(
+        &mut self,
+        elt: &ExprType,
+        generators: &[crate::Comprehension],
+    ) {
         self.visit_expr(elt);
         for generator in generators {
             self.visit_expr(&generator.iter);

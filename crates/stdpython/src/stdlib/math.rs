@@ -1,11 +1,11 @@
 //! Python math module implementation
-//!
+//! 
 //! This module provides mathematical functions and constants.
 //! Implementation matches Python's math module API.
 
 use crate::PyException;
-use crate::python_function;
 use std::f64::consts;
+use crate::python_function;
 
 // Mathematical constants
 pub const pi: f64 = consts::PI;
@@ -27,7 +27,10 @@ fn to_py_int(value: f64, func: &str) -> i64 {
     if value.is_infinite() {
         panic!(
             "{}",
-            crate::PyException::new("OverflowError", "cannot convert float infinity to integer",)
+            crate::PyException::new(
+                "OverflowError",
+                "cannot convert float infinity to integer",
+            )
         );
     }
     if value < (i64::MIN as f64) || value > (i64::MAX as f64) {
@@ -169,7 +172,7 @@ python_function! {
         if val <= 0.0 {
             return Err(crate::value_error("math domain error"));
         }
-
+        
         match base {
             Some(b) if b <= 0.0 || b == 1.0 => Err(crate::value_error("math domain error")),
             Some(b) => Ok(val.ln() / b.ln()),
@@ -424,11 +427,11 @@ python_function! {
         if x < 0 {
             return Err(crate::value_error("factorial() not defined for negative values"));
         }
-
+        
         if x > 20 {
             return Err(crate::overflow_error("factorial() result too large"));
         }
-
+        
         let mut result = 1i64;
         for i in 1..=x {
             result = result.saturating_mul(i);
@@ -514,15 +517,15 @@ python_function! {
         let b = b.into();
         let rel_tol = rel_tol.unwrap_or(1e-9);
         let abs_tol = abs_tol.unwrap_or(0.0);
-
+        
         if a == b {
             return true;
         }
-
+        
         if a.is_infinite() || b.is_infinite() || a.is_nan() || b.is_nan() {
             return false;
         }
-
+        
         let diff = (a - b).abs();
         diff <= abs_tol.max(rel_tol * a.abs().max(b.abs()))
     }
@@ -616,7 +619,7 @@ python_function! {
     {
         let x = x.into();
         let y = y.into();
-
+        
         if y == 0.0 || x.is_infinite() {
             // fmod(inf, y) is a domain error in CPython, not NaN.
             Err(crate::value_error("math domain error"))

@@ -94,8 +94,7 @@ impl CrossModuleMutSelf {
     /// The merged table, when computed.
     pub fn computed(
         &self,
-    ) -> Option<&std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>>
-    {
+    ) -> Option<&std::rc::Rc<std::collections::HashMap<String, std::collections::HashSet<String>>>> {
         match self {
             CrossModuleMutSelf::Computed(table) => Some(table),
             _ => None,
@@ -134,7 +133,11 @@ pub enum CrossModuleClasses {
     Uncomputed,
     /// The per-module class facts, keyed by module path (each value an
     /// `Rc` so lookups clone the handle, not the symbol table).
-    Computed(std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<ModuleClassInfo>>>),
+    Computed(
+        std::rc::Rc<
+            std::collections::HashMap<Vec<String>, std::rc::Rc<ModuleClassInfo>>,
+        >,
+    ),
 }
 
 /// Issue #115: how a `global`-written module value lowers as a mutable
@@ -168,10 +171,7 @@ impl MutableGlobalKind {
     /// Whether the static is wrapped in a LazyLock (reads/writes must
     /// deref: `&*name` instead of `&name`).
     pub fn lazy(&self) -> bool {
-        matches!(
-            self,
-            MutableGlobalKind::Str | MutableGlobalKind::Computed { .. }
-        )
+        matches!(self, MutableGlobalKind::Str | MutableGlobalKind::Computed { .. })
     }
     /// Whether stores must box their value in `PyValue::from`.
     pub fn boxed(&self) -> bool {
@@ -233,7 +233,8 @@ pub struct PythonOptions {
     /// M3): duck-typing traits (HasSpeak) and their per-class impls. The
     /// module generator drains this at the end and emits the items at the
     /// top of the module output.
-    pub module_pending_items: std::rc::Rc<std::cell::RefCell<Vec<proc_macro2::TokenStream>>>,
+    pub module_pending_items:
+        std::rc::Rc<std::cell::RefCell<Vec<proc_macro2::TokenStream>>>,
 
     /// Duck-typing trait names already generated in this module (issue
     /// #109, M3): `HasSpeak` and peers are emitted once per module even
@@ -446,7 +447,8 @@ pub struct PythonOptions {
     /// (see `scope_global_writables`), where `<ref>` is `&name` for a
     /// plain Mutex static and `&*name` for a LazyLock-wrapped one
     /// (`MutableGlobalKind::static_ref`). Set by the module generator.
-    pub mutable_statics: std::rc::Rc<std::collections::HashMap<String, MutableGlobalKind>>,
+    pub mutable_statics:
+        std::rc::Rc<std::collections::HashMap<String, MutableGlobalKind>>,
     /// The subset of `mutable_statics` the CURRENT scope may write: every
     /// one of them at module scope (module init / `__main__` body); inside
     /// a function, exactly the names its `global` statements declare — an
@@ -500,7 +502,8 @@ pub struct PythonOptions {
     /// false and fall through to the direct chain walk instead of
     /// recomputing. Per-module conversions (empty `module_defs`) never
     /// touch it.
-    pub cross_module_mut_self: std::rc::Rc<std::cell::RefCell<CrossModuleMutSelf>>,
+    pub cross_module_mut_self:
+        std::rc::Rc<std::cell::RefCell<CrossModuleMutSelf>>,
 
     /// Lazily-computed per-module class facts over ALL modules of the crate
     /// (`module_defs`), shared across every module's conversion: resolving
@@ -509,7 +512,8 @@ pub struct PythonOptions {
     /// and rebuilding its symbol table per call site. Keyed by module path
     /// (the same `Vec<String>` keys as `module_defs`). Per-module
     /// conversions (empty `module_defs`) never touch it.
-    pub cross_module_classes: std::rc::Rc<std::cell::RefCell<CrossModuleClasses>>,
+    pub cross_module_classes:
+        std::rc::Rc<std::cell::RefCell<CrossModuleClasses>>,
 
     /// Lazily-computed per-module sets of names promoted to `pub static`
     /// LazyLock statics (module.rs's promotion pass), keyed by module path.
@@ -519,11 +523,8 @@ pub struct PythonOptions {
     /// the defining module's own promotion must include sibling-imported
     /// names (module.rs consults it too, so both sides agree). Per-module
     /// conversions (empty `module_defs`) never touch it.
-    pub module_promoted_statics: std::rc::Rc<
-        std::cell::RefCell<
-            std::collections::HashMap<Vec<String>, std::rc::Rc<std::collections::HashSet<String>>>,
-        >,
-    >,
+    pub module_promoted_statics:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<std::collections::HashSet<String>>>>>,
 }
 
 impl Default for PythonOptions {

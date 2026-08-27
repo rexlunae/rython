@@ -184,11 +184,7 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
         }
     }
     out.push_str("\noptions:\n");
-    entry(
-        &mut out,
-        &help_spec,
-        Some("show this help message and exit"),
-    );
+    entry(&mut out, &help_spec, Some("show this help message and exit"));
     for s in specs.iter().filter(|s| !s.is_positional()) {
         entry(&mut out, &s.invocation(), s.help);
     }
@@ -201,7 +197,12 @@ fn exit_error(prog: &str, specs: &[ArgSpec], message: &str) -> ! {
     std::process::exit(2);
 }
 
-fn convert(prog: &str, specs: &[ArgSpec], spec: &ArgSpec, raw: &str) -> ParsedValue {
+fn convert(
+    prog: &str,
+    specs: &[ArgSpec],
+    spec: &ArgSpec,
+    raw: &str,
+) -> ParsedValue {
     match spec.kind {
         ArgKind::Str => ParsedValue::Str(raw.to_string()),
         ArgKind::Int => match raw.parse::<i64>() {
@@ -279,7 +280,8 @@ pub fn run_parser(
                     continue;
                 }
                 (None, many) => {
-                    let options: Vec<&str> = many.iter().map(|&i| specs[i].name).collect();
+                    let options: Vec<&str> =
+                        many.iter().map(|&i| specs[i].name).collect();
                     exit_error(
                         &prog,
                         specs,
@@ -319,12 +321,17 @@ pub fn run_parser(
                 convert(&prog, specs, spec, &raw)
             };
             values[idx] = Some(value);
-        } else if token.starts_with('-') && token.len() > 1 && token.parse::<f64>().is_err() {
+        } else if token.starts_with('-')
+            && token.len() > 1
+            && token.parse::<f64>().is_err()
+        {
             // A SHORT option (-c, -s 2.5, -s2.5). Like Python, a token
             // that looks like an option (leading '-', not a negative
             // number) never fills a positional — an unknown one is an
             // "unrecognized arguments" error.
-            let exact = specs.iter().position(|s| s.short == Some(token.as_str()));
+            let exact = specs
+                .iter()
+                .position(|s| s.short == Some(token.as_str()));
             if let Some(idx) = exact {
                 let spec = &specs[idx];
                 let value = if spec.kind == ArgKind::StoreTrue {
@@ -345,7 +352,8 @@ pub fn run_parser(
                 // Attached-value form (-s2.5) for value-taking shorts.
                 let head: String = token.chars().take(2).collect();
                 let attached = specs.iter().position(|s| {
-                    s.short.as_deref() == Some(head.as_str()) && s.kind != ArgKind::StoreTrue
+                    s.short.as_deref() == Some(head.as_str())
+                        && s.kind != ArgKind::StoreTrue
                 });
                 match attached {
                     Some(idx) => {

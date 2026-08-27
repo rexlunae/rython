@@ -10,8 +10,8 @@ mod tests {
     use test_log::test;
 
     use crate::parse;
-    use crate::tree::Module;
     use crate::tree::statement::StatementType;
+    use crate::tree::Module;
     use pyo3::PyResult;
 
     fn setup(input: &str) -> PyResult<Module> {

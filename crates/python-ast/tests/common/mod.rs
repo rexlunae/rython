@@ -9,7 +9,7 @@ pub fn assert_parse_success(code: &str, filename: &str) -> Module {
             assert!(module.filename.is_some());
             assert_eq!(module.filename.as_ref().unwrap(), filename);
             module
-        }
+        },
         Err(e) => panic!("Expected parsing to succeed, but got error: {}", e),
     }
 }
@@ -35,7 +35,7 @@ mod tests {
     fn test_assert_parse_success() {
         let code = "x = 1";
         let module = assert_parse_success(code, "test.py");
-
+        
         assert_eq!(module.raw.body.len(), 1);
         assert_eq!(module.filename.as_ref().unwrap(), "test.py");
     }
@@ -50,7 +50,7 @@ mod tests {
     fn test_create_test_code() {
         let statements = vec!["x = 1", "y = 2", "print(x + y)"];
         let code = create_test_code(&statements);
-
+        
         let expected = "x = 1\ny = 2\nprint(x + y)";
         assert_eq!(code, expected);
     }

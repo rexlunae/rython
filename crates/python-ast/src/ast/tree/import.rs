@@ -91,19 +91,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         StdModule::Collections => {
             matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
         }
-        StdModule::Re => matches!(
-            name,
-            "compile"
-                | "match"
-                | "search"
-                | "findall"
-                | "finditer"
-                | "sub"
-                | "split"
-                | "fullmatch"
-                | "escape"
-                | "IGNORECASE"
-        ),
+        StdModule::Re => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "escape" | "IGNORECASE"),
         StdModule::Itertools => matches!(
             name,
             "accumulate"
@@ -217,7 +205,10 @@ pub(crate) fn import_from_python_module(
 /// urllib3's `urlencode(fields)` rendered as a `urlencode::new(...)`
 /// class construction). Scoped to urllib: its functions have no runtime
 /// items and no call-lowering special arms.
-pub(crate) fn import_dropped_stdpython_item(name: &str, symbols: &SymbolTableScopes) -> bool {
+pub(crate) fn import_dropped_stdpython_item(
+    name: &str,
+    symbols: &SymbolTableScopes,
+) -> bool {
     let Some(SymbolTableNode::ImportFrom(ifm)) = symbols.get(name) else {
         return false;
     };
@@ -270,14 +261,14 @@ pub(crate) fn resolves_to_external_import(
                     if ifm.module == "collections.abc" {
                         return true;
                     }
-                    return !is_stdpython_module(root) && !options.python_modules.contains(root);
+                    return !is_stdpython_module(root)
+                        && !options.python_modules.contains(root);
                 };
                 {
                     // A re-export chain: hop into the defining module.
-                    let is_package = options
-                        .module_defs
-                        .keys()
-                        .any(|k| k.len() > key.len() && k[..key.len()] == key[..]);
+                    let is_package = options.module_defs.keys().any(|k| {
+                        k.len() > key.len() && k[..key.len()] == key[..]
+                    });
                     module_path = if is_package {
                         key.to_vec()
                     } else {
@@ -323,14 +314,12 @@ fn is_type_name_tuple_alias(
                 // `_HEADER_VALIDATORS_STR = (_VALID_HEADER_NAME_RE_STR,
                 // _VALID_HEADER_VALUE_RE_STR)` is a runtime tuple of
                 // compiled-regex statics, imported and indexed at runtime.
-                return t.elts.iter().all(|e| {
-                    matches!(e, crate::ExprType::Name(n)
+                return t.elts.iter().all(|e| matches!(e, crate::ExprType::Name(n)
                     if matches!(
                         n.id.as_str(),
                         "str" | "bytes" | "bytearray" | "int" | "float" | "bool"
                             | "object" | "None" | "Any" | "Union"
-                    ))
-                });
+                    )));
             }
             Some(SymbolTableNode::Alias(canonical)) => {
                 current = canonical.clone();
@@ -572,17 +561,19 @@ impl CodeGen for Import {
                     // to nothing with a warning (documented divergence:
                     // the module's runtime functionality is unavailable;
                     // uses of its names become loud errors or boxed drops).
-                    let path: Vec<String> = alias.name.split('.').map(|s| s.to_string()).collect();
+                    let path: Vec<String> =
+                        alias.name.split('.').map(|s| s.to_string()).collect();
                     // The crate path may differ from the dotted Python name:
                     // a root-qualified absolute self-import (`import
                     // urllib3.connection` inside the urllib3 conversion)
                     // resolves under the STRIPPED key, and rendering the
                     // full path would emit `use crate::urllib3::connection;`
                     // — a module the crate doesn't contain.
-                    let crate_path: Vec<String> = match crate::module_defs_key(&options, &path) {
-                        Some(key) => key.to_vec(),
-                        None => path.clone(),
-                    };
+                    let crate_path: Vec<String> =
+                        match crate::module_defs_key(&options, &path) {
+                            Some(key) => key.to_vec(),
+                            None => path.clone(),
+                        };
                     let is_sibling = crate::module_defs_contains(&options, &path)
                         || options.python_modules.contains(
                             &path.first().cloned().unwrap_or_default(),
@@ -918,8 +909,7 @@ impl CodeGen for ImportFrom {
             && !options
                 .python_modules
                 .contains(&first_part.unwrap_or("").to_string());
-        if external || self.module == "collections.abc" {
-            options.definition_warnings.borrow_mut().push(format!(
+        if external || self.module == "collections.abc" {            options.definition_warnings.borrow_mut().push(format!(
                 "`from {} import ...` is dropped: the module is not part of the \
                  generated crate nor the stdpython runtime \
                  (external-module divergence)",
@@ -937,10 +927,7 @@ impl CodeGen for ImportFrom {
         // PyValue); the present ones still emit their use.
         let first_part = parts.first().copied().unwrap_or("");
         if is_stdpython_module(first_part)
-            && self
-                .names
-                .iter()
-                .any(|a| !stdpython_module_item(first_part, &a.name))
+            && self.names.iter().any(|a| !stdpython_module_item(first_part, &a.name))
         {
             let present: Vec<crate::Alias> = self
                 .names
@@ -971,7 +958,9 @@ impl CodeGen for ImportFrom {
             for alias in &present {
                 let name = crate::safe_ident(&alias.name);
                 let variants: &[&str] = crate::StdModule::from_name(&self.module)
-                    .map(|m| crate::ast::tree::std_module::runtime_fn_variants(m, &alias.name))
+                    .map(|m| {
+                        crate::ast::tree::std_module::runtime_fn_variants(m, &alias.name)
+                    })
                     .unwrap_or(&[]);
                 // `pub use`, matching the plain stdpython path below: the
                 // imported name is a module attribute a sibling's
@@ -1007,7 +996,8 @@ impl CodeGen for ImportFrom {
         // HTTPSConnectionPool` — both classes share the ancestor trait
         // `ConnectionPoolTrait`, so the bring-along would emit it twice
         // (E0252 — duplicate import).
-        let mut seen_traits: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_traits: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for alias in self.names.iter() {
             // functools.partial/lru_cache/cache have no runtime symbols:
             // partial lowers to a closure at each call site, and the
@@ -1111,14 +1101,8 @@ impl CodeGen for ImportFrom {
                 continue;
             }
             if alias.name == "*" {
-                let visibility = if self.level > 0 {
-                    quote!(pub)
-                } else {
-                    quote!()
-                };
-                tokens.extend(
-                    quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::*; },
-                );
+                let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+                tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::*; });
                 continue;
             }
             // Some runtime functions split into arity/keyword-specific
@@ -1197,8 +1181,8 @@ impl CodeGen for ImportFrom {
             // re-export chain (`from .util.ssl_ import SSLContext` where
             // ssl_.py did `from ssl import SSLContext` — urllib3) must
             // find a public item, not a private use (E0603).
-            let stdpython_root =
-                self.level == 0 && parts.first().is_some_and(|p| is_stdpython_module(p));
+            let stdpython_root = self.level == 0
+                && parts.first().is_some_and(|p| is_stdpython_module(p));
             let visibility = if self.level > 0 && alias.name.starts_with("_") {
                 quote!(pub(crate))
             } else if self.level > 0 || stdpython_root {
@@ -1225,8 +1209,8 @@ impl CodeGen for ImportFrom {
             // submodules, already declared by `pub mod`; the emitted
             // `pub use crate::requests::packages;` would re-import the
             // sibling into itself (E0255 — defined multiple times).
-            let self_resolved =
-                self.level > 0 && options.this_module_path == self.resolved_module_path(&options);
+            let self_resolved = self.level > 0
+                && options.this_module_path == self.resolved_module_path(&options);
             if !self_resolved {
                 tokens.extend(import);
             }

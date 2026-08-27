@@ -135,7 +135,8 @@ impl core::fmt::Debug for SSLContext {
 
 fn build_ctx(protocol: i64) -> Result<openssl::ssl::SslContext, PyException> {
     let server = protocol == PROTOCOL_TLS_SERVER;
-    let builder = openssl::ssl::SslContextBuilder::new(method_of(server)).map_err(ssl_error)?;
+    let builder =
+        openssl::ssl::SslContextBuilder::new(method_of(server)).map_err(ssl_error)?;
     // SslContextBuilder::build is infallible (the method is validated at
     // builder construction), so the fallible part is only `new`.
     Ok(builder.build())
@@ -238,7 +239,10 @@ impl SSLContext {
     }
 
     /// ssl.SSLContext.load_verify_locations(cafile) — a PEM bundle path.
-    pub fn load_verify_locations<P: AsRef<str>>(&mut self, cafile: P) -> Result<(), PyException> {
+    pub fn load_verify_locations<P: AsRef<str>>(
+        &mut self,
+        cafile: P,
+    ) -> Result<(), PyException> {
         self.ca_file = Some(cafile.as_ref().to_string());
         self.rebuild()
     }
@@ -261,10 +265,7 @@ impl SSLContext {
 
     /// ssl.SSLContext.set_alpn_protocols(protocols).
     pub fn set_alpn_protocols<S: AsRef<str>>(&mut self, protocols: Vec<S>) {
-        self.alpn = protocols
-            .iter()
-            .map(|p| p.as_ref().as_bytes().to_vec())
-            .collect();
+        self.alpn = protocols.iter().map(|p| p.as_ref().as_bytes().to_vec()).collect();
     }
 
     /// ssl.SSLContext.load_cert_chain(certfile, keyfile) — CLIENT or
@@ -321,17 +322,13 @@ impl SSLContext {
         let mut stream = openssl::ssl::SslStream::new(ssl, tcp).map_err(ssl_error)?;
         if self.server {
             // Server-side: accept the client's ClientHello.
-            std::pin::Pin::new(&mut stream)
-                .accept()
-                .map_err(ssl_error)?;
+            std::pin::Pin::new(&mut stream).accept().map_err(ssl_error)?;
         } else {
             // Connect drives the handshake eagerly so failures surface
             // at wrap_socket, as CPython's blocking sockets do. (The
             // hostname — used for SNI and hostname verification — was
             // set on the Ssl above; SslStream::connect takes none.)
-            std::pin::Pin::new(&mut stream)
-                .connect()
-                .map_err(ssl_error)?;
+            std::pin::Pin::new(&mut stream).connect().map_err(ssl_error)?;
         }
         Ok(SSLSocket {
             inner: Arc::new(std::sync::Mutex::new(Some(stream))),
@@ -353,12 +350,17 @@ pub struct SSLSocket {
 impl SSLSocket {
     fn with_stream<R>(
         &self,
-        f: impl FnOnce(&mut openssl::ssl::SslStream<std::net::TcpStream>) -> Result<R, PyException>,
+        f: impl FnOnce(
+            &mut openssl::ssl::SslStream<std::net::TcpStream>,
+        ) -> Result<R, PyException>,
     ) -> Result<R, PyException> {
         let mut guard = self.inner.lock().unwrap();
         match guard.as_mut() {
             Some(s) => f(s),
-            None => Err(PyException::new("OSError", "[Errno 9] Bad file descriptor")),
+            None => Err(PyException::new(
+                "OSError",
+                "[Errno 9] Bad file descriptor",
+            )),
         }
     }
 
@@ -457,7 +459,8 @@ mod tests {
         // A plain (non-CA) leaf with a localhost SAN — the realistic
         // server-cert shape; webpki rejects a CA-marked cert used as an
         // end-entity (CaUsedAsEndEntity).
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         let cert = params.self_signed(&key_pair).expect("self-signed cert");
         (cert, key_pair)
     }
@@ -473,8 +476,10 @@ mod tests {
 
         // The server context needs PEM FILES (the CPython signature);
         // write them to a temp dir, cleaned up on drop.
-        let dir =
-            std::env::temp_dir().join(format!("rython-ssl-test-{}-handshake", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rython-ssl-test-{}-handshake",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -491,9 +496,10 @@ mod tests {
             tcp.set_nodelay(true).unwrap();
             let sock = crate::stdlib::socket::Socket::from_tcp_stream(tcp).unwrap();
             let mut ctx = SSLContext(PROTOCOL_TLS_SERVER);
-            ctx.load_cert_chain(server_cert.to_str().unwrap(), server_key.to_str().unwrap())
-                .unwrap();
-            let tls = ctx.wrap_socket(sock, "").expect("server accept handshake");
+            ctx.load_cert_chain(server_cert.to_str().unwrap(), server_key.to_str().unwrap()).unwrap();
+            let tls = ctx
+                .wrap_socket(sock, "")
+                .expect("server accept handshake");
             // Read the client's greeting, echo it back, close.
             let msg = tls.recv(1024).unwrap();
             tls.sendall(&msg).unwrap();
@@ -536,8 +542,10 @@ mod tests {
         // half-verification (the rustls backend treats CERT_OPTIONAL as
         // CERT_REQUIRED; OpenSSL really does distinguish).
         let (cert, key_pair) = localhost_cert();
-        let dir =
-            std::env::temp_dir().join(format!("rython-ssl-test-{}-certmodes", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rython-ssl-test-{}-certmodes",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -552,8 +560,7 @@ mod tests {
             let (tcp, _) = listener.accept().unwrap();
             let sock = crate::stdlib::socket::Socket::from_tcp_stream(tcp).unwrap();
             let mut ctx = SSLContext(PROTOCOL_TLS_SERVER);
-            ctx.load_cert_chain(server_cert.to_str().unwrap(), server_key.to_str().unwrap())
-                .unwrap();
+            ctx.load_cert_chain(server_cert.to_str().unwrap(), server_key.to_str().unwrap()).unwrap();
             let tls = ctx.wrap_socket(sock, "").expect("server handshake");
             let _ = tls.recv(1024);
             tls.close().unwrap();
@@ -581,8 +588,7 @@ mod tests {
             let (tcp, _) = listener.accept().unwrap();
             let sock = crate::stdlib::socket::Socket::from_tcp_stream(tcp).unwrap();
             let mut ctx = SSLContext(PROTOCOL_TLS_SERVER);
-            ctx.load_cert_chain(server_cert.to_str().unwrap(), server_key.to_str().unwrap())
-                .unwrap();
+            ctx.load_cert_chain(server_cert.to_str().unwrap(), server_key.to_str().unwrap()).unwrap();
             // The client rejects before completing; the server sees an
             // error on its accept handshake — ignore it.
             let _ = ctx.wrap_socket(sock, "");

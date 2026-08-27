@@ -141,6 +141,7 @@ fn np_int32_pow(a: i32, b: i32) -> i32 {
     a.wrapping_pow(b as u32)
 }
 
+
 /// numpy int `//` (floor division) — see scalar.rs; identical semantics.
 fn np_int_floor_div(a: i64, b: i64) -> i64 {
     if b == 0 {
@@ -264,15 +265,8 @@ macro_rules! binary_parallel {
                 BinOp::Pow => par_bin_vec(a, b, $pow),
                 BinOp::Max => par_bin_vec(a, b, $max),
                 BinOp::Min => par_bin_vec(a, b, $min),
-                BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor => {
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                     panic!(
                         "{}",
                         crate::PyException::new(
@@ -287,44 +281,24 @@ macro_rules! binary_parallel {
 }
 
 binary_parallel!(
-    binary_f64,
-    f64,
-    "float64",
-    np_max_f64,
-    np_min_f64,
-    |x: f64, y: f64| x / y,
-    np_floor_div_f64,
-    np_mod_f64,
+    binary_f64, f64, "float64", np_max_f64, np_min_f64,
+    |x: f64, y: f64| x / y, np_floor_div_f64, np_mod_f64,
     |a: f64, b: f64| a.powf(b)
 );
 binary_parallel!(
-    binary_f32,
-    f32,
-    "float32",
-    np_max_f32,
-    np_min_f32,
-    |x: f32, y: f32| x / y,
-    np_floor_div_f32,
-    np_mod_f32,
+    binary_f32, f32, "float32", np_max_f32, np_min_f32,
+    |x: f32, y: f32| x / y, np_floor_div_f32, np_mod_f32,
     |a: f32, b: f32| a.powf(b)
 );
 binary_parallel!(
-    binary_i64,
-    i64,
-    "int64",
-    |a: i64, b: i64| a.max(b),
-    |a: i64, b: i64| a.min(b),
+    binary_i64, i64, "int64", |a: i64, b: i64| a.max(b), |a: i64, b: i64| a.min(b),
     int_div_unreachable,
     np_int_floor_div,
     np_int_mod,
     np_int_pow
 );
 binary_parallel!(
-    binary_i32,
-    i32,
-    "int32",
-    |a: i32, b: i32| a.max(b),
-    |a: i32, b: i32| a.min(b),
+    binary_i32, i32, "int32", |a: i32, b: i32| a.max(b), |a: i32, b: i32| a.min(b),
     int_div_unreachable,
     np_int32_floor_div,
     np_int32_mod,
@@ -347,7 +321,10 @@ pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool]) -> Vec<bool> {
         BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
             panic!(
                 "{}",
-                crate::PyException::new("TypeError", "unsupported numpy operation on bool arrays")
+                crate::PyException::new(
+                    "TypeError",
+                    "unsupported numpy operation on bool arrays"
+                )
             )
         }
     }
@@ -438,23 +415,10 @@ macro_rules! unary_parallel_int {
                 }),
                 UnOp::Square => par_un_vec(a, |x| x.wrapping_mul(x)),
                 UnOp::Floor | UnOp::Ceil => par_un_vec(a, |x| x),
-                UnOp::Sqrt
-                | UnOp::Exp
-                | UnOp::Log
-                | UnOp::Log2
-                | UnOp::Log10
-                | UnOp::Sin
-                | UnOp::Cos
-                | UnOp::Tan
-                | UnOp::Asin
-                | UnOp::Acos
-                | UnOp::Atan
-                | UnOp::Sinh
-                | UnOp::Cosh
-                | UnOp::Tanh
-                | UnOp::Reciprocal
-                | UnOp::ExpM1
-                | UnOp::Log1P => {
+                UnOp::Sqrt | UnOp::Exp | UnOp::Log | UnOp::Log2 | UnOp::Log10
+                | UnOp::Sin | UnOp::Cos | UnOp::Tan | UnOp::Asin | UnOp::Acos
+                | UnOp::Atan | UnOp::Sinh | UnOp::Cosh | UnOp::Tanh | UnOp::Reciprocal
+                | UnOp::ExpM1 | UnOp::Log1P => {
                     panic!(
                         "{}",
                         crate::PyException::new(
@@ -495,8 +459,8 @@ pub(crate) fn unary_bool(op: UnOp, a: &[bool]) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::scalar;
     use super::*;
+    use super::super::scalar;
 
     /// Both sides of the PARALLEL_MIN_LEN floor: below it the kernels run
     /// the sequential branch, above it the rayon one. Parity must hold for

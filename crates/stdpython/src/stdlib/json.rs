@@ -1,11 +1,11 @@
 //! Python json module implementation
-//!
+//! 
 //! This module provides JSON encoder and decoder functionality.
 //! Implementation matches Python's json module API.
 
-use crate::PyDict;
 use crate::PyException;
 use crate::python_function;
+use crate::PyDict;
 use alloc::{format, string::String, string::ToString, vec::Vec};
 use core::fmt;
 
@@ -36,35 +36,32 @@ impl JSONValue {
     pub fn is_null(&self) -> bool {
         matches!(self, JSONValue::Null)
     }
-
+    
     /// Check if this is a boolean
     pub fn is_bool(&self) -> bool {
         matches!(self, JSONValue::Bool(_))
     }
-
+    
     /// Check if this is a number
     pub fn is_number(&self) -> bool {
-        matches!(
-            self,
-            JSONValue::Int(_) | JSONValue::Float(_) | JSONValue::BigInt(_)
-        )
+        matches!(self, JSONValue::Int(_) | JSONValue::Float(_) | JSONValue::BigInt(_))
     }
-
+    
     /// Check if this is a string
     pub fn is_string(&self) -> bool {
         matches!(self, JSONValue::String(_))
     }
-
+    
     /// Check if this is an array
     pub fn is_array(&self) -> bool {
         matches!(self, JSONValue::Array(_))
     }
-
+    
     /// Check if this is an object
     pub fn is_object(&self) -> bool {
         matches!(self, JSONValue::Object(_))
     }
-
+    
     /// Get as boolean
     pub fn as_bool(&self) -> Option<bool> {
         if let JSONValue::Bool(b) = self {
@@ -73,7 +70,7 @@ impl JSONValue {
             None
         }
     }
-
+    
     /// Get as number
     pub fn as_number(&self) -> Option<f64> {
         match self {
@@ -93,7 +90,7 @@ impl JSONValue {
             None
         }
     }
-
+    
     /// Get as string
     pub fn as_string(&self) -> Option<&String> {
         if let JSONValue::String(s) = self {
@@ -102,7 +99,7 @@ impl JSONValue {
             None
         }
     }
-
+    
     /// Get as array
     pub fn as_array(&self) -> Option<&Vec<JSONValue>> {
         if let JSONValue::Array(arr) = self {
@@ -111,7 +108,7 @@ impl JSONValue {
             None
         }
     }
-
+    
     /// Get as object
     pub fn as_object(&self) -> Option<&PyDict<String, JSONValue>> {
         if let JSONValue::Object(obj) = self {
@@ -140,7 +137,7 @@ impl fmt::Display for JSONValue {
                     write!(f, "{}", item)?;
                 }
                 write!(f, "]")
-            }
+            },
             JSONValue::Object(obj) => {
                 write!(f, "{{")?;
                 let mut first = true;
@@ -182,7 +179,7 @@ impl JSONEncoder {
             separators: None,
         }
     }
-
+    
     /// Create encoder with custom settings
     pub fn with_options(
         skipkeys: bool,
@@ -203,7 +200,7 @@ impl JSONEncoder {
             separators,
         }
     }
-
+    
     /// Encode JSONValue to string
     pub fn encode(&self, obj: &JSONValue) -> String {
         if let Some(indent) = self.indent {
@@ -212,24 +209,16 @@ impl JSONEncoder {
             self.encode_compact(obj)
         }
     }
-
+    
     fn encode_compact(&self, obj: &JSONValue) -> String {
         // Python's json.dumps default separators are (", ", ": ").
-        let (item_sep, key_sep) = self
-            .separators
-            .as_ref()
+        let (item_sep, key_sep) = self.separators.as_ref()
             .map(|(is, ks)| (is.as_str(), ks.as_str()))
             .unwrap_or((", ", ": "));
 
         match obj {
             JSONValue::Null => "null".to_string(),
-            JSONValue::Bool(b) => {
-                if *b {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
+            JSONValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
             JSONValue::Int(n) => format!("{}", n),
             JSONValue::BigInt(digits) => digits.clone(),
             JSONValue::Float(n) => {
@@ -243,51 +232,38 @@ impl JSONEncoder {
                     );
                 }
                 format_json_float(*n)
-            }
+            },
             JSONValue::String(s) => format!("\"{}\"", escape_json_string(s, self.ensure_ascii)),
             JSONValue::Array(arr) => {
                 let items: Vec<String> = arr.iter().map(|item| self.encode_compact(item)).collect();
                 format!("[{}]", items.join(item_sep))
-            }
+            },
             JSONValue::Object(obj) => {
-                let mut pairs: Vec<(String, String)> = obj
-                    .iter()
+                let mut pairs: Vec<(String, String)> = obj.iter()
                     .map(|(k, v)| (k.clone(), self.encode_compact(v)))
                     .collect();
-
+                    
                 if self.sort_keys {
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
                 }
-
-                let items: Vec<String> = pairs
-                    .into_iter()
+                
+                let items: Vec<String> = pairs.into_iter()
                     .map(|(k, v)| {
-                        format!(
-                            "\"{}\"{}{}",
-                            escape_json_string(&k, self.ensure_ascii),
-                            key_sep,
-                            v
-                        )
+                        format!("\"{}\"{}{}", escape_json_string(&k, self.ensure_ascii), key_sep, v)
                     })
                     .collect();
                 format!("{{{}}}", items.join(item_sep))
             }
         }
     }
-
+    
     fn encode_pretty(&self, obj: &JSONValue, depth: usize, indent_size: usize) -> String {
         let indent = " ".repeat(depth * indent_size);
         let next_indent = " ".repeat((depth + 1) * indent_size);
-
+        
         match obj {
             JSONValue::Null => "null".to_string(),
-            JSONValue::Bool(b) => {
-                if *b {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
+            JSONValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
             JSONValue::Int(n) => format!("{}", n),
             JSONValue::BigInt(digits) => digits.clone(),
             JSONValue::Float(n) => {
@@ -301,13 +277,13 @@ impl JSONEncoder {
                     );
                 }
                 format_json_float(*n)
-            }
+            },
             JSONValue::String(s) => format!("\"{}\"", escape_json_string(s, self.ensure_ascii)),
             JSONValue::Array(arr) => {
                 if arr.is_empty() {
                     return "[]".to_string();
                 }
-
+                
                 let mut result = "[\n".to_string();
                 for (i, item) in arr.iter().enumerate() {
                     if i > 0 {
@@ -320,21 +296,20 @@ impl JSONEncoder {
                 result.push_str(&indent);
                 result.push(']');
                 result
-            }
+            },
             JSONValue::Object(obj) => {
                 if obj.is_empty() {
                     return "{}".to_string();
                 }
-
-                let mut pairs: Vec<(String, String)> = obj
-                    .iter()
+                
+                let mut pairs: Vec<(String, String)> = obj.iter()
                     .map(|(k, v)| (k.clone(), self.encode_pretty(v, depth + 1, indent_size)))
                     .collect();
-
+                    
                 if self.sort_keys {
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
                 }
-
+                
                 let mut result = "{\n".to_string();
                 for (i, (key, value)) in pairs.iter().enumerate() {
                     if i > 0 {
@@ -373,19 +348,19 @@ impl JSONDecoder {
     pub fn new() -> Self {
         Self { strict: true }
     }
-
+    
     /// Create decoder with custom settings
     pub fn with_strict(strict: bool) -> Self {
         Self { strict }
     }
-
+    
     /// Decode JSON string to JSONValue
     pub fn decode<S: AsRef<str>>(&self, s: S) -> Result<JSONValue, PyException> {
         let s = s.as_ref().trim();
         if s.is_empty() {
             return Err(crate::value_error("Empty JSON string"));
         }
-
+        
         let mut parser = JSONParser::new(s);
         let value = parser.parse_value()?;
         parser.skip_whitespace();
@@ -418,14 +393,14 @@ impl JSONParser {
             pos: 0,
         }
     }
-
+    
     fn parse_value(&mut self) -> Result<JSONValue, PyException> {
         self.skip_whitespace();
-
+        
         if self.pos >= self.input.len() {
             return Err(crate::value_error("Unexpected end of JSON input"));
         }
-
+        
         match self.input[self.pos] {
             '"' => self.parse_string(),
             '[' => self.parse_array(),
@@ -433,35 +408,32 @@ impl JSONParser {
             't' | 'f' => self.parse_boolean(),
             'n' => self.parse_null(),
             c if c.is_ascii_digit() || c == '-' => self.parse_number(),
-            _ => Err(crate::value_error(format!(
-                "Unexpected character: {}",
-                self.input[self.pos]
-            ))),
+            _ => Err(crate::value_error(format!("Unexpected character: {}", self.input[self.pos]))),
         }
     }
-
+    
     fn parse_string(&mut self) -> Result<JSONValue, PyException> {
         if self.input[self.pos] != '"' {
             return Err(crate::value_error("Expected '\"'"));
         }
-
+        
         self.pos += 1; // Skip opening quote
         let mut result = String::new();
-
+        
         while self.pos < self.input.len() {
             let ch = self.input[self.pos];
-
+            
             if ch == '"' {
                 self.pos += 1; // Skip closing quote
                 return Ok(JSONValue::String(result));
             }
-
+            
             if ch == '\\' {
                 self.pos += 1;
                 if self.pos >= self.input.len() {
                     return Err(crate::value_error("Unterminated string"));
                 }
-
+                
                 match self.input[self.pos] {
                     '"' => result.push('"'),
                     '\\' => result.push('\\'),
@@ -476,8 +448,7 @@ impl JSONParser {
                         if self.pos + 4 >= self.input.len() {
                             return Err(crate::value_error("Invalid unicode escape"));
                         }
-                        let hex_chars: String =
-                            self.input[self.pos + 1..=self.pos + 4].iter().collect();
+                        let hex_chars: String = self.input[self.pos+1..=self.pos+4].iter().collect();
                         let Ok(code_point) = u32::from_str_radix(&hex_chars, 16) else {
                             return Err(crate::value_error("Invalid unicode escape"));
                         };
@@ -493,8 +464,9 @@ impl JSONParser {
                                     self.input[self.pos + 3..=self.pos + 6].iter().collect();
                                 if let Ok(lo) = u32::from_str_radix(&lo_hex, 16) {
                                     if (0xDC00..0xE000).contains(&lo) {
-                                        let combined =
-                                            0x10000 + ((code_point - 0xD800) << 10) + (lo - 0xDC00);
+                                        let combined = 0x10000
+                                            + ((code_point - 0xD800) << 10)
+                                            + (lo - 0xDC00);
                                         if let Some(ch) = char::from_u32(combined) {
                                             result.push(ch);
                                             self.pos += 6;
@@ -517,119 +489,119 @@ impl JSONParser {
                         } else {
                             return Err(crate::value_error("Invalid unicode code point"));
                         }
-                    }
+                    },
                     _ => return Err(crate::value_error("Invalid escape sequence")),
                 }
             } else {
                 result.push(ch);
             }
-
+            
             self.pos += 1;
         }
-
+        
         Err(crate::value_error("Unterminated string"))
     }
-
+    
     fn parse_array(&mut self) -> Result<JSONValue, PyException> {
         if self.input[self.pos] != '[' {
             return Err(crate::value_error("Expected '['"));
         }
-
+        
         self.pos += 1; // Skip '['
         self.skip_whitespace();
-
+        
         let mut result = Vec::new();
-
+        
         if self.pos < self.input.len() && self.input[self.pos] == ']' {
             self.pos += 1;
             return Ok(JSONValue::Array(result));
         }
-
+        
         loop {
             result.push(self.parse_value()?);
             self.skip_whitespace();
-
+            
             if self.pos >= self.input.len() {
                 return Err(crate::value_error("Unterminated array"));
             }
-
+            
             match self.input[self.pos] {
                 ',' => {
                     self.pos += 1;
                     self.skip_whitespace();
-                }
+                },
                 ']' => {
                     self.pos += 1;
                     break;
-                }
+                },
                 _ => return Err(crate::value_error("Expected ',' or ']'")),
             }
         }
-
+        
         Ok(JSONValue::Array(result))
     }
-
+    
     fn parse_object(&mut self) -> Result<JSONValue, PyException> {
         if self.input[self.pos] != '{' {
             return Err(crate::value_error("Expected '{'"));
         }
-
+        
         self.pos += 1; // Skip '{'
         self.skip_whitespace();
-
+        
         let mut result = PyDict::default();
-
+        
         if self.pos < self.input.len() && self.input[self.pos] == '}' {
             self.pos += 1;
             return Ok(JSONValue::Object(result));
         }
-
+        
         loop {
             // Parse key
             if self.pos >= self.input.len() || self.input[self.pos] != '"' {
                 return Err(crate::value_error("Expected string key"));
             }
-
+            
             let key = match self.parse_string()? {
                 JSONValue::String(s) => s,
                 _ => return Err(crate::value_error("Key must be string")),
             };
-
+            
             self.skip_whitespace();
-
+            
             // Parse colon
             if self.pos >= self.input.len() || self.input[self.pos] != ':' {
                 return Err(crate::value_error("Expected ':'"));
             }
             self.pos += 1;
             self.skip_whitespace();
-
+            
             // Parse value
             let value = self.parse_value()?;
             result.insert(key, value);
-
+            
             self.skip_whitespace();
-
+            
             if self.pos >= self.input.len() {
                 return Err(crate::value_error("Unterminated object"));
             }
-
+            
             match self.input[self.pos] {
                 ',' => {
                     self.pos += 1;
                     self.skip_whitespace();
-                }
+                },
                 '}' => {
                     self.pos += 1;
                     break;
-                }
+                },
                 _ => return Err(crate::value_error("Expected ',' or '}'")),
             }
         }
-
+        
         Ok(JSONValue::Object(result))
     }
-
+    
     fn parse_boolean(&mut self) -> Result<JSONValue, PyException> {
         if self.matches("true") {
             self.pos += 4;
@@ -641,7 +613,7 @@ impl JSONParser {
             Err(crate::value_error("Invalid boolean value"))
         }
     }
-
+    
     fn parse_null(&mut self) -> Result<JSONValue, PyException> {
         if self.matches("null") {
             self.pos += 4;
@@ -650,20 +622,20 @@ impl JSONParser {
             Err(crate::value_error("Invalid null value"))
         }
     }
-
+    
     fn parse_number(&mut self) -> Result<JSONValue, PyException> {
         let start = self.pos;
-
+        
         // Handle negative sign
         if self.pos < self.input.len() && self.input[self.pos] == '-' {
             self.pos += 1;
         }
-
+        
         // Parse integer part
         if self.pos >= self.input.len() || !self.input[self.pos].is_ascii_digit() {
             return Err(crate::value_error("Invalid number"));
         }
-
+        
         if self.input[self.pos] == '0' {
             self.pos += 1;
         } else {
@@ -671,7 +643,7 @@ impl JSONParser {
                 self.pos += 1;
             }
         }
-
+        
         // Parse fractional part
         if self.pos < self.input.len() && self.input[self.pos] == '.' {
             self.pos += 1;
@@ -682,15 +654,11 @@ impl JSONParser {
                 self.pos += 1;
             }
         }
-
+        
         // Parse exponent
-        if self.pos < self.input.len()
-            && (self.input[self.pos] == 'e' || self.input[self.pos] == 'E')
-        {
+        if self.pos < self.input.len() && (self.input[self.pos] == 'e' || self.input[self.pos] == 'E') {
             self.pos += 1;
-            if self.pos < self.input.len()
-                && (self.input[self.pos] == '+' || self.input[self.pos] == '-')
-            {
+            if self.pos < self.input.len() && (self.input[self.pos] == '+' || self.input[self.pos] == '-') {
                 self.pos += 1;
             }
             if self.pos >= self.input.len() || !self.input[self.pos].is_ascii_digit() {
@@ -700,7 +668,7 @@ impl JSONParser {
                 self.pos += 1;
             }
         }
-
+        
         let number_str: String = self.input[start..self.pos].iter().collect();
         // A literal with no fraction or exponent is an int, like Python's
         // json.loads("1") -> 1 vs json.loads("1.0") -> 1.0.
@@ -718,13 +686,13 @@ impl JSONParser {
             Err(_) => Err(crate::value_error("Invalid number")),
         }
     }
-
+    
     fn matches(&self, s: &str) -> bool {
         let chars: Vec<char> = s.chars().collect();
         if self.pos + chars.len() > self.input.len() {
             return false;
         }
-
+        
         for (i, ch) in chars.iter().enumerate() {
             if self.input[self.pos + i] != *ch {
                 return false;
@@ -732,7 +700,7 @@ impl JSONParser {
         }
         true
     }
-
+    
     fn skip_whitespace(&mut self) {
         // JSON permits only space, tab, LF, CR (issue #82): Rust's
         // is_ascii_whitespace also accepts \x0c (form feed), which CPython's
@@ -802,11 +770,7 @@ fn format_json_float(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
     } else if n.is_infinite() {
-        if n > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
+        if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
     } else if crate::flt::fract(n) == 0.0 && crate::flt::abs(n) < 1e16 {
         format!("{:.1}", n)
     } else {

@@ -4,8 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoolOpNotYetImplemented, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
-    dump, err_from, extraction_failure,
+    dump, extraction_failure, err_from, BoolOpNotYetImplemented, CodeGen, CodeGenContext, ExprType,
+    PythonOptions, SymbolTableScopes,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -49,24 +49,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for BoolOp {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         tracing::debug!("ob: {}", dump(&ob, None)?);
-        let op = ob
-            .getattr("op")
-            .map_err(|e| extraction_failure("op", &ob, e))?;
+        let op = ob.getattr("op").map_err(|e| extraction_failure("op", &ob, e))?;
 
         let op_type = op
             .get_type()
             .name()
             .map_err(|e| extraction_failure("boolean operator type", &ob, e))?;
 
-        let values = ob
-            .getattr("values")
-            .map_err(|e| extraction_failure("values", &ob, e))?;
+        let values = ob.getattr("values").map_err(|e| extraction_failure("values", &ob, e))?;
 
         tracing::debug!("BoolOps values: {}", dump(&values, None)?);
 
-        let values: Vec<ExprType> = values
-            .extract()
-            .map_err(|e| extraction_failure("getting values from BoolOp", &ob, e))?;
+        let values: Vec<ExprType> = values.extract().map_err(|e| extraction_failure("getting values from BoolOp", &ob, e))?;
 
         let op_type_str: String = op_type.extract()?;
         let op = match op_type_str.as_str() {

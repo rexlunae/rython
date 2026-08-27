@@ -4,8 +4,8 @@ use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PyAttributeExtractor, PythonOptions,
-    SymbolTableScopes, extract_list, impl_node_with_positions,
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
+    Node, impl_node_with_positions, PyAttributeExtractor, extract_list
 };
 
 use super::Statement;
@@ -27,17 +27,17 @@ impl<'a, 'py> FromPyObject<'a, 'py> for For {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let target = ob.extract_attr_with_context("target", "for loop target")?;
         let iter = ob.extract_attr_with_context("iter", "for loop iterator")?;
-
+        
         let target = target
             .extract()
             .map_err(|e| crate::extraction_failure("for loop target", &ob, e))?;
         let iter = iter
             .extract()
             .map_err(|e| crate::extraction_failure("for loop iterator", &ob, e))?;
-
+        
         let body: Vec<Statement> = extract_list(&ob, "body", "for body statements")?;
         let orelse: Vec<Statement> = extract_list(&ob, "orelse", "for else statements")?;
-
+        
         Ok(For {
             target,
             iter,
@@ -51,12 +51,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for For {
     }
 }
 
-impl_node_with_positions!(For {
-    lineno,
-    col_offset,
-    end_lineno,
-    end_col_offset
-});
+impl_node_with_positions!(For { lineno, col_offset, end_lineno, end_col_offset });
 
 impl CodeGen for For {
     type Context = CodeGenContext;
@@ -66,13 +61,8 @@ impl CodeGen for For {
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let symbols = self.target.find_symbols(symbols);
         let symbols = self.iter.find_symbols(symbols);
-        let symbols = self
-            .body
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc));
-        self.orelse
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc))
+        let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
+        self.orelse.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc))
     }
 
     fn to_rust(
@@ -107,7 +97,9 @@ impl CodeGen for For {
                     && !crate::name_referenced_in(&self.body, &n.id)
                     && !crate::name_referenced_in(&self.orelse, &n.id)
         );
-        let any_hoisted = target_names.iter().any(|n| leaked.contains(*n));
+        let any_hoisted = target_names
+            .iter()
+            .any(|n| leaked.contains(*n));
         let has_else = !self.orelse.is_empty();
         // Break-tracking is only needed when the else clause could be skipped
         // by a break belonging to this loop; otherwise the flag would be
@@ -119,8 +111,7 @@ impl CodeGen for For {
             has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
-        let body_stmts: Result<Vec<_>, _> = self
-            .body
+        let body_stmts: Result<Vec<_>, _> = self.body
             .into_iter()
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
@@ -139,16 +130,12 @@ impl CodeGen for For {
                 &mut stmts,
                 &mut counter,
             );
-            (
-                quote!(__rython_elt),
-                quote!({ #(#stmts)* #(#body_stmts;)* }),
-            )
+            (quote!(__rython_elt), quote!({ #(#stmts)* #(#body_stmts;)* }))
         } else {
             let target = if unused_index {
                 quote!(_)
             } else {
-                self.target
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?
             };
             (target, quote!(#(#body_stmts;)*))
         };
@@ -173,8 +160,12 @@ impl CodeGen for For {
                 keywords: Vec::new(),
             });
             let call = call_expr.to_rust(body_ctx.clone(), options.clone(), symbols.clone())?;
-            let sentinel =
-                crate::render_reused(&c.args[1], ctx.clone(), options.clone(), symbols.clone())?;
+            let sentinel = crate::render_reused(
+                &c.args[1],
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
             let core = quote! {
                 let __rython_sentinel = #sentinel;
                 loop {
@@ -220,7 +211,12 @@ impl CodeGen for For {
         // not consume its iterable (issue #109, M2: iteration over
         // inferred parameters). The reuse-clone rule's `T: Clone` bound
         // makes this compile for generic parameters.
-        let iter = crate::render_reused(&self.iter, ctx.clone(), options.clone(), symbols.clone())?;
+        let iter = crate::render_reused(
+            &self.iter,
+            ctx.clone(),
+            options.clone(),
+            symbols.clone(),
+        )?;
 
         if !has_else {
             Ok(quote! {
@@ -231,8 +227,7 @@ impl CodeGen for For {
         } else {
             // Python's for/else: the else clause runs iff the loop finished
             // without hitting `break` (which sets __rython_broke).
-            let else_stmts: Result<Vec<_>, _> = self
-                .orelse
+            let else_stmts: Result<Vec<_>, _> = self.orelse
                 .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
@@ -325,19 +320,7 @@ mod tests {
     use super::*;
     use crate::create_parse_test;
 
-    create_parse_test!(
-        test_simple_for,
-        "for x in range(10):\n    print(x)",
-        "for_test.py"
-    );
-    create_parse_test!(
-        test_for_else,
-        "for x in range(10):\n    print(x)\nelse:\n    print('done')",
-        "for_test.py"
-    );
-    create_parse_test!(
-        test_for_list,
-        "for item in [1, 2, 3]:\n    print(item)",
-        "for_test.py"
-    );
+    create_parse_test!(test_simple_for, "for x in range(10):\n    print(x)", "for_test.py");
+    create_parse_test!(test_for_else, "for x in range(10):\n    print(x)\nelse:\n    print('done')", "for_test.py");
+    create_parse_test!(test_for_list, "for item in [1, 2, 3]:\n    print(item)", "for_test.py");
 }

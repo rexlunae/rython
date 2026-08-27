@@ -3,11 +3,11 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
-use crate::ast::tree::std_module::variant as rt_variant;
 use crate::{
     CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions, SymbolTableNode, SymbolTableScopes,
     extract_required_attr,
 };
+use crate::ast::tree::std_module::variant as rt_variant;
 
 /// The type names isinstance() lowers against (a PyValue predicate or a
 /// static verdict exists for each). ONE list for the three consumers —
@@ -42,26 +42,12 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
 /// mirror the Result-returning `python_function!` blocks in stdpython.
 const FALLIBLE_STDLIB_FN: &[&str] = &[
     // math: domain/range errors and overflow.
-    "sqrt",
-    "pow",
-    "log",
-    "log2",
-    "log10",
-    "log1p",
-    "asin",
-    "acos",
-    "acosh",
-    "atanh",
-    "factorial",
-    "fmod",
-    "remainder",
-    "ldexp",
+    "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
+    "factorial", "fmod", "remainder", "ldexp",
     // json: parse errors.
     "loads",
     // glob: filesystem access can fail.
-    "glob",
-    "rglob",
-    "iglob",
+    "glob", "rglob", "iglob",
     // os: entropy source can fail (os.urandom raises OSError).
     "urandom",
     // socket.socket() rejects unknown families/kinds with OSError.
@@ -93,9 +79,7 @@ pub(crate) const RUNTIME_KEYWORD_SIGNATURES: &[(&str, &str, &[&str])] = &[
     (
         "warnings",
         "filterwarnings",
-        &[
-            "action", "message", "category", "module", "lineno", "append",
-        ],
+        &["action", "message", "category", "module", "lineno", "append"],
     ),
     (
         "warnings",
@@ -122,9 +106,7 @@ pub(crate) const RUNTIME_KEYWORD_SIGNATURES: &[(&str, &str, &[&str])] = &[
 /// can be re-applied AFTER an `.await`: an async function call renders with
 /// `?` (exceptions propagate), but the operator must unwrap the awaited
 /// Result, not the future. Mirrors the Await node's reordering.
-pub(crate) fn strip_trailing_question(
-    tokens: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
+pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
     let rendered = tokens.to_string();
     match rendered.trim_end().strip_suffix('?') {
         Some(inner) => inner.parse().unwrap_or_else(|_| tokens.clone()),
@@ -247,7 +229,9 @@ fn stdpython_reexport_chain(
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
                 let Some(key) = crate::module_defs_key(options, &path) else {
-                    return crate::is_stdpython_module(ifm.module.split('.').next().unwrap_or(""));
+                    return crate::is_stdpython_module(
+                        ifm.module.split('.').next().unwrap_or(""),
+                    );
                 };
                 // Re-export chain: hop into the defining module's scope.
                 let defining = ifm
@@ -391,15 +375,19 @@ fn render_datetime_ctor(
     for (i, slot) in slots.iter().enumerate() {
         let tok = match slot {
             Some(e) => {
-                let v = e
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                if i < required { v } else { quote!(Some(#v)) }
+                let v = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                if i < required {
+                    v
+                } else {
+                    quote!(Some(#v))
+                }
             }
             None if i < required => {
-                return Err(
-                    format!("{}() missing required argument: '{}'", name, params[i]).into(),
-                );
+                return Err(format!(
+                    "{}() missing required argument: '{}'",
+                    name, params[i]
+                )
+                .into());
             }
             None => quote!(None),
         };
@@ -467,12 +455,16 @@ impl Call {
                 continue;
             }
             let Some(pos) = params.iter().position(|p| *p == name) else {
-                return Err(
-                    format!("`{attr}()` got an unexpected keyword argument '{name}'").into(),
-                );
+                return Err(format!(
+                    "`{attr}()` got an unexpected keyword argument '{name}'"
+                )
+                .into());
             };
             if slots[pos].is_some() {
-                return Err(format!("`{attr}()` got multiple values for argument '{name}'").into());
+                return Err(format!(
+                    "`{attr}()` got multiple values for argument '{name}'"
+                )
+                .into());
             }
             slots[pos] = Some(kw.value.clone());
         }
@@ -483,11 +475,10 @@ impl Call {
             // `filterwarnings` are warning-class VALUES — classes cannot be
             // runtime values in rython. They lower as None (the warning
             // fires unconditionally; documented divergence).
-            let is_warning_class_slot =
-                matches!(
-                    attr.as_str(),
-                    "warn" | "warn_explicit" | "simplefilter" | "filterwarnings"
-                ) && matches!(params.get(i).copied(), Some("category" | "source"));
+            let is_warning_class_slot = matches!(
+                attr.as_str(),
+                "warn" | "warn_explicit" | "simplefilter" | "filterwarnings"
+            ) && matches!(params.get(i).copied(), Some("category" | "source"));
             match slot {
                 // The signed runtime signatures take Option for every
                 // parameter: a present argument wraps in Some, an omitted
@@ -503,14 +494,16 @@ impl Call {
                 }
                 Some(expr) => {
                     let rendered =
-                        expr.clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     rendered_args.push(quote!(Some(#rendered)));
                 }
                 None => rendered_args.push(quote!(None)),
             }
         }
-        let name = self.func.clone().to_rust(ctx, options, symbols)?;
+        let name = self
+            .func
+            .clone()
+            .to_rust(ctx, options, symbols)?;
         Ok(Some(quote!(#name(#(#rendered_args),*))))
     }
 }
@@ -809,7 +802,8 @@ fn np_is_bool_literal(expr: &ExprType) -> bool {
 fn np_dtype_tokens(expr: &ExprType) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let name = match expr {
         ExprType::Attribute(attr) => {
-            if !matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_numpy_alias(&m.id)) {
+            if !matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_numpy_alias(&m.id))
+            {
                 return Err(format!(
                     "dtype= must be one of np.float64/np.float32/np.int64/np.int32/np.bool_ \
                      or a string like \"float64\" (got an unsupported expression)"
@@ -1449,7 +1443,8 @@ fn resolve_construction_class_depth(
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
             if options.module_defs.contains_key(&path) {
-                if name == "RLResolver" {}
+                if name == "RLResolver" {
+                }
                 // The DEFINING module's name for the class: an alias
                 // (`from urllib3.util import Timeout as TimeoutSauce`)
                 // binds the ORIGINAL name there.
@@ -1506,7 +1501,9 @@ impl<'a> CodeGen for Call {
             && let Some(builtin) = resolve_builtin_alias(&n.id, &symbols, &options)
         {
             let mut c = self.clone();
-            c.func = Box::new(ExprType::Name(crate::ast::tree::name::Name { id: builtin }));
+            c.func = Box::new(ExprType::Name(crate::ast::tree::name::Name {
+                id: builtin,
+            }));
             return c.to_rust(ctx, options, symbols);
         }
         // `threading.Thread(target=f, args=(...))` — the constructor takes
@@ -1597,11 +1594,7 @@ impl<'a> CodeGen for Call {
                 let root = crate::ast::tree::call::root_name(&attr.value);
                 match root {
                     Some(root) if !crate::is_stdpython_module(&root) => {
-                        crate::ast::tree::attribute::is_module_path_chain(
-                            &attr.value,
-                            &symbols,
-                            &options,
-                        )
+                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols, &options)
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
                         FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
@@ -1748,13 +1741,21 @@ impl<'a> CodeGen for Call {
             && !crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
             && !crate::ast::tree::import::import_from_python_module(&n.id, &symbols, &options)
             && (crate::ast::tree::attribute::external_module_root(
-                &ExprType::Name(crate::ast::tree::name::Name { id: n.id.clone() }),
+                &ExprType::Name(crate::ast::tree::name::Name {
+                    id: n.id.clone(),
+                }),
                 &symbols,
                 &options,
             )
             .is_some()
-                || crate::ast::tree::import::resolves_to_external_import(&n.id, &options, &symbols)
-                || crate::ast::tree::import::import_dropped_stdpython_item(&n.id, &symbols))
+                || crate::ast::tree::import::resolves_to_external_import(
+                    &n.id,
+                    &options,
+                    &symbols,
+                )
+                || crate::ast::tree::import::import_dropped_stdpython_item(
+                    &n.id, &symbols,
+                ))
         {
             options.definition_warnings.borrow_mut().push(format!(
                 "`{}(...)` is dropped: `{}` is imported from a module that is \
@@ -2229,9 +2230,9 @@ impl<'a> CodeGen for Call {
                             && c.args.len() == 1
                         {
                             let inner_class = match &c.args[0] {
-                                ExprType::Name(n) if n.id == "self" => {
-                                    ctx.enclosing_class_name().map(str::to_string)
-                                }
+                                ExprType::Name(n) if n.id == "self" => ctx
+                                    .enclosing_class_name()
+                                    .map(str::to_string),
                                 ExprType::Name(n) => {
                                     // A user-class instance resolves through
                                     // name_types. A BUILTIN type name (int,
@@ -2240,13 +2241,11 @@ impl<'a> CodeGen for Call {
                                     // annotation mapping rather than a
                                     // parallel string list.
                                     match options.name_types.get(&n.id) {
-                                        Some(crate::TypeInfo::Class(cname)) => Some(cname.clone()),
-                                        _ => {
-                                            crate::ast::tree::type_ctx::is_builtin_type_annotation(
-                                                &ExprType::Name(n.clone()),
-                                            )
-                                            .then(|| n.id.clone())
+                                        Some(crate::TypeInfo::Class(cname)) => {
+                                            Some(cname.clone())
                                         }
+                                        _ => crate::ast::tree::type_ctx::is_builtin_type_annotation(&ExprType::Name(n.clone()))
+                                            .then(|| n.id.clone()),
                                     }
                                 }
                                 _ => None,
@@ -2291,23 +2290,31 @@ impl<'a> CodeGen for Call {
                             && is_class_target(&t.id, &symbols, &options, 0)
                         {
                             let arg_class = match &self.args[0] {
-                                ExprType::Name(n) => match options.name_types.get(&n.id) {
-                                    Some(crate::TypeInfo::Class(c)) => Some(c.clone()),
-                                    _ => None,
-                                },
+                                ExprType::Name(n) => {
+                                    match options.name_types.get(&n.id) {
+                                        Some(crate::TypeInfo::Class(c)) => {
+                                            Some(c.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                }
                                 _ => None,
                             };
                             let result = match &arg_class {
-                                Some(c) => crate::ast::tree::class_def::ClassDef::class_extends(
-                                    c, &t.id, &symbols,
-                                ),
+                                Some(c) => {
+                                    crate::ast::tree::class_def::ClassDef::class_extends(
+                                        c, &t.id, &symbols,
+                                    )
+                                }
                                 None => {
-                                    options.definition_warnings.borrow_mut().push(format!(
-                                        "isinstance(x, {}) with x not statically \
+                                    options.definition_warnings.borrow_mut().push(
+                                        format!(
+                                            "isinstance(x, {}) with x not statically \
                                              typed as a class lowers to false (the \
                                              class-as-value divergence)",
-                                        t.id
-                                    ));
+                                            t.id
+                                        ),
+                                    );
                                     false
                                 }
                             };
@@ -2329,7 +2336,7 @@ impl<'a> CodeGen for Call {
                                     _ => return None,
                                 },
                                 Some(SymbolTableNode::Alias(canonical)) => {
-                                    return resolve_type_tuple(canonical, options, symbols);
+                                    return resolve_type_tuple(canonical, options, symbols)
                                 }
                                 Some(SymbolTableNode::ImportFrom(i)) => {
                                     let path = i.resolved_module_path(options);
@@ -2376,14 +2383,17 @@ impl<'a> CodeGen for Call {
                                 return None;
                             }
                             match symbols.get(id) {
-                                Some(SymbolTableNode::Assign { value, .. }) => match value {
-                                    ExprType::Name(n)
-                                        if ISINSTANCE_TARGET_NAMES.contains(&n.id.as_str()) =>
-                                    {
-                                        Some(n.id.clone())
+                                Some(SymbolTableNode::Assign { value, .. }) => {
+                                    match value {
+                                        ExprType::Name(n)
+                                            if ISINSTANCE_TARGET_NAMES
+                                                .contains(&n.id.as_str()) =>
+                                        {
+                                            Some(n.id.clone())
+                                        }
+                                        _ => None,
                                     }
-                                    _ => None,
-                                },
+                                }
                                 Some(SymbolTableNode::Alias(canonical)) => {
                                     // A self-aliasing re-export
                                     // (`from .connection import ProxyConfig
@@ -2393,12 +2403,7 @@ impl<'a> CodeGen for Call {
                                     if canonical == id {
                                         None
                                     } else {
-                                        resolve_type_name_depth(
-                                            canonical,
-                                            options,
-                                            symbols,
-                                            depth + 1,
-                                        )
+                                        resolve_type_name_depth(canonical, options, symbols, depth + 1)
                                     }
                                 }
                                 // An imported name: resolve it through the
@@ -2407,10 +2412,12 @@ impl<'a> CodeGen for Call {
                                 Some(SymbolTableNode::ImportFrom(i)) => {
                                     let path = i.resolved_module_path(options);
                                     if options.module_defs.contains_key(&path) {
-                                        let module = options.module_defs.get(&path)?;
+                                        let module =
+                                            options.module_defs.get(&path)?;
                                         let module: &crate::Module = module;
-                                        let syms =
-                                            module.clone().find_symbols(SymbolTableScopes::new());
+                                        let syms = module
+                                            .clone()
+                                            .find_symbols(SymbolTableScopes::new());
                                         resolve_type_name_depth(id, options, &syms, depth + 1)
                                     } else {
                                         None
@@ -2561,7 +2568,10 @@ impl<'a> CodeGen for Call {
                         // constant — the branch body narrows the name.
                         if let ExprType::Name(n) = &self.args[0]
                             && options.name_types.get(&n.id).is_some_and(|t| {
-                                matches!(t, crate::TypeInfo::StrOrBytes | crate::TypeInfo::PyValue)
+                                matches!(
+                                    t,
+                                    crate::TypeInfo::StrOrBytes | crate::TypeInfo::PyValue
+                                )
                             })
                         {
                             let arg = self.args[0].clone().to_rust(
@@ -2620,13 +2630,13 @@ impl<'a> CodeGen for Call {
                             // lockstep with the local_types PRODUCER; the
                             // "str" fallback for unmodeled literal types is
                             // this site's own historical behavior.
-                            lit => {
-                                crate::ast::tree::function_def::simple_expr_type(lit).map(|ty| {
+                            lit => crate::ast::tree::function_def::simple_expr_type(lit).map(
+                                |ty| {
                                     crate::ast::tree::function_def::rust_type_to_py_name(&ty)
                                         .unwrap_or("str")
                                         .to_string()
-                                })
-                            }
+                                },
+                            ),
                         };
                         let Some(actual) = actual else {
                             // An expression whose type is not statically
@@ -2715,11 +2725,15 @@ impl<'a> CodeGen for Call {
                         // always UTF-8, so a non-UTF-8 encoding is the
                         // documented divergence; newline/binary spellings
                         // stay loud.
-                        if self.keywords.iter().any(|k| {
-                            k.arg
-                                .as_deref()
-                                .is_some_and(|a| a != "encoding" && a != "errors")
-                        }) {
+                        if self
+                            .keywords
+                            .iter()
+                            .any(|k| {
+                                k.arg
+                                    .as_deref()
+                                    .is_some_and(|a| a != "encoding" && a != "errors")
+                            })
+                        {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         return Ok(match rendered.as_slice() {
@@ -2790,12 +2804,14 @@ impl<'a> CodeGen for Call {
                             // (for_stmt.rs). As a bare value it would need
                             // an iterator object, which the value model
                             // does not have.
-                            return Err("iter(callable, sentinel) is only supported as a \
+                            return Err(
+                                "iter(callable, sentinel) is only supported as a \
                                  for-loop iterable (`for x in iter(f, sentinel):`), \
                                  where it lowers to a call-until-sentinel loop \
                                  (issue #155)"
-                                .to_string()
-                                .into());
+                                    .to_string()
+                                    .into(),
+                            );
                         }
                         if rendered.len() != 1 {
                             return Err("iter() takes exactly one argument".to_string().into());
@@ -2818,11 +2834,9 @@ impl<'a> CodeGen for Call {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         if rendered.len() < 2 || rendered.len() > 3 {
-                            return Err(
-                                "getattr() takes 2 or 3 arguments (object, name[, default])"
-                                    .to_string()
-                                    .into(),
-                            );
+                            return Err("getattr() takes 2 or 3 arguments (object, name[, default])"
+                                .to_string()
+                                .into());
                         }
                         // getattr on a STDLIB MODULE with a LITERAL name
                         // resolves statically — the version-probing idiom
@@ -2830,13 +2844,16 @@ impl<'a> CodeGen for Call {
                         // 0x80000)` — urllib3's ssl_.py): the runtime item
                         // when the module has it, else the default (this
                         // mirrors the static import-guard decision).
-                        if let (ExprType::Name(m), ExprType::Constant(c)) =
-                            (&self.args[0], &self.args[1])
+                        if let (
+                            ExprType::Name(m),
+                            ExprType::Constant(c),
+                        ) = (&self.args[0], &self.args[1])
                             && crate::ast::tree::import::is_stdpython_module(&m.id)
                             && let Some(litrs::Literal::String(slit)) = &c.0
                         {
                             let item = slit.value();
-                            if crate::ast::tree::import::stdpython_module_item(&m.id, item) {
+                            if crate::ast::tree::import::stdpython_module_item(&m.id, item)
+                            {
                                 let module = crate::safe_ident(&m.id);
                                 let name = crate::safe_ident(item);
                                 return Ok(quote!(#module::#name));
@@ -2883,11 +2900,9 @@ impl<'a> CodeGen for Call {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
                         if rendered.len() != 3 {
-                            return Err(
-                                "setattr() takes exactly 3 arguments (object, name, value)"
-                                    .to_string()
-                                    .into(),
-                            );
+                            return Err("setattr() takes exactly 3 arguments (object, name, value)"
+                                .to_string()
+                                .into());
                         }
                         options.definition_warnings.borrow_mut().push(
                             "setattr(obj, name, value) is dropped: rython's typed \
@@ -3136,8 +3151,11 @@ impl<'a> CodeGen for Call {
                             // `str((...), encoding=encoding_iana)`).
                             (1, Some(enc)) => {
                                 let a = &rendered[0];
-                                let enc =
-                                    enc.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                let enc = enc.to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
                                 let runtime = crate::safe_ident(&options.stdpython);
                                 return Ok(quote!(
                                     #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
@@ -3161,7 +3179,11 @@ impl<'a> CodeGen for Call {
                                     #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
                                 ));
                             }
-                            _ => return Err("str() takes at most 3 arguments".to_string().into()),
+                            _ => {
+                                return Err("str() takes at most 3 arguments"
+                                    .to_string()
+                                    .into())
+                            }
                         }
                     }
                     _ => unreachable!(),
@@ -3192,8 +3214,9 @@ impl<'a> CodeGen for Call {
             ExprType::Attribute(a) => {
                 // `datetime.date(...)`: the receiver is the stdlib module,
                 // not shadowed by a user binding.
-                let is_datetime_module = matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "datetime")
-                    && !crate::module_name_shadowed("datetime", &symbols);
+                let is_datetime_module =
+                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "datetime")
+                        && !crate::module_name_shadowed("datetime", &symbols);
                 if is_datetime_module {
                     Some(a.attr.as_str())
                 } else {
@@ -3292,27 +3315,15 @@ impl<'a> CodeGen for Call {
                             }
                         };
                         return Ok(match (func, initial) {
-                            (None, None) => {
-                                let f = crate::safe_ident(rt_variant::ACCUMULATE_SUM);
-                                quote!(#f(&(#xs)))
-                            }
-                            (Some(f), None) => {
-                                let v = crate::safe_ident(rt_variant::ACCUMULATE_FUNC);
-                                quote!(#v(&(#xs), #f))
-                            }
+                            (None, None) => { let f = crate::safe_ident(rt_variant::ACCUMULATE_SUM); quote!(#f(&(#xs))) },
+                            (Some(f), None) => { let v = crate::safe_ident(rt_variant::ACCUMULATE_FUNC); quote!(#v(&(#xs), #f)) },
                             (None, Some(init)) => {
                                 let init = render(init)?;
-                                {
-                                    let f = crate::safe_ident(rt_variant::ACCUMULATE_SUM_INITIAL);
-                                    quote!(#f(&(#xs), #init))
-                                }
+                                { let f = crate::safe_ident(rt_variant::ACCUMULATE_SUM_INITIAL); quote!(#f(&(#xs), #init)) }
                             }
                             (Some(f), Some(init)) => {
                                 let init = render(init)?;
-                                {
-                                    let v = crate::safe_ident(rt_variant::ACCUMULATE_FUNC_INITIAL);
-                                    quote!(#v(&(#xs), #f, #init))
-                                }
+                                { let v = crate::safe_ident(rt_variant::ACCUMULATE_FUNC_INITIAL); quote!(#v(&(#xs), #f, #init)) }
                             }
                         });
                     }
@@ -3329,14 +3340,8 @@ impl<'a> CodeGen for Call {
                             let r = render(r)?;
                             let xs = &rendered[0];
                             return match r.to_string().as_str() {
-                                "2" => {
-                                    let f = crate::safe_ident(rt_variant::PRODUCT_REPEAT2);
-                                    Ok(quote!(#f(&(#xs))))
-                                }
-                                "3" => {
-                                    let f = crate::safe_ident(rt_variant::PRODUCT_REPEAT3);
-                                    Ok(quote!(#f(&(#xs))))
-                                }
+                                "2" => { let f = crate::safe_ident(rt_variant::PRODUCT_REPEAT2); Ok(quote!(#f(&(#xs)))) },
+                                "3" => { let f = crate::safe_ident(rt_variant::PRODUCT_REPEAT3); Ok(quote!(#f(&(#xs)))) },
                                 other => Err(format!(
                                     "product() repeat must be the literal 2 or 3 \
                                      (tuple arity is a compile-time shape); got {}",
@@ -3346,14 +3351,8 @@ impl<'a> CodeGen for Call {
                             };
                         }
                         return match rendered.as_slice() {
-                            [a, b] => {
-                                let f = crate::safe_ident(rt_variant::PRODUCT2);
-                                Ok(quote!(#f(&(#a), &(#b))))
-                            }
-                            [a, b, c] => {
-                                let f = crate::safe_ident(rt_variant::PRODUCT3);
-                                Ok(quote!(#f(&(#a), &(#b), &(#c))))
-                            }
+                            [a, b] => { let f = crate::safe_ident(rt_variant::PRODUCT2); Ok(quote!(#f(&(#a), &(#b)))) },
+                            [a, b, c] => { let f = crate::safe_ident(rt_variant::PRODUCT3); Ok(quote!(#f(&(#a), &(#b), &(#c)))) },
                             _ => Err("product() supports 2 or 3 iterables, or one \
                                       iterable with repeat=2/3"
                                 .to_string()
@@ -3369,7 +3368,11 @@ impl<'a> CodeGen for Call {
                             // spread cannot be unpacked statically — the
                             // call is dropped (an empty iterable; the
                             // dynamic-arity divergence).
-                            if self.args.iter().any(|a| matches!(a, ExprType::Starred(_))) {
+                            if self
+                                .args
+                                .iter()
+                                .any(|a| matches!(a, ExprType::Starred(_)))
+                            {
                                 options.definition_warnings.borrow_mut().push(
                                     "zip_longest with a `*` spread is dropped (an empty \
                                      iterable; the dynamic-arity divergence)"
@@ -3385,10 +3388,7 @@ impl<'a> CodeGen for Call {
                         return Ok(match fill {
                             Some(v) => {
                                 let v = render(v)?;
-                                {
-                                    let f = crate::safe_ident(rt_variant::ZIP_LONGEST_FILL);
-                                    quote!(#f(&(#a), &(#b), #v))
-                                }
+                                { let f = crate::safe_ident(rt_variant::ZIP_LONGEST_FILL); quote!(#f(&(#a), &(#b), #v)) }
                             }
                             None => quote!(zip_longest(&(#a), &(#b))),
                         });
@@ -3403,18 +3403,13 @@ impl<'a> CodeGen for Call {
                             key = Some(self.args[1].clone());
                         }
                         if rendered.is_empty() || rendered.len() > 2 {
-                            return Err("groupby() takes one iterable and a key"
-                                .to_string()
-                                .into());
+                            return Err("groupby() takes one iterable and a key".to_string().into());
                         }
                         let xs = &rendered[0];
                         return Ok(match key {
                             Some(f) => {
                                 let f = render(f)?;
-                                {
-                                    let v = crate::safe_ident(rt_variant::GROUPBY_KEY);
-                                    quote!(#v(&(#xs), #f))
-                                }
+                                { let v = crate::safe_ident(rt_variant::GROUPBY_KEY); quote!(#v(&(#xs), #f)) }
                             }
                             None => quote!(groupby(&(#xs))),
                         });
@@ -3536,17 +3531,20 @@ impl<'a> CodeGen for Call {
                              parameter lowers to the boxed None (classes cannot be \
                              runtime values in rython)",
                             arg.clone()
-                                .to_rust(ctx.clone(), options.clone(), symbols.clone(),)
+                                .to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )
                                 .map(|t| t.to_string())
                                 .unwrap_or_else(|_| "<arg>".to_string())
                         ));
                         bound.push(quote!(stdpython::PyValue::None_));
                     } else {
-                        bound.push(arg.clone().to_rust(
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                        )?);
+                        bound.push(
+                            arg.clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                        );
                     }
                 }
                 // Keyword bindings (`partial(f, a, k=v)`): bind the named
@@ -3556,13 +3554,21 @@ impl<'a> CodeGen for Call {
                 let mut kw_bindings: Vec<(String, TokenStream)> = Vec::new();
                 for kw in &self.keywords {
                     let Some(kname) = &kw.arg else {
-                        return Err("functools.partial with a `**d` spread is not supported"
-                            .to_string()
-                            .into());
+                        return Err(
+                            "functools.partial with a `**d` spread is not supported"
+                                .to_string()
+                                .into(),
+                        );
                     };
-                    let idx = params.iter().position(|p| p == kname).ok_or_else(|| {
-                        format!("functools.partial: `{}` has no parameter `{}`", f.id, kname)
-                    })?;
+                    let idx = params
+                        .iter()
+                        .position(|p| p == kname)
+                        .ok_or_else(|| {
+                            format!(
+                                "functools.partial: `{}` has no parameter `{}`",
+                                f.id, kname
+                            )
+                        })?;
                     if idx < bound_n {
                         return Err(format!(
                             "functools.partial: `{}` is bound both positionally and by \
@@ -3571,10 +3577,10 @@ impl<'a> CodeGen for Call {
                         )
                         .into());
                     }
-                    let value =
-                        kw.value
-                            .clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let value = kw
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     kw_bindings.push((kname.clone(), value));
                 }
                 // The call emits arguments in the CALLEE'S DECLARED
@@ -3650,12 +3656,15 @@ impl<'a> CodeGen for Call {
                     // _json` — urllib3): follow it to the runtime module.
                     let root = match attr.value.as_ref() {
                         ExprType::Name(m) => {
-                            if dispatches_qualified(&m.id) && !module_name_shadowed(&m.id, &symbols)
+                            if dispatches_qualified(&m.id)
+                                && !module_name_shadowed(&m.id, &symbols)
                             {
                                 m.id.clone()
                             } else {
                                 match symbols.get(&m.id) {
-                                    Some(SymbolTableNode::Alias(canonical)) => canonical.clone(),
+                                    Some(SymbolTableNode::Alias(canonical)) => {
+                                        canonical.clone()
+                                    }
                                     _ => m.id.clone(),
                                 }
                             }
@@ -3671,7 +3680,7 @@ impl<'a> CodeGen for Call {
                         }
                         _ => None,
                     }
-                }
+                },
                 _ => None,
             };
             let known = target.as_ref().is_some_and(|(f, _)| {
@@ -3720,14 +3729,7 @@ impl<'a> CodeGen for Call {
                 // keywords.
                 let is_re_fn = matches!(
                     fname.as_str(),
-                    "search"
-                        | "match"
-                        | "fullmatch"
-                        | "findall"
-                        | "finditer"
-                        | "sub"
-                        | "split"
-                        | "compile"
+                    "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub" | "split" | "compile"
                 );
                 let mut width_kw: Option<crate::ExprType> = None;
                 let mut flags_kw: Option<crate::ExprType> = None;
@@ -3752,7 +3754,9 @@ impl<'a> CodeGen for Call {
                         // compat.get_md5, where both are empty in practice):
                         // the dynamic args are dropped (documented
                         // divergence).
-                        None if matches!(fname.as_str(), "md5" | "sha1" | "sha256" | "sha512") => {
+                        None
+                            if matches!(fname.as_str(), "md5" | "sha1" | "sha256" | "sha512") =>
+                        {
                             &mut _usedforsecurity_kw
                         }
                         // deepcopy's `memo=` keyword (issue #154:
@@ -3911,8 +3915,8 @@ impl<'a> CodeGen for Call {
                 // rendered[0] becomes the full mutable-borrow expression:
                 // py_index_mut already yields &mut for subscripts, names
                 // take a fresh &mut.
-                let heap_mutator =
-                    crate::ast::tree::scope::HEAPQ_FIRST_ARG_MUTATORS.contains(&fname.as_str());
+                let heap_mutator = crate::ast::tree::scope::HEAPQ_FIRST_ARG_MUTATORS
+                    .contains(&fname.as_str());
                 if heap_mutator {
                     if let Some(first) = self.args.first() {
                         rendered[0] = if matches!(first, ExprType::Subscript(_)) {
@@ -4008,7 +4012,10 @@ impl<'a> CodeGen for Call {
                         };
                         Ok(quote!(#p(&(#t), #width)?))
                     }
-                    ("compile", [pat, ..]) => {
+                    (
+                        "compile",
+                        [pat, ..],
+                    ) => {
                         if rendered.len() > 2 {
                             return Err("compile() takes at most 2 positional arguments"
                                 .to_string()
@@ -4241,9 +4248,7 @@ impl<'a> CodeGen for Call {
                     // TextIOWrapper: buffered file-object wrappers (urllib3's
                     // ssltransport.makefile) — no rython equivalent — the
                     // boxed PyValue (the file-object divergence).
-                    ("BufferedRWPair", _)
-                    | ("BufferedReader", _)
-                    | ("BufferedWriter", _)
+                    ("BufferedRWPair", _) | ("BufferedReader", _) | ("BufferedWriter", _)
                     | ("TextIOWrapper", _) => {
                         options.definition_warnings.borrow_mut().push(
                             "io.{}(...) lowers as the boxed PyValue (buffered \
@@ -4276,10 +4281,8 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(&(#lines))?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
-                        let p = qual(
-                            crate::ast::tree::std_module::hashlib_new_variant(&fname)
-                                .expect("the arm above names exactly the registry algos"),
-                        );
+                        let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
+                            .expect("the arm above names exactly the registry algos"));
                         Ok(quote!(#p()))
                     }
                     ("indent", [s, prefix]) => {
@@ -4310,16 +4313,20 @@ impl<'a> CodeGen for Call {
         // inherited __init__ must resolve through the defining module's
         // base chain, not the importer's scope.
         if let ExprType::Name(n) = self.func.as_ref() {
-            if n.id == "RLResolver" {}
+            if n.id == "RLResolver" {
+            }
             let resolved = resolve_construction_class(&n.id, &symbols, &options);
-            if n.id == "RLResolver" {}
+            if n.id == "RLResolver" {
+            }
             if let Some((class, class_symbols)) = resolved {
                 // The CONSTRUCTED type's Rust name: for a @classmethod's
                 // `cls(...)` the receiver identifier `cls` is not a Rust
                 // type in scope — the class's OWN name is (urllib3's
                 // Retry.from_int).
                 let cname = match symbols.get(&n.id) {
-                    Some(crate::SymbolTableNode::ClassDef(c)) => crate::safe_ident(&c.name),
+                    Some(crate::SymbolTableNode::ClassDef(c)) => {
+                        crate::safe_ident(&c.name)
+                    }
                     _ => crate::safe_ident(&n.id),
                 };
                 // An EXCEPTION class (`SSLError(e)` — urllib3's
@@ -4340,14 +4347,17 @@ impl<'a> CodeGen for Call {
                             quote!(format!("{}", #arg))
                         }
                         _ => {
-                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
-                                .args
-                                .iter()
-                                .map(|a| {
-                                    a.clone()
-                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                                })
-                                .collect();
+                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> =
+                                self.args
+                                    .iter()
+                                    .map(|a| {
+                                        a.clone().to_rust(
+                                            ctx.clone(),
+                                            options.clone(),
+                                            symbols.clone(),
+                                        )
+                                    })
+                                    .collect();
                             let args = args?;
                             let fmt = vec!["{}"; args.len()].join(", ");
                             quote!(format!(#fmt, #(#args),*))
@@ -4359,7 +4369,11 @@ impl<'a> CodeGen for Call {
                 // spreads a tuple; the signature mapping cannot know the
                 // arity, so the collection passes positionally (the
                 // spread divergence, issue #122-family).
-                if self.args.iter().any(|a| matches!(a, ExprType::Starred(_))) {
+                if self
+                    .args
+                    .iter()
+                    .any(|a| matches!(a, ExprType::Starred(_)))
+                {
                     let mut args = Vec::new();
                     for arg in &self.args {
                         args.push(arg.clone().to_rust(
@@ -4475,12 +4489,12 @@ impl<'a> CodeGen for Call {
             // call, not a `::new` construction; the socket module's
             // items are functions except the constants.
             let stdpython_fn = matches!(symbols.get(&n.id),
-            Some(crate::SymbolTableNode::ImportFrom(ifm))
-                if ifm.module == "socket"
-                    && matches!(
-                        n.id.as_str(),
-                        "getdefaulttimeout" | "setdefaulttimeout" | "gethostname"
-                    ));
+                Some(crate::SymbolTableNode::ImportFrom(ifm))
+                    if ifm.module == "socket"
+                        && matches!(
+                            n.id.as_str(),
+                            "getdefaulttimeout" | "setdefaulttimeout" | "gethostname"
+                        ));
             let stdpython_class = !stdpython_fn
                 && match symbols.get(&n.id) {
                     Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
@@ -4575,7 +4589,9 @@ impl<'a> CodeGen for Call {
             // Same-module class, or an imported one resolved through its
             // defining module.
             let resolved = match symbols.get(&receiver.id) {
-                Some(crate::SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+                Some(crate::SymbolTableNode::ClassDef(c)) => {
+                    Some((c.clone(), symbols.clone()))
+                }
                 _ => resolve_construction_class(&receiver.id, &symbols, &options),
             };
 
@@ -4594,8 +4610,14 @@ impl<'a> CodeGen for Call {
                         sig.args.args.remove(0);
                     }
                 }
-                let MappedArguments { prelude, args } =
-                    map_call_arguments(&sig, &self.args, &self.keywords, &ctx, &options, &symbols)?;
+                let MappedArguments { prelude, args } = map_call_arguments(
+                    &sig,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                )?;
                 let cname = crate::safe_ident(&receiver.id);
                 let method_name = crate::safe_ident(&attr.attr);
                 return Ok(quote!({ #prelude #cname::#method_name(#(#args),*)? }));
@@ -4710,9 +4732,7 @@ impl<'a> CodeGen for Call {
                         // base implementation is unmodeled, so the method
                         // resolves to the class's own (a documented
                         // divergence; Python would use the base's).
-                        if attr.attr == "__init__"
-                            && self.args.is_empty()
-                            && self.keywords.is_empty()
+                        if attr.attr == "__init__" && self.args.is_empty() && self.keywords.is_empty()
                         {
                             return Ok(quote!(()));
                         }
@@ -4757,8 +4777,14 @@ impl<'a> CodeGen for Call {
                 };
                 let mut sig = method;
                 crate::strip_self(&mut sig.args);
-                let MappedArguments { prelude, args } =
-                    map_call_arguments(&sig, &self.args, &self.keywords, &ctx, &options, &symbols)?;
+                let MappedArguments { prelude, args } = map_call_arguments(
+                    &sig,
+                    &self.args,
+                    &self.keywords,
+                    &ctx,
+                    &options,
+                    &symbols,
+                )?;
                 // `super().__init__(...)` stays on the embedded base struct:
                 // __init__ is a constructor, not a virtual method — it must
                 // write the base's fields through the base struct (`new`
@@ -4819,11 +4845,10 @@ impl<'a> CodeGen for Call {
                     .into_iter()
                     .find(|c| c.methods().any(|mm| mm.name == attr.attr))
                     .expect("super(): method_on_mro found the method, so its definer exists");
-                let definer_trait = crate::safe_ident(&format!("{}Trait", definer.name));
+                let definer_trait =
+                    crate::safe_ident(&format!("{}Trait", definer.name));
                 let helper = crate::safe_ident(&format!("__rython_super_{}", attr.attr));
-                return Ok(
-                    quote!({ #prelude <Self as #definer_trait>::#helper(self, #(#args),*)? }),
-                );
+                return Ok(quote!({ #prelude <Self as #definer_trait>::#helper(self, #(#args),*)? }));
             }
             // A method call on a receiver whose class is known — `self`
             // inside a method, or a name assigned a construction — resolves
@@ -4854,14 +4879,12 @@ impl<'a> CodeGen for Call {
                     // whatever its name — Python binds the instance to the
                     // first parameter, so boto3's `factory_self` is a
                     // receiver too.
-                    let is_static = sig
-                        .decorator_list
-                        .iter()
-                        .any(|d| matches!(d, ExprType::Name(n) if n.id == "staticmethod"));
-                    let is_classmethod = sig
-                        .decorator_list
-                        .iter()
-                        .any(|d| matches!(d, ExprType::Name(n) if n.id == "classmethod"));
+                    let is_static = sig.decorator_list.iter().any(|d| {
+                        matches!(d, ExprType::Name(n) if n.id == "staticmethod")
+                    });
+                    let is_classmethod = sig.decorator_list.iter().any(|d| {
+                        matches!(d, ExprType::Name(n) if n.id == "classmethod")
+                    });
                     if is_classmethod {
                         if !sig.args.posonlyargs.is_empty() {
                             sig.args.posonlyargs.remove(0);
@@ -4881,8 +4904,7 @@ impl<'a> CodeGen for Call {
                     // is dropped (the abstract protocol is unmodeled;
                     // documented divergence).
                     let supplied = self.args.len() + self.keywords.len();
-                    let stub_params = sig.args.posonlyargs.len()
-                        + sig.args.args.len()
+                    let stub_params = sig.args.posonlyargs.len() + sig.args.args.len()
                         + sig.args.kwonlyargs.len()
                         + usize::from(sig.args.vararg.is_some())
                         + usize::from(sig.args.kwarg.is_some());
@@ -4901,19 +4923,23 @@ impl<'a> CodeGen for Call {
                     // zero-parameter property whose VALUE is a callable): a
                     // plain method with a keyword call (`c.bump(amount=2)`)
                     // is a normal keyword-argument call, never dropped.
-                    let is_property_descriptor = sig.decorator_list.iter().any(|d| match d {
-                        ExprType::Name(n) => matches!(
-                            n.id.as_str(),
-                            "property" | "CachedProperty" | "cached_property"
-                        ),
-                        ExprType::Attribute(a) => a.attr == "cached_property",
-                        _ => false,
+                    let is_property_descriptor = sig.decorator_list.iter().any(|d| {
+                        match d {
+                            ExprType::Name(n) => matches!(
+                                n.id.as_str(),
+                                "property" | "CachedProperty" | "cached_property"
+                            ),
+                            ExprType::Attribute(a) => a.attr == "cached_property",
+                            _ => false,
+                        }
                     });
                     if is_property_descriptor
                         && !self.keywords.is_empty()
                         && class
                             .infer_fields(&class_symbols, &options)
-                            .map(|fields| !fields.iter().any(|(name, _)| name == &attr.attr))
+                            .map(|fields| {
+                                !fields.iter().any(|(name, _)| name == &attr.attr)
+                            })
                             .unwrap_or(false)
                     {
                         options.definition_warnings.borrow_mut().push(format!(
@@ -4924,7 +4950,9 @@ impl<'a> CodeGen for Call {
                         ));
                         return Ok(quote!(stdpython::PyValue::None_));
                     }
-                    if supplied < stub_params && crate::ast::tree::call::is_notimpl_stub(&sig) {
+                    if supplied < stub_params
+                        && crate::ast::tree::call::is_notimpl_stub(&sig)
+                    {
                         options.definition_warnings.borrow_mut().push(format!(
                             "call to the abstract stub `{}.{}` with {} argument(s) is \
                              dropped (the abstract method protocol is unmodeled; the \
@@ -4971,25 +4999,28 @@ impl<'a> CodeGen for Call {
                     // only callees may read through the load form.
                     let mutates_receiver =
                         class.method_needs_mut_self(&attr.attr, &class_symbols, &options);
-                    let receiver = if mutates_receiver
-                        && crate::ast::tree::attribute::chain_root_is_self(&attr.value)
-                    {
-                        // The WHOLE chain renders as a place:
-                        // `self.outer.inner.bump()` goes through
-                        // `self.outer_mut().inner_mut().bump()`, not the
-                        // cloning load accessors.
-                        crate::ast::tree::attribute::to_rust_place_expr(
-                            &attr.value,
-                            &ctx,
-                            &options,
-                            &symbols,
-                            false,
-                        )?
-                    } else {
-                        attr.value
-                            .clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
-                    };
+                    let receiver =
+                        if mutates_receiver
+                            && crate::ast::tree::attribute::chain_root_is_self(&attr.value)
+                        {
+                            // The WHOLE chain renders as a place:
+                            // `self.outer.inner.bump()` goes through
+                            // `self.outer_mut().inner_mut().bump()`, not the
+                            // cloning load accessors.
+                            crate::ast::tree::attribute::to_rust_place_expr(
+                                &attr.value,
+                                &ctx,
+                                &options,
+                                &symbols,
+                                false,
+                            )?
+                        } else {
+                            attr.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?
+                        };
                     let method_name = crate::safe_ident(&attr.attr);
                     return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
                 }
@@ -5001,10 +5032,7 @@ impl<'a> CodeGen for Call {
             // the call is a no-op with a warning — the bookkeeping the set
             // performs is unmodeled (documented divergence).
             if crate::ast::tree::call::receiver_is_pyvalue_self_field(
-                &attr.value,
-                &ctx,
-                &symbols,
-                &options,
+                &attr.value, &ctx, &symbols, &options,
             ) {
                 options.definition_warnings.borrow_mut().push(format!(
                     "call to `self.{}(...)` on a boxed PyValue field is dropped (the \
@@ -5136,7 +5164,8 @@ impl<'a> CodeGen for Call {
                     .keywords
                     .iter()
                     .filter(|kw| {
-                        !(kw.arg.as_deref() == Some("tzinfo") && crate::is_none_expr(&kw.value))
+                        !(kw.arg.as_deref() == Some("tzinfo")
+                            && crate::is_none_expr(&kw.value))
                     })
                     .cloned()
                     .collect();
@@ -5318,17 +5347,20 @@ impl<'a> CodeGen for Call {
                         Some(SymbolTableNode::Assign {
                             value: ExprType::Constant(c),
                             ..
-                        }) if matches!(&c.0, Some(litrs::Literal::String(_))) => match &c.0 {
-                            Some(litrs::Literal::String(s)) => s.value().to_string(),
-                            _ => unreachable!(),
-                        },
+                        }) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
+                            match &c.0 {
+                                Some(litrs::Literal::String(s)) => s.value().to_string(),
+                                _ => unreachable!(),
+                            }
+                        }
                         _ => {
-                            options.definition_warnings.borrow_mut().push(
-                                "str.format on a non-literal template is dropped (the \
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
                         }
                     },
                     // A SELF-FIELD template (`self.default_endpoint.format(
@@ -5336,23 +5368,27 @@ impl<'a> CodeGen for Call {
                     // Client._assume_endpoint, where the field stores
                     // `default_endpoint or self.DEFAULT_ENDPOINT`): resolve
                     // the field's stored value to a string template.
-                    ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+                    ExprType::Attribute(a)
+                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
                     {
                         let Some(enclosing) = ctx.enclosing_class_name() else {
-                            options.definition_warnings.borrow_mut().push(
-                                "str.format on a non-literal template is dropped (the \
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
                         };
-                        let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing) else {
-                            options.definition_warnings.borrow_mut().push(
-                                "str.format on a non-literal template is dropped (the \
+                        let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
+                        else {
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
                         };
                         // The class's class-level string constants
                         // (`self.DEFAULT_ENDPOINT` reads).
@@ -5399,12 +5435,13 @@ impl<'a> CodeGen for Call {
                             })
                         });
                         let Some(v) = store_value else {
-                            options.definition_warnings.borrow_mut().push(
-                                "str.format on a non-literal template is dropped (the \
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
                         };
                         match template_from_expr(v, &class_const) {
                             Some(t) => t,
@@ -5431,12 +5468,13 @@ impl<'a> CodeGen for Call {
                     // template is statically known.
                     ExprType::Attribute(a) => {
                         let ExprType::Name(class) = a.value.as_ref() else {
-                            options.definition_warnings.borrow_mut().push(
-                                "str.format on a non-literal template is dropped (the \
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
                         };
                         // The class may be imported (`from .exceptions import
                         // ResponseError` in urllib3/util/retry.py): resolve
@@ -5451,12 +5489,13 @@ impl<'a> CodeGen for Call {
                             _ => None,
                         };
                         let Some(c) = class_def else {
-                            options.definition_warnings.borrow_mut().push(
-                                "str.format on a non-literal template is dropped (the \
+                            
+                                options.definition_warnings.borrow_mut().push(
+                                    "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                                        .to_string(),
+                                );
+                                return Ok(quote!(stdpython::PyValue::None_));
                         };
                         let Some(assign) = c.body.iter().find_map(|s| match &s.statement {
                             crate::StatementType::Assign(assign)
@@ -5485,6 +5524,7 @@ impl<'a> CodeGen for Call {
                                 }
                             }
                             _ => {
+                                
                                 options.definition_warnings.borrow_mut().push(
                                     "str.format on a non-literal template is dropped (the \
                                      dynamic-format divergence)"
@@ -5636,18 +5676,14 @@ impl<'a> CodeGen for Call {
                     // through to the generic path.
                     ("encode", [])
                         if crate::ast::tree::call::receiver_is_str_like(
-                            &attr.value,
-                            &options,
-                            &symbols,
+                            &attr.value, &options, &symbols,
                         ) =>
                     {
                         return Ok(quote!((#receiver).as_bytes().to_vec()));
                     }
                     ("encode", [enc])
                         if crate::ast::tree::call::receiver_is_str_like(
-                            &attr.value,
-                            &options,
-                            &symbols,
+                            &attr.value, &options, &symbols,
                         ) =>
                     {
                         // A `self.CONST` encoding argument
@@ -5711,8 +5747,8 @@ impl<'a> CodeGen for Call {
                             // only a few code points (urllib3's emscripten
                             // fetch); treated as latin-1 — a documented
                             // divergence.
-                            "latin1" | "latin-1" | "iso-8859-1" | "iso-8859-15" | "ISO-8859-15"
-                            | "ISO-8859-1" => {
+                            "latin1" | "latin-1" | "iso-8859-1" | "iso-8859-15"
+                            | "ISO-8859-15" | "ISO-8859-1" => {
                                 let runtime = crate::safe_ident(&options.stdpython);
                                 return Ok(quote!(
                                     #runtime::stdlib::codec::encode_latin1(#receiver)?
@@ -5734,13 +5770,14 @@ impl<'a> CodeGen for Call {
                     // PyValue — dispatches through the PyDecode trait at
                     // runtime. Defaults are Python's (utf-8, strict).
                     ("decode", args @ ([] | [_] | [_, _]))
-                        if crate::ast::tree::call::root_name(&attr.value).is_some_and(|root| {
-                            options.param_method_params.contains(root)
-                                || matches!(
-                                    options.name_types.get(root),
-                                    Some(crate::TypeInfo::PyValue)
-                                )
-                        }) =>
+                        if crate::ast::tree::call::root_name(&attr.value)
+                            .is_some_and(|root| {
+                                options.param_method_params.contains(root)
+                                    || matches!(
+                                        options.name_types.get(root),
+                                        Some(crate::TypeInfo::PyValue)
+                                    )
+                            }) =>
                     {
                         let enc = args
                             .first()
@@ -5764,9 +5801,7 @@ impl<'a> CodeGen for Call {
                     // (Vec<u8> implements the trait directly).
                     ("decode", [enc, errors])
                         if crate::ast::tree::call::receiver_is_str_like(
-                            &attr.value,
-                            &options,
-                            &symbols,
+                            &attr.value, &options, &symbols,
                         ) || matches!(
                             &*attr.value,
                             ExprType::Name(n) if matches!(
@@ -5784,9 +5819,7 @@ impl<'a> CodeGen for Call {
                     // bytes→String conversion is the codec's job).
                     ("decode", [enc])
                         if crate::ast::tree::call::receiver_is_str_like(
-                            &attr.value,
-                            &options,
-                            &symbols,
+                            &attr.value, &options, &symbols,
                         ) =>
                     {
                         // A literal codec name dispatches at conversion
@@ -5794,7 +5827,10 @@ impl<'a> CodeGen for Call {
                         // the codec registry dispatch.
                         let codec = enc.to_string().trim_matches('"').to_string();
                         let runtime = crate::safe_ident(&options.stdpython);
-                        if matches!(codec.as_str(), "utf-8" | "ascii" | "punycode") {
+                        if matches!(
+                            codec.as_str(),
+                            "utf-8" | "ascii" | "punycode"
+                        ) {
                             let f = crate::safe_ident(match codec.as_str() {
                                 "utf-8" | "utf8" => "decode_utf8",
                                 "ascii" => "decode_ascii",
@@ -5935,8 +5971,7 @@ impl<'a> CodeGen for Call {
                             &attr.value,
                             &symbols,
                             &options,
-                        ) =>
-                    {
+                        ) => {
                         // The receiver and argument are each evaluated ONCE,
                         // receiver first (CPython evaluates the primary +
                         // attribute, then the argument). The previous shape
@@ -6011,8 +6046,8 @@ impl<'a> CodeGen for Call {
                 // Issue #121: bytes methods on a name narrowed to Vec<u8>
                 // (the bytes branch of a str|bytes union) — ASCII byte-wise
                 // semantics, matching Python's bytes methods.
-                let narrowed_bytes =
-                    crate::ast::tree::call::root_name(&attr.value).is_some_and(|root| {
+                let narrowed_bytes = crate::ast::tree::call::root_name(&attr.value)
+                    .is_some_and(|root| {
                         options
                             .narrowed_names
                             .get(root)
@@ -6074,7 +6109,9 @@ impl<'a> CodeGen for Call {
                     crate::TypeInfo::Int => Some("int".into()),
                     crate::TypeInfo::Float => Some("float".into()),
                     crate::TypeInfo::Bool => Some("bool".into()),
-                    crate::TypeInfo::String | crate::TypeInfo::StrRef => Some("str".into()),
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => {
+                        Some("str".into())
+                    }
                     crate::TypeInfo::Bytes => Some("bytes".into()),
                     _ => None,
                 }
@@ -6139,10 +6176,11 @@ impl<'a> CodeGen for Call {
                         }
                     }
                     lit => (
-                        crate::ast::tree::function_def::simple_expr_type(lit).and_then(|ty| {
-                            crate::ast::tree::function_def::rust_type_to_py_name(&ty)
-                                .map(str::to_string)
-                        }),
+                        crate::ast::tree::function_def::simple_expr_type(lit)
+                            .and_then(|ty| {
+                                crate::ast::tree::function_def::rust_type_to_py_name(&ty)
+                                    .map(str::to_string)
+                            }),
                         false,
                     ),
                 }
@@ -6165,13 +6203,9 @@ impl<'a> CodeGen for Call {
                     .into());
                 };
                 let boxed = arg_is_boxed(arg);
-                let (py_ty, is_class) = if boxed { (None, false) } else { classify(arg) };
-                sites.push(AxisSite {
-                    axis,
-                    boxed,
-                    py_ty,
-                    is_class,
-                });
+                let (py_ty, is_class) =
+                    if boxed { (None, false) } else { classify(arg) };
+                sites.push(AxisSite { axis, boxed, py_ty, is_class });
             }
             // An argument with NO statically-known type (a local reassigned
             // through untyped calls — botocore configloader's
@@ -6199,15 +6233,19 @@ impl<'a> CodeGen for Call {
                 // OUTSIDE the tested set boxes so it lands in `Other` —
                 // the residual arm for that axis, exactly Python.
                 use crate::ast::tree::specialize::{
-                    RouterReturn, axis_dispatch_suffix, py_id_boxable,
+                    axis_dispatch_suffix, py_id_boxable, RouterReturn,
                 };
                 let orig = crate::safe_ident(&callee_name.id);
                 let mut rendered = Vec::new();
                 for (i, arg) in self.args.iter().enumerate() {
-                    let a = arg
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    let Some(site) = sites.iter().find(|s| s.axis.index == i) else {
+                    let a = arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    let Some(site) =
+                        sites.iter().find(|s| s.axis.index == i)
+                    else {
                         rendered.push(a);
                         continue;
                     };
@@ -6222,7 +6260,8 @@ impl<'a> CodeGen for Call {
                     let Some(py_ty) = &site.py_ty else {
                         unreachable!("unknown-typed sites take the unadorned path above")
                     };
-                    if axis_dispatch_suffix(site.axis, py_ty, site.is_class).is_some()
+                    if axis_dispatch_suffix(site.axis, py_ty, site.is_class)
+                        .is_some()
                         || site.is_class
                     {
                         // A class inside the tested subtree has its own
@@ -6230,7 +6269,10 @@ impl<'a> CodeGen for Call {
                         // below via the From-less build if ever reached,
                         // so keep classes on the plain path only when a
                         // variant exists.
-                        if site.is_class && axis_dispatch_suffix(site.axis, py_ty, true).is_none() {
+                        if site.is_class
+                            && axis_dispatch_suffix(site.axis, py_ty, true)
+                                .is_none()
+                        {
                             return Err(format!(
                                 "cannot dispatch `{}`: argument {} is a class \
                                  outside the isinstance-tested set, which has \
@@ -6309,19 +6351,14 @@ impl<'a> CodeGen for Call {
                 };
                 suffixes.push(
                     crate::ast::tree::specialize::axis_dispatch_suffix(
-                        site.axis,
-                        py_ty,
-                        site.is_class,
+                        site.axis, py_ty, site.is_class,
                     )
                     .unwrap_or("any")
                     .to_lowercase(),
                 );
             }
             let suffix = suffixes.join("_");
-            let mangled = crate::safe_ident(&crate::ast::tree::specialize::mangled_name(
-                &callee_name.id,
-                &suffix,
-            ));
+            let mangled = crate::safe_ident(&crate::ast::tree::specialize::mangled_name(&callee_name.id, &suffix));
             let mut rendered = Vec::new();
             for arg in &self.args {
                 rendered.push(arg.clone().to_rust(
@@ -6356,24 +6393,24 @@ impl<'a> CodeGen for Call {
         let callee = match self.func.as_ref() {
             ExprType::Name(n) => {
                 match symbols.get(&n.id) {
-                    Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),
-                    // Issue #123: an IMPORTED function (`from pip._internal.
-                    // locations import get_scheme`) resolves through the
-                    // defining module's AST, with that module's symbol table —
-                    // the same cross-module lookup classes use. This unlocks
-                    // keyword arguments on imported functions and, via
-                    // `module_function_def`, return-annotation typing.
-                    Some(SymbolTableNode::ImportFrom(i)) => {
-                        let path = i.resolved_module_path(&options);
-                        if options.module_defs.contains_key(&path) {
-                            crate::module_function_def(&options, &path, &n.id).map(|(f, _)| f)
-                        } else {
-                            None
-                        }
+                Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),
+                // Issue #123: an IMPORTED function (`from pip._internal.
+                // locations import get_scheme`) resolves through the
+                // defining module's AST, with that module's symbol table —
+                // the same cross-module lookup classes use. This unlocks
+                // keyword arguments on imported functions and, via
+                // `module_function_def`, return-annotation typing.
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let path = i.resolved_module_path(&options);
+                    if options.module_defs.contains_key(&path) {
+                        crate::module_function_def(&options, &path, &n.id).map(|(f, _)| f)
+                    } else {
+                        None
                     }
-                    _ => None,
                 }
-            }
+                _ => None,
+                }
+            },
             _ => None,
         };
         if let Some(callee_def) = &callee {
@@ -6505,9 +6542,12 @@ impl<'a> CodeGen for Call {
         // rython cannot hold it, so the generated module has no `pub fn`
         // for it (E0425). Drop the call (the callable-as-value divergence).
         if let ExprType::Attribute(attr) = self.func.as_ref()
-            && crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols, &options)
-            && let Some(module_path) =
-                crate::ast::tree::call::module_path_of(&attr.value, &symbols, &options)
+            && crate::ast::tree::attribute::is_module_path_chain(
+                &attr.value,
+                &symbols,
+                &options,
+            )
+            && let Some(module_path) = crate::ast::tree::call::module_path_of(&attr.value, &symbols, &options)
             && options.module_defs.contains_key(&module_path)
             && crate::module_function_def(&options, &module_path, &attr.attr).is_none()
             && crate::module_class_def(&options, &module_path, &attr.attr).is_none()
@@ -6535,10 +6575,7 @@ impl<'a> CodeGen for Call {
             let cname = crate::safe_ident(&attr.attr);
             let mut args = Vec::new();
             for arg in &self.args {
-                args.push(
-                    arg.clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
-                );
+                args.push(arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?);
             }
             return Ok(quote!(#module::#cname::new(#(#args),*)));
         }
@@ -6594,10 +6631,7 @@ impl<'a> CodeGen for Call {
                     ));
                     quote!(stdpython::PyValue::None_)
                 } else if crate::is_class_value_expr(&arg, &symbols)
-                    && param
-                        .annotation
-                        .as_deref()
-                        .and_then(crate::call_arg_expected_type)
+                    && param.annotation.as_deref().and_then(crate::call_arg_expected_type)
                         .is_some_and(|t| {
                             let s = t.to_rust_type().to_string();
                             s == "stdpython :: PyValue" || s == "PyValue"
@@ -6972,10 +7006,10 @@ fn lower_str_format(
             // (`{data[installer][name]}` — pip's user agent): attribute/
             // index access inside fields is unmodeled — the format call is
             // dropped (documented divergence).
-            options
-                .definition_warnings
-                .borrow_mut()
-                .push(format!("str.format({:?}) is dropped: {}", template, e));
+            options.definition_warnings.borrow_mut().push(format!(
+                "str.format({:?}) is dropped: {}",
+                template, e
+            ));
             return Ok(quote!(stdpython::PyValue::None_));
         }
     };
@@ -6988,15 +7022,7 @@ fn lower_str_format(
     if let Some(pos) = args.iter().position(|a| matches!(a, ExprType::Starred(_))) {
         let field_count = pieces
             .iter()
-            .filter(|p| {
-                matches!(
-                    p,
-                    Piece::Field {
-                        arg: FieldRef::Auto,
-                        ..
-                    }
-                )
-            })
+            .filter(|p| matches!(p, Piece::Field { arg: FieldRef::Auto, .. }))
             .count();
         let explicit = args
             .iter()
@@ -7036,20 +7062,23 @@ fn lower_str_format(
                         }
                     }
                 }
-                ExprType::Call(c) if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "dict") =>
+                ExprType::Call(c)
+                    if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "dict") =>
                 {
                     // The first argument may be a dict LITERAL, or a NAME
                     // bound to one (`dict(opts, links=...)` where
                     // `opts = {"name": ...}` — pip's req_command).
                     let first_dict: Option<&crate::Dict> = match c.args.first() {
                         Some(ExprType::Dict(d)) => Some(d),
-                        Some(ExprType::Name(n)) => match symbols.get(&n.id) {
-                            Some(SymbolTableNode::Assign {
-                                value: ExprType::Dict(d),
-                                ..
-                            }) => Some(d),
-                            _ => None,
-                        },
+                        Some(ExprType::Name(n)) => {
+                            match symbols.get(&n.id) {
+                                Some(SymbolTableNode::Assign {
+                                    value: ExprType::Dict(d),
+                                    ..
+                                }) => Some(d),
+                                _ => None,
+                            }
+                        }
                         _ => None,
                     };
                     if let Some(d) = first_dict {
@@ -7351,7 +7380,11 @@ fn escape_regex_braces(pattern: &str) -> String {
 /// Whether a function is a raise-only NotImplementedError stub — an
 /// abstract method (`_do_modeled_error_parse` — botocore's parsers).
 fn is_notimpl_stub(f: &crate::FunctionDef) -> bool {
-    f.body.len() == 1 && matches!(&f.body[0].statement, crate::StatementType::Raise(_))
+    f.body.len() == 1
+        && matches!(
+            &f.body[0].statement,
+            crate::StatementType::Raise(_)
+        )
 }
 
 /// The class of a method-call receiver, when it is statically known:
@@ -7643,23 +7676,37 @@ pub(crate) fn receiver_is_str_like(
     match receiver {
         ExprType::Constant(c) => matches!(&c.0, Some(litrs::Literal::String(_))),
         ExprType::Name(n) => {
-            options.local_types.get(&n.id).is_some_and(|t| {
-                let s = t.to_string();
-                s.contains("String") || s.contains("str")
-            }) || options.name_types.get(&n.id).is_some_and(|t| {
-                matches!(
-                    t,
-                    crate::TypeInfo::StrOrBytes
-                        | crate::TypeInfo::String
-                        | crate::TypeInfo::StrRef
-                        | crate::TypeInfo::PyValue
-                )
-            }) || options.narrowed_names.get(&n.id).is_some_and(|t| {
-                matches!(
-                    t,
-                    crate::TypeInfo::StrOrBytes | crate::TypeInfo::String | crate::TypeInfo::StrRef
-                )
-            }) || crate::module_name_shadowed(&n.id, symbols)
+            options
+                .local_types
+                .get(&n.id)
+                .is_some_and(|t| {
+                    let s = t.to_string();
+                    s.contains("String") || s.contains("str")
+                })
+                || options
+                    .name_types
+                    .get(&n.id)
+                    .is_some_and(|t| {
+                        matches!(
+                            t,
+                            crate::TypeInfo::StrOrBytes
+                                | crate::TypeInfo::String
+                                | crate::TypeInfo::StrRef
+                                | crate::TypeInfo::PyValue
+                        )
+                    })
+                || options
+                    .narrowed_names
+                    .get(&n.id)
+                    .is_some_and(|t| {
+                        matches!(
+                            t,
+                            crate::TypeInfo::StrOrBytes
+                                | crate::TypeInfo::String
+                                | crate::TypeInfo::StrRef
+                        )
+                    })
+                || crate::module_name_shadowed(&n.id, symbols)
         }
         _ => false,
     }
@@ -7726,10 +7773,12 @@ fn lower_threading_thread(
             Some("target") => match &kw.value {
                 ExprType::Name(n) => target = Some(n.id.clone()),
                 _ => {
-                    return Err("threading.Thread(target=...): the target must be a plain \
+                    return Err(
+                        "threading.Thread(target=...): the target must be a plain \
                          function name — callables are not runtime values in rython"
-                        .to_string()
-                        .into());
+                            .to_string()
+                            .into(),
+                    );
                 }
             },
             Some("args") => match &kw.value {
@@ -7747,10 +7796,14 @@ fn lower_threading_thread(
             Some("daemon") => match &kw.value {
                 // The parser represents True/False as bool Constants; the
                 // Name spelling covers synthesized/re-entered ASTs.
-                ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Bool(b)) if b.value()) => {
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if b.value()) =>
+                {
                     daemon = true
                 }
-                ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value()) => {
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value()) =>
+                {
                     daemon = false
                 }
                 ExprType::Name(n) if n.id == "True" => daemon = true,
@@ -8026,8 +8079,11 @@ fn map_call_arguments_inner(
         // DEFINING module's scope when the callee is an imported class's
         // method (the caller may not even bind the constant).
         if let ExprType::Name(n) = expr
-            && let Some(v) =
-                resolve_constant_name(&n.id, default_symbols.unwrap_or(symbols), &options)
+            && let Some(v) = resolve_constant_name(
+                &n.id,
+                default_symbols.unwrap_or(symbols),
+                &options,
+            )
         {
             return Ok(v);
         }
@@ -8043,7 +8099,8 @@ fn map_call_arguments_inner(
         // or the ENCLOSING class's ClassDef for non-construction calls
         // (`map_call_arguments_inner` with no constructed_class).
         if let ExprType::Name(n) = expr
-            && let Some(class_name) = constructed_class.or(ctx.enclosing_class_name())
+            && let Some(class_name) = constructed_class
+                .or(ctx.enclosing_class_name())
             && let Some(class) = crate::resolve_class_referenced(
                 &class_name,
                 default_symbols.unwrap_or(symbols),
@@ -8061,7 +8118,8 @@ fn map_call_arguments_inner(
             return Ok(quote!((*#class_ident::#ident).clone()));
         }
         if let ExprType::Name(n) = expr
-            && let Some(class_name) = constructed_class.or(ctx.enclosing_class_name())
+            && let Some(class_name) = constructed_class
+                .or(ctx.enclosing_class_name())
             && let Some(class) = crate::resolve_class_referenced(
                 &class_name,
                 default_symbols.unwrap_or(symbols),
@@ -8086,10 +8144,7 @@ fn map_call_arguments_inner(
         // requests' sessions): rython cannot hold a class/function as a
         // value (the callables-as-data divergence), so any argument passed
         // for it lowers to the boxed None.
-        if param
-            .annotation
-            .as_deref()
-            .is_some_and(crate::ast::tree::arguments::is_type_annotation)
+        if param.annotation.as_deref().is_some_and(crate::ast::tree::arguments::is_type_annotation)
         {
             options.definition_warnings.borrow_mut().push(format!(
                 "callable argument for `{}` (a `type`-annotated parameter) lowers to \
@@ -8232,12 +8287,8 @@ fn map_call_arguments_inner(
                 })
             {
                 for (k, v) in d.keys.iter().zip(d.values.iter()) {
-                    let Some(ExprType::Constant(c)) = k else {
-                        continue;
-                    };
-                    let Some(litrs::Literal::String(s)) = &c.0 else {
-                        continue;
-                    };
+                    let Some(ExprType::Constant(c)) = k else { continue };
+                    let Some(litrs::Literal::String(s)) = &c.0 else { continue };
                     let key = s.value().to_string();
                     if let Some(idx) = pos_params.iter().position(|p| &p.arg == &key) {
                         if slots[idx].is_some() {
@@ -8405,7 +8456,8 @@ fn map_call_arguments_inner(
             let vals: Vec<&TokenStream> = items.iter().map(|(v, _)| v).collect();
             quote!(vec![#(#vals),*])
         } else {
-            let mut stmts = quote!(let mut __rython_varargs: Vec<stdpython::PyValue> = Vec::new(););
+            let mut stmts =
+                quote!(let mut __rython_varargs: Vec<stdpython::PyValue> = Vec::new(););
             for (v, is_spread) in items {
                 if *is_spread {
                     stmts.extend(quote!(__rython_varargs.extend(
@@ -8453,8 +8505,7 @@ fn map_call_arguments_inner(
     let kw_expr = if kwarg_param.is_some() {
         let pairs = if keywords.is_empty() {
             Vec::new()
-        } else {
-            extra_kwarg_temps
+        } else {            extra_kwarg_temps
                 .iter()
                 .zip(extra_kwargs.iter())
                 .map(|(ti, (name, _))| {

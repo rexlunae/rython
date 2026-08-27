@@ -4,8 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PyAttributeExtractor, PythonOptions,
-    SymbolTableScopes, extract_list, impl_node_with_positions,
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
+    Node, impl_node_with_positions, PyAttributeExtractor, extract_list
 };
 
 use super::Statement;
@@ -28,10 +28,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for If {
         let test = test
             .extract()
             .map_err(|e| crate::extraction_failure("if condition", &ob, e))?;
-
+        
         let body: Vec<Statement> = extract_list(&ob, "body", "if body statements")?;
         let orelse: Vec<Statement> = extract_list(&ob, "orelse", "if else statements")?;
-
+        
         Ok(If {
             test,
             body,
@@ -44,12 +44,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for If {
     }
 }
 
-impl_node_with_positions!(If {
-    lineno,
-    col_offset,
-    end_lineno,
-    end_col_offset
-});
+impl_node_with_positions!(If { lineno, col_offset, end_lineno, end_col_offset });
 
 impl CodeGen for If {
     type Context = CodeGenContext;
@@ -58,13 +53,8 @@ impl CodeGen for If {
 
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let symbols = self.test.find_symbols(symbols);
-        let symbols = self
-            .body
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc));
-        self.orelse
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc))
+        let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
+        self.orelse.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc))
     }
 
     fn to_rust(
@@ -178,7 +168,7 @@ impl CodeGen for If {
             .map(|stmt| stmt.to_rust(ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
-
+        
         if self.orelse.is_empty() {
             Ok(quote! {
                 if #test {
@@ -186,13 +176,12 @@ impl CodeGen for If {
                 }
             })
         } else {
-            let else_stmts: Result<Vec<_>, _> = self
-                .orelse
+            let else_stmts: Result<Vec<_>, _> = self.orelse
                 .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), else_options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
-
+            
             Ok(quote! {
                 if #test {
                     #(#body_stmts;)*
@@ -263,7 +252,9 @@ fn version_gate_taken(test: &ExprType) -> Option<bool> {
     // < 3`), or a tuple expression (`sys.version_info >= (3,)`).
     let right: Option<Vec<i64>> = match &c.comparators[0] {
         ExprType::Constant(cn) => match &cn.0 {
-            Some(litrs::Literal::Integer(i)) => Some(vec![i.value()?]),
+            Some(litrs::Literal::Integer(i)) => {
+                Some(vec![i.value()?])
+            }
             _ => return None,
         },
         ExprType::Tuple(t) => {
@@ -346,23 +337,18 @@ mod tests {
     use crate::create_parse_test;
 
     create_parse_test!(test_simple_if, "if x > 5:\n    print('big')", "if_test.py");
-    create_parse_test!(
-        test_if_else,
-        "if x > 5:\n    print('big')\nelse:\n    print('small')",
-        "if_test.py"
-    );
-    create_parse_test!(
-        test_if_elif,
-        "if x > 10:\n    print('huge')\nelif x > 5:\n    print('big')\nelse:\n    print('small')",
-        "if_test.py"
-    );
+    create_parse_test!(test_if_else, "if x > 5:\n    print('big')\nelse:\n    print('small')", "if_test.py");
+    create_parse_test!(test_if_elif, "if x > 10:\n    print('huge')\nelif x > 5:\n    print('big')\nelse:\n    print('small')", "if_test.py");
 }
 /// Conversion-time truth of a test over STATICALLY-DECIDED module names
 /// (single-store None/False module constants — module.rs's
 /// statically_none_names / statically_false_names, typically the folded
 /// handler of a failed import guard). Some(truth) when the whole test
 /// folds; None leaves the test to runtime. Issue #137.
-pub(crate) fn static_name_gate_taken(test: &ExprType, options: &PythonOptions) -> Option<bool> {
+pub(crate) fn static_name_gate_taken(
+    test: &ExprType,
+    options: &PythonOptions,
+) -> Option<bool> {
     match test {
         ExprType::Name(n) => {
             // None and False are both falsy; a resolved module import is
@@ -396,7 +382,9 @@ pub(crate) fn static_name_gate_taken(test: &ExprType, options: &PythonOptions) -
             }
             match c.ops.first() {
                 Some(crate::Compares::Is) | Some(crate::Compares::Eq) => Some(is_none),
-                Some(crate::Compares::IsNot) | Some(crate::Compares::NotEq) => Some(!is_none),
+                Some(crate::Compares::IsNot) | Some(crate::Compares::NotEq) => {
+                    Some(!is_none)
+                }
                 _ => None,
             }
         }

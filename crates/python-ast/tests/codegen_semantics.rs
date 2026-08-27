@@ -34,10 +34,7 @@ fn cross_module_fixture() -> (std::rc::Rc<python_ast::Module>, PythonOptions) {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
     };
-    (
-        options.module_defs.values().next().unwrap().clone(),
-        options,
-    )
+    (options.module_defs.values().next().unwrap().clone(), options)
 }
 
 #[test]
@@ -54,11 +51,7 @@ fn ellipsis_statement_is_a_noop() {
         "bare `...` statement must not leak into generated code: {}",
         out
     );
-    assert!(
-        out.contains("fn stub"),
-        "stub must still be emitted: {}",
-        out
-    );
+    assert!(out.contains("fn stub"), "stub must still be emitted: {}", out);
     assert!(
         out.contains("fn real"),
         "real must still be emitted: {}",
@@ -95,11 +88,7 @@ fn future_import_is_a_noop() {
         "from __future__ must lower to nothing: {}",
         out
     );
-    assert!(
-        out.contains("fn f"),
-        "function must still be emitted: {}",
-        out
-    );
+    assert!(out.contains("fn f"), "function must still be emitted: {}", out);
 }
 
 #[test]
@@ -123,17 +112,17 @@ fn metaclass_abcmata_is_a_lossy_noop() {
         out
     );
 
-    let (out, warnings) =
-        compile_with_warnings("class Bad(metaclass=SomeMeta):\n    pass\n", "meta_bad.py");
+    let (out, warnings) = compile_with_warnings(
+        "class Bad(metaclass=SomeMeta):\n    pass\n",
+        "meta_bad.py",
+    );
     assert!(
         out.contains("struct Bad"),
         "a non-ABCMeta metaclass name must not block conversion: {}",
         out
     );
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("metaclass") && w.contains("dropped")),
+        warnings.iter().any(|w| w.contains("metaclass") && w.contains("dropped")),
         "the dropped-metaclass divergence must be reported through -W: {:?}",
         warnings
     );
@@ -321,7 +310,10 @@ fn imported_function_keyword_args_resolve_cross_module() {
     )
     .unwrap();
     let mut defs = std::collections::HashMap::new();
-    defs.insert(vec!["helpers".to_string()], std::rc::Rc::new(helpers));
+    defs.insert(
+        vec!["helpers".to_string()],
+        std::rc::Rc::new(helpers),
+    );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
@@ -636,12 +628,14 @@ fn exception_class_lowers_to_a_marker_struct() {
         "exc.py",
     );
     assert!(
-        out.contains("pub struct IDNAError ;") || out.contains("pub struct IDNAError;"),
+        out.contains("pub struct IDNAError ;")
+            || out.contains("pub struct IDNAError;"),
         "exception class must lower to a marker struct: {}",
         out
     );
     assert!(
-        out.contains("pub struct IDNABidiError") || out.contains("pub struct IDNABidiError ;"),
+        out.contains("pub struct IDNABidiError")
+            || out.contains("pub struct IDNABidiError ;"),
         "custom exception inheriting a custom exception must be a marker: {}",
         out
     );
@@ -808,13 +802,9 @@ fn cross_module_mut_table_computed_once_and_cached() {
         ),
         "first fallback must leave the merged table cached"
     );
-    assert!(python_ast::module_widens_method_cached(
-        &options, "Animal", "grow"
-    ));
+    assert!(python_ast::module_widens_method_cached(&options, "Animal", "grow"));
     // A method no definition mutates stays un-widened.
-    assert!(!python_ast::module_widens_method_cached(
-        &options, "Animal", "describe"
-    ));
+    assert!(!python_ast::module_widens_method_cached(&options, "Animal", "describe"));
 }
 
 #[test]
@@ -850,7 +840,8 @@ fn cross_module_class_info_computed_once_and_cached() {
     assert_eq!(dog2.name, "Dog");
     // Traits: Animal is the hierarchy root, so Dog carries DogTrait (own)
     // plus AnimalTrait (its methods re-emit there), nearest first.
-    let traits = python_ast::module_class_traits(&options, &["animals".to_string()]);
+    let traits =
+        python_ast::module_class_traits(&options, &["animals".to_string()]);
     assert_eq!(
         traits.get("Dog").map(Vec::as_slice),
         Some(&["DogTrait".to_string(), "AnimalTrait".to_string()][..]),
@@ -1010,8 +1001,7 @@ fn field_named_base_in_hierarchy_converts_with_a_collision_warning() {
         "basefield.py",
     );
     assert!(
-        out.contains("pub struct Dog")
-            && out.contains("pub base : i64")
+        out.contains("pub struct Dog") && out.contains("pub base : i64")
             && out.contains("pub __rython_base : Animal"),
         "the base field and the embedded base must coexist: {}",
         out
@@ -1216,8 +1206,7 @@ fn unpinned_empty_container_lowers_as_a_boxed_pyvalue_vec() {
     // to be a conversion-time error. It now converts as the boxed-container
     // divergence: `Vec<PyValue>`, with the -W channel reporting the lossy
     // type.
-    let (out, warnings) =
-        compile_with_warnings("def f():\n    x = []\n    return x\n", "issue77.py");
+    let (out, warnings) = compile_with_warnings("def f():\n    x = []\n    return x\n", "issue77.py");
     assert!(
         out.contains("Vec :: < stdpython :: PyValue > :: new ()"),
         "the empty list must lower as Vec<PyValue>: {}",
@@ -1364,7 +1353,10 @@ fn chained_module_string_constants_promote_both_names() {
     // urllib3/_version.py: `__version__ = version = '2.7.0'` — a chained
     // module-level constant. Both names become `pub static` (the importing
     // module's `from ._version import __version__` needs the item).
-    let out = compile("__version__ = version = '2.7.0'\n", "version.py");
+    let out = compile(
+        "__version__ = version = '2.7.0'\n",
+        "version.py",
+    );
     assert!(
         out.contains("pub static __version__ : & 'static str = \"2.7.0\""),
         "generated: {}",
@@ -1423,8 +1415,7 @@ fn plain_for_has_no_break_flag() {
 }
 
 #[test]
-fn loop_index_read_in_yield_body_is_not_unused() {
-    // `for x in chunks[1:-1]: yield x + b"\n"` (urllib3's response
+fn loop_index_read_in_yield_body_is_not_unused() {    // `for x in chunks[1:-1]: yield x + b"\n"` (urllib3's response
     // __iter__): the index is used ONLY in the yield expression, which the
     // unused-index walker must still see — otherwise `x` lowers to `_`
     // while the body references it (E0425).
@@ -2360,11 +2351,7 @@ fn chained_assignment_to_a_container_literal_clones_per_target() {
         "each target must receive its own clone: {}",
         out
     );
-    assert!(
-        out.contains("Vec :: < stdpython :: PyValue > :: new ()"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("Vec :: < stdpython :: PyValue > :: new ()"), "generated: {}", out);
     assert!(
         warnings
             .iter()
@@ -2679,7 +2666,10 @@ fn dict_literals_and_methods_lower_through_pydict() {
 fn del_full_slice_clears_in_place() {
     // Python: `del xs[:]` on ["a","b","c"] leaves []; the lowering is the
     // container's in-place clear. Verified against python3.
-    let out = compile("xs = [\"a\", \"b\", \"c\"]\ndel xs[:]\n", "delclear.py");
+    let out = compile(
+        "xs = [\"a\", \"b\", \"c\"]\ndel xs[:]\n",
+        "delclear.py",
+    );
     assert!(out.contains(". clear ()"), "generated: {}", out);
 }
 
@@ -2699,8 +2689,15 @@ fn bounded_slice_delete_lowers_to_py_slice_delete() {
 fn extended_step_slice_delete_lowers_to_the_step_variant() {
     // `del xs[a:b:c]` removes the strided selection via the runtime's
     // index-computing delete.
-    let out = compile("xs = [1, 2, 3, 4]\ndel xs[::2]\n", "stepdel.py");
-    assert!(out.contains("py_slice_delete_step"), "generated: {}", out);
+    let out = compile(
+        "xs = [1, 2, 3, 4]\ndel xs[::2]\n",
+        "stepdel.py",
+    );
+    assert!(
+        out.contains("py_slice_delete_step"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -2709,7 +2706,11 @@ fn negative_step_slice_delete_removes_the_selection() {
     // [0,1,2] leaves [1]. Verified against python3 3.14 - the runtime's
     // extended index walk removes highest-slot-first.
     let out = compile("xs = [1, 2, 3, 4]\ndel xs[::-1]\n", "negdel.py");
-    assert!(out.contains("py_slice_delete_step"), "generated: {}", out);
+    assert!(
+        out.contains("py_slice_delete_step"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -2730,7 +2731,11 @@ fn strided_slice_assignment_lowers_to_the_step_variant() {
     // `ys[::2] = [9, 9]` on [0,1,2] -> [9,1,9]: slots computed by the
     // runtime, replacement length-checked (ValueError on mismatch).
     let out = compile("ys = [0, 1, 2]\nys[::2] = [9, 9]\n", "strideassign.py");
-    assert!(out.contains("py_slice_assign_step"), "generated: {}", out);
+    assert!(
+        out.contains("py_slice_assign_step"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -2739,7 +2744,11 @@ fn negative_strided_slice_assignment_assigns_in_slot_order() {
     // indices [2, 0]; values assign left-to-right onto those slots.
     // Verified against python3 3.14.
     let out = compile("ys = [0, 1, 2]\nys[::-2] = [7, 8]\n", "negassign.py");
-    assert!(out.contains("py_slice_assign_step"), "generated: {}", out);
+    assert!(
+        out.contains("py_slice_assign_step"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -2849,7 +2858,10 @@ fn rebinding_a_nonself_receiver_is_a_loud_error() {
         "class W:\n    def m(factory_self):\n        factory_self = 3\n        return factory_self\n",
         "recvrebind.py",
     );
-    assert!(err.contains("rebinds its receiver"), "err: {err}");
+    assert!(
+        err.contains("rebinds its receiver"),
+        "err: {err}"
+    );
 }
 
 #[test]
@@ -2974,11 +2986,7 @@ fn optional_parameters_wrap_arguments_at_call_sites() {
     // All-positional calls emit directly (no reordering): the `?` still
     // applies to the whole call, now wrapped in the lowering block and
     // parenthesized so it is valid in any position (F9).
-    assert!(
-        out.contains("({ label (Some (7)) }) ?"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("({ label (Some (7)) }) ?"), "generated: {}", out);
     assert!(out.contains("({ label (None) }) ?"), "generated: {}", out);
 }
 
@@ -3274,9 +3282,7 @@ fn construction_and_method_calls_propagate_exceptions() {
         out
     );
     assert!(
-        !warnings
-            .iter()
-            .any(|w| w.contains("bump") && w.contains("is dropped")),
+        !warnings.iter().any(|w| w.contains("bump") && w.contains("is dropped")),
         "a keyword call on a real method must NOT be dropped: {:?}",
         warnings
     );
@@ -3384,11 +3390,7 @@ fn inheritance_emits_trait_machinery() {
     );
     let out = compile(src, "inherit.py");
     assert!(out.contains("trait BaseTrait"), "generated: {}", out);
-    assert!(
-        out.contains("impl BaseTrait for Child"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("impl BaseTrait for Child"), "generated: {}", out);
     assert!(
         out.contains("pub __rython_base : Base"),
         "derived struct must embed the direct base: {}",
@@ -3636,7 +3638,10 @@ fn middle_class_reassigning_base_field_emits_no_accessor() {
         .find("impl DogTrait for Puppy")
         .unwrap_or_else(|| panic!("missing Dog impl for Puppy: {}", out));
     let rest = &out[start..];
-    let end = rest.find("\nimpl ").map(|i| i + start).unwrap_or(out.len());
+    let end = rest
+        .find("\nimpl ")
+        .map(|i| i + start)
+        .unwrap_or(out.len());
     let dog_impl = &out[start..end];
     assert!(
         !dog_impl.contains("fn name"),
@@ -3708,6 +3713,15 @@ fn own_override_super_targets_the_direct_base() {
 }
 
 // ---- Trait-based inheritance ----
+
+
+
+
+
+
+
+
+
 
 #[test]
 fn str_getters_clone_the_field_out_of_the_shared_receiver() {
@@ -4099,7 +4113,9 @@ fn sibling_imported_module_values_promote_to_statics() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(
         vec!["pkg".to_string(), "constant".to_string()],
-        std::rc::Rc::new(parse("TOO_BIG_SEQUENCE = int(10e6)\n", "constant.py").unwrap()),
+        std::rc::Rc::new(
+            parse("TOO_BIG_SEQUENCE = int(10e6)\n", "constant.py").unwrap(),
+        ),
     );
     defs.insert(
         vec!["pkg".to_string(), "utils".to_string()],
@@ -4162,6 +4178,7 @@ fn bitwise_module_constant_binop_lowers_to_plain_static() {
         out
     );
 }
+
 
 // ---------------------------------------------------------------------------
 // no_std profile: OS-facing constructs fail at conversion time
@@ -5160,9 +5177,9 @@ fn partial_over_nonlocal_functions_drops_and_overbinding_stays_loud() {
         out
     );
     assert!(
-        warnings.iter().any(
-            |w| w.contains("functools.partial over a non-local function") && w.contains("dropped")
-        ),
+        warnings
+            .iter()
+            .any(|w| w.contains("functools.partial over a non-local function") && w.contains("dropped")),
         "the callable-as-value divergence must be reported through -W: {:?}",
         warnings
     );
@@ -5599,11 +5616,7 @@ fn module_level_empty_list_pinned_by_later_use() {
     // only computed for function bodies; the `xs.append(1)` use must pin
     // the element type the same way it does inside a function.
     let out = compile("xs = []\nxs.append(1)\n", "mempty.py");
-    assert!(
-        out.contains("Vec :: < i64 > :: new ()"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("Vec :: < i64 > :: new ()"), "generated: {}", out);
 }
 
 #[test]
@@ -5621,11 +5634,7 @@ fn annotated_empty_list_honors_annotation() {
     // F8: the empty-container error suggests `xs: list[float] = []`, so the
     // annotation must actually pin the type (it used to be discarded).
     let out = compile("xs: list[float] = []\nxs.append(1.0)\n", "ann_empty.py");
-    assert!(
-        out.contains("Vec :: < f64 > :: new ()"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("Vec :: < f64 > :: new ()"), "generated: {}", out);
 }
 
 #[test]
@@ -5651,11 +5660,7 @@ fn post_try_lambda_gets_no_dummy_init() {
     // `x` (assigned inside the try body) keeps its dummy init; the
     // post-try lambda `g` must NOT get one (it cannot be Default).
     assert!(out.contains("x = Default :: default"), "generated: {}", out);
-    assert!(
-        !out.contains("g = Default :: default"),
-        "generated: {}",
-        out
-    );
+    assert!(!out.contains("g = Default :: default"), "generated: {}", out);
 }
 
 #[test]
@@ -6340,7 +6345,11 @@ fn np_set_backend_lowers_to_a_raisable_runtime_error() {
         "import numpy as np\ndef pick() -> None:\n    np.set_backend(\"cuda\")\n",
         "setbackend.py",
     );
-    assert!(out.contains("set_backend_by_name"), "generated: {}", out);
+    assert!(
+        out.contains("set_backend_by_name"),
+        "generated: {}",
+        out
+    );
     assert!(
         out.contains("RuntimeError"),
         "the String error must surface as a raised RuntimeError: {}",
@@ -6368,7 +6377,10 @@ fn keyword_call_as_statement_keeps_propagation() {
     // so the generated Rust failed to build. The block must be
     // parenthesized: `({...})?`, valid in both statement and expression
     // position.
-    let out = compile("def f(a: int) -> int:\n    return a\nf(a=1)\n", "kwstmt.py");
+    let out = compile(
+        "def f(a: int) -> int:\n    return a\nf(a=1)\n",
+        "kwstmt.py",
+    );
     assert!(
         out.contains("({ let __rython_arg_0 = 1 ; f (__rython_arg_0) }) ?"),
         "generated: {}",
@@ -6395,12 +6407,9 @@ fn defaulted_call_as_statement_keeps_propagation() {
         "defstmt.py",
     );
     assert!(out.contains("? ;"), "generated: {}", out);
-    assert!(
-        !out.contains("} ? ;"),
-        "bare block with `?` leaked: {}",
-        out
-    );
+    assert!(!out.contains("} ? ;"), "bare block with `?` leaked: {}", out);
 }
+
 
 // ---- issue #79 cheap guard: conversion-time aliasing detection ----
 
@@ -6505,10 +6514,15 @@ fn alias_inside_loop_body_is_detected() {
     assert!(err.contains("`b = a`"), "error: {}", err);
 }
 
+
 // ---- async/await: runtime feature gating, asyncio lowering ----
 
 /// Compile with a custom options object.
-fn compile_with_options(src: &str, name: &str, options: PythonOptions) -> Result<String, String> {
+fn compile_with_options(
+    src: &str,
+    name: &str,
+    options: PythonOptions,
+) -> Result<String, String> {
     let module = parse(src, name).map_err(|e| format!("{e}"))?;
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     module
@@ -6569,21 +6583,9 @@ fn async_library_has_no_runtime_import_or_entry_attribute() {
     let out = compile_with_options(src, "asynclib.py", PythonOptions::default())
         .expect("async library converts");
     assert!(out.contains("pub async fn compute"), "generated: {}", out);
-    assert!(
-        !out.contains("tokio"),
-        "no runtime import for a lib: {}",
-        out
-    );
-    assert!(
-        !out.contains("compile_error"),
-        "no feature error for a lib: {}",
-        out
-    );
-    assert!(
-        !out.contains("cfg_attr"),
-        "no entry attribute for a lib: {}",
-        out
-    );
+    assert!(!out.contains("tokio"), "no runtime import for a lib: {}", out);
+    assert!(!out.contains("compile_error"), "no feature error for a lib: {}", out);
+    assert!(!out.contains("cfg_attr"), "no entry attribute for a lib: {}", out);
 }
 
 #[test]
@@ -6641,7 +6643,10 @@ fn unannotated_add_infers_pyadd_bounds() {
     // one generic function (`fn add<A, B>(a: A, b: B) -> Result<<A as
     // PyAdd<B>>::Output, ...> where A: PyAdd<B>`), NOT the dead
     // `impl Into<PyObject>` fallback.
-    let out = compile("def add(a, b):\n    return a + b\n", "inf_add.py");
+    let out = compile(
+        "def add(a, b):\n    return a + b\n",
+        "inf_add.py",
+    );
     assert!(out.contains("fn add < A , B >"), "generated: {}", out);
     assert!(out.contains("where A : PyAdd < B >"), "generated: {}", out);
     assert!(
@@ -6649,16 +6654,15 @@ fn unannotated_add_infers_pyadd_bounds() {
         "generated: {}",
         out
     );
-    assert!(
-        !out.contains("Into < PyObject >"),
-        "no dead fallback: {}",
-        out
-    );
+    assert!(!out.contains("Into < PyObject >"), "no dead fallback: {}", out);
 }
 
 #[test]
 fn unannotated_multi_param_add_uses_letter_variables() {
-    let out = compile("def add(a, b):\n    return a + b\n", "inf_add2.py");
+    let out = compile(
+        "def add(a, b):\n    return a + b\n",
+        "inf_add2.py",
+    );
     assert!(out.contains("fn add < A , B >"), "generated: {}", out);
     assert!(out.contains("where A : PyAdd < B >"), "generated: {}", out);
     assert!(
@@ -6675,11 +6679,7 @@ fn int_conversion_yields_a_bound_not_a_concrete_type() {
     let out = compile("def to_int(x):\n    return int(x)\n", "inf_int.py");
     assert!(out.contains("pub fn to_int < T >"), "generated: {}", out);
     assert!(out.contains("where T : PyInt"), "generated: {}", out);
-    assert!(
-        out.contains("-> Result < i64 , PyException >"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
 }
 
 #[test]
@@ -6714,11 +6714,7 @@ fn truthiness_lens_and_display_infer_bounds() {
         ),
         "inf_multi.py",
     );
-    assert!(
-        out.contains("where A : Truthy , B : Len , C : PyDisplay"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("where A : Truthy , B : Len , C : PyDisplay"), "generated: {}", out);
 }
 
 #[test]
@@ -6749,8 +6745,7 @@ fn callable_parameter_call_drops_as_a_noop() {
     // A callable parameter called as a function: the callable-as-value
     // divergence (issue #122) — the call site drops to the boxed None and
     // -W reports it.
-    let (out, warnings) =
-        compile_with_warnings("def f(cb):\n    return cb(1)\n", "inf_callable.py");
+    let (out, warnings) = compile_with_warnings("def f(cb):\n    return cb(1)\n", "inf_callable.py");
     assert!(
         out.contains("stdpython :: PyValue :: None_"),
         "the call through the callable must drop to a no-op: {}",
@@ -6771,8 +6766,10 @@ fn unknown_method_on_unannotated_parameter_warns_but_converts() {
     // the parameter on the duck-unknown trait, and the definitionally
     // unsatisfiable bound becomes a -W warning (M5) plus a #[deprecated]
     // note — never a rustc surprise.
-    let (out, warnings) =
-        compile_with_warnings("def frob(s):\n    return s.upar()\n", "inf_attr.py");
+    let (out, warnings) = compile_with_warnings(
+        "def frob(s):\n    return s.upar()\n",
+        "inf_attr.py",
+    );
     assert!(
         out.contains("s . upar ()"),
         "the unknown-method call must still be emitted: {}",
@@ -6929,7 +6926,10 @@ fn iterating_a_parameter_infers_into_iterator_bounds() {
     // M2 iteration: `for x in p` bounds the parameter as IntoIterator and
     // threads the element type into the loop variable, whose own uses get
     // bounds.
-    let out = compile("def f(p):\n    for x in p:\n        print(x)\n", "iter1.py");
+    let out = compile(
+        "def f(p):\n    for x in p:\n        print(x)\n",
+        "iter1.py",
+    );
     assert!(
         out.contains("where A : IntoIterator < Item = B >"),
         "generated: {}",
@@ -6958,11 +6958,7 @@ fn loop_element_as_method_receiver_infers_its_own_bounds() {
         out
     );
     assert!(out.contains("B : PyStrOps"), "generated: {}", out);
-    assert!(
-        out.contains("-> Result < Vec < String > , PyException >"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("-> Result < Vec < String > , PyException >"), "generated: {}", out);
 }
 
 #[test]
@@ -7058,21 +7054,9 @@ fn self_recursive_receiver_gets_a_pyadd_self_bound() {
         ),
         "inf_fib.py",
     );
-    assert!(
-        out.contains("T : PyAdd < T , Output = T >"),
-        "generated: {}",
-        out
-    );
-    assert!(
-        out.contains("T : PySub < i64 , Output = T >"),
-        "generated: {}",
-        out
-    );
-    assert!(
-        out.contains("-> Result < T , PyException >"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("T : PyAdd < T , Output = T >"), "generated: {}", out);
+    assert!(out.contains("T : PySub < i64 , Output = T >"), "generated: {}", out);
+    assert!(out.contains("-> Result < T , PyException >"), "generated: {}", out);
 }
 
 #[test]
@@ -7081,7 +7065,10 @@ fn definitionally_unsatisfiable_bounds_warn_but_convert() {
     // PyStrOps + PyPop. A well-formed Python definition: it converts, with
     // the warning baked as a #[deprecated] note (the -W channel reports
     // it; -W deny promotes it to an error).
-    let out = compile("def bad(p):\n    p.upper()\n    p.pop()\n", "inf_unsat.py");
+    let out = compile(
+        "def bad(p):\n    p.upper()\n    p.pop()\n",
+        "inf_unsat.py",
+    );
     assert!(
         out.contains("satisfied by no known rython type"),
         "deprecated note must carry the warning: {}",
@@ -7141,11 +7128,7 @@ fn genexpr_over_a_parameter_infers_iteration_bounds() {
         "def version_str(version):\n    return \".\".join(str(v) for v in version)\n",
         "inf_genexpr.py",
     );
-    assert!(
-        out.contains("A : IntoIterator < Item = B >"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("A : IntoIterator < Item = B >"), "generated: {}", out);
     assert!(out.contains("B : PyToString"), "generated: {}", out);
     assert!(
         out.contains("-> Result < String , PyException >"),
@@ -7183,21 +7166,13 @@ fn string_literal_local_rebound_by_aug_assign_is_owned() {
         ),
         "str_aug.py",
     );
-    assert!(
-        out.contains("out = (\"\") . to_string ()"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("out = (\"\") . to_string ()"), "generated: {}", out);
     assert!(
         out.contains("-> Result < String , PyException >"),
         "generated: {}",
         out
     );
-    assert!(
-        !out.contains("-> Result < & 'static str"),
-        "generated: {}",
-        out
-    );
+    assert!(!out.contains("-> Result < & 'static str"), "generated: {}", out);
 }
 
 #[test]
@@ -7229,11 +7204,7 @@ fn global_declaration_with_read_converts() {
         ),
         "global_read.py",
     );
-    assert!(
-        out.contains("pub static DEFAULT_SESSION"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("pub static DEFAULT_SESSION"), "generated: {}", out);
     assert!(!out.contains("not supported"), "generated: {}", out);
 }
 
@@ -7273,9 +7244,7 @@ fn global_string_write_lowers_to_a_lazylock_static() {
         out
     );
     assert!(
-        warnings
-            .iter()
-            .all(|w| !w.contains("writes to module-level name")),
+        warnings.iter().all(|w| !w.contains("writes to module-level name")),
         "the supported write must not warn: {:?}",
         warnings
     );
@@ -7390,9 +7359,7 @@ fn warnings_calls_render_through_their_signature() {
         out
     );
     assert!(
-        out.contains(
-            "warnings :: simplefilter (Some (\"ignore\") , None , None , None , Some (true))"
-        ),
+        out.contains("warnings :: simplefilter (Some (\"ignore\") , None , None , None , Some (true))"),
         "generated: {}",
         out
     );
@@ -7414,7 +7381,10 @@ fn class_with_a_foreign_base_lowers_as_a_plain_struct() {
     // now tolerated as metadata: the class lowers as a plain struct with
     // no embedded base (the foreign-base divergence).
     let out = compile(
-        concat!("class ShutdownQueue(queue.Queue):\n", "    pass\n",),
+        concat!(
+            "class ShutdownQueue(queue.Queue):\n",
+            "    pass\n",
+        ),
         "foreign_base.py",
     );
     assert!(
@@ -7451,7 +7421,11 @@ fn classmethod_and_staticmethod_lower_as_associated_functions() {
     assert!(out.contains("Finder :: find_spec"), "generated: {}", out);
     assert!(out.contains("Finder :: hint"), "generated: {}", out);
     // The class reference is dropped: no receiver, no cls parameter.
-    assert!(!out.contains("fn find_spec (cls"), "generated: {}", out);
+    assert!(
+        !out.contains("fn find_spec (cls"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -7518,16 +7492,18 @@ fn no_impl_into_pyobject_anywhere_for_unannotated_params() {
 
 #[test]
 fn str_methods_infer_pystrops_bounds() {
-    let out = compile("def shout(s):\n    return s.upper()\n", "m2_upper.py");
+    let out = compile(
+        "def shout(s):\n    return s.upper()\n",
+        "m2_upper.py",
+    );
     assert!(out.contains("pub fn shout < T >"), "generated: {}", out);
     assert!(out.contains("where T : PyStrOps"), "generated: {}", out);
-    assert!(
-        out.contains("-> Result < String , PyException >"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("-> Result < String , PyException >"), "generated: {}", out);
 
-    let out = compile("def parts(s):\n    return s.split(\" \")\n", "m2_split.py");
+    let out = compile(
+        "def parts(s):\n    return s.split(\" \")\n",
+        "m2_split.py",
+    );
     assert!(out.contains("T : PyStrOps"), "generated: {}", out);
     assert!(
         out.contains("-> Result < Vec < String > , PyException >"),
@@ -7538,12 +7514,11 @@ fn str_methods_infer_pystrops_bounds() {
 
 #[test]
 fn pop_infers_pypop_with_index_type() {
-    let out = compile("def last(xs):\n    return xs.pop()\n", "m2_pop.py");
-    assert!(
-        out.contains("where T : PyPop < i64 >"),
-        "generated: {}",
-        out
+    let out = compile(
+        "def last(xs):\n    return xs.pop()\n",
+        "m2_pop.py",
     );
+    assert!(out.contains("where T : PyPop < i64 >"), "generated: {}", out);
     assert!(
         out.contains("< T as PyPop < i64 >> :: Output"),
         "generated: {}",
@@ -7593,18 +7568,10 @@ fn two_class_method_generates_has_trait() {
     assert!(out.contains("pub trait HasSpeak"), "generated: {}", out);
     assert!(out.contains("impl HasSpeak for Dog"), "generated: {}", out);
     assert!(out.contains("impl HasSpeak for Cat"), "generated: {}", out);
-    assert!(
-        out.contains("fn speak (& self) -> Result < String , PyException >"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("fn speak (& self) -> Result < String , PyException >"), "generated: {}", out);
     assert!(out.contains("pub fn hear < T >"), "generated: {}", out);
     assert!(out.contains("where T : HasSpeak"), "generated: {}", out);
-    assert!(
-        out.contains("animal . speak () ?"),
-        "call threads `?`: {}",
-        out
-    );
+    assert!(out.contains("animal . speak () ?"), "call threads `?`: {}", out);
 }
 
 #[test]
@@ -7625,11 +7592,7 @@ fn single_class_method_still_generates_has_trait() {
     assert!(out.contains("pub trait HasBark"), "generated: {}", out);
     assert!(out.contains("impl HasBark for Dog"), "generated: {}", out);
     assert!(out.contains("where T : HasBark"), "generated: {}", out);
-    assert!(
-        !out.contains("where T : Dog"),
-        "never the concrete class: {}",
-        out
-    );
+    assert!(!out.contains("where T : Dog"), "never the concrete class: {}", out);
 }
 
 #[test]
@@ -7672,18 +7635,8 @@ fn duck_trait_generated_once_per_module() {
         ),
         "m3_once.py",
     );
-    assert_eq!(
-        out.matches("pub trait HasSpeak").count(),
-        1,
-        "generated: {}",
-        out
-    );
-    assert_eq!(
-        out.matches("impl HasSpeak for Dog").count(),
-        1,
-        "generated: {}",
-        out
-    );
+    assert_eq!(out.matches("pub trait HasSpeak").count(), 1, "generated: {}", out);
+    assert_eq!(out.matches("impl HasSpeak for Dog").count(), 1, "generated: {}", out);
 }
 
 #[test]
@@ -7704,31 +7657,11 @@ fn pyvalue_bool_str_none_narrows_via_isinstance() {
          \x20   return pool_kwargs\n",
         "verify.py",
     );
-    assert!(
-        out.contains("PyValue"),
-        "bool | str | None must lower to PyValue: {}",
-        out
-    );
-    assert!(
-        out.contains("is_bool ()") || out.contains("is_bool()"),
-        "is False must test is_bool: {}",
-        out
-    );
-    assert!(
-        out.contains("is_str ()") || out.contains("is_str()"),
-        "isinstance(str) must dispatch: {}",
-        out
-    );
-    assert!(
-        out.contains("as_str () . unwrap ()") || out.contains("as_str().unwrap()"),
-        "str branch must narrow: {}",
-        out
-    );
-    assert!(
-        out.contains("PyValue :: from") || out.contains("PyValue::from"),
-        "stores must box: {}",
-        out
-    );
+    assert!(out.contains("PyValue"), "bool | str | None must lower to PyValue: {}", out);
+    assert!(out.contains("is_bool ()") || out.contains("is_bool()"), "is False must test is_bool: {}", out);
+    assert!(out.contains("is_str ()") || out.contains("is_str()"), "isinstance(str) must dispatch: {}", out);
+    assert!(out.contains("as_str () . unwrap ()") || out.contains("as_str().unwrap()"), "str branch must narrow: {}", out);
+    assert!(out.contains("PyValue :: from") || out.contains("PyValue::from"), "stores must box: {}", out);
 }
 
 #[test]
@@ -7749,21 +7682,9 @@ fn pyvalue_tuple_union_len_and_index() {
          \x20   return pool_kwargs\n",
         "cert.py",
     );
-    assert!(
-        out.contains("is_tuple ()") || out.contains("is_tuple()"),
-        "isinstance(tuple) must dispatch: {}",
-        out
-    );
-    assert!(
-        out.contains("as_tuple () . unwrap ()") || out.contains("as_tuple().unwrap()"),
-        "tuple branch must narrow: {}",
-        out
-    );
-    assert!(
-        out.contains("py_index"),
-        "tuple indexing must use py_index: {}",
-        out
-    );
+    assert!(out.contains("is_tuple ()") || out.contains("is_tuple()"), "isinstance(tuple) must dispatch: {}", out);
+    assert!(out.contains("as_tuple () . unwrap ()") || out.contains("as_tuple().unwrap()"), "tuple branch must narrow: {}", out);
+    assert!(out.contains("py_index"), "tuple indexing must use py_index: {}", out);
 }
 
 #[test]
@@ -7779,16 +7700,8 @@ fn object_param_is_boxed_and_class_isinstance_is_static() {
          \x20       return True\n",
         "eq.py",
     );
-    assert!(
-        out.contains("PyValue"),
-        "object must lower to PyValue: {}",
-        out
-    );
-    assert!(
-        out.contains("false"),
-        "isinstance(class) on an object must be false: {}",
-        out
-    );
+    assert!(out.contains("PyValue"), "object must lower to PyValue: {}", out);
+    assert!(out.contains("false"), "isinstance(class) on an object must be false: {}", out);
 }
 
 #[test]
@@ -7810,11 +7723,7 @@ fn kwargs_param_packs_extra_keywords() {
         "**kwargs must lower to the boxed dict: {}",
         out
     );
-    assert!(
-        out.contains("PyValue :: from") || out.contains("PyValue::from"),
-        "keyword values must box: {}",
-        out
-    );
+    assert!(out.contains("PyValue :: from") || out.contains("PyValue::from"), "keyword values must box: {}", out);
 }
 
 #[test]
@@ -7831,21 +7740,9 @@ fn generator_builds_and_returns_list() {
          \x20       yield chunk\n",
         "gen.py",
     );
-    assert!(
-        out.contains("__rython_gen"),
-        "generator must build a collector Vec: {}",
-        out
-    );
-    assert!(
-        out.contains("push"),
-        "yield must push into the collector: {}",
-        out
-    );
-    assert!(
-        out.contains("Vec < String >") || out.contains("Vec<String>"),
-        "element type must come from Generator[T, ...]: {}",
-        out
-    );
+    assert!(out.contains("__rython_gen"), "generator must build a collector Vec: {}", out);
+    assert!(out.contains("push"), "yield must push into the collector: {}", out);
+    assert!(out.contains("Vec < String >") || out.contains("Vec<String>"), "element type must come from Generator[T, ...]: {}", out);
     // Inside the function's Result, like every return (a bare
     // `return __rython_gen` was an E0308 against the Result signature).
     assert!(
@@ -7867,12 +7764,7 @@ fn dict_any_literal_wraps_mixed_values() {
          \x20   return host_params\n",
         "host.py",
     );
-    assert!(
-        out.contains("PyDict < String , stdpython :: PyValue >")
-            || out.contains("PyDict<String, stdpython::PyValue>"),
-        "dict[str, Any] must lower to the boxed dict: {}",
-        out
-    );
+    assert!(out.contains("PyDict < String , stdpython :: PyValue >") || out.contains("PyDict<String, stdpython::PyValue>"), "dict[str, Any] must lower to the boxed dict: {}", out);
     assert!(
         out.matches("PyValue :: from").count() >= 2 || out.matches("PyValue::from").count() >= 2,
         "mixed values must wrap: {}",
@@ -7937,9 +7829,11 @@ fn imported_class_constant_default_resolves_through_import() {
     // (`Retry::DEFAULT_ALLOWED_METHODS`), not a bare undefined identifier.
     // Two-module conversion: retry.py defines the class, adapters.py imports
     // and constructs it.
-    let retry_src = "class Retry:\n    DEFAULT_ALLOWED_METHODS = frozenset([\"HEAD\", \"GET\"])\n    def __init__(self, allowed_methods=DEFAULT_ALLOWED_METHODS, backoff_max=120) -> None:\n        self.allowed = allowed_methods\n        self.backoff = backoff_max\n";
+    let retry_src =
+        "class Retry:\n    DEFAULT_ALLOWED_METHODS = frozenset([\"HEAD\", \"GET\"])\n    def __init__(self, allowed_methods=DEFAULT_ALLOWED_METHODS, backoff_max=120) -> None:\n        self.allowed = allowed_methods\n        self.backoff = backoff_max\n";
     let retry_mod = parse(retry_src, "retry.py").unwrap();
-    let adapters_src = "from retry import Retry\nclass HTTPAdapter:\n    def __init__(self) -> None:\n        self.retries = Retry()\n";
+    let adapters_src =
+        "from retry import Retry\nclass HTTPAdapter:\n    def __init__(self) -> None:\n        self.retries = Retry()\n";
     let adapters_mod = parse(adapters_src, "adapters.py").unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["retry".to_string()], std::rc::Rc::new(retry_mod));
@@ -7950,14 +7844,12 @@ fn imported_class_constant_default_resolves_through_import() {
     };
     let out = compile_with_options(adapters_src, "adapters.py", options).expect("converts");
     assert!(
-        out.contains("Retry :: DEFAULT_ALLOWED_METHODS")
-            || out.contains("Retry::DEFAULT_ALLOWED_METHODS"),
+        out.contains("Retry :: DEFAULT_ALLOWED_METHODS") || out.contains("Retry::DEFAULT_ALLOWED_METHODS"),
         "dropped default must render through the imported class name: {}",
         out
     );
     assert!(
-        !out.contains("Some (DEFAULT_ALLOWED_METHODS)")
-            && !out.contains("Some(DEFAULT_ALLOWED_METHODS)"),
+        !out.contains("Some (DEFAULT_ALLOWED_METHODS)") && !out.contains("Some(DEFAULT_ALLOWED_METHODS)"),
         "bare DEFAULT_ALLOWED_METHODS must not leak: {}",
         out
     );
@@ -8049,8 +7941,7 @@ fn except_binding_attribute_read_boxes_to_none() {
         out
     );
     assert!(
-        out.contains("let mut e = __rython_exc . clone ()")
-            || out.contains("let mut e = __rython_exc.clone()"),
+        out.contains("let mut e = __rython_exc . clone ()") || out.contains("let mut e = __rython_exc.clone()"),
         "the except binding must still bind the PyException: {}",
         out
     );
@@ -8059,9 +7950,7 @@ fn except_binding_attribute_read_boxes_to_none() {
         "excattr.py",
     );
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("e.expected") && w.contains("dynamic-attribute divergence")),
+        warnings.iter().any(|w| w.contains("e.expected") && w.contains("dynamic-attribute divergence")),
         "must warn about the dropped attribute read: {:?}",
         warnings
     );
@@ -8117,7 +8006,11 @@ fn external_import_value_read_boxes_to_none() {
         "external-import value read must box to None: {}",
         out
     );
-    assert!(!out.contains("DEBUG"), "bare DEBUG must not leak: {}", out);
+    assert!(
+        !out.contains("DEBUG"),
+        "bare DEBUG must not leak: {}",
+        out
+    );
 }
 
 #[test]
@@ -8132,8 +8025,7 @@ fn module_level_try_import_error_flattens_imports_to_module_scope() {
         "tryimp.py",
     );
     assert!(
-        out.contains("use crate :: socks :: SOCKSProxyManager")
-            || out.contains("use crate::socks::SOCKSProxyManager"),
+        out.contains("use crate :: socks :: SOCKSProxyManager") || out.contains("use crate::socks::SOCKSProxyManager"),
         "the import must lower to a module-scope use: {}",
         out
     );
@@ -8410,10 +8302,7 @@ fn imported_class_method_keyword_values_resolve_in_caller_scope() {
     // class-name token (E0423 `expected value, found struct`). The temp
     // prelude binds it as __rython_arg_2 before the call.
     let call_idx = out.find("merge_setting (").expect("call present");
-    let prelude_start = out[..call_idx]
-        .rfind("let __rython_arg_")
-        .map(|i| i)
-        .unwrap_or(0);
+    let prelude_start = out[..call_idx].rfind("let __rython_arg_").map(|i| i).unwrap_or(0);
     let block = &out[prelude_start..call_idx + 200];
     assert!(
         block.contains("stdpython :: PyValue :: None_") || block.contains("PyValue::None_"),
@@ -8459,11 +8348,7 @@ fn sibling_import_of_reexported_and_submodule_names_is_kept() {
     .unwrap();
     // The SUBMODULES the `from .util import connection, ssl_` names
     // resolve to (urllib3's util/connection.py, util/ssl_.py).
-    let conn_sub = parse(
-        "def create_connection(addr):\n    return addr\n",
-        "util/connection.py",
-    )
-    .unwrap();
+    let conn_sub = parse("def create_connection(addr):\n    return addr\n", "util/connection.py").unwrap();
     let ssl_sub = parse("ALPN_PROTOCOLS = [\"h2\"]\n", "util/ssl_.py").unwrap();
     let c = parse(
         concat!(
@@ -8480,19 +8365,13 @@ fn sibling_import_of_reexported_and_submodule_names_is_kept() {
     )
     .unwrap();
     let mut defs = std::collections::HashMap::new();
-    defs.insert(
-        vec!["util".to_string(), "request".to_string()],
-        std::rc::Rc::new(a),
-    );
+    defs.insert(vec!["util".to_string(), "request".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["util".to_string()], std::rc::Rc::new(b));
     defs.insert(
         vec!["util".to_string(), "connection".to_string()],
         std::rc::Rc::new(conn_sub),
     );
-    defs.insert(
-        vec!["util".to_string(), "ssl_".to_string()],
-        std::rc::Rc::new(ssl_sub),
-    );
+    defs.insert(vec!["util".to_string(), "ssl_".to_string()], std::rc::Rc::new(ssl_sub));
     defs.insert(vec!["connection".to_string()], std::rc::Rc::new(c));
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
@@ -8527,6 +8406,7 @@ fn sibling_import_of_reexported_and_submodule_names_is_kept() {
         out
     );
 }
+
 
 #[test]
 fn import_reexport_of_stdpython_module_is_kept() {
@@ -8581,10 +8461,7 @@ fn module_path_member_read_missing_item_boxes_to_none() {
     .unwrap();
     let util_init = parse("from . import ssl_\n", "util/__init__.py").unwrap();
     let mut defs = std::collections::HashMap::new();
-    defs.insert(
-        vec!["util".to_string(), "ssl_".to_string()],
-        std::rc::Rc::new(a),
-    );
+    defs.insert(vec!["util".to_string(), "ssl_".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["util".to_string()], std::rc::Rc::new(util_init));
     defs.insert(vec!["pyopenssl".to_string()], std::rc::Rc::new(b));
     let options = PythonOptions {
@@ -8604,6 +8481,7 @@ fn module_path_member_read_missing_item_boxes_to_none() {
         out
     );
 }
+
 
 #[test]
 fn stdpython_module_reexport_via_sibling_aliases_to_runtime() {
@@ -8766,10 +8644,18 @@ fn socket_calls_thread_the_result_question_mark() {
         out
     );
     assert!(out.contains(". connect ("), "generated: {}", out);
-    assert!(out.contains(". recv (64) ?"), "recv must thread ?: {}", out);
+    assert!(
+        out.contains(". recv (64) ?"),
+        "recv must thread ?: {}",
+        out
+    );
     // sendall passes the payload by reference (the runtime takes
     // AsRef<[u8]>), so a named buffer survives its send.
-    assert!(out.contains(". sendall (& ("), "generated: {}", out);
+    assert!(
+        out.contains(". sendall (& ("),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]
@@ -8796,7 +8682,11 @@ fn urllib_request_urlopen_lowers_with_question_mark() {
         "status is a field read: {}",
         out
     );
-    assert!(out.contains(". read () ?"), "read threads ?: {}", out);
+    assert!(
+        out.contains(". read () ?"),
+        "read threads ?: {}",
+        out
+    );
 }
 
 #[test]
@@ -8843,7 +8733,11 @@ fn bytesio_lowers_to_the_runtime_buffer() {
         ),
         "bio.py",
     );
-    assert!(out.contains("io :: BytesIO_seeded"), "generated: {}", out);
+    assert!(
+        out.contains("io :: BytesIO_seeded"),
+        "generated: {}",
+        out
+    );
     assert!(out.contains("io :: BytesIO ()"), "generated: {}", out);
     assert!(
         !out.contains("PyValue :: None_"),
@@ -8976,15 +8870,9 @@ fn global_write_lowers_to_a_mutable_static() {
         out
     );
     assert!(out.contains("py_global_write"), "generated: {}", out);
+    assert!(out.contains("py_global_read (& count)"), "generated: {}", out);
     assert!(
-        out.contains("py_global_read (& count)"),
-        "generated: {}",
-        out
-    );
-    assert!(
-        warnings
-            .iter()
-            .all(|w| !w.contains("writes to module-level name")),
+        warnings.iter().all(|w| !w.contains("writes to module-level name")),
         "the supported write must not warn: {:?}",
         warnings
     );
@@ -10242,8 +10130,8 @@ fn cross_module_subclass_implements_imported_ancestor_traits() {
     // module need not import them) — with accessor types resolved in the
     // DEFINING module's scope.
     let src = "from animals import Dog\n\nclass Puppy(Dog):\n    def fetch(self) -> int:\n        return 1\n";
-    let out =
-        compile_with_options(src, "puppy.py", cross_module_subclass_options()).expect("converts");
+    let out = compile_with_options(src, "puppy.py", cross_module_subclass_options())
+        .expect("converts");
     assert!(
         out.contains("impl crate :: animals :: DogTrait for Puppy"),
         "the imported base's trait must be implemented by crate path: {}",
@@ -10299,9 +10187,16 @@ fn covariant_cross_module_override_is_dropped_with_warning() {
 /// yet" (pip's `_internal/commands/download.py`).
 #[test]
 fn absolute_import_of_src_layout_sibling_decorator_resolves() {
-    let reqmod = parse("def with_cleanup(func):\n    return func\n", "reqmod.py").unwrap();
+    let reqmod = parse(
+        "def with_cleanup(func):\n    return func\n",
+        "reqmod.py",
+    )
+    .unwrap();
     let mut defs = std::collections::HashMap::new();
-    defs.insert(vec!["reqmod".to_string()], std::rc::Rc::new(reqmod));
+    defs.insert(
+        vec!["reqmod".to_string()],
+        std::rc::Rc::new(reqmod),
+    );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
         // The stripped-prefix lookup applies only to the package's OWN
@@ -10341,9 +10236,16 @@ fn absolute_import_of_src_layout_sibling_decorator_resolves() {
 /// `crate::pkg::session::make` (which would fail E0432).
 #[test]
 fn absolute_import_of_src_layout_sibling_emits_relative_use() {
-    let session = parse("def make() -> int:\n    return 42\n", "session.py").unwrap();
+    let session = parse(
+        "def make() -> int:\n    return 42\n",
+        "session.py",
+    )
+    .unwrap();
     let mut defs = std::collections::HashMap::new();
-    defs.insert(vec!["session".to_string()], std::rc::Rc::new(session));
+    defs.insert(
+        vec!["session".to_string()],
+        std::rc::Rc::new(session),
+    );
     let options = PythonOptions {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
@@ -10367,7 +10269,8 @@ fn absolute_import_of_src_layout_sibling_emits_relative_use() {
         .unwrap()
         .to_string();
     assert!(
-        out.contains("session :: make") && !out.contains("pkg :: session"),
+        out.contains("session :: make")
+            && !out.contains("pkg :: session"),
         "use must reference the crate-relative module: {}",
         out
     );
@@ -10405,7 +10308,11 @@ fn plain_import_of_root_qualified_sibling_binds_root_only() {
     .unwrap();
     let symbols = user.clone().find_symbols(SymbolTableScopes::new());
     let out = user
-        .to_rust(CodeGenContext::Module("user".to_string()), options, symbols)
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
         .unwrap()
         .to_string();
     assert!(
@@ -10445,7 +10352,11 @@ fn plain_import_of_external_root_is_not_aliased_onto_crate_modules() {
     let user = parse("import h2.connection\n", "user.py").unwrap();
     let symbols = user.clone().find_symbols(SymbolTableScopes::new());
     let out = user
-        .to_rust(CodeGenContext::Module("user".to_string()), options, symbols)
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
         .unwrap()
         .to_string();
     assert!(
@@ -10566,7 +10477,11 @@ fn type_checking_import_filters_per_name() {
     .unwrap();
     let symbols = user.clone().find_symbols(SymbolTableScopes::new());
     let out = user
-        .to_rust(CodeGenContext::Module("user".to_string()), options, symbols)
+        .to_rust(
+            CodeGenContext::Module("user".to_string()),
+            options,
+            symbols,
+        )
         .expect("converts")
         .to_string();
     assert!(
@@ -10675,8 +10590,8 @@ fn cross_module_only_base_emits_accessor_only_trait() {
 #[test]
 fn cross_module_base_supertrait_is_named_by_crate_path() {
     let src = "from animals import Animal\n\nclass Keeper(Animal):\n    def feed(self) -> int:\n        return 1\n";
-    let out =
-        compile_with_options(src, "keeper.py", cross_module_subclass_options()).expect("converts");
+    let out = compile_with_options(src, "keeper.py", cross_module_subclass_options())
+        .expect("converts");
     assert!(
         out.contains("pub trait KeeperTrait : crate :: animals :: AnimalTrait"),
         "the cross-module supertrait must be crate-path-qualified: {}",
@@ -10713,7 +10628,8 @@ fn mixed_dict_literal_with_nested_dict_boxes_values() {
     // inferred return type proves the dict widened to PyDict<String,
     // PyValue> (the literal itself renders as inferred PyDict::from([...])).
     assert!(
-        out.contains("PyValue :: from") && out.contains("PyDict < String , stdpython :: PyValue >"),
+        out.contains("PyValue :: from")
+            && out.contains("PyDict < String , stdpython :: PyValue >"),
         "mixed values must box into a PyDict<String, PyValue>: {}",
         out
     );

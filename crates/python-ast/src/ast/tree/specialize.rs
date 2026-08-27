@@ -42,8 +42,8 @@
 
 use std::collections::HashMap;
 
-use crate::ast::tree::StatementType;
 use crate::ast::tree::statement::Statement;
+use crate::ast::tree::StatementType;
 use crate::{ExprType, SymbolTableNode, SymbolTableScopes};
 
 /// One specialization target: a builtin type name or a user class.
@@ -358,10 +358,7 @@ pub fn detect_specializable(
     // An isinstance use outside a plain if-test on ANY unannotated
     // parameter: not specializable (the caller's lowering reports the
     // loud error).
-    if stray
-        .iter()
-        .any(|p| unannotated.iter().any(|(_, n)| n == p))
-    {
+    if stray.iter().any(|p| unannotated.iter().any(|(_, n)| n == p)) {
         return None;
     }
     // Every isinstance-tested unannotated parameter becomes an AXIS, in
@@ -482,7 +479,9 @@ fn collect_isinstance_tests(
                 collect_isinstance_tests(&s.body, unannotated, tests, stray);
                 collect_isinstance_tests(&s.orelse, unannotated, tests, stray);
             }
-            other => visit_statement_exprs(other, &mut |e| isinstance_args_in_expr(e, stray)),
+            other => visit_statement_exprs(other, &mut |e| {
+                isinstance_args_in_expr(e, stray)
+            }),
         }
     }
 }
@@ -677,25 +676,14 @@ fn plan_router(
         }
         let mut out_idents = std::collections::HashSet::new();
         for m in &members {
-            let ident = if py_id_boxable(m) {
-                to_pascal(m)
-            } else {
-                m.clone()
-            };
+            let ident = if py_id_boxable(m) { to_pascal(m) } else { m.clone() };
             if !out_idents.insert(ident) {
                 return None;
             }
         }
-        RouterReturn::Enum {
-            name: out_name,
-            members,
-        }
+        RouterReturn::Enum { name: out_name, members }
     };
-    Some(RouterPlan {
-        enum_names,
-        extra_params,
-        ret,
-    })
+    Some(RouterPlan { enum_names, extra_params, ret })
 }
 
 /// The compile-time truth of `isinstance(<axis>: <variant type>, T)` —
@@ -753,7 +741,11 @@ pub fn fold_morph_body(
 /// nested statement bodies, and truncate dead tails after an
 /// unconditional return/raise (Python never runs them; emitting them
 /// would only draw rustc's unreachable_code warning).
-fn fold_axis_tests(body: &[Statement], axis: &str, taken: &dyn Fn(&str) -> bool) -> Vec<Statement> {
+fn fold_axis_tests(
+    body: &[Statement],
+    axis: &str,
+    taken: &dyn Fn(&str) -> bool,
+) -> Vec<Statement> {
     let mut out = Vec::new();
     for stmt in body {
         let mut stmt = stmt.clone();
@@ -894,8 +886,9 @@ fn variant_expr_type(
     if let ExprType::BinOp(b) = e
         && matches!(b.op, crate::ast::tree::BinOps::Add)
     {
-        let stringy =
-            |t: &crate::TypeInfo| matches!(t, crate::TypeInfo::String | crate::TypeInfo::StrRef);
+        let stringy = |t: &crate::TypeInfo| {
+            matches!(t, crate::TypeInfo::String | crate::TypeInfo::StrRef)
+        };
         let l = variant_expr_type(&b.left, opts, symbols);
         let r = variant_expr_type(&b.right, opts, symbols);
         if stringy(&l) || stringy(&r) {
@@ -968,7 +961,10 @@ pub fn underscore_unused_params(f: &mut crate::FunctionDef) {
 /// Collect every Name mentioned in the statements; false when an
 /// unmodeled construct is found (the caller must then assume everything
 /// is mentioned).
-fn collect_stmt_names(body: &[Statement], out: &mut std::collections::HashSet<String>) -> bool {
+fn collect_stmt_names(
+    body: &[Statement],
+    out: &mut std::collections::HashSet<String>,
+) -> bool {
     for stmt in body {
         let ok = match &stmt.statement {
             StatementType::Expr(e) => collect_expr_names(&e.value, out),
@@ -1003,9 +999,7 @@ fn collect_stmt_names(body: &[Statement], out: &mut std::collections::HashSet<St
             }
             StatementType::Raise(r) => {
                 r.exc.as_ref().map_or(true, |e| collect_expr_names(e, out))
-                    && r.cause
-                        .as_ref()
-                        .map_or(true, |e| collect_expr_names(e, out))
+                    && r.cause.as_ref().map_or(true, |e| collect_expr_names(e, out))
             }
             _ => false,
         };
@@ -1017,7 +1011,10 @@ fn collect_stmt_names(body: &[Statement], out: &mut std::collections::HashSet<St
 }
 
 /// Collect every Name in the expression; false on an unmodeled variant.
-fn collect_expr_names(e: &ExprType, out: &mut std::collections::HashSet<String>) -> bool {
+fn collect_expr_names(
+    e: &ExprType,
+    out: &mut std::collections::HashSet<String>,
+) -> bool {
     match e {
         ExprType::Name(n) => {
             out.insert(n.id.clone());
@@ -1030,7 +1027,9 @@ fn collect_expr_names(e: &ExprType, out: &mut std::collections::HashSet<String>)
                 && c.keywords.iter().all(|k| collect_expr_names(&k.value, out))
         }
         ExprType::BoolOp(b) => b.values.iter().all(|v| collect_expr_names(v, out)),
-        ExprType::BinOp(b) => collect_expr_names(&b.left, out) && collect_expr_names(&b.right, out),
+        ExprType::BinOp(b) => {
+            collect_expr_names(&b.left, out) && collect_expr_names(&b.right, out)
+        }
         ExprType::UnaryOp(u) => collect_expr_names(&u.operand, out),
         ExprType::IfExp(i) => {
             collect_expr_names(&i.test, out)

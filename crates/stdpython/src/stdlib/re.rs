@@ -327,7 +327,10 @@ pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
     match re.captures_len() {
-        1 => Ok(re.find_iter(text).map(|m| m.as_str().to_string()).collect()),
+        1 => Ok(re
+            .find_iter(text)
+            .map(|m| m.as_str().to_string())
+            .collect()),
         2 => Ok(re
             .captures_iter(text)
             .map(|caps| {
@@ -384,9 +387,7 @@ pub fn findall3<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 }
 
 fn cap_or_empty(caps: &regex::Captures, i: usize) -> String {
-    caps.get(i)
-        .map(|g| g.as_str().to_string())
-        .unwrap_or_default()
+    caps.get(i).map(|g| g.as_str().to_string()).unwrap_or_default()
 }
 
 /// The tuple arity is part of findall2/findall3's TYPE; a pattern with a

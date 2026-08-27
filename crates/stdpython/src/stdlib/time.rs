@@ -69,13 +69,7 @@ pub fn ctime() -> String {
     let wd = WD[days.rem_euclid(7) as usize];
     format!(
         "{} {} {:2} {:02}:{:02}:{:02} {}",
-        wd,
-        MO[(month - 1) as usize],
-        day,
-        hour,
-        minute,
-        second,
-        year
+        wd, MO[(month - 1) as usize], day, hour, minute, second, year
     )
 }
 

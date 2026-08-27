@@ -4,7 +4,9 @@ use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes};
+use crate::{
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
+};
 
 /// A complete argument representation that can hold any Python expression.
 /// This replaces the limited Arg enum to support all argument types.
@@ -58,6 +60,7 @@ pub struct Arguments {
     pub defaults: Vec<Box<ExprType>>,
 }
 
+
 /// Function call arguments supporting all Python call patterns.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CallArguments {
@@ -73,7 +76,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Argument {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract the expression value
         let value: ExprType = ob.extract()?;
-
+        
         Ok(Self {
             value,
             lineno: ob.lineno(),
@@ -104,7 +107,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let arg: String = ob.getattr("arg")?.extract()?;
-
+        
         // Extract optional annotation
         let annotation = if let Ok(ann) = ob.getattr("annotation") {
             if ann.is_none() {
@@ -115,7 +118,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
         } else {
             None
         };
-
+        
         // Extract optional type comment
         let type_comment = if let Ok(tc) = ob.getattr("type_comment") {
             if tc.is_none() {
@@ -126,7 +129,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
         } else {
             None
         };
-
+        
         Ok(Self {
             arg,
             annotation,
@@ -192,9 +195,7 @@ pub fn is_str_bytes_union(ann: &ExprType) -> bool {
     }
     let has_str = members.iter().any(|m| is_str_annotation(m));
     let has_bytes = members.iter().any(|m| is_bytes_annotation(m));
-    let all_known = members
-        .iter()
-        .all(|m| is_str_annotation(m) || is_bytes_annotation(m));
+    let all_known = members.iter().all(|m| is_str_annotation(m) || is_bytes_annotation(m));
     has_str && has_bytes && all_known
 }
 
@@ -231,29 +232,10 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
             match sub.value.as_ref() {
                 ExprType::Name(n) => matches!(
                     n.id.as_str(),
-                    "tuple"
-                        | "Tuple"
-                        | "Literal"
-                        | "list"
-                        | "List"
-                        | "IO"
-                        | "Iterable"
-                        | "Union"
-                        | "Callable"
-                        | "SupportsRead"
-                        | "SupportsItems"
-                        | "Mapping"
-                        | "Dict"
-                        | "Set"
-                        | "Sequence"
-                        | "MutableMapping"
-                        | "Collection"
-                        | "Container"
-                        | "Generator"
-                        | "Iterator"
-                        | "Type"
-                        | "Optional"
-                        | "Any"
+                    "tuple" | "Tuple" | "Literal" | "list" | "List" | "IO" | "Iterable"
+                        | "Union" | "Callable" | "SupportsRead" | "SupportsItems"
+                        | "Mapping" | "Dict" | "Set" | "Sequence" | "MutableMapping" | "Collection" | "Container"
+                        | "Generator" | "Iterator" | "Type" | "Optional" | "Any"
                         | "memoryview"
                 ),
                 // `typing.Sequence[...]` / `typing.Iterable[...]` — the
@@ -263,27 +245,10 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
                     matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
                         && matches!(
                             a.attr.as_str(),
-                            "Tuple"
-                                | "List"
-                                | "Dict"
-                                | "Set"
-                                | "Sequence"
-                                | "Iterable"
-                                | "Iterator"
-                                | "Generator"
-                                | "Mapping"
-                                | "MutableMapping"
-                                | "Callable"
-                                | "Union"
-                                | "Optional"
-                                | "Literal"
-                                | "Any"
-                                | "IO"
-                                | "SupportsRead"
-                                | "SupportsItems"
-                                | "Type"
-                                | "Collection"
-                                | "Container"
+                            "Tuple" | "List" | "Dict" | "Set" | "Sequence" | "Iterable"
+                                | "Iterator" | "Generator" | "Mapping" | "MutableMapping"
+                                | "Callable" | "Union" | "Optional" | "Literal" | "Any"
+                                | "IO" | "SupportsRead" | "SupportsItems" | "Type" | "Collection" | "Container"
                         )
                 }
                 _ => false,
@@ -308,8 +273,7 @@ pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
     matches!(annotation, ExprType::Name(n) if n.id == "type")
 }
 
-pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
-    match annotation {
+pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {    match annotation {
         // T | None (and None | T) is Option<T>; a union whose members map
         // to the SAME Rust type (`bytes | bytearray` → Vec<u8>) is that
         // type. `str | bytes` (and `str | bytes | bytearray`) is the
@@ -329,10 +293,7 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 for m in &members {
                     match python_annotation_to_rust_type(m) {
                         Some(t) if all_same.is_none() => all_same = Some(t),
-                        Some(t)
-                            if all_same
-                                .as_ref()
-                                .is_some_and(|p| p.to_string() == t.to_string()) => {}
+                        Some(t) if all_same.as_ref().is_some_and(|p| p.to_string() == t.to_string()) => {}
                         _ => {
                             same = false;
                             break;
@@ -350,7 +311,10 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 // #121: `bool | str | None`, `tuple[str, str] | str |
                 // None`, `int | str | None`, ...) is the boxed
                 // heterogeneous value; isinstance narrows at runtime.
-                if members.iter().all(|m| crate::is_pyvalue_boxable_member(m)) {
+                if members
+                    .iter()
+                    .all(|m| crate::is_pyvalue_boxable_member(m))
+                {
                     return Some(quote!(stdpython::PyValue));
                 }
                 return None;
@@ -409,8 +373,7 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                     return Some(quote!(socket::Socket));
                 }
             }
-            let is_np =
-                matches!(attr.value.as_ref(), ExprType::Name(n) if crate::is_numpy_alias(&n.id));
+            let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if crate::is_numpy_alias(&n.id));
             if !is_np {
                 return None;
             }
@@ -432,7 +395,9 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 ExprType::Name(n) => n.id.as_str(),
                 // `typing.Mapping[K, V]` — the typing-prefixed generic
                 // lowers like the bare name.
-                ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") => {
+                ExprType::Attribute(a)
+                    if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+                {
                     match a.attr.as_str() {
                         "Mapping" => "Mapping",
                         "Dict" => "dict",
@@ -451,7 +416,9 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 // pass as a value — tolerated as an opaque Option<()> so
                 // the definition compiles (a call passing an actual class
                 // is the documented class-as-value divergence).
-                (crate::SubscriptKind::Index(_), "type" | "Type") => Some(quote!(Option<()>)),
+                (crate::SubscriptKind::Index(_), "type" | "Type") => {
+                    Some(quote!(Option<()>))
+                }
                 (crate::SubscriptKind::Index(elt), "Optional") => {
                     let inner = python_annotation_to_rust_type(elt)?;
                     // Optional[bool | str] is the boxed PyValue (which
@@ -547,6 +514,7 @@ impl CodeGen for Parameter {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+
         let param_name = crate::safe_ident(&self.arg);
 
         // Generate type annotation if present
@@ -646,19 +614,13 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Arguments {
         // Extract each field with proper error handling
         let posonlyargs: Vec<Parameter> = ob.getattr("posonlyargs")?.extract().unwrap_or_default();
         let args: Vec<Parameter> = ob.getattr("args")?.extract().unwrap_or_default();
-
+        
         let vararg = if let Ok(va) = ob.getattr("vararg") {
-            if va.is_none() {
-                None
-            } else {
-                Some(va.extract()?)
-            }
-        } else {
-            None
-        };
-
+            if va.is_none() { None } else { Some(va.extract()?) }
+        } else { None };
+        
         let kwonlyargs: Vec<Parameter> = ob.getattr("kwonlyargs")?.extract().unwrap_or_default();
-
+        
         // Handle kw_defaults which can contain None values
         let kw_defaults = if let Ok(kw_def) = ob.getattr("kw_defaults") {
             let defaults_list: Vec<Bound<PyAny>> = kw_def.extract().unwrap_or_default();
@@ -674,20 +636,14 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Arguments {
         } else {
             Vec::new()
         };
-
+        
         let kwarg = if let Ok(kw) = ob.getattr("kwarg") {
-            if kw.is_none() {
-                None
-            } else {
-                Some(kw.extract()?)
-            }
-        } else {
-            None
-        };
-
+            if kw.is_none() { None } else { Some(kw.extract()?) }
+        } else { None };
+        
         let defaults_raw: Vec<ExprType> = ob.getattr("defaults")?.extract().unwrap_or_default();
         let defaults = defaults_raw.into_iter().map(Box::new).collect();
-
+        
         Ok(Self {
             posonlyargs,
             args,
@@ -712,13 +668,13 @@ impl CodeGen for Arguments {
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         let mut params = Vec::new();
-
+        
         // Process positional-only arguments
         for arg in self.posonlyargs {
             let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             params.push(param);
         }
-
+        
         // Process regular positional arguments. Defaulted parameters lower
         // to plain required parameters: Rust has no default arguments, and
         // the old Option<T> wrapping neither type-checked against bodies
@@ -729,7 +685,7 @@ impl CodeGen for Arguments {
             let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             params.push(param);
         }
-
+        
         // Process *args (issue #120): a boxed heterogeneous list —
         // callers pack extra positional arguments into PyValue::from
         // values (mirroring **kwargs below). The body reads it like any
@@ -739,24 +695,25 @@ impl CodeGen for Arguments {
             let vararg_name = crate::safe_ident(&vararg.arg);
             params.push(quote!(#vararg_name: Vec<stdpython::PyValue>));
         }
-
+        
         // Process keyword-only arguments. Like positional defaults above,
         // these lower to plain required parameters.
         for arg in self.kwonlyargs {
             let param = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             params.push(param);
         }
-
+        
         // Process **kwargs (issue #120): a boxed heterogeneous dict —
         // callers pack extra keyword arguments into PyValue::from values.
         if let Some(kwarg) = self.kwarg {
             let kwarg_name = crate::safe_ident(&kwarg.arg);
             params.push(quote!(#kwarg_name: PyDict<String, stdpython::PyValue>));
         }
-
+        
         Ok(quote!(#(#params),*))
     }
 }
+
 
 // Implementation for CallArguments
 impl<'a, 'py> FromPyObject<'a, 'py> for CallArguments {
@@ -764,7 +721,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for CallArguments {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let args: Vec<ExprType> = ob.getattr("args")?.extract().unwrap_or_default();
         let keywords: Vec<crate::Keyword> = ob.getattr("keywords")?.extract().unwrap_or_default();
-
+        
         Ok(Self { args, keywords })
     }
 }
@@ -781,72 +738,60 @@ impl CodeGen for CallArguments {
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         let mut all_args = Vec::new();
-
+        
         // Add positional arguments
         for arg in self.args {
             let rust_arg = arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             all_args.push(rust_arg);
         }
-
+        
         // Add keyword arguments
         for keyword in self.keywords {
             let rust_kw = keyword.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             all_args.push(rust_kw);
         }
-
+        
         Ok(quote!(#(#all_args),*))
     }
 }
 
+
 // Node trait implementations for position tracking
 impl Node for Argument {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
 
 impl Node for Parameter {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CodeGenContext, ExprType, PythonOptions, SymbolTableScopes, parse};
+    use crate::{parse, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes};
     use test_log::test;
 
     #[test]
     fn test_simple_function_call() {
         let code = "func(1, 2, 3)";
         let result = parse(code, "test.py").unwrap();
-
+        
         // Generate Rust code
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let _rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let _rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         // Should generate function call with positional arguments
     }
 
@@ -859,10 +804,11 @@ mod tests {
 
         let options = PythonOptions::default();
         let symbols = result.clone().find_symbols(SymbolTableScopes::new());
-        let rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap()
-            .to_string();
+        let rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap().to_string();
         assert!(rust_code.contains("let __rython_arg_0 = 2 ; let __rython_arg_1 = 1 ; func (__rython_arg_1 , __rython_arg_0)"), "generated: {}", rust_code);
     }
 
@@ -873,10 +819,11 @@ mod tests {
 
         let options = PythonOptions::default();
         let symbols = result.clone().find_symbols(SymbolTableScopes::new());
-        let rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap()
-            .to_string();
+        let rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap().to_string();
         assert!(rust_code.contains("let __rython_arg_0 = 1 ; let __rython_arg_1 = 2 ; let __rython_arg_2 = 4 ; let __rython_arg_3 = 3 ; func (__rython_arg_0 , __rython_arg_1 , __rython_arg_3 , __rython_arg_2)"), "generated: {}", rust_code);
     }
 
@@ -887,13 +834,15 @@ def func(a, b=2, c=3):
     pass
         "#;
         let result = parse(code, "test.py").unwrap();
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let _rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let _rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         // Should generate function with optional parameters
     }
 
@@ -904,13 +853,15 @@ def func(a, *args):
     pass
         "#;
         let result = parse(code, "test.py").unwrap();
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let _rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let _rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         // Should generate function with variable arguments
     }
 
@@ -921,13 +872,15 @@ def func(a, **kwargs):
     pass
         "#;
         let result = parse(code, "test.py").unwrap();
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let _rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let _rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         // Should generate function with keyword arguments dict
     }
 
@@ -938,13 +891,15 @@ def func(a, b=2, *args, c, d=4, **kwargs):
     pass
         "#;
         let result = parse(code, "test.py").unwrap();
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let _rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let _rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         // Should generate function with all argument types
     }
 
@@ -955,13 +910,15 @@ def func(a, *, b, c=3):
     pass
         "#;
         let result = parse(code, "test.py").unwrap();
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let _rust_code = result
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let _rust_code = result.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         // Should generate function with keyword-only arguments
     }
 
@@ -970,20 +927,23 @@ def func(a, *, b, c=3):
         // Note: This would require additional AST node support for Starred expressions
         let code = "func(*args, **kwargs)";
         let result = parse(code, "test.py");
-
+        
         match result {
             Ok(ast) => {
                 let options = PythonOptions::default();
                 let symbols = SymbolTableScopes::new();
-                let rust_code =
-                    ast.to_rust(CodeGenContext::Module("test".to_string()), options, symbols);
-
+                let rust_code = ast.to_rust(
+                    CodeGenContext::Module("test".to_string()),
+                    options,
+                    symbols,
+                );
+                
                 match rust_code {
-                    Ok(_code) => { /* Code generation succeeded as expected */ }
-                    Err(_e) => { /* Expected error for unimplemented feature */ }
+                    Ok(_code) => { /* Code generation succeeded as expected */ },
+                    Err(_e) => { /* Expected error for unimplemented feature */ },
                 }
             }
-            Err(_e) => { /* Parse error expected for unimplemented features */ }
+            Err(_e) => { /* Parse error expected for unimplemented features */ },
         }
     }
 
@@ -994,13 +954,15 @@ def func(a, *, b, c=3):
         let literal = Literal::parse("42").unwrap().into_owned();
         let constant = crate::Constant(Some(literal));
         let arg: Arg = ExprType::Constant(constant);
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let rust_code = arg
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let rust_code = arg.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         assert!(rust_code.to_string().contains("42"));
     }
 
@@ -1011,13 +973,15 @@ def func(a, *, b, c=3):
             id: "variable".to_string(),
         });
         let arg: Arg = name_expr;
-
+        
         let options = PythonOptions::default();
         let symbols = SymbolTableScopes::new();
-        let rust_code = arg
-            .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
-            .unwrap();
-
+        let rust_code = arg.to_rust(
+            CodeGenContext::Module("test".to_string()),
+            options,
+            symbols,
+        ).unwrap();
+        
         assert!(rust_code.to_string().contains("variable"));
     }
 }

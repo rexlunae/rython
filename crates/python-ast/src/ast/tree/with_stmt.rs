@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CodeGen, CodeGenContext, ExprType, Node, PythonOptions, Statement, SymbolTableNode,
-    SymbolTableScopes, WithItem, extract_list,
+    SymbolTableScopes, extract_list, WithItem,
 };
 
 /// Whether a with-item's context expression is a threading synchronization
@@ -43,10 +43,9 @@ fn is_threading_sync_call(
             // An annotated parameter (or annotated local) recorded in
             // local_types as "threading.Lock"/"threading.RLock"/
             // "threading.Semaphore".
-            let annotated_sync = options
-                .local_types
-                .get(&n.id)
-                .is_some_and(|py| py.strip_prefix("threading.").is_some_and(is_sync_name));
+            let annotated_sync = options.local_types.get(&n.id).is_some_and(|py| {
+                py.strip_prefix("threading.").is_some_and(is_sync_name)
+            });
             annotated_sync
                 || matches!(
                     symbols.get(&n.id),
@@ -77,10 +76,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for With {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract items (list of withitem objects)
         let items: Vec<WithItem> = extract_list(&ob, "items", "with items")?;
-
+        
         // Extract body
         let body: Vec<Statement> = extract_list(&ob, "body", "with body")?;
-
+        
         Ok(With {
             items,
             body,
@@ -93,18 +92,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for With {
 }
 
 impl Node for With {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
 
 impl CodeGen for With {
@@ -122,9 +113,7 @@ impl CodeGen for With {
                 acc
             }
         });
-        self.body
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc))
+        self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc))
     }
 
     fn to_rust(
@@ -174,9 +163,7 @@ impl CodeGen for With {
             }
         }
 
-        let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
-            .body
-            .into_iter()
+        let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_tokens = body_tokens?;

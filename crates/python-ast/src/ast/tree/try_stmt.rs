@@ -47,19 +47,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Try {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract body
         let body: Vec<Statement> = extract_list(&ob, "body", "try body")?;
-
+        
         // Extract handlers
         let handlers: Vec<ExceptHandler> = extract_list(&ob, "handlers", "try handlers")?;
-
+        
         // Extract orelse (optional)
         let orelse: Vec<Statement> = extract_list(&ob, "orelse", "try orelse").unwrap_or_default();
-
+        
         // Extract finalbody (optional)
-        let finalbody: Vec<Statement> =
-            extract_list(&ob, "finalbody", "try finalbody").unwrap_or_default();
-
+        let finalbody: Vec<Statement> = extract_list(&ob, "finalbody", "try finalbody").unwrap_or_default();
+        
         Ok(Try {
-            body,
+            body, 
             handlers,
             orelse,
             finalbody,
@@ -84,7 +83,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExceptHandler {
         } else {
             None
         };
-
+        
         // Extract name (optional)
         let name: Option<String> = if let Ok(name_attr) = ob.getattr("name") {
             if name_attr.is_none() {
@@ -95,10 +94,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExceptHandler {
         } else {
             None
         };
-
+        
         // Extract body
         let body: Vec<Statement> = extract_list(&ob, "body", "except handler body")?;
-
+        
         Ok(ExceptHandler {
             exception_type,
             name,
@@ -112,33 +111,17 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExceptHandler {
 }
 
 impl Node for Try {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
 
 impl Node for ExceptHandler {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }
 
 impl CodeGen for Try {
@@ -149,10 +132,7 @@ impl CodeGen for Try {
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         // Process body, handlers, orelse, and finalbody
         let body_has_import = try_body_contains_import(&self.body);
-        let symbols = self
-            .body
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc));
+        let symbols = self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
         let symbols = self.handlers.into_iter().fold(symbols, |acc, handler| {
             // A bare `except ImportError:` handler is DROPPED at render
             // time (rython's imports are static — the fallback can never
@@ -164,7 +144,10 @@ impl CodeGen for Try {
             // external-import boxed None. The ImportError-family TUPLE
             // spelling drops the same way for an import-attempt body.
             if is_bare_import_error(&handler.exception_type)
-                && (matches!(handler.exception_type, Some(ExprType::Name(_))) || body_has_import)
+                && (matches!(
+                    handler.exception_type,
+                    Some(ExprType::Name(_))
+                ) || body_has_import)
             {
                 return acc;
             }
@@ -176,23 +159,15 @@ impl CodeGen for Try {
             if let Some(name) = &handler.name {
                 acc.insert(name.clone(), crate::SymbolTableNode::ExceptBinding);
             }
-            let symbols = handler
-                .body
-                .into_iter()
-                .fold(acc, |acc, stmt| stmt.find_symbols(acc));
+            let symbols = handler.body.into_iter().fold(acc, |acc, stmt| stmt.find_symbols(acc));
             if let Some(exception_type) = handler.exception_type {
                 exception_type.find_symbols(symbols)
             } else {
                 symbols
             }
         });
-        let symbols = self
-            .orelse
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc));
-        self.finalbody
-            .into_iter()
-            .fold(symbols, |acc, stmt| stmt.find_symbols(acc))
+        let symbols = self.orelse.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc));
+        self.finalbody.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc))
     }
 
     fn to_rust(
@@ -216,11 +191,7 @@ impl CodeGen for Try {
         // would escape that closure with no signal path back. Refuse at
         // conversion time rather than emit Rust that cannot compile.
         if !self.finalbody.is_empty() {
-            let where_ = if self
-                .handlers
-                .iter()
-                .any(|h| crate::body_breaks_outward(&h.body))
-            {
+            let where_ = if self.handlers.iter().any(|h| crate::body_breaks_outward(&h.body)) {
                 Some("except handler")
             } else if crate::body_breaks_outward(&self.orelse) {
                 Some("else clause")
@@ -296,7 +267,10 @@ impl CodeGen for Try {
             // drops the same way, but only when the try body is actually
             // an import attempt.
             if is_bare_import_error(&handler.exception_type)
-                && (matches!(handler.exception_type, Some(ExprType::Name(_))) || body_has_import)
+                && (matches!(
+                    handler.exception_type,
+                    Some(ExprType::Name(_))
+                ) || body_has_import)
             {
                 options.definition_warnings.borrow_mut().push(
                     "`except ImportError:` handler is dropped: rython's \
@@ -407,10 +381,7 @@ impl CodeGen for Try {
                 let replay_break = if ctx.break_crosses_try_closure() {
                     quote!(return Ok(PyFlow::Break);)
                 } else if ctx.break_target_has_else() {
-                    quote!({
-                        __rython_broke = true;
-                        break;
-                    })
+                    quote!({ __rython_broke = true; break; })
                 } else {
                     quote!(break;)
                 };
@@ -574,10 +545,8 @@ pub(crate) fn is_bare_import_error(exception_type: &Option<ExprType>) -> bool {
         Some(ExprType::Name(n)) if n.id == "ImportError" => true,
         Some(ExprType::Tuple(t)) => {
             !t.elts.is_empty()
-                && t.elts.iter().all(|e| {
-                    matches!(e, ExprType::Name(n)
-                    if matches!(n.id.as_str(), "ImportError" | "AttributeError"))
-                })
+                && t.elts.iter().all(|e| matches!(e, ExprType::Name(n)
+                    if matches!(n.id.as_str(), "ImportError" | "AttributeError")))
         }
         _ => false,
     }
@@ -620,9 +589,11 @@ fn exception_match_guard(
             // stdlib alias canonicalizes identically.
             let n = match attr.value.as_ref() {
                 ExprType::Name(m) => {
-                    crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &attr.attr)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| attr.attr.clone())
+                    crate::ast::tree::raise_stmt::stdlib_exception_canonical(
+                        &m.id, &attr.attr,
+                    )
+                    .map(str::to_string)
+                    .unwrap_or_else(|| attr.attr.clone())
                 }
                 _ => attr.attr.clone(),
             };

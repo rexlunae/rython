@@ -134,27 +134,25 @@ pub fn parse_decorator(
             match (base.as_deref(), call) {
                 // typing metadata (`@typing.overload`, `@typing.final`,
                 // `@typing.no_type_check`): no runtime effect — no-op.
-                (
-                    Some(
-                        "overload" | "final" | "no_type_check" | "runtime_checkable"
-                        | "contextmanager" | "abstractmethod" | "total_ordering",
-                    ),
-                    None,
-                ) => {
+                (Some("overload" | "final" | "no_type_check" | "runtime_checkable" | "contextmanager" | "abstractmethod" | "total_ordering"), None) => {
                     // total_ordering synthesizes the comparison methods not
                     // explicitly defined — rython lowers the class's own
                     // methods (the synthesized ones are missing, a
                     // documented divergence).
                     Ok(Some(Decorator::Property))
                 }
-                (Some("setter" | "getter" | "deleter"), None) => Ok(Some(Decorator::Property)),
+                (Some("setter" | "getter" | "deleter"), None) => {
+                    Ok(Some(Decorator::Property))
+                }
                 (Some("property"), None) => Ok(Some(Decorator::Property)),
                 // A property-LIKE descriptor (`@CachedProperty` — botocore's
                 // Client.waiter_names; `@functools.cached_property` — pip's
                 // req_install): a read-only cached property — the method
                 // lowers as a plain method (the property-read divergence;
                 // the caching is a performance-only optimization).
-                (Some("CachedProperty" | "cached_property"), None) => Ok(Some(Decorator::Property)),
+                (Some("CachedProperty" | "cached_property"), None) => {
+                    Ok(Some(Decorator::Property))
+                }
                 // A local caching decorator (`@instance_cache` — botocore's
                 // loaders, defined in-module): caches the function's result
                 // per instance — the cache is a performance optimization;
@@ -184,9 +182,11 @@ pub fn parse_decorator(
                             Some(kw.value.clone())
                         }
                         _ => {
-                            return Err("lru_cache() takes at most a single maxsize argument"
-                                .to_string()
-                                .into());
+                            return Err(
+                                "lru_cache() takes at most a single maxsize argument"
+                                    .to_string()
+                                    .into(),
+                            )
                         }
                     };
                     match maxsize {
@@ -199,9 +199,9 @@ pub fn parse_decorator(
                         {
                             let lit = c.0.clone().expect("matched integer");
                             let n: i64 = match &lit {
-                                litrs::Literal::Integer(i) => {
-                                    i.value().ok_or("lru_cache maxsize out of range")?
-                                }
+                                litrs::Literal::Integer(i) => i
+                                    .value()
+                                    .ok_or("lru_cache maxsize out of range")?,
                                 _ => unreachable!(),
                             };
                             Ok(Some(Decorator::Cache(Some(Some(n)))))
@@ -223,7 +223,9 @@ pub fn parse_decorator(
                 // flavor is a memory optimization — the cache semantics are
                 // the same; the maxsize is a non-literal constant, so the
                 // cache is unbounded (documented divergence).
-                (Some("lru_cache_weakref"), Some(_)) => Ok(Some(Decorator::Cache(Some(None)))),
+                (Some("lru_cache_weakref"), Some(_)) => {
+                    Ok(Some(Decorator::Cache(Some(None))))
+                }
                 // `@wraps(func)` — functools.wraps copies the wrapped
                 // function's metadata (__name__, __doc__): unmodeled — the
                 // decorated function lowers as-is.
@@ -232,7 +234,9 @@ pub fn parse_decorator(
                 // (with or without a hook argument): enters a tracing
                 // context around the call — unmodeled; the decorated
                 // function lowers directly (documented divergence).
-                (Some("with_current_context"), Some(_)) => Ok(Some(Decorator::Property)),
+                (Some("with_current_context"), Some(_)) => {
+                    Ok(Some(Decorator::Property))
+                }
                 // An unknown decorator FACTORY CALL with NO arguments
                 // (`@with_current_context()` — botocore's Client): the
                 // factory produces a wrapper whose behavior (context
@@ -261,20 +265,10 @@ pub fn parse_decorator(
                 }
             }
             // Only metadata markers stacked: a no-op.
-            if many.iter().all(|d| {
-                matches!(
-                    name_of(d).as_deref(),
-                    Some(
-                        "overload"
-                            | "final"
-                            | "no_type_check"
-                            | "runtime_checkable"
-                            | "property"
-                            | "abstractmethod"
-                            | "total_ordering"
-                    )
-                )
-            }) {
+            if many
+                .iter()
+                .all(|d| matches!(name_of(d).as_deref(), Some("overload" | "final" | "no_type_check" | "runtime_checkable" | "property" | "abstractmethod" | "total_ordering")))
+            {
                 return Ok(Some(Decorator::Property));
             }
             Err(unsupported(&format!("{:?}", many[0])))

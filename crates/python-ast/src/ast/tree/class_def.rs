@@ -200,8 +200,7 @@ impl ClassDef {
     /// fields are field metadata, and construction takes them as arguments
     /// — the same shape a @dataclass synthesizes (urllib3's ProxyConfig,
     /// _WrappedAndVerifiedSocket, Url).
-    pub fn is_namedtuple(&self) -> bool {
-        self.bases.iter().any(|b| match b {
+    pub fn is_namedtuple(&self) -> bool {        self.bases.iter().any(|b| match b {
             ExprType::Attribute(a) => {
                 a.attr == "NamedTuple"
                     && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
@@ -344,7 +343,9 @@ impl ClassDef {
             for (i, (name, ann)) in fields.into_iter().enumerate() {
                 // A field whose default rides in __new__: the __new__
                 // parameter's default applies at the same position.
-                if let Some((_, default)) = new_defaults.iter().find(|(n, _)| *n == name) {
+                if let Some((_, default)) =
+                    new_defaults.iter().find(|(n, _)| *n == name)
+                {
                     defaults.push(Box::new(default.clone()));
                 } else if new_required.iter().any(|n| *n == name) {
                     // __new__ has the param WITHOUT a default: required.
@@ -569,7 +570,11 @@ impl ClassDef {
                     ExprType::Attribute(a) => a.attr == "overload",
                     _ => false,
                 });
-                if is_overload { None } else { Some(f) }
+                if is_overload {
+                    None
+                } else {
+                    Some(f)
+                }
             }
             _ => None,
         })
@@ -611,7 +616,8 @@ impl ClassDef {
             Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
             Some(SymbolTableNode::ImportFrom(i)) => {
                 let path = i.resolved_module_path(options);
-                crate::module_class_def(options, &path, &n.id).map(|(c, _)| c)
+                crate::module_class_def(options, &path, &n.id)
+                    .map(|(c, _)| c)
             }
             _ => None,
         }
@@ -627,10 +633,9 @@ impl ClassDef {
         let mut chain = vec![self.clone()];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         seen.insert(self.name.clone());
-        while let Some(base) = chain
-            .last()
-            .and_then(|c| c.base_class_with_options(symbols, options))
-        {
+        while let Some(base) = chain.last().and_then(|c| {
+            c.base_class_with_options(symbols, options)
+        }) {
             if !seen.insert(base.name.clone()) {
                 break;
             }
@@ -655,12 +660,7 @@ impl ClassDef {
         &self,
         symbols: &SymbolTableScopes,
         options: &crate::PythonOptions,
-    ) -> Vec<(
-        ClassDef,
-        SymbolTableScopes,
-        crate::PythonOptions,
-        Option<Vec<String>>,
-    )> {
+    ) -> Vec<(ClassDef, SymbolTableScopes, crate::PythonOptions, Option<Vec<String>>)> {
         // Each entry carries the scope its class's TRAIT was declared in:
         // the defining module's symbols AND an options clone whose
         // module_path/this_module_path point there, so relative imports
@@ -674,7 +674,9 @@ impl ClassDef {
         loop {
             let (last, last_syms, last_opts, last_path) = chain.last().unwrap();
             let Some(base_name) = last.bases.iter().find_map(|b| match b {
-                ExprType::Name(n) if n.id != "object" && !is_metadata_base_name(&n.id) => {
+                ExprType::Name(n)
+                    if n.id != "object" && !is_metadata_base_name(&n.id) =>
+                {
                     Some(n.id.clone())
                 }
                 _ => None,
@@ -683,8 +685,8 @@ impl ClassDef {
             };
             let resolve_import = |i: &crate::ImportFrom, name: &str| {
                 let path = i.resolved_module_path(last_opts);
-                crate::resolve_imported_class_with_path(options, &path, name, 0).map(
-                    |(c, s, defining)| {
+                crate::resolve_imported_class_with_path(options, &path, name, 0)
+                    .map(|(c, s, defining)| {
                         let mut o = options.clone();
                         // The package context: an __init__ module IS its
                         // own package (mirrors resolve_imported_class).
@@ -759,16 +761,21 @@ impl ClassDef {
     /// `isinstance(x, C)` folds through this — `isinstance(dog, Animal)`
     /// is true because Dog's base chain contains Animal, exactly like
     /// CPython's subclass check. Non-class names answer false.
-    pub(crate) fn class_extends(child: &str, ancestor: &str, symbols: &SymbolTableScopes) -> bool {
+    pub(crate) fn class_extends(
+        child: &str,
+        ancestor: &str,
+        symbols: &SymbolTableScopes,
+    ) -> bool {
         if child == ancestor {
             // Reflexive even when the name isn't resolvable in scope (an
             // annotated parameter of an imported class).
             return true;
         }
         match symbols.get(child) {
-            Some(crate::SymbolTableNode::ClassDef(c)) => {
-                c.base_chain(symbols).iter().any(|a| a.name == ancestor)
-            }
+            Some(crate::SymbolTableNode::ClassDef(c)) => c
+                .base_chain(symbols)
+                .iter()
+                .any(|a| a.name == ancestor),
             _ => false,
         }
     }
@@ -790,11 +797,7 @@ impl ClassDef {
 
     /// The first method named `name` found walking the MRO (the class
     /// itself, then its base, then the base's base, ...).
-    pub(crate) fn method_on_mro(
-        &self,
-        name: &str,
-        symbols: &SymbolTableScopes,
-    ) -> Option<FunctionDef> {
+    pub(crate) fn method_on_mro(&self, name: &str, symbols: &SymbolTableScopes) -> Option<FunctionDef> {
         self.base_chain(symbols)
             .into_iter()
             .find_map(|c| c.methods().find(|m| m.name == name).cloned())
@@ -824,11 +827,7 @@ impl ClassDef {
     /// depth-0 owner for a field the struct no longer has, making
     /// `self.n = n` in a subclass's own `__init__` write to a nonexistent
     /// field.
-    pub(crate) fn field_owner_depth(
-        &self,
-        attr: &str,
-        symbols: &SymbolTableScopes,
-    ) -> Option<usize> {
+    pub(crate) fn field_owner_depth(&self, attr: &str, symbols: &SymbolTableScopes) -> Option<usize> {
         self.base_chain(symbols)
             .iter()
             .rposition(|c| c.owns_field(attr))
@@ -839,7 +838,11 @@ impl ClassDef {
     /// `__init__` stores, either a direct construction or an
     /// annotated parameter whose annotation names a class. Walks the MRO so
     /// a base class's composed field resolves from a derived method.
-    pub(crate) fn field_class(&self, attr: &str, symbols: &SymbolTableScopes) -> Option<String> {
+    pub(crate) fn field_class(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+    ) -> Option<String> {
         let chain = self.base_chain(symbols);
         let owner = chain.iter().find(|c| c.owns_field(attr))?;
         let init = owner.init_method()?;
@@ -1029,7 +1032,8 @@ impl ClassDef {
                 && let [ExprType::Name(n)] = a.targets.as_slice()
                 && !name_types.contains_key(&n.id)
                 && let ExprType::Call(call) = &a.value
-                && let Some(t) = crate::call_return_typeinfo(call, Some(&symbols), Some(&options))
+                && let Some(t) =
+                    crate::call_return_typeinfo(call, Some(&symbols), Some(&options))
             {
                 name_types.insert(n.id.clone(), t.to_rust_type());
             }
@@ -1066,7 +1070,8 @@ impl ClassDef {
                 let ty = if matches!(ann, ExprType::Name(n) if n.id == "str") {
                     Some(quote!(String))
                 } else if !matches!(ann, ExprType::Name(_)) {
-                    if p.arg == "dist" {}
+                    if p.arg == "dist" {
+                    }
                     // A union/container/alias annotation
                     // (`None | connection._TYPE_SOCKET_OPTIONS`,
                     // `tuple[str, int] | None`): resolve alias-aware.
@@ -1074,7 +1079,8 @@ impl ClassDef {
                         .map(|t| t.to_rust_type())
                         .or_else(|| crate::python_annotation_to_rust_type(ann))
                         .or_else(|| {
-                            if p.arg == "dist" {}
+                            if p.arg == "dist" {
+                            }
                             // `T | None` where T is a CLASS (`load_only:
                             // Kind | None` — pip's Configuration): an
                             // Option of the class struct.
@@ -1115,10 +1121,11 @@ impl ClassDef {
                                         Some(SymbolTableNode::Assign {
                                             value: ExprType::Call(c),
                                             ..
-                                        }) if matches!(
-                                            c.func.as_ref(),
-                                            ExprType::Name(fnm) if fnm.id == "NewType"
-                                        ) =>
+                                        })
+                                            if matches!(
+                                                c.func.as_ref(),
+                                                ExprType::Name(fnm) if fnm.id == "NewType"
+                                            ) =>
                                         {
                                             Some(quote!(Option<String>))
                                         }
@@ -1132,7 +1139,8 @@ impl ClassDef {
                         });
                     r
                 } else if let ExprType::Name(n) = ann {
-                    if p.arg == "dist" {}
+                    if p.arg == "dist" {
+                    }
                     match symbols.get(&n.id) {
                         Some(SymbolTableNode::ClassDef(_)) => {
                             let ident = crate::safe_ident(&n.id);
@@ -1248,7 +1256,9 @@ impl ClassDef {
             };
             if let Some((name, annotation)) = annotated {
                 let ty = crate::python_annotation_to_rust_type(annotation)
-                    .or_else(|| crate::annotation_type_info(annotation).map(|t| t.to_rust_type()))
+                    .or_else(|| {
+                        crate::annotation_type_info(annotation).map(|t| t.to_rust_type())
+                    })
                     .or_else(|| {
                         crate::resolve_alias_typeinfo(annotation, symbols, options)
                             .map(|t| t.to_rust_type())
@@ -1301,99 +1311,96 @@ impl ClassDef {
             // frozenset[str] = frozenset(...)`, `self._last_latin_character:
             // CharInfo | None = None`); the value's shape infers it
             // otherwise.
-            let ty = store
-                .annotation
-                .and_then(|a| {
-                    // A module-level TYPE ALIAS (`self._languages:
-                    // CoherenceMatches = languages`) resolves through symbols;
-                    // a class name maps to the struct ident; `T | None` wraps
-                    // in Option.
-                    let alias_ty = crate::resolve_alias_typeinfo(a, symbols, options)
-                        .map(|t| t.to_rust_type());
-                    let ty_tokens = |t: &ExprType| -> Option<TokenStream> {
-                        crate::python_annotation_to_rust_type(t).or_else(|| match t {
-                            ExprType::Name(n)
-                                if matches!(
-                                    symbols.get(&n.id),
-                                    Some(SymbolTableNode::ClassDef(_))
-                                ) =>
-                            {
-                                let ident = crate::safe_ident(&n.id);
-                                Some(quote!(#ident))
-                            }
-                            _ => None,
-                        })
+            let ty = store.annotation.and_then(|a| {
+                // A module-level TYPE ALIAS (`self._languages:
+                // CoherenceMatches = languages`) resolves through symbols;
+                // a class name maps to the struct ident; `T | None` wraps
+                // in Option.
+                let alias_ty = crate::resolve_alias_typeinfo(a, symbols, options)
+                    .map(|t| t.to_rust_type());
+                let ty_tokens = |t: &ExprType| -> Option<TokenStream> {
+                    crate::python_annotation_to_rust_type(t).or_else(|| match t {
+                        ExprType::Name(n)
+                            if matches!(
+                                symbols.get(&n.id),
+                                Some(SymbolTableNode::ClassDef(_))
+                            ) =>
+                        {
+                            let ident = crate::safe_ident(&n.id);
+                            Some(quote!(#ident))
+                        }
+                        _ => None,
+                    })
+                };
+                if let Some(t) = alias_ty {
+                    // The whole annotation resolved (aliases, Option<T>,
+                    // containers) — use it as-is.
+                    Some(t)
+                } else if crate::is_optional_annotation(a) {
+                    let inner = match a {
+                        ExprType::BinOp(op) if crate::is_none_expr(&op.left) => op.right.as_ref(),
+                        ExprType::BinOp(op) if crate::is_none_expr(&op.right) => op.left.as_ref(),
+                        _ => return None,
                     };
-                    if let Some(t) = alias_ty {
-                        // The whole annotation resolved (aliases, Option<T>,
-                        // containers) — use it as-is.
-                        Some(t)
-                    } else if crate::is_optional_annotation(a) {
-                        let inner = match a {
-                            ExprType::BinOp(op) if crate::is_none_expr(&op.left) => {
-                                op.right.as_ref()
-                            }
-                            ExprType::BinOp(op) if crate::is_none_expr(&op.right) => {
-                                op.left.as_ref()
-                            }
-                            _ => return None,
-                        };
-                        let inner = ty_tokens(inner)?;
-                        Some(quote!(Option<#inner>))
-                    } else {
-                        ty_tokens(a)
-                            .or_else(|| {
-                                // A dict-generic annotation with an unresolvable
-                                // element (`dict[Kind, list[tuple[str,
-                                // RawConfigParser]]]` — pip's Configuration):
-                                // a boxed PyDict<String, PyValue>.
-                                match a {
-                                    ExprType::Subscript(sub)
-                                        if matches!(
-                                            sub.value.as_ref(),
-                                            ExprType::Name(n)
-                                                if matches!(n.id.as_str(), "dict" | "Dict")
-                                        ) =>
-                                    {
-                                        Some(quote!(PyDict<String, PyValue>))
-                                    }
-                                    _ => None,
+                    let inner = ty_tokens(inner)?;
+                    Some(quote!(Option<#inner>))
+                } else {
+                    ty_tokens(a)
+                        .or_else(|| {
+                            // A dict-generic annotation with an unresolvable
+                            // element (`dict[Kind, list[tuple[str,
+                            // RawConfigParser]]]` — pip's Configuration):
+                            // a boxed PyDict<String, PyValue>.
+                            match a {
+                                ExprType::Subscript(sub)
+                                    if matches!(
+                                        sub.value.as_ref(),
+                                        ExprType::Name(n)
+                                            if matches!(n.id.as_str(), "dict" | "Dict")
+                                    ) =>
+                                {
+                                    Some(quote!(PyDict<String, PyValue>))
                                 }
-                            })
-                            .or_else(|| {
-                                // A union of CLASSES
-                                // (`InsecureCacheControlAdapter |
-                                // InsecureHTTPAdapter` — pip's PipSession):
-                                // the field is one of them — a boxed PyValue
-                                // (the two-concrete-classes divergence).
-                                crate::union_members(a).and_then(|ms| {
-                                    if !ms.is_empty()
-                                        && ms.iter().all(|m| {
-                                            matches!(m, ExprType::Name(n)
+                                _ => None,
+                            }
+                        })
+                        .or_else(|| {
+                            // A union of CLASSES
+                            // (`InsecureCacheControlAdapter |
+                            // InsecureHTTPAdapter` — pip's PipSession):
+                            // the field is one of them — a boxed PyValue
+                            // (the two-concrete-classes divergence).
+                            crate::union_members(a).and_then(|ms| {
+                                if !ms.is_empty()
+                                    && ms.iter().all(|m| {
+                                        matches!(m, ExprType::Name(n)
                                             if matches!(
                                                 symbols.get(&n.id),
                                                 Some(SymbolTableNode::ClassDef(_))
                                             ))
-                                        })
-                                    {
-                                        Some(quote!(stdpython::PyValue))
-                                    } else {
-                                        None
-                                    }
-                                })
+                                    })
+                                {
+                                    Some(quote!(stdpython::PyValue))
+                                } else {
+                                    None
+                                }
                             })
-                    }
-                })
-                .or_else(|| class_annotations.get(&store.attr).cloned())
-                .or_else(|| {
-                    infer_field_type(store.value, &name_types, symbols, options, &self.name)
-                });
+                        })
+                }
+            })
+            .or_else(|| {
+                class_annotations.get(&store.attr).cloned()
+            })
+            .or_else(|| {
+                infer_field_type(store.value, &name_types, symbols, options, &self.name)
+            });
             match ty {
                 Some(ty) => {
                     match fields.iter().find(|(name, _)| *name == store.attr) {
                         None => fields.push((store.attr.clone(), ty)),
                         Some((_, prev)) if prev.to_string() == ty.to_string() => {}
-                        Some((_, prev)) if annotated_fields.contains(&store.attr) => {
+                        Some((_, prev))
+                            if annotated_fields.contains(&store.attr) => {
                             // The attribute has an ANNOTATED store: the
                             // annotation's type wins over the value-shape
                             // inference of later plain stores (issue #121 —
@@ -1440,7 +1447,10 @@ impl ClassDef {
                                     .iter()
                                     .position(|(name, _)| name == &store.attr)
                                     .unwrap();
-                                fields[idx] = (store.attr.clone(), quote!(stdpython::PyValue));
+                                fields[idx] = (
+                                    store.attr.clone(),
+                                    quote!(stdpython::PyValue),
+                                );
                             } else {
                                 return Err(format!(
                                     "attribute `self.{}` of class `{}` is assigned \
@@ -1550,7 +1560,8 @@ fn collect_bound_idents(tokens: &TokenStream, out: &mut std::collections::HashSe
                 // `&mut T` position) does not.
                 if prev_word.as_deref() == Some("let")
                     || prev_word.as_deref() == Some("for")
-                    || (prev_word.as_deref() == Some("mut") && prev_prev.as_deref() == Some("let"))
+                    || (prev_word.as_deref() == Some("mut")
+                        && prev_prev.as_deref() == Some("let"))
                 {
                     out.insert(w.clone());
                 }
@@ -1573,7 +1584,7 @@ fn qualify_tokens(
     options: &PythonOptions,
     bound: &std::collections::HashSet<String>,
 ) -> TokenStream {
-    use proc_macro2::{Spacing, TokenTree};
+    use proc_macro2::{TokenTree, Spacing};
     let mut out: Vec<TokenTree> = Vec::new();
     let mut after_path_sep = false;
     let mut prev_colon_joint = false;
@@ -1581,8 +1592,14 @@ fn qualify_tokens(
     for tt in tokens {
         match tt {
             TokenTree::Group(g) => {
-                let inner =
-                    qualify_tokens(g.stream(), definer_path, a_syms, a_opts, options, bound);
+                let inner = qualify_tokens(
+                    g.stream(),
+                    definer_path,
+                    a_syms,
+                    a_opts,
+                    options,
+                    bound,
+                );
                 let mut ng = proc_macro2::Group::new(g.delimiter(), inner);
                 ng.set_span(g.span());
                 out.push(TokenTree::Group(ng));
@@ -1619,7 +1636,8 @@ fn qualify_tokens(
                 // qualify (let-mut locals are handled by the bound set).
                 prev_blocker = matches!(
                     name.as_str(),
-                    "fn" | "let" | "for" | "impl" | "trait" | "struct" | "mod" | "use" | "pub"
+                    "fn" | "let" | "for" | "impl" | "trait" | "struct" | "mod" | "use"
+                        | "pub"
                 );
                 // Class names are CapWords, possibly private-prefixed
                 // (`_ResponseOptions` — urllib3's _base_connection).
@@ -1670,7 +1688,9 @@ fn qualify_tokens(
                     // bound in this stream stays untouched.
                     match a_syms.get(&name) {
                         Some(SymbolTableNode::FunctionDef(_))
-                        | Some(SymbolTableNode::Assign { .. }) => Some(definer_path.to_vec()),
+                        | Some(SymbolTableNode::Assign { .. }) => {
+                            Some(definer_path.to_vec())
+                        }
                         _ => None,
                     }
                 } else {
@@ -1678,7 +1698,8 @@ fn qualify_tokens(
                 };
                 match target {
                     Some(path) => {
-                        let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                        let segs: Vec<_> =
+                            path.iter().map(|p| crate::safe_ident(p)).collect();
                         let ident = crate::safe_ident(&name);
                         out.extend(quote!(crate #(::#segs)* :: #ident));
                     }
@@ -1746,12 +1767,7 @@ pub(crate) fn fn_signature_key(tokens: &TokenStream) -> Option<(String, String)>
 }
 
 /// A `self.field = field` statement for a dataclass-synthesized __init__.
-fn dataclass_store_stmt(field: &str) -> Statement {
-    let name = || {
-        ExprType::Name(crate::ast::tree::name::Name {
-            id: field.to_string(),
-        })
-    };
+fn dataclass_store_stmt(field: &str) -> Statement {    let name = || ExprType::Name(crate::ast::tree::name::Name { id: field.to_string() });
     let attr = ExprType::Attribute(crate::ast::tree::attribute::Attribute {
         value: Box::new(ExprType::Name(crate::ast::tree::name::Name {
             id: "self".to_string(),
@@ -1774,8 +1790,7 @@ fn dataclass_store_stmt(field: &str) -> Statement {
 }
 
 /// All parameter names of a method, `self` included.
-fn method_param_names(m: &FunctionDef) -> Vec<String> {
-    m.args
+fn method_param_names(m: &FunctionDef) -> Vec<String> {    m.args
         .posonlyargs
         .iter()
         .chain(m.args.args.iter())
@@ -1810,9 +1825,9 @@ fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>
                 if let Some(attr) = name.strip_prefix("self.") {
                     out.push(FieldStore {
                         attr: attr.to_string(),
-                        value: &crate::ExprType::NoneType(crate::ast::tree::constant::Constant(
-                            None,
-                        )),
+                        value: &crate::ExprType::NoneType(
+                            crate::ast::tree::constant::Constant(None),
+                        ),
                         annotation: Some(annotation),
                     });
                 }
@@ -1829,8 +1844,7 @@ fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>
                         }
                     }
                 }
-            }
-            StatementType::If(s) => {
+            }            StatementType::If(s) => {
                 collect_field_stores(&s.body, out);
                 collect_field_stores(&s.orelse, out);
             }
@@ -1867,7 +1881,10 @@ impl CodeGen for ClassDef {
         // symbol table: call sites resolve the class through this clone,
         // and a @dataclass without __init__ must look constructed.
         if let Err(_e) = self.synthesize_dataclass_init() {
-            symbols.insert(self.name.clone(), SymbolTableNode::ClassDef(self));
+            symbols.insert(
+                self.name.clone(),
+                SymbolTableNode::ClassDef(self),
+            );
             return symbols;
         }
         symbols.insert(self.name.clone(), SymbolTableNode::ClassDef(self));
@@ -1998,11 +2015,12 @@ impl CodeGen for ClassDef {
             // decorator function (`@auto` — rich's repr.py __main__
             // demo) is the same shape.
             if matches!(d, ExprType::Name(n)
-            if matches!(
-                symbols.get(&n.id),
-                Some(crate::SymbolTableNode::ImportFrom(_))
-                    | Some(crate::SymbolTableNode::FunctionDef(_))
-            )) {
+                if matches!(
+                    symbols.get(&n.id),
+                    Some(crate::SymbolTableNode::ImportFrom(_))
+                        | Some(crate::SymbolTableNode::FunctionDef(_))
+                ))
+            {
                 options.definition_warnings.borrow_mut().push(format!(
                     "class `{}`: decorator `{}` (a local wrapper function) \
                      is dropped; the class lowers directly (documented divergence)",
@@ -2071,7 +2089,9 @@ impl CodeGen for ClassDef {
             // of the crate (`requests.Session` — pip's vendored requests,
             // `importlib.metadata.Distribution`): a foreign module's class
             // the embedded-struct scheme cannot represent — metadata.
-            if matches!(b, ExprType::Attribute(_)) && crate::root_name(b).is_some() {
+            if matches!(b, ExprType::Attribute(_))
+                && crate::root_name(b).is_some()
+            {
                 return true;
             }
             let external_import = |sym: &SymbolTableNode| -> bool {
@@ -2099,7 +2119,10 @@ impl CodeGen for ClassDef {
                 // is not in the crate — either the root name or the full
                 // dotted chain is the registered import symbol.
                 if let Some(root) = crate::root_name(b) {
-                    if symbols.get(root).is_some_and(|s| external_import(s)) {
+                    if symbols
+                        .get(root)
+                        .is_some_and(|s| external_import(s))
+                    {
                         return true;
                     }
                 }
@@ -2123,7 +2146,9 @@ impl CodeGen for ClassDef {
             }
         };
         if let Some(_bad) = self.bases.iter().find(|b| {
-            !matches!(b, ExprType::Name(_)) && !is_typing_base(b) && !external_attr_base(b)
+            !matches!(b, ExprType::Name(_))
+                && !is_typing_base(b)
+                && !external_attr_base(b)
         }) {
             return Err(format!(
                 "class `{}` inherits from a base rython cannot lower (only single \
@@ -2275,10 +2300,10 @@ impl CodeGen for ClassDef {
                         && let Some(ty) = crate::ast::tree::module::const_static_type(&a.value) =>
                 {
                     let ident = crate::safe_ident(&n.id);
-                    let value =
-                        a.value
-                            .clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let value = a
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     class_constants.extend(quote!(pub const #ident: #ty = #value;));
                 }
                 // A class-level COMPUTED constant: single-store name
@@ -2304,11 +2329,12 @@ impl CodeGen for ClassDef {
                     // of literals is a concrete set the boxed PyValue
                     // cannot hold); the PyValue wrap only as a fallback.
                     let ident = crate::class_const_static_ident(&self.name, &n.id);
-                    let rhs =
-                        a.value
-                            .clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    let stripped = crate::ast::tree::call::strip_trailing_question(&rhs);
+                    let rhs = a
+                        .value
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let stripped =
+                        crate::ast::tree::call::strip_trailing_question(&rhs);
                     let value_tokens = if stripped.to_string() != rhs.to_string() {
                         quote!(match #stripped {
                             Ok(__rython_v) => __rython_v,
@@ -2369,10 +2395,9 @@ impl CodeGen for ClassDef {
                 // auto()`) is metadata: the members are sentinel values,
                 // not struct fields (urllib3).
                 StatementType::Assign(_)
-                    if self
-                        .bases
-                        .iter()
-                        .any(|b| matches!(b, ExprType::Name(n) if is_enum_base_name(&n.id))) => {}
+                    if self.bases.iter().any(|b| {
+                        matches!(b, ExprType::Name(n) if is_enum_base_name(&n.id))
+                    }) => {}
                 // A class-level CONSTANT assignment (`_encode_url_methods
                 // = {...}`, `default_port = port_by_scheme["https"]`, a
                 // method alias `getheaders = getlist`): metadata the struct
@@ -2380,7 +2405,8 @@ impl CodeGen for ClassDef {
                 // its fields). Reads of these attributes fail at rustc —
                 // the documented class-as-value divergence.
                 StatementType::Assign(a)
-                    if a.targets.len() == 1 && matches!(&a.targets[0], ExprType::Name(_)) => {}
+                    if a.targets.len() == 1
+                        && matches!(&a.targets[0], ExprType::Name(_)) => {}
                 // A class-level VERSION-/PLATFORM-GATED block (`if
                 // sys.version_info < ...:` — urllib3's HTTPConnection;
                 // `if sys.platform.startswith('java'): ... else: ...` —
@@ -2403,7 +2429,9 @@ impl CodeGen for ClassDef {
                 // prepends the init and keeps the field declarations in the
                 // body), so what remains here is the declaration the
                 // synthesis could not consume — only valid for dataclasses.
-                StatementType::Assign(a) if is_dataclass && a.annotation.is_some() => {
+                StatementType::Assign(a)
+                    if is_dataclass && a.annotation.is_some() =>
+                {
                     if let [ExprType::Name(_)] = a.targets.as_slice() {
                         // consumed by the synthesis; nothing to emit here
                     } else {
@@ -2429,14 +2457,16 @@ impl CodeGen for ClassDef {
                 // class-level constant dict — metadata, no runtime effect
                 // in the lowered struct — dropped.
                 StatementType::Assign(a)
-                    if a.targets.len() == 1 && matches!(&a.targets[0], ExprType::Subscript(_)) => {}
+                    if a.targets.len() == 1
+                        && matches!(&a.targets[0], ExprType::Subscript(_)) => {}
                 // A class-level ATTRIBUTE assignment (`all.__doc__ =
                 // ResourceCollection.all.__doc__` — boto3's
                 // CollectionManager): docstring/metadata wiring on methods
                 // (or a class-level constant store via attribute), with no
                 // runtime effect in the lowered plain struct — dropped.
                 StatementType::Assign(a)
-                    if a.targets.len() == 1 && matches!(&a.targets[0], ExprType::Attribute(_)) =>
+                    if a.targets.len() == 1
+                        && matches!(&a.targets[0], ExprType::Attribute(_)) =>
                 {
                     options.definition_warnings.borrow_mut().push(format!(
                         "class `{}`: the class-level attribute assignment \
@@ -2444,8 +2474,7 @@ impl CodeGen for ClassDef {
                          no runtime effect in the lowered struct)",
                         self.name, a.targets[0]
                     ));
-                }
-                StatementType::AsyncFunctionDef(f) => {
+                }                StatementType::AsyncFunctionDef(f) => {
                     return Err(format!(
                         "async method `{}.{}` is not supported yet",
                         self.name, f.name
@@ -2642,11 +2671,9 @@ impl CodeGen for ClassDef {
             if self.is_property_setter(&m.name) {
                 emitted.name = self.emitted_method_name(m);
             }
-            methods_stream.extend(emitted.to_rust(
-                method_ctx.clone(),
-                options.clone(),
-                symbols.clone(),
-            )?);
+            methods_stream.extend(
+                emitted.to_rust(method_ctx.clone(), options.clone(), symbols.clone())?,
+            );
         }
 
         // ---- Synthesized constructor ----
@@ -2665,8 +2692,11 @@ impl CodeGen for ClassDef {
                     .chain(params.kwonlyargs.iter())
                     .map(|p| crate::safe_ident(&p.arg))
                     .collect();
-                let rendered =
-                    params.to_rust(method_ctx.clone(), options.clone(), symbols.clone())?;
+                let rendered = params.to_rust(
+                    method_ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
                 quote! {
                     pub fn new(#rendered) -> Result<Self, PyException> {
                         let mut __rython_self = Self::default();
@@ -2697,8 +2727,11 @@ impl CodeGen for ClassDef {
                         .chain(params.kwonlyargs.iter())
                         .map(|p| crate::safe_ident(&p.arg))
                         .collect();
-                    let rendered =
-                        params.to_rust(method_ctx.clone(), options.clone(), symbols.clone())?;
+                    let rendered = params.to_rust(
+                        method_ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
                     quote! {
                         pub(crate) fn __init__(&mut self, #rendered) -> Result<(), PyException> {
                             self.__rython_base.__init__(#(#param_names),*)?;
@@ -2937,11 +2970,9 @@ impl ClassDef {
             if self.is_property_setter(&m.name) {
                 emitted.name = self.emitted_method_name(m);
             }
-            own_method_defaults.extend(emitted.to_rust(
-                trait_ctx,
-                options.clone(),
-                symbols.clone(),
-            )?);
+            own_method_defaults.extend(
+                emitted.to_rust(trait_ctx, options.clone(), symbols.clone())?,
+            );
         }
 
         // ---- Super trampolines ----
@@ -2997,11 +3028,9 @@ impl ClassDef {
                 super_target: None,
                 force_mut_self,
             };
-            super_trampolines.extend(helper.to_rust(
-                helper_ctx,
-                options.clone(),
-                symbols.clone(),
-            )?);
+            super_trampolines.extend(
+                helper.to_rust(helper_ctx, options.clone(), symbols.clone())?,
+            );
         }
 
         let mut own_impl_body = TokenStream::new();
@@ -3057,7 +3086,8 @@ impl ClassDef {
                 // RequestMethodsTrait`, urllib3).
                 match chain.get(1).and_then(|(_, _, _, p)| p.as_ref()) {
                     Some(path) => {
-                        let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                        let segs: Vec<_> =
+                            path.iter().map(|p| crate::safe_ident(p)).collect();
                         quote!(: crate #(::#segs)* :: #b_trait)
                     }
                     None => quote!(: #b_trait),
@@ -3195,7 +3225,8 @@ impl ClassDef {
                     if self.is_property_setter(&am.name) {
                         emitted.name = self.emitted_method_name(&am);
                     }
-                    let rendered = emitted.to_rust(trait_ctx, dopts.clone(), dsyms.clone())?;
+                    let rendered =
+                        emitted.to_rust(trait_ctx, dopts.clone(), dsyms.clone())?;
                     // An override must agree with the trait's declared
                     // signature: Python's covariant overrides
                     // (`_new_conn() -> socks.socksocket` over the base's
@@ -3217,10 +3248,9 @@ impl ClassDef {
                                 .get(&ancestor.name)
                                 .is_some_and(|s| s.contains(&am.name)),
                         };
-                        let reference =
-                            (*am)
-                                .clone()
-                                .to_rust(ref_ctx, a_opts.clone(), a_syms.clone())?;
+                        let reference = (*am)
+                            .clone()
+                            .to_rust(ref_ctx, a_opts.clone(), a_syms.clone())?;
                         if fn_signature_key(&rendered) != fn_signature_key(&reference) {
                             options.definition_warnings.borrow_mut().push(format!(
                                 "`{}.{}` overrides `{}.{}` with a different \
@@ -3241,8 +3271,20 @@ impl ClassDef {
             // them).
             let (accessor_impls, override_stream) = match a_path {
                 Some(path) => (
-                    qualify_cross_module_types(accessor_impls, path, a_syms, a_opts, options),
-                    qualify_cross_module_types(override_stream, path, a_syms, a_opts, options),
+                    qualify_cross_module_types(
+                        accessor_impls,
+                        path,
+                        a_syms,
+                        a_opts,
+                        options,
+                    ),
+                    qualify_cross_module_types(
+                        override_stream,
+                        path,
+                        a_syms,
+                        a_opts,
+                        options,
+                    ),
                 ),
                 None => (accessor_impls, override_stream),
             };
@@ -3283,8 +3325,7 @@ pub(crate) fn strip_self(args: &mut crate::ParameterList) {
 /// Whether an expression is a CLASS REFERENCE (`HTTPConnectionPool` — a
 /// Name resolving to a class, or an imported class name): class values have
 /// no rython runtime equivalent (the classes-as-values divergence).
-pub(crate) fn is_class_value_expr(value: &ExprType, symbols: &SymbolTableScopes) -> bool {
-    match value {
+pub(crate) fn is_class_value_expr(value: &ExprType, symbols: &SymbolTableScopes) -> bool {    match value {
         ExprType::Name(n) => match symbols.get(&n.id) {
             Some(SymbolTableNode::ClassDef(_)) => true,
             Some(SymbolTableNode::Alias(canonical)) => {
@@ -3429,36 +3470,40 @@ fn infer_field_type(
             // A `cast(T, ...)` typing no-op (`self.frames = cast(List[str],
             // spinner["frames"])[:]` — rich's Spinner): the cast's FIRST
             // argument is the annotation — `List[str]` → `Vec<String>`.
-            ExprType::Name(n) if n.id == "cast" => call.args.first().and_then(|ann| match ann {
-                ExprType::Name(sn) => match sn.id.as_str() {
-                    "float" => Some(quote!(f64)),
-                    "int" => Some(quote!(i64)),
-                    "str" => Some(quote!(String)),
-                    "bool" => Some(quote!(bool)),
-                    _ => None,
-                },
-                ExprType::Subscript(sub)
-                    if matches!(sub.value.as_ref(), ExprType::Name(sn)
-                            if matches!(sn.id.as_str(), "List" | "list")) =>
-                {
-                    match &sub.kind {
-                        crate::SubscriptKind::Index(elt) => {
-                            let t = crate::annotation_type_info(elt)?;
-                            if matches!(t, crate::TypeInfo::String) {
-                                Some(quote!(Vec<String>))
-                            } else {
-                                None
-                            }
-                        }
+            ExprType::Name(n) if n.id == "cast" => {
+                call.args.first().and_then(|ann| match ann {
+                    ExprType::Name(sn) => match sn.id.as_str() {
+                        "float" => Some(quote!(f64)),
+                        "int" => Some(quote!(i64)),
+                        "str" => Some(quote!(String)),
+                        "bool" => Some(quote!(bool)),
                         _ => None,
+                    },
+                    ExprType::Subscript(sub)
+                        if matches!(sub.value.as_ref(), ExprType::Name(sn)
+                            if matches!(sn.id.as_str(), "List" | "list")) =>
+                    {
+                        match &sub.kind {
+                            crate::SubscriptKind::Index(elt) => {
+                                let t = crate::annotation_type_info(elt)?;
+                                if matches!(t, crate::TypeInfo::String) {
+                                    Some(quote!(Vec<String>))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
                     }
-                }
-                _ => None,
-            }),
+                    _ => None,
+                })
+            }
             // A builtin scalar conversion call (`int(x)`, `float(x)`,
             // `str(x)`) types the field as that scalar (urllib3's
             // emscripten `self.timeout = int(1000 * timeout)`).
-            ExprType::Name(n) if matches!(n.id.as_str(), "int" | "float" | "str") => {
+            ExprType::Name(n)
+                if matches!(n.id.as_str(), "int" | "float" | "str") =>
+            {
                 Some(match n.id.as_str() {
                     "int" => quote!(i64),
                     "float" => quote!(f64),
@@ -3472,7 +3517,9 @@ fn infer_field_type(
             // with duck-typed future objects) is bookkeeping with no
             // statically-known element: a boxed PyValue (documented
             // divergence — set bookkeeping fields are unmodeled).
-            ExprType::Name(n) if matches!(n.id.as_str(), "set" | "frozenset") => {
+            ExprType::Name(n)
+                if matches!(n.id.as_str(), "set" | "frozenset") =>
+            {
                 let has_str_generator = call.args.iter().any(|a| {
                     matches!(a, ExprType::GeneratorExp(g)
                         if matches!(g.elt.as_ref(), ExprType::Call(c)
@@ -3496,7 +3543,9 @@ fn infer_field_type(
             // a stdlib object with no rython equivalent; `with self.lock:`
             // only evaluates the receiver (the __enter__/__exit__ protocol
             // is unmodeled), so the field is unit.
-            ExprType::Name(n) if matches!(n.id.as_str(), "RLock" | "Lock" | "Semaphore") => {
+            ExprType::Name(n)
+                if matches!(n.id.as_str(), "RLock" | "Lock" | "Semaphore") =>
+            {
                 Some(quote!(()))
             }
             ExprType::Attribute(a)
@@ -3552,9 +3601,8 @@ fn infer_field_type(
             },
             // A boolean predicate call (`character.isprintable()`,
             // `s.isascii()`) types the field bool.
-            ExprType::Attribute(a) if a.attr.starts_with("is") && a.attr.len() > 2 => {
-                Some(quote!(bool))
-            }
+            ExprType::Attribute(a)
+                if a.attr.starts_with("is") && a.attr.len() > 2 => Some(quote!(bool)),
             // A `.copy()` of a module-level dict (`self.key_fn_by_scheme =
             // key_fn_by_scheme.copy()` — urllib3's PoolManager): the field
             // takes the copied dict's type (a boxed PyDict for the
@@ -3594,7 +3642,13 @@ fn infer_field_type(
                     && crate::root_name(&a.value).is_some_and(|r| r == "copy")
                     && call.args.len() == 1 =>
             {
-                infer_field_type(&call.args[0], name_types, symbols, options, class_name)
+                infer_field_type(
+                    &call.args[0],
+                    name_types,
+                    symbols,
+                    options,
+                    class_name,
+                )
             }
             // A STRING-method call on an expression (`normalize_host(host,
             // ...).lower()`, `name.strip()`, `x.replace(a, b)`): the field
@@ -3602,19 +3656,9 @@ fn infer_field_type(
             ExprType::Attribute(a)
                 if matches!(
                     a.attr.as_str(),
-                    "lower"
-                        | "upper"
-                        | "strip"
-                        | "lstrip"
-                        | "rstrip"
-                        | "replace"
-                        | "title"
-                        | "casefold"
-                        | "split"
-                        | "rsplit"
-                        | "join"
-                        | "capitalize"
-                        | "swapcase"
+                    "lower" | "upper" | "strip" | "lstrip" | "rstrip" | "replace"
+                        | "title" | "casefold" | "split" | "rsplit" | "join"
+                        | "capitalize" | "swapcase"
                 ) =>
             {
                 Some(quote!(String))
@@ -3625,7 +3669,9 @@ fn infer_field_type(
                 // A `js.*` foreign-object call (`js.globalThis.Worker.new(
                 // ...)` — pyodide, urllib3's emscripten fetch): a JS
                 // interop object with no rython equivalent — a boxed value.
-                if crate::root_name(&a.value).is_some_and(|r| r == "js") {
+                if crate::root_name(&a.value)
+                    .is_some_and(|r| r == "js")
+                {
                     return Some(quote!(stdpython::PyValue));
                 }
                 // A stdlib MODULE call (`zlib.decompressobj()`,
@@ -3683,9 +3729,11 @@ fn infer_field_type(
                                 .unwrap_or_default();
                             !options.module_defs.contains_key(&path)
                         }
-                        SymbolTableNode::ImportFrom(i) => !options
-                            .module_defs
-                            .contains_key(&i.resolved_module_path(options)),
+                        SymbolTableNode::ImportFrom(i) => {
+                            !options
+                                .module_defs
+                                .contains_key(&i.resolved_module_path(options))
+                        }
                         // `import brotlicffi as brotli` — the alias resolves
                         // to the Import symbol (urllib3's response decoders
                         // with the dropped-ImportError fallback): follow it
@@ -3730,7 +3778,11 @@ fn infer_field_type(
                         }
                         // `try: import brotli except: brotli = None` — the
                         // Assign(None) fallback shadows the import.
-                        SymbolTableNode::Assign { value, .. } if crate::is_none_expr(value) => true,
+                        SymbolTableNode::Assign { value, .. }
+                            if crate::is_none_expr(value) =>
+                        {
+                            true
+                        }
                         _ => false,
                     };
                     if external {
@@ -3742,18 +3794,24 @@ fn infer_field_type(
                     // name): the function's return annotation types the
                     // field; an unannotated function boxes it (PyValue).
                     let path = match sym {
-                        SymbolTableNode::Import(i) => i.names.first().map(|al| {
-                            al.name
-                                .split('.')
-                                .map(|s| s.to_string())
-                                .collect::<Vec<_>>()
-                        }),
-                        SymbolTableNode::ImportFrom(i) => Some(i.resolved_module_path(options)),
+                        SymbolTableNode::Import(i) => i
+                            .names
+                            .first()
+                            .map(|al| {
+                                al.name
+                                    .split('.')
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                            }),
+                        SymbolTableNode::ImportFrom(i) => {
+                            Some(i.resolved_module_path(options))
+                        }
                         _ => None,
                     };
                     if let Some(path) = path
                         && options.module_defs.contains_key(&path)
-                        && let Some((f, _)) = crate::module_function_def(options, &path, &a.attr)
+                        && let Some((f, _)) =
+                            crate::module_function_def(options, &path, &a.attr)
                     {
                         if let Some(ann) = f.returns.as_deref()
                             && let Some(t) = crate::python_annotation_to_rust_type(ann)
@@ -3769,7 +3827,8 @@ fn infer_field_type(
                     if let Some(path) = crate::dotted_module_path(&a.value)
                         && options.module_defs.contains_key(&path)
                         && (crate::module_class_def(options, &path, &a.attr).is_some()
-                            || crate::resolve_imported_class(options, &path, &a.attr, 0).is_some())
+                            || crate::resolve_imported_class(options, &path, &a.attr, 0)
+                                .is_some())
                     {
                         let ident = crate::safe_ident(&a.attr);
                         return Some(quote!(#ident));
@@ -3803,7 +3862,11 @@ fn infer_field_type(
                         // `try: import crt_checksums except: crt_checksums =
                         // None` — the fallback shadows the import
                         // (botocore's httpchecksum).
-                        SymbolTableNode::Assign { value, .. } if crate::is_none_expr(value) => true,
+                        SymbolTableNode::Assign { value, .. }
+                            if crate::is_none_expr(value) =>
+                        {
+                            true
+                        }
                         _ => false,
                     };
                     if external {
@@ -3926,9 +3989,8 @@ fn infer_field_type(
                             }
                             _ => None,
                         } {
-                            if let Some(field_ty) =
-                                class.body.iter().find_map(|s| {
-                                    match &s.statement {
+                            if let Some(field_ty) = class.body.iter().find_map(|s| {
+                                match &s.statement {
                                     crate::StatementType::AnnotatedName {
                                         name, annotation, ..
                                     } if name == &a.attr => {
@@ -3955,8 +4017,7 @@ fn infer_field_type(
                                     }
                                     _ => None,
                                 }
-                                })
-                            {
+                            }) {
                                 return Some(field_ty);
                             }
                         }
@@ -4150,7 +4211,9 @@ fn infer_field_type(
                 if let Some(field_ty) = class.body.iter().find_map(|s| match &s.statement {
                     crate::StatementType::AnnotatedName {
                         name, annotation, ..
-                    } if name == &a.attr => crate::python_annotation_to_rust_type(annotation),
+                    } if name == &a.attr => {
+                        crate::python_annotation_to_rust_type(annotation)
+                    }
                     crate::StatementType::FunctionDef(f)
                         if f.name == a.attr
                             && f.decorator_list.iter().any(|d| {
@@ -4180,7 +4243,10 @@ fn infer_field_type(
             if let Some(root) = crate::root_name(&a.value)
                 && matches!(
                     symbols.get(root),
-                    Some(crate::SymbolTableNode::Import(_) | crate::SymbolTableNode::ImportFrom(_))
+                    Some(
+                        crate::SymbolTableNode::Import(_)
+                            | crate::SymbolTableNode::ImportFrom(_)
+                    )
                 )
             {
                 return Some(quote!(stdpython::PyValue));
@@ -4228,10 +4294,11 @@ fn infer_field_type(
             {
                 let field_ty = c.body.iter().find_map(|s| match &s.statement {
                     crate::StatementType::AnnotatedName { name, annotation } if name == &a.attr => {
-                        crate::python_annotation_to_rust_type(annotation).or_else(|| {
-                            crate::resolve_alias_typeinfo(annotation, symbols, options)
-                                .map(|t| t.to_rust_type())
-                        })
+                        crate::python_annotation_to_rust_type(annotation)
+                            .or_else(|| {
+                                crate::resolve_alias_typeinfo(annotation, symbols, options)
+                                    .map(|t| t.to_rust_type())
+                            })
                     }
                     crate::StatementType::FunctionDef(f)
                         if f.name == a.attr
@@ -4400,7 +4467,9 @@ fn infer_field_type(
         // An EMPTY dict/list store (`self._method_cache = {}` — jmespath's
         // Visitor, later `.get`/`[k] = v`): a boxed PyDict<String, PyValue>
         // / Vec<PyValue> (the element types are unknowable at the store).
-        ExprType::Dict(d) if d.keys.is_empty() => Some(quote!(PyDict<String, stdpython::PyValue>)),
+        ExprType::Dict(d) if d.keys.is_empty() => {
+            Some(quote!(PyDict<String, stdpython::PyValue>))
+        }
         // A NON-EMPTY dict literal (`self._context = {'special_shape_types':
         // {}}` — botocore's ShapeDocumenter): a boxed PyDict<String,
         // PyValue> (the element types are not resolved at field-inference
@@ -4526,7 +4595,8 @@ pub(crate) fn class_body_computed_constant(value: &crate::ExprType) -> bool {
         ExprType::Set(s) => s.elts.iter().all(expr_is_literal),
         ExprType::Tuple(t) => t.elts.iter().all(expr_is_literal),
         ExprType::Dict(d) => {
-            d.keys.iter().flatten().all(expr_is_literal) && d.values.iter().all(expr_is_literal)
+            d.keys.iter().flatten().all(expr_is_literal)
+                && d.values.iter().all(expr_is_literal)
         }
         _ => false,
     }
@@ -4580,16 +4650,8 @@ fn is_typing_base(b: &ExprType) -> bool {
         ExprType::Name(n)
             if matches!(
                 n.id.as_str(),
-                "MutableMapping"
-                    | "Mapping"
-                    | "Generic"
-                    | "Protocol"
-                    | "NamedTuple"
-                    | "TypedDict"
-                    | "Iterator"
-                    | "Iterable"
-                    | "Sequence"
-                    | "Callable"
+                "MutableMapping" | "Mapping" | "Generic" | "Protocol" | "NamedTuple"
+                    | "TypedDict" | "Iterator" | "Iterable" | "Sequence" | "Callable"
             ) =>
         {
             true

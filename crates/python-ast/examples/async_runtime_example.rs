@@ -1,6 +1,4 @@
-use python_ast::{
-    AsyncRuntime, CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse_enhanced,
-};
+use python_ast::{parse_enhanced, CodeGenContext, PythonOptions, SymbolTableScopes, CodeGen, AsyncRuntime};
 
 fn main() {
     let python_code = r#"
@@ -50,14 +48,14 @@ fn generate_and_display(python_code: &str, options: PythonOptions) {
         Ok(ast) => {
             let ctx = CodeGenContext::Module("example".to_string());
             let symbols = SymbolTableScopes::new();
-
+            
             match ast.to_rust(ctx, options, symbols) {
                 Ok(tokens) => {
                     let code_str = tokens.to_string();
-
+                    
                     // Pretty print key parts
                     println!("Generated Rust code:");
-
+                    
                     // Extract imports
                     let parts: Vec<&str> = code_str.split(" ; ").collect();
                     for part in &parts {
@@ -65,13 +63,12 @@ fn generate_and_display(python_code: &str, options: PythonOptions) {
                             println!("  {}", part.trim());
                         }
                     }
-
+                    
                     // Find main function
                     if let Some(main_start) = code_str.find("# [") {
                         if let Some(main_end) = code_str[main_start..].find("async fn main") {
                             if let Some(brace) = code_str[main_start + main_end..].find(" {") {
-                                let main_signature =
-                                    &code_str[main_start..main_start + main_end + brace + 2];
+                                let main_signature = &code_str[main_start..main_start + main_end + brace + 2];
                                 println!("  {}", main_signature.trim());
                                 println!("    // ... main function body ...");
                                 println!("  }}");
@@ -83,7 +80,7 @@ fn generate_and_display(python_code: &str, options: PythonOptions) {
                     println!("❌ Code generation failed: {}", e);
                 }
             }
-        }
+        },
         Err(e) => {
             println!("❌ AST parsing failed: {}", e);
         }

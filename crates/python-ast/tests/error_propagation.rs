@@ -2,9 +2,7 @@
 //! Python must surface as structured `Err` values — never as panics — and the
 //! errors must carry enough location information to point at the user's code.
 
-use python_ast::{
-    CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse, parse_enhanced,
-};
+use python_ast::{parse, parse_enhanced, CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
 
 /// Statements rython does not support must produce an error, not a panic.
 #[test]
@@ -116,11 +114,7 @@ fn bare_annotation_is_a_no_op() {
         PythonOptions::default(),
         symbols,
     );
-    assert!(
-        result.is_ok(),
-        "bare annotation should compile: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "bare annotation should compile: {:?}", result.err());
 }
 
 /// PythonOptions::default() must not panic even in odd environments.

@@ -1,15 +1,13 @@
 use proc_macro2::TokenStream;
-use pyo3::{
-    Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods,
-};
+use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Attribute, Await, BinOp, BoolOp, Call, CodeGen, CodeGenContext, Compare, Constant, Dict,
-    DictComp, ExprTypeNotYetImplemented, FormattedValue, GeneratorExp, IfExp, JoinedStr, Lambda,
-    ListComp, Name, NamedExpr, Node, PythonOptions, Set, SetComp, Starred, Subscript,
-    SymbolTableScopes, Tuple, UnaryOp, Yield, YieldFrom, dump, err_from, extraction_failure,
+    dump, err_from, extraction_failure, Attribute, Await, BinOp, BoolOp, Call, CodeGen, CodeGenContext, Compare,
+    Constant, Dict, DictComp, ExprTypeNotYetImplemented, FormattedValue, GeneratorExp, IfExp,
+    JoinedStr, Lambda, ListComp, Name, NamedExpr, Node, PythonOptions, Set, SetComp, Starred,
+    Subscript, SymbolTableScopes, Tuple, UnaryOp, Yield, YieldFrom,
 };
 
 /// Mostly this shouldn't be used, but it exists so that we don't have to manually implement FromPyObject on all of ExprType
@@ -79,49 +77,33 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExprType {
             .get_type()
             .name()
             .map_err(|e| extraction_failure("expression type name", &ob, e))?;
-        tracing::debug!(
-            "expression type: {}, value: {}",
-            expr_type,
-            dump(&ob, None)?
-        );
+        tracing::debug!("expression type: {}, value: {}", expr_type, dump(&ob, None)?);
 
         let r = match expr_type.extract::<String>()?.as_str() {
             "Attribute" => {
-                let a = ob.extract().map_err(|e| {
-                    extraction_failure("extracting Attribute in expression", &ob, e)
-                })?;
+                let a = ob.extract().map_err(|e| extraction_failure("extracting Attribute in expression", &ob, e))?;
                 Ok(Self::Attribute(a))
             }
             "Await" => {
                 //println!("await: {}", dump(&ob, None)?);
-                let a = ob.extract().map_err(|e| {
-                    extraction_failure("extracting await value in expression", &ob, e)
-                })?;
+                let a = ob.extract().map_err(|e| extraction_failure("extracting await value in expression", &ob, e))?;
                 Ok(Self::Await(a))
             }
             "BoolOp" => {
-                let b = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting BoolOp in expression", &ob, e))?;
+                let b = ob.extract().map_err(|e| extraction_failure("extracting BoolOp in expression", &ob, e))?;
                 Ok(Self::BoolOp(b))
             }
             "Call" => {
-                let et = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("parsing Call expression", &ob, e))?;
+                let et = ob.extract().map_err(|e| extraction_failure("parsing Call expression", &ob, e))?;
                 Ok(Self::Call(et))
             }
             "Compare" => {
-                let c = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Compare in expression", &ob, e))?;
+                let c = ob.extract().map_err(|e| extraction_failure("extracting Compare in expression", &ob, e))?;
                 Ok(Self::Compare(c))
             }
             "Constant" => {
                 tracing::debug!("constant: {}", dump(&ob, None)?);
-                let c = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Constant in expression", &ob, e))?;
+                let c = ob.extract().map_err(|e| extraction_failure("extracting Constant in expression", &ob, e))?;
                 Ok(Self::Constant(c))
             }
             "List" => {
@@ -141,123 +123,85 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExprType {
                         .map_err(|e| extraction_failure("list element", &elt, e))?;
                     expr_list.push(expr);
                 }
-
+                
                 Ok(Self::List(expr_list))
             }
             "ListComp" => {
-                let lc = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting ListComp in expression", &ob, e))?;
+                let lc = ob.extract().map_err(|e| extraction_failure("extracting ListComp in expression", &ob, e))?;
                 Ok(Self::ListComp(lc))
             }
             "DictComp" => {
-                let dc = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting DictComp in expression", &ob, e))?;
+                let dc = ob.extract().map_err(|e| extraction_failure("extracting DictComp in expression", &ob, e))?;
                 Ok(Self::DictComp(dc))
             }
             "SetComp" => {
-                let sc = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting SetComp in expression", &ob, e))?;
+                let sc = ob.extract().map_err(|e| extraction_failure("extracting SetComp in expression", &ob, e))?;
                 Ok(Self::SetComp(sc))
             }
             "GeneratorExp" => {
-                let ge = ob.extract().map_err(|e| {
-                    extraction_failure("extracting GeneratorExp in expression", &ob, e)
-                })?;
+                let ge = ob.extract().map_err(|e| extraction_failure("extracting GeneratorExp in expression", &ob, e))?;
                 Ok(Self::GeneratorExp(ge))
             }
             "Name" => {
-                let name = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("parsing Name expression", &ob, e))?;
+                let name = ob.extract().map_err(|e| extraction_failure("parsing Name expression", &ob, e))?;
                 Ok(Self::Name(name))
             }
             // The walrus operator (`if (x := f()) is not None:`): a
             // NamedExpr assigns its target and evaluates to it.
             "NamedExpr" => {
-                let ne = ob.extract().map_err(|e| {
-                    extraction_failure("extracting NamedExpr in expression", &ob, e)
-                })?;
+                let ne = ob.extract().map_err(|e| extraction_failure("extracting NamedExpr in expression", &ob, e))?;
                 Ok(Self::NamedExpr(ne))
             }
             "UnaryOp" => {
-                let c = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting UnaryOp in expression", &ob, e))?;
+                let c = ob.extract().map_err(|e| extraction_failure("extracting UnaryOp in expression", &ob, e))?;
                 Ok(Self::UnaryOp(c))
             }
             "BinOp" => {
-                let c = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting BinOp in expression", &ob, e))?;
+                let c = ob.extract().map_err(|e| extraction_failure("extracting BinOp in expression", &ob, e))?;
                 Ok(Self::BinOp(c))
             }
             "Lambda" => {
-                let l = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Lambda in expression", &ob, e))?;
+                let l = ob.extract().map_err(|e| extraction_failure("extracting Lambda in expression", &ob, e))?;
                 Ok(Self::Lambda(l))
             }
             "IfExp" => {
-                let i = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting IfExp in expression", &ob, e))?;
+                let i = ob.extract().map_err(|e| extraction_failure("extracting IfExp in expression", &ob, e))?;
                 Ok(Self::IfExp(i))
             }
             "Dict" => {
-                let d = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Dict in expression", &ob, e))?;
+                let d = ob.extract().map_err(|e| extraction_failure("extracting Dict in expression", &ob, e))?;
                 Ok(Self::Dict(d))
             }
             "Set" => {
-                let s = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Set in expression", &ob, e))?;
+                let s = ob.extract().map_err(|e| extraction_failure("extracting Set in expression", &ob, e))?;
                 Ok(Self::Set(s))
             }
             "Tuple" => {
-                let t = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Tuple in expression", &ob, e))?;
+                let t = ob.extract().map_err(|e| extraction_failure("extracting Tuple in expression", &ob, e))?;
                 Ok(Self::Tuple(t))
             }
             "Subscript" => {
-                let s = ob.extract().map_err(|e| {
-                    extraction_failure("extracting Subscript in expression", &ob, e)
-                })?;
+                let s = ob.extract().map_err(|e| extraction_failure("extracting Subscript in expression", &ob, e))?;
                 Ok(Self::Subscript(s))
             }
             "Starred" => {
-                let s = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Starred in expression", &ob, e))?;
+                let s = ob.extract().map_err(|e| extraction_failure("extracting Starred in expression", &ob, e))?;
                 Ok(Self::Starred(s))
             }
             "Yield" => {
-                let y = ob
-                    .extract()
-                    .map_err(|e| extraction_failure("extracting Yield in expression", &ob, e))?;
+                let y = ob.extract().map_err(|e| extraction_failure("extracting Yield in expression", &ob, e))?;
                 Ok(Self::Yield(y))
             }
             "YieldFrom" => {
-                let yf = ob.extract().map_err(|e| {
-                    extraction_failure("extracting YieldFrom in expression", &ob, e)
-                })?;
+                let yf = ob.extract().map_err(|e| extraction_failure("extracting YieldFrom in expression", &ob, e))?;
                 Ok(Self::YieldFrom(yf))
             }
             "JoinedStr" => {
-                let js = ob.extract().map_err(|e| {
-                    extraction_failure("extracting JoinedStr in expression", &ob, e)
-                })?;
+                let js = ob.extract().map_err(|e| extraction_failure("extracting JoinedStr in expression", &ob, e))?;
                 Ok(Self::JoinedStr(js))
             }
             "FormattedValue" => {
-                let fv = ob.extract().map_err(|e| {
-                    extraction_failure("extracting FormattedValue in expression", &ob, e)
-                })?;
+                let fv = ob.extract().map_err(|e| extraction_failure("extracting FormattedValue in expression", &ob, e))?;
                 Ok(Self::FormattedValue(fv))
             }
             _ => {
@@ -290,7 +234,8 @@ impl<'a> CodeGen for ExprType {
             static E_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         let d = E_DEPTH.with(|c| c.get());
-        if d > 100 && d % 20 == 0 {}
+        if d > 100 && d % 20 == 0 {
+        }
         E_DEPTH.with(|c| c.set(d + 1));
         let result = self.to_rust_inner(ctx, options, symbols);
         E_DEPTH.with(|c| c.set(d));
@@ -369,10 +314,7 @@ impl ExprType {
                     // rython; rustc reports the Vec element mismatch), but
                     // the conversion itself proceeds — primitive mixes
                     // ([1, "a"]) stay a loud error.
-                    if !distinct
-                        .iter()
-                        .all(|t| matches!(t, crate::TypeInfo::Class(_)))
-                    {
+                    if !distinct.iter().all(|t| matches!(t, crate::TypeInfo::Class(_))) {
                         // A HETEROGENEOUS list involving a TUPLE
                         // (`['s3_use_arn_region', ('s3',
                         // 'use_arn_region')]` — botocore's
@@ -437,7 +379,7 @@ impl ExprType {
                     )?;
                     elements.push(code);
                 }
-
+                
                 // If we have starred expressions, handle them specially
                 if has_starred {
                     // Emit elements in SOURCE ORDER: a spread before or
@@ -519,9 +461,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let err_msg = format!("extracting object value {} in expression", dump(&ob, None)?);
 
-        let ob_value = ob.getattr("value").map_err(|e| {
-            extraction_failure("expression value", &ob, format!("{}: {}", err_msg, e))
-        })?;
+        let ob_value = ob
+            .getattr("value")
+            .map_err(|e| extraction_failure("expression value", &ob, format!("{}: {}", err_msg, e)))?;
         tracing::debug!("ob_value: {}", dump(&ob_value, None)?);
 
         // The context is Load, Store, etc. For some types of expressions such as Constants, it does not exist.
@@ -616,7 +558,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Expr {
                         .map_err(|e| extraction_failure("list element", &elt, e))?;
                     expr_list.push(expr);
                 }
-
+                
                 r.value = ExprType::List(expr_list);
                 Ok(r)
             }
@@ -811,14 +753,15 @@ mod tests {
 /// yield bool; anything else is wrapped in stdpython's Truthy::is_truthy,
 /// giving Python's truth table (empty string/collection and zero are
 /// false).
-pub fn condition_to_rust(
-    expr: &ExprType,
+pub fn condition_to_rust(    expr: &ExprType,
     ctx: CodeGenContext,
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     match expr {
-        ExprType::BoolOp(op) if matches!(op.op, crate::BoolOps::And | crate::BoolOps::Or) => {
+        ExprType::BoolOp(op)
+            if matches!(op.op, crate::BoolOps::And | crate::BoolOps::Or) =>
+        {
             let mut parts = Vec::new();
             for value in &op.values {
                 parts.push(condition_to_rust(
@@ -866,7 +809,10 @@ pub fn narrowing_from_test(
     }
     // One side must be None, the other a plain name.
     let left_is_none = crate::is_none_expr(&cmp.left);
-    let right_is_none = cmp.comparators.first().is_some_and(crate::is_none_expr);
+    let right_is_none = cmp
+        .comparators
+        .first()
+        .is_some_and(crate::is_none_expr);
     if left_is_none == right_is_none {
         return None; // both None (degenerate) or neither — no narrowing
     }
@@ -882,10 +828,13 @@ pub fn narrowing_from_test(
     if !options.optional_names.contains(&n.id) {
         return None;
     }
-    let inner = options.name_types.get(&n.id).and_then(|t| match t {
-        crate::TypeInfo::Option(inner) => Some((**inner).clone()),
-        _ => None,
-    });
+    let inner = options
+        .name_types
+        .get(&n.id)
+        .and_then(|t| match t {
+            crate::TypeInfo::Option(inner) => Some((**inner).clone()),
+            _ => None,
+        });
     Some((n.id.clone(), inner))
 }
 
@@ -930,7 +879,9 @@ pub fn isinstance_narrowing(
         // A compound `isinstance(x, T) and <rest>` narrows the body only.
         ExprType::BoolOp(op) if matches!(op.op, crate::BoolOps::And) => {
             for value in &op.values {
-                if let Some((name, body_ty, _)) = isinstance_narrowing(value, options, symbols) {
+                if let Some((name, body_ty, _)) =
+                    isinstance_narrowing(value, options, symbols)
+                {
                     // The else branch keeps the ORIGINAL type: the `and`
                     // may have failed on the other conjunct, so the
                     // complement narrowing does not apply.
@@ -988,7 +939,9 @@ pub fn isinstance_narrowing(
         }
         match symbols.get(id) {
             Some(crate::SymbolTableNode::Assign { value, .. }) => match value {
-                ExprType::Name(n) if narrowing_member_of(&n.id).is_some() => Some(n.id.clone()),
+                ExprType::Name(n) if narrowing_member_of(&n.id).is_some() => {
+                    Some(n.id.clone())
+                }
                 _ => None,
             },
             Some(crate::SymbolTableNode::Alias(canonical)) => {
@@ -1006,7 +959,9 @@ pub fn isinstance_narrowing(
                 if options.module_defs.contains_key(&path) {
                     let module = options.module_defs.get(&path)?;
                     let module: &crate::Module = module;
-                    let syms = module.clone().find_symbols(SymbolTableScopes::new());
+                    let syms = module
+                        .clone()
+                        .find_symbols(SymbolTableScopes::new());
                     resolve_type_name_depth(id, options, &syms, depth + 1)
                 } else {
                     None
@@ -1027,7 +982,8 @@ pub fn isinstance_narrowing(
                 let ExprType::Name(t) = elt else {
                     return None;
                 };
-                let id = resolve_type_name(&t.id, options, symbols).unwrap_or_else(|| t.id.clone());
+                let id = resolve_type_name(&t.id, options, symbols)
+                    .unwrap_or_else(|| t.id.clone());
                 targets.push(id);
             }
         }
@@ -1065,8 +1021,12 @@ pub fn isinstance_narrowing(
             // StrOrBytes: bytes → Bytes, str → String; the complement is
             // the other branch.
             match member {
-                crate::TypeInfo::Bytes => (crate::TypeInfo::Bytes, crate::TypeInfo::String),
-                crate::TypeInfo::String => (crate::TypeInfo::String, crate::TypeInfo::Bytes),
+                crate::TypeInfo::Bytes => {
+                    (crate::TypeInfo::Bytes, crate::TypeInfo::String)
+                }
+                crate::TypeInfo::String => {
+                    (crate::TypeInfo::String, crate::TypeInfo::Bytes)
+                }
                 _ => return None,
             }
         }
@@ -1102,7 +1062,10 @@ pub fn update_narrowed_after_statement(
                 let body_ok = branch_ends_non_none(&i.body);
                 let else_ok = branch_ends_non_none(&i.orelse);
                 if body_ok && else_ok {
-                    narrowed.insert(name, inner.unwrap_or(crate::TypeInfo::StrOrBytes));
+                    narrowed.insert(
+                        name,
+                        inner.unwrap_or(crate::TypeInfo::StrOrBytes),
+                    );
                 }
             }
             // A name narrowed by an INNER statement only narrows within that

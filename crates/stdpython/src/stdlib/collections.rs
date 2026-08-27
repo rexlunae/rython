@@ -1,28 +1,28 @@
 //! Python collections module implementation
-//!
+//! 
 //! This module provides specialized container datatypes.
 //! Implementation matches Python's collections module API.
 
-use crate::{Len, PyException, Truthy, python_function};
+use crate::{PyException, Len, Truthy, python_function};
 use alloc::collections::VecDeque;
 use alloc::{format, string::String, vec, vec::Vec};
 use core::hash::Hash;
-#[cfg(not(feature = "std"))]
-use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
+#[cfg(not(feature = "std"))]
+use hashbrown::{HashMap, HashSet};
 
 /// Counter - dict subclass for counting hashable objects
 #[derive(Debug, Clone)]
-pub struct Counter<T>
-where
+pub struct Counter<T> 
+where 
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     counts: crate::PyDict<T, i64>,
 }
 
-impl<T> Counter<T>
-where
+impl<T> Counter<T> 
+where 
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     /// Create a new Counter
@@ -31,10 +31,10 @@ where
             counts: crate::PyDict::default(),
         }
     }
-
+    
     /// Create Counter from iterable
-    pub fn from_iter<I>(iterable: I) -> Self
-    where
+    pub fn from_iter<I>(iterable: I) -> Self 
+    where 
         I: IntoIterator<Item = T>,
     {
         let mut counter = Self::new();
@@ -43,42 +43,44 @@ where
         }
         counter
     }
-
+    
     /// Update counts with elements from iterable
-    pub fn update<I>(&mut self, iterable: I)
-    where
+    pub fn update<I>(&mut self, iterable: I) 
+    where 
         I: IntoIterator<Item = T>,
     {
         for item in iterable {
             self.update_one(&item, 1);
         }
     }
-
+    
     /// Update count for single element
     pub fn update_one(&mut self, element: &T, count: i64) {
         // Python's Counter keeps zero and negative counts after update() and
         // subtract(); only the +/- operators drop them.
         *self.counts.entry(element.clone()).or_insert(0) += count;
     }
-
+    
     /// Get count for element
     pub fn get(&self, element: &T) -> i64 {
         self.counts.get(element).copied().unwrap_or(0)
     }
-
+    
     /// Get most common elements
     pub fn most_common(&self, n: Option<usize>) -> Vec<(T, i64)> {
-        let mut items: Vec<(T, i64)> = self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut items: Vec<(T, i64)> = self.counts.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         // Stable sort by count only: Python breaks ties by FIRST-INSERTION
         // order (the old Debug-string comparison invented an ordering).
         items.sort_by(|a, b| b.1.cmp(&a.1));
-
+        
         match n {
             Some(limit) => items.into_iter().take(limit).collect(),
             None => items,
         }
     }
-
+    
     /// Get all elements (with repetitions)
     pub fn elements(&self) -> Vec<T> {
         let mut result = Vec::new();
@@ -89,42 +91,42 @@ where
         }
         result
     }
-
+    
     /// Subtract counts from another counter
     pub fn subtract(&mut self, other: &Counter<T>) {
         for (element, count) in &other.counts {
             self.update_one(element, -count);
         }
     }
-
+    
     /// Get total count
     pub fn total(&self) -> i64 {
         self.counts.values().sum()
     }
-
+    
     /// Clear all counts
     pub fn clear(&mut self) {
         self.counts.clear();
     }
-
+    
     /// Get keys (elements)
     pub fn keys(&self) -> Vec<T> {
         self.counts.keys().cloned().collect()
     }
-
+    
     /// Get values (counts)
     pub fn values(&self) -> Vec<i64> {
         self.counts.values().copied().collect()
     }
-
+    
     /// Get items (element, count pairs)
     pub fn items(&self) -> Vec<(T, i64)> {
         self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 }
 
-impl<T> Default for Counter<T>
-where
+impl<T> Default for Counter<T> 
+where 
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn default() -> Self {
@@ -132,8 +134,8 @@ where
     }
 }
 
-impl<T> Len for Counter<T>
-where
+impl<T> Len for Counter<T> 
+where 
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn len(&self) -> usize {
@@ -141,8 +143,8 @@ where
     }
 }
 
-impl<T> Truthy for Counter<T>
-where
+impl<T> Truthy for Counter<T> 
+where 
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn is_truthy(&self) -> bool {
@@ -165,10 +167,10 @@ impl<T> deque<T> {
             maxlen: None,
         }
     }
-
+    
     /// Create deque from iterable
-    pub fn from_iter<I>(iterable: I, maxlen: Option<usize>) -> Self
-    where
+    pub fn from_iter<I>(iterable: I, maxlen: Option<usize>) -> Self 
+    where 
         I: IntoIterator<Item = T>,
     {
         let mut deque = Self {
@@ -180,7 +182,7 @@ impl<T> deque<T> {
         }
         deque
     }
-
+    
     /// Create deque with maximum length
     pub fn with_maxlen(maxlen: usize) -> Self {
         Self {
@@ -188,52 +190,52 @@ impl<T> deque<T> {
             maxlen: Some(maxlen),
         }
     }
-
+    
     /// Add element to right end
     pub fn append(&mut self, item: T) {
         self.inner.push_back(item);
         self.check_maxlen();
     }
-
+    
     /// Add element to left end
     pub fn appendleft(&mut self, item: T) {
         self.inner.push_front(item);
         self.check_maxlen_front();
     }
-
+    
     /// Remove and return element from right end
     pub fn pop(&mut self) -> Option<T> {
         self.inner.pop_back()
     }
-
+    
     /// Remove and return element from left end
     pub fn popleft(&mut self) -> Option<T> {
         self.inner.pop_front()
     }
-
+    
     /// Extend right side with iterable
-    pub fn extend<I>(&mut self, iterable: I)
-    where
+    pub fn extend<I>(&mut self, iterable: I) 
+    where 
         I: IntoIterator<Item = T>,
     {
         for item in iterable {
             self.append(item);
         }
     }
-
+    
     /// Extend left side with iterable
-    pub fn extendleft<I>(&mut self, iterable: I)
-    where
+    pub fn extendleft<I>(&mut self, iterable: I) 
+    where 
         I: IntoIterator<Item = T>,
     {
         for item in iterable {
             self.appendleft(item);
         }
     }
-
+    
     /// Remove first occurrence of value
-    pub fn remove(&mut self, value: &T) -> Result<(), PyException>
-    where
+    pub fn remove(&mut self, value: &T) -> Result<(), PyException> 
+    where 
         T: PartialEq,
     {
         if let Some(pos) = self.inner.iter().position(|x| x == value) {
@@ -243,23 +245,23 @@ impl<T> deque<T> {
             Err(crate::value_error("deque.remove(x): x not in deque"))
         }
     }
-
+    
     /// Rotate deque n steps
     pub fn rotate(&mut self, n: i32) {
         if self.inner.is_empty() {
             return;
         }
-
+        
         let len = self.inner.len() as i32;
         let steps = ((n % len) + len) % len;
-
+        
         for _ in 0..steps {
             if let Some(item) = self.inner.pop_back() {
                 self.inner.push_front(item);
             }
         }
     }
-
+    
     /// Reverse the deque in place
     pub fn reverse(&mut self) {
         let items: Vec<T> = self.inner.drain(..).collect();
@@ -267,23 +269,18 @@ impl<T> deque<T> {
             self.inner.push_back(item);
         }
     }
-
+    
     /// Count occurrences of value
-    pub fn count(&self, value: &T) -> usize
-    where
+    pub fn count(&self, value: &T) -> usize 
+    where 
         T: PartialEq,
     {
         self.inner.iter().filter(|&x| x == value).count()
     }
-
+    
     /// Find index of first occurrence
-    pub fn index(
-        &self,
-        value: &T,
-        start: Option<usize>,
-        stop: Option<usize>,
-    ) -> Result<usize, PyException>
-    where
+    pub fn index(&self, value: &T, start: Option<usize>, stop: Option<usize>) -> Result<usize, PyException> 
+    where 
         T: PartialEq + crate::PyRepr,
     {
         let start = start.unwrap_or(0);
@@ -300,22 +297,21 @@ impl<T> deque<T> {
                 return Ok(i);
             }
         }
-
+        
         // CPython names the missing value with repr(): "9 is not in deque",
         // "'x' is not in deque" — single quotes for str, not Rust Debug's
         // double quotes.
-        Err(crate::value_error(format!(
-            "{} is not in deque",
-            value.py_repr()
-        )))
+        Err(crate::value_error(format!("{} is not in deque", value.py_repr())))
     }
-
+    
     /// Insert item at position. A bounded deque at its maximum size raises
     /// IndexError like CPython (issue #82) instead of silently evicting.
     pub fn insert(&mut self, index: usize, item: T) -> Result<(), PyException> {
         if let Some(max_len) = self.maxlen {
             if self.inner.len() >= max_len {
-                return Err(crate::index_error("deque already at its maximum size"));
+                return Err(crate::index_error(
+                    "deque already at its maximum size",
+                ));
             }
         }
         if index >= self.inner.len() {
@@ -326,15 +322,15 @@ impl<T> deque<T> {
         self.check_maxlen();
         Ok(())
     }
-
+    
     /// Clear the deque
     pub fn clear(&mut self) {
         self.inner.clear();
     }
-
+    
     /// Copy the deque
-    pub fn copy(&self) -> Self
-    where
+    pub fn copy(&self) -> Self 
+    where 
         T: Clone,
     {
         Self {
@@ -342,12 +338,12 @@ impl<T> deque<T> {
             maxlen: self.maxlen,
         }
     }
-
+    
     /// Get maximum length
     pub fn maxlen(&self) -> Option<usize> {
         self.maxlen
     }
-
+    
     /// Trim to maxlen after growing at the BACK: CPython discards from
     /// the opposite end, i.e. the front.
     fn check_maxlen(&mut self) {
@@ -369,12 +365,12 @@ impl<T> deque<T> {
             }
         }
     }
-
+    
     /// Get item by index
     pub fn get(&self, index: usize) -> Option<&T> {
         self.inner.get(index)
     }
-
+    
     /// Get item by index (mutable)
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.inner.get_mut(index)
@@ -413,7 +409,9 @@ impl<T> crate::PyListOps<T> for deque<T> {
     fn py_insert(&mut self, index: i64, item: T) -> Result<(), crate::PyException> {
         if let Some(max_len) = self.maxlen {
             if self.inner.len() >= max_len {
-                return Err(crate::index_error("deque already at its maximum size"));
+                return Err(crate::index_error(
+                    "deque already at its maximum size",
+                ));
             }
         }
         let len = self.inner.len() as i64;
@@ -433,8 +431,8 @@ impl<T> crate::PyListOps<T> for deque<T> {
 
 /// defaultdict - dict subclass with default factory function
 #[derive(Debug, Clone)]
-pub struct defaultdict<K, V>
-where
+pub struct defaultdict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -445,8 +443,8 @@ where
     default_factory: Option<fn() -> V>,
 }
 
-impl<K, V> defaultdict<K, V>
-where
+impl<K, V> defaultdict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -457,7 +455,7 @@ where
             default_factory: Some(default_factory),
         }
     }
-
+    
     /// Create defaultdict without factory
     pub fn without_factory() -> Self {
         Self {
@@ -465,7 +463,7 @@ where
             default_factory: None,
         }
     }
-
+    
     /// Get value, creating with factory if missing
     pub fn get_or_default(&mut self, key: &K) -> Result<V, PyException> {
         if let Some(value) = self.inner.get(key) {
@@ -475,65 +473,60 @@ where
             self.inner.insert(key.clone(), default_value.clone());
             Ok(default_value)
         } else {
-            Err(crate::key_error(format!(
-                "Key not found and no default factory"
-            )))
+            Err(crate::key_error(format!("Key not found and no default factory")))
         }
     }
-
+    
     /// Get value without creating default
     pub fn get(&self, key: &K) -> Option<&V> {
         self.inner.get(key)
     }
-
+    
     /// Set value
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.inner.insert(key, value)
     }
-
+    
     /// Remove key
     pub fn remove(&mut self, key: &K) -> Option<V> {
         // shift_remove keeps the remaining insertion order intact (Python's
         // dict.pop preserves the order of the other keys).
         self.inner.shift_remove(key)
     }
-
+    
     /// Check if key exists
     pub fn contains_key(&self, key: &K) -> bool {
         self.inner.contains_key(key)
     }
-
+    
     /// Get keys
     pub fn keys(&self) -> Vec<K> {
         self.inner.keys().cloned().collect()
     }
-
+    
     /// Get values
     pub fn values(&self) -> Vec<V> {
         self.inner.values().cloned().collect()
     }
-
+    
     /// Get items
     pub fn items(&self) -> Vec<(K, V)> {
-        self.inner
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        self.inner.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
-
+    
     /// Clear all items
     pub fn clear(&mut self) {
         self.inner.clear();
     }
-
+    
     /// Get missing method (for compatibility)
     pub fn default_factory_fn(&self) -> Option<fn() -> V> {
         self.default_factory
     }
 }
 
-impl<K, V> Len for defaultdict<K, V>
-where
+impl<K, V> Len for defaultdict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -542,8 +535,8 @@ where
     }
 }
 
-impl<K, V> Truthy for defaultdict<K, V>
-where
+impl<K, V> Truthy for defaultdict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -555,8 +548,8 @@ where
 /// OrderedDict - dictionary that maintains insertion order
 /// Note: In Rust, HashMap doesn't guarantee order, so we use a Vec for ordering
 #[derive(Debug, Clone)]
-pub struct OrderedDict<K, V>
-where
+pub struct OrderedDict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -564,8 +557,8 @@ where
     order: Vec<K>,
 }
 
-impl<K, V> OrderedDict<K, V>
-where
+impl<K, V> OrderedDict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -576,7 +569,7 @@ where
             order: Vec::new(),
         }
     }
-
+    
     /// Insert key-value pair
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         if !self.inner.contains_key(&key) {
@@ -584,12 +577,12 @@ where
         }
         self.inner.insert(key, value)
     }
-
+    
     /// Get value by key
     pub fn get(&self, key: &K) -> Option<&V> {
         self.inner.get(key)
     }
-
+    
     /// Remove key-value pair
     pub fn remove(&mut self, key: &K) -> Option<V> {
         if let Some(value) = self.inner.remove(key) {
@@ -599,74 +592,68 @@ where
             None
         }
     }
-
+    
     /// Pop last item (LIFO order)
     pub fn popitem(&mut self, last: bool) -> Result<(K, V), PyException> {
         if self.order.is_empty() {
             return Err(crate::key_error("dictionary is empty"));
         }
-
+        
         let key = if last {
             self.order.pop().unwrap()
         } else {
             self.order.remove(0)
         };
-
+        
         let value = self.inner.remove(&key).unwrap();
         Ok((key, value))
     }
-
+    
     /// Move key to end (or beginning)
     pub fn move_to_end(&mut self, key: &K, last: bool) -> Result<(), PyException> {
         if !self.inner.contains_key(key) {
             return Err(crate::key_error("Key not found"));
         }
-
+        
         self.order.retain(|k| k != key);
         if last {
             self.order.push(key.clone());
         } else {
             self.order.insert(0, key.clone());
         }
-
+        
         Ok(())
     }
-
+    
     /// Get keys in order
     pub fn keys(&self) -> Vec<K> {
         self.order.clone()
     }
-
+    
     /// Get values in order
     pub fn values(&self) -> Vec<V> {
-        self.order
-            .iter()
-            .filter_map(|k| self.inner.get(k).cloned())
-            .collect()
+        self.order.iter().filter_map(|k| self.inner.get(k).cloned()).collect()
     }
-
+    
     /// Get items in order
     pub fn items(&self) -> Vec<(K, V)> {
-        self.order
-            .iter()
-            .filter_map(|k| self.inner.get(k).map(|v| (k.clone(), v.clone())))
-            .collect()
+        self.order.iter().filter_map(|k| self.inner.get(k).map(|v| (k.clone(), v.clone()))).collect()
     }
-
+    
     /// Clear all items
     pub fn clear(&mut self) {
         self.inner.clear();
         self.order.clear();
     }
-
+    
     /// Check if key exists
     pub fn contains_key(&self, key: &K) -> bool {
         self.inner.contains_key(key)
     }
 }
 
-impl<K, V> Default for OrderedDict<K, V>
-where
+impl<K, V> Default for OrderedDict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -675,8 +662,8 @@ where
     }
 }
 
-impl<K, V> Len for OrderedDict<K, V>
-where
+impl<K, V> Len for OrderedDict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -685,8 +672,8 @@ where
     }
 }
 
-impl<K, V> Truthy for OrderedDict<K, V>
-where
+impl<K, V> Truthy for OrderedDict<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -697,16 +684,16 @@ where
 
 /// ChainMap - groups multiple mappings into single view
 #[derive(Debug)]
-pub struct ChainMap<K, V>
-where
+pub struct ChainMap<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
     maps: Vec<HashMap<K, V>>,
 }
 
-impl<K, V> ChainMap<K, V>
-where
+impl<K, V> ChainMap<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -714,14 +701,12 @@ where
     pub fn new(maps: Vec<HashMap<K, V>>) -> Self {
         Self { maps }
     }
-
+    
     /// Create empty ChainMap
     pub fn empty() -> Self {
-        Self {
-            maps: vec![HashMap::new()],
-        }
+        Self { maps: vec![HashMap::new()] }
     }
-
+    
     /// Get value by key (searches all maps)
     pub fn get(&self, key: &K) -> Option<&V> {
         for map in &self.maps {
@@ -731,7 +716,7 @@ where
         }
         None
     }
-
+    
     /// Set value (in first map)
     pub fn insert(&mut self, key: K, value: V) {
         if self.maps.is_empty() {
@@ -739,7 +724,7 @@ where
         }
         self.maps[0].insert(key, value);
     }
-
+    
     /// Remove key from first map
     pub fn remove(&mut self, key: &K) -> Option<V> {
         if !self.maps.is_empty() {
@@ -748,7 +733,7 @@ where
             None
         }
     }
-
+    
     /// Get all keys
     pub fn keys(&self) -> Vec<K> {
         let mut keys = HashSet::new();
@@ -757,12 +742,12 @@ where
         }
         keys.into_iter().collect()
     }
-
+    
     /// Get all values
     pub fn values(&self) -> Vec<V> {
         let mut seen_keys = HashSet::new();
         let mut values = Vec::new();
-
+        
         for map in &self.maps {
             for (key, value) in map {
                 if !seen_keys.contains(key) {
@@ -771,29 +756,29 @@ where
                 }
             }
         }
-
+        
         values
     }
-
+    
     /// Check if key exists
     pub fn contains_key(&self, key: &K) -> bool {
         self.maps.iter().any(|map| map.contains_key(key))
     }
-
+    
     /// Add new child map
     pub fn new_child(&mut self, map: HashMap<K, V>) -> &mut Self {
         self.maps.insert(0, map);
         self
     }
-
+    
     /// Get number of maps
     pub fn num_maps(&self) -> usize {
         self.maps.len()
     }
 }
 
-impl<K, V> Len for ChainMap<K, V>
-where
+impl<K, V> Len for ChainMap<K, V> 
+where 
     K: Hash + Eq + Clone,
     V: Clone,
 {

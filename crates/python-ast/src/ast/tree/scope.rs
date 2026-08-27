@@ -167,9 +167,14 @@ impl Analysis<'_> {
 }
 
 /// Merge the post-states of alternative branches.
-fn merge_states(branches: Vec<HashMap<String, Init>>) -> HashMap<String, Init> {
+fn merge_states(
+    branches: Vec<HashMap<String, Init>>,
+) -> HashMap<String, Init> {
     let mut merged: HashMap<String, Init> = HashMap::new();
-    let keys: HashSet<String> = branches.iter().flat_map(|b| b.keys().cloned()).collect();
+    let keys: HashSet<String> = branches
+        .iter()
+        .flat_map(|b| b.keys().cloned())
+        .collect();
     for key in keys {
         let states: Vec<Init> = branches
             .iter()
@@ -231,7 +236,10 @@ pub(crate) fn analyze_scope_with(
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
         leaked_loop_targets: HashSet::new(),
-        state: initialized.iter().map(|n| (n.clone(), Init::Yes)).collect(),
+        state: initialized
+            .iter()
+            .map(|n| (n.clone(), Init::Yes))
+            .collect(),
         resolve_call,
     };
     walk_stmts(body, &mut a, false);
@@ -556,7 +564,8 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 // not, so they get no dummy initializer.
                 a.record_closure_boundary(&before);
                 // Handlers may run with the body only partially executed.
-                let handler_entry = merge_states(vec![before, after_body.clone()]);
+                let handler_entry =
+                    merge_states(vec![before, after_body.clone()]);
                 // With a finally clause the handler and else bodies also run
                 // in closures (so a return/raise still executes finally):
                 // their entry state may still be uninitialized for names
@@ -598,7 +607,12 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
 
 /// A loop body may execute any number of times: analyze it as a branch that
 /// may or may not have run, with every store marked multi-execution.
-fn walk_loop(body: &[Statement], orelse: &[Statement], a: &mut Analysis<'_>, outer_multi: bool) {
+fn walk_loop(
+    body: &[Statement],
+    orelse: &[Statement],
+    a: &mut Analysis<'_>,
+    outer_multi: bool,
+) {
     let before = a.state.clone();
     walk_stmts(body, a, true);
     let after_body = std::mem::replace(&mut a.state, HashMap::new());
@@ -611,13 +625,8 @@ fn walk_loop(body: &[Statement], orelse: &[Statement], a: &mut Analysis<'_>, out
 /// mutates `h` like a method call would). ONE registry: call.rs's
 /// `&mut`-rendering consults it too, so the borrow emission and this
 /// needs-`mut` analysis cannot drift.
-pub(crate) const HEAPQ_FIRST_ARG_MUTATORS: &[&str] = &[
-    "heappush",
-    "heappop",
-    "heapify",
-    "heappushpop",
-    "heapreplace",
-];
+pub(crate) const HEAPQ_FIRST_ARG_MUTATORS: &[&str] =
+    &["heappush", "heappop", "heapify", "heappushpop", "heapreplace"];
 
 /// Free functions that mutate their first argument in place: the heapq
 /// mutators plus csv.writer(f), which holds &mut f for the writer's
@@ -632,7 +641,9 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         // receiver: `heapq.heappush(h, x)` needs `h` mutable, mirroring
         // the bare-function branch below.
         if let ExprType::Name(m) = attr.value.as_ref() {
-            if matches!(m.id.as_str(), "heapq" | "csv") && mutates_first_arg(&attr.attr) {
+            if matches!(m.id.as_str(), "heapq" | "csv")
+                && mutates_first_arg(&attr.attr)
+            {
                 if let Some(first) = call.args.first() {
                     if let Some(name) = chain_base_name(first) {
                         a.record_mutation(name);

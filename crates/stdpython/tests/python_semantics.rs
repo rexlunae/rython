@@ -67,20 +67,14 @@ fn floordiv_and_mod_follow_divisor_sign() {
         py_floordiv(1i64, 0).unwrap_err().exception_type,
         "ZeroDivisionError"
     );
-    assert_eq!(
-        py_mod(1.0f64, 0.0).unwrap_err().exception_type,
-        "ZeroDivisionError"
-    );
+    assert_eq!(py_mod(1.0f64, 0.0).unwrap_err().exception_type, "ZeroDivisionError");
 }
 
 #[test]
 fn divmod_matches_python() {
     assert_eq!(divmod(-7i64, 2).unwrap(), (-4, 1));
     assert_eq!(divmod(7i64, 2).unwrap(), (3, 1));
-    assert_eq!(
-        divmod(1i64, 0).unwrap_err().exception_type,
-        "ZeroDivisionError"
-    );
+    assert_eq!(divmod(1i64, 0).unwrap_err().exception_type, "ZeroDivisionError");
 }
 
 #[test]
@@ -180,6 +174,7 @@ fn counter_keeps_zero_and_negative_counts() {
     assert_eq!(c.most_common(None).len(), 1);
 }
 
+
 /// The random tests share one global generator; parallel test threads
 /// would interleave draws and break seeded sequences, so every test that
 /// touches the RNG serializes on this lock.
@@ -197,11 +192,7 @@ fn randrange_reaches_last_step_value() {
     let mut seen_max = 0;
     for _ in 0..2000 {
         let v = stdpython::random::randrange(0, Some(10), Some(3)).unwrap();
-        assert!(
-            v == 0 || v == 3 || v == 6 || v == 9,
-            "unexpected value {}",
-            v
-        );
+        assert!(v == 0 || v == 3 || v == 6 || v == 9, "unexpected value {}", v);
         seen_max = seen_max.max(v);
     }
     assert_eq!(seen_max, 9);
@@ -414,8 +405,12 @@ fn issue81_round_and_pow_match_cpython() {
 fn issue81_negative_index_overflow_does_not_panic() {
     // i64::MIN + len used to overflow in normalize_index; Python answers
     // IndexError because |index| > len.
-    assert!(vec![1i64, 2].py_index(-9223372036854775808i64).is_err());
-    assert!(vec![1i64, 2].py_pop(-9223372036854775808i64).is_err());
+    assert!(vec![1i64, 2]
+        .py_index(-9223372036854775808i64)
+        .is_err());
+    assert!(vec![1i64, 2]
+        .py_pop(-9223372036854775808i64)
+        .is_err());
     // insert prepends, like Python (insert(-huge, x) == insert(0, x)).
     let mut v = vec![1i64, 2];
     let _ = v.py_insert(-9223372036854775808i64, 9);
@@ -526,11 +521,7 @@ fn py_index_mut_writes_land_in_place() {
     );
     // Dicts: KeyError on missing key, mutation in place otherwise.
     let mut table = std::collections::HashMap::from([("row", vec![5i64, 6])]);
-    table
-        .py_index_mut("row")
-        .unwrap()
-        .py_set_index(1, 7)
-        .unwrap();
+    table.py_index_mut("row").unwrap().py_set_index(1, 7).unwrap();
     assert_eq!(table["row"][1], 7);
     assert_eq!(
         table.py_index_mut("nope").unwrap_err().exception_type,
@@ -685,7 +676,12 @@ fn seeded_distributions_match_cpython_arithmetic() {
     // Same algorithms as CPython; transcendental libm calls may differ in
     // the last ulp, so compare with a tight relative tolerance.
     fn close(a: f64, b: f64) {
-        assert!(((a - b) / b).abs() < 1e-12, "expected {}, got {}", b, a);
+        assert!(
+            ((a - b) / b).abs() < 1e-12,
+            "expected {}, got {}",
+            b,
+            a
+        );
     }
     random::seed(Some(1i64));
     close(random::normalvariate(0.0, 1.0), 0.6074558576437062);
@@ -709,10 +705,7 @@ fn seeded_distributions_match_cpython_arithmetic() {
     random::seed(Some(9i64));
     close(random::vonmisesvariate(0.0, 4.0), 5.846117145872649);
     random::seed(Some(9i64));
-    close(
-        random::weibullvariate(1.0, 1.5).unwrap(),
-        0.7284843985495473,
-    );
+    close(random::weibullvariate(1.0, 1.5).unwrap(), 0.7284843985495473);
 }
 
 #[test]
@@ -725,11 +718,7 @@ fn random_state_round_trips_and_seed_resets_gauss() {
     let a = random::gauss(0.0, 1.0);
     let b = random::random();
     random::setstate(&state).unwrap();
-    assert_eq!(
-        random::gauss(0.0, 1.0),
-        a,
-        "state must include the gauss cache"
-    );
+    assert_eq!(random::gauss(0.0, 1.0), a, "state must include the gauss cache");
     assert_eq!(random::random(), b);
 
     // Reseeding clears the cached deviate (CPython behavior): two fresh
@@ -810,10 +799,7 @@ fn environ_is_a_live_view() {
     // Mutations after first access must be visible (the old snapshot
     // silently disagreed with os.getenv).
     stdpython::os::setenv(key, "second");
-    assert_eq!(
-        stdpython::os::environ.py_get(key).as_deref(),
-        Some("second")
-    );
+    assert_eq!(stdpython::os::environ.py_get(key).as_deref(), Some("second"));
     assert_eq!(stdpython::os::environ.py_index(key).unwrap(), "second");
     assert!(stdpython::os::environ.py_contains(key));
     // Missing keys raise KeyError like Python's os.environ[...].
@@ -835,13 +821,9 @@ fn glob_wildcards_skip_hidden_files() {
     assert_eq!(star.len(), 1, "hidden file must not match *: {:?}", star);
     assert!(star[0].ends_with("visible.txt"));
 
-    let dotted = stdpython::glob::glob(format!("{}/.*.txt", dir.to_string_lossy())).unwrap();
-    assert_eq!(
-        dotted.len(),
-        1,
-        "literal-dot pattern must match: {:?}",
-        dotted
-    );
+    let dotted =
+        stdpython::glob::glob(format!("{}/.*.txt", dir.to_string_lossy())).unwrap();
+    assert_eq!(dotted.len(), 1, "literal-dot pattern must match: {:?}", dotted);
     assert!(dotted[0].ends_with(".hidden.txt"));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -857,8 +839,12 @@ fn tempfile_gettempdir_picks_first_usable_cpython_candidate() {
     // TMPDIR=/nonexistent-xyz still yields '/tmp'.
     let dir = stdpython::stdlib::tempfile::gettempdir();
     assert!(dir.is_absolute(), "gettempdir must be absolute: {:?}", dir);
-    let probe = dir.join(format!("rython-tempfile-pin-{}", std::process::id()));
-    std::fs::write(&probe, b"x").expect("gettempdir must return a directory that accepts writes");
+    let probe = dir.join(format!(
+        "rython-tempfile-pin-{}",
+        std::process::id()
+    ));
+    std::fs::write(&probe, b"x")
+        .expect("gettempdir must return a directory that accepts writes");
     let _ = std::fs::remove_file(&probe);
 }
 
@@ -872,11 +858,16 @@ fn heterogeneous_union_values_str_repr_and_display() {
     //   \xNN lowercase; str(7)=='7'; str(True)=='True'; str(3.5)=='3.5';
     //   str(None)=='None'; str((1,'a'))=="(1, 'a')"; str((1,))=='(1,)';
     //   repr('s')=="'s'".
-    use stdpython::{PyValue, StrOrBytes, py_bytes_repr, py_value_repr, py_value_str};
+    use stdpython::{
+        py_bytes_repr, py_value_repr, py_value_str, PyValue, StrOrBytes,
+    };
     let sb = |v: StrOrBytes| v.py_str();
     assert_eq!(sb(StrOrBytes::from("s")), "s");
     assert_eq!(sb(StrOrBytes::from(b"raw".as_slice())), "b'raw'");
-    assert_eq!(sb(StrOrBytes::Bytes(vec![b'a', b'\'', b'b'])), "b\"a'b\"");
+    assert_eq!(
+        sb(StrOrBytes::Bytes(vec![b'a', b'\'', b'b'])),
+        "b\"a'b\""
+    );
     assert_eq!(
         py_bytes_repr(&[0x00, 0x7f, 0x80, 0xff]),
         "b'\\x00\\x7f\\x80\\xff'"
@@ -888,7 +879,10 @@ fn heterogeneous_union_values_str_repr_and_display() {
     assert_eq!(pv(&PyValue::Bool(true)), "True");
     assert_eq!(pv(&PyValue::Bool(false)), "False");
     assert_eq!(pv(&PyValue::Str("s".into())), "s");
-    assert_eq!(pv(&PyValue::Bytes(vec![b'r', b'a', b'w'])), "b'raw'");
+    assert_eq!(
+        pv(&PyValue::Bytes(vec![b'r', b'a', b'w'])),
+        "b'raw'"
+    );
     assert_eq!(pv(&PyValue::None_), "None");
     assert_eq!(
         pv(&PyValue::Tuple(std::sync::Arc::new(vec![
@@ -976,7 +970,9 @@ fn exception_matching_walks_the_cpython_hierarchy() {
         PyException::new("TabError", "tabs").matches("SyntaxError"),
         "three-hop ancestry"
     );
-    assert!(PyException::new("ZeroDivisionError", "/0").matches("ArithmeticError"));
+    assert!(
+        PyException::new("ZeroDivisionError", "/0").matches("ArithmeticError")
+    );
 
     for base_only in ["SystemExit", "KeyboardInterrupt", "GeneratorExit"] {
         assert!(
@@ -1051,6 +1047,7 @@ fn ascii_escapes_outside_printable_ascii_like_python() {
     assert_eq!(ascii(&3.5f64), "3.5");
 }
 
+
 // ---- str operations: code points and the Python method surface ----
 
 #[test]
@@ -1073,10 +1070,7 @@ fn str_count_is_nonoverlapping() {
 fn split_variants_match_python() {
     // Values verified against python3.
     assert_eq!("x-y-z".py_split_maxsplit("-", 1).unwrap(), vec!["x", "y-z"]);
-    assert_eq!(
-        "a-b-c-d".py_rsplit_maxsplit("-", 2).unwrap(),
-        vec!["a-b", "c", "d"]
-    );
+    assert_eq!("a-b-c-d".py_rsplit_maxsplit("-", 2).unwrap(), vec!["a-b", "c", "d"]);
     assert_eq!("café".py_rsplit("a").unwrap(), vec!["c", "fé"]);
     // Python: "ab".split("") raises ValueError: empty separator.
     let err = "ab".py_split("").unwrap_err();
@@ -1152,46 +1146,16 @@ fn whitespace_maxsplit_matches_python() {
 fn int_radix_format_matches_python_sign_magnitude() {
     // Values verified against python3: format(-255, 'x') == "-ff" — sign
     // and magnitude, never the two's-complement bit pattern.
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, false, false, 0, 'x'),
-        "-ff"
-    );
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, true, false, 0, 'x'),
-        "-0xff"
-    );
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, true, true, 6, 'x'),
-        "-0x0ff"
-    );
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, false, true, 6, 'x'),
-        "-000ff"
-    );
-    assert_eq!(
-        py_int_radix_format(255, ' ', '>', false, false, false, 6, 'x'),
-        "    ff"
-    );
-    assert_eq!(
-        py_int_radix_format(255, '*', '^', false, false, false, 8, 'x'),
-        "***ff***"
-    );
-    assert_eq!(
-        py_int_radix_format(-5, ' ', '\0', false, false, false, 0, 'b'),
-        "-101"
-    );
-    assert_eq!(
-        py_int_radix_format(-8, ' ', '\0', false, false, false, 0, 'o'),
-        "-10"
-    );
-    assert_eq!(
-        py_int_radix_format(255, ' ', '\0', false, false, true, 8, 'X'),
-        "000000FF"
-    );
-    assert_eq!(
-        py_int_radix_format(5, ' ', '\0', true, false, false, 0, 'x'),
-        "+5"
-    );
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, false, false, 0, 'x'), "-ff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, true, false, 0, 'x'), "-0xff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, true, true, 6, 'x'), "-0x0ff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, false, true, 6, 'x'), "-000ff");
+    assert_eq!(py_int_radix_format(255, ' ', '>', false, false, false, 6, 'x'), "    ff");
+    assert_eq!(py_int_radix_format(255, '*', '^', false, false, false, 8, 'x'), "***ff***");
+    assert_eq!(py_int_radix_format(-5, ' ', '\0', false, false, false, 0, 'b'), "-101");
+    assert_eq!(py_int_radix_format(-8, ' ', '\0', false, false, false, 0, 'o'), "-10");
+    assert_eq!(py_int_radix_format(255, ' ', '\0', false, false, true, 8, 'X'), "000000FF");
+    assert_eq!(py_int_radix_format(5, ' ', '\0', true, false, false, 0, 'x'), "+5");
 }
 
 // ---- Issue 23: lazy range, frexp, Counter ties, datetime ----
@@ -1260,10 +1224,7 @@ fn counter_most_common_breaks_ties_by_insertion_order() {
 fn abs_of_i64_min_fails_loudly_not_silently() {
     assert_eq!(abs(-5i64), 5);
     let result = std::panic::catch_unwind(|| abs(i64::MIN));
-    assert!(
-        result.is_err(),
-        "abs(i64::MIN) must be a defined, loud failure"
-    );
+    assert!(result.is_err(), "abs(i64::MIN) must be a defined, loud failure");
 }
 
 #[test]
@@ -1275,11 +1236,9 @@ fn range_len_survives_extreme_endpoints() {
     );
     assert_eq!(range_start_stop_step(0, 100, i64::MAX).unwrap().py_len(), 1);
     assert_eq!(range_start_stop_step(100, 0, i64::MIN).unwrap().py_len(), 1);
-    assert!(
-        range_start_stop_step(i64::MIN, i64::MAX, 1)
-            .unwrap()
-            .py_contains(&i64::MAX.wrapping_sub(1))
-    );
+    assert!(range_start_stop_step(i64::MIN, i64::MAX, 1)
+        .unwrap()
+        .py_contains(&i64::MAX.wrapping_sub(1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,15 +1252,9 @@ mod builtin_min_max {
     #[test]
     fn empty_iterables_raise_value_error_with_pythons_message() {
         let e = min(&Vec::<i64>::new()).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: min() arg is an empty sequence"
-        );
+        assert_eq!(format!("{}", e), "ValueError: min() arg is an empty sequence");
         let e = max(&Vec::<i64>::new()).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: max() arg is an empty sequence"
-        );
+        assert_eq!(format!("{}", e), "ValueError: max() arg is an empty sequence");
     }
 
     #[test]
@@ -1334,12 +1287,12 @@ mod builtin_min_max {
         let pairs = [(1i64, "a"), (1i64, "b")];
         assert_eq!(max_key(&pairs, |t| t.0).unwrap(), (1, "a"));
         assert_eq!(min_key(&[3i64, 1, 2], |x| -x).unwrap(), 3);
-        assert_eq!(min_key_default(&Vec::<i64>::new(), |x| -x, 42), 42);
-        let e = min_key(&Vec::<i64>::new(), |x| *x).unwrap_err();
         assert_eq!(
-            format!("{}", e),
-            "ValueError: min() arg is an empty sequence"
+            min_key_default(&Vec::<i64>::new(), |x| -x, 42),
+            42
         );
+        let e = min_key(&Vec::<i64>::new(), |x| *x).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: min() arg is an empty sequence");
     }
 }
 
@@ -1415,10 +1368,7 @@ mod builtin_enumerate_pow {
         assert_eq!(pow_mod(2, 0, 5).unwrap(), 1);
 
         let e = pow_mod(2, 3, 0).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: pow() 3rd argument cannot be 0"
-        );
+        assert_eq!(format!("{}", e), "ValueError: pow() 3rd argument cannot be 0");
         let e = pow_mod(2, -1, 4).unwrap_err();
         assert_eq!(
             format!("{}", e),
@@ -1447,10 +1397,7 @@ mod builtin_repr {
         assert_eq!(py_float_repr(9999999999999998.0), "9999999999999998.0");
         assert_eq!(py_float_repr(1e16), "1e+16");
         assert_eq!(py_float_repr(-1e16), "-1e+16");
-        assert_eq!(
-            py_float_repr(123456789012345680.0),
-            "1.2345678901234568e+17"
-        );
+        assert_eq!(py_float_repr(123456789012345680.0), "1.2345678901234568e+17");
         assert_eq!(py_float_repr(1e100), "1e+100");
         assert_eq!(py_float_repr(0.0001), "0.0001");
         assert_eq!(py_float_repr(0.00001), "1e-05");
@@ -1526,15 +1473,7 @@ mod datetime_arithmetic {
     use stdpython::datetime::{date, datetime, timedelta};
 
     fn td(days: i64, hours: i64, minutes: i64) -> timedelta {
-        timedelta::new(
-            Some(days),
-            None,
-            None,
-            None,
-            Some(minutes),
-            Some(hours),
-            None,
-        )
+        timedelta::new(Some(days), None, None, None, Some(minutes), Some(hours), None)
     }
 
     #[test]
@@ -1559,7 +1498,8 @@ mod datetime_arithmetic {
     #[test]
     fn datetime_arithmetic_keeps_microseconds_exact() {
         let dt1 = datetime::new(2024, 3, 1, Some(10), Some(30), Some(0), None).unwrap();
-        let dt2 = datetime::new(2024, 2, 28, Some(23), Some(45), Some(30), Some(500_000)).unwrap();
+        let dt2 =
+            datetime::new(2024, 2, 28, Some(23), Some(45), Some(30), Some(500_000)).unwrap();
         let diff = dt1 - dt2;
         assert_eq!(format!("{}", diff), "1 day, 10:44:29.500000");
         assert_eq!(diff.total_seconds(), 125069.5);
@@ -1582,10 +1522,7 @@ mod datetime_arithmetic {
         assert_eq!(format!("{}", neg), "-1 day, 1:00:00");
         assert_eq!(format!("{}", td(2, 0, 0)), "2 days, 0:00:00");
         assert_eq!(
-            format!(
-                "{}",
-                timedelta::new(None, None, None, None, None, None, None)
-            ),
+            format!("{}", timedelta::new(None, None, None, None, None, None, None)),
             "0:00:00"
         );
     }
@@ -1636,10 +1573,7 @@ mod datetime_strptime {
             "ValueError: time data 'abc' does not match format '%Y'"
         );
         let e = datetime::strptime("2024 rest", "%Y").unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: unconverted data remains:  rest"
-        );
+        assert_eq!(format!("{}", e), "ValueError: unconverted data remains:  rest");
         let e = datetime::strptime("2024", "%Q").unwrap_err();
         assert_eq!(
             format!("{}", e),
@@ -1655,10 +1589,7 @@ mod time_module {
         // A sane wall clock: after 2020, before 2100.
         assert!(t > 1_577_836_800.0 && t < 4_102_444_800.0, "time(): {}", t);
         let ns = stdpython::time::time_ns();
-        assert!(
-            (ns as f64 / 1e9 - t).abs() < 5.0,
-            "time_ns disagrees with time()"
-        );
+        assert!((ns as f64 / 1e9 - t).abs() < 5.0, "time_ns disagrees with time()");
 
         let a = stdpython::time::monotonic();
         stdpython::time::sleep(0.01);
@@ -1686,10 +1617,7 @@ mod itertools_gaps {
     #[test]
     fn accumulate_variants_match_python() {
         assert_eq!(accumulate_sum(&[1i64, 2, 3, 4]), vec![1, 3, 6, 10]);
-        assert_eq!(
-            accumulate_sum_initial(&[1i64, 2, 3], 100),
-            vec![100, 101, 103, 106]
-        );
+        assert_eq!(accumulate_sum_initial(&[1i64, 2, 3], 100), vec![100, 101, 103, 106]);
         assert_eq!(
             accumulate_func(&[1i64, 2, 3, 4], |a, b| a * b),
             vec![1, 2, 6, 24]
@@ -1713,15 +1641,9 @@ mod itertools_gaps {
             product_repeat2(&[0i64, 1]),
             vec![(0, 0), (0, 1), (1, 0), (1, 1)]
         );
-        assert_eq!(
-            product3(&[1i64], &[2i64], &[3i64, 4]),
-            vec![(1, 2, 3), (1, 2, 4)]
-        );
+        assert_eq!(product3(&[1i64], &[2i64], &[3i64, 4]), vec![(1, 2, 3), (1, 2, 4)]);
         assert_eq!(product_repeat3(&[0i64, 1]).len(), 8);
-        assert_eq!(
-            product2(&Vec::<i64>::new(), &[1i64]),
-            Vec::<(i64, i64)>::new()
-        );
+        assert_eq!(product2(&Vec::<i64>::new(), &[1i64]), Vec::<(i64, i64)>::new());
     }
 
     #[test]
@@ -1737,10 +1659,7 @@ mod itertools_gaps {
                 vec![3, 3]
             ]
         );
-        assert_eq!(
-            combinations_with_replacement(&[1i64], 0).unwrap(),
-            vec![Vec::<i64>::new()]
-        );
+        assert_eq!(combinations_with_replacement(&[1i64], 0).unwrap(), vec![Vec::<i64>::new()]);
         assert_eq!(
             combinations_with_replacement(&Vec::<i64>::new(), 2).unwrap(),
             Vec::<Vec<i64>>::new()
@@ -1760,7 +1679,11 @@ mod itertools_gaps {
         assert_eq!(pairwise(&[1i64]), Vec::<(i64, i64)>::new());
         assert_eq!(
             zip_longest(&[1i64, 2, 3], &["a"]),
-            vec![(Some(1), Some("a")), (Some(2), None), (Some(3), None)]
+            vec![
+                (Some(1), Some("a")),
+                (Some(2), None),
+                (Some(3), None)
+            ]
         );
         assert_eq!(
             zip_longest_fill(&[1i64], &[10i64, 20, 30], 0),
@@ -1793,10 +1716,7 @@ mod itertools_gaps {
 
     #[test]
     fn starmap_splats_tuples_of_two_and_three() {
-        assert_eq!(
-            starmap(|a: i64, b: i64| a * b, &[(2, 3), (4, 5)]),
-            vec![6, 20]
-        );
+        assert_eq!(starmap(|a: i64, b: i64| a * b, &[(2, 3), (4, 5)]), vec![6, 20]);
         assert_eq!(
             starmap(|a: i64, b: i64, c: i64| a + b + c, &[(1, 2, 3)]),
             vec![6]
@@ -1862,11 +1782,7 @@ mod functools_module {
         assert_eq!(reduce_initial(|a: i64, b: i64| a + b, &[], 42), 42);
         // The accumulator type may differ from the element type.
         assert_eq!(
-            reduce_initial(
-                |acc: String, n: i64| format!("{}{}", acc, n),
-                &[1, 2, 3],
-                String::new()
-            ),
+            reduce_initial(|acc: String, n: i64| format!("{}{}", acc, n), &[1, 2, 3], String::new()),
             "123"
         );
         let e = reduce(|a: i64, b: i64| a + b, &[]).unwrap_err();
@@ -1958,10 +1874,7 @@ mod re_module {
         // Two-plus groups yield tuples in Python: loud, not wrong-shaped.
         assert!(re::findall(r"(a)(b)", "ab", "").is_err());
 
-        assert_eq!(
-            re::sub(r"(\d+)", r"<\1>", "a1 b22", 0, "").unwrap(),
-            "a<1> b<22>"
-        );
+        assert_eq!(re::sub(r"(\d+)", r"<\1>", "a1 b22", 0, "").unwrap(), "a<1> b<22>");
         assert_eq!(re::sub("cat", "dog", "cat cat", 0, "").unwrap(), "dog dog");
 
         assert_eq!(
@@ -1971,10 +1884,7 @@ mod re_module {
         assert_eq!(re::split(r"\d", "abc", 0, "").unwrap(), vec!["abc"]);
         // Capturing groups interleave the delimiters, as in Python:
         // re.split(r"(\d)", "a1b") == ['a', '1', 'b'].
-        assert_eq!(
-            re::split(r"(\d)", "a1b", 0, "").unwrap(),
-            vec!["a", "1", "b"]
-        );
+        assert_eq!(re::split(r"(\d)", "a1b", 0, "").unwrap(), vec!["a", "1", "b"]);
         assert_eq!(re::split(r"(\d)", "1", 0, "").unwrap(), vec!["", "1", ""]);
         assert_eq!(
             re::split(r"([,;])\s*", "a, b;c", 0, "").unwrap(),
@@ -2045,7 +1955,10 @@ mod re_module {
             re::split(r"(\d)", "a1b2c", 1, "").unwrap(),
             vec!["a", "1", "b2c"]
         );
-        assert_eq!(re::split("x", "AxBxC", 1, "i").unwrap(), vec!["A", "BxC"]);
+        assert_eq!(
+            re::split("x", "AxBxC", 1, "i").unwrap(),
+            vec!["A", "BxC"]
+        );
 
         let spans: Vec<(i64, i64)> = re::finditer(r"\d+", "a1 b22", "")
             .unwrap()
@@ -2111,7 +2024,8 @@ mod map_filter_list {
         )
         .unwrap_err();
         assert_eq!(format!("{}", err), "ValueError: bad");
-        let kept = filter_fallible(|x: i64| Ok(x % 2 == 0), vec![1, 2, 3, 4]).unwrap();
+        let kept =
+            filter_fallible(|x: i64| Ok(x % 2 == 0), vec![1, 2, 3, 4]).unwrap();
         assert_eq!(kept, vec![2, 4]);
     }
 
@@ -2142,11 +2056,9 @@ mod hashlib_module {
             sha256("hello").hexdigest(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
-        assert!(
-            sha512("hello")
-                .hexdigest()
-                .starts_with("9b71d224bd62f3785d96d46ad3ea3d73")
-        );
+        assert!(sha512("hello")
+            .hexdigest()
+            .starts_with("9b71d224bd62f3785d96d46ad3ea3d73"));
         // Non-ASCII hashes its UTF-8 bytes: hashlib.md5("café".encode()).
         assert_eq!(md5("café").hexdigest(), "07117fe4a1ebd544965dc19573183da2");
         assert_eq!(
@@ -2196,10 +2108,7 @@ mod textwrap_wrap {
             wrap("word wrap-ping is--neat", 6).unwrap(),
             vec!["word", "wrap-", "ping", "is--", "neat"]
         );
-        assert_eq!(
-            fill("one two three four", 9).unwrap(),
-            "one two\nthree\nfour"
-        );
+        assert_eq!(fill("one two three four", 9).unwrap(), "one two\nthree\nfour");
     }
 
     #[test]
@@ -2235,15 +2144,9 @@ mod textwrap_wrap {
     #[test]
     fn invalid_width_raises_pythons_value_error() {
         let e = wrap("x", 0).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: invalid width 0 (must be > 0)"
-        );
+        assert_eq!(format!("{}", e), "ValueError: invalid width 0 (must be > 0)");
         let e = fill("x", -3).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: invalid width -3 (must be > 0)"
-        );
+        assert_eq!(format!("{}", e), "ValueError: invalid width -3 (must be > 0)");
     }
 }
 
@@ -2461,7 +2364,10 @@ mod list_sort {
             xs.py_sort();
         }))
         .unwrap_err();
-        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
         assert!(msg.contains("NaN"), "panic message: {}", msg);
     }
 }
@@ -2546,15 +2452,7 @@ mod datetime_fields_and_directives {
     fn datetime_fields_are_flat_like_python() {
         let d = datetime::new(2024, 2, 29, Some(13), Some(5), Some(7), Some(123456)).unwrap();
         assert_eq!(
-            (
-                d.year,
-                d.month,
-                d.day,
-                d.hour,
-                d.minute,
-                d.second,
-                d.microsecond
-            ),
+            (d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond),
             (2024, 2, 29, 13, 5, 7, 123456)
         );
         // dt.date() / dt.time() are methods, as in Python.
@@ -2612,7 +2510,7 @@ mod datetime_fields_and_directives {
 }
 
 mod replace_keywords {
-    use stdpython::datetime::{PyReplace, ReplaceArgs, date, datetime, time};
+    use stdpython::datetime::{date, datetime, time, PyReplace, ReplaceArgs};
 
     #[test]
     fn replace_maps_fields_per_receiver_type() {
@@ -2678,22 +2576,20 @@ mod replace_keywords {
         let d = datetime::new(2024, 1, 15, None, None, None, None).unwrap();
         // python3: d.replace(month=2, day=30) -> ValueError: day is out of
         // range for month
-        assert!(
-            d.py_replace(ReplaceArgs {
+        assert!(d
+            .py_replace(ReplaceArgs {
                 month: Some(2),
                 day: Some(30),
                 ..ReplaceArgs::default()
             })
-            .is_err()
-        );
+            .is_err());
         // A negative field cannot narrow to u32: ValueError, not a wrap.
-        assert!(
-            d.py_replace(ReplaceArgs {
+        assert!(d
+            .py_replace(ReplaceArgs {
                 hour: Some(-1),
                 ..ReplaceArgs::default()
             })
-            .is_err()
-        );
+            .is_err());
     }
 }
 
@@ -2725,10 +2621,7 @@ mod file_objects {
         let mut b = io::StringIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: I/O operation on closed file."
-        );
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
         // getvalue on a closed buffer is closed too.
         assert!(b.getvalue().is_err());
     }
@@ -2802,7 +2695,7 @@ mod lru_cache_store {
 }
 
 mod dict_and_exception_display {
-    use stdpython::{PyDict, PyException, PyRepr, py_display};
+    use stdpython::{py_display, PyDict, PyException, PyRepr};
 
     #[test]
     fn dict_repr_matches_python_including_order() {
@@ -2844,17 +2737,14 @@ mod dict_and_exception_display {
 }
 
 mod cpython_numeric_and_stdlib_fixes {
-    use stdpython::{PyInt, PyMul, datetime::date, py_pow};
+    use stdpython::{datetime::date, py_pow, PyInt, PyMul};
 
     #[test]
     fn float_power_uses_libm_pow_not_repeated_squaring() {
         // python3: 0.1 ** 4 == 0.00010000000000000002 (powi's repeated
         // squaring gives ...05), and 1.05 ** 10 == 1.628894626777442.
         assert_eq!(py_pow(0.1f64, 4i64), 0.1f64.powf(4.0));
-        assert_eq!(
-            format!("{:?}", py_pow(0.1f64, 4i64)),
-            "0.00010000000000000002"
-        );
+        assert_eq!(format!("{:?}", py_pow(0.1f64, 4i64)), "0.00010000000000000002");
         assert_eq!(format!("{:?}", py_pow(1.05f64, 10i64)), "1.628894626777442");
     }
 
@@ -2876,10 +2766,7 @@ mod cpython_numeric_and_stdlib_fixes {
         assert_eq!(2i64.py_mul(&"ab".to_string()), "abab");
         // NaN and infinity raise instead of silently becoming 0/i64::MAX.
         let e = f64::NAN.py_int().unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: cannot convert float NaN to integer"
-        );
+        assert_eq!(format!("{}", e), "ValueError: cannot convert float NaN to integer");
         let e = f64::INFINITY.py_int().unwrap_err();
         assert_eq!(
             format!("{}", e),
@@ -3301,10 +3188,7 @@ mod bytesio {
         let mut b = io::BytesIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: I/O operation on closed file."
-        );
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
     }
 }
 
@@ -3325,10 +3209,7 @@ fn pyvalue_add_dispatches_like_cpython() {
         PyValue::from("abcd")
     );
     assert_eq!(
-        v(
-            PyValue::Bytes(b"ab".to_vec()),
-            PyValue::Bytes(b"c".to_vec())
-        ),
+        v(PyValue::Bytes(b"ab".to_vec()), PyValue::Bytes(b"c".to_vec())),
         PyValue::Bytes(b"abc".to_vec())
     );
     let t = |vals: Vec<PyValue>| PyValue::Tuple(std::sync::Arc::new(vals));
@@ -3361,7 +3242,7 @@ fn range_replace_mechanics_match_python() {
     //   del xs[1:3]                     -> removes range
     //   strided: ys[::2]=[9,9] on [0,1,2] -> [9,1,9]
     //   mismatched stride length raises ValueError
-    use stdpython::{PySliceReplace, PyValue, py_value_str};
+    use stdpython::{py_value_str, PySliceReplace, PyValue};
     let mut v = vec![
         PyValue::Int(0),
         PyValue::Int(1),

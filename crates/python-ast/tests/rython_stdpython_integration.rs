@@ -1,20 +1,18 @@
-use python_ast::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse};
+use python_ast::{parse, CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
 use test_log::test;
 
 #[test]
 fn test_print_function_with_stdpython() {
     let code = r#"print("Hello, world!")"#;
     let module = parse(code, "test.py").unwrap();
-
+    
     let options = PythonOptions::default();
-    let rust_code = module
-        .to_rust(
-            CodeGenContext::Module("test".to_string()),
-            options,
-            SymbolTableScopes::new(),
-        )
-        .unwrap();
-
+    let rust_code = module.to_rust(
+        CodeGenContext::Module("test".to_string()),
+        options,
+        SymbolTableScopes::new(),
+    ).unwrap();
+    
     let rust_str = rust_code.to_string();
     assert!(rust_str.contains("use stdpython :: *"));
     assert!(rust_str.contains("print"));
@@ -27,16 +25,14 @@ result = 5 + 3
 print(result)
 "#;
     let module = parse(code, "test.py").unwrap();
-
+    
     let options = PythonOptions::default();
-    let rust_code = module
-        .to_rust(
-            CodeGenContext::Module("test".to_string()),
-            options,
-            SymbolTableScopes::new(),
-        )
-        .unwrap();
-
+    let rust_code = module.to_rust(
+        CodeGenContext::Module("test".to_string()),
+        options,
+        SymbolTableScopes::new(),
+    ).unwrap();
+    
     let rust_str = rust_code.to_string();
     assert!(rust_str.contains("use stdpython :: *"));
 }
@@ -48,16 +44,14 @@ my_list = [1, 2, 3]
 print(len(my_list))
 "#;
     let module = parse(code, "test.py").unwrap();
-
+    
     let options = PythonOptions::default();
-    let rust_code = module
-        .to_rust(
-            CodeGenContext::Module("test".to_string()),
-            options,
-            SymbolTableScopes::new(),
-        )
-        .unwrap();
-
+    let rust_code = module.to_rust(
+        CodeGenContext::Module("test".to_string()),
+        options,
+        SymbolTableScopes::new(),
+    ).unwrap();
+    
     let rust_str = rust_code.to_string();
     assert!(rust_str.contains("use stdpython :: *"));
     assert!(rust_str.contains("len"));
@@ -73,16 +67,14 @@ result = greet("Python")
 print(result)
 "#;
     let module = parse(code, "test.py").unwrap();
-
+    
     let options = PythonOptions::default();
-    let rust_code = module
-        .to_rust(
-            CodeGenContext::Module("test".to_string()),
-            options,
-            SymbolTableScopes::new(),
-        )
-        .unwrap();
-
+    let rust_code = module.to_rust(
+        CodeGenContext::Module("test".to_string()),
+        options,
+        SymbolTableScopes::new(),
+    ).unwrap();
+    
     let rust_str = rust_code.to_string();
     assert!(rust_str.contains("use stdpython :: *"));
 }
@@ -91,18 +83,16 @@ print(result)
 fn test_nostd_mode() {
     let code = r#"print("Hello, world!")"#;
     let module = parse(code, "test.py").unwrap();
-
+    
     let mut options = PythonOptions::default();
     options.with_std_python = false;
-
-    let rust_code = module
-        .to_rust(
-            CodeGenContext::Module("test".to_string()),
-            options,
-            SymbolTableScopes::new(),
-        )
-        .unwrap();
-
+    
+    let rust_code = module.to_rust(
+        CodeGenContext::Module("test".to_string()),
+        options,
+        SymbolTableScopes::new(),
+    ).unwrap();
+    
     let rust_str = rust_code.to_string();
     assert!(!rust_str.contains("use stdpython :: *"));
 }

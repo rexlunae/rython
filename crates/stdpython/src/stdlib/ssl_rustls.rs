@@ -26,11 +26,13 @@ use super::{
 // (`ssl.OPENSSL_VERSION_INFO < (1, 1, 1)` — urllib3's __init__), and
 // rython tuples compare same-arity only, so this is the 3-prefix. All
 // zeros: rustls is not OpenSSL (a documented divergence).
-pub static OPENSSL_VERSION: std::sync::LazyLock<&'static str> =
-    std::sync::LazyLock::new(|| concat!("rustls ", env!("CARGO_PKG_VERSION")));
+pub static OPENSSL_VERSION: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+    concat!("rustls ", env!("CARGO_PKG_VERSION"))
+});
 pub static OPENSSL_VERSION_NUMBER: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| 0);
 pub static OPENSSL_VERSION_INFO: std::sync::LazyLock<(i64, i64, i64)> =
     std::sync::LazyLock::new(|| (0, 0, 0));
+
 
 /// A verifier that accepts any certificate — `verify_mode = CERT_NONE`
 /// (Python's "no verification" mode; the connection is still encrypted).
@@ -78,7 +80,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.0
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -176,7 +180,10 @@ impl SSLContext {
     }
 
     /// ssl.SSLContext.load_verify_locations(cafile) — a PEM bundle path.
-    pub fn load_verify_locations<P: AsRef<str>>(&mut self, cafile: P) -> Result<(), PyException> {
+    pub fn load_verify_locations<P: AsRef<str>>(
+        &mut self,
+        cafile: P,
+    ) -> Result<(), PyException> {
         let path = cafile.as_ref();
         let data = std::fs::read(path).map_err(|e| {
             PyException::new(
@@ -269,7 +276,9 @@ impl SSLContext {
             for cert in &self.extra_roots {
                 roots.add(cert.clone()).map_err(ssl_error)?;
             }
-            builder.with_root_certificates(roots).with_no_client_auth()
+            builder
+                .with_root_certificates(roots)
+                .with_no_client_auth()
         };
         config.alpn_protocols = self.alpn.clone();
         Ok(config)
@@ -284,8 +293,10 @@ impl SSLContext {
         server_hostname: S,
     ) -> Result<SSLSocket, PyException> {
         let config = Arc::new(self.client_config()?);
-        let name = rustls::pki_types::ServerName::try_from(server_hostname.as_ref().to_string())
-            .map_err(ssl_error)?;
+        let name = rustls::pki_types::ServerName::try_from(
+            server_hostname.as_ref().to_string(),
+        )
+        .map_err(ssl_error)?;
         let conn = rustls::ClientConnection::new(config, name).map_err(ssl_error)?;
         let tcp = sock.tcp_stream_clone()?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
@@ -306,11 +317,7 @@ impl SSLContext {
 /// with Python's reference semantics (clones share the session).
 #[derive(Clone)]
 pub struct SSLSocket {
-    inner: Arc<
-        std::sync::Mutex<
-            Option<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>,
-        >,
-    >,
+    inner: Arc<std::sync::Mutex<Option<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>>>,
 }
 
 impl SSLSocket {
@@ -323,7 +330,10 @@ impl SSLSocket {
         let mut guard = self.inner.lock().unwrap();
         match guard.as_mut() {
             Some(s) => f(s),
-            None => Err(PyException::new("OSError", "[Errno 9] Bad file descriptor")),
+            None => Err(PyException::new(
+                "OSError",
+                "[Errno 9] Bad file descriptor",
+            )),
         }
     }
 
@@ -469,7 +479,8 @@ mod tests {
         // A plain (non-CA) leaf with a localhost SAN — the realistic
         // server-cert shape; webpki rejects a CA-marked cert used as an
         // end-entity (CaUsedAsEndEntity).
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         let cert = params.self_signed(&key_pair).expect("self-signed cert");
         (cert, key_pair)
     }

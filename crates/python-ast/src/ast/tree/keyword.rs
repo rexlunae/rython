@@ -3,7 +3,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 // Keyword arguments are now handled by just passing values
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes};
+use crate::{CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes, Node};
 
 /// A keyword argument in a function call.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -31,9 +31,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Keyword {
         } else {
             None
         };
-
+        
         let value: ExprType = ob.getattr("value")?.extract()?;
-
+        
         Ok(Self {
             arg,
             value,
@@ -57,7 +57,7 @@ impl CodeGen for Keyword {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let value = self.value.to_rust(ctx, options, symbols)?;
-
+        
         if let Some(_keyword) = self.arg {
             // Named keyword argument: In Python this is keyword=value,
             // but in Rust we typically pass just the value
@@ -74,16 +74,8 @@ impl CodeGen for Keyword {
 }
 
 impl Node for Keyword {
-    fn lineno(&self) -> Option<usize> {
-        self.lineno
-    }
-    fn col_offset(&self) -> Option<usize> {
-        self.col_offset
-    }
-    fn end_lineno(&self) -> Option<usize> {
-        self.end_lineno
-    }
-    fn end_col_offset(&self) -> Option<usize> {
-        self.end_col_offset
-    }
+    fn lineno(&self) -> Option<usize> { self.lineno }
+    fn col_offset(&self) -> Option<usize> { self.col_offset }
+    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
+    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
 }

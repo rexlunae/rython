@@ -211,8 +211,10 @@ impl CodeGen for Name {
                         .find(|a| a.asname.as_deref() == Some(self.id.as_str()))
                         .map(|a| a.name.clone())
                         .unwrap_or_else(|| self.id.clone());
-                    if crate::ast::tree::module::module_promoted_static_names(&options, &path)
-                        .contains(&canonical)
+                    if crate::ast::tree::module::module_promoted_static_names(
+                        &options, &path,
+                    )
+                    .contains(&canonical)
                     {
                         return Ok(quote!((*#name).clone()));
                     }
@@ -222,7 +224,8 @@ impl CodeGen for Name {
             // requests' auth, where sha256_utf8 is a dropped nested
             // function): the callable-as-value divergence — the read lowers
             // to the boxed None.
-            if options.value_callables.contains(&self.id) {
+            if options.value_callables.contains(&self.id)
+            {
                 options.definition_warnings.borrow_mut().push(format!(
                     "callable `{}` read as a value lowers to the boxed None \
                      (the callable-as-value divergence, issue #122)",
@@ -243,7 +246,11 @@ impl CodeGen for Name {
             // import has no runtime item, so the read lowers to the boxed
             // None (external-module divergence, the same model call.rs and
             // attribute.rs use for external imports).
-            if crate::ast::tree::import::resolves_to_external_import(&self.id, &options, &symbols) {
+            if crate::ast::tree::import::resolves_to_external_import(
+                &self.id,
+                &options,
+                &symbols,
+            ) {
                 options.definition_warnings.borrow_mut().push(format!(
                     "`{}` is dropped: it is imported from a module that is \
                      external to the generated crate (external-module divergence)",

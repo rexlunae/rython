@@ -90,7 +90,9 @@ fn parse_field(field: &str) -> Result<Piece, String> {
         None => (field, ""),
     };
     if spec.contains('{') {
-        return Err("nested replacement fields in format specs are not supported yet".into());
+        return Err(
+            "nested replacement fields in format specs are not supported yet".into(),
+        );
     }
     let (name, conversion) = match name_conv.find('!') {
         Some(i) => {
@@ -100,7 +102,10 @@ fn parse_field(field: &str) -> Result<Piece, String> {
                 "s" => 's',
                 "a" => 'a',
                 other => {
-                    return Err(format!("Unknown conversion specifier {:?}", other));
+                    return Err(format!(
+                        "Unknown conversion specifier {:?}",
+                        other
+                    ));
                 }
             };
             (&name_conv[..i], Some(c))
@@ -110,11 +115,10 @@ fn parse_field(field: &str) -> Result<Piece, String> {
     let arg = if name.is_empty() {
         FieldRef::Auto
     } else if name.chars().all(|c| c.is_ascii_digit()) {
-        FieldRef::Index(
-            name.parse()
-                .map_err(|_| "field index too large".to_string())?,
-        )
-    } else if name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        FieldRef::Index(name.parse().map_err(|_| "field index too large".to_string())?)
+    } else if name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_')
         && !name.starts_with(|c: char| c.is_ascii_digit())
     {
         FieldRef::Name(name.to_string())
@@ -158,6 +162,7 @@ pub(crate) enum SpecLowering {
     GroupedInt,
 }
 
+
 /// Translate a Python format spec (the text after `:`) into a lowering
 /// producing IDENTICAL output, or a descriptive error when Rust's
 /// formatter cannot reproduce it.
@@ -181,7 +186,9 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
         i = 1;
     }
     if align == Some('=') {
-        return Err("the '=' (sign-aware padding) alignment is not supported yet".into());
+        return Err(
+            "the '=' (sign-aware padding) alignment is not supported yet".into(),
+        );
     }
 
     let mut sign: Option<char> = None;
@@ -263,9 +270,11 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
         None | Some('d') | Some('s') => {
             // The `,` separator applies to integers only (d or empty).
             if grouped && ty == Some('s') {
-                return Err("the ',' thousands separator is not supported with the 's' \
+                return Err(
+                    "the ',' thousands separator is not supported with the 's' \
                      presentation type"
-                    .into());
+                        .into(),
+                );
             }
         }
         Some('f') | Some('F') => {
@@ -352,20 +361,9 @@ mod tests {
         assert_eq!(translate_format_spec("+d").unwrap(), Inline("+".into()));
         assert_eq!(
             translate_format_spec("#x").unwrap(),
-            IntRadix {
-                fill: ' ',
-                align: '\0',
-                plus: false,
-                alternate: true,
-                zero: false,
-                width: 0,
-                radix: 'x'
-            }
+            IntRadix { fill: ' ', align: '\0', plus: false, alternate: true, zero: false, width: 0, radix: 'x' }
         );
-        assert_eq!(
-            translate_format_spec("8.3f").unwrap(),
-            CastF64("8.3".into())
-        );
+        assert_eq!(translate_format_spec("8.3f").unwrap(), CastF64("8.3".into()));
         assert_eq!(translate_format_spec(".3s").unwrap(), Inline(".3".into()));
         // Bare precision is Python's general float format — ambiguous
         // without the operand type, so it is loud.

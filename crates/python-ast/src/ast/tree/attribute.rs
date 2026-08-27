@@ -169,16 +169,23 @@ impl<'a> CodeGen for Attribute {
                 })
             };
             let owning_class: Option<String> = match self.value.as_ref() {
-                ExprType::Name(receiver) if receiver.id == "self" || receiver.id == "cls" => ctx
-                    .enclosing_class_name()
-                    .and_then(|c| match symbols.get(c) {
-                        Some(crate::SymbolTableNode::ClassDef(cd)) if attr_is_lazy_const(cd) => {
-                            Some(cd.name.clone())
-                        }
-                        _ => None,
-                    }),
+                ExprType::Name(receiver)
+                    if receiver.id == "self" || receiver.id == "cls" =>
+                {
+                    ctx.enclosing_class_name()
+                        .and_then(|c| match symbols.get(c) {
+                            Some(crate::SymbolTableNode::ClassDef(cd))
+                                if attr_is_lazy_const(cd) =>
+                            {
+                                Some(cd.name.clone())
+                            }
+                            _ => None,
+                        })
+                }
                 ExprType::Name(receiver) => match symbols.get(&receiver.id) {
-                    Some(crate::SymbolTableNode::ClassDef(cd)) if attr_is_lazy_const(cd) => {
+                    Some(crate::SymbolTableNode::ClassDef(cd))
+                        if attr_is_lazy_const(cd) =>
+                    {
                         Some(cd.name.clone())
                     }
                     _ => None,
@@ -269,7 +276,9 @@ impl<'a> CodeGen for Attribute {
                 .is_some_and(|mod_path| {
                     options.module_defs.contains_key(&mod_path)
                         && crate::ast::tree::module::module_def_has_path_item(
-                            &options, &mod_path, &self.attr,
+                            &options,
+                            &mod_path,
+                            &self.attr,
                         )
                         && crate::module_class_def(&options, &mod_path, &self.attr).is_some()
                 });
@@ -280,7 +289,9 @@ impl<'a> CodeGen for Attribute {
                 .is_some_and(|mod_path| {
                     options.module_defs.contains_key(&mod_path)
                         && !crate::ast::tree::module::module_def_has_path_item(
-                            &options, &mod_path, &self.attr,
+                            &options,
+                            &mod_path,
+                            &self.attr,
                         )
                 });
         // An attribute read on an except-bound name (`e.expected` —
@@ -291,7 +302,9 @@ impl<'a> CodeGen for Attribute {
         // before `self.value`/`symbols` are moved below.
         let except_binding_receiver: Option<String> = match self.value.as_ref() {
             ExprType::Name(receiver) => match symbols.get(&receiver.id) {
-                Some(crate::SymbolTableNode::ExceptBinding) => Some(receiver.id.clone()),
+                Some(crate::SymbolTableNode::ExceptBinding) => {
+                    Some(receiver.id.clone())
+                }
                 _ => None,
             },
             _ => None,
@@ -341,7 +354,8 @@ impl<'a> CodeGen for Attribute {
         // each inner attribute resolves the same way. ImportFrom bindings
         // are VALUES (a function/class), not modules, so they never turn
         // attribute access into a path.
-        let is_module_access = !root_shadowed && (module_access_token(&value_str) || module_chain);
+        let is_module_access =
+            !root_shadowed && (module_access_token(&value_str) || module_chain);
 
         if is_module_access {
             // An EXTERNAL module (ssl, socket, zlib, logging, ...) has no
@@ -584,9 +598,7 @@ pub(crate) fn to_rust_place_expr(
             let root_shadowed = crate::ast::tree::call::root_name(&attr.value)
                 .is_some_and(|root| crate::module_name_shadowed(root, symbols));
             let value_tokens =
-                attr.value
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let is_module = !root_shadowed
                 && (crate::ast::tree::call::root_name(&attr.value).is_some_and(|_root| {
                     crate::ast::tree::attribute::is_module_path_chain(&attr.value, symbols, options)
@@ -613,7 +625,8 @@ pub(crate) fn to_rust_place_expr(
             // `Inner` with no rewrite — the place flavor of the receiver is
             // what keeps the store on the real field.
             let recv_place = to_rust_place_expr(&attr.value, ctx, options, symbols, false)?;
-            let field_access = class_field_access(&attr.value, &attr.attr, ctx, symbols, options);
+            let field_access =
+                class_field_access(&attr.value, &attr.attr, ctx, symbols, options);
             let attr_ident = crate::safe_ident(&attr.attr);
             match field_access {
                 None => Ok(quote!(#recv_place.#attr_ident)),
@@ -635,15 +648,15 @@ pub(crate) fn to_rust_place_expr(
                 }
             }
         }
-        ExprType::Subscript(sub) => crate::ast::tree::subscript::subscript_receiver_place(
-            &ExprType::Subscript(sub.clone()),
-            ctx.clone(),
-            options.clone(),
-            symbols.clone(),
-        ),
-        _ => expr
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone()),
+        ExprType::Subscript(sub) => {
+            crate::ast::tree::subscript::subscript_receiver_place(
+                &ExprType::Subscript(sub.clone()),
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )
+        }
+        _ => expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()),
     }
 }
 
@@ -787,12 +800,15 @@ pub(crate) fn is_module_path_chain(
                         return true;
                     }
                     let path = ifm.resolved_module_path(options);
-                    crate::module_defs_key(options, &path).is_some_and(|key| {
-                        crate::ast::tree::module::module_reexports_stdpython_module(
-                            options, key, &n.id,
-                        )
-                        .is_some()
-                    })
+                    crate::module_defs_key(options, &path)
+                        .is_some_and(|key| {
+                            crate::ast::tree::module::module_reexports_stdpython_module(
+                                options,
+                                key,
+                                &n.id,
+                            )
+                            .is_some()
+                        })
                 }
                 // An ABSOLUTE import whose name resolves to a crate
                 // SUBMODULE (`from urllib3.contrib import pyopenssl` —
@@ -844,9 +860,7 @@ fn receiver_class_deep(
             let ExprType::Attribute(a) = c.func.as_ref() else {
                 return None;
             };
-            if let Some(r) =
-                crate::receiver_class(&ExprType::Attribute(a.clone()), ctx, symbols, options)
-            {
+            if let Some(r) = crate::receiver_class(&ExprType::Attribute(a.clone()), ctx, symbols, options) {
                 return Some(r);
             }
             if let Some(stripped) = a.attr.strip_suffix("_mut") {
@@ -872,7 +886,9 @@ fn field_chain_ends_in_pyvalue(
     let ExprType::Attribute(a) = expr else {
         return false;
     };
-    let Some((class, class_symbols)) = receiver_class_deep(&a.value, ctx, symbols, options) else {
+    let Some((class, class_symbols)) =
+        receiver_class_deep(&a.value, ctx, symbols, options)
+    else {
         return false;
     };
     let Ok(fields) = class.infer_fields(&class_symbols, options) else {
