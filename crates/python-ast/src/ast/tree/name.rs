@@ -145,6 +145,17 @@ impl CodeGen for Name {
             // the module global, as in Python.
             if let Some(kind) = options.mutable_statics.get(&self.id) {
                 let global_ref = kind.static_ref(&name);
+                // Issue #189: a class-instance global's VALUE read is the
+                // INSTANCE — the Option is the static's representation, and
+                // reading while None is a loud runtime panic (§12.2). `is
+                // None` compares read the Option instead (compare.rs).
+                if let crate::MutableGlobalKind::Class { .. } = kind {
+                    let msg =
+                        format!("module global `{}` read while None (issue #189)", self.id);
+                    return Ok(quote!(
+                        stdpython::py_global_read(#global_ref).expect(#msg)
+                    ));
+                }
                 return Ok(quote!(stdpython::py_global_read(#global_ref)));
             }
             // A module-level value promoted to a LazyLock static (module.rs):

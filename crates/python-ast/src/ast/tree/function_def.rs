@@ -3305,6 +3305,43 @@ impl FunctionDef {
         })
     }
 
+    /// The class a factory function returns, for receiver resolution
+    /// (`history_recorder = get_global_history_recorder()` then
+    /// `.record(...)` — botocore's client.py). The `-> ClassName`
+    /// annotation when it names a type; else — for the unannotated
+    /// lazy-singleton shape (issue #189) — the single class-instance
+    /// module global every return reads. None when neither applies.
+    pub fn return_class_name(&self, options: &crate::PythonOptions) -> Option<String> {
+        if let Some(ann) = self.returns.as_ref() {
+            return match ann.as_ref() {
+                ExprType::Name(r) => Some(r.id.clone()),
+                _ => None,
+            };
+        }
+        // Unannotated: every return must be the same Class-kind mutable
+        // static (a bare/implicit None return bails — the receiver could
+        // be None, which no class type represents).
+        let mut returns = Vec::new();
+        collect_returns(&self.body, &mut returns);
+        let mut class: Option<String> = None;
+        for ret in &returns {
+            let value = (*ret)?;
+            let ExprType::Name(name) = value else {
+                return None;
+            };
+            match options.mutable_statics.get(&name.id) {
+                Some(crate::MutableGlobalKind::Class { class: c }) => {
+                    if class.is_some() && class.as_deref() != Some(c.as_str()) {
+                        return None;
+                    }
+                    class = Some(c.clone());
+                }
+                _ => return None,
+            }
+        }
+        class
+    }
+
     /// The return type the generated Rust function actually carries, if any.
     ///
     /// Inference from the body comes first (it reflects the type the body
@@ -3416,7 +3453,7 @@ impl FunctionDef {
         {
             return Some(quote!(Self));
         }
-        self.inferred_return_type()
+        self.inferred_return_type(options)
             .or(annotated)
             .or_else(|| self.boxed_list_return_type(symbols, options))
     }
@@ -3554,7 +3591,7 @@ impl FunctionDef {
     /// returns (which implicitly return None on the fall-through path),
     /// mixed types, and uninferable values all yield None so the function
     /// stays unannotated, as before.
-    pub fn inferred_return_type(&self) -> Option<TokenStream> {
+    pub fn inferred_return_type(&self, options: &crate::PythonOptions) -> Option<TokenStream> {
         // A function that can fall off the end must not get a concrete
         // return annotation: the implicit tail is `()`.
         if !guarantees_return(&self.body) {
@@ -3578,16 +3615,29 @@ impl FunctionDef {
         for ret in &returns {
             let value = (*ret)?; // a bare `return` means the type is unit
             let ty = match value {
-                ExprType::Name(name) => {
-                    let t = locals.get(&name.id)?.clone();
-                    if t.to_string() == quote!(&'static str).to_string()
-                        && rebound.contains(&name.id)
-                    {
-                        quote!(String)
-                    } else {
-                        t
+                ExprType::Name(name) => match locals.get(&name.id) {
+                    Some(t) => {
+                        let t = t.clone();
+                        if t.to_string() == quote!(&'static str).to_string()
+                            && rebound.contains(&name.id)
+                        {
+                            quote!(String)
+                        } else {
+                            t
+                        }
                     }
-                }
+                    // Issue #189: a class-instance module global reads as
+                    // the INSTANCE (the Option is the static's
+                    // representation), so `return HISTORY_RECORDER` types
+                    // the function as the class.
+                    None => match options.mutable_statics.get(&name.id) {
+                        Some(crate::MutableGlobalKind::Class { class }) => {
+                            let ident = crate::safe_ident(class);
+                            quote!(#ident)
+                        }
+                        _ => return None,
+                    },
+                },
                 other => simple_expr_type(other)?,
             };
             match &inferred {

@@ -8715,17 +8715,20 @@ fn global_none_singleton_boxes_to_a_pyvalue_static() {
 }
 
 #[test]
-fn global_class_instance_store_is_loud_at_function_scope() {
-    // The remaining boxed-global edge (issue #189): a `global`-declared
-    // store of a CLASS INSTANCE (`HISTORY_RECORDER = HistoryRecorder()`
-    // — botocore's history.py) has no PyValue representation, so the
-    // function-scope write is a loud conversion error naming the rewrite.
-    let err = compile_err(
+fn global_class_instance_lowers_to_a_typed_static() {
+    // Issue #189: the lazy-singleton shape (botocore's history.py) — a
+    // None-initialized global whose `global`-writing function stores
+    // exactly one LOCAL class construction — lowers to
+    // `Mutex<Option<Class>>`: None / `Some(instance)` stores, the `is
+    // None` compare reading the Option, value reads unwrapping with a
+    // loud panic while None, and the getter's return type is the class.
+    let out = compile(
         concat!(
             "class HistoryRecorder:\n",
-            "    pass\n",
+            "    def __init__(self) -> None:\n",
+            "        self.events = []\n",
             "RECORDER = None\n",
-            "def get():\n",
+            "def get_recorder() -> HistoryRecorder:\n",
             "    global RECORDER\n",
             "    if RECORDER is None:\n",
             "        RECORDER = HistoryRecorder()\n",
@@ -8734,8 +8737,58 @@ fn global_class_instance_store_is_loud_at_function_scope() {
         "global_class_store.py",
     );
     assert!(
+        out.contains("pub static RECORDER : std :: sync :: Mutex < Option < HistoryRecorder >> = std :: sync :: Mutex :: new (None)"),
+        "the static must be typed Option<HistoryRecorder>: {}",
+        out
+    );
+    assert!(
+        out.contains("py_global_write (& RECORDER , Some ({ HistoryRecorder :: new () ? }))"),
+        "the class store must wrap in Some: {}",
+        out
+    );
+    assert!(
+        out.contains("(stdpython :: py_global_read (& RECORDER)) . py_is_none ()"),
+        "the None check must read the Option: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: py_global_read (& RECORDER) . expect ("),
+        "the value read must unwrap the instance: {}",
+        out
+    );
+    assert!(
+        out.contains("fn get_recorder () -> Result < HistoryRecorder , PyException >"),
+        "the getter returns the instance: {}",
+        out
+    );
+}
+
+#[test]
+fn global_class_instance_stays_loud_for_unsupported_stores() {
+    // Outside the recognized pattern the store is still a loud conversion
+    // error: a container literal into a None-initialized Boxed global, and
+    // a class instance into a global the detection disqualified (two
+    // different classes). Correct-or-loud, never silently None.
+    let err = compile_err(
+        concat!(
+            "class A:\n",
+            "    pass\n",
+            "class B:\n",
+            "    pass\n",
+            "X = None\n",
+            "def set_x(flag: bool) -> None:\n",
+            "    global X\n",
+            "    if flag:\n",
+            "        X = A()\n",
+            "    else:\n",
+            "        X = B()\n",
+            "    return None\n",
+        ),
+        "global_class_loud.py",
+    );
+    assert!(
         err.contains("no boxed representation") && err.contains("issue #189"),
-        "the loud error must cite the tracked gap: {}",
+        "two different classes disqualify the pattern: {}",
         err
     );
 }

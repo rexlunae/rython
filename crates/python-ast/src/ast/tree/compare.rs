@@ -8,6 +8,23 @@ use crate::{
     PythonOptions, SymbolTableScopes,
 };
 
+/// The `is None` read for an operand (issue #189): a class-instance module
+/// global's VALUE reads render the unwrapped instance (name.rs), so a
+/// None-ness test must read the Option the static actually holds. Returns
+/// the Option-read tokens when the operand is such a global, else None.
+fn class_global_none_check(operand: &ExprType, options: &PythonOptions) -> Option<TokenStream> {
+    if let ExprType::Name(n) = operand
+        && matches!(
+            options.mutable_statics.get(&n.id),
+            Some(crate::MutableGlobalKind::Class { .. })
+        )
+    {
+        let ident = crate::safe_ident(&n.id);
+        return Some(quote!(stdpython::py_global_read(&#ident)));
+    }
+    None
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Compares {
     Eq,
@@ -159,9 +176,12 @@ impl CodeGen for Compare {
                     None
                 };
                 if let Some(operand) = none_check {
-                    let operand_tokens = operand
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let operand_tokens = match class_global_none_check(operand, &options) {
+                        Some(ts) => ts,
+                        None => operand
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                    };
                     let tokens = match op {
                         Compares::Is => quote!((#operand_tokens).py_is_none()),
                         _ => quote!(!(#operand_tokens).py_is_none()),
@@ -412,6 +432,20 @@ impl Compare {
                     None
                 };
                 if let Some(operand) = operand {
+                    // Issue #189: the None-tested operand may be a
+                    // class-instance global — its temporary was rendered as
+                    // the unwrapped instance, so test the Option directly.
+                    let operand_ast = if is_none[i + 1] {
+                        operands[i]
+                    } else {
+                        operands[i + 1]
+                    };
+                    if let Some(ts) = class_global_none_check(operand_ast, &options) {
+                        return Ok(match op {
+                            Compares::Is => quote!((#ts).py_is_none()),
+                            _ => quote!(!(#ts).py_is_none()),
+                        });
+                    }
                     return Ok(match op {
                         Compares::Is => quote!((#operand).py_is_none()),
                         _ => quote!(!(#operand).py_is_none()),
