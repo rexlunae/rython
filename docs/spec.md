@@ -883,6 +883,57 @@ in CPython's `<urlopen error …>` shape (reason wording is
 backend-derived, §12.3). `URLError`/`HTTPError`/`gaierror` are wired
 into the exception hierarchy (`except OSError:` catches them).
 
+### 10.6 numpy
+
+`import numpy as np` maps onto the runtime's `numpy` module. Arrays are
+VALUES (copies), not views: indexing, slicing and reshaping copy the
+elements they touch.
+
+**Accepted surface.** Creation: `array`, `asarray`, `zeros`, `ones`,
+`full`, `empty`, `arange`, `linspace`, `eye`, `identity`, `dtype`.
+Shape: `reshape`, `ravel`, `transpose`, `concatenate`, `vstack`,
+`hstack`. Selection: `clip`, `where`, `sort`, `argsort`. Reductions:
+`sum`, `prod`, `mean`, `max`, `min`, `std`, `var`, `all`, `any`,
+`argmax`, `argmin`. Linear algebra: `dot`, `matmul`, `vdot`, and
+`np.linalg.{inv,det,solve}`. The ufuncs (`add`, `subtract`, `multiply`,
+`divide`, `floor_divide`, `mod`, `power`, `maximum`, `minimum`, `sqrt`,
+`exp`, `log`, `log2`, `log10`, the trig and hyperbolic family, `floor`,
+`ceil`, `abs`, `negative`, `square`, `sign`, `reciprocal`, `expm1`,
+`log1p`, `isfinite`, `isinf`, `isnan`, `logical_not`) and the
+comparisons (`equal`, `not_equal`, `less`, `less_equal`, `greater`,
+`greater_equal`, `bitwise_and`, `bitwise_or`, `bitwise_xor`). The dtype
+casts (`np.float64(x)`, `np.int64(x)`, …) and `dtype=` on the
+constructors, over `float64`, `float32`, `int64`, `int32`, `bool_`.
+Array attributes `shape` (a tuple), `ndim`, `size`, `dtype`, `T`, and
+the methods `sum`, `prod`, `mean`, `max`, `min`, `std`, `var`, `all`,
+`any`, `argmax`, `argmin`, `reshape`, `ravel`, `copy`, `astype`.
+Indexing, slicing, boolean-mask indexing, iteration, in-place `+=`/`*=`,
+and broadcasting all follow numpy.
+
+**Printing** reproduces numpy's own formatter: `precision=8`,
+column-aligned cells, `linewidth=75` wrapping, `threshold=1000`
+summarization with `edgeitems=3`, exponential mode past the dtype's
+cutoff, and numpy's `repr` with its `shape=`/`dtype=` extras.
+
+**Outside the subset**, and a loud conversion error naming the
+construct: `axis=` on reductions, the positional `axis` of
+`np.concatenate`/`np.std`/`np.var`, `np.linspace(..., endpoint=False)`,
+`np.full(..., dtype=…)`, every numpy submodule other than `linalg`
+(including `np.random`), and any function not listed above.
+
+**Execution backends.** Every elementwise kernel dispatches through one
+engine chosen once per process: `scalar` (always built), `rayon`
+(`numpy-rayon`), `simd` (`numpy-simd`, currently an alias of `scalar`),
+`cuda` (`numpy-cuda`) and `vulkan` (`numpy-vulkan`) — the last two
+compile but ship no kernels yet. Selection is `np.set_backend("...")`,
+the `RYPY_NUMPY_BACKEND` environment variable, or `rythonc
+--numpy-backend`; `auto` picks the best engine compiled in. Requesting
+an engine the binary lacks is a loud `RuntimeError`, never a silent
+fallback. Every backend produces identical results — the parity is
+pinned by tests.
+
+The divergences that remain are ledgered in §12.2 and §12.3.
+
 ---
 
 ## 11. Interop and targets
@@ -1026,6 +1077,10 @@ catchable `PyException`:
 - Sorting a `NaN`; `hash(nan)`.
 - Arithmetic on `None`.
 - An exception escaping a lambda body.
+- numpy shape mismatches through the OPERATOR spelling (`a + b` on
+  arrays of different shapes). The function spelling `np.add(a, b)`
+  raises a catchable `ValueError`; the operator traits have no fallible
+  form yet, so that spelling panics with the same message.
 
 The intended model is the one `ZeroDivisionError` already follows —
 fallible operations return `Result<T, PyException>` and propagate with
@@ -1059,6 +1114,10 @@ accepted as permanent spec:
 | TCP `socket.bind()` binds AND starts listening (std::net has no half-bound TCP socket); a connection can be accepted by the OS before `listen()` runs, and binding a client socket before `connect()` is a loud error | Model limit of the std::net backend |
 | `URLError`'s reason text inside CPython's `<urlopen error …>` shape is the HTTP backend's wording, not CPython's | Model limit of the wrapped-crate convention (§10.2.1) |
 | `HTTPError` carries CPython's message but not the error response's body/headers (exceptions are string-tagged values) | Model limit; §8.1 representation |
+| numpy reductions on integer and bool arrays return `float` (`np.sum(np.array([1, 2, 3]))` prints `6.0`, not `6`) — `NdArray`'s dtype is a runtime value, so one static return type must serve every dtype | Model limit; `np.all`/`np.any`/`np.argmax`/`np.argmin` are single-typed in numpy too and match exactly |
+| `np.linalg.det`/`inv`/`solve` differ from LAPACK in the last bits (rython's decomposition is not LAPACK's) | Model limit; results agree to floating-point method differences, not bit-for-bit |
+| `np.dot` returns an ARRAY for the 1-D x 1-D case unless both operands are provably 1-D at conversion time, where numpy returns a scalar; the printed form is identical either way, so only arithmetic on the result differs | Model limit of one static type per expression (issue #206) |
+| numpy `RuntimeWarning`s (integer divide by zero, invalid value) are not emitted; the VALUES match numpy exactly | Model limit; no `warnings` machinery on the numpy path |
 | Verified stdlib divergences (json/defaultdict ordering, `math.remainder`, `strftime` edge cases, `glob` paths, `pathlib` edges, `string.Template`, …) | Tracked as defects in issue #82 |
 
 ---

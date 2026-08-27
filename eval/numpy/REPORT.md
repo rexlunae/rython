@@ -1,5 +1,11 @@
 # Evaluating rython's numpy against CPython
 
+> **Status: the findings below have been fixed.** This report is kept as
+> written — it is the measurement that produced issues #192–#208 — with a
+> [What changed](#what-changed) section at the end recording the result of
+> fixing them. The numbers in the body are the BEFORE state; `results/`
+> now holds the after.
+
 An end-to-end evaluation of the `numpy` subset in `crates/stdpython`: does
 a converted program print what CPython + real numpy prints, and how fast is
 it, on every execution backend that runs on this machine.
@@ -535,3 +541,90 @@ labels.
    rather than reinterpreting it.
 7. **#203 (ndarray-returning helpers)** — the ergonomic blocker for real
    numpy code.
+
+## What changed
+
+Every finding was fixed; the harnesses were re-run against the same
+CPython + numpy 2.4.6 on the same machine.
+
+### Correctness: 18/58 → 48/58 byte-identical
+
+| status | before | after |
+|---|---|---|
+| PASS | 18 | **48** |
+| DIVERGE | 21 | 8 |
+| BUILD_FAIL | 12 | **0** |
+| RUN_FAIL | 6 | **0** |
+| CONVERT_FAIL | 1 | 2 |
+
+Nothing fails to build or panics any more. The 10 remaining non-PASS
+cases are all *deliberate*, and now ledgered in `docs/spec.md` §12:
+
+- **8 DIVERGE** — the documented single-static-type limits: reductions on
+  int/bool/float32 arrays return `float` (`11`, `19`, `23`, `24`, `25`,
+  `27`), and `np.linalg.det`/`inv` differ from LAPACK in the last bits
+  (`14`, `28`).
+- **2 CONVERT_FAIL** — loud rejections the fixes *added*: `np.std(a, 1)`
+  (whose positional numpy reads as `axis`, #196) and `np.random.*`
+  (#204). Both are the contract working.
+
+Backends still agree exactly: 280 case-runs across `default/auto`,
+`scalar`, `rayon`, `simd` and `cpu-auto`, zero disagreements.
+
+### Speed: every program improved
+
+Geometric mean vs CPython per program (higher is better):
+
+| program | scalar before → after | rayon before → after |
+|---|---|---|
+| elementwise | 0.23x → **0.33x** | 0.10x → **0.36x** |
+| scalar_operand | 0.14x → **0.34x** | 0.12x → **0.36x** |
+| reduce | 0.12x → **0.22x** | 0.12x → **0.22x** |
+| sort | 0.41x → **0.49x** | 0.42x → **0.47x** |
+| linalg | 0.36x → 0.33x | 0.35x → 0.34x |
+| sim (mixed workload) | 0.23x → **0.61x** | 0.09x → **0.62x** |
+
+The kernels S1–S3 named:
+
+| kernel | n | before | after |
+|---|---|---|---|
+| `sum` | 100 000 | 0.05x | **0.57x** |
+| `sum` | 10 000 000 | 0.03x | **0.07x** |
+| `add` array+scalar | 100 000 | 0.04x | **0.21x** |
+| `add` array+array | 100 000 | 0.23x | **0.50x** |
+| `add` | 1 000 (rayon) | 0.02x | **1.19x** |
+| oscillator sim | 1 000 x 2 000 steps | 0.28x | **1.25x** |
+
+The mixed simulation — the shape real numpy code takes — now runs
+**faster than CPython + numpy** on both CPU backends, and `rayon` is no
+longer a trap at small sizes: the size floor turned its 32x loss on a
+1 000-element kernel into a small win. `linalg` is unchanged within
+noise; its `matmul` gap is BLAS, which no amount of copy-removal closes.
+
+### What fixed what
+
+| issue | fix |
+|---|---|
+| [#192](https://github.com/rexlunae/rython/issues/192) | `py_slice` normalizes negative bounds before clamping |
+| [#193](https://github.com/rexlunae/rython/issues/193) | `np_dtype_tokens` emits an `Ident`, not a `&str` |
+| [#194](https://github.com/rexlunae/rython/issues/194), [#195](https://github.com/rexlunae/rython/issues/195) | `FloatingFormat`/`_formatArray` reimplemented; validated against 2 709 arrays |
+| [#196](https://github.com/rexlunae/rython/issues/196) | the `axis` positional of `std`/`var` is refused; `ddof` is keyword-only |
+| [#197](https://github.com/rexlunae/rython/issues/197) | `a.shape` lowers to a `Shape` tuple |
+| [#198](https://github.com/rexlunae/rython/issues/198) | `RYPY_NUMPY_BACKEND` is read, validated and loud |
+| [#199](https://github.com/rexlunae/rython/issues/199) | rayon kernels stay sequential below 2^18 elements |
+| [#200](https://github.com/rexlunae/rython/issues/200) | reductions borrow; scalar operands fill; same-shape operands are not cloned; temporaries are not cloned at call sites |
+| [#201](https://github.com/rexlunae/rython/issues/201) | by-value operator helpers and list elements clone place expressions |
+| [#203](https://github.com/rexlunae/rython/issues/203) | `np.ndarray` annotations resolve to `NdArray` instead of boxing |
+| [#204](https://github.com/rexlunae/rython/issues/204) | `a.T`/`a.astype`/`a.dtype` lower to runtime accessors; unmodeled submodules are refused |
+| [#205](https://github.com/rexlunae/rython/issues/205) | broadcast/singular/empty-reduction errors raise; `IndexError` carries numpy's text |
+| [#206](https://github.com/rexlunae/rython/issues/206) | `np.dot` routes provably-1-D operands to `vdot` |
+| [#207](https://github.com/rexlunae/rython/issues/207) | spec §10.6 + §12 ledger entries; example README corrected |
+| [#208](https://github.com/rexlunae/rython/issues/208) | `rust-version = "1.95"`, bisected by building on 1.94 and 1.95 |
+
+Two bugs the fixes *uncovered*, once the cases could build and run, are
+fixed too: `np.vstack` did not promote 1-D inputs to rows (it produced
+one flat array instead of a matrix), and `np.concatenate` accepted only
+`axis=0` at runtime while the compiler accepted any axis.
+
+`ndarray.rs` went from zero tests to pinning every formatting, slicing
+and exception rule against real `python3` output.

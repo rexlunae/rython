@@ -211,16 +211,13 @@ pub fn det(a: NdArray) -> f64 {
 
 /// `np.linalg.inv(a)` — inverse of a square matrix by Gauss-Jordan with
 /// partial pivoting.
-pub fn inv(a: NdArray) -> NdArray {
+pub fn inv(a: NdArray) -> Result<NdArray, PyException> {
     let (n, n2, m) = as_matrix(&a, "inv");
     if n != n2 {
-        panic!(
-            "{}",
-            PyException::new(
-                "ValueError",
-                format!("inv: last 2 dimensions of the array must be square (got {n}x{n2})")
-            )
-        );
+        return Err(PyException::new(
+            "ValueError",
+            format!("inv: last 2 dimensions of the array must be square (got {n}x{n2})"),
+        ));
     }
     let mut aug = vec![0.0f64; n * n * 2];
     for i in 0..n {
@@ -237,10 +234,8 @@ pub fn inv(a: NdArray) -> NdArray {
             }
         }
         if aug[piv * (2 * n) + k] == 0.0 {
-            panic!(
-                "{}",
-                PyException::new("LinAlgError", "Singular matrix (det == 0); cannot invert")
-            );
+            // numpy's own wording, and CATCHABLE (issue #205).
+            return Err(PyException::new("LinAlgError", "Singular matrix"));
         }
         if piv != k {
             for j in 0..2 * n {
@@ -268,42 +263,33 @@ pub fn inv(a: NdArray) -> NdArray {
             out[i * n + j] = aug[i * (2 * n) + n + j];
         }
     }
-    NdArray::new(vec![n, n], Dtype::Float64, Data::F64(out))
+    Ok(NdArray::new(vec![n, n], Dtype::Float64, Data::F64(out)))
 }
 
 /// `np.linalg.solve(a, b)` — solve A·x = b for square A; b may be 1-D
 /// (vector) or 2-D (matrix of right-hand sides).
-pub fn solve(a: NdArray, b: NdArray) -> NdArray {
+pub fn solve(a: NdArray, b: NdArray) -> Result<NdArray, PyException> {
     let (n, n2, m) = as_matrix(&a, "solve");
     if n != n2 {
-        panic!(
-            "{}",
-            PyException::new(
-                "ValueError",
-                format!("solve: input a must be square (got {n}x{n2})")
-            )
-        );
+        return Err(PyException::new(
+            "ValueError",
+            format!("solve: input a must be square (got {n}x{n2})"),
+        ));
     }
     let rhs_cols = if b.ndim == 2 {
         if b.shape[0] != n {
-            panic!(
-                "{}",
-                PyException::new(
-                    "ValueError",
-                    format!("solve: incompatible dimensions ({n},{n}) and {:?}", b.shape)
-                )
-            );
+            return Err(PyException::new(
+                "ValueError",
+                format!("solve: incompatible dimensions ({n},{n}) and {:?}", b.shape),
+            ));
         }
         b.shape[1]
     } else {
         if b.size != n {
-            panic!(
-                "{}",
-                PyException::new(
-                    "ValueError",
-                    format!("solve: incompatible dimensions ({n},{n}) and ({},)", b.size)
-                )
-            );
+            return Err(PyException::new(
+                "ValueError",
+                format!("solve: incompatible dimensions ({n},{n}) and ({},)", b.size),
+            ));
         }
         1
     };
@@ -330,7 +316,7 @@ pub fn solve(a: NdArray, b: NdArray) -> NdArray {
             }
         }
         if aug[piv * (n + rhs_cols) + k] == 0.0 {
-            panic!("{}", PyException::new("LinAlgError", "Singular matrix"));
+            return Err(PyException::new("LinAlgError", "Singular matrix"));
         }
         if piv != k {
             for j in 0..n + rhs_cols {
@@ -357,7 +343,7 @@ pub fn solve(a: NdArray, b: NdArray) -> NdArray {
         for i in 0..n {
             out[i] = aug[i * (n + 1) + n];
         }
-        NdArray::new(vec![n], Dtype::Float64, Data::F64(out))
+        Ok(NdArray::new(vec![n], Dtype::Float64, Data::F64(out)))
     } else {
         let mut out = vec![0.0f64; n * rhs_cols];
         for i in 0..n {
@@ -365,6 +351,10 @@ pub fn solve(a: NdArray, b: NdArray) -> NdArray {
                 out[i * rhs_cols + c] = aug[i * (n + rhs_cols) + n + c];
             }
         }
-        NdArray::new(vec![n, rhs_cols], Dtype::Float64, Data::F64(out))
+        Ok(NdArray::new(
+            vec![n, rhs_cols],
+            Dtype::Float64,
+            Data::F64(out),
+        ))
     }
 }

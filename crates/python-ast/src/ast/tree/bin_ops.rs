@@ -165,6 +165,8 @@ impl CodeGen for BinOp {
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = clone_if_place(&self.left, left);
+            let right = clone_if_place(&self.right, right);
             return Ok(quote!(py_pow(#left, #right)));
         }
 
@@ -179,6 +181,8 @@ impl CodeGen for BinOp {
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = clone_if_place(&self.left, left);
+            let right = clone_if_place(&self.right, right);
             return Ok(quote!(py_div(#left, #right)?));
         }
 
@@ -192,6 +196,8 @@ impl CodeGen for BinOp {
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = clone_if_place(&self.left, left);
+            let right = clone_if_place(&self.right, right);
             return Ok(quote!(py_matmul(#left, #right)));
         }
 
@@ -205,6 +211,8 @@ impl CodeGen for BinOp {
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = clone_if_place(&self.left, left);
+            let right = clone_if_place(&self.right, right);
             return Ok(quote!(py_floordiv(#left, #right)?));
         }
 
@@ -214,6 +222,8 @@ impl CodeGen for BinOp {
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = clone_if_place(&self.left, left);
+            let right = clone_if_place(&self.right, right);
             return Ok(quote!(py_mod(#left, #right)?));
         }
 
@@ -287,6 +297,26 @@ impl CodeGen for BinOp {
 
         // Use the generic binary operation implementation for everything else
         self.generate_rust_code(ctx, options, symbols)
+    }
+}
+
+/// Clone a VARIABLE operand handed to a by-value helper.
+///
+/// `py_add`/`py_sub`/`py_mul` borrow, so `x + y` never moves; the helpers
+/// below (`py_div`, `py_floordiv`, `py_mod`, `py_pow`, `py_matmul`) take
+/// ownership, which moved out of the variable and made any later use a
+/// borrow-checker error in the generated crate — `print(b / a)` followed by
+/// `print(a * 2.0)` on numpy arrays (issue #201). Python has no such
+/// restriction, and rython's value semantics say a name survives being
+/// used. Only place expressions are cloned: temporaries cannot be moved
+/// from twice, and a bare numeric literal must stay unwrapped so its type
+/// can still be anchored.
+fn clone_if_place(expr: &ExprType, tokens: TokenStream) -> TokenStream {
+    match expr {
+        ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_) => {
+            quote!((#tokens).clone())
+        }
+        _ => tokens,
     }
 }
 

@@ -12,6 +12,7 @@ use super::dtype::Dtype;
 use super::engine::{self, BinOp, UnOp};
 use super::ndarray::{Data, NdArray};
 use crate::PyException;
+use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
 // Broadcasting
@@ -57,6 +58,23 @@ pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>, P
 pub(crate) fn broadcast_to(a: &NdArray, shape: &[usize]) -> NdArray {
     if a.shape.as_slice() == shape {
         return a.clone();
+    }
+    // A 0-d source (every scalar operand of a ufunc) maps every output
+    // index to element 0, so it is a FILL. The general path below builds an
+    // n-element `Vec<usize>` of source indices first and then gathers
+    // through it — two full-size allocations and two passes to write one
+    // repeated value, which made `np.add(a, 1.0)` cost more than
+    // `np.add(a, b)` despite doing less work (issue #200).
+    if a.ndim == 0 {
+        let n: usize = shape.iter().product();
+        let data = match &a.data {
+            Data::F64(v) => Data::F64(vec![v[0]; n]),
+            Data::F32(v) => Data::F32(vec![v[0]; n]),
+            Data::I64(v) => Data::I64(vec![v[0]; n]),
+            Data::I32(v) => Data::I32(vec![v[0]; n]),
+            Data::Bool(v) => Data::Bool(vec![v[0]; n]),
+        };
+        return NdArray::new(shape.to_vec(), a.dtype, data);
     }
     let n: usize = shape.iter().product();
     // Right-align the source shape against the target: leading size-1
@@ -230,96 +248,124 @@ impl From<bool> for BinaryOperand {
 }
 
 /// Elementwise binary op with numpy broadcasting and dtype promotion.
+///
+/// The INFALLIBLE spelling, for the operator traits (`a + b`), whose
+/// associated `Output` type has no room for a `Result` — a broadcast
+/// mismatch there panics with the same message (spec §12.2).
 pub(crate) fn binary<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
     op: BinOp,
     l: L,
     r: R,
 ) -> NdArray {
+    binary_checked(op, l, r).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Elementwise binary op that RAISES a broadcast mismatch instead of
+/// panicking: `np.add(a, b)` and the rest of the module-level ufuncs
+/// propagate this with `?`, so the ValueError is catchable exactly as in
+/// CPython (issue #205).
+pub(crate) fn binary_checked<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+    op: BinOp,
+    l: L,
+    r: R,
+) -> Result<NdArray, PyException> {
     let (a, b) = (l.into(), r.into());
     let (a, b, shape) = match (a, b) {
         (BinaryOperand::Array(a), BinaryOperand::Array(b)) => {
-            let shape = broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &b.shape)?;
             (a, b, shape)
         }
         (BinaryOperand::Array(a), BinaryOperand::I64(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             let d = weak_promote(a.dtype, &BinaryOperand::I64(v));
             (a, scalar_to_dtype(BinaryOperand::I64(v), d), shape)
         }
         (BinaryOperand::I64(v), BinaryOperand::Array(a)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             let d = weak_promote(a.dtype, &BinaryOperand::I64(v));
             (scalar_to_dtype(BinaryOperand::I64(v), d), a, shape)
         }
         (BinaryOperand::Array(a), BinaryOperand::F64(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             let d = weak_promote(a.dtype, &BinaryOperand::F64(v));
             (a, scalar_to_dtype(BinaryOperand::F64(v), d), shape)
         }
         (BinaryOperand::F64(v), BinaryOperand::Array(a)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             let d = weak_promote(a.dtype, &BinaryOperand::F64(v));
             (scalar_to_dtype(BinaryOperand::F64(v), d), a, shape)
         }
         (BinaryOperand::Array(a), BinaryOperand::Bool(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             let d = weak_promote(a.dtype, &BinaryOperand::Bool(v));
             (a, scalar_to_dtype(BinaryOperand::Bool(v), d), shape)
         }
         (BinaryOperand::Bool(v), BinaryOperand::Array(a)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             let d = weak_promote(a.dtype, &BinaryOperand::Bool(v));
             (scalar_to_dtype(BinaryOperand::Bool(v), d), a, shape)
         }
         (BinaryOperand::I64(x), BinaryOperand::I64(y)) => {
             let a = scalar_arr_i64(x);
             let b = scalar_arr_i64(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::I64(x), BinaryOperand::F64(y)) => {
             let a = scalar_arr_i64(x);
             let b = scalar_arr_f64(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::F64(x), BinaryOperand::I64(y)) => {
             let a = scalar_arr_f64(x);
             let b = scalar_arr_i64(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::F64(x), BinaryOperand::F64(y)) => {
             let a = scalar_arr_f64(x);
             let b = scalar_arr_f64(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::Bool(x), BinaryOperand::Bool(y)) => {
             let a = scalar_arr_bool(x);
             let b = scalar_arr_bool(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::I64(x), BinaryOperand::Bool(y)) => {
             let a = scalar_arr_i64(x);
             let b = scalar_arr_bool(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::Bool(x), BinaryOperand::I64(y)) => {
             let a = scalar_arr_bool(x);
             let b = scalar_arr_i64(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::F64(x), BinaryOperand::Bool(y)) => {
             let a = scalar_arr_f64(x);
             let b = scalar_arr_bool(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
         (BinaryOperand::Bool(x), BinaryOperand::F64(y)) => {
             let a = scalar_arr_bool(x);
             let b = scalar_arr_f64(y);
-            return NdArray::binary_same_shape(op, &a, &b);
+            return Ok(NdArray::binary_same_shape(op, &a, &b));
         }
     };
-    let a = broadcast_to(&a, &shape);
-    let b = broadcast_to(&b, &shape);
-    NdArray::binary_same_shape(op, &a, &b)
+    // `binary_same_shape` only reads its operands, so an operand that is
+    // already the output shape is BORROWED rather than cloned: the common
+    // same-shape `np.add(a, b)` allocated three full-size buffers to
+    // produce one (issue #200).
+    let a = if a.shape.as_slice() == shape.as_slice() {
+        Cow::Borrowed(&a)
+    } else {
+        Cow::Owned(broadcast_to(&a, &shape))
+    };
+    let b = if b.shape.as_slice() == shape.as_slice() {
+        Cow::Borrowed(&b)
+    } else {
+        Cow::Owned(broadcast_to(&b, &shape))
+    };
+    Ok(NdArray::binary_same_shape(op, &a, &b))
 }
 
 /// Convert a numeric array to f64 for float-returning ufuncs (numpy
@@ -339,8 +385,11 @@ macro_rules! binary_ufunc {
     ($($name:ident, $op:expr),* $(,)?) => {
         $(
             #[doc = concat!("`np.", stringify!($name), "(a, b)` — elementwise with broadcasting.")]
-            pub fn $name<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(a: L, b: R) -> NdArray {
-                binary($op, a, b)
+            pub fn $name<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+                a: L,
+                b: R,
+            ) -> Result<NdArray, PyException> {
+                binary_checked($op, a, b)
             }
         )*
     };
@@ -391,21 +440,34 @@ pub fn remainder<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(a: L, b: R) -> 
 }
 
 /// `np.logical_and(a, b)` — truthiness of each element, then `&`.
-pub fn logical_and<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(a: L, b: R) -> NdArray {
+pub fn logical_and<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+    a: L,
+    b: R,
+) -> Result<NdArray, PyException> {
     logical(BinOp::BitAnd, a, b)
 }
-pub fn logical_or<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(a: L, b: R) -> NdArray {
+pub fn logical_or<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+    a: L,
+    b: R,
+) -> Result<NdArray, PyException> {
     logical(BinOp::BitOr, a, b)
 }
-pub fn logical_xor<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(a: L, b: R) -> NdArray {
+pub fn logical_xor<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+    a: L,
+    b: R,
+) -> Result<NdArray, PyException> {
     logical(BinOp::BitXor, a, b)
 }
 
-fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(op: BinOp, a: L, b: R) -> NdArray {
+fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+    op: BinOp,
+    a: L,
+    b: R,
+) -> Result<NdArray, PyException> {
     let (a, b) = (a.into(), b.into());
     let (a, b) = match (a, b) {
         (BinaryOperand::Array(a), BinaryOperand::Array(b)) => {
-            let shape = broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &b.shape)?;
             (broadcast_to(&a, &shape), broadcast_to(&b, &shape))
         }
         (BinaryOperand::Array(a), b) => (a, bool_of_scalar(b)),
@@ -418,7 +480,7 @@ fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(op: BinOp, a: L, b: R
     let a = bool_array(&a);
     let b = bool_array(&b);
     let out = engine::binary_bool(op, &a.bool(), &b.bool());
-    NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(out))
+    Ok(NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(out)))
 }
 
 fn bool_of_scalar(s: BinaryOperand) -> NdArray {
@@ -576,15 +638,15 @@ pub fn where_<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
     cond: NdArray,
     a: L,
     b: R,
-) -> NdArray {
+) -> Result<NdArray, PyException> {
     let (a, b) = (a.into(), b.into());
     let (a, b) = match (a, b) {
         (BinaryOperand::Array(a), BinaryOperand::Array(b)) => {
-            let shape = broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &b.shape)?;
             (broadcast_to(&a, &shape), broadcast_to(&b, &shape))
         }
         (BinaryOperand::Array(a), BinaryOperand::I64(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             (
                 broadcast_to(&a, &shape),
                 broadcast_to(&scalar_arr_i64(v), &shape),
@@ -598,7 +660,7 @@ pub fn where_<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
             )
         }
         (BinaryOperand::Array(a), BinaryOperand::F64(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             (
                 broadcast_to(&a, &shape),
                 broadcast_to(&scalar_arr_f64(v), &shape),
@@ -612,7 +674,7 @@ pub fn where_<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
             )
         }
         (BinaryOperand::Array(a), BinaryOperand::Bool(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &[])?;
             (
                 broadcast_to(&a, &shape),
                 broadcast_to(&scalar_arr_bool(v), &shape),
@@ -667,5 +729,5 @@ pub fn where_<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
             PyException::new("TypeError", "unsupported where() operand dtypes")
         ),
     };
-    NdArray::new(shape, out_dtype, data)
+    Ok(NdArray::new(shape, out_dtype, data))
 }

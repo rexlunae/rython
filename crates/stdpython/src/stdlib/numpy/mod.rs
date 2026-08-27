@@ -31,7 +31,7 @@ mod ufunc;
 
 pub use dtype::Dtype;
 pub use engine::{Backend, active_backend, backend_summary, set_backend};
-pub use ndarray::{IntoShape, NdArray};
+pub use ndarray::{IntoShape, NdArray, Shape};
 
 use crate::PyException;
 use crate::PyIndex;
@@ -500,16 +500,19 @@ pub fn concatenate(arrays: Vec<NdArray>, axis: i64) -> NdArray {
             PyException::new("ValueError", "need at least one array to concatenate")
         );
     }
-    if axis != 0 {
+    let ndim = arrays[0].ndim;
+    // Python's negative axis counts from the end.
+    let axis = if axis < 0 { axis + ndim as i64 } else { axis };
+    if axis < 0 || axis >= ndim.max(1) as i64 {
         panic!(
             "{}",
             PyException::new(
-                "ValueError",
-                "concatenate: rython's numpy subset supports axis=0 only"
+                "AxisError",
+                format!("axis {axis} is out of bounds for array of dimension {ndim}")
             )
         );
     }
-    let ndim = arrays[0].ndim;
+    let axis = axis as usize;
     for a in &arrays {
         if a.ndim != ndim {
             panic!(
@@ -520,7 +523,9 @@ pub fn concatenate(arrays: Vec<NdArray>, axis: i64) -> NdArray {
                 )
             );
         }
-        if a.shape[1..] != arrays[0].shape[1..] {
+        if a.shape[..axis] != arrays[0].shape[..axis]
+            || a.shape[axis + 1..] != arrays[0].shape[axis + 1..]
+        {
             panic!(
                 "{}",
                 PyException::new(
@@ -531,7 +536,7 @@ pub fn concatenate(arrays: Vec<NdArray>, axis: i64) -> NdArray {
         }
     }
     let mut shape = arrays[0].shape.clone();
-    shape[0] = arrays.iter().map(|a| a.shape[0]).sum();
+    shape[axis] = arrays.iter().map(|a| a.shape[axis]).sum();
     let total: usize = arrays.iter().map(|a| a.size).sum();
     let dtype = arrays
         .iter()
@@ -546,48 +551,59 @@ pub fn concatenate(arrays: Vec<NdArray>, axis: i64) -> NdArray {
             }
         })
         .collect();
+    // Concatenating along `axis` interleaves the arrays once per OUTER
+    // block (the dimensions before the axis); axis 0 has a single block,
+    // which is the plain append this used to be limited to.
+    let outer: usize = arrays[0].shape[..axis].iter().product();
+    let inner: usize = arrays[0].shape[axis + 1..].iter().product();
+    macro_rules! gather {
+        ($get:ident) => {{
+            let mut flat = Vec::with_capacity(total);
+            for o in 0..outer {
+                for a in &promoted {
+                    let run = a.shape[axis] * inner;
+                    let src = a.$get();
+                    flat.extend_from_slice(&src[o * run..(o + 1) * run]);
+                }
+            }
+            flat
+        }};
+    }
     let data = match dtype {
         Dtype::Float64 => {
             let mut flat = Vec::with_capacity(total);
-            for a in &promoted {
-                flat.extend(a.as_f64());
+            for o in 0..outer {
+                for a in &promoted {
+                    let run = a.shape[axis] * inner;
+                    flat.extend_from_slice(&a.as_f64()[o * run..(o + 1) * run]);
+                }
             }
             Data::F64(flat)
         }
-        Dtype::Float32 => {
-            let mut flat = Vec::with_capacity(total);
-            for a in &promoted {
-                flat.extend(a.f32());
-            }
-            Data::F32(flat)
-        }
-        Dtype::Int64 => {
-            let mut flat = Vec::with_capacity(total);
-            for a in &promoted {
-                flat.extend(a.i64());
-            }
-            Data::I64(flat)
-        }
-        Dtype::Int32 => {
-            let mut flat = Vec::with_capacity(total);
-            for a in &promoted {
-                flat.extend(a.i32());
-            }
-            Data::I32(flat)
-        }
-        Dtype::Bool => {
-            let mut flat = Vec::with_capacity(total);
-            for a in &promoted {
-                flat.extend(a.bool());
-            }
-            Data::Bool(flat)
-        }
+        Dtype::Float32 => Data::F32(gather!(f32)),
+        Dtype::Int64 => Data::I64(gather!(i64)),
+        Dtype::Int32 => Data::I32(gather!(i32)),
+        Dtype::Bool => Data::Bool(gather!(bool)),
     };
     NdArray::new(shape, dtype, data)
 }
 
 /// `np.vstack([a, b])` — 2-D stack along axis 0 (like concatenate).
 pub fn vstack(arrays: Vec<NdArray>) -> NdArray {
+    // numpy promotes each 1-D input to a (1, n) ROW first, so stacking two
+    // vectors gives a 2xN matrix, not one long vector. Concatenating them
+    // as-is silently produced the flat array instead.
+    let arrays: Vec<NdArray> = arrays
+        .into_iter()
+        .map(|a| {
+            if a.ndim == 1 {
+                let n = a.shape[0] as i64;
+                a.reshape(vec![1, n])
+            } else {
+                a
+            }
+        })
+        .collect();
     concatenate(arrays, 0)
 }
 
@@ -734,10 +750,10 @@ pub fn prod(a: NdArray) -> f64 {
 pub fn mean(a: NdArray) -> f64 {
     reduce::mean(a)
 }
-pub fn max(a: NdArray) -> f64 {
+pub fn max(a: NdArray) -> Result<f64, PyException> {
     reduce::max(a)
 }
-pub fn min(a: NdArray) -> f64 {
+pub fn min(a: NdArray) -> Result<f64, PyException> {
     reduce::min(a)
 }
 pub fn std(a: NdArray, ddof: f64) -> f64 {
@@ -752,10 +768,10 @@ pub fn all(a: NdArray) -> bool {
 pub fn any(a: NdArray) -> bool {
     reduce::any(a)
 }
-pub fn argmax(a: NdArray) -> i64 {
+pub fn argmax(a: NdArray) -> Result<i64, PyException> {
     reduce::argmax(a)
 }
-pub fn argmin(a: NdArray) -> i64 {
+pub fn argmin(a: NdArray) -> Result<i64, PyException> {
     reduce::argmin(a)
 }
 
@@ -909,7 +925,7 @@ mod divmod_tests {
         // -> array([inf, -inf, -inf, nan]) — IEEE results, NO exception.
         let a = array(vec![1.0f64, -1.0, 2.5, 0.0]);
         let b = array(vec![0.0f64, 0.0, -0.0, 0.0]);
-        let r = divide(a, b);
+        let r = divide(a, b).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         let v = f64s(&r);
         assert_eq!(v[0], f64::INFINITY);
@@ -924,12 +940,12 @@ mod divmod_tests {
         // -> array([1.5, 1., 2., 4.]) float64 (numpy never does int division)
         let a = array(vec![3i64, 1, 2, 4]);
         let b = array(vec![2i64, 1, 1, 1]);
-        let r = divide(a, b);
+        let r = divide(a, b).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         assert_eq!(f64s(&r), vec![1.5, 1.0, 2.0, 4.0]);
         // np.divide(np.array([1, -1, 2, 0]), 0) -> array([inf, -inf, inf, nan]) float64
         let a = array(vec![1i64, -1, 2, 0]);
-        let r = divide(a, 0);
+        let r = divide(a, 0).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         let v = f64s(&r);
         assert_eq!(v[0], f64::INFINITY);
@@ -944,7 +960,7 @@ mod divmod_tests {
         // -> array([1., nan]) float64
         let a = array(vec![true, false]);
         let b = array(vec![true, false]);
-        let r = divide(a, b);
+        let r = divide(a, b).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         let v = f64s(&r);
         assert_eq!(v[0], 1.0);
@@ -955,21 +971,21 @@ mod divmod_tests {
     fn floor_divide_and_mod_by_zero() {
         // np.floor_divide(np.array([1.0, -1.0, 2.5, 0.0]), 0.0) -> [inf, -inf, inf, nan]
         let a = array(vec![1.0f64, -1.0, 2.5, 0.0]);
-        let r = floor_divide(a.clone(), 0.0f64);
+        let r = floor_divide(a.clone(), 0.0f64).unwrap();
         let v = f64s(&r);
         assert_eq!(v[0], f64::INFINITY);
         assert_eq!(v[1], f64::NEG_INFINITY);
         assert_eq!(v[2], f64::INFINITY);
         assert!(v[3].is_nan());
         // np.mod(np.array([1.0, -1.0, 2.5, 0.0]), 0.0) -> [nan, nan, nan, nan]
-        let r = mod_(a, 0.0f64);
+        let r = mod_(a, 0.0f64).unwrap();
         assert!(f64s(&r).iter().all(|x| x.is_nan()));
         // np.floor_divide(np.array([5, -5, 0, 1]), 0) -> array([0, 0, 0, 0])
         let ai = array(vec![5i64, -5, 0, 1]);
-        let r = floor_divide(ai.clone(), 0i64);
+        let r = floor_divide(ai.clone(), 0i64).unwrap();
         assert_eq!(i64s(&r), vec![0, 0, 0, 0]);
         // np.mod(np.array([5, -5, 0, 1]), 0) -> array([0, 0, 0, 0])
-        let r = mod_(ai, 0i64);
+        let r = mod_(ai, 0i64).unwrap();
         assert_eq!(i64s(&r), vec![0, 0, 0, 0]);
     }
 
@@ -978,7 +994,7 @@ mod divmod_tests {
     fn power_int_negative_exponent_raises() {
         // np.power(np.array([1, 2]), -1) -> ValueError (exact numpy message)
         let a = array(vec![1i64, 2]);
-        power(a, -1i64);
+        power(a, -1i64).unwrap();
     }
 
     #[test]
@@ -987,7 +1003,7 @@ mod divmod_tests {
         // np.power(np.array([1, 2]), np.array([2, -1])) -> ValueError
         let a = array(vec![1i64, 2]);
         let b = array(vec![2i64, -1]);
-        power(a, b);
+        power(a, b).unwrap();
     }
 
     #[test]
@@ -996,7 +1012,7 @@ mod divmod_tests {
         // -> array([8, 9, 1, 625])
         let a = array(vec![2i64, -3, 0, 5]);
         let b = array(vec![3i64, 2, 0, 4]);
-        let r = power(a, b);
+        let r = power(a, b).unwrap();
         assert_eq!(i64s(&r), vec![8, 9, 1, 625]);
     }
 
@@ -1008,16 +1024,16 @@ mod divmod_tests {
         let a = array(vec![7i64, -7, 3, -3]);
         let b = array(vec![2i64, 2, -2, -2]);
         assert_eq!(
-            i64s(&floor_divide(a.clone(), b.clone())),
+            i64s(&floor_divide(a.clone(), b.clone()).unwrap()),
             vec![3, -4, -2, 1]
         );
-        assert_eq!(i64s(&mod_(a, b)), vec![1, 1, -1, -1]);
+        assert_eq!(i64s(&mod_(a, b).unwrap()), vec![1, 1, -1, -1]);
         // i64::MIN // -1 wraps to i64::MIN (numpy, with an overflow warning)
         assert_eq!(
-            i64s(&floor_divide(array(vec![i64::MIN]), -1i64)),
+            i64s(&floor_divide(array(vec![i64::MIN]), -1i64).unwrap()),
             vec![i64::MIN]
         );
-        assert_eq!(i64s(&mod_(array(vec![i64::MIN]), -1i64)), vec![0]);
+        assert_eq!(i64s(&mod_(array(vec![i64::MIN]), -1i64).unwrap()), vec![0]);
     }
 
     #[test]
@@ -1025,18 +1041,21 @@ mod divmod_tests {
         // np.floor_divide(np.array([1.0]), 0.1) -> 9.0 (NOT floor(1.0/0.1),
         // which is floor(10.0) = 10.0 — numpy uses its fmod-based divmod);
         // np.mod(np.array([1.0]), 0.1) -> 0.09999999999999995.
-        assert_eq!(f64s(&floor_divide(array(vec![1.0f64]), 0.1f64)), vec![9.0]);
         assert_eq!(
-            f64s(&mod_(array(vec![1.0f64]), 0.1f64)),
+            f64s(&floor_divide(array(vec![1.0f64]), 0.1f64).unwrap()),
+            vec![9.0]
+        );
+        assert_eq!(
+            f64s(&mod_(array(vec![1.0f64]), 0.1f64).unwrap()),
             vec![0.09999999999999995]
         );
-        // signed-zero corners: floor_divide(-1.0, -2.0) is +0.0,
-        // floor_divide(0.0, -2.0) is -0.0, mod(0.0, -2.0) is -0.0
-        let z = f64s(&floor_divide(array(vec![-1.0f64]), -2.0f64));
+        // signed-zero corners: floor_divide(-1.0, -2.0).unwrap() is +0.0,
+        // floor_divide(0.0, -2.0).unwrap() is -0.0, mod(0.0, -2.0) is -0.0
+        let z = f64s(&floor_divide(array(vec![-1.0f64]), -2.0f64).unwrap());
         assert!(z[0] == 0.0 && z[0].is_sign_positive());
-        let z = f64s(&floor_divide(array(vec![0.0f64]), -2.0f64));
+        let z = f64s(&floor_divide(array(vec![0.0f64]), -2.0f64).unwrap());
         assert!(z[0] == 0.0 && z[0].is_sign_negative());
-        let z = f64s(&mod_(array(vec![0.0f64]), -2.0f64));
+        let z = f64s(&mod_(array(vec![0.0f64]), -2.0f64).unwrap());
         assert!(z[0] == 0.0 && z[0].is_sign_negative());
     }
 }
@@ -1111,7 +1130,13 @@ mod reduce_tests {
         assert_eq!(std(l.clone(), 0.0), 0.28867542327009177);
         assert_eq!(var(l, 0.0), 0.08333350000016665);
         // boundary sizes exercise the pairwise blocks (<8, <=128, recursive)
-        let x = |n: i64| multiply(subtract(divide(arange_f(n as f64), 7.0), 3.0), 1.0000001);
+        let x = |n: i64| {
+            multiply(
+                subtract(divide(arange_f(n as f64), 7.0).unwrap(), 3.0).unwrap(),
+                1.0000001,
+            )
+            .unwrap()
+        };
         assert_eq!(sum(x(8)), -20.000002000000002);
         assert_eq!(sum(x(128)), 777.1429348571429);
         assert_eq!(sum(x(129)), 792.4286506714286);
@@ -1150,24 +1175,51 @@ mod weak_promotion_tests {
         let i64a = array(vec![1i64, 2]);
         let b = array(vec![true, false]);
         // Python float + f32 array stays f32
-        assert!(matches!(add(f32a.clone(), 0.0f64).dtype, Dtype::Float32));
-        assert!(matches!(add(0.0f64, f32a.clone()).dtype, Dtype::Float32));
-        assert!(matches!(divide(f32a.clone(), 0.0f64).dtype, Dtype::Float32));
+        assert!(matches!(
+            add(f32a.clone(), 0.0f64).unwrap().dtype,
+            Dtype::Float32
+        ));
+        assert!(matches!(
+            add(0.0f64, f32a.clone()).unwrap().dtype,
+            Dtype::Float32
+        ));
+        assert!(matches!(
+            divide(f32a.clone(), 0.0f64).unwrap().dtype,
+            Dtype::Float32
+        ));
         // Python int + i32 array stays i32; + f32 stays f32
-        assert!(matches!(add(i32a.clone(), 1i64).dtype, Dtype::Int32));
-        assert!(matches!(add(f32a.clone(), 1i64).dtype, Dtype::Float32));
+        assert!(matches!(
+            add(i32a.clone(), 1i64).unwrap().dtype,
+            Dtype::Int32
+        ));
+        assert!(matches!(
+            add(f32a.clone(), 1i64).unwrap().dtype,
+            Dtype::Float32
+        ));
         // Python float + int array -> f64
-        assert!(matches!(add(i32a.clone(), 0.0f64).dtype, Dtype::Float64));
-        assert!(matches!(add(i64a.clone(), 0.0f64).dtype, Dtype::Float64));
+        assert!(matches!(
+            add(i32a.clone(), 0.0f64).unwrap().dtype,
+            Dtype::Float64
+        ));
+        assert!(matches!(
+            add(i64a.clone(), 0.0f64).unwrap().dtype,
+            Dtype::Float64
+        ));
         // bool arrays: + Python int -> int64, + Python bool stays bool
-        assert!(matches!(add(b.clone(), 1i64).dtype, Dtype::Int64));
-        assert!(matches!(add(b.clone(), true).dtype, Dtype::Bool));
-        assert!(matches!(add(f32a.clone(), true).dtype, Dtype::Float32));
+        assert!(matches!(add(b.clone(), 1i64).unwrap().dtype, Dtype::Int64));
+        assert!(matches!(add(b.clone(), true).unwrap().dtype, Dtype::Bool));
+        assert!(matches!(
+            add(f32a.clone(), true).unwrap().dtype,
+            Dtype::Float32
+        ));
         // int64 + Python int stays int64; comparison outputs are bool anyway
-        assert!(matches!(add(i64a, 1i64).dtype, Dtype::Int64));
-        assert!(matches!(equal(f32a.clone(), 1i64).dtype, Dtype::Bool));
+        assert!(matches!(add(i64a, 1i64).unwrap().dtype, Dtype::Int64));
+        assert!(matches!(
+            equal(f32a.clone(), 1i64).unwrap().dtype,
+            Dtype::Bool
+        ));
         // a large-but-fitting Python int scalar stays int32
-        let r = add(i32a, 1i64 << 30);
+        let r = add(i32a, 1i64 << 30).unwrap();
         assert!(matches!(r.dtype, Dtype::Int32));
         // (int32 arithmetic overflow wraps in release, matching numpy; in
         // debug builds it panics — documented ledger §12.2, out of contract)
@@ -1179,6 +1231,161 @@ mod weak_promotion_tests {
     )]
     fn int_scalar_out_of_int32_bounds_raises() {
         let i32a = array(vec![1i64, 2]).astype(Dtype::Int32);
-        add(i32a, 1i64 << 40);
+        add(i32a, 1i64 << 40).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod exception_tests {
+    use super::*;
+
+    /// The operations CPython raises from now RAISE here too, with numpy's
+    /// own message, instead of aborting the process with a panic
+    /// (issue #205). Every expectation is real `python3` output.
+    #[test]
+    fn empty_reductions_raise_with_numpy_message() {
+        // Verified against python3.
+        let empty = || zeros(0i64, Dtype::Float64);
+        let cases: Vec<(Result<f64, PyException>, &str)> = vec![
+            (
+                max(empty()),
+                "zero-size array to reduction operation maximum which has no identity",
+            ),
+            (
+                min(empty()),
+                "zero-size array to reduction operation minimum which has no identity",
+            ),
+        ];
+        for (r, msg) in cases {
+            let err = r.expect_err("an empty reduction must raise");
+            assert_eq!(err.exception_type, "ValueError");
+            assert_eq!(err.message, msg);
+        }
+        for (r, msg) in [
+            (
+                argmax(empty()),
+                "attempt to get argmax of an empty sequence",
+            ),
+            (
+                argmin(empty()),
+                "attempt to get argmin of an empty sequence",
+            ),
+        ] {
+            let err = r.expect_err("an empty argmax/argmin must raise");
+            assert_eq!(err.exception_type, "ValueError");
+            assert_eq!(err.message, msg);
+        }
+    }
+
+    #[test]
+    fn broadcast_mismatch_raises_valueerror() {
+        // np.add(np.zeros(2), np.zeros(3)) -> ValueError: operands could not
+        // be broadcast together with shapes (2,) (3,)
+        // Verified against python3.
+        let err = add(zeros(2i64, Dtype::Float64), zeros(3i64, Dtype::Float64))
+            .expect_err("a shape mismatch must raise");
+        assert_eq!(err.exception_type, "ValueError");
+        assert!(
+            err.message.contains("could not be broadcast together"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn singular_matrix_raises_linalgerror() {
+        // np.linalg.inv(np.array([[1., 2.], [2., 4.]])) -> LinAlgError:
+        // Singular matrix. Verified against python3.
+        let singular = || reshape(array(vec![1.0f64, 2.0, 2.0, 4.0]), vec![2i64, 2]);
+        for r in [
+            linalg::inv(singular()),
+            linalg::solve(singular(), ones(2i64, Dtype::Float64)),
+        ] {
+            let err = r.expect_err("a singular matrix must raise");
+            assert_eq!(err.exception_type, "LinAlgError");
+            assert_eq!(err.message, "Singular matrix");
+        }
+    }
+
+    #[test]
+    fn index_errors_carry_numpys_message() {
+        // np.zeros((2, 3))[5] -> IndexError: index 5 is out of bounds for
+        // axis 0 with size 2; [0, 7] names axis 1. Verified against python3.
+        let a = zeros(vec![2i64, 3], Dtype::Float64);
+        let err = crate::PyIndex::<i64>::py_index(&a, 5).expect_err("out of bounds");
+        assert_eq!(err.exception_type, "IndexError");
+        assert_eq!(
+            err.message,
+            "index 5 is out of bounds for axis 0 with size 2"
+        );
+        let err = crate::PyIndex::<(i64, i64)>::py_index(&a, (0, 7)).expect_err("out of bounds");
+        assert_eq!(
+            err.message,
+            "index 7 is out of bounds for axis 1 with size 3"
+        );
+        // a.shape is a TUPLE, and Python's tuple has its own wording.
+        let err = crate::PyIndex::<i64>::py_index(&a.shape_tuple(), 9).expect_err("out of bounds");
+        assert_eq!(err.message, "tuple index out of range");
+    }
+}
+
+#[cfg(test)]
+mod shape_and_stack_tests {
+    use super::*;
+
+    /// `a.shape` is a Python TUPLE, not a list (issue #197).
+    #[test]
+    fn shape_prints_as_a_tuple() {
+        // Verified against python3: str(np.zeros(3).shape) == '(3,)'.
+        assert_eq!(
+            crate::py_display(&zeros(3i64, Dtype::Float64).shape_tuple()),
+            "(3,)"
+        );
+        assert_eq!(
+            crate::py_display(&zeros(vec![2i64, 3], Dtype::Float64).shape_tuple()),
+            "(2, 3)"
+        );
+        // and still indexes and measures like the sequence it is.
+        let s = zeros(vec![2i64, 3], Dtype::Float64).shape_tuple();
+        assert_eq!(crate::PyIndex::<i64>::py_index(&s, 1).unwrap(), 3);
+        assert_eq!(crate::PyIndex::<i64>::py_index(&s, -1).unwrap(), 3);
+        assert_eq!(crate::Len::len(&s), 2);
+    }
+
+    /// `a.dtype` prints its name (issue #204).
+    #[test]
+    fn dtype_prints_like_numpy() {
+        // Verified against python3: str(np.zeros(3).dtype) == 'float64',
+        // repr(...) == "dtype('float64')".
+        assert_eq!(crate::py_display(&Dtype::Float64), "float64");
+        assert_eq!(crate::PyRepr::py_repr(&Dtype::Float32), "dtype('float32')");
+    }
+
+    /// numpy promotes 1-D inputs to rows before stacking them.
+    #[test]
+    fn vstack_promotes_vectors_to_rows() {
+        // np.vstack([np.array([1., 2.]), np.array([3., 4.])])
+        // -> array([[1., 2.], [3., 4.]]). Verified against python3.
+        let r = vstack(vec![array(vec![1.0f64, 2.0]), array(vec![3.0f64, 4.0])]);
+        assert_eq!(r.shape, vec![2, 2]);
+        assert_eq!(crate::py_display(&r), "[[1. 2.]\n [3. 4.]]");
+    }
+
+    /// Concatenation along a non-zero axis interleaves per outer block.
+    #[test]
+    fn concatenate_supports_every_axis() {
+        // np.concatenate([np.arange(4).reshape(2,2), np.arange(4,8).reshape(2,2)], axis=1)
+        // -> array([[0, 1, 4, 5], [2, 3, 6, 7]]). Verified against python3.
+        let p = || reshape(arange(4), vec![2i64, 2]);
+        let q = || reshape(arange3(4, 8, 1), vec![2i64, 2]);
+        let r = concatenate(vec![p(), q()], 1);
+        assert_eq!(r.shape, vec![2, 4]);
+        assert_eq!(crate::py_display(&r), "[[0 1 4 5]\n [2 3 6 7]]");
+        // axis 0 still appends whole blocks.
+        let r = concatenate(vec![p(), q()], 0);
+        assert_eq!(crate::py_display(&r), "[[0 1]\n [2 3]\n [4 5]\n [6 7]]");
+        // A negative axis counts from the end, like Python.
+        let r = concatenate(vec![p(), q()], -1);
+        assert_eq!(crate::py_display(&r), "[[0 1 4 5]\n [2 3 6 7]]");
     }
 }

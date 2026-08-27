@@ -1048,6 +1048,83 @@ fn shape_tuple(shape: &[usize]) -> String {
     format!("({})", inner.join(", "))
 }
 
+/// numpy's `a.shape`: a TUPLE of ints, not a list.
+///
+/// A dedicated type so the attribute prints as `(3,)` the way Python does,
+/// rather than as the `Vec` it is backed by (issue #197) — while still
+/// indexing, measuring and iterating like the sequence it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shape(Vec<i64>);
+
+impl Shape {
+    pub fn as_slice(&self) -> &[i64] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Shape {
+    type Target = [i64];
+    fn deref(&self) -> &[i64] {
+        &self.0
+    }
+}
+
+impl crate::PyDisplay for Shape {
+    fn py_display(&self) -> String {
+        // Python's tuple repr, including the 1-tuple's trailing comma.
+        if self.0.len() == 1 {
+            return format!("({},)", self.0[0]);
+        }
+        let inner: Vec<String> = self.0.iter().map(|d| d.to_string()).collect();
+        format!("({})", inner.join(", "))
+    }
+}
+
+impl PyRepr for Shape {
+    fn py_repr(&self) -> String {
+        crate::py_display(self)
+    }
+}
+
+impl std::fmt::Display for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", crate::py_display(self))
+    }
+}
+
+impl crate::Len for Shape {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl crate::PyIndex<i64> for Shape {
+    type Output = i64;
+    fn py_index(&self, index: i64) -> Result<i64, PyException> {
+        let len = self.0.len() as i64;
+        let i = if index < 0 { len + index } else { index };
+        if i < 0 || i >= len {
+            return Err(PyException::new("IndexError", "tuple index out of range"));
+        }
+        Ok(self.0[i as usize])
+    }
+}
+
+impl IntoIterator for Shape {
+    type Item = i64;
+    type IntoIter = std::vec::IntoIter<i64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl NdArray {
+    /// `a.shape` — the dimensions as a Python tuple.
+    pub fn shape_tuple(&self) -> Shape {
+        Shape(self.shape.iter().map(|&d| d as i64).collect())
+    }
+}
+
 /// numpy `str(array)` — brackets, space separators, column-aligned.
 impl crate::PyDisplay for NdArray {
     fn py_display(&self) -> String {
@@ -1106,10 +1183,19 @@ impl std::fmt::Display for NdArray {
 // ===========================================================================
 
 pub(crate) fn checked_index(idx: i64, len: usize) -> Result<usize, PyException> {
+    checked_index_axis(idx, len, 0)
+}
+
+/// numpy's own IndexError text names the index, the axis and the size —
+/// "index out of bounds" alone was a message divergence (issue #205).
+pub(crate) fn checked_index_axis(idx: i64, len: usize, axis: usize) -> Result<usize, PyException> {
     let len_i = len as i64;
     let i = if idx < 0 { len_i + idx } else { idx };
     if i < 0 || i >= len_i {
-        return Err(PyException::new("IndexError", "index out of bounds"));
+        return Err(PyException::new(
+            "IndexError",
+            format!("index {idx} is out of bounds for axis {axis} with size {len}"),
+        ));
     }
     Ok(i as usize)
 }
@@ -1167,8 +1253,8 @@ impl crate::PyIndex<(i64, i64)> for NdArray {
                 ),
             ));
         }
-        let i = checked_index(index.0, self.shape[0])?;
-        let j = checked_index(index.1, self.shape[1])?;
+        let i = checked_index_axis(index.0, self.shape[0], 0)?;
+        let j = checked_index_axis(index.1, self.shape[1], 1)?;
         Ok(self.subarray(&[i, j]))
     }
 }
@@ -1185,9 +1271,9 @@ impl crate::PyIndex<(i64, i64, i64)> for NdArray {
                 ),
             ));
         }
-        let i = checked_index(index.0, self.shape[0])?;
-        let j = checked_index(index.1, self.shape[1])?;
-        let k = checked_index(index.2, self.shape[2])?;
+        let i = checked_index_axis(index.0, self.shape[0], 0)?;
+        let j = checked_index_axis(index.1, self.shape[1], 1)?;
+        let k = checked_index_axis(index.2, self.shape[2], 2)?;
         Ok(self.subarray(&[i, j, k]))
     }
 }

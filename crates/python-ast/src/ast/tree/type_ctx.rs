@@ -192,6 +192,33 @@ pub fn coerce_tokens(tokens: TokenStream, from: &TypeInfo, to: &TypeInfo) -> Opt
     }
 }
 
+/// Is this expression an `NdArray`?
+///
+/// `infer_type` consults the per-function `name_types` map before the
+/// symbol table, and that map does not record numpy locals, so a plain
+/// `a = np.array(...)` name inferred as something else and the numpy
+/// attribute/method lowerings never fired (issues #197, #204). This falls
+/// back to the recorded assignment, which is where a numpy local's type
+/// actually lives.
+pub fn is_ndarray_expr(
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    if matches!(infer_type(expr, options, symbols), TypeInfo::NdArray) {
+        return true;
+    }
+    match expr {
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::Assign { value, .. }) => {
+                matches!(infer_type(&value, options, symbols), TypeInfo::NdArray)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Infer the Rust type an expression will produce, bottom-up, from syntax
 /// plus the per-function annotation/assignment maps.
 pub fn infer_type(
@@ -406,6 +433,10 @@ fn py_type(py: &str) -> TypeInfo {
         "bool" => TypeInfo::Bool,
         "str" => TypeInfo::String,
         "bytes" => TypeInfo::Bytes,
+        // An `np.ndarray` annotation names the runtime array type; without
+        // this a `a: np.ndarray` local inferred PyObject and the numpy
+        // attribute/method lowerings never recognized it (issue #197).
+        "ndarray" | "np.ndarray" | "numpy.ndarray" => TypeInfo::NdArray,
         _ => TypeInfo::PyObject,
     }
 }
@@ -1502,6 +1533,20 @@ fn resolve_alias_typeinfo_inner(
                 }
                 return annotation_type_info(ann);
             };
+            // numpy annotations name RUNTIME types, not external classes.
+            // `numpy` is not in module_defs, so the module loop below used
+            // to fall through to "external import → boxed PyValue": a
+            // function annotated `-> np.ndarray` had its result boxed, and
+            // every use of the local failed in rustc (issue #203).
+            if crate::is_numpy_alias(&module.id) {
+                return match attr.attr.as_str() {
+                    "ndarray" => Some(TypeInfo::NdArray),
+                    "float64" | "float32" => Some(TypeInfo::Float),
+                    "int64" | "int32" => Some(TypeInfo::Int),
+                    "bool_" => Some(TypeInfo::Bool),
+                    _ => None,
+                };
+            }
             // A SELF-module reference (`connection._TYPE_SOCKET_OPTIONS`
             // inside urllib3/connection.py): the attribute is a name in the
             // CURRENT module's symbols — resolve it there. An Import symbol

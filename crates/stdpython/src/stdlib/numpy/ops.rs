@@ -455,58 +455,58 @@ impl crate::Truthy for NdArray {
 /// Elementwise comparison returning a bool NdArray. Scalar/side order is
 /// preserved so `2 < arr` and `arr < 2` both work.
 macro_rules! array_cmp {
-    ($trait:ident, $method:ident, $ufunc:ident) => {
+    ($trait:ident, $method:ident, $op:expr) => {
         impl crate::$trait<NdArray> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                super::$ufunc(self.clone(), rhs.clone())
+                ufunc::binary($op, self.clone(), rhs.clone())
             }
         }
         impl crate::$trait<i64> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &i64) -> NdArray {
-                super::$ufunc(self.clone(), *rhs)
+                ufunc::binary($op, self.clone(), *rhs)
             }
         }
         impl crate::$trait<f64> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &f64) -> NdArray {
-                super::$ufunc(self.clone(), *rhs)
+                ufunc::binary($op, self.clone(), *rhs)
             }
         }
         impl crate::$trait<bool> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &bool) -> NdArray {
-                super::$ufunc(self.clone(), *rhs)
+                ufunc::binary($op, self.clone(), *rhs)
             }
         }
         impl crate::$trait<NdArray> for i64 {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                super::$ufunc(*self, rhs.clone())
+                ufunc::binary($op, *self, rhs.clone())
             }
         }
         impl crate::$trait<NdArray> for f64 {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                super::$ufunc(*self, rhs.clone())
+                ufunc::binary($op, *self, rhs.clone())
             }
         }
         impl crate::$trait<NdArray> for bool {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                super::$ufunc(*self, rhs.clone())
+                ufunc::binary($op, *self, rhs.clone())
             }
         }
     };
 }
 
-array_cmp!(PyEq, py_eq, equal);
-array_cmp!(PyNe, py_ne, not_equal);
-array_cmp!(PyLt, py_lt, less);
-array_cmp!(PyLe, py_le, less_equal);
-array_cmp!(PyGt, py_gt, greater);
-array_cmp!(PyGe, py_ge, greater_equal);
+array_cmp!(PyEq, py_eq, BinOp::Eq);
+array_cmp!(PyNe, py_ne, BinOp::Ne);
+array_cmp!(PyLt, py_lt, BinOp::Lt);
+array_cmp!(PyLe, py_le, BinOp::Le);
+array_cmp!(PyGt, py_gt, BinOp::Gt);
+array_cmp!(PyGe, py_ge, BinOp::Ge);
 
 // ---------------------------------------------------------------------------
 // `x in a` — flattened membership test (numpy semantics)
