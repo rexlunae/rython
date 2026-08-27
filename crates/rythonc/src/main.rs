@@ -136,6 +136,14 @@ fn main() -> Result<()> {
                             python_ast::format_error_chain(e.as_ref())
                         )
                     })?;
+                // The -W channel: lossy-conversion divergences collected
+                // during lowering print to stderr, exactly like rypip's
+                // multi-module converter (issue #209 — previously the
+                // single-file CLI silently discarded them, so a dropped
+                // call looked like a clean conversion).
+                for w in options.definition_warnings.borrow().iter() {
+                    eprintln!("warning: {}: {}", module_name, w);
+                }
                 if args.pretty {
                     let unformatted = rust.to_string();
                     RustFmt::default().format_str(unformatted)?
