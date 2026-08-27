@@ -15,6 +15,9 @@ exclude = ["examples"]
 [workspace.package]
 version = "1.2.0"
 edition = "2024"
+# The floor the tree actually needs: python-ast's `if let` match
+# guards (E0658 on older stables, issue #208). Verify before lowering.
+rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/rexlunae/rython"
 homepage = "https://github.com/rexlunae/rython"

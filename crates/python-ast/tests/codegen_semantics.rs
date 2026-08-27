@@ -10481,3 +10481,61 @@ fn class_with_dunder_len_implements_len() {
         out
     );
 }
+
+#[test]
+fn boxed_self_field_method_drop_warns_with_a_readable_spelling() {
+    // Issue #209: `self.items.append(x)` on an UNTYPED list field (the
+    // empty literal types the field as the boxed PyValue) cannot lower —
+    // the boxed value's methods are unmodeled — so the call drops through
+    // the -W channel with a READABLE spelling of the dropped call, not an
+    // AST Debug dump. (Annotating the field — `self.items: list[str] = []`
+    // — lowers append to Vec::push; that is the rewrite the message
+    // names.)
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items = []\n",
+            "\n",
+            "    def add(self, x: str) -> None:\n",
+            "        self.items.append(x)\n",
+        ),
+        "bag.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w
+            .contains("`self.items.append(...)` is dropped: the receiver is a boxed \
+                       PyValue (dynamic-method divergence)")),
+        "the drop must warn with a readable source spelling: {:?}",
+        warnings
+    );
+    // The dropped call is a no-op in the generated body.
+    assert!(
+        out.contains("stdpython :: PyValue :: None_ ; Ok (())"),
+        "the dropped call lowers to the boxed None: {}",
+        out
+    );
+    // The pinned shape lowers for real: append becomes Vec::push.
+    let (pinned, pinned_warnings) = compile_with_warnings(
+        concat!(
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[str] = []\n",
+            "\n",
+            "    def add(self, x: str) -> None:\n",
+            "        self.items.append(x)\n",
+        ),
+        "bag_pinned.py",
+    );
+    assert!(
+        pinned.contains("(self . items) . push (x)"),
+        "the annotated field lowers append to push: {}",
+        pinned
+    );
+    assert!(
+        pinned_warnings.is_empty(),
+        "the pinned shape must not warn: {:?}",
+        pinned_warnings
+    );
+}
+

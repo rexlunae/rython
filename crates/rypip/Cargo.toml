@@ -2,6 +2,7 @@
 name = "rypip"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A pip-like tool that builds Python packages as native Rust binaries and converts them into Rust crates, optionally with PyO3 bindings."
