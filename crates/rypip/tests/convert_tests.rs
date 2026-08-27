@@ -799,7 +799,7 @@ fn functools_partial_keyword_bindings_match_python_at_runtime() {
             "\n",
             "unit = functools.partial(clamp, 0, x=5)\n",
             "\n",
-            "if __name__ == "__main__":\n",
+            "if __name__ == \"__main__\":\n",
             "    print(unit(100))\n",
             "    print(unit(-7))\n",
         ),
