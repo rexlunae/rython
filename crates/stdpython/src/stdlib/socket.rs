@@ -258,7 +258,9 @@ impl Socket {
     /// Wrap an already-connected TCP stream as a Python socket — used
     /// by the TLS backends' tests to hand accept()/connect() results to
     /// wrap_socket (the stream was obtained outside the Python surface;
-    /// in converted code the socket object already exists).
+    /// in converted code the socket object already exists). Test-only:
+    /// converted code builds sockets through socket()/accept()/connect.
+    #[cfg(test)]
     pub(crate) fn from_tcp_stream(tcp: TcpStream) -> Result<Socket, PyException> {
         Ok(Socket::from_state(SockState::Stream(tcp)))
     }

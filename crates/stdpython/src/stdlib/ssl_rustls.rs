@@ -11,9 +11,8 @@ use std::sync::Arc;
 use crate::PyException;
 
 use super::{
-    CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, OP_NO_COMPRESSION, OP_NO_SSLv3, OP_NO_TICKET,
-    OP_NO_TLSv1, OP_NO_TLSv1_1, OP_NO_TLSv1_2, OP_NO_TLSv1_3, PROTOCOL_TLS,
-    PROTOCOL_TLS_CLIENT, TLSVersion, VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT,
+    CERT_NONE, CERT_REQUIRED, OP_NO_TLSv1_2, OP_NO_TLSv1_3, PROTOCOL_TLS, PROTOCOL_TLS_CLIENT,
+    TLSVersion,
 };
 
 // The backing TLS implementation's identity. Deliberately NOT an
@@ -404,6 +403,13 @@ impl SSLSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The OP_*/VERIFY_* constants are only referenced by these tests;
+    // they are imported here (not at module scope) so the lib build
+    // stays warning-clean under -D warnings.
+    use crate::stdlib::ssl::{
+        CERT_OPTIONAL, OP_NO_COMPRESSION, OP_NO_SSLv3, OP_NO_TICKET, OP_NO_TLSv1, OP_NO_TLSv1_1,
+        VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT,
+    };
 
     #[test]
     fn constants_match_cpython() {
