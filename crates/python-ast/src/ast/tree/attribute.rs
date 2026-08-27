@@ -375,10 +375,17 @@ impl<'a> CodeGen for Attribute {
             // Use :: for module access (Python's sys.executable becomes sys::executable)
             // Special handling for LazyLock static variables that need
             // dereferencing. os::environ is NOT here: it is a live-view
-            // unit struct whose methods auto-ref.
+            // unit struct whose methods auto-ref. The ssl version
+            // constants are LazyLock statics in both backends (the openssl
+            // backend's real version is only knowable at runtime), so
+            // reads deref to the plain &str / i64 / tuple value.
             let needs_deref = matches!(
                 (value_str.as_str(), self.attr.as_str()),
-                ("sys", "executable") | ("sys", "argv")
+                ("sys", "executable")
+                    | ("sys", "argv")
+                    | ("ssl", "OPENSSL_VERSION")
+                    | ("ssl", "OPENSSL_VERSION_NUMBER")
+                    | ("ssl", "OPENSSL_VERSION_INFO")
             );
 
             // `sys.modules` — the process's import registry (requests'

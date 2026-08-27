@@ -9469,6 +9469,45 @@ fn module_constant_method_call_is_a_value_call_not_a_path() {
     );
 }
 
+#[test]
+fn ssl_version_constant_attribute_reads_deref_the_lazy_static() {
+    // The ssl version constants are LazyLock statics in both backends
+    // (the openssl backend's real version is only knowable at runtime),
+    // so a module-attribute read (`ssl.OPENSSL_VERSION`) emits a deref,
+    // exactly like sys::executable: converted code sees the plain &str.
+    let out = compile(
+        "import ssl\n\
+         \n\
+         def f() -> str:\n\
+         \x20   return ssl.OPENSSL_VERSION\n",
+        "sslver.py",
+    );
+    assert!(
+        out.contains("(* ssl :: OPENSSL_VERSION)"),
+        "the LazyLock read must deref to the plain value: {}",
+        out
+    );
+}
+
+#[test]
+fn ssl_version_constant_from_import_reads_deref_clone() {
+    // `from ssl import OPENSSL_VERSION` (urllib3's util/ssl_.py) brings
+    // the LazyLock static into scope; a plain NAME read of it must also
+    // deref-clone so the value is a &str, not the static.
+    let out = compile(
+        "from ssl import OPENSSL_VERSION\n\
+         \n\
+         def f() -> bool:\n\
+         \x20   return OPENSSL_VERSION.startswith(\"OpenSSL \")\n",
+        "sslver.py",
+    );
+    assert!(
+        out.contains("(* OPENSSL_VERSION) . clone ()"),
+        "the imported LazyLock read must deref-clone to the plain value: {}",
+        out
+    );
+}
+
 // ---- issue #137 round 16: urllib3 residual clusters ----
 
 #[test]

@@ -173,6 +173,24 @@ impl CodeGen for Name {
             }
             if let Some(crate::SymbolTableNode::ImportFrom(ifm)) = sym {
                 let path = ifm.resolved_module_path(&options);
+                // The ssl version constants are LazyLock statics (see
+                // attribute.rs `needs_deref`): a `from ssl import
+                // OPENSSL_VERSION` binding (urllib3's util/ssl_.py) reads
+                // as the plain &str / i64 / tuple value, not the static.
+                // Both ssl backends expose the same LazyLock shape.
+                if path.len() == 1
+                    && path[0] == "ssl"
+                    && matches!(
+                        ifm.names
+                            .iter()
+                            .find(|a| a.asname.as_deref() == Some(self.id.as_str()))
+                            .map(|a| a.name.as_str())
+                            .unwrap_or(self.id.as_str()),
+                        "OPENSSL_VERSION" | "OPENSSL_VERSION_NUMBER" | "OPENSSL_VERSION_INFO"
+                    )
+                {
+                    return Ok(quote!((*#name).clone()));
+                }
                 if options.module_defs.contains_key(&path) {
                     // The canonical name in the defining module (the alias
                     // target when this name is an asname binding).

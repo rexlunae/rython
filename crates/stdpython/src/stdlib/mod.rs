@@ -132,10 +132,13 @@ pub mod threading;
 #[cfg(feature = "std")]
 pub mod socket;
 
-/// Python ssl module - client-side TLS wrapped over the rustls crate.
-/// Feature-gated per the platform-surface convention (`ssl-rustls`),
-/// but ON by default: TLS is load-bearing for the top converted packages.
-#[cfg(feature = "ssl-rustls")]
+/// Python ssl module - TLS over a pluggable backend: the rustls crate
+/// (`ssl-rustls`, default) or the system OpenSSL/LibreSSL
+/// (`ssl-openssl`, full CPython surface). Feature-gated per the
+/// platform-surface convention; exactly one backend is enabled.
+/// ssl-rustls is ON by default: TLS is load-bearing for the top
+/// converted packages.
+#[cfg(any(feature = "ssl-rustls", feature = "ssl-openssl"))]
 pub mod ssl;
 
 /// Python urllib package (urllib.request) - HTTP(S) client wrapped over
