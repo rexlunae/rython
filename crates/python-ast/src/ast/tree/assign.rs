@@ -118,6 +118,22 @@ impl<'a> CodeGen for Assign {
                 if matches!(symbols.get(&name.id), Some(SymbolTableNode::ClassDef(_))) {
                     continue;
                 }
+                // A module-level stdlib EXCEPTION ALIAS through the dotted
+                // module attribute (`BaseSSLError = ssl.SSLError` —
+                // urllib3): register the target as an Alias of the
+                // canonical exception name so raise/except guards
+                // canonicalize; the store itself emits nothing (classes
+                // cannot be runtime values — documented divergence).
+                if let ExprType::Attribute(attr) = &self.value
+                    && let ExprType::Name(m) = attr.value.as_ref()
+                    && let Some(canonical) =
+                        crate::ast::tree::raise_stmt::stdlib_exception_canonical(
+                            &m.id, &attr.attr,
+                        )
+                {
+                    symbols.insert(name.id, SymbolTableNode::Alias(canonical.to_string()));
+                    continue;
+                }
                 // A module-level CLASS ALIAS (`VerifiedHTTPSConnection =
                 // HTTPSConnection`) registers the name as an Alias so
                 // construction/isinstance/type resolution follows it; the

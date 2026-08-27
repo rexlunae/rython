@@ -350,6 +350,10 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
             "str" => Some(quote!(String)),
             "bool" => Some(quote!(bool)),
             "bytes" | "bytearray" => Some(quote!(Vec<u8>)),
+            // ssl.TLSVersion is an IntEnum: values are plain ints in the
+            // runtime module (`ssl_minimum_version: TLSVersion | None` —
+            // urllib3's ssl_.py).
+            "TLSVersion" => Some(quote!(i64)),
             // `Any` (typing.Any) and `object`: a value of unknown type —
             // the boxed heterogeneous value.
             "Any" | "object" => Some(quote!(stdpython::PyValue)),
@@ -544,6 +548,31 @@ impl CodeGen for Parameter {
                     if let Some(t) = crate::resolve_alias_typeinfo(&annotation, &symbols, &options)
                     {
                         t.to_rust_type()
+                    } else if let ExprType::BinOp(op) = &*annotation
+                        && matches!(op.op, crate::BinOps::BitOr)
+                        && let Some(members) = crate::union_members(&annotation)
+                        && !members.is_empty()
+                        && members.iter().all(|m| {
+                            crate::is_pyvalue_boxable_member(m)
+                                || matches!(m, ExprType::Name(n)
+                                    if crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+                                        || crate::ast::tree::raise_stmt::imported_exception_alias(
+                                            &n.id,
+                                            &symbols,
+                                            Some(&options),
+                                        )
+                                        .is_some())
+                        })
+                    {
+                        // A union with exception-class members (`err:
+                        // BaseSSLError | OSError | SocketTimeout` —
+                        // urllib3's _raise_timeout): exceptions are boxed
+                        // values, so the parameter boxes. Checked only
+                        // AFTER the direct mapping, so `str | bytes` still
+                        // lowers to StrOrBytes. Members resolve through
+                        // the naming convention and the symbol table
+                        // (import aliases like SocketTimeout).
+                        quote!(stdpython::PyValue)
                     } else {
                         annotation.to_rust(ctx, options, symbols)?
                     }

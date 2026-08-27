@@ -304,6 +304,23 @@ pub struct PythonOptions {
     /// legal in trait method signatures).
     pub pyvalue_into_params: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// Module names that are STATICALLY None: bound `name = None` exactly
+    /// once at module level (typically the folded handler of a failed
+    /// import guard — `try: import brotli except ImportError: brotli =
+    /// None`, urllib3's response.py) and never mutated through `global`.
+    /// Conditions over them fold at conversion time (issue #137).
+    pub statically_none_names: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Module names that are STATICALLY False the same way (`HAS_ZSTD =
+    /// False` from a folded import guard's handler).
+    pub statically_false_names: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Names bound by a RESOLVABLE module import (`import ssl`) and never
+    /// reassigned at module level: statically truthy and never None, so
+    /// `if not ssl:` / `if ssl is None:` gates fold at conversion time
+    /// (a module object as a value has no other lowering — E0423).
+    pub statically_module_names: std::rc::Rc<std::collections::HashSet<String>>,
+
     /// The current module's package path within the generated crate
     /// ("" for the crate root, "pkg" for pkg/__init__.py, "pkg.sub" for
     /// pkg/sub/module.py). Relative imports (`from .x import y`,
@@ -531,6 +548,9 @@ impl Default for PythonOptions {
             clone_str_attribute_returns: false,
             fn_return_is_pyvalue: false,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
+            statically_none_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            statically_false_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            statically_module_names: std::rc::Rc::new(std::collections::HashSet::new()),
             module_path: Vec::new(),
             this_module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),

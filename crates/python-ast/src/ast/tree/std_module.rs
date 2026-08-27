@@ -46,6 +46,9 @@ pub(crate) enum StdModule {
     Asyncio,
     Threading,
     Socket,
+    /// ssl lives on the rustls-backed `ssl-rustls` stdpython feature
+    /// (on by default).
+    Ssl,
     /// urllib.request lives on the ureq-backed `http-ureq` stdpython
     /// feature; rypip enables it when a package imports it.
     Urllib,
@@ -86,6 +89,7 @@ impl StdModule {
             "asyncio" => StdModule::Asyncio,
             "threading" => StdModule::Threading,
             "socket" => StdModule::Socket,
+            "ssl" => StdModule::Ssl,
             "urllib" => StdModule::Urllib,
             _ => return None,
         })
@@ -124,6 +128,7 @@ impl StdModule {
             StdModule::Asyncio => "asyncio",
             StdModule::Threading => "threading",
             StdModule::Socket => "socket",
+            StdModule::Ssl => "ssl",
             StdModule::Urllib => "urllib",
         }
     }
@@ -154,6 +159,7 @@ impl StdModule {
             | StdModule::Asyncio
             | StdModule::Threading
             | StdModule::Socket
+            | StdModule::Ssl
             | StdModule::Urllib => true,
             StdModule::Io
             | StdModule::Json
@@ -203,6 +209,7 @@ impl StdModule {
                 | StdModule::Io
                 | StdModule::Threading
                 | StdModule::Socket
+                | StdModule::Ssl
                 | StdModule::Datetime
                 | StdModule::Numpy
         )
@@ -317,7 +324,7 @@ mod tests {
     /// Every module, for the exhaustive round-trip walk. Lives in the
     /// test module (its only consumer): CI builds with -D warnings, so a
     /// test-only item in the non-test build would be a dead-code error.
-    const ALL: [StdModule; 31] = [
+    const ALL: [StdModule; 32] = [
         StdModule::Os,
         StdModule::Sys,
         StdModule::Re,
@@ -348,6 +355,7 @@ mod tests {
         StdModule::Asyncio,
         StdModule::Threading,
         StdModule::Socket,
+        StdModule::Ssl,
         StdModule::Urllib,
     ];
 

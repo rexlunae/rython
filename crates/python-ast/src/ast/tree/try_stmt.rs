@@ -281,7 +281,7 @@ impl CodeGen for Try {
             }
             let guard = match &handler.exception_type {
                 None => None,
-                Some(t) => exception_match_guard(t, &symbols)?,
+                Some(t) => exception_match_guard(t, &symbols, &options)?,
             };
             let bind = match &handler.name {
                 Some(name) => {
@@ -567,6 +567,7 @@ pub(crate) fn try_body_contains_import(body: &[crate::Statement]) -> bool {
 fn exception_match_guard(
     exception_type: &ExprType,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
     match exception_type {
         ExprType::Name(name) => {
@@ -575,7 +576,9 @@ fn exception_match_guard(
             // canonicalize to the builtin, matching the raise side
             // (issue #137).
             let n = crate::ast::tree::raise_stmt::imported_exception_alias(
-                &name.id, symbols,
+                &name.id,
+                symbols,
+                Some(options),
             )
             .map(str::to_string)
             .unwrap_or_else(|| name.id.clone());
@@ -599,7 +602,7 @@ fn exception_match_guard(
         ExprType::Tuple(tuple) => {
             let mut guards = Vec::new();
             for elt in &tuple.elts {
-                match exception_match_guard(elt, symbols)? {
+                match exception_match_guard(elt, symbols, options)? {
                     Some(g) => guards.push(g),
                     None => return Ok(None),
                 }

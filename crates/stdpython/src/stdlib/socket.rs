@@ -24,6 +24,7 @@ use crate::PyException;
 
 /// Address families / socket kinds (Linux numeric values, as CPython
 /// exposes on Linux).
+pub const AF_UNSPEC: i64 = 0;
 pub const AF_INET: i64 = 2;
 pub const AF_INET6: i64 = 10;
 pub const SOCK_STREAM: i64 = 1;
@@ -250,6 +251,21 @@ impl Socket {
             _ => Err(PyException::new(
                 "OSError",
                 "[Errno 107] Transport endpoint is not connected",
+            )),
+        }
+    }
+
+    /// A cloned TCP handle for the TLS layer: `ssl.SSLContext.
+    /// wrap_socket` runs the rustls session over the connected stream
+    /// (the clone shares the descriptor, exactly like Python's ssl
+    /// wrapping the same fd).
+    #[cfg(feature = "ssl-rustls")]
+    pub(crate) fn tcp_stream_clone(&self) -> Result<TcpStream, PyException> {
+        match self.io_handle()? {
+            IoHandle::Tcp(s) => Ok(s),
+            IoHandle::Udp(_) => Err(PyException::new(
+                "OSError",
+                "wrap_socket requires a TCP stream socket",
             )),
         }
     }

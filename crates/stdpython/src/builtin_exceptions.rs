@@ -47,6 +47,9 @@ macro_rules! builtin_exceptions {
                     // Historical aliases of OSError (CPython: the same
                     // class object).
                     "EnvironmentError" | "IOError" => Some(Self::OSError),
+                    // ssl.CertificateError IS SSLCertVerificationError
+                    // (an alias since Python 3.7).
+                    "CertificateError" => Some(Self::SSLCertVerificationError),
                     _ => None,
                 }
             }
@@ -127,6 +130,18 @@ builtin_exceptions! {
     // against python3: gaierror/herror → OSError).
     Gaierror => "gaierror",
     Herror => "herror",
+    // ssl-module exceptions (the ssl-rustls runtime raises SSLError):
+    // SSLError IS-A OSError; the leaves subclass SSLError, and
+    // SSLCertVerificationError MULTIPLY inherits (SSLError, ValueError) —
+    // the second ancestry is explicit in is_caught_by. CertificateError
+    // is its alias (canonicalized in from_name). Verified against python3.
+    SSLError => "SSLError",
+    SSLZeroReturnError => "SSLZeroReturnError",
+    SSLWantReadError => "SSLWantReadError",
+    SSLWantWriteError => "SSLWantWriteError",
+    SSLSyscallError => "SSLSyscallError",
+    SSLEOFError => "SSLEOFError",
+    SSLCertVerificationError => "SSLCertVerificationError",
     // RuntimeError leaves.
     NotImplementedError => "NotImplementedError",
     RecursionError => "RecursionError",
@@ -180,7 +195,9 @@ impl BuiltinException {
             BlockingIOError | ChildProcessError | ConnectionError | FileExistsError
             | FileNotFoundError | InterruptedError | IsADirectoryError | NotADirectoryError
             | PermissionError | ProcessLookupError | TimeoutError | URLError | Gaierror
-            | Herror => OSError,
+            | Herror | SSLError => OSError,
+            SSLZeroReturnError | SSLWantReadError | SSLWantWriteError | SSLSyscallError
+            | SSLEOFError | SSLCertVerificationError => SSLError,
             BrokenPipeError | ConnectionAbortedError | ConnectionRefusedError
             | ConnectionResetError => ConnectionError,
             HTTPError | ContentTooShortError => URLError,
@@ -205,6 +222,10 @@ impl BuiltinException {
             return true;
         }
         if self == Self::ExceptionGroup && target == Self::Exception {
+            return true;
+        }
+        // SSLCertVerificationError's second base: (SSLError, ValueError).
+        if self == Self::SSLCertVerificationError && target == Self::ValueError {
             return true;
         }
         let mut current = self.parent();
@@ -276,9 +297,9 @@ impl BuiltinException {
             PermissionError => PyPermissionError::new_err(msg),
             ProcessLookupError => PyProcessLookupError::new_err(msg),
             TimeoutError => PyTimeoutError::new_err(msg),
-            URLError | HTTPError | ContentTooShortError | Gaierror | Herror => {
-                PyOSError::new_err(msg)
-            }
+            URLError | HTTPError | ContentTooShortError | Gaierror | Herror | SSLError
+            | SSLZeroReturnError | SSLWantReadError | SSLWantWriteError | SSLSyscallError
+            | SSLEOFError | SSLCertVerificationError => PyOSError::new_err(msg),
             NotImplementedError => PyNotImplementedError::new_err(msg),
             RecursionError => PyRecursionError::new_err(msg),
             PythonFinalizationError => PyRuntimeError::new_err(msg),
@@ -351,6 +372,17 @@ mod tests {
             Some(OSError)
         );
         assert_eq!(BuiltinException::from_name("IOError"), Some(OSError));
+        // ssl aliases and the multiple-inheritance edge (verified against
+        // python3: CertificateError is SSLCertVerificationError, and
+        // SSLCertVerificationError.__bases__ == (SSLError, ValueError)).
+        assert_eq!(
+            BuiltinException::from_name("CertificateError"),
+            Some(SSLCertVerificationError)
+        );
+        assert!(SSLCertVerificationError.is_caught_by(ValueError));
+        assert!(SSLCertVerificationError.is_caught_by(SSLError));
+        assert!(SSLError.is_caught_by(OSError));
+        assert!(!SSLError.is_caught_by(ValueError));
         assert!(ExceptionGroup.is_caught_by(Exception));
         assert!(!BaseExceptionGroup.is_caught_by(Exception));
         assert!(!SystemExit.is_caught_by(Exception));

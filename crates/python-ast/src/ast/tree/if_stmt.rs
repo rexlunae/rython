@@ -86,6 +86,23 @@ impl CodeGen for If {
             return Ok(quote! { #(#stmts;)* });
         }
 
+        // A STATICALLY-DECIDED module-name gate (issue #137): `if brotli
+        // is not None:` where `brotli = None` is the module's single
+        // store (the folded handler of a failed import guard), or `if
+        // HAS_ZSTD:` where the flag is a single-store False. CPython
+        // never enters the dead branch; the guarded class definitions
+        // and decoder branches fold away with it.
+        if let Some(taken) = static_name_gate_taken(&self.test, &options) {
+            let branch = if taken { &self.body } else { &self.orelse };
+            let stmts: Result<Vec<_>, _> = branch
+                .iter()
+                .cloned()
+                .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+                .collect();
+            let stmts = stmts?;
+            return Ok(quote! { #(#stmts;)* });
+        }
+
         // Regular if statement handling; the test is a condition position,
         // so Python truthiness applies.
         let test =
@@ -322,4 +339,83 @@ mod tests {
     create_parse_test!(test_simple_if, "if x > 5:\n    print('big')", "if_test.py");
     create_parse_test!(test_if_else, "if x > 5:\n    print('big')\nelse:\n    print('small')", "if_test.py");
     create_parse_test!(test_if_elif, "if x > 10:\n    print('huge')\nelif x > 5:\n    print('big')\nelse:\n    print('small')", "if_test.py");
+}
+/// Conversion-time truth of a test over STATICALLY-DECIDED module names
+/// (single-store None/False module constants — module.rs's
+/// statically_none_names / statically_false_names, typically the folded
+/// handler of a failed import guard). Some(truth) when the whole test
+/// folds; None leaves the test to runtime. Issue #137.
+pub(crate) fn static_name_gate_taken(
+    test: &ExprType,
+    options: &PythonOptions,
+) -> Option<bool> {
+    match test {
+        ExprType::Name(n) => {
+            // None and False are both falsy; a resolved module import is
+            // always truthy.
+            if options.statically_module_names.contains(&n.id) {
+                return Some(true);
+            }
+            (options.statically_none_names.contains(&n.id)
+                || options.statically_false_names.contains(&n.id))
+            .then_some(false)
+        }
+        ExprType::UnaryOp(u) if matches!(u.op, crate::Ops::Not) => {
+            static_name_gate_taken(&u.operand, options).map(|t| !t)
+        }
+        ExprType::Compare(c) => {
+            let ExprType::Name(n) = c.left.as_ref() else {
+                return None;
+            };
+            // `name is None` truth: a statically-None name → true; a
+            // resolved module import (never None) → false.
+            let is_none = if options.statically_none_names.contains(&n.id) {
+                true
+            } else if options.statically_module_names.contains(&n.id) {
+                false
+            } else {
+                return None;
+            };
+            let rhs = c.comparators.first()?;
+            if !crate::is_none_expr(rhs) {
+                return None;
+            }
+            match c.ops.first() {
+                Some(crate::Compares::Is) | Some(crate::Compares::Eq) => Some(is_none),
+                Some(crate::Compares::IsNot) | Some(crate::Compares::NotEq) => {
+                    Some(!is_none)
+                }
+                _ => None,
+            }
+        }
+        ExprType::BoolOp(b) => {
+            let vals: Vec<Option<bool>> = b
+                .values
+                .iter()
+                .map(|v| static_name_gate_taken(v, options))
+                .collect();
+            match b.op {
+                crate::BoolOps::And => {
+                    if vals.iter().any(|v| *v == Some(false)) {
+                        Some(false)
+                    } else if vals.iter().all(|v| *v == Some(true)) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+                crate::BoolOps::Or => {
+                    if vals.iter().any(|v| *v == Some(true)) {
+                        Some(true)
+                    } else if vals.iter().all(|v| *v == Some(false)) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                crate::BoolOps::Unknown => None,
+            }
+        }
+        _ => None,
+    }
 }

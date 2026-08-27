@@ -5518,6 +5518,10 @@ pub use stdlib::argparse;
 pub use stdlib::threading;
 #[cfg(feature = "std")]
 pub use stdlib::socket;
+/// Python ssl (rustls-backed; gated on the ssl-rustls feature, which
+/// implies std — on by default).
+#[cfg(feature = "ssl-rustls")]
+pub use stdlib::ssl;
 /// Python urllib.request (ureq-backed; gated on the http-ureq feature,
 /// which implies std).
 #[cfg(feature = "http-ureq")]
