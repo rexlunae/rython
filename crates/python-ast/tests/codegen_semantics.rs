@@ -5145,7 +5145,7 @@ fn partial_lowers_to_a_move_closure_with_remaining_params() {
         "    return g()\n",
     );
     let out = compile(src, "part2.py");
-    assert!(out.contains("move | | add (2 , 3 ,)"), "generated: {}", out);
+    assert!(out.contains("move | | add (2 , 3)"), "generated: {}", out);
 
     // The functools.partial attribute spelling works too.
     let src = concat!(
@@ -10445,6 +10445,63 @@ fn mixed_dict_literal_with_nested_dict_boxes_values() {
         out.contains("Credentials"),
         "the nested-dict key must survive: {}",
         out
+    );
+}
+
+#[test]
+fn functools_partial_keyword_bindings_emit_in_callee_order() {
+    // Issue #189-family (botocore's retryhandler): keyword bindings may
+    // bind ANY subset of the callee's parameters in any order — the
+    // closure's call emits arguments in the CALLEE'S DECLARED ORDER, so
+    // `partial(delay_exponential, base=base, growth_factor=growth_factor)`
+    // (keyword-bound parameters BEFORE the unbound one) lowers instead of
+    // demanding a parameter reorder.
+    let out = compile(
+        concat!(
+            "import functools\n",
+            "\n",
+            "def delay_exponential(base: int, growth_factor: int, attempts: int) -> int:\n",
+            "    return base * growth_factor ** (attempts - 1)\n",
+            "\n",
+            "def create_delay(base: int, growth_factor: int):\n",
+            "    return functools.partial(\n",
+            "        delay_exponential, base=base, growth_factor=growth_factor\n",
+            "    )\n",
+        ),
+        "partial_kw.py",
+    );
+    assert!(
+        out.contains("move | attempts | delay_exponential (base , growth_factor , attempts)"),
+        "the closure emits the callee's declared order: {}",
+        out
+    );
+}
+
+#[test]
+fn functools_partial_keyword_call_through_the_bound_name_is_loud() {
+    // A keyword call through a partial-bound name (`unit(x=-4)`) has no
+    // named closure parameters to map onto — the keyword would be silently
+    // dropped and the call mis-arity'd — so it is a loud conversion error
+    // (the callable-as-value divergence, issue #122).
+    let err = compile_err(
+        concat!(
+            "import functools\n",
+            "\n",
+            "def clamp(lo: int, hi: int, x: int) -> int:\n",
+            "    return lo + hi + x\n",
+            "\n",
+            "unit = functools.partial(clamp, lo=0, hi=100)\n",
+            "\n",
+            "def f() -> int:\n",
+            "    return unit(x=-4)\n",
+        ),
+        "partial_kw_call.py",
+    );
+    assert!(
+        err.contains("keyword call through a functools.partial-bound name")
+            && err.contains("issue #122"),
+        "the keyword call must be loud: {}",
+        err
     );
 }
 
