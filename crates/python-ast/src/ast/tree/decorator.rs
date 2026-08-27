@@ -362,12 +362,11 @@ pub fn try_lru_cache_factory(
         Some(crate::SymbolTableNode::ImportFrom(i)) => {
             let options = options?;
             let path = i.resolved_module_path(&options);
-            if options.module_defs.contains_key(&path) {
-                let (f, _) = crate::module_function_def(&options, &path, &fn_name.id)?;
-                f
-            } else {
+            let Some(key) = crate::module_defs_key(&options, &path) else {
                 return None;
-            }
+            };
+            let (f, _) = crate::module_function_def(&options, key, &fn_name.id)?;
+            f
         }
         _ => return None,
     };

@@ -4530,6 +4530,35 @@ pub fn resolve_class_referenced(
     }
 }
 
+/// The `module_defs` key for a resolved import path, matching both keying
+/// conventions: keys are RELATIVE to the package root for src-layout /
+/// package-dir sdists (boto3, pip: `session`, `_internal.cli.req_command`),
+/// but include the package root when the sdist root IS the package
+/// (requests' vendored deps: `urllib3.contrib`). An absolute import
+/// (`from boto3.session import ...`) resolves to the root-qualified path,
+/// so try it first, then with the leading (package-root) segment dropped.
+/// Returns the matching key (borrowing the caller's `path`) so callers can
+/// index `module_defs` with it, or `None` when neither form is a crate
+/// module.
+pub fn module_defs_key<'a>(
+    options: &'a PythonOptions,
+    path: &'a [String],
+) -> Option<&'a [String]> {
+    if options.module_defs.contains_key(path) {
+        Some(path)
+    } else if path.len() > 1 && options.module_defs.contains_key(&path[1..]) {
+        Some(&path[1..])
+    } else {
+        None
+    }
+}
+
+/// Whether `path` names a module of the converted crate — see
+/// [`module_defs_key`].
+pub fn module_defs_contains(options: &PythonOptions, path: &[String]) -> bool {
+    module_defs_key(options, path).is_some()
+}
+
 /// Resolve a FUNCTION defined at the top level of another module of the
 /// crate, with that module's symbol table (issue #123): `from
 /// pip._internal.locations import get_scheme` + `scheme = get_scheme(...)`
