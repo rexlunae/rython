@@ -2434,6 +2434,7 @@ pub enum PyValue {
     Str(String),
     Bytes(Vec<u8>),
     Tuple(Arc<Vec<PyValue>>),
+    Dict(Arc<PyDict<String, PyValue>>),
     None_,
 }
 
@@ -2453,6 +2454,8 @@ impl IntoIterator for PyValue {
                 .map(|c| PyValue::Str(c.to_string()))
                 .collect(),
             PyValue::Bytes(b) => b.iter().map(|&o| PyValue::Int(o as i64)).collect(),
+            // Python iterates a dict's KEYS.
+            PyValue::Dict(d) => d.keys().map(|k| PyValue::Str(k.clone())).collect(),
             PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
             PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
             PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
@@ -2553,6 +2556,7 @@ impl Truthy for PyValue {
             PyValue::Str(s) => !s.is_empty(),
             PyValue::Bytes(b) => !b.is_empty(),
             PyValue::Tuple(t) => !t.is_empty(),
+            PyValue::Dict(d) => !d.is_empty(),
             PyValue::None_ => false,
         }
     }
@@ -2642,6 +2646,24 @@ impl From<StrOrBytes> for PyValue {
     }
 }
 
+/// A boxed DICT (issue #180): a dict literal whose value types mix
+/// (`{'ProviderType': 'sso', 'Credentials': {...}}` — botocore) widens
+/// to PyDict<String, PyValue> and a nested dict VALUE boxes here, so the
+/// heterogeneous container is representable and indexable.
+impl<K, V> From<PyDict<K, V>> for PyValue
+where
+    K: Into<String>,
+    V: Into<PyValue>,
+{
+    fn from(d: PyDict<K, V>) -> Self {
+        PyValue::Dict(Arc::new(
+            d.into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        ))
+    }
+}
+
 impl From<Option<PyValue>> for PyValue {
     // A mixed-literal element whose own lowering produced an Option
     // (a None member) flattens into the boxed value.
@@ -2670,6 +2692,7 @@ impl PyValue {
             PyValue::Str(_) => "str",
             PyValue::Bytes(_) => "bytes",
             PyValue::Tuple(_) => "tuple",
+            PyValue::Dict(_) => "dict",
             PyValue::None_ => "NoneType",
         }
     }
@@ -2759,6 +2782,20 @@ pub fn py_global_write<T>(cell: &std::sync::Mutex<T>, value: T) {
 /// bools and None render as themselves; a str renders UNQUOTED; bytes use
 /// the `b'...'` repr form; tuple elements always render in REPR form
 /// (`str((1, 'a'))` == `"(1, 'a')"`).
+/// The Python type name of a boxed value, for TypeError messages.
+pub fn py_value_type_name(v: &PyValue) -> &'static str {
+    match v {
+        PyValue::Int(_) => "int",
+        PyValue::Float(_) => "float",
+        PyValue::Bool(_) => "bool",
+        PyValue::Str(_) => "str",
+        PyValue::Bytes(_) => "bytes",
+        PyValue::Tuple(_) => "tuple",
+        PyValue::Dict(_) => "dict",
+        PyValue::None_ => "NoneType",
+    }
+}
+
 pub fn py_value_str(v: &PyValue) -> String {
     match v {
         PyValue::Int(i) => i.to_string(),
@@ -2773,6 +2810,19 @@ pub fn py_value_str(v: &PyValue) -> String {
             } else {
                 format!("({})", inner.join(", "))
             }
+        }
+        PyValue::Dict(d) => {
+            let inner: Vec<String> = d
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        py_value_repr(&PyValue::Str(k.clone())),
+                        py_value_repr(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", inner.join(", "))
         }
         PyValue::None_ => "None".to_string(),
     }
@@ -2823,6 +2873,13 @@ impl core::hash::Hash for PyValue {
             PyValue::Tuple(items) => {
                 core::hash::Hash::hash(&5u8, state);
                 core::hash::Hash::hash(items.as_ref(), state);
+            }
+            PyValue::Dict(d) => {
+                core::hash::Hash::hash(&7u8, state);
+                for (k, v) in d.iter() {
+                    core::hash::Hash::hash(k, state);
+                    core::hash::Hash::hash(v, state);
+                }
             }
             PyValue::None_ => core::hash::Hash::hash(&6u8, state),
         }
@@ -4355,6 +4412,41 @@ impl<K: Eq + Hash, V> PyPopDefault<K, V> for HashMap<K, V> {
 }
 
 // PyDict participates in every container protocol HashMap does.
+
+/// Indexing a BOXED dict (`credentials['Credentials']` where the outer
+/// value is a boxed PyValue — issue #180): a boxed dict member indexes
+/// like the dict it holds; anything else raises CPython's TypeError.
+impl PyIndex<&str> for PyValue {
+    type Output = PyValue;
+    fn py_index(&self, key: &str) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Dict(d) => d.py_index(key),
+            other => Err(PyException::new(
+                "TypeError",
+                format!(
+                    "'{}' object is not subscriptable",
+                    py_value_type_name(other)
+                ),
+            )),
+        }
+    }
+}
+
+impl PyIndexMut<&str> for PyValue {
+    type Output = PyValue;
+    fn py_index_mut(&mut self, key: &str) -> Result<&mut PyValue, PyException> {
+        match self {
+            PyValue::Dict(d) => Arc::make_mut(d).py_index_mut(key),
+            other => Err(PyException::new(
+                "TypeError",
+                format!(
+                    "'{}' object is not subscriptable",
+                    py_value_type_name(other)
+                ),
+            )),
+        }
+    }
+}
 
 impl<K: Eq + Hash + Debug, V: Clone> PyIndex<K> for PyDict<K, V> {
     type Output = V;

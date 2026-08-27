@@ -1062,14 +1062,14 @@ fn mixed_numeric_list_unifies_to_float() {
 
 #[test]
 fn incompatible_list_elements_are_a_loud_error() {
-    // Issue #130: primitive mixes ([1, "a"]) BOX to Vec<PyValue>; a mix
-    // involving an UNBOXABLE element (a dict literal has no PyValue
-    // variant) stays a loud conversion error.
-    let err = compile_err("[1, {'a': 2}]", "badlist.py");
+    // Issue #130: primitive mixes ([1, "a"]) BOX to Vec<PyValue>. Since
+    // #180 (PyValue::Dict) a dict literal is boxable too, so [1, {'a':
+    // 2}] now boxes instead of erroring.
+    let out = compile("[1, {'a': 2}]", "boxlist.py");
     assert!(
-        err.contains("mixes incompatible element types"),
-        "expected loud conversion error, got: {}",
-        err
+        out.contains("PyValue :: from"),
+        "a dict element must box like any other boxable value: {}",
+        out
     );
 }
 
@@ -10209,6 +10209,47 @@ fn annotated_empty_dict_keeps_types_inside_loop() {
     assert!(
         out.contains("PyDict :: < i64 , i64 > :: from ([])"),
         "the annotated element types must survive the loop: {}",
+        out
+    );
+}
+
+/// Issue #180: a dict literal whose value types mix (a string and a
+/// NESTED DICT) must widen to the boxed PyValue rather than erroring:
+/// `{'ProviderType': 'sso', 'Credentials': {...}}` (botocore's
+/// credentials.py) lowers to PyDict<String, PyValue> with the nested
+/// dict boxed via PyValue::from(PyDict...), and the returned dict keeps
+/// its type so `c['Credentials']['AccessKeyId']` compiles.
+#[test]
+fn mixed_dict_literal_with_nested_dict_boxes_values() {
+    let out = compile(
+        "def make_credentials(account_id: str):\n\
+         \x20   credentials = {\n\
+         \x20       'ProviderType': 'sso',\n\
+         \x20       'Credentials': {\n\
+         \x20           'AccessKeyId': 'AK',\n\
+         \x20           'AccountId': account_id,\n\
+         \x20       },\n\
+         \x20   }\n\
+         \x20   return credentials\n\
+         \n\
+         def main() -> int:\n\
+         \x20   c = make_credentials('123')\n\
+         \x20   print(c['Credentials']['AccessKeyId'])\n\
+         \x20   return 0\n",
+        "mixeddict.py",
+    );
+    // The nested dict VALUE boxes via PyValue::from, and the function's
+    // inferred return type proves the dict widened to PyDict<String,
+    // PyValue> (the literal itself renders as inferred PyDict::from([...])).
+    assert!(
+        out.contains("PyValue :: from")
+            && out.contains("PyDict < String , stdpython :: PyValue >"),
+        "mixed values must box into a PyDict<String, PyValue>: {}",
+        out
+    );
+    assert!(
+        out.contains("Credentials"),
+        "the nested-dict key must survive: {}",
         out
     );
 }
