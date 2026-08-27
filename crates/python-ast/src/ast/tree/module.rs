@@ -4450,6 +4450,58 @@ pub(crate) fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate
     }
 }
 
+/// Is `name` — a class of the CURRENT module (options.this_module_path) —
+/// used as a base by a class in another module of the crate? urllib3's
+/// RequestMethods: subclassed only cross-module (poolmanager,
+/// connectionpool), so its own module's hierarchy computation never sees
+/// it, yet the subclass modules' ancestor impls and supertrait bounds
+/// name `RequestMethodsTrait` (issue #137 round 20).
+///
+/// The importer match is deliberately loose — the importing module binds
+/// `name` through a from-import whose dotted module's LAST segment equals
+/// this module's — because resolving each sibling's relative imports here
+/// would repeat the whole chain machinery; a false positive only emits an
+/// unused accessor-only trait (dead code, never an error), while a miss
+/// leaves an unresolved `{Name}Trait` (E0405).
+pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOptions) -> bool {
+    let Some(this_leaf) = options.this_module_path.last() else {
+        return false;
+    };
+    fn imports_name_from(stmts: &[crate::Statement], name: &str, leaf: &str) -> bool {
+        use crate::StatementType as ST;
+        stmts.iter().any(|s| match &s.statement {
+            ST::ImportFrom(i) => {
+                i.module.rsplit('.').next() == Some(leaf)
+                    && i.names
+                        .iter()
+                        .any(|a| a.asname.as_deref().unwrap_or(&a.name) == name)
+            }
+            ST::If(b) => imports_name_from(&b.body, name, leaf) || imports_name_from(&b.orelse, name, leaf),
+            ST::Try(t) => {
+                imports_name_from(&t.body, name, leaf)
+                    || t.handlers.iter().any(|h| imports_name_from(&h.body, name, leaf))
+            }
+            _ => false,
+        })
+    }
+    for (path, module) in options.module_defs.iter() {
+        if path[..] == options.this_module_path[..] {
+            continue;
+        }
+        let mut classes = Vec::new();
+        collect_class_defs(&module.raw.body, &mut classes);
+        let subclasses_name = classes.iter().any(|c| {
+            c.bases
+                .iter()
+                .any(|b| matches!(b, crate::ExprType::Name(n) if n.id == name))
+        });
+        if subclasses_name && imports_name_from(&module.raw.body, name, this_leaf) {
+            return true;
+        }
+    }
+    false
+}
+
 /// For each class in `ast` that lowers with the trait machinery, the trait
 /// names that carry its methods: its own `{Name}Trait` plus one per
 /// ancestor, nearest first. Consumed by the converter so a relative import
