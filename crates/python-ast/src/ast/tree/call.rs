@@ -52,6 +52,14 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "urandom",
     // socket.socket() rejects unknown families/kinds with OSError.
     "socket",
+    // socket.getaddrinfo raises gaierror (an OSError) on resolution failure.
+    "getaddrinfo",
+    // socket.SocketIO / ssl.MemoryBIO construction raises
+    // NotImplementedError: makefile()-over-wrapped-socket and TLS-in-TLS
+    // BIOs are not modeled by the runtime (documented divergence) — the
+    // constructors are loud, catchable stubs.
+    "SocketIO",
+    "MemoryBIO",
     // urllib.request.urlopen raises URLError/HTTPError.
     "urlopen",
 ];
@@ -6554,6 +6562,12 @@ impl<'a> CodeGen for Call {
             } else {
                 quote!(#call_expr)
             }
+        } else if name_str == "socket :: socket" && all_args.len() == 3 {
+            // socket.socket(family, type, proto) — the 3-argument spelling
+            // (the getaddrinfo loop passes the resolved proto). The runtime's
+            // 2-arg `socket()` keeps the common spelling; the proto-validating
+            // variant carries the third argument.
+            quote!(socket::socket3(#(#all_args),*)?)
         } else if propagates_exceptions {
             quote!(#call_expr?)
         } else if name_str == "subprocess :: run" {

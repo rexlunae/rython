@@ -1669,11 +1669,7 @@ fn resolve_alias_typeinfo_inner(
             Some(SymbolTableNode::Assign { value, .. }) => {
                 // A TypeVar (`_DT = TypeVar("_DT")`) is a compile-time
                 // generic — boxed when it appears in a union.
-                if let ExprType::Call(c) = value
-                    && (matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "TypeVar")
-                        || matches!(c.func.as_ref(), ExprType::Attribute(a)
-                            if a.attr == "TypeVar"))
-                {
+                if is_typevar_call(value) {
                     return Some(TypeInfo::PyValue);
                 }
                 // A NewType alias (`RecordPath = NewType("RecordPath",
@@ -1707,11 +1703,7 @@ fn resolve_alias_typeinfo_inner(
                 let syms = module.clone().find_symbols(SymbolTableScopes::new());
                 match syms.get(&n.id) {
                     Some(SymbolTableNode::Assign { value, .. }) => {
-                        if let ExprType::Call(c) = value
-                            && (matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "TypeVar")
-                                || matches!(c.func.as_ref(), ExprType::Attribute(a)
-                                    if a.attr == "TypeVar"))
-                        {
+                        if is_typevar_call(value) {
                             return Some(TypeInfo::PyValue);
                         }
                         // A NewType alias (`NormalizedName =
@@ -1963,6 +1955,18 @@ pub fn call_return_typeinfo(
 }
 
 /// The symbol table of a module in options.module_defs ("" root).
+/// Is `value` a `TypeVar(...)` construction (`T = typing.TypeVar("T")`)?
+/// A TypeVar is a compile-time generic with no runtime item — every
+/// annotation position that meets one lowers to the boxed PyValue.
+pub(crate) fn is_typevar_call(value: &ExprType) -> bool {
+    matches!(
+        value,
+        ExprType::Call(c)
+            if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "TypeVar")
+                || matches!(c.func.as_ref(), ExprType::Attribute(a) if a.attr == "TypeVar")
+    )
+}
+
 fn module_symbols(options: &PythonOptions, path: &[String]) -> SymbolTableScopes {
     match options.module_defs.get(path) {
         Some(module) => {

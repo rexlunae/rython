@@ -125,13 +125,32 @@ pub mod TLSVersion {
     pub const MAXIMUM_SUPPORTED: i64 = -1;
 }
 
-// ---------------------------------------------------------------------------
-// Certificate verification plumbing.
-// ---------------------------------------------------------------------------
+/// ssl.MemoryBIO() — the in-memory BIO pair `SSLContext.wrap_bio` drives
+/// for TLS-in-TLS. Not modeled by either backend: `wrap_bio` itself is
+/// absent (urllib3's SSLTransport already raises ProxySchemeUnsupported
+/// on that check). The construction raises a catchable
+/// NotImplementedError instead of handing back a silently inert buffer
+/// (documented divergence).
+#[allow(non_snake_case)]
+pub fn MemoryBIO() -> Result<crate::PyValue, crate::PyException> {
+    Err(crate::PyException::new(
+        "NotImplementedError",
+        "ssl.MemoryBIO is not modeled by the stdpython runtime \
+         (TLS-in-TLS wrap_bio; documented divergence)",
+    ))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_bio_raises_not_implemented() {
+        // TLS-in-TLS BIOs are not modeled — the constructor is a loud,
+        // CATCHABLE stub (never a silent inert buffer).
+        let err = MemoryBIO().unwrap_err();
+        assert_eq!(err.exception_type, "NotImplementedError");
+    }
 
     #[test]
     fn constants_match_cpython() {
