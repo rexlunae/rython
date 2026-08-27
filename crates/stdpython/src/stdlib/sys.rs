@@ -237,3 +237,18 @@ python_function! {
         let _ = (event, args);
     }
 }
+/// sys.implementation — the running interpreter's identity. rython pins
+/// CPython semantics (docs/spec.md conformance rule), so the name
+/// reports "cpython". A nested module, because the dotted attribute
+/// chain renders as the path `sys::implementation::name`.
+pub mod implementation {
+    #[allow(non_upper_case_globals)]
+    pub static name: &'static str = "cpython";
+}
+
+/// sys.pypy_version_info — exists only under PyPy; readable code guards
+/// it behind `sys.implementation.name == "pypy"`, which is statically
+/// false here, so the value is unreachable at runtime. Zeros keep the
+/// guarded code compiling (the interpreter-identity divergence).
+#[allow(non_upper_case_globals)]
+pub static pypy_version_info: (i64, i64, i64) = (0, 0, 0);

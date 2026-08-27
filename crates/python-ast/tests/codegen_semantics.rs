@@ -7614,8 +7614,8 @@ fn class_body_computed_constant_promotes_to_lazylock() {
         "retryconst.py",
     );
     assert!(
-        out.contains("pub static DEFAULT_ALLOWED_METHODS"),
-        "class-body computed constant must be a LazyLock static: {}",
+        out.contains("pub static Retry_DEFAULT_ALLOWED_METHODS"),
+        "class-body computed constant must be a module-level class-mangled LazyLock static (issue #137): {}",
         out
     );
 }
@@ -9111,6 +9111,162 @@ fn sum_into_a_typed_slot_pins_the_output() {
     assert!(
         !out.contains("T : PySum ,"),
         "the plain bound is subsumed by the pinned one: {}",
+        out
+    );
+}
+
+// ---- Issue #137: build-sweep round (top-5 packages) ----
+
+#[test]
+fn with_block_returns_feed_m4_callee_inference() {
+    // requests' api.py: `get` calls `request`, whose only return sits
+    // inside a `with` block — the M4 callee-return collector previously
+    // missed it ("no return statements") and the whole package failed to
+    // convert.
+    let out = compile(
+        concat!(
+            "def request(method, url):\n",
+            "    with open(url) as session:\n",
+            "        return method\n",
+            "\n",
+            "def get(url):\n",
+            "    return request(\"GET\", url)\n",
+        ),
+        "withret.py",
+    );
+    assert!(out.contains("fn get"), "conversion must succeed: {}", out);
+}
+
+#[test]
+fn attribute_of_call_field_boxes_to_pyvalue() {
+    // requests' cookies.MockRequest: `self.type = urlparse(...).scheme` —
+    // a dynamic member of a foreign object — types the field as the
+    // boxed PyValue instead of failing the class.
+    let out = compile(
+        concat!(
+            "class MockRequest:\n",
+            "    def __init__(self, url: str):\n",
+            "        self.kind = open(url).scheme\n",
+        ),
+        "mockreq.py",
+    );
+    assert!(
+        out.contains("kind : stdpython :: PyValue"),
+        "the field must box: {}",
+        out
+    );
+}
+
+#[test]
+fn callee_element_operands_map_to_the_fresh_iterate_element() {
+    // requests' cookiejar_from_dict/merge_cookies: the callee subscripts
+    // its parameter by its own LOOP ELEMENT (`cookie_dict[name]` under
+    // `for name in cookie_dict`); propagating that requirement into a
+    // caller previously failed with "parameter `name` used as an operand
+    // but has no type".
+    let out = compile(
+        concat!(
+            "def from_dict(cookie_dict):\n",
+            "    total = 0\n",
+            "    for name in cookie_dict:\n",
+            "        total = total + cookie_dict[name]\n",
+            "    return total\n",
+            "\n",
+            "def merge(cookies):\n",
+            "    return from_dict(cookies)\n",
+        ),
+        "eltmap.py",
+    );
+    assert!(out.contains("fn merge"), "conversion must succeed: {}", out);
+}
+
+#[test]
+fn class_computed_constants_are_module_level_statics() {
+    // urllib3's RequestMethods._encode_url_methods: associated statics
+    // are not legal Rust — the LazyLock lives at module level under the
+    // class-mangled name, and `self.X` reads deref-clone it.
+    let out = compile(
+        concat!(
+            "class RequestMethods:\n",
+            "    _encode_url_methods = frozenset([\"DELETE\", \"GET\"])\n",
+            "    def uses_url(self, method: str) -> bool:\n",
+            "        return method in self._encode_url_methods\n",
+        ),
+        "clsconst.py",
+    );
+    assert!(
+        out.contains("pub static RequestMethods__encode_url_methods"),
+        "the constant must be a module-level class-mangled static: {}",
+        out
+    );
+    assert!(
+        out.contains("RequestMethods :: _encode_url_methods ()"),
+        "the self-read must call the associated accessor: {}",
+        out
+    );
+    // Nothing static remains inside the impl block.
+    assert!(
+        !out.contains("impl RequestMethods { pub static"),
+        "no associated statics: {}",
+        out
+    );
+}
+
+#[test]
+fn stdlib_exception_aliases_canonicalize_on_raise_and_except() {
+    // urllib3's pyopenssl: `from socket import timeout` then
+    // `raise timeout(...)`; response.py catches it as an aliased import.
+    // CPython aliases socket.timeout to TimeoutError, so both sides
+    // lower to the canonical builtin and the hierarchy walk matches.
+    let out = compile(
+        concat!(
+            "from socket import timeout as SocketTimeout\n",
+            "\n",
+            "def read(n: int) -> int:\n",
+            "    try:\n",
+            "        if n > 0:\n",
+            "            raise SocketTimeout(\"The read operation timed out\")\n",
+            "    except SocketTimeout:\n",
+            "        return -1\n",
+            "    return n\n",
+        ),
+        "socktimeout.py",
+    );
+    assert!(
+        out.contains("PyException :: new (\"TimeoutError\""),
+        "the raise must carry the canonical builtin: {}",
+        out
+    );
+    assert!(
+        out.contains("matches (\"TimeoutError\")"),
+        "the handler must match the canonical builtin: {}",
+        out
+    );
+}
+
+#[test]
+fn urllib_calls_without_runtime_items_drop_boxed() {
+    // urllib3's `urlencode(fields)` under `from urllib.parse import
+    // urlencode`: no runtime item exists — the call drops to the boxed
+    // None with the divergence warning instead of rendering a
+    // `urlencode::new(...)` class construction.
+    let out = compile(
+        concat!(
+            "from urllib.parse import urlencode\n",
+            "\n",
+            "def q(fields: str) -> None:\n",
+            "    x = urlencode(fields)\n",
+        ),
+        "urlenc.py",
+    );
+    assert!(
+        out.contains("PyValue :: None_"),
+        "the call must drop boxed: {}",
+        out
+    );
+    assert!(
+        !out.contains("urlencode :: new"),
+        "no class construction for a dropped import: {}",
         out
     );
 }

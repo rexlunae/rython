@@ -3463,7 +3463,7 @@ fn module_init_static_ty(
 
 /// Whether a type contains the UNINFERRED placeholder (`TypeInfo::PyObject`
 /// renders as `_`) anywhere — dict/list elements of external-module reads.
-fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
+pub(crate) fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
     match t {
         crate::TypeInfo::PyObject => true,
         crate::TypeInfo::Vec(inner) | crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {

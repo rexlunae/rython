@@ -1536,6 +1536,9 @@ impl<'a> CodeGen for Call {
                     &n.id,
                     &options,
                     &symbols,
+                )
+                || crate::ast::tree::import::import_dropped_stdpython_item(
+                    &n.id, &symbols,
                 ))
         {
             options.definition_warnings.borrow_mut().push(format!(
@@ -7791,9 +7794,12 @@ fn map_call_arguments_inner(
                         && crate::class_body_computed_constant(&a.value))
             })
         {
+            // The computed constant's associated ACCESSOR (the LazyLock
+            // static itself lives at module level in the DEFINING module —
+            // issue #137).
             let ident = crate::safe_ident(&n.id);
             let class_ident = crate::safe_ident(&class_name);
-            return Ok(quote!((*#class_ident::#ident).clone()));
+            return Ok(quote!(#class_ident::#ident()));
         }
         // A CALLABLE parameter (`dict_class: type = OrderedDict` —
         // requests' sessions): rython cannot hold a class/function as a

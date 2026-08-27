@@ -195,6 +195,17 @@ pub fn active_count() -> i64 {
     ACTIVE_THREADS.load(Ordering::SeqCst) + 1
 }
 
+/// threading.get_ident() — the current thread's opaque integer identity
+/// (urllib3's connectionpool keys per-thread state on it). CPython
+/// promises only uniqueness among live threads; a stable per-thread hash
+/// of the Rust ThreadId satisfies that.
+pub fn get_ident() -> i64 {
+    use core::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    (h.finish() & 0x7fff_ffff_ffff_ffff) as i64
+}
+
 struct LockInner {
     locked: Mutex<bool>,
     cv: Condvar,

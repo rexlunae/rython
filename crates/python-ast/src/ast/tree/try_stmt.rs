@@ -281,7 +281,7 @@ impl CodeGen for Try {
             }
             let guard = match &handler.exception_type {
                 None => None,
-                Some(t) => exception_match_guard(t)?,
+                Some(t) => exception_match_guard(t, &symbols)?,
             };
             let bind = match &handler.name {
                 Some(name) => {
@@ -566,20 +566,40 @@ pub(crate) fn try_body_contains_import(body: &[crate::Statement]) -> bool {
 
 fn exception_match_guard(
     exception_type: &ExprType,
+    symbols: &crate::SymbolTableScopes,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
     match exception_type {
         ExprType::Name(name) => {
-            let n = &name.id;
+            // A stdlib exception ALIAS (`except SocketTimeout:` under
+            // `from socket import timeout as SocketTimeout` — urllib3):
+            // canonicalize to the builtin, matching the raise side
+            // (issue #137).
+            let n = crate::ast::tree::raise_stmt::imported_exception_alias(
+                &name.id, symbols,
+            )
+            .map(str::to_string)
+            .unwrap_or_else(|| name.id.clone());
             Ok(Some(quote!(__rython_exc.matches(#n))))
         }
         ExprType::Attribute(attr) => {
-            let n = &attr.attr;
+            // `except socket.timeout:` — the dotted spelling of the same
+            // stdlib alias canonicalizes identically.
+            let n = match attr.value.as_ref() {
+                ExprType::Name(m) => {
+                    crate::ast::tree::raise_stmt::stdlib_exception_canonical(
+                        &m.id, &attr.attr,
+                    )
+                    .map(str::to_string)
+                    .unwrap_or_else(|| attr.attr.clone())
+                }
+                _ => attr.attr.clone(),
+            };
             Ok(Some(quote!(__rython_exc.matches(#n))))
         }
         ExprType::Tuple(tuple) => {
             let mut guards = Vec::new();
             for elt in &tuple.elts {
-                match exception_match_guard(elt)? {
+                match exception_match_guard(elt, symbols)? {
                     Some(g) => guards.push(g),
                     None => return Ok(None),
                 }

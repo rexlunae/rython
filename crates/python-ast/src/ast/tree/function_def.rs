@@ -2324,7 +2324,12 @@ impl FunctionDef {
         // generated crate via a single #[deprecated] note (the standard
         // mechanism for user-defined warnings). An item can carry only one
         // #[deprecated] attribute, so all notes are folded into it.
-        let lossy_warning = if options.lossy_warnings {
+        // NOT in a Trait context: `#[deprecated]` is not legal on trait
+        // methods in impl blocks (issue #137: urllib3's inherited-method
+        // bodies) — the -W channel still reports those notes.
+        let lossy_warning = if options.lossy_warnings
+            && !matches!(&ctx, CodeGenContext::Trait { .. })
+        {
             let mut notes = self.lossy_conversion_notes();
             if let Some(dw) = &inferred_signature.definition_warning {
                 notes.push(dw.clone());
@@ -3166,6 +3171,11 @@ pub(crate) fn annotation_display(ann: &ExprType) -> String {
 pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
     match body.last().map(|stmt| &stmt.statement) {
         Some(StatementType::Return(Some(_))) => true,
+        // A `with` body's return IS the function's return (context
+        // managers only intercept exceptions, never returns — requests'
+        // api.request; issue #137).
+        Some(StatementType::With(s)) => guarantees_return(&s.body),
+        Some(StatementType::AsyncWith(s)) => guarantees_return(&s.body),
         Some(StatementType::If(s)) => {
             !s.orelse.is_empty() && guarantees_return(&s.body) && guarantees_return(&s.orelse)
         }

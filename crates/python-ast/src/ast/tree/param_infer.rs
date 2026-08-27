@@ -2374,6 +2374,12 @@ fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
                 collect_return_exprs(&t.orelse, out);
                 collect_return_exprs(&t.finalbody, out);
             }
+            // A `with` body's returns are the function's returns
+            // (`with sessions.Session() as session: return
+            // session.request(...)` — requests' api.request, whose M4
+            // callers failed with "no return statements"; issue #137).
+            StatementType::With(s) => collect_return_exprs(&s.body, out),
+            StatementType::AsyncWith(s) => collect_return_exprs(&s.body, out),
             _ => {}
         }
     }
@@ -4243,6 +4249,13 @@ impl<'a> Collector<'a> {
                 let Some(param_reqs) = callee_reqs.get(&callee_param.arg) else {
                     continue;
                 };
+                // Whether this parameter's requirement set declares a loop
+                // element (the Iterate arm below adopts it under a fresh
+                // caller-side name): a callee-ELEMENT operand in another
+                // requirement maps to that same fresh name.
+                let has_iterate = param_reqs
+                    .iter()
+                    .any(|r| matches!(r, ParamReq::Iterate(_)));
                 for req in param_reqs {
                     let mapped = match req {
                         ParamReq::Op(t, RhsType::Param(callee_name)) => {
@@ -4252,6 +4265,54 @@ impl<'a> Collector<'a> {
                         ParamReq::Cmp(t, RhsType::Param(callee_name)) => {
                             let mapped = self.map_callee_param(callee_name, &callee_params, args);
                             ParamReq::Cmp(t, mapped)
+                        }
+                        ParamReq::CmpCond(t, RhsType::Param(callee_name)) => {
+                            let mapped = self.map_callee_operand(
+                                callee_name,
+                                &callee_params,
+                                args,
+                                &arg_param,
+                                has_iterate,
+                            );
+                            ParamReq::CmpCond(t, mapped)
+                        }
+                        // A SUBSCRIPT/membership requirement whose index
+                        // names a callee-side operand (`cookie_dict[name]`
+                        // under `for name in cookie_dict` — requests'
+                        // cookiejar_from_dict, whose merge_cookies caller
+                        // failed with "parameter `name` has no type";
+                        // issue #137): map through the argument list, or
+                        // to the fresh Iterate element for a callee loop
+                        // element.
+                        ParamReq::Index(RhsType::Param(callee_name)) => {
+                            ParamReq::Index(self.map_callee_operand(
+                                callee_name,
+                                &callee_params,
+                                args,
+                                &arg_param,
+                                has_iterate,
+                            ))
+                        }
+                        ParamReq::SetIndex(RhsType::Param(callee_name), val) => {
+                            ParamReq::SetIndex(
+                                self.map_callee_operand(
+                                    callee_name,
+                                    &callee_params,
+                                    args,
+                                    &arg_param,
+                                    has_iterate,
+                                ),
+                                val.clone(),
+                            )
+                        }
+                        ParamReq::Contains(RhsType::Param(callee_name)) => {
+                            ParamReq::Contains(self.map_callee_operand(
+                                callee_name,
+                                &callee_params,
+                                args,
+                                &arg_param,
+                                has_iterate,
+                            ))
                         }
                         ParamReq::Method(t, m, Some(RhsType::Param(callee_name))) => {
                             let mapped = self.map_callee_param(callee_name, &callee_params, args);
@@ -4324,6 +4385,30 @@ impl<'a> Collector<'a> {
             Some(other) => self.rhs_of(other),
             None => RhsType::Unknown,
         }
+    }
+
+    /// Map a callee-side operand NAME into the caller's terms: a callee
+    /// parameter maps through the argument list (map_callee_param); a
+    /// callee LOOP ELEMENT (`cookie_dict[name]` under `for name in
+    /// cookie_dict` — requests' cookiejar_from_dict) maps to the fresh
+    /// element the Iterate adoption declares for this argument, which
+    /// gets its own type variable (issue #137).
+    fn map_callee_operand(
+        &self,
+        callee_name: &str,
+        callee_params: &[&crate::Parameter],
+        args: &[ExprType],
+        arg_param: &str,
+        has_iterate: bool,
+    ) -> RhsType {
+        let mapped = self.map_callee_param(callee_name, callee_params, args);
+        if matches!(mapped, RhsType::Unknown)
+            && has_iterate
+            && callee_params.iter().all(|p| p.arg != callee_name)
+        {
+            return RhsType::Param(format!("__rython_elt_{}", arg_param));
+        }
+        mapped
     }
 
     /// Map a callee's LOOP-ELEMENT requirement into the caller's terms

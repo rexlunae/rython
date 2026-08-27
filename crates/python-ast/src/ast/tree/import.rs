@@ -157,6 +157,33 @@ pub(crate) fn import_from_python_module(
     options.python_modules.contains(root)
 }
 
+/// Whether a name was bound by `from urllib.parse import X` (or another
+/// urllib submodule) where the stdpython runtime has no item for X — the
+/// import itself was already dropped with a warning, so CALLS through
+/// the name must drop to the boxed None the same way (issue #137:
+/// urllib3's `urlencode(fields)` rendered as a `urlencode::new(...)`
+/// class construction). Scoped to urllib: its functions have no runtime
+/// items and no call-lowering special arms.
+pub(crate) fn import_dropped_stdpython_item(
+    name: &str,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    let Some(SymbolTableNode::ImportFrom(ifm)) = symbols.get(name) else {
+        return false;
+    };
+    let first = ifm.module.split('.').next().unwrap_or("");
+    if first != "urllib" {
+        return false;
+    }
+    let canonical = ifm
+        .names
+        .iter()
+        .find(|a| a.asname.as_deref() == Some(name))
+        .map(|a| a.name.as_str())
+        .unwrap_or(name);
+    !stdpython_module_item(first, canonical)
+}
+
 pub(crate) fn resolves_to_external_import(
     name: &str,
     options: &PythonOptions,
@@ -850,18 +877,41 @@ impl CodeGen for ImportFrom {
             if present.is_empty() {
                 return Ok(TokenStream::new());
             }
-            // Re-emit the import with only the present names.
+            // Re-emit the import with only the present names — INCLUDING
+            // each name's runtime-fn variants (the arity-split
+            // `BytesIO_seeded` etc.), exactly as the plain path below
+            // brings them along; the mixed `from io import BytesIO,
+            // IOBase` previously dropped the variants and every seeded
+            // call site failed E0425 (issue #137).
             let mut present_tokens = TokenStream::new();
             for alias in &present {
                 let name = crate::safe_ident(&alias.name);
+                let variants: &[&str] = crate::StdModule::from_name(&self.module)
+                    .map(|m| {
+                        crate::ast::tree::std_module::runtime_fn_variants(m, &alias.name)
+                    })
+                    .unwrap_or(&[]);
                 let import = match &alias.asname {
                     Some(asname) => {
                         let asname = crate::safe_ident(asname);
                         quote! { use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
                     }
-                    None => quote! { use #root #(::#base_parts)* #(::#module_path)*::#name; },
+                    None if variants.is_empty() => {
+                        quote! { use #root #(::#base_parts)* #(::#module_path)*::#name; }
+                    }
+                    None => quote! {
+                        #[allow(unused_imports)]
+                        use #root #(::#base_parts)* #(::#module_path)*::#name;
+                    },
                 };
                 present_tokens.extend(import);
+                for variant in variants {
+                    let v = crate::safe_ident(variant);
+                    present_tokens.extend(quote! {
+                        #[allow(unused_imports)]
+                        use #root #(::#base_parts)* #(::#module_path)*::#v;
+                    });
+                }
             }
             return Ok(present_tokens);
         }
