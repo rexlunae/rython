@@ -393,7 +393,7 @@ fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(op: BinOp, a: L, b: R
     let a = bool_array(&a);
     let b = bool_array(&b);
     let out = engine::binary_bool(op, &a.bool(), &b.bool());
-    NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(out))
+    NdArray::new(a.shape.0.clone(), Dtype::Bool, Data::Bool(out))
 }
 
 fn bool_of_scalar(s: BinaryOperand) -> NdArray {
@@ -492,7 +492,7 @@ pub fn clip<T: Into<f64>>(a: NdArray, min: Option<T>, max: Option<T>) -> NdArray
             } else {
                 Data::I32(out.iter().map(|&x| x as i32).collect())
             };
-            NdArray::new(a.shape.clone(), a.dtype, data)
+            NdArray::new(a.shape.0.clone(), a.dtype, data)
         }
         Dtype::Float64 | Dtype::Float32 => {
             let vals: Vec<f64> = a.as_f64();
@@ -513,13 +513,13 @@ pub fn clip<T: Into<f64>>(a: NdArray, min: Option<T>, max: Option<T>) -> NdArray
             } else {
                 Data::F32(out.iter().map(|&x| x as f32).collect())
             };
-            NdArray::new(a.shape.clone(), a.dtype, data)
+            NdArray::new(a.shape.0.clone(), a.dtype, data)
         }
         Dtype::Bool => {
             let lo = minv.unwrap_or(0.0) != 0.0;
             let hi = maxv.unwrap_or(1.0) != 0.0;
             let out: Vec<bool> = a.bool().iter().map(|&x| x && hi || !x && lo).collect();
-            NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(out))
+            NdArray::new(a.shape.0.clone(), Dtype::Bool, Data::Bool(out))
         }
     }
 }

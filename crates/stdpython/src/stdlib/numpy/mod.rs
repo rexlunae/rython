@@ -531,7 +531,7 @@ pub fn concatenate(arrays: Vec<NdArray>, axis: i64) -> NdArray {
             );
         }
     }
-    let mut shape = arrays[0].shape.clone();
+    let mut shape = arrays[0].shape.0.clone();
     shape[0] = arrays.iter().map(|a| a.shape[0]).sum();
     let total: usize = arrays.iter().map(|a| a.size).sum();
     let dtype = arrays.iter().fold(arrays[0].dtype, |acc, a| acc.promote(a.dtype));
@@ -665,7 +665,7 @@ pub fn sort(a: NdArray) -> NdArray {
         Dtype::Int32 => Data::I32(v.iter().map(|&x| x as i32).collect()),
         Dtype::Bool => Data::Bool(v.iter().map(|&x| x != 0.0).collect()),
     };
-    NdArray::new(a.shape.clone(), a.dtype, data)
+    NdArray::new(a.shape.0.clone(), a.dtype, data)
 }
 
 /// `np.argsort(a)` — indices that sort the array (1-D only).

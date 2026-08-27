@@ -11,7 +11,7 @@
 
 use super::dtype::Dtype;
 use super::engine::{self, BinOp, UnOp};
-use crate::{PyException, PyIndex, PyRepr};
+use crate::{PyDisplay, PyException, PyIndex, PyRepr};
 
 /// Convert a Python `shape` argument into the `Vec<i64>` numpy works with.
 /// Python shape tuples `(2, 3)` lower to Rust tuples and lists `[2, 3]` to
@@ -80,10 +80,44 @@ pub(crate) enum Data {
     Bool(Vec<bool>),
 }
 
+/// numpy's `a.shape` — a PYTHON TUPLE for display: `(3,)` (one-element
+/// tuples carry the trailing comma), `(2, 3)`, `()`. Derefs to the inner
+/// `Vec<usize>` so indexed/iterated/sliced uses (`a.shape[0]`,
+/// `a.shape[1..]`) are unchanged from the plain-Vec lowering (issue #197:
+/// the Vec display printed `[3]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapeTuple(pub Vec<usize>);
+
+impl core::ops::Deref for ShapeTuple {
+    type Target = Vec<usize>;
+    fn deref(&self) -> &Vec<usize> {
+        &self.0
+    }
+}
+
+impl PyDisplay for ShapeTuple {
+    fn py_display(&self) -> String {
+        match self.0.len() {
+            0 => "()".to_string(),
+            1 => format!("({},)", self.0[0]),
+            _ => format!(
+                "({})",
+                self.0.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+}
+
+impl PyRepr for ShapeTuple {
+    fn py_repr(&self) -> String {
+        self.py_display()
+    }
+}
+
 /// A dense N-dimensional array (numpy subset).
 #[derive(Clone, Debug)]
 pub struct NdArray {
-    pub shape: Vec<usize>,
+    pub shape: ShapeTuple,
     pub ndim: usize,
     pub size: usize,
     pub dtype: Dtype,
@@ -156,7 +190,7 @@ impl NdArray {
         let size: usize = shape.iter().product();
         let ndim = shape.len();
         NdArray {
-            shape,
+            shape: ShapeTuple(shape),
             ndim,
             size,
             dtype,
@@ -261,7 +295,7 @@ impl NdArray {
                 let a = a.astype(Dtype::Float64);
                 let b = b.astype(Dtype::Float64);
                 let out = engine::binary_f64(op, a.f64(), b.f64());
-                return NdArray::new(a.shape.clone(), Dtype::Float64, Data::F64(out));
+                return NdArray::new(a.shape.0.clone(), Dtype::Float64, Data::F64(out));
             }
         }
         let out_dtype = if matches!(
@@ -292,28 +326,28 @@ impl NdArray {
                     return NdArray::binary_same_shape(op, &a, &b);
                 }
             };
-            return NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(bools));
+            return NdArray::new(a.shape.0.clone(), Dtype::Bool, Data::Bool(bools));
         }
         match (a.dtype, b.dtype) {
             (Dtype::Float64, Dtype::Float64) => {
                 let out = engine::binary_f64(op, a.f64(), b.f64());
-                NdArray::new(a.shape.clone(), out_dtype, Data::F64(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::F64(out))
             }
             (Dtype::Float32, Dtype::Float32) => {
                 let out = engine::binary_f32(op, a.f32(), b.f32());
-                NdArray::new(a.shape.clone(), out_dtype, Data::F32(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::F32(out))
             }
             (Dtype::Int64, Dtype::Int64) => {
                 let out = engine::binary_i64(op, a.i64(), b.i64());
-                NdArray::new(a.shape.clone(), out_dtype, Data::I64(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::I64(out))
             }
             (Dtype::Int32, Dtype::Int32) => {
                 let out = engine::binary_i32(op, a.i32(), b.i32());
-                NdArray::new(a.shape.clone(), out_dtype, Data::I32(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::I32(out))
             }
             (Dtype::Bool, Dtype::Bool) => {
                 let out = engine::binary_bool(op, a.bool(), b.bool());
-                NdArray::new(a.shape.clone(), out_dtype, Data::Bool(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::Bool(out))
             }
             // Mixed-dtype: promote to the common dtype, then recurse.
             _ => {
@@ -344,29 +378,29 @@ impl NdArray {
                 Dtype::Int32 => a.i32().iter().map(|&x| pred_int(op, x as i64)).collect(),
                 Dtype::Bool => a.bool().iter().map(|&x| pred_bool(op, x)).collect(),
             };
-            return NdArray::new(a.shape.clone(), Dtype::Bool, Data::Bool(bools));
+            return NdArray::new(a.shape.0.clone(), Dtype::Bool, Data::Bool(bools));
         }
         let out_dtype = a.dtype;
         match a.dtype {
             Dtype::Float64 => {
                 let out = engine::unary_f64(op, a.f64());
-                NdArray::new(a.shape.clone(), out_dtype, Data::F64(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::F64(out))
             }
             Dtype::Float32 => {
                 let out = engine::unary_f32(op, a.f32());
-                NdArray::new(a.shape.clone(), out_dtype, Data::F32(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::F32(out))
             }
             Dtype::Int64 => {
                 let out = engine::unary_i64(op, a.i64());
-                NdArray::new(a.shape.clone(), out_dtype, Data::I64(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::I64(out))
             }
             Dtype::Int32 => {
                 let out = engine::unary_i32(op, a.i32());
-                NdArray::new(a.shape.clone(), out_dtype, Data::I32(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::I32(out))
             }
             Dtype::Bool => {
                 let out = engine::unary_bool(op, a.bool());
-                NdArray::new(a.shape.clone(), out_dtype, Data::Bool(out))
+                NdArray::new(a.shape.0.clone(), out_dtype, Data::Bool(out))
             }
         }
     }
@@ -419,7 +453,7 @@ impl NdArray {
             Dtype::Int32 => Data::I32(self.as_i64().iter().map(|&x| x as i32).collect()),
             Dtype::Bool => Data::Bool(self.as_bool()),
         };
-        NdArray::new(self.shape.clone(), dtype, data)
+        NdArray::new(self.shape.0.clone(), dtype, data)
     }
 
     /// `a.reshape(shape)` — copy with a new shape (row-major, so the data is

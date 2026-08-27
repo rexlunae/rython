@@ -417,7 +417,7 @@ impl std::ops::Not for NdArray {
                 } else {
                     Data::I32(out.iter().map(|&x| x as i32).collect())
                 };
-                NdArray::new(self.shape.clone(), self.dtype, data)
+                NdArray::new(self.shape.0.clone(), self.dtype, data)
             }
             _ => panic!(
                 "{}",
@@ -714,7 +714,7 @@ impl crate::PySetIndex<i64, NdArray> for NdArray {
             self.copy_into(i, &value);
             return Ok(());
         }
-        if value.shape != self.shape[1..] {
+        if value.shape.0[..] != self.shape[1..] {
             return Err(PyException::new(
                 "ValueError",
                 format!(
