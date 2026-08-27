@@ -3445,6 +3445,61 @@ pub(crate) fn stdlib_const_attr(value: &crate::ExprType) -> Option<(String, Stri
     .then_some((module, item))
 }
 
+/// Whether `name` is bound in the CURRENT module by an ALIASED import of
+/// an EXTERNAL module (`from http.client import HTTPResponse as
+/// _HttplibHTTPResponse` — urllib3's response.py). The symbol table only
+/// keeps the Alias hop to the canonical name, which a LATER local class
+/// of the same name shadows (`class HTTPResponse(...)`), so following the
+/// alias would wrongly resolve to the local class; the module's own AST
+/// still carries the truth.
+pub(crate) fn aliased_external_import(
+    name: &str,
+    options: &crate::PythonOptions,
+) -> bool {
+    let Some(module) = options.module_defs.get(&options.this_module_path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    fn scan(
+        body: &[crate::Statement],
+        name: &str,
+        options: &crate::PythonOptions,
+    ) -> bool {
+        use crate::StatementType as ST;
+        for s in body {
+            match &s.statement {
+                ST::ImportFrom(i) => {
+                    if i.names
+                        .iter()
+                        .any(|a| a.asname.as_deref() == Some(name))
+                    {
+                        let root = i.module.split('.').next().unwrap_or("");
+                        let external = i.level == 0
+                            && !crate::ast::tree::import::is_stdpython_module(root)
+                            && !options
+                                .python_modules
+                                .contains(&root.to_string())
+                            && !options
+                                .module_defs
+                                .contains_key(&i.resolved_module_path(options));
+                        if external {
+                            return true;
+                        }
+                    }
+                }
+                ST::Try(t) => {
+                    if scan(&t.body, name, options) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    scan(&module.raw.body, name, options)
+}
+
 pub(crate) fn module_def_exception_alias(
     options: &crate::PythonOptions,
     path: &[String],

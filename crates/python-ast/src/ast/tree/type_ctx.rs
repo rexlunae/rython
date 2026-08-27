@@ -1631,8 +1631,16 @@ fn resolve_alias_typeinfo_inner(
         ExprType::Name(n) => match symbols.get(&n.id) {
             // An ALIAS (`from ._base_connection import ProxyConfig as
             // ProxyConfig` — a self-aliasing re-export): follow to the
-            // canonical name (the depth guard breaks cycles).
+            // canonical name (the depth guard breaks cycles) — UNLESS the
+            // alias came from an aliased EXTERNAL import whose canonical
+            // name a later local class shadows (`_HttplibHTTPResponse`
+            // vs. urllib3's own HTTPResponse): the annotation means the
+            // external class — a boxed value — not the local one (which
+            // would make the field self-recursive, E0072).
             Some(SymbolTableNode::Alias(canonical)) => {
+                if crate::ast::tree::module::aliased_external_import(&n.id, options) {
+                    return Some(TypeInfo::PyValue);
+                }
                 resolve_alias_typeinfo(
                     &ExprType::Name(crate::ast::tree::name::Name {
                         id: canonical.clone(),

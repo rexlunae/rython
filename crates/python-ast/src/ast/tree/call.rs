@@ -4456,6 +4456,24 @@ impl<'a> CodeGen for Call {
                 };
                 let class = match symbols.get(&super_owner) {
                     Some(SymbolTableNode::ClassDef(c)) => c.clone(),
+                    // A CROSS-MODULE definer (a re-emitted override whose
+                    // defining class was imported — `SOCKSHTTPSConnectionPool`
+                    // re-emitting `HTTPSConnectionPool`'s method, urllib3's
+                    // contrib/socks): the class resolves through the
+                    // defining module, not the current scope.
+                    Some(SymbolTableNode::ImportFrom(i)) => {
+                        let path = i.resolved_module_path(&options);
+                        match crate::resolve_imported_class(&options, &path, &super_owner, 0) {
+                            Some((c, _)) => c,
+                            None => {
+                                return Err(format!(
+                                    "super() used outside a class method (`{}` is not a class)",
+                                    super_owner
+                                )
+                                .into());
+                            }
+                        }
+                    }
                     _ => {
                         return Err(format!(
                             "super() used outside a class method (`{}` is not a class)",

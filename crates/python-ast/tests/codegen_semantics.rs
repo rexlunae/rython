@@ -7550,7 +7550,13 @@ fn generator_builds_and_returns_list() {
     assert!(out.contains("__rython_gen"), "generator must build a collector Vec: {}", out);
     assert!(out.contains("push"), "yield must push into the collector: {}", out);
     assert!(out.contains("Vec < String >") || out.contains("Vec<String>"), "element type must come from Generator[T, ...]: {}", out);
-    assert!(out.contains("return __rython_gen"), "generator must return the collector: {}", out);
+    // Inside the function's Result, like every return (a bare
+    // `return __rython_gen` was an E0308 against the Result signature).
+    assert!(
+        out.contains("return Ok (__rython_gen)"),
+        "generator must return the collector in the Result: {}",
+        out
+    );
 }
 
 #[test]
@@ -9613,6 +9619,124 @@ fn module_self_assign_is_a_noop() {
     assert!(
         out.contains("pub static CONST"),
         "the single real store must still promote: {}",
+        out
+    );
+}
+
+// ---- issue #137 round 17: shadowed external aliases and generators ----
+
+#[test]
+fn shadowed_external_base_is_metadata_not_self() {
+    // `from http.client import HTTPConnection as _HTTPConnection` then
+    // `class HTTPConnection(_HTTPConnection)` — urllib3's connection.py:
+    // the alias's canonical name is shadowed by the class itself, so
+    // following it made the class its own base (a self-supertrait cycle,
+    // E0391, and an infinitely-sized embedded struct, E0072). The base
+    // is the shadowed EXTERNAL class — metadata.
+    let out = compile(
+        "from socks import HTTPConnection as _HTTPConnection\n\
+         \n\
+         class HTTPConnection(_HTTPConnection):\n\
+         \x20   def __init__(self, host: str) -> None:\n\
+         \x20       self.host = host\n",
+        "shadowbase.py",
+    );
+    assert!(
+        !out.contains("HTTPConnectionTrait : HTTPConnectionTrait"),
+        "no self-supertrait: {}",
+        out
+    );
+    assert!(
+        !out.contains("__rython_base : HTTPConnection"),
+        "no self-embedded base struct: {}",
+        out
+    );
+}
+
+#[test]
+fn shadowed_external_alias_annotation_boxes() {
+    // `self._fp: _HttplibHTTPResponse | None` (urllib3's response.py)
+    // where the alias's canonical name is shadowed by the local class:
+    // the annotation means the external class — a boxed value — never
+    // Option<LocalClass> (which made the field self-recursive, E0072).
+    let src = "from http_client import HTTPResponse as _HttplibHTTPResponse\n\
+               \n\
+               class HTTPResponse:\n\
+               \x20   def __init__(self) -> None:\n\
+               \x20       self._fp: _HttplibHTTPResponse | None = None\n";
+    let m = parse(src, "shadowfield.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["shadowfield".to_string()], std::rc::Rc::new(m));
+    let other = parse("x = 1\n", "other.py").unwrap();
+    defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        this_module_path: vec!["shadowfield".to_string()],
+        ..Default::default()
+    };
+    let out = compile_with_options(src, "shadowfield.py", options).expect("converts");
+    assert!(
+        out.contains("_fp : stdpython :: PyValue"),
+        "the field must box to PyValue: {}",
+        out
+    );
+    assert!(
+        !out.contains("Option < HTTPResponse >"),
+        "no self-recursive Option field: {}",
+        out
+    );
+}
+
+#[test]
+fn unannotated_generator_boxes_and_returns_ok() {
+    // A generator whose yield type the inference cannot resolve boxes to
+    // PyValue — the `_` placeholder is illegal in item signatures
+    // (E0121) — and the collector returns inside the function's Result
+    // (`return __rython_gen` bare was E0308).
+    let out = compile(
+        "def gen(n: int):\n\
+         \x20   for i in range(n):\n\
+         \x20       yield i\n",
+        "boxgen.py",
+    );
+    assert!(
+        out.contains("Vec < stdpython :: PyValue >"),
+        "unresolved yield element must box: {}",
+        out
+    );
+    assert!(
+        out.contains("return Ok (__rython_gen)"),
+        "the collector returns in the Result: {}",
+        out
+    );
+    assert!(
+        out.contains("push (stdpython :: PyValue :: from"),
+        "yields box into the collector: {}",
+        out
+    );
+}
+
+#[test]
+fn bare_yield_contextmanager_pushes_boxed_none() {
+    // `@contextmanager`-style bare `yield` (urllib3's _error_catcher):
+    // yields None — the boxed None in a PyValue collector, not a
+    // no-op expression in a Vec<_> signature.
+    let out = compile(
+        "def catcher():\n\
+         \x20   try:\n\
+         \x20       yield\n\
+         \x20   except OSError:\n\
+         \x20       pass\n",
+        "bareyield.py",
+    );
+    assert!(
+        out.contains("push (stdpython :: PyValue :: None_)"),
+        "bare yield must push the boxed None: {}",
+        out
+    );
+    assert!(
+        !out.contains("Vec < _ >"),
+        "no inference placeholder in the signature: {}",
         out
     );
 }

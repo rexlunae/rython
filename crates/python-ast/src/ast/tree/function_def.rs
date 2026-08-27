@@ -1994,8 +1994,19 @@ impl FunctionDef {
         } else {
             None
         };
-        if let Some(elt) = &gen_elt {
-            let t = elt.to_rust_type();
+        // An UNRESOLVED yield type (a bare `yield` — @contextmanager — or
+        // a value the inference cannot type) boxes: the placeholder `_`
+        // is not legal in item signatures (E0121), and the boxed PyValue
+        // is the honest element for an unknown yield.
+        let gen_boxed = matches!(gen_elt, Some(crate::TypeInfo::PyObject));
+        let gen_elt_tokens = gen_elt.as_ref().map(|elt| {
+            if gen_boxed {
+                quote!(stdpython::PyValue)
+            } else {
+                elt.to_rust_type()
+            }
+        });
+        if let Some(t) = &gen_elt_tokens {
             streams.extend(quote!(let mut __rython_gen: Vec<#t> = Vec::new();));
         }
 
@@ -2085,6 +2096,7 @@ impl FunctionDef {
             if gen_elt.is_some() {
                 stmt_options.generator_collector =
                     std::rc::Rc::new(Some("__rython_gen".to_string()));
+                stmt_options.generator_boxes = gen_boxed;
             }
             streams.extend(
                 s.clone()
@@ -2118,8 +2130,7 @@ impl FunctionDef {
         }
         // A GENERATOR returns its collected list (`Generator[str, ...]`
         // → Vec<String>), overriding any other inference.
-        let return_type = if let Some(elt) = &gen_elt {
-            let t = elt.to_rust_type();
+        let return_type = if let Some(t) = &gen_elt_tokens {
             quote!(-> Result<Vec<#t>, PyException>)
         } else if (inferred_signature.is_generic()
             || inferred_signature.return_type.is_some())
@@ -2209,9 +2220,10 @@ impl FunctionDef {
         // A body that can fall off the end implicitly returns None: give the
         // generated block an Ok(()) tail. Bodies that return (or raise) on
         // every path end with `return`/`return Err`, which need no tail.
-        // A GENERATOR ends by returning its collected list.
+        // A GENERATOR ends by returning its collected list — inside the
+        // function's Result, like every return.
         if gen_elt.is_some() {
-            streams.extend(quote!(return __rython_gen;));
+            streams.extend(quote!(return Ok(__rython_gen);));
         } else if !guarantees_return(&self.body) {
             if options.fn_return_is_pyvalue {
                 streams.extend(quote!(Ok(PyValue::None_)));
