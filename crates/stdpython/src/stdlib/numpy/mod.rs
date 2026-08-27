@@ -859,3 +859,155 @@ mod arange_tests {
         arange_f3(0.0, -1e300, 1.0);
     }
 }
+
+#[cfg(test)]
+mod divmod_tests {
+    use super::*;
+
+    fn f64s(a: &NdArray) -> Vec<f64> {
+        match &a.data {
+            Data::F64(v) => v.clone(),
+            _ => panic!("expected f64 data"),
+        }
+    }
+
+    fn i64s(a: &NdArray) -> Vec<i64> {
+        match &a.data {
+            Data::I64(v) => v.clone(),
+            _ => panic!("expected i64 data"),
+        }
+    }
+
+    /// All literals below were captured from real `python3` + numpy 2.x
+    /// runs (issue #168), not written from memory.
+    #[test]
+    fn divide_float_by_zero_is_ieee() {
+        // np.divide(np.array([1.0, -1.0, 2.5, 0.0]), np.array([0.0, 0.0, -0.0, 0.0]))
+        // -> array([inf, -inf, -inf, nan]) — IEEE results, NO exception.
+        let a = array(vec![1.0f64, -1.0, 2.5, 0.0]);
+        let b = array(vec![0.0f64, 0.0, -0.0, 0.0]);
+        let r = divide(a, b);
+        assert!(matches!(r.dtype, Dtype::Float64));
+        let v = f64s(&r);
+        assert_eq!(v[0], f64::INFINITY);
+        assert_eq!(v[1], f64::NEG_INFINITY);
+        assert_eq!(v[2], f64::NEG_INFINITY);
+        assert!(v[3].is_nan());
+    }
+
+    #[test]
+    fn divide_int_arrays_promote_to_float64() {
+        // np.divide(np.array([3, 1, 2, 4]), np.array([2, 1, 1, 1]))
+        // -> array([1.5, 1., 2., 4.]) float64 (numpy never does int division)
+        let a = array(vec![3i64, 1, 2, 4]);
+        let b = array(vec![2i64, 1, 1, 1]);
+        let r = divide(a, b);
+        assert!(matches!(r.dtype, Dtype::Float64));
+        assert_eq!(f64s(&r), vec![1.5, 1.0, 2.0, 4.0]);
+        // np.divide(np.array([1, -1, 2, 0]), 0) -> array([inf, -inf, inf, nan]) float64
+        let a = array(vec![1i64, -1, 2, 0]);
+        let r = divide(a, 0);
+        assert!(matches!(r.dtype, Dtype::Float64));
+        let v = f64s(&r);
+        assert_eq!(v[0], f64::INFINITY);
+        assert_eq!(v[1], f64::NEG_INFINITY);
+        assert_eq!(v[2], f64::INFINITY);
+        assert!(v[3].is_nan());
+    }
+
+    #[test]
+    fn divide_bool_promotes_to_float64() {
+        // np.divide(np.array([True, False]), np.array([True, False]))
+        // -> array([1., nan]) float64
+        let a = array(vec![true, false]);
+        let b = array(vec![true, false]);
+        let r = divide(a, b);
+        assert!(matches!(r.dtype, Dtype::Float64));
+        let v = f64s(&r);
+        assert_eq!(v[0], 1.0);
+        assert!(v[1].is_nan());
+    }
+
+    #[test]
+    fn floor_divide_and_mod_by_zero() {
+        // np.floor_divide(np.array([1.0, -1.0, 2.5, 0.0]), 0.0) -> [inf, -inf, inf, nan]
+        let a = array(vec![1.0f64, -1.0, 2.5, 0.0]);
+        let r = floor_divide(a.clone(), 0.0f64);
+        let v = f64s(&r);
+        assert_eq!(v[0], f64::INFINITY);
+        assert_eq!(v[1], f64::NEG_INFINITY);
+        assert_eq!(v[2], f64::INFINITY);
+        assert!(v[3].is_nan());
+        // np.mod(np.array([1.0, -1.0, 2.5, 0.0]), 0.0) -> [nan, nan, nan, nan]
+        let r = mod_(a, 0.0f64);
+        assert!(f64s(&r).iter().all(|x| x.is_nan()));
+        // np.floor_divide(np.array([5, -5, 0, 1]), 0) -> array([0, 0, 0, 0])
+        let ai = array(vec![5i64, -5, 0, 1]);
+        let r = floor_divide(ai.clone(), 0i64);
+        assert_eq!(i64s(&r), vec![0, 0, 0, 0]);
+        // np.mod(np.array([5, -5, 0, 1]), 0) -> array([0, 0, 0, 0])
+        let r = mod_(ai, 0i64);
+        assert_eq!(i64s(&r), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "ValueError: Integers to negative integer powers are not allowed.")]
+    fn power_int_negative_exponent_raises() {
+        // np.power(np.array([1, 2]), -1) -> ValueError (exact numpy message)
+        let a = array(vec![1i64, 2]);
+        power(a, -1i64);
+    }
+
+    #[test]
+    #[should_panic(expected = "ValueError: Integers to negative integer powers are not allowed.")]
+    fn power_int_negative_exponent_in_array_raises() {
+        // np.power(np.array([1, 2]), np.array([2, -1])) -> ValueError
+        let a = array(vec![1i64, 2]);
+        let b = array(vec![2i64, -1]);
+        power(a, b);
+    }
+
+    #[test]
+    fn power_int_positive_matches_numpy() {
+        // np.power(np.array([2, -3, 0, 5]), np.array([3, 2, 0, 4]))
+        // -> array([8, 9, 1, 625])
+        let a = array(vec![2i64, -3, 0, 5]);
+        let b = array(vec![3i64, 2, 0, 4]);
+        let r = power(a, b);
+        assert_eq!(i64s(&r), vec![8, 9, 1, 625]);
+    }
+
+    #[test]
+    fn floor_divide_and_mod_negative_divisors() {
+        // np.floor_divide(np.array([7, -7, 3, -3]), np.array([2, 2, -2, -2]))
+        // -> array([3, -4, -2, 1]) — FLOOR semantics (3 // -2 == -2, not
+        // Euclidean -1); np.mod -> array([1, 1, -1, -1]) — divisor sign.
+        let a = array(vec![7i64, -7, 3, -3]);
+        let b = array(vec![2i64, 2, -2, -2]);
+        assert_eq!(i64s(&floor_divide(a.clone(), b.clone())), vec![3, -4, -2, 1]);
+        assert_eq!(i64s(&mod_(a, b)), vec![1, 1, -1, -1]);
+        // i64::MIN // -1 wraps to i64::MIN (numpy, with an overflow warning)
+        assert_eq!(
+            i64s(&floor_divide(array(vec![i64::MIN]), -1i64)),
+            vec![i64::MIN]
+        );
+        assert_eq!(i64s(&mod_(array(vec![i64::MIN]), -1i64)), vec![0]);
+    }
+
+    #[test]
+    fn floor_divide_float_rounding_matches_numpy() {
+        // np.floor_divide(np.array([1.0]), 0.1) -> 9.0 (NOT floor(1.0/0.1),
+        // which is floor(10.0) = 10.0 — numpy uses its fmod-based divmod);
+        // np.mod(np.array([1.0]), 0.1) -> 0.09999999999999995.
+        assert_eq!(f64s(&floor_divide(array(vec![1.0f64]), 0.1f64)), vec![9.0]);
+        assert_eq!(f64s(&mod_(array(vec![1.0f64]), 0.1f64)), vec![0.09999999999999995]);
+        // signed-zero corners: floor_divide(-1.0, -2.0) is +0.0,
+        // floor_divide(0.0, -2.0) is -0.0, mod(0.0, -2.0) is -0.0
+        let z = f64s(&floor_divide(array(vec![-1.0f64]), -2.0f64));
+        assert!(z[0] == 0.0 && z[0].is_sign_positive());
+        let z = f64s(&floor_divide(array(vec![0.0f64]), -2.0f64));
+        assert!(z[0] == 0.0 && z[0].is_sign_negative());
+        let z = f64s(&mod_(array(vec![0.0f64]), -2.0f64));
+        assert!(z[0] == 0.0 && z[0].is_sign_negative());
+    }
+}
