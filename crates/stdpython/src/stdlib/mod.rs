@@ -135,7 +135,7 @@ pub mod socket;
 /// Python ssl module - client-side TLS wrapped over the rustls crate.
 /// Feature-gated per the platform-surface convention (`ssl-rustls`),
 /// but ON by default: TLS is load-bearing for the top converted packages.
-#[cfg(feature = "ssl-rustls")]
+#[cfg(any(feature = "ssl-rustls", feature = "ssl-openssl"))]
 pub mod ssl;
 
 /// Python urllib package (urllib.request) - HTTP(S) client wrapped over

@@ -832,12 +832,12 @@ the real CPython hierarchy (`ConnectionRefusedError` IS-A
 shape. Not modeled (loud rustc error): `setsockopt`, `makefile`, the
 address families beyond AF_INET/AF_INET6.
 
-**`ssl`** (std tier, `ssl-rustls` feature — ON by default; §10.2.1):
-client-side TLS over rustls (ring provider, webpki/Mozilla roots).
-`SSLContext(protocol)` / `create_default_context()` with CPython's
-PROTOCOL_TLS_CLIENT defaults (CERT_REQUIRED + check_hostname);
-`load_default_certs`, `load_verify_locations(cafile)` (PEM, loud on
-an empty bundle), `set_alpn_protocols`, `wrap_socket(sock,
+**`ssl`** (std tier, `ssl-rustls` feature — ON by default; or
+`ssl-openssl`; §10.2.1): TLS with a pluggable backend, exactly one
+enabled. `SSLContext(protocol)` / `create_default_context()` with
+CPython's PROTOCOL_TLS_CLIENT defaults (CERT_REQUIRED +
+check_hostname); `load_default_certs`, `load_verify_locations(cafile)`
+(PEM, loud on an empty bundle), `set_alpn_protocols`, `wrap_socket(sock,
 server_hostname=...)` → `SSLSocket` with `send`/`sendall`/`recv`
 (ragged EOF reads as `b""`), `version()`,
 `selected_alpn_protocol()`, `close()` (close_notify). The module
@@ -845,17 +845,34 @@ constants match python3 (CERT_*/PROTOCOL_*/OP_NO_*/VERIFY_X509_*/
 SSL_ERROR_*, `TLSVersion` as a nested constants module), and the ssl
 exception family (`SSLError` IS-A `OSError`; `SSLCertVerificationError`
 also IS-A `ValueError`, `CertificateError` its alias) is wired into
-the runtime hierarchy. Divergences, all deliberate: `OPENSSL_VERSION`
-reports `"rustls …"` (never an "OpenSSL" string, so version-sniffing
-code takes its generic path) with `OPENSSL_VERSION_NUMBER = 0` and a
-3-tuple all-zero `OPENSSL_VERSION_INFO` (§12.3); `set_ciphers` and
-`keylog_filename` are stored-only no-ops (rustls's policy governs);
-the OP_*/VERIFY_* bits are stored and readable, but rustls's own
-policy decides the handshake, with `minimum_version`/
-`maximum_version` and the OP_NO_TLSv1_2/1_3 bits clamping the
-negotiated range; `CERT_NONE` installs a no-verification path
-exactly like CPython's unverified context. Not modeled (loud rustc
-error): `MemoryBIO`/`wrap_bio` (TLS-in-TLS), server-side sockets.
+the runtime hierarchy.
+
+The default backend is **rustls** (ring provider, webpki/Mozilla
+roots): client-side TLS. Divergences, all deliberate:
+`OPENSSL_VERSION` reports `"rustls …"` (never an "OpenSSL" string, so
+version-sniffing code takes its generic path) with
+`OPENSSL_VERSION_NUMBER = 0` and a 3-tuple all-zero
+`OPENSSL_VERSION_INFO` (§12.3); `set_ciphers` and `keylog_filename`
+are stored-only no-ops (rustls's policy governs); the OP_*/VERIFY_*
+bits are stored and readable, but rustls's own policy decides the
+handshake, with `minimum_version`/`maximum_version` and the
+OP_NO_TLSv1_2/1_3 bits clamping the negotiated range; `CERT_NONE`
+installs a no-verification path exactly like CPython's unverified
+context. Not modeled (loud rustc error): `MemoryBIO`/`wrap_bio`
+(TLS-in-TLS), server-side sockets, client certificates.
+
+The **`ssl-openssl`** backend links the SYSTEM OpenSSL/LibreSSL (the
+`openssl` crate) and implements the full CPython surface with real
+OpenSSL semantics: `CERT_OPTIONAL` half-verification (`CERT_REQUIRED`
+verifies and requires a peer cert, `CERT_OPTIONAL` verifies one when
+present), real `set_ciphers()` (an unknown cipher string raises
+`SSLError`), client certificates via `load_cert_chain(certfile,
+keyfile)`, server-side contexts (`PROTOCOL_TLS_SERVER` + accepting
+`wrap_socket`), and `OPENSSL_VERSION*` reporting the linked library's
+real version (so urllib3's OpenSSL sniffing takes its OpenSSL path).
+The wire protocol is standard TLS 1.2/1.3; the system CA store backs
+`load_default_certs`. Like the rustls backend it is std-tier; the two
+features are mutually exclusive.
 
 **`urllib.request`** (std tier, `http-ureq` feature; §10.2.1):
 `urlopen(url)` for http/https with redirects, returning a response

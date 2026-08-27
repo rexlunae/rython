@@ -255,11 +255,19 @@ impl Socket {
         }
     }
 
+    /// Wrap an already-connected TCP stream as a Python socket — used
+    /// by the TLS backends' tests to hand accept()/connect() results to
+    /// wrap_socket (the stream was obtained outside the Python surface;
+    /// in converted code the socket object already exists).
+    pub(crate) fn from_tcp_stream(tcp: TcpStream) -> Result<Socket, PyException> {
+        Ok(Socket::from_state(SockState::Stream(tcp)))
+    }
+
     /// A cloned TCP handle for the TLS layer: `ssl.SSLContext.
-    /// wrap_socket` runs the rustls session over the connected stream
+    /// wrap_socket` runs the TLS session over the connected stream
     /// (the clone shares the descriptor, exactly like Python's ssl
     /// wrapping the same fd).
-    #[cfg(feature = "ssl-rustls")]
+    #[cfg(any(feature = "ssl-rustls", feature = "ssl-openssl"))]
     pub(crate) fn tcp_stream_clone(&self) -> Result<TcpStream, PyException> {
         match self.io_handle()? {
             IoHandle::Tcp(s) => Ok(s),
