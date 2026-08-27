@@ -2919,16 +2919,60 @@ pub(crate) fn collect_local_types(
                     } else if let Some(ty) = simple_expr_type(&assign.value) {
                         out.insert(name.id.clone(), ty);
                     } else {
-                        // An EMPTY container local (`allowed = {}` then
-                        // `allowed[alg] = ...` — pip's Hashes): the boxed
-                        // heterogeneous container (the element types are
-                        // unknowable at the store).
+                        // A CONTAINER literal local types like the literal
+                        // lowering (issue #180): a dict gets String keys and
+                        // boxes heterogeneous-but-boxable values (`{
+                        // 'ProviderType': 'sso', 'Credentials': {...}}` —
+                        // botocore), a list gets its concrete element type.
+                        // Without this, an unannotated function returning
+                        // such a local collapses to unit and every use of
+                        // the returned container breaks.
                         match &assign.value {
+                            ExprType::Dict(d) if !d.keys.is_empty() => {
+                                if let crate::TypeInfo::Dict(k, v) =
+                                    crate::syntactic_type(&assign.value)
+                                {
+                                    let k = if matches!(
+                                        *k,
+                                        crate::TypeInfo::StrRef | crate::TypeInfo::PyObject
+                                    ) {
+                                        quote!(String)
+                                    } else {
+                                        k.to_rust_type()
+                                    };
+                                    let v = if matches!(*v, crate::TypeInfo::PyObject) {
+                                        quote!(stdpython::PyValue)
+                                    } else {
+                                        v.to_rust_type()
+                                    };
+                                    out.insert(name.id.clone(), quote!(PyDict<#k, #v>));
+                                }
+                            }
+                            ExprType::List(l) if !l.is_empty() => {
+                                if let crate::TypeInfo::Vec(elt) =
+                                    crate::syntactic_type(&assign.value)
+                                {
+                                    if !matches!(*elt, crate::TypeInfo::PyObject) {
+                                        let t = elt.to_rust_type();
+                                        out.insert(name.id.clone(), quote!(Vec<#t>));
+                                    }
+                                }
+                            }
+                            // An EMPTY container local (`allowed = {}` then
+                            // `allowed[alg] = ...` — pip's Hashes): the
+                            // boxed heterogeneous container (the element
+                            // types are unknowable at the store).
                             ExprType::Dict(d) if d.keys.is_empty() => {
-                                out.insert(name.id.clone(), quote!(PyDict<String, stdpython::PyValue>));
+                                out.insert(
+                                    name.id.clone(),
+                                    quote!(PyDict<String, stdpython::PyValue>),
+                                );
                             }
                             ExprType::List(l) if l.is_empty() => {
-                                out.insert(name.id.clone(), quote!(Vec<stdpython::PyValue>));
+                                out.insert(
+                                    name.id.clone(),
+                                    quote!(Vec<stdpython::PyValue>),
+                                );
                             }
                             _ => {}
                         }

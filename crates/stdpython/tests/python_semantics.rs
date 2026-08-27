@@ -895,6 +895,24 @@ fn heterogeneous_union_values_str_repr_and_display() {
         pv(&PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]))),
         "(1,)"
     );
+    // A boxed dict (issue #180): str renders like a Python dict, and
+    // indexing a boxed dict dispatches to the held dict — anything else
+    // raises the TypeError.
+    let mut boxed: stdpython::PyDict<String, PyValue> = stdpython::PyDict::new();
+    boxed.insert("ProviderType".into(), PyValue::Str("sso".into()));
+    boxed.insert("n".into(), PyValue::Int(7));
+    let pv_dict = PyValue::Dict(std::sync::Arc::new(boxed));
+    assert_eq!(pv(&pv_dict), "{'ProviderType': 'sso', 'n': 7}");
+    assert_eq!(pv(&pv_dict.py_index("ProviderType").unwrap()), "sso");
+    assert!(pv_dict.py_index("missing").is_err());
+    let not_dict = PyValue::Int(1);
+    assert!(not_dict.py_index("x").is_err());
+    // iterating a boxed dict yields its KEYS (Python semantics).
+    let keys: Vec<PyValue> = pv_dict.clone().into_iter().collect();
+    assert_eq!(
+        keys.iter().map(|k| pv(k)).collect::<Vec<_>>(),
+        vec!["ProviderType", "n"]
+    );
 
     // repr quotes strs; every other member matches its str form.
     assert_eq!(py_value_repr(&PyValue::Str("s".into())), "'s'");
