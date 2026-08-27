@@ -185,8 +185,29 @@ pub fn resetwarnings() {
 mod tests {
     use super::*;
 
+    // The output hook and DEFAULT_ACTION are PROCESS-GLOBAL, and every
+    // test here mutates them: the parallel test harness races them (a
+    // sibling's reset_warning_output mid-warn reads as CAPTURED == 0).
+    // They serialize on this core-only spin guard — std::sync::Mutex
+    // would fail the no_std --all-targets build.
+    use core::sync::atomic::AtomicBool;
+    static SERIAL: AtomicBool = AtomicBool::new(false);
+    struct SerialGuard;
+    fn serial() -> SerialGuard {
+        while SERIAL.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        SerialGuard
+    }
+    impl Drop for SerialGuard {
+        fn drop(&mut self) {
+            SERIAL.store(false, Ordering::Release);
+        }
+    }
+
     #[test]
     fn hooks_run_without_an_output_hook() {
+        let _serial = serial();
         // The hooks work with no output installed: warn is a no-op, and
         // the filter action still suppresses.
         reset_warning_output();
@@ -200,6 +221,7 @@ mod tests {
 
     #[test]
     fn warn_routes_through_the_output_hook() {
+        let _serial = serial();
         use core::sync::atomic::AtomicUsize;
         static CAPTURED: AtomicUsize = AtomicUsize::new(0);
         fn capture(message: &str, _file: &str, _line: i64) {
@@ -214,6 +236,7 @@ mod tests {
 
     #[test]
     fn ignore_action_suppresses_the_hook() {
+        let _serial = serial();
         use core::sync::atomic::AtomicUsize;
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         fn count(_m: &str, _f: &str, _l: i64) {
@@ -229,6 +252,7 @@ mod tests {
 
     #[test]
     fn filter_calls_set_the_action() {
+        let _serial = serial();
         simplefilter(Some("ignore"), None, None, None, Some(true));
         assert_eq!(DEFAULT_ACTION.load(Ordering::Relaxed), ACTION_IGNORE);
         filterwarnings(Some("always"), None, None, None, None, None);
