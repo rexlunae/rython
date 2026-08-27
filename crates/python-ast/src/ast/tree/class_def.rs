@@ -1574,10 +1574,10 @@ impl CodeGen for ClassDef {
         // Exception classes with *args/**kwargs __init__ (idna) lower
         // through here without tripping the variadic-parameter guard.
         if is_exception_class(&self) {
-            let doc = self
-                .get_docstring()
-                .map(|d| format!("#[doc = \"{}\"]\n", d.replace('"', "\\\"")))
-                .unwrap_or_default();
+            // A real doc ATTRIBUTE: interpolating a String into quote!
+            // yields a string-literal token — `""` in item position, a
+            // parse error in the generated crate.
+            let doc = self.get_docstring().map(|d| quote!(#[doc = #d]));
             return Ok(quote! {
                 #doc
                 #[allow(dead_code)]
@@ -1602,10 +1602,8 @@ impl CodeGen for ClassDef {
             _ => false,
         });
         if is_protocol {
-            let doc = self
-                .get_docstring()
-                .map(|d| format!("#[doc = \"{}\"]\n", d.replace('"', "\\\"")))
-                .unwrap_or_default();
+            // Same string-vs-attribute distinction as the exception arm.
+            let doc = self.get_docstring().map(|d| quote!(#[doc = #d]));
             return Ok(quote! {
                 #doc
                 #[allow(dead_code)]

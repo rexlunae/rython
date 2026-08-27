@@ -37,6 +37,8 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
             name,
             "socket"
                 | "gethostname"
+                | "getdefaulttimeout"
+                | "setdefaulttimeout"
                 | "AF_UNSPEC"
                 | "AF_INET"
                 | "AF_INET6"
@@ -65,6 +67,9 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "PROTOCOL_TLS"
                 | "PROTOCOL_SSLv23"
                 | "PROTOCOL_TLS_CLIENT"
+                | "PROTOCOL_TLSv1"
+                | "PROTOCOL_TLSv1_1"
+                | "PROTOCOL_TLSv1_2"
                 | "OP_NO_SSLv2"
                 | "OP_NO_SSLv3"
                 | "OP_NO_TLSv1"
@@ -75,6 +80,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "OP_NO_TICKET"
                 | "OP_NO_RENEGOTIATION"
                 | "VERIFY_X509_STRICT"
+                | "VERIFY_X509_TRUSTED_FIRST"
                 | "VERIFY_X509_PARTIAL_CHAIN"
         ),
         // urllib: the request submodule and its items. urllib.error's
@@ -85,7 +91,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         StdModule::Collections => {
             matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
         }
-        StdModule::Re => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "IGNORECASE"),
+        StdModule::Re => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "escape" | "IGNORECASE"),
         StdModule::Itertools => matches!(
             name,
             "accumulate"
@@ -982,6 +988,22 @@ impl CodeGen for ImportFrom {
                 options.definition_warnings.borrow_mut().push(format!(
                     "`from {} import {}`: `{}` is a type-name tuple alias \
                      (typing-only; consumed by isinstance resolution)",
+                    self.module, alias.name, alias.name
+                ));
+                continue;
+            }
+            // A sibling re-export of a BUILTIN exception name
+            // (`BrokenPipeError = BrokenPipeError` — connection.py's
+            // py2-compat shim, imported by connectionpool): builtins are
+            // string-tagged with no runtime item, and raise/except match
+            // by name — the use drops.
+            if self.level > 0
+                && crate::ast::tree::raise_stmt::is_builtin_exception_name(&alias.name)
+            {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "`from {} import {}`: `{}` is a builtin exception \
+                     (string-tagged; no runtime item — raise/except match \
+                     by name)",
                     self.module, alias.name, alias.name
                 ));
                 continue;

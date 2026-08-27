@@ -9461,3 +9461,158 @@ fn module_constant_method_call_is_a_value_call_not_a_path() {
         out
     );
 }
+
+// ---- issue #137 round 16: urllib3 residual clusters ----
+
+#[test]
+fn exception_class_docstring_is_a_doc_attribute() {
+    // `class HTTPError(Exception): """Base exception."""` — the marker
+    // struct's docstring must be a real #[doc] ATTRIBUTE; interpolating
+    // a String into quote! yields a string-literal token (`""` in item
+    // position for the doc-less case — a parse error in the generated
+    // crate, which hid every later error in the file).
+    let out = compile(
+        "class HTTPError(Exception):\n\
+         \x20   \"\"\"Base exception.\"\"\"\n\
+         \n\
+         class Bare(Exception):\n\
+         \x20   pass\n",
+        "excdoc.py",
+    );
+    assert!(
+        out.contains("# [doc = \"Base exception.\"]"),
+        "docstring must render as a doc attribute: {}",
+        out
+    );
+    assert!(
+        !out.contains("\"\" #"),
+        "no stray empty-string tokens in item position: {}",
+        out
+    );
+}
+
+#[test]
+fn underscore_is_a_real_readable_variable() {
+    // Python's `_` is an ordinary name — bound by `except ... as _` and
+    // READ afterwards (urllib3's util/connection), and stored by tuple
+    // destructures (`(scheme, _, host) = ...`). Rust's `_` is a wildcard
+    // (unreadable, illegal after `let mut`), so it maps to a real
+    // underscore-prefixed identifier; throwaway loop indices keep the
+    // wildcard through the unused-index path.
+    let out = compile(
+        "def f(url: str) -> str:\n\
+         \x20   err = ''\n\
+         \x20   try:\n\
+         \x20       return url\n\
+         \x20   except OSError as _:\n\
+         \x20       err = str(_)\n\
+         \x20   return err\n",
+        "underscore.py",
+    );
+    assert!(
+        out.contains("__rython_underscore"),
+        "`as _` must bind a real identifier: {}",
+        out
+    );
+    assert!(
+        !out.contains("let mut _ ="),
+        "no illegal wildcard binding: {}",
+        out
+    );
+}
+
+#[test]
+fn qualified_collections_class_constructs_via_new() {
+    // `collections.deque()` (urllib3's response.py): the runtime item is
+    // a struct — the qualified call goes through `::new` exactly like
+    // the from-import spelling.
+    let out = compile(
+        "import collections\n\
+         \n\
+         def f() -> None:\n\
+         \x20   buf = collections.deque()\n\
+         \x20   buf.append(1)\n",
+        "cdeque.py",
+    );
+    assert!(
+        out.contains("collections :: deque :: new ()"),
+        "qualified deque() must construct via ::new: {}",
+        out
+    );
+}
+
+#[test]
+fn from_imported_socket_function_calls_directly() {
+    // `from socket import getdefaulttimeout` then `getdefaulttimeout()`
+    // (urllib3's util/timeout): a stdlib FUNCTION import — a direct
+    // call, never a `::new` class construction.
+    let out = compile(
+        "from socket import getdefaulttimeout\n\
+         \n\
+         def f() -> object:\n\
+         \x20   return getdefaulttimeout()\n",
+        "gdt.py",
+    );
+    assert!(
+        out.contains("getdefaulttimeout ()"),
+        "the function must call directly: {}",
+        out
+    );
+    assert!(
+        !out.contains("getdefaulttimeout :: new"),
+        "no class construction for a stdlib function: {}",
+        out
+    );
+}
+
+#[test]
+fn generator_annotation_types_the_stub_signature() {
+    // An abstract generator STUB (`-> typing.Generator[bytes]` with no
+    // yields — urllib3's BaseHTTPResponse.stream): the annotation still
+    // decides the signature, so overriding generators' Vec returns
+    // agree with the trait declaration (E0053 otherwise). Both the
+    // typing-qualified and single-parameter spellings resolve.
+    let out = compile(
+        "import typing\n\
+         \n\
+         class Base:\n\
+         \x20   def stream(self, amt: int) -> typing.Generator[bytes]:\n\
+         \x20       raise NotImplementedError()\n\
+         \n\
+         class Impl(Base):\n\
+         \x20   def stream(self, amt: int) -> typing.Generator[bytes]:\n\
+         \x20       yield b'x'\n",
+        "genstub.py",
+    );
+    assert!(
+        out.contains("Result < Vec < Vec < u8 > >"),
+        "the stub's signature must carry the annotated element: {}",
+        out
+    );
+    assert!(
+        !out.contains("Vec < _ >"),
+        "no inference placeholder in item signatures: {}",
+        out
+    );
+}
+
+#[test]
+fn module_self_assign_is_a_noop() {
+    // `__version__ = __version__` (urllib3's __init__, a typing/
+    // re-export idiom): a no-op — it must not demote the name to a
+    // module-init local (E0530 against the imported static) nor count
+    // as a second store.
+    let out = compile(
+        "CONST = 5\n\
+         CONST = CONST\n\
+         \n\
+         def f() -> int:\n\
+         \x20   return CONST\n",
+        "selfassign.py",
+    );
+    assert!(
+        out.contains("pub static CONST"),
+        "the single real store must still promote: {}",
+        out
+    );
+}

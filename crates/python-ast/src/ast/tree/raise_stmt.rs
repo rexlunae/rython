@@ -154,8 +154,22 @@ pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "AttributeError",
     "BaseException",
     "BaseExceptionGroup",
+    // The OSError connection family and the remaining warning types:
+    // absent for years (this registry had drifted from the runtime's
+    // builtin_exceptions tree, which has had them all along), surfacing
+    // as an E0432 on connection.py's `BrokenPipeError = BrokenPipeError`
+    // re-export shim (issue #137 round 16).
+    "BlockingIOError",
+    "BrokenPipeError",
     "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
     "DeprecationWarning",
+    "EncodingWarning",
     "EOFError",
     "EnvironmentError",
     "Exception",
@@ -167,6 +181,7 @@ pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "GeneratorExit",
     "IOError",
     "ImportError",
+    "ImportWarning",
     "IndentationError",
     "IndexError",
     "InterruptedError",
@@ -183,6 +198,7 @@ pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "OverflowError",
     "PendingDeprecationWarning",
     "PermissionError",
+    "ProcessLookupError",
     "RecursionError",
     "ReferenceError",
     "ResourceWarning",
@@ -191,6 +207,7 @@ pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "StopAsyncIteration",
     "StopIteration",
     "SyntaxError",
+    "SyntaxWarning",
     "SystemError",
     "SystemExit",
     "TabError",
@@ -201,6 +218,7 @@ pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "UnicodeEncodeError",
     "UnicodeError",
     "UnicodeTranslateError",
+    "UnicodeWarning",
     "UserWarning",
     "ValueError",
     "Warning",
@@ -328,6 +346,23 @@ fn exception_value(
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     match exc {
         ExprType::Call(call) => {
+            // `raise ssl.SSLError(...)` — the dotted stdlib exception
+            // spelling (urllib3's pyopenssl): canonicalize like the bare
+            // name, constructing the tagged PyException (the runtime
+            // module has no SSLError item to call).
+            if let ExprType::Attribute(attr) = call.func.as_ref()
+                && let ExprType::Name(m) = attr.value.as_ref()
+                && let Some(kind) = stdlib_exception_canonical(&m.id, &attr.attr)
+            {
+                let msg = match call.args.len() {
+                    0 => quote!(String::new()),
+                    _ => {
+                        let arg = call.args[0].clone().to_rust(ctx, options, symbols)?;
+                        quote!(format!("{}", #arg))
+                    }
+                };
+                return Ok(quote!(PyException::new(#kind, #msg)));
+            }
             if let ExprType::Name(name) = call.func.as_ref() {
                 if let Some(kind) = imported_exception_alias(&name.id, &symbols, Some(&options)) {
                     // `raise timeout(...)` under `from socket import

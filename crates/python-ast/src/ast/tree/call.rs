@@ -4245,16 +4245,28 @@ impl<'a> CodeGen for Call {
             // so the signature mapping above cannot resolve; lower to
             // the runtime `::new` constructor with the arguments passed
             // positionally (the stdpython-construction divergence).
-            let stdpython_class = match symbols.get(&n.id) {
-                Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
-                    crate::is_stdpython_module(ifm.module.split('.').next().unwrap_or(""))
-                        || stdpython_reexport_chain(&n.id, &symbols, &options)
-                }
-                Some(crate::SymbolTableNode::Alias(canonical)) => {
-                    stdpython_reexport_chain(canonical, &symbols, &options)
-                }
-                _ => false,
-            };
+            // A from-imported stdlib FUNCTION (`from socket import
+            // getdefaulttimeout` — urllib3's util/timeout) is a direct
+            // call, not a `::new` construction; the socket module's
+            // items are functions except the constants.
+            let stdpython_fn = matches!(symbols.get(&n.id),
+                Some(crate::SymbolTableNode::ImportFrom(ifm))
+                    if ifm.module == "socket"
+                        && matches!(
+                            n.id.as_str(),
+                            "getdefaulttimeout" | "setdefaulttimeout" | "gethostname"
+                        ));
+            let stdpython_class = !stdpython_fn
+                && match symbols.get(&n.id) {
+                    Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                        crate::is_stdpython_module(ifm.module.split('.').next().unwrap_or(""))
+                            || stdpython_reexport_chain(&n.id, &symbols, &options)
+                    }
+                    Some(crate::SymbolTableNode::Alias(canonical)) => {
+                        stdpython_reexport_chain(canonical, &symbols, &options)
+                    }
+                    _ => false,
+                };
             if stdpython_class {
                 let cname = crate::safe_ident(&n.id);
                 let mut args = Vec::new();
@@ -6291,6 +6303,24 @@ impl<'a> CodeGen for Call {
                 attr.attr
             ));
             return Ok(quote!(stdpython::PyValue::None_));
+        }
+
+        // A qualified STDPYTHON-CLASS construction (`collections.deque()`
+        // — urllib3's response.py): the runtime item is a struct, so the
+        // path call must go through its `::new` constructor exactly like
+        // the from-import spelling does.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let ExprType::Name(m) = attr.value.as_ref()
+            && m.id == "collections"
+            && matches!(attr.attr.as_str(), "deque" | "OrderedDict" | "defaultdict")
+        {
+            let module = crate::safe_ident(&m.id);
+            let cname = crate::safe_ident(&attr.attr);
+            let mut args = Vec::new();
+            for arg in &self.args {
+                args.push(arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?);
+            }
+            return Ok(quote!(#module::#cname::new(#(#args),*)));
         }
 
         let name = self

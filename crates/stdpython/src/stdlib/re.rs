@@ -220,6 +220,47 @@ impl PyMatchOps for Option<PyMatch> {
     }
 }
 
+/// re.escape(pattern): backslash-escape regex metacharacters — exactly
+/// CPython 3.7+'s special set (its `_special_chars_map`), verified
+/// against python3: `()[]{}?*+-|^$\.&~# \t\n\r\v\f`; everything else
+/// passes through (so `hello_world123` is unchanged).
+pub fn escape<S: AsRef<str> + ?Sized>(pattern: &S) -> String {
+    let s = pattern.as_ref();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '(' | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '?'
+                | '*'
+                | '+'
+                | '-'
+                | '|'
+                | '^'
+                | '$'
+                | '\\'
+                | '.'
+                | '&'
+                | '~'
+                | '#'
+                | ' '
+                | '\t'
+                | '\n'
+                | '\r'
+                | '\x0b'
+                | '\x0c'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Compile with Python flag letters ("i", "m", "s") applied as an
 /// inline group, which the regex crate shares with Python's syntax.
 pub fn compile(pattern: &str, flags: &str) -> Result<regex::Regex, PyException> {
@@ -504,4 +545,22 @@ fn translate_replacement(repl: &str) -> Result<String, PyException> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod escape_tests {
+    #[test]
+    fn escape_matches_cpython() {
+        // Pinned against python3: re.escape's special set (3.7+) and the
+        // pass-through of word characters.
+        assert_eq!(
+            super::escape("a-b.c(d)e[f]g{h}i?j*k+l|m^n$o\\p&q~r#s t"),
+            "a\\-b\\.c\\(d\\)e\\[f\\]g\\{h\\}i\\?j\\*k\\+l\\|m\\^n\\$o\\\\p\\&q\\~r\\#s\\ t"
+        );
+        assert_eq!(super::escape("hello_world123"), "hello_world123");
+        assert_eq!(super::escape("a\tb\nc"), "a\\\tb\\\nc");
+        // The escaped pattern matches its own literal text.
+        let re = super::compile(&super::escape("1+1=2?"), "").unwrap();
+        assert!(re.is_match("1+1=2?"));
+    }
 }

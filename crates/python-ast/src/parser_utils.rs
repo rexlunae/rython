@@ -162,6 +162,13 @@ pub fn safe_ident(name: &str) -> proc_macro2::Ident {
     match name {
         "self" => format_ident!("{}", name),
         "Self" | "super" | "crate" => format_ident!("{}_", name),
+        // Python's `_` is an ordinary variable — readable and rebindable
+        // (`except OSError as _: err = _` — urllib3's util/connection).
+        // Rust's `_` is a wildcard pattern: `let mut _` and reads are
+        // both illegal, so it maps to a real identifier. The leading
+        // underscore keeps never-read binders (throwaway loop targets)
+        // free of unused-variable warnings.
+        "_" => format_ident!("__rython_underscore"),
         // Strict and reserved keywords, all legal as raw identifiers.
         "as" | "break" | "const" | "continue" | "dyn" | "else" | "enum" | "extern" | "false"
         | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
