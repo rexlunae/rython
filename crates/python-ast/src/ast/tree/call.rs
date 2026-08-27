@@ -122,16 +122,16 @@ fn resolve_constant_name(
         match syms.get(&current) {
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
-                if !options.module_defs.contains_key(&path) {
+                let Some(key) = crate::module_defs_key(options, &path) else {
                     return None;
-                }
+                };
                 let defining = ifm
                     .names
                     .iter()
                     .find(|a| a.asname.as_deref() == Some(&current))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| current.clone());
-                let module = &options.module_defs[&path];
+                let module = &options.module_defs[key];
                 let module: &crate::Module = module;
                 syms = module.clone().find_symbols(SymbolTableScopes::new());
                 current = defining;
@@ -170,16 +170,16 @@ fn resolve_builtin_alias(
         match syms.get(&current) {
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
-                if !options.module_defs.contains_key(&path) {
+                let Some(key) = crate::module_defs_key(options, &path) else {
                     return None;
-                }
+                };
                 let defining = ifm
                     .names
                     .iter()
                     .find(|a| a.asname.as_deref() == Some(&current))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| current.clone());
-                let module = &options.module_defs[&path];
+                let module = &options.module_defs[key];
                 let module: &crate::Module = module;
                 syms = module.clone().find_symbols(SymbolTableScopes::new());
                 current = defining;
@@ -220,11 +220,11 @@ fn stdpython_reexport_chain(
         match syms.get(&current) {
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
-                if !options.module_defs.contains_key(&path) {
+                let Some(key) = crate::module_defs_key(options, &path) else {
                     return crate::is_stdpython_module(
                         ifm.module.split('.').next().unwrap_or(""),
                     );
-                }
+                };
                 // Re-export chain: hop into the defining module's scope.
                 let defining = ifm
                     .names
@@ -232,7 +232,7 @@ fn stdpython_reexport_chain(
                     .find(|a| a.asname.as_deref() == Some(&current))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| current.clone());
-                let module = &options.module_defs[&path];
+                let module = &options.module_defs[key];
                 let module: &crate::Module = module;
                 syms = module.clone().find_symbols(SymbolTableScopes::new());
                 current = defining;

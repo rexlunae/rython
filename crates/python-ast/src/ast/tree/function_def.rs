@@ -468,7 +468,14 @@ fn parse_method_decorator(
             Some(SymbolTableNode::FunctionDef(_)) => true,
             Some(SymbolTableNode::ImportFrom(i)) => {
                 let path = i.resolved_module_path(options);
-                options.module_defs.get(&path).is_some_and(|m| {
+                // `module_defs` is keyed RELATIVE to the package root for
+                // src-layout packages (pip/urllib3), while an absolute
+                // import (`from pip._internal.cli.req_command import ...`)
+                // resolves to a root-qualified path — match both forms.
+                let Some(key) = crate::module_defs_key(options, &path) else {
+                    return false;
+                };
+                options.module_defs.get(key).is_some_and(|m| {
                     let m: &crate::Module = m;
                     m.raw.body.iter().any(|s| {
                         matches!(

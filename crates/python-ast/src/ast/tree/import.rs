@@ -251,27 +251,7 @@ pub(crate) fn resolves_to_external_import(
                 let mut ctx = options.clone();
                 ctx.module_path = module_path.clone();
                 let path = ifm.resolved_module_path(&ctx);
-                if options.module_defs.contains_key(&path) {
-                    // A re-export chain: hop into the defining module.
-                    let is_package = options.module_defs.keys().any(|k| {
-                        k.len() > path.len() && k[..path.len()] == path[..]
-                    });
-                    module_path = if is_package {
-                        path.clone()
-                    } else {
-                        path[..path.len().saturating_sub(1)].to_vec()
-                    };
-                    let defining = ifm
-                        .names
-                        .iter()
-                        .find(|a| a.asname.as_deref() == Some(&current))
-                        .map(|a| a.name.clone())
-                        .unwrap_or_else(|| current.clone());
-                    let module = &options.module_defs[&path];
-                    let module: &crate::Module = module;
-                    syms = module.clone().find_symbols(SymbolTableScopes::new());
-                    current = defining;
-                } else {
+                let Some(key) = crate::module_defs_key(&options, &path) else {
                     // The terminal hop: external when the module is neither
                     // stdpython nor a vendored python-module dep.
                     let root = ifm.module.split('.').next().unwrap_or("");
@@ -283,6 +263,27 @@ pub(crate) fn resolves_to_external_import(
                     }
                     return !is_stdpython_module(root)
                         && !options.python_modules.contains(root);
+                };
+                {
+                    // A re-export chain: hop into the defining module.
+                    let is_package = options.module_defs.keys().any(|k| {
+                        k.len() > key.len() && k[..key.len()] == key[..]
+                    });
+                    module_path = if is_package {
+                        key.to_vec()
+                    } else {
+                        key[..key.len().saturating_sub(1)].to_vec()
+                    };
+                    let defining = ifm
+                        .names
+                        .iter()
+                        .find(|a| a.asname.as_deref() == Some(&current))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| current.clone());
+                    let module = &options.module_defs[key];
+                    let module: &crate::Module = module;
+                    syms = module.clone().find_symbols(SymbolTableScopes::new());
+                    current = defining;
                 }
             }
             _ => return false,
@@ -325,16 +326,16 @@ fn is_type_name_tuple_alias(
             }
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
-                if !options.module_defs.contains_key(&path) {
+                let Some(key) = crate::module_defs_key(options, &path) else {
                     return false;
-                }
+                };
                 let defining = ifm
                     .names
                     .iter()
                     .find(|a| a.asname.as_deref() == Some(&current))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| current.clone());
-                let module = &options.module_defs[&path];
+                let module = &options.module_defs[key];
                 let module: &crate::Module = module;
                 syms = module.clone().find_symbols(SymbolTableScopes::new());
                 current = defining;
@@ -562,9 +563,7 @@ impl CodeGen for Import {
                     // uses of its names become loud errors or boxed drops).
                     let path: Vec<String> =
                         alias.name.split('.').map(|s| s.to_string()).collect();
-                    let is_sibling = options
-                        .module_defs
-                        .contains_key(&path)
+                    let is_sibling = crate::module_defs_contains(&options, &path)
                         || options.python_modules.contains(
                             &path.first().cloned().unwrap_or_default(),
                         )
@@ -844,7 +843,22 @@ impl CodeGen for ImportFrom {
         } else {
             Vec::new()
         };
-        let module_path: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
+        // For an ABSOLUTE import of a crate module, the generated `use`
+        // path must match the crate's mod tree, which is keyed RELATIVE to
+        // the package root for src-layout sdists (pip, boto3 —
+        // `pip._internal.cli.req_command` lives at
+        // `_internal/cli/req_command.rs`). `module_defs_key` returns that
+        // relative key; external modules fall back to the literal segments
+        // (their imports are dropped before a use is emitted).
+        let module_path: Vec<_> = if self.level == 0 {
+            let resolved = self.resolved_module_path(&options);
+            match crate::module_defs_key(&options, &resolved) {
+                Some(key) => key.iter().map(|p| crate::safe_ident(p)).collect(),
+                None => parts.iter().map(|part| crate::safe_ident(part)).collect(),
+            }
+        } else {
+            parts.iter().map(|part| crate::safe_ident(part)).collect()
+        };
         let root = if self.level > 0 {
             quote!(crate)
         } else if parts
@@ -875,7 +889,7 @@ impl CodeGen for ImportFrom {
         let external = self.level == 0
             && options.module_defs.len() > 1
             && !matches!(first_part, Some(p) if is_stdpython_module(p))
-            && !options.module_defs.contains_key(&resolved_path)
+            && !crate::module_defs_contains(&options, &resolved_path)
             && !options
                 .python_modules
                 .contains(&first_part.unwrap_or("").to_string());
@@ -1121,10 +1135,10 @@ impl CodeGen for ImportFrom {
             // has no runtime item.
             let import_module_path = self.resolved_module_path(&options);
             if options.module_defs.len() > 1
-                && options.module_defs.contains_key(&import_module_path)
+                && let Some(key) = crate::module_defs_key(&options, &import_module_path)
                 && !crate::ast::tree::module::module_def_has_runtime_item(
                     &options,
-                    &import_module_path,
+                    key,
                     &alias.name,
                 )
             {
@@ -1204,9 +1218,8 @@ impl CodeGen for ImportFrom {
             // plain structs get none (the per-module map is empty for
             // them).
             let import_module_path = self.resolved_module_path(&options);
-            if options.module_defs.contains_key(&import_module_path)
-                && let Some(traits) =
-                    crate::module_class_traits(&options, &import_module_path).get(&alias.name)
+            if let Some(key) = crate::module_defs_key(&options, &import_module_path)
+                && let Some(traits) = crate::module_class_traits(&options, key).get(&alias.name)
             {
                 for trait_name in traits {
                     if !seen_traits.insert(trait_name.clone()) {

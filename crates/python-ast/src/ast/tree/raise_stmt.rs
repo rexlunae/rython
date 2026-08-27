@@ -443,12 +443,12 @@ fn resolved_is_exception_class(
         Some(SymbolTableNode::ClassDef(c)) => crate::is_exception_class(c),
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
-            if options.module_defs.contains_key(&path) {
-                crate::module_class_def(&options, &path, name)
-                    .is_some_and(|(c, _)| crate::is_exception_class(&c))
-            } else {
-                false
-            }
+            let Some(key) = crate::module_defs_key(options, &path) else {
+                return false;
+            };
+            crate::module_class_def(&options, key, name).is_some_and(|(c, _)| {
+                crate::is_exception_class(&c)
+            })
         }
         _ => false,
     }
