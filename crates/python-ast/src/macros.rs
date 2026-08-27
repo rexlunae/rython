@@ -75,7 +75,7 @@ macro_rules! impl_node_with_positions {
             }
         }
     };
-    
+
     // Variant for types without position fields
     ($type_name:ident) => {
         impl $crate::Node for $type_name {
@@ -83,4 +83,3 @@ macro_rules! impl_node_with_positions {
         }
     };
 }
-

@@ -1,6 +1,6 @@
-use python_ast::*;
 use python_ast::codegen::{CodeGen, CodeGenContext, PythonOptions};
 use python_ast::symbols::SymbolTableScopes;
+use python_ast::*;
 
 mod common;
 
@@ -12,25 +12,25 @@ def calculate_sum(a, b):
     result = a + b
     return result
 "#;
-    
+
     let module = parse(code, "test_function.py").expect("Failed to parse code");
-    
+
     // Verify parsing worked
     assert_eq!(module.raw.body.len(), 1);
     assert!(module.filename.is_some());
     assert_eq!(module.filename.as_ref().unwrap(), "test_function.py");
-    
+
     // Test code generation
     let options = PythonOptions::default();
     let context = CodeGenContext::Module("test_function".to_string());
     let scopes = SymbolTableScopes::new();
-    
+
     let rust_code = module.to_rust(context, options, scopes);
     // Code generation is experimental, so we just verify it doesn't panic
     assert!(rust_code.is_ok() || rust_code.is_err()); // Just ensure it completes
 }
 
-#[test] 
+#[test]
 fn test_end_to_end_class_definition() {
     let code = r#"
 class Calculator:
@@ -47,12 +47,12 @@ class Calculator:
         self.value *= x
         return self.value
 "#;
-    
+
     let module = parse(code, "calculator.py").expect("Failed to parse class");
-    
+
     // Verify parsing
     assert_eq!(module.raw.body.len(), 1);
-    
+
     // Verify module name generation
     assert!(module.name.is_some());
     assert_eq!(module.name.unwrap().id, "calculator");
@@ -116,12 +116,12 @@ if __name__ == "__main__":
     results = processor.process()
     print(f"Results: {results}")
 "#;
-    
+
     let module = parse(code, "complex_module.py").expect("Failed to parse complex module");
-    
+
     // Verify we parsed all the top-level statements
     assert!(module.raw.body.len() > 10); // Should have many statements
-    
+
     // Verify module properties
     assert!(module.filename.is_some());
     assert_eq!(module.filename.as_ref().unwrap(), "complex_module.py");
@@ -148,8 +148,9 @@ def safe_divide(a, b):
 with open("file.txt", "r") as f:
     content = f.read()
 "#;
-    
-    let module = parse(valid_code, "error_handling.py").expect("Failed to parse error handling code");
+
+    let module =
+        parse(valid_code, "error_handling.py").expect("Failed to parse error handling code");
     assert_eq!(module.raw.body.len(), 2); // Function definition + with statement
 }
 
@@ -191,7 +192,7 @@ def risky_operation():
         raise ValueError("Random failure")
     return "Success!"
 "#;
-    
+
     let module = parse(code, "decorators.py").expect("Failed to parse decorators");
     assert!(module.raw.body.len() >= 3); // Imports + functions
 }
@@ -227,7 +228,7 @@ nested_dict = {
 word_lengths = {word: len(word) for word in ["hello", "world", "python"]}
 vowels = {char for char in "hello world" if char in "aeiou"}
 "#;
-    
+
     let module = parse(code, "data_structures.py").expect("Failed to parse data structures");
     assert!(module.raw.body.len() >= 8); // Various assignments
 }
@@ -235,12 +236,14 @@ vowels = {char for char in "hello world" if char in "aeiou"}
 #[test]
 fn test_end_to_end_module_with_path() {
     let code = "value = 42";
-    let complex_path = format!("src{}utils{}helpers.py", 
-                              std::path::MAIN_SEPARATOR, 
-                              std::path::MAIN_SEPARATOR);
-    
+    let complex_path = format!(
+        "src{}utils{}helpers.py",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+
     let module = parse(code, &complex_path).expect("Failed to parse with complex path");
-    
+
     assert!(module.name.is_some());
     assert_eq!(module.name.unwrap().id, "src__utils__helpers");
     assert!(module.filename.is_some());
@@ -251,7 +254,7 @@ fn test_end_to_end_module_with_path() {
 fn test_end_to_end_empty_module() {
     let code = "";
     let module = parse(code, "empty.py").expect("Failed to parse empty module");
-    
+
     assert!(module.raw.body.is_empty());
     assert!(module.filename.is_some());
     assert!(module.name.is_some());
@@ -270,9 +273,9 @@ It should still parse successfully.
 
 # More comments...
 "#;
-    
+
     let module = parse(code, "comments_only.py").expect("Failed to parse comments-only module");
-    
+
     // Should have the docstring as a statement
     assert_eq!(module.raw.body.len(), 1);
 }
@@ -284,9 +287,12 @@ def broken_function(
     # Missing closing parenthesis and colon
     pass
 "#;
-    
+
     let result = parse(invalid_code, "broken.py");
-    assert!(result.is_err(), "Expected parsing to fail for invalid syntax");
+    assert!(
+        result.is_err(),
+        "Expected parsing to fail for invalid syntax"
+    );
 }
 
 #[test]
@@ -294,10 +300,11 @@ fn test_end_to_end_large_module() {
     // Generate a larger module to test performance and memory usage
     let mut large_code = String::new();
     large_code.push_str("# Large module test\n");
-    
+
     // Add many function definitions
     for i in 0..50 {
-        large_code.push_str(&format!(r#"
+        large_code.push_str(&format!(
+            r#"
 def function_{}(param1, param2=None):
     """Function number {}"""
     if param2 is None:
@@ -305,12 +312,15 @@ def function_{}(param1, param2=None):
     result = param1 + param2
     return result * 2
 
-"#, i, i, i));
+"#,
+            i, i, i
+        ));
     }
-    
+
     // Add many class definitions
     for i in 0..20 {
-        large_code.push_str(&format!(r#"
+        large_code.push_str(&format!(
+            r#"
 class Class{}:
     """Class number {}"""
     
@@ -320,11 +330,17 @@ class Class{}:
     def method_{}(self):
         return self.value * {}
 
-"#, i, i, i, i, i + 1));
+"#,
+            i,
+            i,
+            i,
+            i,
+            i + 1
+        ));
     }
-    
+
     let module = parse(&large_code, "large_module.py").expect("Failed to parse large module");
-    
+
     // Should have parsed all functions and classes
     assert_eq!(module.raw.body.len(), 70); // 50 functions + 20 classes
     assert!(module.filename.is_some());

@@ -1,7 +1,7 @@
-use proc_macro2::TokenStream;
-use quote::quote;
-use pyo3::types::{PyAnyMethods, PyTypeMethods};
 use crate::{CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes};
+use proc_macro2::TokenStream;
+use pyo3::types::{PyAnyMethods, PyTypeMethods};
+use quote::quote;
 
 /// Common trait for Python operators that can be converted to Rust tokens.
 pub trait PythonOperator: Clone + std::fmt::Debug {
@@ -52,31 +52,39 @@ pub trait BinaryOperation: Clone + std::fmt::Debug {
 /// Trait for extracting Python attributes with consistent error handling.
 pub trait PyAttributeExtractor {
     /// Extract an attribute with context-aware error messages.
-    fn extract_attr_with_context(&self, attr: &str, context: &str) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>>;
-    
+    fn extract_attr_with_context(
+        &self,
+        attr: &str,
+        context: &str,
+    ) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>>;
+
     /// Extract a type name with error handling.
     fn extract_type_name(&self, context: &str) -> pyo3::PyResult<String>;
 }
 
 impl<'py> PyAttributeExtractor for pyo3::Bound<'py, pyo3::PyAny> {
-    fn extract_attr_with_context(&self, attr: &str, context: &str) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
+    fn extract_attr_with_context(
+        &self,
+        attr: &str,
+        context: &str,
+    ) -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
         use crate::Node;
         self.getattr(attr).map_err(|_| {
             pyo3::exceptions::PyAttributeError::new_err(
-                self.error_message("<unknown>", format!("error getting {}", context))
+                self.error_message("<unknown>", format!("error getting {}", context)),
             )
         })
     }
-    
+
     fn extract_type_name(&self, context: &str) -> pyo3::PyResult<String> {
         use crate::Node;
-        
+
         let type_name = self.get_type().name().map_err(|_| {
             pyo3::exceptions::PyTypeError::new_err(
-                self.error_message("<unknown>", format!("extracting type name for {}", context))
+                self.error_message("<unknown>", format!("extracting type name for {}", context)),
             )
         })?;
-        
+
         type_name.extract()
     }
 }
@@ -85,7 +93,7 @@ impl<'py> PyAttributeExtractor for pyo3::Bound<'py, pyo3::PyAny> {
 pub trait PositionInfo {
     /// Get all position fields as a tuple (lineno, col_offset, end_lineno, end_col_offset).
     fn position_info(&self) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>);
-    
+
     /// Check if this node has position information.
     fn has_position(&self) -> bool {
         let (lineno, col_offset, _, _) = self.position_info();
@@ -97,7 +105,7 @@ pub trait PositionInfo {
 pub trait DebugInfo {
     /// Get a human-readable description of this node.
     fn debug_description(&self) -> String;
-    
+
     /// Get the node type name.
     fn node_type(&self) -> &'static str;
 }
@@ -106,13 +114,13 @@ pub trait DebugInfo {
 pub trait ChainableOperation {
     type Operand;
     type Operator;
-    
+
     /// Get all operands in the chain.
     fn operands(&self) -> Vec<&Self::Operand>;
-    
+
     /// Get all operators in the chain.
     fn operators(&self) -> Vec<&Self::Operator>;
-    
+
     /// Generate chained Rust code.
     fn generate_chained_rust(
         &self,
@@ -126,10 +134,10 @@ pub trait ChainableOperation {
 pub trait FromPythonString: Sized {
     /// Convert a Python operator string to the enum variant.
     fn from_python_string(s: &str) -> Option<Self>;
-    
+
     /// Get the unknown/default variant.
     fn unknown() -> Self;
-    
+
     /// Parse from string with fallback to unknown.
     fn parse_or_unknown(s: &str) -> Self {
         Self::from_python_string(s).unwrap_or_else(Self::unknown)

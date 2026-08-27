@@ -1,5 +1,5 @@
 //! Python glob module implementation
-//! 
+//!
 //! This module provides Unix shell-style pathname pattern expansion.
 //! Implementation matches Python's glob module API.
 
@@ -96,7 +96,13 @@ fn glob_recursive_helper(
     // recursive=True descends (skipping hidden directories, like Python).
     if current_pattern == "**" && recursive {
         // Try matching current directory first
-        glob_recursive_helper(current_path, pattern_parts, part_index + 1, recursive, results)?;
+        glob_recursive_helper(
+            current_path,
+            pattern_parts,
+            part_index + 1,
+            recursive,
+            results,
+        )?;
 
         // Then recursively search subdirectories. Python's ** does not
         // descend into hidden directories.
@@ -124,9 +130,7 @@ fn glob_recursive_helper(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        let filename = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // Python's glob never matches a leading dot with a wildcard: a
         // hidden file only matches a pattern component that itself starts
@@ -158,26 +162,31 @@ fn matches_pattern(filename: &str, pattern: &str) -> bool {
 fn match_glob(text: &str, pattern: &str) -> bool {
     let text_chars: Vec<char> = text.chars().collect();
     let pattern_chars: Vec<char> = pattern.chars().collect();
-    
+
     match_glob_recursive(&text_chars, &pattern_chars, 0, 0)
 }
 
-fn match_glob_recursive(text: &[char], pattern: &[char], text_idx: usize, pattern_idx: usize) -> bool {
+fn match_glob_recursive(
+    text: &[char],
+    pattern: &[char],
+    text_idx: usize,
+    pattern_idx: usize,
+) -> bool {
     // Base cases
     if pattern_idx >= pattern.len() {
         return text_idx >= text.len();
     }
-    
+
     if text_idx >= text.len() {
         // Check if remaining pattern is only '*'
         return pattern[pattern_idx..].iter().all(|&c| c == '*');
     }
-    
+
     match pattern[pattern_idx] {
         '*' => {
             // Try matching zero or more characters
-            match_glob_recursive(text, pattern, text_idx, pattern_idx + 1) ||
-            match_glob_recursive(text, pattern, text_idx + 1, pattern_idx)
+            match_glob_recursive(text, pattern, text_idx, pattern_idx + 1)
+                || match_glob_recursive(text, pattern, text_idx + 1, pattern_idx)
         }
         '?' => {
             // Match exactly one character
@@ -185,7 +194,9 @@ fn match_glob_recursive(text: &[char], pattern: &[char], text_idx: usize, patter
         }
         '[' => {
             // Character class matching
-            if let Some((matched, next_pattern_idx)) = match_char_class(text[text_idx], pattern, pattern_idx) {
+            if let Some((matched, next_pattern_idx)) =
+                match_char_class(text[text_idx], pattern, pattern_idx)
+            {
                 if matched {
                     match_glob_recursive(text, pattern, text_idx + 1, next_pattern_idx)
                 } else {
@@ -213,12 +224,12 @@ fn match_char_class(ch: char, pattern: &[char], start_idx: usize) -> Option<(boo
     if start_idx >= pattern.len() || pattern[start_idx] != '[' {
         return None;
     }
-    
+
     let mut idx = start_idx + 1;
     if idx >= pattern.len() {
         return None;
     }
-    
+
     // Check for negation
     let negated = pattern[idx] == '!';
     if negated {
@@ -227,9 +238,9 @@ fn match_char_class(ch: char, pattern: &[char], start_idx: usize) -> Option<(boo
             return None;
         }
     }
-    
+
     let mut matched = false;
-    
+
     while idx < pattern.len() && pattern[idx] != ']' {
         if idx + 2 < pattern.len() && pattern[idx + 1] == '-' {
             // Range like a-z
@@ -247,7 +258,7 @@ fn match_char_class(ch: char, pattern: &[char], start_idx: usize) -> Option<(boo
             idx += 1;
         }
     }
-    
+
     if idx < pattern.len() && pattern[idx] == ']' {
         idx += 1; // Skip closing bracket
         Some((if negated { !matched } else { matched }, idx))
@@ -325,7 +336,7 @@ pub fn iglob<P: AsRef<str>>(pathname: P) -> Result<Vec<String>, PyException> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_match_glob() {
         assert!(match_glob("hello.txt", "*.txt"));
@@ -335,15 +346,27 @@ mod tests {
         assert!(!match_glob("file.py", "*.txt"));
         assert!(!match_glob("hello", "h[xyz]llo"));
     }
-    
+
     #[test]
     fn test_char_class() {
-        assert!(matches!(match_char_class('a', &['[', 'a', 'b', 'c', ']'], 0), Some((true, 5))));
-        assert!(matches!(match_char_class('d', &['[', 'a', 'b', 'c', ']'], 0), Some((false, 5))));
-        assert!(matches!(match_char_class('b', &['[', 'a', '-', 'z', ']'], 0), Some((true, 5))));
-        assert!(matches!(match_char_class('a', &['[', '!', 'b', 'c', ']'], 0), Some((true, 5))));
+        assert!(matches!(
+            match_char_class('a', &['[', 'a', 'b', 'c', ']'], 0),
+            Some((true, 5))
+        ));
+        assert!(matches!(
+            match_char_class('d', &['[', 'a', 'b', 'c', ']'], 0),
+            Some((false, 5))
+        ));
+        assert!(matches!(
+            match_char_class('b', &['[', 'a', '-', 'z', ']'], 0),
+            Some((true, 5))
+        ));
+        assert!(matches!(
+            match_char_class('a', &['[', '!', 'b', 'c', ']'], 0),
+            Some((true, 5))
+        ));
     }
-    
+
     #[test]
     fn test_escape() {
         // CPython's bracket escapes, readable by this module's own matcher.
@@ -356,7 +379,7 @@ mod tests {
         assert!(match_glob("test[123].py", &escape("test[123].py")));
         assert!(!match_glob("fileX.txt", &escape("file*.txt")));
     }
-    
+
     #[test]
     fn test_has_magic() {
         assert!(has_magic("*.txt"));
@@ -365,7 +388,7 @@ mod tests {
         assert!(!has_magic("{a,b,c}"));
         assert!(!has_magic("normal_file.txt"));
     }
-    
+
     #[test]
     fn test_is_hidden() {
         assert!(is_hidden(".bashrc"));

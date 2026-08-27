@@ -1,9 +1,9 @@
-use tracing::debug;
+use crate::ast::tree::statement::PyStatementTrait;
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
-use crate::ast::tree::statement::PyStatementTrait;
+use tracing::debug;
 
 use crate::{
     CodeGen, CodeGenContext, ExprType, Object, ParameterList, PythonOptions, Statement,
@@ -28,7 +28,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
         let body: Vec<Statement> = ob.getattr("body")?.extract()?;
 
         // Extract decorator_list as Vec<ExprType>
-        let decorator_list: Vec<ExprType> = ob.getattr("decorator_list")?.extract().unwrap_or_default();
+        let decorator_list: Vec<ExprType> =
+            ob.getattr("decorator_list")?.extract().unwrap_or_default();
 
         // Extract the return annotation, if any.
         let returns: Option<Box<ExprType>> = match ob.getattr("returns") {
@@ -46,8 +47,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
     }
 }
 
-impl PyStatementTrait for FunctionDef {
-}
+impl PyStatementTrait for FunctionDef {}
 
 /// One add_argument spec collected at conversion time.
 pub(crate) struct ArgparseSpec {
@@ -108,9 +108,7 @@ pub(crate) fn scan_argparse(
             return Err("argparse.ArgumentParser must be assigned to a plain name".into());
         };
         if !call.args.is_empty() {
-            return Err(
-                "argparse.ArgumentParser: pass prog=/description= by keyword".into(),
-            );
+            return Err("argparse.ArgumentParser: pass prog=/description= by keyword".into());
         }
         let mut prog = None;
         let mut description = None;
@@ -130,7 +128,7 @@ pub(crate) fn scan_argparse(
                         "argparse.ArgumentParser keyword '{}' is not supported yet",
                         other.unwrap_or("**kwargs")
                     )
-                    .into())
+                    .into());
                 }
             }
         }
@@ -207,11 +205,9 @@ pub(crate) fn scan_argparse(
                         (Some(short), long)
                     }
                     _ => {
-                        return Err(
-                            "add_argument takes one name, or a -short, --long alias \
+                        return Err("add_argument takes one name, or a -short, --long alias \
                              pair"
-                                .into(),
-                        );
+                            .into());
                     }
                 };
                 let mut kind: Option<&'static str> = None;
@@ -231,17 +227,14 @@ pub(crate) fn scan_argparse(
                                          or str",
                                         name
                                     )
-                                    .into())
+                                    .into());
                                 }
                             });
                         }
                         Some("default") => default = Some(kw.value.clone()),
                         Some("help") => {
                             help = Some(literal_str(&kw.value).ok_or_else(|| {
-                                format!(
-                                    "add_argument('{}'): help must be a string literal",
-                                    name
-                                )
+                                format!("add_argument('{}'): help must be a string literal", name)
                             })?)
                         }
                         Some("action") => match literal_str(&kw.value).as_deref() {
@@ -252,7 +245,7 @@ pub(crate) fn scan_argparse(
                                      supported",
                                     name
                                 )
-                                .into())
+                                .into());
                             }
                         },
                         other => {
@@ -261,7 +254,7 @@ pub(crate) fn scan_argparse(
                                 name,
                                 other.unwrap_or("**kwargs")
                             )
-                            .into())
+                            .into());
                         }
                     }
                 }
@@ -540,8 +533,7 @@ impl CodeGen for FunctionDef {
             static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         let depth = FN_DEPTH.with(|d| d.get());
-        if depth > 50 && depth % 10 == 0 {
-        }
+        if depth > 50 && depth % 10 == 0 {}
         FN_DEPTH.with(|d| d.set(depth + 1));
         // A module function registered for isinstance specialization
         // (specialize.rs) renders as its variants + residual instead of
@@ -578,7 +570,7 @@ impl FunctionDef {
         let mut vopts = options.clone();
         vopts.rendering_specialization = true;
         use crate::ast::tree::specialize::{
-            fold_morph_body, mangled_name, target_typeinfo, SpecializedFn,
+            SpecializedFn, fold_morph_body, mangled_name, target_typeinfo,
         };
         // One morph per assignment in the cartesian product over axes:
         // per tested BUILTIN type and per concrete class in the tested
@@ -647,7 +639,7 @@ impl FunctionDef {
             && options.with_std_python
         {
             use crate::ast::tree::specialize::{
-                py_id_boxable, py_type_tokens, to_pascal, RouterReturn, SpecTarget,
+                RouterReturn, SpecTarget, py_id_boxable, py_type_tokens, to_pascal,
             };
             use quote::format_ident;
             let orig_ident = crate::safe_ident(&self.name);
@@ -706,9 +698,7 @@ impl FunctionDef {
             // matchable value, and as a boxed PyValue when every member
             // is boxable (Python's `str | int` union).
             let (ret_ty, out_enum_stream, wrap_result) = match &router.ret {
-                RouterReturn::Unified(id) => {
-                    (py_type_tokens(id), TokenStream::new(), false)
-                }
+                RouterReturn::Unified(id) => (py_type_tokens(id), TokenStream::new(), false),
                 RouterReturn::Enum { name, members } => {
                     let out_ident = crate::safe_ident(name);
                     let mut out_variants = TokenStream::new();
@@ -996,8 +986,7 @@ impl FunctionDef {
         // while the name is never referenced afterwards — this pass makes
         // any such use a loud error (and a reassignment/import clears the
         // deletion, like Python's `del x; x = 1`).
-        check_deleted_names(&self.body)
-            .map_err(|e| format!("function `{}`: {}", self.name, e))?;
+        check_deleted_names(&self.body).map_err(|e| format!("function `{}`: {}", self.name, e))?;
 
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
@@ -1013,11 +1002,9 @@ impl FunctionDef {
                 .collect(),
         };
         // The parse_args statement's position within the filtered body.
-        let argparse_parse_at: Option<usize> = argparse_rewrite.as_ref().map(|rw| {
-            (0..rw.parse_index)
-                .filter(|i| !rw.skip.contains(i))
-                .count()
-        });
+        let argparse_parse_at: Option<usize> = argparse_rewrite
+            .as_ref()
+            .map(|rw| (0..rw.parse_index).filter(|i| !rw.skip.contains(i)).count());
 
         // functools cache decorators rewrite the whole definition below;
         // @classmethod/@staticmethod change the method shape; any OTHER
@@ -1058,15 +1045,15 @@ impl FunctionDef {
         let visibility = if matches!(&ctx, CodeGenContext::Trait { .. }) {
             quote!()
         } else if is_module_level && self.name.starts_with("_") && !self.name.starts_with("__") {
-            quote!(pub(crate))  // module-level: sibling modules import it
+            quote!(pub(crate)) // module-level: sibling modules import it
         } else if is_module_level {
             quote!(pub)
         } else if self.name.starts_with("_") && !self.name.starts_with("__") {
-            quote!()  // private, no visibility modifier
+            quote!() // private, no visibility modifier
         } else if self.name.starts_with("__") && self.name.ends_with("__") {
-            quote!(pub(crate))  // dunder methods are crate-visible
+            quote!(pub(crate)) // dunder methods are crate-visible
         } else {
-            quote!(pub)  // regular methods are public
+            quote!(pub) // regular methods are public
         };
 
         // A nested function body is a fresh exception scope: a `raise` in it
@@ -1094,8 +1081,7 @@ impl FunctionDef {
         // reference is a compile-time value (issue #117).
         if matches!(decorator, MethodDecorator::ClassMethod)
             && let Some(class_name) = ctx.enclosing_class_name()
-            && let Some(crate::SymbolTableNode::ClassDef(class)) =
-                symbols.get(class_name)
+            && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
         {
             symbols.insert(
                 "cls".to_string(),
@@ -1138,14 +1124,14 @@ impl FunctionDef {
         let method_mutates_self = is_method
             && match &ctx {
                 CodeGenContext::Class(class_name)
-                | CodeGenContext::Trait { class: class_name, .. } => {
-                    match symbols.get(class_name) {
-                        Some(crate::SymbolTableNode::ClassDef(c)) => {
-                            c.method_needs_mut_self(&self.name, &symbols, &options)
-                        }
-                        _ => false,
+                | CodeGenContext::Trait {
+                    class: class_name, ..
+                } => match symbols.get(class_name) {
+                    Some(crate::SymbolTableNode::ClassDef(c)) => {
+                        c.method_needs_mut_self(&self.name, &symbols, &options)
                     }
-                }
+                    _ => false,
+                },
                 _ => false,
             };
         if is_method {
@@ -1163,12 +1149,9 @@ impl FunctionDef {
                 .map(|p| p.arg.clone());
             if let Some(r) = receiver_name {
                 if r != "self" {
-                    effective_body = super::rename::rename_receiver_in_body(
-                        &effective_body,
-                        &r,
-                        "self",
-                    )
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    effective_body =
+                        super::rename::rename_receiver_in_body(&effective_body, &r, "self")
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 }
             }
         }
@@ -1213,48 +1196,46 @@ impl FunctionDef {
                         let mut key = Vec::new();
                         let mut key_ok = true;
                         for p in &self.args.args {
-                        let ty = match p.annotation.as_deref() {
-                            Some(ExprType::Name(n)) if n.id == "int" => quote!(i64),
-                            Some(ExprType::Name(n)) if n.id == "bool" => quote!(bool),
-                            Some(ExprType::Name(n)) if n.id == "str" => quote!(String),
-                            // float keys use the PyFloatKey wrapper: Python
-                            // semantics (-0.0 == 0.0, NaN never hits) differ
-                            // from Rust's f64 Hash/Eq.
-                            Some(ExprType::Name(n)) if n.id == "float" => {
-                                quote!(stdpython::stdlib::functools::PyFloatKey)
-                            }
-                            // Optional keys: `x: str | None` caches on the
-                            // Option (charset_normalizer's lg_inclusion).
-                            Some(ann)
-                                if crate::is_optional_annotation(ann) =>
-                            {
-                                let inner = crate::python_annotation_to_rust_type(ann)
-                                    .unwrap_or_else(|| quote!(String));
-                                quote!(Option<#inner>)
-                            }
-                            _ => {
-                                // A cache key of an unsupported type
-                                // (`cacheable_page: CacheablePageContent` —
-                                // pip's with_cached_index_content): the
-                                // cache cannot key on it — dropped (the
-                                // function lowers uncached; documented
-                                // divergence).
-                                options.definition_warnings.borrow_mut().push(format!(
-                                    "@lru_cache on `{}`: parameter `{}` is not a valid \
+                            let ty = match p.annotation.as_deref() {
+                                Some(ExprType::Name(n)) if n.id == "int" => quote!(i64),
+                                Some(ExprType::Name(n)) if n.id == "bool" => quote!(bool),
+                                Some(ExprType::Name(n)) if n.id == "str" => quote!(String),
+                                // float keys use the PyFloatKey wrapper: Python
+                                // semantics (-0.0 == 0.0, NaN never hits) differ
+                                // from Rust's f64 Hash/Eq.
+                                Some(ExprType::Name(n)) if n.id == "float" => {
+                                    quote!(stdpython::stdlib::functools::PyFloatKey)
+                                }
+                                // Optional keys: `x: str | None` caches on the
+                                // Option (charset_normalizer's lg_inclusion).
+                                Some(ann) if crate::is_optional_annotation(ann) => {
+                                    let inner = crate::python_annotation_to_rust_type(ann)
+                                        .unwrap_or_else(|| quote!(String));
+                                    quote!(Option<#inner>)
+                                }
+                                _ => {
+                                    // A cache key of an unsupported type
+                                    // (`cacheable_page: CacheablePageContent` —
+                                    // pip's with_cached_index_content): the
+                                    // cache cannot key on it — dropped (the
+                                    // function lowers uncached; documented
+                                    // divergence).
+                                    options.definition_warnings.borrow_mut().push(format!(
+                                        "@lru_cache on `{}`: parameter `{}` is not a valid \
                                      cache key (must be int, bool, str, float, or \
                                      Optional); the cache is dropped",
-                                    self.name, p.arg
-                                ));
-                                key_ok = false;
-                                break;
-                            }
-                        };
-                        key.push((crate::safe_ident(&p.arg), ty));
+                                        self.name, p.arg
+                                    ));
+                                    key_ok = false;
+                                    break;
+                                }
+                            };
+                            key.push((crate::safe_ident(&p.arg), ty));
+                        }
+                        if key_ok { Some(key) } else { None }
                     }
-                    if key_ok { Some(key) } else { None }
                 }
             }
-        }
         };
 
         // Python variables are function-scoped: hoist every assigned name to
@@ -1375,8 +1356,7 @@ impl FunctionDef {
             // and the String rebind mismatches at build time.
             let mut literal_bindings: std::collections::HashMap<String, bool> =
                 std::collections::HashMap::new();
-            let mut rebound: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
             scan_str_rebindings(&effective_body, &mut literal_bindings, &mut rebound);
             options.owned_str_literals = std::rc::Rc::new(
                 literal_bindings
@@ -1459,7 +1439,8 @@ impl FunctionDef {
         // pinned by later use. Annotation-derived types win over
         // assignment-inferred ones, matching local_types above.
         {
-            let mut info = crate::analyze_function_types(&effective_body, Some(&options), Some(&symbols));
+            let mut info =
+                crate::analyze_function_types(&effective_body, Some(&options), Some(&symbols));
             for p in self
                 .args
                 .args
@@ -1477,16 +1458,19 @@ impl FunctionDef {
                                 info.name_types.insert(p.arg.clone(), crate::TypeInfo::Int);
                             }
                             "float" => {
-                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::Float);
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::Float);
                             }
                             "bool" => {
                                 info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bool);
                             }
                             "str" => {
-                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::String);
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::String);
                             }
                             "bytes" => {
-                                info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bytes);
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::Bytes);
                             }
                             // `object` — a value of unknown type: the boxed
                             // heterogeneous value.
@@ -1513,17 +1497,17 @@ impl FunctionDef {
                             _ => {
                                 let cname = n.id.clone();
                                 if symbols.get(&cname).is_some() {
-                                    info.name_types.insert(
-                                        p.arg.clone(),
-                                        crate::TypeInfo::Class(cname),
-                                    );
+                                    info.name_types
+                                        .insert(p.arg.clone(), crate::TypeInfo::Class(cname));
                                 }
                             }
                         },
                         other => {
                             if crate::is_none_expr(other) {
-                                info.name_types
-                                    .insert(p.arg.clone(), crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)));
+                                info.name_types.insert(
+                                    p.arg.clone(),
+                                    crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                                );
                             } else if matches!(other, ExprType::Subscript(sub)
                                 if matches!(sub.value.as_ref(), ExprType::Name(n)
                                     if matches!(n.id.as_str(), "type" | "Type")))
@@ -1614,11 +1598,13 @@ impl FunctionDef {
             // pack into it at call sites, and the body reads/contains/
             // copies it like any dict.
             if let Some(kwarg) = &self.args.kwarg {
-                info.name_types
-                    .insert(kwarg.arg.clone(), crate::TypeInfo::Dict(
+                info.name_types.insert(
+                    kwarg.arg.clone(),
+                    crate::TypeInfo::Dict(
                         Box::new(crate::TypeInfo::String),
                         Box::new(crate::TypeInfo::PyValue),
-                    ));
+                    ),
+                );
             }
             // Issue #120: the *args parameter is the boxed heterogeneous
             // list (`Vec<PyValue>`): extra positional arguments pack into
@@ -1683,8 +1669,8 @@ impl FunctionDef {
                     .iter()
                     .chain(self.args.args.iter())
                     .position(|q| q.arg == p.arg);
-                let from = self.args.posonlyargs.len() + self.args.args.len()
-                    - self.args.defaults.len();
+                let from =
+                    self.args.posonlyargs.len() + self.args.args.len() - self.args.defaults.len();
                 match pos {
                     Some(i) if i >= from => self
                         .args
@@ -1698,9 +1684,7 @@ impl FunctionDef {
                             .iter()
                             .zip(self.args.kw_defaults.iter())
                             .find(|(q, _)| q.arg == p.arg);
-                        kw.is_some_and(|(_, d)| {
-                            d.as_deref().is_some_and(crate::is_none_expr)
-                        })
+                        kw.is_some_and(|(_, d)| d.as_deref().is_some_and(crate::is_none_expr))
                     }
                 }
             })
@@ -1715,8 +1699,7 @@ impl FunctionDef {
                 CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
             ) && !is_class_method
                 && !is_static_method
-                && (self.args.posonlyargs.first().is_some()
-                    || self.args.args.first().is_some());
+                && (self.args.posonlyargs.first().is_some() || self.args.args.first().is_some());
             let unannotated: Vec<String> = self
                 .args
                 .posonlyargs
@@ -1743,13 +1726,8 @@ impl FunctionDef {
                 // checked against callee bounds (M5, call-site
                 // satisfiability) — the inference collector only walks
                 // functions with unannotated parameters.
-                crate::check_call_sites(
-                    &effective_body,
-                    &symbols,
-                    &options.name_types,
-                    &options,
-                )
-                .map_err(|e| format!("function `{}`: {}", self.name, e))?;
+                crate::check_call_sites(&effective_body, &symbols, &options.name_types, &options)
+                    .map_err(|e| format!("function `{}`: {}", self.name, e))?;
                 // A kwargs-only (or fully-annotated) function still calls
                 // through loop elements over non-param iterables
                 // (`for filter in self.X: filter(**kwargs)` — botocore's
@@ -1804,9 +1782,7 @@ impl FunctionDef {
                     &options,
                     &self.name,
                 )
-                .map_err(|e| {
-                    format!("function `{}`: {}", self.name, e)
-                })?
+                .map_err(|e| format!("function `{}`: {}", self.name, e))?
             }
         };
         // Thread the inferred type variables into parameter rendering
@@ -1855,15 +1831,12 @@ impl FunctionDef {
             options.str_literal_locals = std::rc::Rc::new(
                 locals
                     .into_iter()
-                    .filter(|(_, ty)| {
-                        ty.to_string() == quote!(&'static str).to_string()
-                    })
+                    .filter(|(_, ty)| ty.to_string() == quote!(&'static str).to_string())
                     .map(|(name, _)| name)
                     .collect(),
             );
         }
-        options.param_method_params =
-            std::rc::Rc::new(inferred_signature.method_params.clone());
+        options.param_method_params = std::rc::Rc::new(inferred_signature.method_params.clone());
         options.duck_methods_on_params =
             std::rc::Rc::new(inferred_signature.duck_methods_on_params.clone());
         // A nested function name (`def KD(s, d)` inside __init__ —
@@ -1895,8 +1868,7 @@ impl FunctionDef {
             }
         }
         options.value_callables = std::rc::Rc::new(value_callables);
-        options.called_params =
-            std::rc::Rc::new(inferred_signature.called_params.clone());
+        options.called_params = std::rc::Rc::new(inferred_signature.called_params.clone());
         // str parameters arrive as impl Into<String>; convert them to owned
         // Strings up front so the body works with a concrete type.
         let str_params: std::collections::HashSet<&str> = self
@@ -1926,13 +1898,11 @@ impl FunctionDef {
                 // Value-pinned parameters arrive as impl
                 // Into<stdpython::PyValue>; box them up front (issue #161).
                 if scope.needs_mut.contains(name) {
-                    streams_prologue.extend(
-                        quote!(let mut #ident: stdpython::PyValue = #ident.into();),
-                    );
+                    streams_prologue
+                        .extend(quote!(let mut #ident: stdpython::PyValue = #ident.into();));
                 } else {
-                    streams_prologue.extend(
-                        quote!(let #ident: stdpython::PyValue = #ident.into();),
-                    );
+                    streams_prologue
+                        .extend(quote!(let #ident: stdpython::PyValue = #ident.into();));
                 }
             } else if scope.needs_mut.contains(name) {
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
@@ -2089,12 +2059,7 @@ impl FunctionDef {
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
-                streams.extend(lower_parse_args(
-                    rw,
-                    &ctx,
-                    &options,
-                    &symbols,
-                )?);
+                streams.extend(lower_parse_args(rw, &ctx, &options, &symbols)?);
                 streams.extend(quote!(;));
                 continue;
             }
@@ -2139,8 +2104,7 @@ impl FunctionDef {
         // → Vec<String>), overriding any other inference.
         let return_type = if let Some(t) = &gen_elt_tokens {
             quote!(-> Result<Vec<#t>, PyException>)
-        } else if (inferred_signature.is_generic()
-            || inferred_signature.return_type.is_some())
+        } else if (inferred_signature.is_generic() || inferred_signature.return_type.is_some())
             && self.returns.is_none()
         {
             // Inference ran and owns the unannotated return type: a
@@ -2162,18 +2126,18 @@ impl FunctionDef {
                         // s3transfer's DownloadOutputManager): the return
                         // is a boxed PyValue (the override's type is
                         // unknown).
-                        if self.body.iter().any(|s| {
-                            matches!(&s.statement, crate::StatementType::Raise(_))
-                        }) {
+                        if self
+                            .body
+                            .iter()
+                            .any(|s| matches!(&s.statement, crate::StatementType::Raise(_)))
+                        {
                             quote!(-> Result<stdpython::PyValue, PyException>)
                         } else {
-                            return Err(
-                                "could not infer this function's return type from its \
+                            return Err("could not infer this function's return type from its \
                                  unannotated parameters; add a return annotation \
                                  (issue #109, M1)"
-                                    .to_string()
-                                    .into(),
-                            )
+                                .to_string()
+                                .into());
                         }
                     }
                 }
@@ -2215,9 +2179,7 @@ impl FunctionDef {
                 // annotated params) box to PyValue; the body statements
                 // were rendered with fn_return_is_pyvalue set above, so
                 // the signature must agree (issue #133).
-                None if self.returns.is_none()
-                    && literal_returns_need_boxing(&self.body) =>
-                {
+                None if self.returns.is_none() && literal_returns_need_boxing(&self.body) => {
                     quote!(-> Result<stdpython::PyValue, PyException>)
                 }
                 None => quote!(-> Result<(), PyException>),
@@ -2313,8 +2275,7 @@ impl FunctionDef {
             // before building the key (the inner fn takes concrete String).
             let mut outer_rebinds = TokenStream::new();
             for (p, (name, _)) in self.args.args.iter().zip(key.iter()) {
-                if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "str")
-                {
+                if matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if n.id == "str") {
                     outer_rebinds.extend(quote!(let #name: String = #name.into();));
                 }
             }
@@ -2364,22 +2325,21 @@ impl FunctionDef {
         // NOT in a Trait context: `#[deprecated]` is not legal on trait
         // methods in impl blocks (issue #137: urllib3's inherited-method
         // bodies) — the -W channel still reports those notes.
-        let lossy_warning = if options.lossy_warnings
-            && !matches!(&ctx, CodeGenContext::Trait { .. })
-        {
-            let mut notes = self.lossy_conversion_notes();
-            if let Some(dw) = &inferred_signature.definition_warning {
-                notes.push(dw.clone());
-            }
-            if notes.is_empty() {
-                quote!()
+        let lossy_warning =
+            if options.lossy_warnings && !matches!(&ctx, CodeGenContext::Trait { .. }) {
+                let mut notes = self.lossy_conversion_notes();
+                if let Some(dw) = &inferred_signature.definition_warning {
+                    notes.push(dw.clone());
+                }
+                if notes.is_empty() {
+                    quote!()
+                } else {
+                    let note = notes.join("; ");
+                    quote!(#[deprecated(note = #note)])
+                }
             } else {
-                let note = notes.join("; ");
-                quote!(#[deprecated(note = #note)])
-            }
-        } else {
-            quote!()
-        };
+                quote!()
+            };
 
         let generic_header = inferred_signature.generic_header();
         let where_clause = inferred_signature.where_clause();
@@ -2387,9 +2347,10 @@ impl FunctionDef {
         // Render the parameter list now: the inference pass has populated
         // options.param_type_vars, so unannotated parameters render as
         // their inferred type variables (`a: A`).
-        let parameters = render_args
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let parameters =
+            render_args
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
@@ -2546,7 +2507,8 @@ pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
 }
 
 /// Map an expression to an obviously-inferable Rust type, if any.
-pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
+pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {
+    match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
@@ -2649,20 +2611,23 @@ pub(crate) fn scan_str_rebindings(
 /// reassignment or import clears the deletion (Python rebinds).
 pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
     let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let check = |stmt: &Statement, deleted: &mut std::collections::HashSet<String>| -> Result<(), String> {
-        let walk_expr = |expr: &ExprType, deleted: &std::collections::HashSet<String>| -> Result<(), String> {
-            for name in deleted {
-                if crate::expr_references(expr, name) {
-                    return Err(format!(
-                        "`del {name}` then a use of `{name}`: rython cannot unbind a \
+    let check = |stmt: &Statement,
+                 deleted: &mut std::collections::HashSet<String>|
+     -> Result<(), String> {
+        let walk_expr =
+            |expr: &ExprType, deleted: &std::collections::HashSet<String>| -> Result<(), String> {
+                for name in deleted {
+                    if crate::expr_references(expr, name) {
+                        return Err(format!(
+                            "`del {name}` then a use of `{name}`: rython cannot unbind a \
                          binding (the value would still be readable where Python raises \
                          NameError). Remove the del, or reassign `{name}` first (issue \
                          #112)"
-                    ));
+                        ));
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         match &stmt.statement {
             StatementType::Delete(targets) => {
                 for target in targets {
@@ -2969,10 +2934,7 @@ pub(crate) fn collect_local_types(
                                 );
                             }
                             ExprType::List(l) if l.is_empty() => {
-                                out.insert(
-                                    name.id.clone(),
-                                    quote!(Vec<stdpython::PyValue>),
-                                );
+                                out.insert(name.id.clone(), quote!(Vec<stdpython::PyValue>));
                             }
                             _ => {}
                         }
@@ -3066,9 +3028,8 @@ pub(crate) fn expr_yields_option(
         // expression an Option. A plain-vs-Option mix fails to compile —
         // loud, never silent.
         ExprType::IfExp(e) => {
-            let arm = |x: &ExprType| {
-                crate::is_none_expr(x) || expr_yields_option(x, options, symbols)
-            };
+            let arm =
+                |x: &ExprType| crate::is_none_expr(x) || expr_yields_option(x, options, symbols);
             arm(&e.body) || arm(&e.orelse)
         }
         _ => false,
@@ -3116,10 +3077,7 @@ pub(crate) fn expr_yields_pyvalue(
 /// build-and-return-a-list (issue #122-family).
 pub(crate) fn body_has_yields(body: &[Statement]) -> bool {
     body.iter().any(|s| match &s.statement {
-        StatementType::Expr(e) => matches!(
-            e.value,
-            ExprType::Yield(_) | ExprType::YieldFrom(_)
-        ),
+        StatementType::Expr(e) => matches!(e.value, ExprType::Yield(_) | ExprType::YieldFrom(_)),
         StatementType::If(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
         StatementType::While(s) => body_has_yields(&s.body),
         StatementType::For(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
@@ -3409,9 +3367,10 @@ impl FunctionDef {
         // below cannot type a cls-call, and without this rule the signature
         // collapses to unit and every use of the constructed value breaks.
         if guarantees_return(&self.body)
-            && self.decorator_list.iter().any(|d| {
-                matches!(d, ExprType::Name(n) if n.id == "classmethod")
-            })
+            && self
+                .decorator_list
+                .iter()
+                .any(|d| matches!(d, ExprType::Name(n) if n.id == "classmethod"))
             && self.returns_cls_construction()
         {
             return Some(quote!(Self));
@@ -3605,7 +3564,7 @@ impl FunctionDef {
         if self.body.is_empty() {
             return None;
         }
-        
+
         let expr = self.body[0].clone();
         match expr.statement {
             StatementType::Expr(e) => match e.value {
@@ -3622,32 +3581,32 @@ impl FunctionDef {
                     let raw_string = c.to_string();
                     // Clean up the docstring for Rust documentation
                     Some(self.format_docstring(&raw_string))
-                },
+                }
                 _ => None,
             },
             _ => None,
         }
     }
-    
+
     fn format_docstring(&self, raw: &str) -> String {
         // Remove surrounding quotes
         let content = raw.trim_matches('"');
-        
+
         // Split into lines and clean up Python-style indentation
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             return String::new();
         }
-        
+
         // First line is usually the summary
         let mut formatted = vec![lines[0].trim().to_string()];
-        
+
         if lines.len() > 1 {
             // Add empty line after summary if there are more lines
             if !lines[0].trim().is_empty() && !lines[1].trim().is_empty() {
                 formatted.push(String::new());
             }
-            
+
             // Process remaining lines, cleaning up indentation
             for line in lines.iter().skip(1) {
                 let cleaned = line.trim();
@@ -3668,13 +3627,13 @@ impl FunctionDef {
                     formatted.push(cleaned.to_string());
                 }
             }
-            
+
             // Close any open code blocks
             if content.contains(">>>") {
                 formatted.push("```".to_string());
             }
         }
-        
+
         formatted.join("\n")
     }
 }

@@ -22,8 +22,16 @@ pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>, P
     let rank = a.len().max(b.len());
     let mut out = vec![0usize; rank];
     for i in 0..rank {
-        let da = if i < rank - a.len() { 1 } else { a[i - (rank - a.len())] };
-        let db = if i < rank - b.len() { 1 } else { b[i - (rank - b.len())] };
+        let da = if i < rank - a.len() {
+            1
+        } else {
+            a[i - (rank - a.len())]
+        };
+        let db = if i < rank - b.len() {
+            1
+        } else {
+            b[i - (rank - b.len())]
+        };
         out[i] = match (da, db) {
             (0, 0) => 0,
             (0, _) | (_, 0) => 0,
@@ -37,7 +45,7 @@ pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>, P
                         "operands could not be broadcast together with shapes {:?} {:?}",
                         a, b
                     ),
-                ))
+                ));
             }
         };
     }
@@ -230,8 +238,7 @@ pub(crate) fn binary<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
     let (a, b) = (l.into(), r.into());
     let (a, b, shape) = match (a, b) {
         (BinaryOperand::Array(a), BinaryOperand::Array(b)) => {
-            let shape = broadcast_shapes(&a.shape, &b.shape)
-                .unwrap_or_else(|e| panic!("{}", e));
+            let shape = broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|e| panic!("{}", e));
             (a, b, shape)
         }
         (BinaryOperand::Array(a), BinaryOperand::I64(v)) => {
@@ -340,24 +347,42 @@ macro_rules! binary_ufunc {
 }
 
 binary_ufunc!(
-    add, BinOp::Add,
-    subtract, BinOp::Sub,
-    multiply, BinOp::Mul,
-    divide, BinOp::Div,
-    floor_divide, BinOp::FloorDiv,
-    mod_, BinOp::Mod,
-    power, BinOp::Pow,
-    maximum, BinOp::Max,
-    minimum, BinOp::Min,
-    equal, BinOp::Eq,
-    not_equal, BinOp::Ne,
-    less, BinOp::Lt,
-    less_equal, BinOp::Le,
-    greater, BinOp::Gt,
-    greater_equal, BinOp::Ge,
-    bitwise_and, BinOp::BitAnd,
-    bitwise_or, BinOp::BitOr,
-    bitwise_xor, BinOp::BitXor,
+    add,
+    BinOp::Add,
+    subtract,
+    BinOp::Sub,
+    multiply,
+    BinOp::Mul,
+    divide,
+    BinOp::Div,
+    floor_divide,
+    BinOp::FloorDiv,
+    mod_,
+    BinOp::Mod,
+    power,
+    BinOp::Pow,
+    maximum,
+    BinOp::Max,
+    minimum,
+    BinOp::Min,
+    equal,
+    BinOp::Eq,
+    not_equal,
+    BinOp::Ne,
+    less,
+    BinOp::Lt,
+    less_equal,
+    BinOp::Le,
+    greater,
+    BinOp::Gt,
+    greater_equal,
+    BinOp::Ge,
+    bitwise_and,
+    BinOp::BitAnd,
+    bitwise_or,
+    BinOp::BitOr,
+    bitwise_xor,
+    BinOp::BitXor,
 );
 
 /// `np.remainder(a, b)` — alias of np.mod.
@@ -429,14 +454,22 @@ macro_rules! unary_ufunc {
 }
 
 unary_ufunc!(
-    negative, UnOp::Neg,
-    abs, UnOp::Abs,
-    square, UnOp::Square,
-    sign, UnOp::Sign,
-    isfinite, UnOp::IsFinite,
-    isinf, UnOp::IsInf,
-    isnan, UnOp::IsNan,
-    logical_not, UnOp::LogicalNot,
+    negative,
+    UnOp::Neg,
+    abs,
+    UnOp::Abs,
+    square,
+    UnOp::Square,
+    sign,
+    UnOp::Sign,
+    isfinite,
+    UnOp::IsFinite,
+    isinf,
+    UnOp::IsInf,
+    isnan,
+    UnOp::IsNan,
+    logical_not,
+    UnOp::LogicalNot,
 );
 
 /// Float-only unary ufuncs: int/bool arrays are promoted to float64 first,
@@ -453,25 +486,44 @@ macro_rules! unary_float_ufunc {
 }
 
 unary_float_ufunc!(
-    sqrt, UnOp::Sqrt,
-    exp, UnOp::Exp,
-    log, UnOp::Log,
-    log2, UnOp::Log2,
-    log10, UnOp::Log10,
-    sin, UnOp::Sin,
-    cos, UnOp::Cos,
-    tan, UnOp::Tan,
-    arcsin, UnOp::Asin,
-    arccos, UnOp::Acos,
-    arctan, UnOp::Atan,
-    sinh, UnOp::Sinh,
-    cosh, UnOp::Cosh,
-    tanh, UnOp::Tanh,
-    floor, UnOp::Floor,
-    ceil, UnOp::Ceil,
-    reciprocal, UnOp::Reciprocal,
-    expm1, UnOp::ExpM1,
-    log1p, UnOp::Log1P,
+    sqrt,
+    UnOp::Sqrt,
+    exp,
+    UnOp::Exp,
+    log,
+    UnOp::Log,
+    log2,
+    UnOp::Log2,
+    log10,
+    UnOp::Log10,
+    sin,
+    UnOp::Sin,
+    cos,
+    UnOp::Cos,
+    tan,
+    UnOp::Tan,
+    arcsin,
+    UnOp::Asin,
+    arccos,
+    UnOp::Acos,
+    arctan,
+    UnOp::Atan,
+    sinh,
+    UnOp::Sinh,
+    cosh,
+    UnOp::Cosh,
+    tanh,
+    UnOp::Tanh,
+    floor,
+    UnOp::Floor,
+    ceil,
+    UnOp::Ceil,
+    reciprocal,
+    UnOp::Reciprocal,
+    expm1,
+    UnOp::ExpM1,
+    log1p,
+    UnOp::Log1P,
 );
 
 /// `np.clip(a, min, max)` — elementwise clamp. numpy semantics: values
@@ -500,13 +552,7 @@ pub fn clip<T: Into<f64>>(a: NdArray, min: Option<T>, max: Option<T>) -> NdArray
             let hi = maxv.unwrap_or(f64::INFINITY);
             let out: Vec<f64> = vals
                 .iter()
-                .map(|&x| {
-                    if x.is_nan() {
-                        x
-                    } else {
-                        x.clamp(lo, hi)
-                    }
-                })
+                .map(|&x| if x.is_nan() { x } else { x.clamp(lo, hi) })
                 .collect();
             let data = if a.dtype == Dtype::Float64 {
                 Data::F64(out)
@@ -539,27 +585,45 @@ pub fn where_<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
         }
         (BinaryOperand::Array(a), BinaryOperand::I64(v)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (broadcast_to(&a, &shape), broadcast_to(&scalar_arr_i64(v), &shape))
+            (
+                broadcast_to(&a, &shape),
+                broadcast_to(&scalar_arr_i64(v), &shape),
+            )
         }
         (BinaryOperand::I64(v), BinaryOperand::Array(b)) => {
             let shape = broadcast_shapes(&b.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (broadcast_to(&scalar_arr_i64(v), &shape), broadcast_to(&b, &shape))
+            (
+                broadcast_to(&scalar_arr_i64(v), &shape),
+                broadcast_to(&b, &shape),
+            )
         }
         (BinaryOperand::Array(a), BinaryOperand::F64(v)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (broadcast_to(&a, &shape), broadcast_to(&scalar_arr_f64(v), &shape))
+            (
+                broadcast_to(&a, &shape),
+                broadcast_to(&scalar_arr_f64(v), &shape),
+            )
         }
         (BinaryOperand::F64(v), BinaryOperand::Array(b)) => {
             let shape = broadcast_shapes(&b.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (broadcast_to(&scalar_arr_f64(v), &shape), broadcast_to(&b, &shape))
+            (
+                broadcast_to(&scalar_arr_f64(v), &shape),
+                broadcast_to(&b, &shape),
+            )
         }
         (BinaryOperand::Array(a), BinaryOperand::Bool(v)) => {
             let shape = broadcast_shapes(&a.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (broadcast_to(&a, &shape), broadcast_to(&scalar_arr_bool(v), &shape))
+            (
+                broadcast_to(&a, &shape),
+                broadcast_to(&scalar_arr_bool(v), &shape),
+            )
         }
         (BinaryOperand::Bool(v), BinaryOperand::Array(b)) => {
             let shape = broadcast_shapes(&b.shape, &[]).unwrap_or_else(|e| panic!("{}", e));
-            (broadcast_to(&scalar_arr_bool(v), &shape), broadcast_to(&b, &shape))
+            (
+                broadcast_to(&scalar_arr_bool(v), &shape),
+                broadcast_to(&b, &shape),
+            )
         }
         _ => panic!(
             "{}",

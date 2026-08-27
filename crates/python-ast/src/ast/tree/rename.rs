@@ -218,7 +218,7 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 f.orelse = rename_receiver_in_body(&f.orelse, from, to)?;
             }
             StatementType::AsyncFor(f)
-        },
+        }
         StatementType::AsyncWith(w) => {
             let binds = w.items.iter().any(|item| {
                 item.optional_vars
@@ -243,7 +243,7 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 w.body = rename_receiver_in_body(&w.body, from, to)?;
             }
             StatementType::AsyncWith(w)
-        },
+        }
         // Nested scopes: a def/lambda/class that BINDS the target keeps
         // its scope; a nested def WITHOUT such a binding captures the
         // enclosing receiver and must be renamed through. Class bodies are
@@ -330,7 +330,11 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
         ExprType::Compare(c) => ExprType::Compare(Compare {
             ops: c.ops.clone(),
             left: Box::new(rename_expr(c.left.as_ref(), from, to)),
-            comparators: c.comparators.iter().map(|v| rename_expr(v, from, to)).collect(),
+            comparators: c
+                .comparators
+                .iter()
+                .map(|v| rename_expr(v, from, to))
+                .collect(),
         }),
         ExprType::IfExp(i) => ExprType::IfExp(IfExp {
             test: Box::new(rename_expr(i.test.as_ref(), from, to)),
@@ -381,7 +385,11 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
             end_col_offset: s.end_col_offset,
         }),
         ExprType::Dict(d) => ExprType::Dict(super::dict::Dict {
-            keys: d.keys.iter().map(|k| k.as_ref().map(|kk| rename_expr(kk, from, to))).collect(),
+            keys: d
+                .keys
+                .iter()
+                .map(|k| k.as_ref().map(|kk| rename_expr(kk, from, to)))
+                .collect(),
             values: d.values.iter().map(|v| rename_expr(v, from, to)).collect(),
             lineno: d.lineno,
             col_offset: d.col_offset,
@@ -395,20 +403,18 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
             end_lineno: j.end_lineno,
             end_col_offset: j.end_col_offset,
         }),
-        ExprType::FormattedValue(fv) => {
-            ExprType::FormattedValue(FormattedValue {
-                value: Box::new(rename_expr(fv.value.as_ref(), from, to)),
-                conversion: fv.conversion,
-                format_spec: fv
-                    .format_spec
-                    .as_ref()
-                    .map(|s| Box::new(rename_expr(s.as_ref(), from, to))),
-                lineno: fv.lineno,
-                col_offset: fv.col_offset,
-                end_lineno: fv.end_lineno,
-                end_col_offset: fv.end_col_offset,
-            })
-        }
+        ExprType::FormattedValue(fv) => ExprType::FormattedValue(FormattedValue {
+            value: Box::new(rename_expr(fv.value.as_ref(), from, to)),
+            conversion: fv.conversion,
+            format_spec: fv
+                .format_spec
+                .as_ref()
+                .map(|s| Box::new(rename_expr(s.as_ref(), from, to))),
+            lineno: fv.lineno,
+            col_offset: fv.col_offset,
+            end_lineno: fv.end_lineno,
+            end_col_offset: fv.end_col_offset,
+        }),
         ExprType::Lambda(l) => {
             // A lambda binding the target name shadows it for its body.
             if parameter_list_binds(&l.args, from) {
@@ -442,7 +448,12 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
         }),
         ExprType::DictComp(dc) => ExprType::DictComp(DictComp {
             key: Box::new(rename_comprehension_elt(&dc.key, &dc.generators, from, to)),
-            value: Box::new(rename_comprehension_elt(&dc.value, &dc.generators, from, to)),
+            value: Box::new(rename_comprehension_elt(
+                &dc.value,
+                &dc.generators,
+                from,
+                to,
+            )),
             generators: renamed_generators(&dc.generators, from, to),
             lineno: dc.lineno,
             col_offset: dc.col_offset,
@@ -461,7 +472,10 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
             value: Box::new(rename_expr(a.value.as_ref(), from, to)),
         }),
         ExprType::Yield(y) => ExprType::Yield(super::yield_expr::Yield {
-            value: y.value.as_ref().map(|v| Box::new(rename_expr(v.as_ref(), from, to))),
+            value: y
+                .value
+                .as_ref()
+                .map(|v| Box::new(rename_expr(v.as_ref(), from, to))),
             lineno: y.lineno,
             col_offset: y.col_offset,
             end_lineno: y.end_lineno,
@@ -487,9 +501,7 @@ fn rename_comprehension_elt(
     from: &str,
     to: &str,
 ) -> ExprType {
-    let shadowed = generators
-        .iter()
-        .any(|g| expr_binds_name(&g.target, from));
+    let shadowed = generators.iter().any(|g| expr_binds_name(&g.target, from));
     if shadowed {
         elt.clone()
     } else {
@@ -606,8 +618,14 @@ mod tests {
         );
         let renamed = rename_receiver_in_body(&fn_body(src), "factory_self", "self").unwrap();
         let r = rendered(&renamed);
-        assert!(r.contains("self . items") || r.contains("self.items") || r.contains("\"self\""), "iterable must rename: {r}");
-        assert!(r.contains("factory_self"), "shadowed body keeps the binding name: {r}");
+        assert!(
+            r.contains("self . items") || r.contains("self.items") || r.contains("\"self\""),
+            "iterable must rename: {r}"
+        );
+        assert!(
+            r.contains("factory_self"),
+            "shadowed body keeps the binding name: {r}"
+        );
     }
 
     #[test]
@@ -625,9 +643,8 @@ mod tests {
 
     #[test]
     fn await_renames_its_inner_expression() {
-        let body = fn_body(
-            "async def m(factory_self):\n    v = await factory_self.get()\n    return v\n",
-        );
+        let body =
+            fn_body("async def m(factory_self):\n    v = await factory_self.get()\n    return v\n");
         let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
         let r = rendered(&renamed);
         assert!(!r.contains("factory_self"), "renamed: {r}");
@@ -635,9 +652,7 @@ mod tests {
 
     #[test]
     fn tuple_unpack_rebinding_the_receiver_is_a_loud_error() {
-        let body = fn_body(
-            "def m(factory_self):\n    factory_self, x = f()\n    return x\n",
-        );
+        let body = fn_body("def m(factory_self):\n    factory_self, x = f()\n    return x\n");
         let err = rename_receiver_in_body(&body, "factory_self", "self")
             .expect_err("unpacking rebind must be loud");
         assert!(err.contains("rebinds its receiver"), "err: {err}");
@@ -657,9 +672,8 @@ mod tests {
             "shadowed if keeps the binding name: {}",
             rendered(&renamed)
         );
-        let body = fn_body(
-            "def m(factory_self):\n    return [y for q in [1] if factory_self == 2]\n",
-        );
+        let body =
+            fn_body("def m(factory_self):\n    return [y for q in [1] if factory_self == 2]\n");
         let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
         let r = rendered(&renamed);
         assert!(r.contains("\"self\""), "filter renames: {r}");
@@ -671,9 +685,7 @@ mod tests {
         // (factory_self := x) REBINDS the receiver; rewriting would emit an
         // assignment to &self, so it stays verbatim and the generated
         // crate fails loudly on the unknown name instead.
-        let body = fn_body(
-            "def m(factory_self):\n    y = (factory_self := 3)\n    return y\n",
-        );
+        let body = fn_body("def m(factory_self):\n    y = (factory_self := 3)\n    return y\n");
         let renamed = rename_receiver_in_body(&body, "factory_self", "self").unwrap();
         assert!(rendered(&renamed).contains("factory_self"));
     }

@@ -151,7 +151,10 @@ impl Writer<'_> {
                 out.push(',');
             }
             let text = field.py_display();
-            if text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r')
+            if text.contains(',')
+                || text.contains('"')
+                || text.contains('\n')
+                || text.contains('\r')
             {
                 out.push('"');
                 out.push_str(&text.replace('"', "\"\""));

@@ -4,8 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
-    Node, impl_node_with_positions, extract_list
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes, extract_list,
+    impl_node_with_positions,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -21,7 +21,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Set {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let elts: Vec<ExprType> = extract_list(&ob, "elts", "set elements")?;
-        
+
         Ok(Set {
             elts,
             lineno: ob.lineno(),
@@ -32,7 +32,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Set {
     }
 }
 
-impl_node_with_positions!(Set { lineno, col_offset, end_lineno, end_col_offset });
+impl_node_with_positions!(Set {
+    lineno,
+    col_offset,
+    end_lineno,
+    end_col_offset
+});
 
 impl CodeGen for Set {
     type Context = CodeGenContext;
@@ -45,13 +50,14 @@ impl CodeGen for Set {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let elements: Result<Vec<_>, _> = self.elts
+        let elements: Result<Vec<_>, _> = self
+            .elts
             .into_iter()
             .map(|elt| elt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
-        
+
         let elements = elements?;
-        
+
         Ok(quote! {
             std::collections::HashSet::from([#(#elements),*])
         })

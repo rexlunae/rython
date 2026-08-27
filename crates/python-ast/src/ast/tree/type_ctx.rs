@@ -26,8 +26,8 @@ use quote::quote;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, Statement, StatementType,
-    SymbolTableNode, SymbolTableScopes,
+    CodeGen, CodeGenContext, ExprType, PythonOptions, Statement, StatementType, SymbolTableNode,
+    SymbolTableScopes,
 };
 
 /// The Rust types codegen produces for Python expressions, at the
@@ -164,11 +164,7 @@ impl TypeInfo {
 /// Wrap already-rendered tokens in the conversion that takes a value of
 /// `from` to a value of `to`. Returns `None` when no conversion is needed
 /// or possible.
-pub fn coerce_tokens(
-    tokens: TokenStream,
-    from: &TypeInfo,
-    to: &TypeInfo,
-) -> Option<TokenStream> {
+pub fn coerce_tokens(tokens: TokenStream, from: &TypeInfo, to: &TypeInfo) -> Option<TokenStream> {
     if from == to {
         return Some(tokens);
     }
@@ -191,9 +187,7 @@ pub fn coerce_tokens(
         // Anything → StrOrBytes (issue #121): the str | bytes union's
         // heterogeneous slot converts via its From impls (&str, String,
         // &[u8], Vec<u8>).
-        (_, TypeInfo::StrOrBytes) => {
-            Some(quote!(stdpython::StrOrBytes::from((#tokens))))
-        }
+        (_, TypeInfo::StrOrBytes) => Some(quote!(stdpython::StrOrBytes::from((#tokens)))),
         _ => None,
     }
 }
@@ -232,9 +226,7 @@ fn infer_type_inner(
             Some(litrs::Literal::Float(_)) => TypeInfo::Float,
             Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
             Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
-            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
-                TypeInfo::Bytes
-            }
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => TypeInfo::Bytes,
             None => TypeInfo::PyObject, // None literal
             _ => TypeInfo::PyObject,
         },
@@ -322,9 +314,7 @@ fn infer_type_inner(
         }
         ExprType::UnaryOp(u) => match u.op {
             crate::Ops::Not => TypeInfo::Bool,
-            crate::Ops::USub | crate::Ops::UAdd => {
-                infer_type(&u.operand, options, symbols)
-            }
+            crate::Ops::USub | crate::Ops::UAdd => infer_type(&u.operand, options, symbols),
             _ => TypeInfo::PyObject,
         },
         ExprType::BoolOp(_) => TypeInfo::Bool,
@@ -350,9 +340,7 @@ fn infer_type_inner(
                     // A class-construction call produces an instance of the
                     // class (not Copy: reused instances must be cloned at
                     // each move-prone use, matching Python's aliasing).
-                    Some(crate::SymbolTableNode::ClassDef(_)) => {
-                        TypeInfo::Class(n.id.clone())
-                    }
+                    Some(crate::SymbolTableNode::ClassDef(_)) => TypeInfo::Class(n.id.clone()),
                     _ => TypeInfo::PyObject,
                 },
             },
@@ -381,10 +369,9 @@ fn infer_type_inner(
             _ => TypeInfo::PyObject,
         },
         ExprType::ListComp(_) => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
-        ExprType::DictComp(_) => TypeInfo::Dict(
-            Box::new(TypeInfo::PyObject),
-            Box::new(TypeInfo::PyObject),
-        ),
+        ExprType::DictComp(_) => {
+            TypeInfo::Dict(Box::new(TypeInfo::PyObject), Box::new(TypeInfo::PyObject))
+        }
         ExprType::Starred(s) => infer_type(&s.value, options, symbols),
         _ => TypeInfo::PyObject,
     }
@@ -453,14 +440,12 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
         (TypeInfo::Borrowed(x), TypeInfo::Borrowed(y)) => {
             TypeInfo::Borrowed(Box::new(unify((**x).clone(), (**y).clone())))
         }
-        (TypeInfo::Tuple(x), TypeInfo::Tuple(y)) if x.len() == y.len() => {
-            TypeInfo::Tuple(
-                x.iter()
-                    .zip(y.iter())
-                    .map(|(a, b)| unify(a.clone(), b.clone()))
-                    .collect(),
-            )
-        }
+        (TypeInfo::Tuple(x), TypeInfo::Tuple(y)) if x.len() == y.len() => TypeInfo::Tuple(
+            x.iter()
+                .zip(y.iter())
+                .map(|(a, b)| unify(a.clone(), b.clone()))
+                .collect(),
+        ),
         _ => {
             if is_numeric(&a) && is_numeric(&b) {
                 return TypeInfo::Float;
@@ -746,9 +731,7 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             // drifted 33-name copies). types-module classes and
             // `memoryview` (a builtin buffer class — urllib3's
             // `readinto(b: bytearray | memoryview[int])`) box too.
-            "TracebackType" | "FrameType" | "CodeType" | "memoryview" => {
-                Some(TypeInfo::PyValue)
-            }
+            "TracebackType" | "FrameType" | "CodeType" | "memoryview" => Some(TypeInfo::PyValue),
             other if crate::ast::tree::raise_stmt::is_builtin_exception_name(other) => {
                 Some(TypeInfo::PyValue)
             }
@@ -961,8 +944,7 @@ fn analyze_statement_types(
                             .annotation
                             .as_ref()
                             .and_then(|a| crate::resolve_alias_typeinfo(a, symbols?, options?))
-                    })
-                {
+                    }) {
                     // An annotation pins the type outright.
                     Some(ann) => ann,
                     // Unparseable annotation: a call to a known function
@@ -971,10 +953,8 @@ fn analyze_statement_types(
                     // Vec<(String, f64)>), else the value's syntactic type
                     // (still pinable by later use).
                     None => match &assign.value {
-                        ExprType::Call(c) => {
-                            call_return_typeinfo(c, symbols, options)
-                                .unwrap_or_else(|| syntactic_type(&assign.value))
-                        }
+                        ExprType::Call(c) => call_return_typeinfo(c, symbols, options)
+                            .unwrap_or_else(|| syntactic_type(&assign.value)),
                         _ => syntactic_type(&assign.value),
                     },
                 };
@@ -1119,9 +1099,7 @@ pub(crate) fn syntactic_type(expr: &ExprType) -> TypeInfo {
             Some(litrs::Literal::Float(_)) => TypeInfo::Float,
             Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
             Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
-            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
-                TypeInfo::Bytes
-            }
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => TypeInfo::Bytes,
             _ => TypeInfo::PyObject,
         },
         ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => TypeInfo::String,
@@ -1263,9 +1241,7 @@ fn collect_use_suggestions(
                         // lets PyValue absorb Int). Unknown components only
                         // type an as-yet-UNTYPED container (boto3's
                         // document_actions).
-                        if info.name_types.contains_key(&recv.id)
-                            && (key_unknown || val_unknown)
-                        {
+                        if info.name_types.contains_key(&recv.id) && (key_unknown || val_unknown) {
                             return;
                         }
                         let ty = TypeInfo::Dict(Box::new(k), Box::new(v));
@@ -1274,9 +1250,7 @@ fn collect_use_suggestions(
                         // value is a foreign object — boto3's
                         // document_actions): box the value.
                         let ty = match ty {
-                            TypeInfo::Dict(k, v)
-                                if matches!(*v, TypeInfo::PyObject) =>
-                            {
+                            TypeInfo::Dict(k, v) if matches!(*v, TypeInfo::PyObject) => {
                                 TypeInfo::Dict(k, Box::new(TypeInfo::PyValue))
                             }
                             other => other,
@@ -1316,10 +1290,7 @@ fn collect_use_suggestions(
                                 TypeInfo::StrRef => TypeInfo::String,
                                 other => other,
                             };
-                            let t = TypeInfo::Dict(
-                                Box::new(k),
-                                Box::new(TypeInfo::PyObject),
-                            );
+                            let t = TypeInfo::Dict(Box::new(k), Box::new(TypeInfo::PyObject));
                             out.entry(recv.id.clone())
                                 .and_modify(|e| *e = unify(e.clone(), t.clone()))
                                 .or_insert(t);
@@ -1526,9 +1497,7 @@ fn resolve_alias_typeinfo_inner(
                 // A NESTED module chain (`OpenSSL.SSL.Connection` — a
                 // pyOpenSSL class annotation, urllib3's WrappedSocket): the
                 // root is an external import — a boxed value.
-                if crate::root_name(&attr.value)
-                    .is_some_and(|r| r != "typing")
-                {
+                if crate::root_name(&attr.value).is_some_and(|r| r != "typing") {
                     return Some(TypeInfo::PyValue);
                 }
                 return annotation_type_info(ann);
@@ -1543,8 +1512,7 @@ fn resolve_alias_typeinfo_inner(
                 && !symbols.get(&attr.attr).is_some_and(|s| {
                     matches!(
                         s,
-                        crate::SymbolTableNode::ImportFrom(_)
-                            | crate::SymbolTableNode::Import(_)
+                        crate::SymbolTableNode::ImportFrom(_) | crate::SymbolTableNode::Import(_)
                     )
                 })
             {
@@ -1571,9 +1539,7 @@ fn resolve_alias_typeinfo_inner(
                     // A name shadowed by a try/except fallback
                     // (`ssl = None` after `import ssl` — urllib3): the
                     // module is external — a boxed value.
-                    Some(SymbolTableNode::Assign { value, .. })
-                        if crate::is_none_expr(value) =>
-                    {
+                    Some(SymbolTableNode::Assign { value, .. }) if crate::is_none_expr(value) => {
                         return Some(TypeInfo::PyValue);
                     }
                     Some(SymbolTableNode::Alias(canonical)) => {
@@ -1587,10 +1553,7 @@ fn resolve_alias_typeinfo_inner(
                             &i.names
                                 .first()
                                 .map(|a| {
-                                    a.name
-                                        .split('.')
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
+                                    a.name.split('.').map(|s| s.to_string()).collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default(),
                         ) =>
@@ -1639,7 +1602,11 @@ fn resolve_alias_typeinfo_inner(
         ExprType::Constant(c) => {
             if let Some(litrs::Literal::String(s)) = &c.0 {
                 let text = s.value().to_string();
-                if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+                if !text.is_empty()
+                    && text
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
                     return resolve_alias_typeinfo(
                         &ExprType::Name(crate::ast::tree::name::Name { id: text }),
                         symbols,
@@ -1697,7 +1664,9 @@ fn resolve_alias_typeinfo_inner(
             // An import from a module outside the crate (`CookieJar` from
             // http.cookiejar): an external class — a boxed value.
             Some(SymbolTableNode::ImportFrom(i))
-                if !options.module_defs.contains_key(&i.resolved_module_path(options)) =>
+                if !options
+                    .module_defs
+                    .contains_key(&i.resolved_module_path(options)) =>
             {
                 Some(TypeInfo::PyValue)
             }
@@ -1730,9 +1699,7 @@ fn resolve_alias_typeinfo_inner(
                     // that would not exist in the crate.
                     Some(SymbolTableNode::ClassDef(_)) => {
                         if crate::ast::tree::module::module_def_has_runtime_item(
-                            options,
-                            &path,
-                            &n.id,
+                            options, &path, &n.id,
                         ) {
                             Some(TypeInfo::Class(n.id.clone()))
                         } else {
@@ -1745,9 +1712,7 @@ fn resolve_alias_typeinfo_inner(
                     // the DEFINING module's scope.
                     Some(SymbolTableNode::ImportFrom(_)) | Some(SymbolTableNode::Alias(_)) => {
                         resolve_alias_typeinfo(
-                            &ExprType::Name(crate::ast::tree::name::Name {
-                                id: n.id.clone(),
-                            }),
+                            &ExprType::Name(crate::ast::tree::name::Name { id: n.id.clone() }),
                             &syms,
                             options,
                         )
@@ -1757,9 +1722,7 @@ fn resolve_alias_typeinfo_inner(
             }
             // A user-defined class name (`list[CharsetMatch]`): the struct
             // ident, the same path parameters use.
-            Some(SymbolTableNode::ClassDef(_)) => {
-                Some(TypeInfo::Class(n.id.clone()))
-            }
+            Some(SymbolTableNode::ClassDef(_)) => Some(TypeInfo::Class(n.id.clone())),
             _ => annotation_type_info(ann),
         },
         // A container generic whose ELEMENT may be an alias: rebuild with
@@ -1771,9 +1734,21 @@ fn resolve_alias_typeinfo_inner(
                 ExprType::Name(n)
                     if matches!(
                         n.id.as_str(),
-                        "Union" | "IO" | "Iterable" | "Sequence" | "Iterator" | "Generator"
-                            | "Callable" | "SupportsRead" | "SupportsItems" | "Mapping"
-                            | "MutableMapping" | "Type" | "Optional" | "Literal" | "Any"
+                        "Union"
+                            | "IO"
+                            | "Iterable"
+                            | "Sequence"
+                            | "Iterator"
+                            | "Generator"
+                            | "Callable"
+                            | "SupportsRead"
+                            | "SupportsItems"
+                            | "Mapping"
+                            | "MutableMapping"
+                            | "Type"
+                            | "Optional"
+                            | "Literal"
+                            | "Any"
                     ) =>
                 {
                     return Some(TypeInfo::PyValue);
@@ -1786,15 +1761,21 @@ fn resolve_alias_typeinfo_inner(
                     if symbols.get(&n.id).is_some()
                         && !matches!(
                             n.id.as_str(),
-                            "list" | "List" | "tuple" | "Tuple" | "dict" | "Dict" | "set"
-                                | "Set" | "Optional"
+                            "list"
+                                | "List"
+                                | "tuple"
+                                | "Tuple"
+                                | "dict"
+                                | "Dict"
+                                | "set"
+                                | "Set"
+                                | "Optional"
                         ) =>
                 {
                     return Some(TypeInfo::PyValue);
                 }
                 ExprType::Name(n) => n.id.as_str(),
-                ExprType::Attribute(a)
-                    if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+                ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
                 {
                     match a.attr.as_str() {
                         "List" => "list",
@@ -1807,8 +1788,8 @@ fn resolve_alias_typeinfo_inner(
                         // PyValue union (urllib3's `_TYPE_BODY`).
                         "Union" | "IO" | "Iterable" | "Callable" | "SupportsRead"
                         | "SupportsItems" | "Mapping" | "MutableMapping" | "Optional"
-                        | "Literal" | "Any" | "Sequence" | "Iterator" | "Generator"
-                        | "Type" | "ClassVar" | "Collection" | "Container" => {
+                        | "Literal" | "Any" | "Sequence" | "Iterator" | "Generator" | "Type"
+                        | "ClassVar" | "Collection" | "Container" => {
                             return Some(TypeInfo::PyValue);
                         }
                         _ => return annotation_type_info(ann),
@@ -1839,9 +1820,7 @@ fn resolve_alias_typeinfo_inner(
                         return Some(TypeInfo::PyValue);
                     }
                     let resolved_attr = resolve_alias_typeinfo(
-                        &ExprType::Name(crate::ast::tree::name::Name {
-                            id: a.attr.clone(),
-                        }),
+                        &ExprType::Name(crate::ast::tree::name::Name { id: a.attr.clone() }),
                         symbols,
                         options,
                     );
@@ -1885,11 +1864,9 @@ fn resolve_alias_typeinfo_inner(
                 // set[NormalizedName]` — pip's check): the set lowers as a
                 // Vec of the element type (set-ops on Vecs compile; the
                 // set semantics are the documented divergence).
-                ("set" | "Set" | "frozenset", crate::SubscriptKind::Index(elt)) => {
-                    Some(TypeInfo::Vec(Box::new(resolve_alias_typeinfo(
-                        elt, symbols, options,
-                    )?)))
-                }
+                ("set" | "Set" | "frozenset", crate::SubscriptKind::Index(elt)) => Some(
+                    TypeInfo::Vec(Box::new(resolve_alias_typeinfo(elt, symbols, options)?)),
+                ),
                 _ => annotation_type_info(ann),
             }
         }
@@ -1992,8 +1969,7 @@ fn resolve_type(
         static RT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
     let d = RT_DEPTH.with(|c| c.get());
-    if d > 200 && d % 50 == 0 {
-    }
+    if d > 200 && d % 50 == 0 {}
     RT_DEPTH.with(|c| c.set(d + 1));
     let result = resolve_type_inner(expr, info, symbols, options);
     RT_DEPTH.with(|c| c.set(d));
@@ -2198,25 +2174,34 @@ pub fn name_referenced_in(body: &[Statement], name: &str) -> bool {
 fn statement_references(stmt: &Statement, name: &str) -> bool {
     match &stmt.statement {
         StatementType::Assign(a) => {
-            expr_references(&a.value, name)
-                || a.targets.iter().any(|t| target_references(t, name))
+            expr_references(&a.value, name) || a.targets.iter().any(|t| target_references(t, name))
         }
         StatementType::AugAssign(a) => {
             expr_references(&a.target, name) || expr_references(&a.value, name)
         }
         StatementType::Expr(e) => expr_references(&e.value, name),
-        StatementType::Return(r) => {
-            r.as_ref().map(|e| expr_references(&e.value, name)).unwrap_or(false)
-        }
+        StatementType::Return(r) => r
+            .as_ref()
+            .map(|e| expr_references(&e.value, name))
+            .unwrap_or(false),
         // Assert and raise read their expressions too: a loop index used
         // only there is still a real reference (Devin review on #103).
         StatementType::Assert { test, msg } => {
             expr_references(test, name)
-                || msg.as_ref().map(|m| expr_references(m, name)).unwrap_or(false)
+                || msg
+                    .as_ref()
+                    .map(|m| expr_references(m, name))
+                    .unwrap_or(false)
         }
         StatementType::Raise(r) => {
-            r.exc.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
-                || r.cause.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
+            r.exc
+                .as_ref()
+                .map(|e| expr_references(e, name))
+                .unwrap_or(false)
+                || r.cause
+                    .as_ref()
+                    .map(|e| expr_references(e, name))
+                    .unwrap_or(false)
         }
         StatementType::If(s) => {
             expr_references(&s.test, name)
@@ -2235,7 +2220,9 @@ fn statement_references(stmt: &Statement, name: &str) -> bool {
                 || s.orelse.iter().any(|b| statement_references(b, name))
         }
         StatementType::With(s) => {
-            s.items.iter().any(|i| expr_references(&i.context_expr, name))
+            s.items
+                .iter()
+                .any(|i| expr_references(&i.context_expr, name))
                 || s.body.iter().any(|b| statement_references(b, name))
         }
         StatementType::Try(s) => {
@@ -2261,12 +2248,10 @@ fn target_references(target: &ExprType, name: &str) -> bool {
             expr_references(&s.value, name)
                 || match &s.kind {
                     crate::SubscriptKind::Index(i) => expr_references(i, name),
-                    crate::SubscriptKind::Slice { lower, upper, step } => {
-                        [lower, upper, step]
-                            .into_iter()
-                            .flatten()
-                            .any(|b| expr_references(b, name))
-                    }
+                    crate::SubscriptKind::Slice { lower, upper, step } => [lower, upper, step]
+                        .into_iter()
+                        .flatten()
+                        .any(|b| expr_references(b, name)),
                 }
         }
         ExprType::Tuple(t) => t.elts.iter().any(|e| target_references(e, name)),
@@ -2281,17 +2266,12 @@ pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {
         ExprType::Call(c) => {
             expr_references(&c.func, name)
                 || c.args.iter().any(|a| expr_references(a, name))
-                || c.keywords
-                    .iter()
-                    .any(|k| expr_references(&k.value, name))
+                || c.keywords.iter().any(|k| expr_references(&k.value, name))
         }
-        ExprType::BinOp(b) => {
-            expr_references(&b.left, name) || expr_references(&b.right, name)
-        }
+        ExprType::BinOp(b) => expr_references(&b.left, name) || expr_references(&b.right, name),
         ExprType::BoolOp(b) => b.values.iter().any(|v| expr_references(v, name)),
         ExprType::Compare(c) => {
-            expr_references(&c.left, name)
-                || c.comparators.iter().any(|r| expr_references(r, name))
+            expr_references(&c.left, name) || c.comparators.iter().any(|r| expr_references(r, name))
         }
         ExprType::UnaryOp(u) => expr_references(&u.operand, name),
         ExprType::IfExp(i) => {
@@ -2303,24 +2283,20 @@ pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {
             expr_references(&s.value, name)
                 || match &s.kind {
                     crate::SubscriptKind::Index(i) => expr_references(i, name),
-                    crate::SubscriptKind::Slice { lower, upper, step } => {
-                        [lower, upper, step]
-                            .into_iter()
-                            .flatten()
-                            .any(|b| expr_references(b, name))
-                    }
+                    crate::SubscriptKind::Slice { lower, upper, step } => [lower, upper, step]
+                        .into_iter()
+                        .flatten()
+                        .any(|b| expr_references(b, name)),
                 }
         }
         ExprType::Tuple(t) => t.elts.iter().any(|e| expr_references(e, name)),
         ExprType::List(l) => l.iter().any(|e| expr_references(e, name)),
-        ExprType::Dict(d) => d
-            .keys
-            .iter()
-            .zip(d.values.iter())
-            .any(|(k, v)| {
-                k.as_ref().map(|k| expr_references(k, name)).unwrap_or(false)
-                    || expr_references(v, name)
-            }),
+        ExprType::Dict(d) => d.keys.iter().zip(d.values.iter()).any(|(k, v)| {
+            k.as_ref()
+                .map(|k| expr_references(k, name))
+                .unwrap_or(false)
+                || expr_references(v, name)
+        }),
         ExprType::Set(s) => s.elts.iter().any(|e| expr_references(e, name)),
         ExprType::ListComp(lc) => {
             expr_references(&lc.elt, name)

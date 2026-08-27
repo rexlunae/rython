@@ -2,9 +2,7 @@ use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
-};
+use crate::{CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes};
 use quote::quote;
 
 /// Yield expression (yield value)
@@ -44,7 +42,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Yield {
         } else {
             None
         };
-        
+
         Ok(Yield {
             value,
             lineno: ob.lineno(),
@@ -60,7 +58,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for YieldFrom {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract value
         let value: ExprType = ob.getattr("value")?.extract()?;
-        
+
         Ok(YieldFrom {
             value: Box::new(value),
             lineno: ob.lineno(),
@@ -72,17 +70,33 @@ impl<'a, 'py> FromPyObject<'a, 'py> for YieldFrom {
 }
 
 impl Node for Yield {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl Node for YieldFrom {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl CodeGen for Yield {
@@ -169,9 +183,10 @@ impl CodeGen for YieldFrom {
         }
         let value = self.value.to_rust(ctx, options, symbols)?;
         Ok(proc_macro2::TokenStream::from_iter(
-            std::iter::once(proc_macro2::TokenTree::Ident(
-                proc_macro2::Ident::new("return", proc_macro2::Span::call_site()),
-            ))
+            std::iter::once(proc_macro2::TokenTree::Ident(proc_macro2::Ident::new(
+                "return",
+                proc_macro2::Span::call_site(),
+            )))
             .chain(value.into_iter()),
         ))
     }

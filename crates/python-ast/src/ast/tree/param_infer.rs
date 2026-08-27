@@ -178,7 +178,7 @@ pub const STDLIB_METHOD_TABLE: &[(&str, &str, bool, MethodReturn)] = &[
     ("rjust", "PyStrOps", false, MethodReturn::Str),
     // join is not listed: its argument needs a compound
     // IntoIterator<Item: AsRef<str>> bound, which M2 does not express. A
-    // `p.join(...)` call on an unannotated parameter is a loud error. 
+    // `p.join(...)` call on an unannotated parameter is a loud error.
 
     // list methods (PyListOps / PyPop, mutating).
     ("insert", "PyListOps", true, MethodReturn::Unit),
@@ -464,9 +464,7 @@ pub fn infer_unannotated_signature(
                     .enumerate()
                     .filter(|(i, _p)| {
                         *i >= default_offset
-                            && crate::is_none_expr(
-                                f.args.defaults[*i - default_offset].as_ref(),
-                            )
+                            && crate::is_none_expr(f.args.defaults[*i - default_offset].as_ref())
                     })
                     .map(|(_, p)| p.arg.clone())
                     .collect();
@@ -580,7 +578,9 @@ pub fn infer_unannotated_signature(
     // are checked at the call site). Conflicting identity forces are loud.
     let mut identity_types: HashMap<String, TokenStream> = HashMap::new();
     for name in &all_params {
-        let Some(reqs) = collector.reqs.get(name) else { continue };
+        let Some(reqs) = collector.reqs.get(name) else {
+            continue;
+        };
         for req in reqs {
             if let ParamReq::Identity(ty) = req {
                 match identity_types.get(name) {
@@ -662,9 +662,7 @@ pub fn infer_unannotated_signature(
         for e in candidates {
             if let ExprType::Name(n) = e {
                 let root = collector.alias_root_of(&n.id);
-                if generic_params.iter().any(|p| **p == root)
-                    && !returned.contains(&root)
-                {
+                if generic_params.iter().any(|p| **p == root) && !returned.contains(&root) {
                     returned.push(root);
                 }
             }
@@ -871,7 +869,13 @@ pub fn infer_unannotated_signature(
         let tv_set: HashSet<String> = tv_names.values().cloned().collect();
         let returns = collector.returns.clone();
         for ret in &returns {
-            collect_op_bounds(ret, &mut collector, &param_types, &tv_set, &mut where_bounds);
+            collect_op_bounds(
+                ret,
+                &mut collector,
+                &param_types,
+                &tv_set,
+                &mut where_bounds,
+            );
         }
     }
 
@@ -887,7 +891,9 @@ pub fn infer_unannotated_signature(
     let mut method_params = HashSet::new();
     let mut duck_methods_on_params: HashMap<String, HashSet<String>> = HashMap::new();
     for name in params {
-        let Some(reqs) = collector.reqs.get(name) else { continue };
+        let Some(reqs) = collector.reqs.get(name) else {
+            continue;
+        };
         if reqs.iter().any(|r| matches!(r, ParamReq::Method(..))) {
             method_params.insert(name.clone());
         }
@@ -952,7 +958,7 @@ pub fn infer_unannotated_signature(
                     if let Some(merged) = unify_tuple_returns(prev, &ty) {
                         inferred = Some(merged);
                     } else {
-                            return Err(format!(
+                        return Err(format!(
                             "return statements have different types; annotate the \
                              function's return type (issue #109, M1)"
                         ));
@@ -1037,8 +1043,7 @@ pub fn infer_unannotated_signature(
                         };
                         match &a.value {
                             ExprType::List(elts) => {
-                                let Some(TypeInfo::Vec(inner)) = info.name_types.get(&t.id)
-                                else {
+                                let Some(TypeInfo::Vec(inner)) = info.name_types.get(&t.id) else {
                                     continue;
                                 };
                                 let Some(ety) = scalar(inner) else { continue };
@@ -1050,8 +1055,7 @@ pub fn infer_unannotated_signature(
                             }
                             other => {
                                 if let Some(p) = sum_on_param(other, &collector)
-                                    && let Some(ety) =
-                                        info.name_types.get(&t.id).and_then(&scalar)
+                                    && let Some(ety) = info.name_types.get(&t.id).and_then(&scalar)
                                 {
                                     pins.push((p, ety));
                                 }
@@ -1156,16 +1160,14 @@ fn render_rhs(
                 return Err(format!(
                     "internal: parameter `{name}` used as an operand but has no \
                      type"
-                ))
+                ));
             }
         },
         RhsType::Same => same.clone(),
         RhsType::Unknown => {
-            return Err(
-                "the other operand's type cannot be inferred; annotate the \
+            return Err("the other operand's type cannot be inferred; annotate the \
                  parameter or the other operand"
-                    .to_string(),
-            )
+                .to_string());
         }
     })
 }
@@ -1232,20 +1234,17 @@ fn collect_op_bounds(
             // Bitwise/shift ops are integer-only (i64) — no bound needed.
             if matches!(
                 b.op,
-                BinOps::LShift
-                    | BinOps::RShift
-                    | BinOps::BitOr
-                    | BinOps::BitXor
-                    | BinOps::BitAnd
+                BinOps::LShift | BinOps::RShift | BinOps::BitOr | BinOps::BitXor | BinOps::BitAnd
             ) {
                 return;
             }
-            let Some(trait_name) = bin_op_trait(&b.op) else { return };
+            let Some(trait_name) = bin_op_trait(&b.op) else {
+                return;
+            };
             let Ok(mut left) = return_type_of(&b.left, collector, param_types) else {
                 return;
             };
-            let Ok(mut right) = return_type_of(&b.right, collector, param_types)
-            else {
+            let Ok(mut right) = return_type_of(&b.right, collector, param_types) else {
                 return;
             };
             if left.to_string() == "& str" {
@@ -1257,9 +1256,7 @@ fn collect_op_bounds(
             if !involves_tv(&left) && !involves_tv(&right) {
                 return;
             }
-            if left.to_string().contains("PyValue")
-                || right.to_string().contains("PyValue")
-            {
+            if left.to_string().contains("PyValue") || right.to_string().contains("PyValue") {
                 return;
             }
             let t = quote::format_ident!("{}", trait_name);
@@ -1337,9 +1334,7 @@ fn return_type_of(
                 // A local assigned a STRING literal (`first = '/'` —
                 // botocore's remove_dot_segments): an owned String.
                 match value {
-                    ExprType::Constant(c)
-                        if matches!(&c.0, Some(litrs::Literal::String(_))) =>
-                    {
+                    ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
                         Ok(quote!(String))
                     }
                     _ => Ok(quote!(stdpython::PyValue)),
@@ -1558,16 +1553,15 @@ fn return_type_of(
             // get_rel_path, where the receiver is a SUBSCRIPT of the
             // parameter): the table's return type.
             if let ExprType::Attribute(a) = c.func.as_ref()
-                && let Some(root) = crate::root_name(&a.value)
-                    .or_else(|| {
-                        // A Subscript receiver (`path[len(root):]`) roots
-                        // at the subscripted name.
-                        if let ExprType::Subscript(s) = a.value.as_ref() {
-                            crate::root_name(&s.value)
-                        } else {
-                            None
-                        }
-                    })
+                && let Some(root) = crate::root_name(&a.value).or_else(|| {
+                    // A Subscript receiver (`path[len(root):]`) roots
+                    // at the subscripted name.
+                    if let ExprType::Subscript(s) = a.value.as_ref() {
+                        crate::root_name(&s.value)
+                    } else {
+                        None
+                    }
+                })
                 && (param_types.contains_key(root) || collector.alias.contains_key(root))
             {
                 // M3: a duck-typed user method's return comes from the
@@ -1766,10 +1760,7 @@ fn return_type_of(
                 };
                 if matches!(
                     sym,
-                    Some(
-                        crate::SymbolTableNode::Import(_)
-                            | crate::SymbolTableNode::ImportFrom(_)
-                    )
+                    Some(crate::SymbolTableNode::Import(_) | crate::SymbolTableNode::ImportFrom(_))
                 ) {
                     // `from re import escape` (pygments' regexopt): the
                     // known re-function returns an owned String.
@@ -1786,8 +1777,7 @@ fn return_type_of(
             // **kwargs)` — botocore's exceptions): the callable-as-value
             // divergence (#122) — a boxed PyValue.
             if let ExprType::Name(f) = c.func.as_ref()
-                && (param_types.contains_key(&f.id)
-                    || collector.unannotated.contains(&f.id))
+                && (param_types.contains_key(&f.id) || collector.unannotated.contains(&f.id))
             {
                 return Ok(quote!(stdpython::PyValue));
             }
@@ -1905,10 +1895,7 @@ fn return_type_of(
             // cannot see through (`first + '/'.join(...) + last` —
             // botocore's remove_dot_segments).
             if left.to_string() == right.to_string()
-                && matches!(
-                    left.to_string().as_str(),
-                    "String" | "i64" | "f64" | "bool"
-                )
+                && matches!(left.to_string().as_str(), "String" | "i64" | "f64" | "bool")
             {
                 return Ok(left);
             }
@@ -1916,9 +1903,7 @@ fn return_type_of(
             // where both come from `body.tell()` — botocore's
             // determine_content_length): a boxed result (the boxed-value
             // divergence).
-            if left.to_string().contains("PyValue")
-                || right.to_string().contains("PyValue")
-            {
+            if left.to_string().contains("PyValue") || right.to_string().contains("PyValue") {
                 return Ok(quote!(stdpython::PyValue));
             }
             Ok(quote!(<#left as #t<#right>>::Output))
@@ -1939,11 +1924,9 @@ fn return_type_of(
             } else if unifies_with_recursion(&body_ty, &orelse_ty) {
                 Ok(body_ty)
             } else {
-                Err(
-                    "if-expression branches have different types; annotate the \
+                Err("if-expression branches have different types; annotate the \
                      function's return type (issue #109)"
-                        .to_string(),
-                )
+                    .to_string())
             }
         }
         // A logical combination (`hasattr(f, 'mode') and isinstance(...)
@@ -1956,9 +1939,8 @@ fn return_type_of(
             // when recorded, else String (the common cache-of-strings case).
             if let ExprType::Name(n) = s.value.as_ref()
                 && let Some(reqs) = collector.reqs.get(&n.id)
-                && let Some(ParamReq::SetIndex(_, val)) = reqs.iter().find(|r| {
-                    matches!(r, ParamReq::SetIndex(_, _))
-                })
+                && let Some(ParamReq::SetIndex(_, val)) =
+                    reqs.iter().find(|r| matches!(r, ParamReq::SetIndex(_, _)))
             {
                 match val {
                     RhsType::Concrete(t) => return Ok(t.clone()),
@@ -2125,9 +2107,8 @@ fn operand_type(
                 }
                 if let ExprType::Name(n) = a.value.as_ref()
                     && (param_types.contains_key(&n.id) || collector.alias.contains_key(&n.id))
-                    && let Some((_, _, _, ret)) = STDLIB_METHOD_TABLE
-                        .iter()
-                        .find(|(m, ..)| *m == a.attr)
+                    && let Some((_, _, _, ret)) =
+                        STDLIB_METHOD_TABLE.iter().find(|(m, ..)| *m == a.attr)
                 {
                     match ret {
                         MethodReturn::Str => quote!(String),
@@ -2148,8 +2129,6 @@ fn operand_type(
         _ => return Err(err()),
     })
 }
-
-
 
 /// The unified duck-typing signature of one class's method: (param names,
 /// param type strings, param name idents), all annotated.
@@ -2234,7 +2213,10 @@ fn callee_return_type(
     let mut callee_map: HashMap<String, TokenStream> = HashMap::new();
     for (i, name) in callee_params.iter().enumerate() {
         let Some(arg) = args.get(i) else { continue };
-        callee_map.insert(name.to_string(), return_type_of(arg, collector, param_types)?);
+        callee_map.insert(
+            name.to_string(),
+            return_type_of(arg, collector, param_types)?,
+        );
     }
     let mut returns = Vec::new();
     collect_return_exprs(&callee.body, &mut returns);
@@ -2296,11 +2278,11 @@ fn callee_return_type(
             alias: HashMap::new(),
             returns: Vec::new(),
             reassigned: HashSet::new(),
-        string_pinned: HashSet::new(),
-        value_pinned: HashSet::new(),
+            string_pinned: HashSet::new(),
+            value_pinned: HashSet::new(),
             duck_returns: HashMap::new(),
             duck_method_calls: HashMap::new(),
-        called_params: HashSet::new(),
+            called_params: HashSet::new(),
             error: None,
             current_fn: Some(callee.name.clone()),
             callee_cache: HashMap::new(),
@@ -2428,7 +2410,9 @@ fn expr_contains_call_to(expr: &ExprType, name: &str) -> bool {
         ExprType::Call(c) => {
             matches!(c.func.as_ref(), ExprType::Name(n) if n.id == name)
                 || c.args.iter().any(|a| expr_contains_call_to(a, name))
-                || c.keywords.iter().any(|k| expr_contains_call_to(&k.value, name))
+                || c.keywords
+                    .iter()
+                    .any(|k| expr_contains_call_to(&k.value, name))
         }
         ExprType::BinOp(b) => {
             expr_contains_call_to(&b.left, name) || expr_contains_call_to(&b.right, name)
@@ -2449,10 +2433,7 @@ fn expr_contains_call_to(expr: &ExprType, name: &str) -> bool {
             expr_contains_call_to(&c.left, name)
                 || c.comparators.iter().any(|e| expr_contains_call_to(e, name))
         }
-        ExprType::JoinedStr(j) => j
-            .values
-            .iter()
-            .any(|v| expr_contains_call_to(v, name)),
+        ExprType::JoinedStr(j) => j.values.iter().any(|v| expr_contains_call_to(v, name)),
         ExprType::NamedExpr(ne) => {
             expr_contains_call_to(&ne.left, name) || expr_contains_call_to(&ne.right, name)
         }
@@ -2509,8 +2490,11 @@ fn type_display(ty: &TypeInfo) -> String {
 /// The trait name of a requirement, for the definition-time warning text.
 fn trait_name_of(req: &ParamReq) -> &str {
     match req {
-        ParamReq::Op(t, _) | ParamReq::OpOutput(t, _) | ParamReq::Cmp(t, _)
-        | ParamReq::CmpCond(t, _) | ParamReq::Conversion(t) => t,
+        ParamReq::Op(t, _)
+        | ParamReq::OpOutput(t, _)
+        | ParamReq::Cmp(t, _)
+        | ParamReq::CmpCond(t, _)
+        | ParamReq::Conversion(t) => t,
         ParamReq::Truthy => "Truthy",
         ParamReq::Len => "Len",
         ParamReq::Display => "PyDisplay",
@@ -2678,19 +2662,12 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
         ),
         "PyBool" => matches!(
             ty,
-            TypeInfo::Int
-                | TypeInfo::Float
-                | TypeInfo::Bool
-                | TypeInfo::String
-                | TypeInfo::StrRef
+            TypeInfo::Int | TypeInfo::Float | TypeInfo::Bool | TypeInfo::String | TypeInfo::StrRef
         ),
         "PyToString" | "PyDisplay" | "PyRepr" => true,
         "PyAbs" => matches!(ty, TypeInfo::Int | TypeInfo::Float),
         "Truthy" => true,
-        "Len" => matches!(
-            ty,
-            TypeInfo::String | TypeInfo::Vec(_) | TypeInfo::Dict(..)
-        ),
+        "Len" => matches!(ty, TypeInfo::String | TypeInfo::Vec(_) | TypeInfo::Dict(..)),
         "PyHash" => matches!(
             ty,
             TypeInfo::Int | TypeInfo::Float | TypeInfo::Bool | TypeInfo::String | TypeInfo::StrRef
@@ -2781,16 +2758,12 @@ fn static_arg_type(expr: &ExprType, collector: &Collector) -> Option<TypeInfo> {
         },
         ExprType::UnaryOp(u) if matches!(u.op, crate::Ops::USub) => {
             match static_arg_type(u.operand.as_ref(), collector) {
-                Some(TypeInfo::Int) | Some(TypeInfo::Float) => {
-                    Some(match u.operand.as_ref() {
-                        ExprType::Constant(c)
-                            if matches!(&c.0, Some(litrs::Literal::Integer(_))) =>
-                        {
-                            TypeInfo::Int
-                        }
-                        _ => TypeInfo::Float,
-                    })
-                }
+                Some(TypeInfo::Int) | Some(TypeInfo::Float) => Some(match u.operand.as_ref() {
+                    ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::Integer(_))) => {
+                        TypeInfo::Int
+                    }
+                    _ => TypeInfo::Float,
+                }),
                 _ => None,
             }
         }
@@ -2901,11 +2874,7 @@ fn callee_returned_param(callee: &crate::FunctionDef) -> Option<usize> {
     }
     let mut conflict = false;
     walk_returns(&callee.body, &params, &mut found, &mut conflict);
-    if conflict {
-        None
-    } else {
-        found
-    }
+    if conflict { None } else { found }
 }
 
 /// `<X as PyOp<X>>::Output` unifies with `X` (the recursive-call fixpoint:
@@ -3019,9 +2988,7 @@ fn literal_concrete_type(e: &ExprType) -> Option<TokenStream> {
             _ => None,
         },
         ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => Some(quote!(String)),
-        ExprType::UnaryOp(u)
-            if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) =>
-        {
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) => {
             match u.operand.as_ref() {
                 ExprType::Constant(c) => match &c.0 {
                     Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
@@ -3085,8 +3052,7 @@ impl<'a> Collector<'a> {
             static W_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         let d = W_DEPTH.with(|c| c.get());
-        if d > 100 && d % 10 == 0 {
-        }
+        if d > 100 && d % 10 == 0 {}
         W_DEPTH.with(|c| c.set(d + 1));
         self.walk_inner(body);
         W_DEPTH.with(|c| c.set(d));
@@ -3112,9 +3078,7 @@ impl<'a> Collector<'a> {
                                 // forces the source, concretizing the
                                 // element instead of emitting a generic
                                 // that cannot unify with the seed.
-                                if let Some(ty) =
-                                    self.literal_locals.get(&target.id).cloned()
-                                {
+                                if let Some(ty) = self.literal_locals.get(&target.id).cloned() {
                                     let root = self.alias_root_of(&src.id);
                                     self.add(&root, ParamReq::Identity(ty));
                                 }
@@ -3127,10 +3091,9 @@ impl<'a> Collector<'a> {
                             // record it as a string-pinned param.
                             let is_str_value = match &a.value {
                                 ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => true,
-                                ExprType::Constant(c) => matches!(
-                                    &c.0,
-                                    Some(litrs::Literal::String(_))
-                                ),
+                                ExprType::Constant(c) => {
+                                    matches!(&c.0, Some(litrs::Literal::String(_)))
+                                }
                                 // A `%`-formatting reassignment
                                 // (`executable = '"%s"' % executable` —
                                 // distlib's enquote_executable): a BinOp
@@ -3166,26 +3129,26 @@ impl<'a> Collector<'a> {
                                     matches!(c.func.as_ref(), ExprType::Name(n)
                                         if matches!(n.id.as_str(), "str" | "bytes"))
                                         || matches!(
-                                        c.func.as_ref(),
-                                        ExprType::Attribute(at)
-                                            if matches!(
-                                                at.attr.as_str(),
-                                                "replace"
-                                                    | "lower"
-                                                    | "upper"
-                                                    | "strip"
-                                                    | "lstrip"
-                                                    | "rstrip"
-                                                    | "split"
-                                                    | "rsplit"
-                                                    | "join"
-                                                    | "format"
-                                                    | "title"
-                                                    | "casefold"
-                                                    | "encode"
-                                                    | "decode"
-                                            )
-                                    )
+                                            c.func.as_ref(),
+                                            ExprType::Attribute(at)
+                                                if matches!(
+                                                    at.attr.as_str(),
+                                                    "replace"
+                                                        | "lower"
+                                                        | "upper"
+                                                        | "strip"
+                                                        | "lstrip"
+                                                        | "rstrip"
+                                                        | "split"
+                                                        | "rsplit"
+                                                        | "join"
+                                                        | "format"
+                                                        | "title"
+                                                        | "casefold"
+                                                        | "encode"
+                                                        | "decode"
+                                                )
+                                        )
                                 }
                                 _ => false,
                             };
@@ -3213,20 +3176,14 @@ impl<'a> Collector<'a> {
                                 self.add(&root, ParamReq::Identity(ty.clone()));
                             }
                             self.literal_locals.insert(target.id.clone(), ty);
-                        } else if let Some(seed) =
-                            self.literal_locals.get(&target.id).cloned()
-                        {
+                        } else if let Some(seed) = self.literal_locals.get(&target.id).cloned() {
                             // A literal-seeded ACCUMULATOR (`s = 0; s = s +
                             // x`): the local keeps one type, so parameter/
                             // element operands of the arithmetic are forced
                             // to the seed's concrete type.
                             if matches!(&a.value, ExprType::BinOp(_)) {
                                 let mut roots = Vec::new();
-                                self.arithmetic_name_roots(
-                                    &a.value,
-                                    &target.id,
-                                    &mut roots,
-                                );
+                                self.arithmetic_name_roots(&a.value, &target.id, &mut roots);
                                 for r in roots {
                                     self.add(&r, ParamReq::Identity(seed.clone()));
                                 }
@@ -3287,10 +3244,7 @@ impl<'a> Collector<'a> {
                                 Some(e) => self.rhs_of(e),
                                 None => RhsType::Unknown,
                             };
-                            self.add(
-                                &n.id,
-                                ParamReq::SetIndex(idx, self.rhs_of(&a.value)),
-                            );
+                            self.add(&n.id, ParamReq::SetIndex(idx, self.rhs_of(&a.value)));
                         }
                     }
                     self.walk_expr(&a.target, false);
@@ -3325,28 +3279,20 @@ impl<'a> Collector<'a> {
                         if let Some(root) = self.root_unannotated(&n.id) {
                             match &s.target {
                                 ExprType::Name(elt) => {
-                                    self.loop_elements
-                                        .insert(elt.id.clone(), root.clone());
+                                    self.loop_elements.insert(elt.id.clone(), root.clone());
                                     self.add(&root, ParamReq::Iterate(elt.id.clone()));
                                 }
                                 ExprType::Tuple(t) if t.elts.len() >= 2 => {
-                                    if t.elts
-                                        .iter()
-                                        .all(|e| matches!(e, ExprType::Name(_)))
-                                    {
+                                    if t.elts.iter().all(|e| matches!(e, ExprType::Name(_))) {
                                         let mut elts = Vec::new();
                                         for e in &t.elts {
                                             let ExprType::Name(en) = e else {
                                                 unreachable!()
                                             };
-                                            self.loop_elements
-                                                .insert(en.id.clone(), root.clone());
+                                            self.loop_elements.insert(en.id.clone(), root.clone());
                                             elts.push(en.id.clone());
                                         }
-                                        self.add(
-                                            &root,
-                                            ParamReq::IterateTuple(elts),
-                                        );
+                                        self.add(&root, ParamReq::IterateTuple(elts));
                                     } else {
                                         self.add(
                                             &root,
@@ -3464,7 +3410,10 @@ impl<'a> Collector<'a> {
                                 Some(e) => self.rhs_of(e),
                                 None => RhsType::Concrete(quote!(i64)),
                             };
-                            self.add(&root, ParamReq::Method("PyPop".to_string(), true, Some(idx)));
+                            self.add(
+                                &root,
+                                ParamReq::Method("PyPop".to_string(), true, Some(idx)),
+                            );
                         }
                     }
                     for target in targets {
@@ -3506,8 +3455,13 @@ impl<'a> Collector<'a> {
                     // bound on `b`).
                     if let ExprType::Name(l) = b.left.as_ref() {
                         if self.unannotated.contains(&l.id) {
-                            let same = matches!(b.right.as_ref(), ExprType::Name(r) if r.id == l.id);
-                            let rhs = if same { RhsType::Same } else { self.rhs_of(&b.right) };
+                            let same =
+                                matches!(b.right.as_ref(), ExprType::Name(r) if r.id == l.id);
+                            let rhs = if same {
+                                RhsType::Same
+                            } else {
+                                self.rhs_of(&b.right)
+                            };
                             // An UNKNOWN rhs (`preference_list +
                             // service_supported` where the rhs is a list
                             // comprehension — botocore's auth): skip the
@@ -3549,8 +3503,9 @@ impl<'a> Collector<'a> {
                 self.walk_expr(&b.right, false);
             }
             ExprType::Compare(c) => {
-                let operands: Vec<&ExprType> =
-                    std::iter::once(c.left.as_ref()).chain(c.comparators.iter()).collect();
+                let operands: Vec<&ExprType> = std::iter::once(c.left.as_ref())
+                    .chain(c.comparators.iter())
+                    .collect();
                 for (i, op) in c.ops.iter().enumerate() {
                     let left = operands[i];
                     let right = operands[i + 1];
@@ -3699,9 +3654,8 @@ impl<'a> Collector<'a> {
                 if let ExprType::Attribute(a) = c.func.as_ref() {
                     if let ExprType::Name(n) = a.value.as_ref() {
                         if self.unannotated.contains(&n.id) {
-                            if let Some((_, trait_name, mutates, _)) = STDLIB_METHOD_TABLE
-                                .iter()
-                                .find(|(m, ..)| *m == a.attr)
+                            if let Some((_, trait_name, mutates, _)) =
+                                STDLIB_METHOD_TABLE.iter().find(|(m, ..)| *m == a.attr)
                             {
                                 let rhs = if *trait_name == "PyPop" {
                                     match c.args.first() {
@@ -3715,8 +3669,7 @@ impl<'a> Collector<'a> {
                                     &n.id,
                                     ParamReq::Method((*trait_name).to_string(), *mutates, rhs),
                                 );
-                            } else if let Some(trait_name) = self.duck_trait_for(&a.attr, c)
-                            {
+                            } else if let Some(trait_name) = self.duck_trait_for(&a.attr, c) {
                                 // M3: a method defined by user classes in this
                                 // package. The trait is generated once; the
                                 // bound is the requirement.
@@ -3819,11 +3772,14 @@ impl<'a> Collector<'a> {
                     if self.unannotated.contains(&n.id)
                         && STDLIB_METHOD_TABLE.iter().all(|(m, ..)| *m != a.attr)
                     {
-                        if let Some(trait_name) = self.duck_trait_for(&a.attr, &crate::Call {
-                            func: Box::new(ExprType::Attribute(a.clone())),
-                            args: Vec::new(),
-                            keywords: Vec::new(),
-                        }) {
+                        if let Some(trait_name) = self.duck_trait_for(
+                            &a.attr,
+                            &crate::Call {
+                                func: Box::new(ExprType::Attribute(a.clone())),
+                                args: Vec::new(),
+                                keywords: Vec::new(),
+                            },
+                        ) {
                             let mutates = self.duck_method_mutates(&a.attr);
                             self.duck_method_calls
                                 .entry(n.id.clone())
@@ -3967,11 +3923,7 @@ impl<'a> Collector<'a> {
 
     /// M3: generate (once per module) a duck-typing trait for a method
     /// defined by user classes in this package, and return the trait name.
-    fn duck_trait_for(
-        &mut self,
-        method: &str,
-        _call: &crate::Call,
-    ) -> Option<String> {
+    fn duck_trait_for(&mut self, method: &str, _call: &crate::Call) -> Option<String> {
         let classes: Vec<crate::ClassDef> = self
             .symbols
             .all_classes()
@@ -4073,7 +4025,10 @@ impl<'a> Collector<'a> {
                 }
                 #(#impls)*
             };
-            self.options.generated_duck_traits.borrow_mut().insert(trait_name.clone());
+            self.options
+                .generated_duck_traits
+                .borrow_mut()
+                .insert(trait_name.clone());
             self.options.module_pending_items.borrow_mut().push(items);
         }
         self.duck_returns.insert(method.to_string(), ret.clone());
@@ -4103,9 +4058,15 @@ impl<'a> Collector<'a> {
             Err(_) => return, // the callee's own inference reports this
         };
         for (i, arg) in args.iter().enumerate() {
-            let Some(param) = callee_params.get(i) else { continue };
-            let Some(param_reqs) = callee_reqs.get(&param.arg) else { continue };
-            let Some(arg_ty) = static_arg_type(arg, self) else { continue };
+            let Some(param) = callee_params.get(i) else {
+                continue;
+            };
+            let Some(param_reqs) = callee_reqs.get(&param.arg) else {
+                continue;
+            };
+            let Some(arg_ty) = static_arg_type(arg, self) else {
+                continue;
+            };
             for req in param_reqs {
                 // Resolve the requirement's rhs to a concrete type.
                 let rhs_ty = |rhs: &RhsType| -> Option<TypeInfo> {
@@ -4120,15 +4081,18 @@ impl<'a> Collector<'a> {
                     }
                 };
                 let (trait_name, ok) = match req {
-                    ParamReq::Op(t, rhs) => {
-                        (*t, rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))))
-                    }
-                    ParamReq::OpOutput(t, rhs) => {
-                        (*t, rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))))
-                    }
-                    ParamReq::Cmp(t, rhs) | ParamReq::CmpCond(t, rhs) => {
-                        (*t, rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))))
-                    }
+                    ParamReq::Op(t, rhs) => (
+                        *t,
+                        rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))),
+                    ),
+                    ParamReq::OpOutput(t, rhs) => (
+                        *t,
+                        rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))),
+                    ),
+                    ParamReq::Cmp(t, rhs) | ParamReq::CmpCond(t, rhs) => (
+                        *t,
+                        rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))),
+                    ),
                     ParamReq::Conversion(t) => (*t, type_satisfies(&arg_ty, t, None)),
                     ParamReq::Truthy => ("Truthy", type_satisfies(&arg_ty, "Truthy", None)),
                     ParamReq::Len => ("Len", type_satisfies(&arg_ty, "Len", None)),
@@ -4142,7 +4106,8 @@ impl<'a> Collector<'a> {
                     ),
                     ParamReq::SetIndex(idx, _) => (
                         "PySetIndex",
-                        rhs_ty(idx).map_or(true, |r| type_satisfies(&arg_ty, "PySetIndex", Some(&r))),
+                        rhs_ty(idx)
+                            .map_or(true, |r| type_satisfies(&arg_ty, "PySetIndex", Some(&r))),
                     ),
                     ParamReq::Contains(item) => (
                         "PyContains",
@@ -4152,13 +4117,16 @@ impl<'a> Collector<'a> {
                     ParamReq::Method(t, _, rhs) => {
                         let t = t.as_str();
                         let ok = match rhs {
-                            Some(rhs) => rhs_ty(rhs)
-                                .map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r))),
+                            Some(rhs) => {
+                                rhs_ty(rhs).map_or(true, |r| type_satisfies(&arg_ty, t, Some(&r)))
+                            }
                             None => type_satisfies(&arg_ty, t, None),
                         };
                         (t, ok)
                     }
-                    ParamReq::PyFromInt => ("PyFromInt", type_satisfies(&arg_ty, "PyFromInt", None)),
+                    ParamReq::PyFromInt => {
+                        ("PyFromInt", type_satisfies(&arg_ty, "PyFromInt", None))
+                    }
                     ParamReq::Iterate(_) => (
                         "IntoIterator",
                         type_satisfies(&arg_ty, "IntoIterator", None),
@@ -4167,10 +4135,9 @@ impl<'a> Collector<'a> {
                         "IntoIterator",
                         type_satisfies(&arg_ty, "IntoIterator", None),
                     ),
-                    ParamReq::AsRefStr => (
-                        "AsRef<str>",
-                        type_satisfies(&arg_ty, "AsRef<str>", None),
-                    ),
+                    ParamReq::AsRefStr => {
+                        ("AsRef<str>", type_satisfies(&arg_ty, "AsRef<str>", None))
+                    }
                     ParamReq::Identity(_) | ParamReq::Untranslatable(_) => continue,
                 };
                 if !ok {
@@ -4229,7 +4196,9 @@ impl<'a> Collector<'a> {
             }) else {
                 continue;
             };
-            let Some(callee_param) = callee_params.get(i) else { continue };
+            let Some(callee_param) = callee_params.get(i) else {
+                continue;
+            };
             if let Some(ann) = callee_param.annotation.as_deref() {
                 // Identity-forced: the argument takes the concrete type.
                 if let Some(ty) = crate::python_annotation_to_rust_type(ann) {
@@ -4253,9 +4222,7 @@ impl<'a> Collector<'a> {
                 // element (the Iterate arm below adopts it under a fresh
                 // caller-side name): a callee-ELEMENT operand in another
                 // requirement maps to that same fresh name.
-                let has_iterate = param_reqs
-                    .iter()
-                    .any(|r| matches!(r, ParamReq::Iterate(_)));
+                let has_iterate = param_reqs.iter().any(|r| matches!(r, ParamReq::Iterate(_)));
                 for req in param_reqs {
                     let mapped = match req {
                         ParamReq::Op(t, RhsType::Param(callee_name)) => {
@@ -4293,18 +4260,16 @@ impl<'a> Collector<'a> {
                                 has_iterate,
                             ))
                         }
-                        ParamReq::SetIndex(RhsType::Param(callee_name), val) => {
-                            ParamReq::SetIndex(
-                                self.map_callee_operand(
-                                    callee_name,
-                                    &callee_params,
-                                    args,
-                                    &arg_param,
-                                    has_iterate,
-                                ),
-                                val.clone(),
-                            )
-                        }
+                        ParamReq::SetIndex(RhsType::Param(callee_name), val) => ParamReq::SetIndex(
+                            self.map_callee_operand(
+                                callee_name,
+                                &callee_params,
+                                args,
+                                &arg_param,
+                                has_iterate,
+                            ),
+                            val.clone(),
+                        ),
                         ParamReq::Contains(RhsType::Param(callee_name)) => {
                             ParamReq::Contains(self.map_callee_operand(
                                 callee_name,
@@ -4331,10 +4296,7 @@ impl<'a> Collector<'a> {
                             if let Some(elt_reqs) = callee_reqs.get(elt) {
                                 for er in elt_reqs {
                                     let mapped = self.map_adopted_req(er, &callee_params, args);
-                                    self.reqs
-                                        .entry(fresh.clone())
-                                        .or_default()
-                                        .push(mapped);
+                                    self.reqs.entry(fresh.clone()).or_default().push(mapped);
                                 }
                             }
                             ParamReq::Iterate(fresh)
@@ -4345,12 +4307,8 @@ impl<'a> Collector<'a> {
                                 let f = format!("__rython_elt_{}_{i}", arg_param);
                                 if let Some(elt_reqs) = callee_reqs.get(e) {
                                     for er in elt_reqs {
-                                        let mapped =
-                                            self.map_adopted_req(er, &callee_params, args);
-                                        self.reqs
-                                            .entry(f.clone())
-                                            .or_default()
-                                            .push(mapped);
+                                        let mapped = self.map_adopted_req(er, &callee_params, args);
+                                        self.reqs.entry(f.clone()).or_default().push(mapped);
                                     }
                                 }
                                 fresh.push(f);
@@ -4431,18 +4389,14 @@ impl<'a> Collector<'a> {
             ParamReq::CmpCond(t, RhsType::Param(name)) => {
                 ParamReq::CmpCond(t, self.map_callee_param(name, callee_params, args))
             }
-            ParamReq::Method(t, m, Some(RhsType::Param(name))) => {
-                ParamReq::Method(t.clone(), *m, Some(self.map_callee_param(name, callee_params, args)))
-            }
-            ParamReq::Iterate(inner) => {
-                ParamReq::Iterate(format!("__rython_elt_{}", inner))
-            }
+            ParamReq::Method(t, m, Some(RhsType::Param(name))) => ParamReq::Method(
+                t.clone(),
+                *m,
+                Some(self.map_callee_param(name, callee_params, args)),
+            ),
+            ParamReq::Iterate(inner) => ParamReq::Iterate(format!("__rython_elt_{}", inner)),
             ParamReq::IterateTuple(elts) => {
-                ParamReq::IterateTuple(
-                    elts.iter()
-                        .map(|e| format!("__rython_elt_{}", e))
-                        .collect(),
-                )
+                ParamReq::IterateTuple(elts.iter().map(|e| format!("__rython_elt_{}", e)).collect())
             }
             other => other.clone(),
         }
@@ -4460,8 +4414,7 @@ impl<'a> Collector<'a> {
             static CR_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         let cd = CR_DEPTH.with(|c| c.get());
-        if cd > 50 && cd % 10 == 0 {
-        }
+        if cd > 50 && cd % 10 == 0 {}
         CR_DEPTH.with(|c| c.set(cd + 1));
         let result = self.callee_requirements_inner(callee);
         CR_DEPTH.with(|c| c.set(cd));
@@ -4511,11 +4464,11 @@ impl<'a> Collector<'a> {
             alias: HashMap::new(),
             returns: Vec::new(),
             reassigned: HashSet::new(),
-        string_pinned: HashSet::new(),
-        value_pinned: HashSet::new(),
+            string_pinned: HashSet::new(),
+            value_pinned: HashSet::new(),
             duck_returns: HashMap::new(),
             duck_method_calls: HashMap::new(),
-        called_params: HashSet::new(),
+            called_params: HashSet::new(),
             error: None,
             current_fn: Some(callee.name.clone()),
             callee_cache: std::mem::take(&mut self.callee_cache),
@@ -4534,15 +4487,15 @@ impl<'a> Collector<'a> {
         if let Some(e) = inner_error {
             return Err(e);
         }
-        self.callee_cache.insert(callee.name.clone(), inner_reqs.clone());
+        self.callee_cache
+            .insert(callee.name.clone(), inner_reqs.clone());
         Ok(inner_reqs)
     }
 
     fn duck_method_mutates(&self, method: &str) -> bool {
         self.symbols.all_classes().iter().any(|c| {
             c.methods().any(|m| {
-                m.name == method
-                    && c.own_method_mutates(method, &self.symbols, &self.options)
+                m.name == method && c.own_method_mutates(method, &self.symbols, &self.options)
             })
         })
     }

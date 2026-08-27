@@ -1,12 +1,12 @@
 //! Python os module implementation
-//! 
+//!
 //! This module provides Python's os module functionality for
 //! operating system interface functions.
 //!
 //! Note: This module is only available with the `std` feature enabled,
 //! as it requires operating system functionality.
 
-use crate::{PyException, PyValue, AsStrLike, AsPathLike, python_function};
+use crate::{AsPathLike, AsStrLike, PyException, PyValue, python_function};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -53,14 +53,14 @@ python_function! {
 
 python_function! {
     /// os.execv - execute a program (generic version using traits)
-    /// 
+    ///
     /// # Arguments
     /// * `program` - Path to the program to execute (any string-like type)
     /// * `args` - Arguments to pass to the program (any collection of string-like types)
-    /// 
+    ///
     /// # Note
     /// This function replaces the current process with the new program.
-    pub fn execv_mixed<P, A, S>(program: P, args: A) -> Result<(), PyException> 
+    pub fn execv_mixed<P, A, S>(program: P, args: A) -> Result<(), PyException>
     where [P: AsPathLike, A: IntoIterator<Item = S>, S: AsStrLike]
     [signature: (program, args)]
     [concrete_types: (String, Vec<String>) -> Result<(), crate::PyException>]
@@ -73,11 +73,11 @@ python_function! {
 }
 
 /// os.execv - execute a program
-/// 
+///
 /// # Arguments
 /// * `program` - Path to the program to execute
 /// * `args` - Arguments to pass to the program
-/// 
+///
 /// # Note
 /// This function replaces the current process with the new program.
 /// On Unix systems, this uses the actual execv system call.
@@ -85,46 +85,51 @@ python_function! {
 #[cfg(unix)]
 pub fn execv<P: AsRef<str>, A: AsRef<str>>(program: P, args: Vec<A>) -> Result<(), PyException> {
     use std::ffi::CString;
-    
+
     // Convert program path and arguments to C strings
-    let program_c = CString::new(program.as_ref())
-        .map_err(|_| crate::value_error("Invalid program path"))?;
-    
+    let program_c =
+        CString::new(program.as_ref()).map_err(|_| crate::value_error("Invalid program path"))?;
+
     let mut args_c: Vec<CString> = Vec::new();
     for arg in &args {
-        args_c.push(CString::new(arg.as_ref())
-            .map_err(|_| crate::value_error("Invalid argument"))?);
+        args_c
+            .push(CString::new(arg.as_ref()).map_err(|_| crate::value_error("Invalid argument"))?);
     }
-    
+
     // Convert to raw pointers for execv
-    let mut args_ptr: Vec<*const libc::c_char> = args_c.iter()
-        .map(|s| s.as_ptr())
-        .collect();
+    let mut args_ptr: Vec<*const libc::c_char> = args_c.iter().map(|s| s.as_ptr()).collect();
     args_ptr.push(std::ptr::null()); // execv expects null-terminated array
-    
+
     // Call execv - this replaces the current process
     unsafe {
         libc::execv(program_c.as_ptr(), args_ptr.as_ptr());
     }
-    
+
     // If we reach here, execv failed
-    Err(crate::runtime_error(format!("execv failed for program: {}", program.as_ref())))
+    Err(crate::runtime_error(format!(
+        "execv failed for program: {}",
+        program.as_ref()
+    )))
 }
 
 /// os.execv - execute a program (Windows implementation)
 #[cfg(windows)]
 pub fn execv<P: AsRef<str>, A: AsRef<str>>(program: P, args: Vec<A>) -> Result<(), PyException> {
     use std::process::Command;
-    
+
     // On Windows, we simulate execv using process spawn + exit
     let mut cmd = Command::new(program.as_ref());
     cmd.args(args.iter().map(|a| a.as_ref()));
-    
+
     match cmd.status() {
         Ok(status) => {
             std::process::exit(status.code().unwrap_or(1));
         }
-        Err(e) => Err(crate::runtime_error(format!("Failed to execute program {}: {}", program.as_ref(), e)))
+        Err(e) => Err(crate::runtime_error(format!(
+            "Failed to execute program {}: {}",
+            program.as_ref(),
+            e
+        ))),
     }
 }
 
@@ -345,8 +350,7 @@ impl Environ {
 impl crate::PyIndex<&str> for Environ {
     type Output = String;
     fn py_index(&self, index: &str) -> Result<String, PyException> {
-        std::env::var(index)
-            .map_err(|_| PyException::new("KeyError", &format!("'{}'", index)))
+        std::env::var(index).map_err(|_| PyException::new("KeyError", &format!("'{}'", index)))
     }
 }
 
@@ -379,7 +383,7 @@ impl<V: crate::AsStrLike> crate::PySetIndex<String, V> for Environ {
 }
 
 /// os.name - operating system name
-/// 
+///
 /// This provides the name of the operating system, similar to Python's os.name.
 pub static name: LazyLock<&'static str> = LazyLock::new(|| {
     if cfg!(target_os = "windows") {
@@ -395,14 +399,18 @@ pub static name: LazyLock<&'static str> = LazyLock::new(|| {
 /// os.path submodule
 pub mod path {
     //! Python os.path module implementation
-    //! 
+    //!
     //! This submodule provides path manipulation functions using Rust's std::path.
 
+    use crate::{AsPathLike, PyException, python_function};
     use std::path::{Path, PathBuf};
-    use crate::{PyException, AsPathLike, python_function};
-    
+
     /// os.path.sep - path separator for the current platform
-    pub static sep: &str = if cfg!(target_os = "windows") { "\\" } else { "/" };
+    pub static sep: &str = if cfg!(target_os = "windows") {
+        "\\"
+    } else {
+        "/"
+    };
 
     python_function! {
     /// os.path.expandvars - expand `$VAR` and `${VAR}` from the
@@ -569,7 +577,7 @@ pub mod path {
             }
         }
     }
-    
+
     python_function! {
         /// os.path.join - join path components
         pub fn join<P1, P2>(path1: P1, path2: P2) -> String
@@ -582,7 +590,7 @@ pub mod path {
             path.to_string_lossy().to_string()
         }
     }
-    
+
     python_function! {
         /// os.path.join - join path components (3 arguments version)
         pub fn join3<P1, P2, P3>(path1: P1, path2: P2, path3: P3) -> String
@@ -596,7 +604,7 @@ pub mod path {
             path.to_string_lossy().to_string()
         }
     }
-    
+
     python_function! {
         /// os.path.join - join path components (variable arguments version)
         pub fn join_many<I, P>(components: I) -> String
@@ -611,15 +619,15 @@ pub mod path {
             path.to_string_lossy().to_string()
         }
     }
-    
+
     /// os.path.join - variadic version for compatibility with Python's os.path.join
-    /// 
+    ///
     /// This function accepts individual arguments like Python's os.path.join(a, b, c, ...)
-    /// 
+    ///
     /// # Arguments
     /// * `first` - First path component
     /// * `rest` - Additional path components (variadic)
-    /// 
+    ///
     /// # Returns
     /// The joined path as a String
     pub fn join_paths<P: AsPathLike>(first: P, rest: &[P]) -> String {
@@ -629,7 +637,7 @@ pub mod path {
         }
         path.to_string_lossy().to_string()
     }
-    
+
     python_function! {
         /// os.path.exists - check if path exists
         pub fn exists<P>(path: P) -> bool
@@ -640,7 +648,7 @@ pub mod path {
             Path::new(path.as_path_like()).exists()
         }
     }
-    
+
     python_function! {
         /// os.path.isfile - check if path is a regular file
         pub fn isfile<P>(path: P) -> bool
@@ -651,7 +659,7 @@ pub mod path {
             Path::new(path.as_ref()).is_file()
         }
     }
-    
+
     python_function! {
         /// os.path.isdir - check if path is a directory
         pub fn isdir<P>(path: P) -> bool
@@ -662,7 +670,7 @@ pub mod path {
             Path::new(path.as_ref()).is_dir()
         }
     }
-    
+
     python_function! {
         /// os.path.split - split a path into (head, tail): everything
         /// before the final separator and the final component

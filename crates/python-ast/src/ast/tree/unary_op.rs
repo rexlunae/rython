@@ -2,8 +2,9 @@ use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
-use crate::{extraction_failure,     dump, err_from, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
-    UnaryOpNotYetImplemented,
+use crate::{
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes, UnaryOpNotYetImplemented,
+    dump, err_from, extraction_failure,
 };
 
 use serde::{Deserialize, Serialize};
@@ -106,7 +107,7 @@ impl CodeGen for UnaryOp {
                     Ok(quote!(-#operand))
                 }
             }
-            _ => Err(err_from(UnaryOpNotYetImplemented(self)).into())
+            _ => Err(err_from(UnaryOpNotYetImplemented(self)).into()),
         }
     }
 }

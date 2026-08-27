@@ -1,4 +1,6 @@
-use crate::{dump, error_to_pyerr, parsing_error, Module, Name, Result as CrateResult, SourceLocation, *};
+use crate::{
+    Module, Name, Result as CrateResult, SourceLocation, dump, error_to_pyerr, parsing_error, *,
+};
 
 use pyo3::prelude::*;
 use std::ffi::CString;
@@ -27,22 +29,22 @@ fn parse_to_py(
 }
 
 /// Parses Python code and returns the AST as a Module with improved error handling.
-/// 
+///
 /// This function accepts any type that can be converted to a string reference,
 /// making it flexible for different input types. It provides detailed error information
 /// including file location and helpful guidance when parsing fails.
-/// 
+///
 /// # Arguments
 /// * `input` - The Python source code to parse
 /// * `filename` - The filename to associate with the parsed code
-/// 
+///
 /// # Returns
 /// * `CrateResult<Module>` - The parsed AST module or a detailed error with location info
-/// 
+///
 /// # Examples
 /// ```rust
 /// use python_ast::parse_enhanced;
-/// 
+///
 /// let code = "x = 1 + 2";
 /// let module = parse_enhanced(code, "example.py").unwrap();
 /// ```
@@ -50,9 +52,9 @@ pub fn parse_enhanced(input: impl AsRef<str>, filename: impl AsRef<str>) -> Crat
     let filename = filename.as_ref();
     let input_str = input.as_ref();
     let location = SourceLocation::new(filename);
-    
+
     // Empty files are valid in Python (they create empty modules), so we don't treat them as errors
-    
+
     let mut module: Module = Python::attach(|py| {
         let py_tree = parse_to_py(input_str, filename, py)
             .map_err(|py_err| {
@@ -120,21 +122,21 @@ pub fn parse_enhanced(input: impl AsRef<str>, filename: impl AsRef<str>) -> Crat
 }
 
 /// Parses Python code and returns the AST as a Module (backward compatible version).
-/// 
+///
 /// This is the original parse function that returns PyResult for backward compatibility.
 /// For better error messages with location information, use `parse_enhanced` instead.
-/// 
+///
 /// # Arguments
 /// * `input` - The Python source code to parse
 /// * `filename` - The filename to associate with the parsed code
-/// 
+///
 /// # Returns
 /// * `PyResult<Module>` - The parsed AST module or a PyO3 error
-/// 
+///
 /// # Examples
 /// ```rust
 /// use python_ast::parse;
-/// 
+///
 /// let code = "x = 1 + 2";
 /// let module = parse(code, "example.py").unwrap();
 /// ```
@@ -152,7 +154,7 @@ mod tests {
         let code = "1 + 2";
         let result = parse(code, "test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert!(module.filename.is_some());
         assert_eq!(module.filename.as_ref().unwrap(), "test.py");
@@ -167,7 +169,7 @@ def hello_world():
 "#;
         let result = parse(code, "function_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 1);
     }
@@ -184,7 +186,7 @@ class TestClass:
 "#;
         let result = parse(code, "class_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 1);
     }
@@ -199,7 +201,7 @@ from typing import List, Dict
 "#;
         let result = parse(code, "import_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 4);
     }
@@ -213,7 +215,7 @@ condition = (a > b) and (c < d) or (e == f)
 "#;
         let result = parse(code, "expressions_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 3);
     }
@@ -238,7 +240,7 @@ else:
 "#;
         let result = parse(code, "control_flow_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 1);
     }
@@ -254,7 +256,7 @@ async def async_function():
 "#;
         let result = parse(code, "async_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 1);
     }
@@ -273,14 +275,14 @@ def getter(self):
 "#;
         let result = parse(code, "decorators_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 2);
     }
 
     #[test]
     fn test_parse_invalid_syntax() {
-        let code = "def invalid_function(";  // Missing closing parenthesis
+        let code = "def invalid_function("; // Missing closing parenthesis
         let result = parse(code, "invalid.py");
         assert!(result.is_err());
     }
@@ -290,7 +292,7 @@ def getter(self):
         let code = "";
         let result = parse(code, "empty.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert!(module.raw.body.is_empty());
     }
@@ -306,7 +308,7 @@ def function_with_docstring():
 "#;
         let result = parse(code, "comments_test.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert_eq!(module.raw.body.len(), 2); // Docstring + function
     }
@@ -315,7 +317,7 @@ def function_with_docstring():
     fn test_module_name_generation() {
         let result = parse("x = 1", "some_file.py");
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert!(module.name.is_some());
         assert_eq!(module.name.unwrap().id, "some_file");
@@ -324,10 +326,14 @@ def function_with_docstring():
     #[test]
     fn test_module_name_with_path_separators() {
         let code = "x = 1";
-        let filename = format!("path{}to{}module.py", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
+        let filename = format!(
+            "path{}to{}module.py",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
         let result = parse(code, &filename);
         assert!(result.is_ok());
-        
+
         let module = result.unwrap();
         assert!(module.name.is_some());
         assert_eq!(module.name.unwrap().id, "path__to__module");

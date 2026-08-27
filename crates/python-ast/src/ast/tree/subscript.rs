@@ -3,9 +3,9 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{extraction_failure, 
-    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
-    Node, impl_node_with_positions, PyAttributeExtractor
+use crate::{
+    CodeGen, CodeGenContext, ExprType, Node, PyAttributeExtractor, PythonOptions,
+    SymbolTableScopes, extraction_failure, impl_node_with_positions,
 };
 
 /// A subscript's bracket contents: a plain index or a slice.
@@ -35,7 +35,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Subscript {
         use pyo3::types::PyTypeMethods;
 
         let value = ob.extract_attr_with_context("value", "subscript value")?;
-        let value = value.extract().map_err(|e| extraction_failure("getting subscript value", &ob, e))?;
+        let value = value
+            .extract()
+            .map_err(|e| extraction_failure("getting subscript value", &ob, e))?;
 
         let slice_attr = ob.extract_attr_with_context("slice", "subscript slice")?;
         let slice_type: String = slice_attr
@@ -47,9 +49,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Subscript {
         let kind = if slice_type == "Slice" {
             let bound = |name: &str| -> PyResult<Option<Box<ExprType>>> {
                 match slice_attr.getattr(name) {
-                    Ok(v) if !v.is_none() => Ok(Some(Box::new(v.extract().map_err(
-                        |e| extraction_failure("slice bound", &ob, e),
-                    )?))),
+                    Ok(v) if !v.is_none() => Ok(Some(Box::new(
+                        v.extract()
+                            .map_err(|e| extraction_failure("slice bound", &ob, e))?,
+                    ))),
                     _ => Ok(None),
                 }
             };
@@ -76,7 +79,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Subscript {
     }
 }
 
-impl_node_with_positions!(Subscript { lineno, col_offset, end_lineno, end_col_offset });
+impl_node_with_positions!(Subscript {
+    lineno,
+    col_offset,
+    end_lineno,
+    end_col_offset
+});
 
 /// Lower the receiver of a subscript STORE as a place. Names and
 /// attributes are places already; a nested subscript (`grid[i][j] = v`)
@@ -99,21 +107,17 @@ pub(crate) fn subscript_receiver_place(
             )?;
             match &sub.kind {
                 SubscriptKind::Index(index) => {
-                    let index = index
-                        .clone()
-                        .to_rust(ctx, options, symbols)?;
+                    let index = index.clone().to_rust(ctx, options, symbols)?;
                     Ok(quote!((#inner).py_index_mut(#index)?))
                 }
-                SubscriptKind::Slice { .. } => Err(
-                    "cannot assign through a slice (`x[a:b][...] = ...`)"
+                SubscriptKind::Slice { .. } => {
+                    Err("cannot assign through a slice (`x[a:b][...] = ...`)"
                         .to_string()
-                        .into(),
-                ),
+                        .into())
+                }
             }
         }
-        ExprType::Name(_) => {
-            expr.clone().to_rust(ctx, options, symbols)
-        }
+        ExprType::Name(_) => expr.clone().to_rust(ctx, options, symbols),
         ExprType::Attribute(attr) => {
             // Attribute receivers render in place flavor: in a generic trait
             // default, `self.items[i]` must mutate through `self.items_mut()`,
@@ -155,7 +159,9 @@ impl CodeGen for Subscript {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value = self
+            .value
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         match self.kind {
             // Python index rules via PyIndex: negatives from the end, a
             // catchable IndexError/KeyError instead of a Rust panic.
@@ -163,26 +169,22 @@ impl CodeGen for Subscript {
                 // Context-aware: indices are i64. `len(x)` yields usize and
                 // `xs[len(xs) - 1]` yields i64, so coerce usize → i64 here
                 // rather than depend on the runtime generic.
-                let index = crate::render_typed(
-                    &index,
-                    ctx,
-                    options,
-                    symbols,
-                    Some(crate::TypeInfo::Int),
-                )?;
+                let index =
+                    crate::render_typed(&index, ctx, options, symbols, Some(crate::TypeInfo::Int))?;
                 Ok(quote! { (#value).py_index(#index)? })
             }
             // Slices clamp and never raise.
             SubscriptKind::Slice { lower, upper, step } => {
-                let bound = |b: Option<Box<ExprType>>| -> Result<TokenStream, Box<dyn std::error::Error>> {
-                    Ok(match b {
-                        Some(e) => {
-                            let t = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                            quote!(Some(#t))
-                        }
-                        None => quote!(None),
-                    })
-                };
+                let bound =
+                    |b: Option<Box<ExprType>>| -> Result<TokenStream, Box<dyn std::error::Error>> {
+                        Ok(match b {
+                            Some(e) => {
+                                let t = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                quote!(Some(#t))
+                            }
+                            None => quote!(None),
+                        })
+                    };
                 let lower = bound(lower)?;
                 let upper = bound(upper)?;
                 let step = bound(step)?;
@@ -215,4 +217,3 @@ pub fn is_step_one(step: Option<&ExprType>) -> bool {
         ),
     }
 }
-

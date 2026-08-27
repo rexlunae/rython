@@ -1,5 +1,5 @@
 //! Python Standard Library Implementation
-//! 
+//!
 //! This module contains implementations of Python's standard library modules
 //! that are commonly used in Python programs. Each submodule provides
 //! functionality equivalent to the corresponding Python module.
@@ -147,4 +147,3 @@ pub mod ssl;
 /// this automatically for converted packages).
 #[cfg(feature = "http-ureq")]
 pub mod urllib;
-

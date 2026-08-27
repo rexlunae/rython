@@ -41,7 +41,9 @@ pub enum CodeGenContext {
     /// loses the Class marker at the function boundary, and function bodies
     /// must not be confused with module scope (module-level-only constructs
     /// like rust.bind declarations are rejected there).
-    Function { class: Option<String> },
+    Function {
+        class: Option<String>,
+    },
     Async(Box<CodeGenContext>),
     /// Directly inside a loop body. `has_else` is true when the loop carries
     /// a Python `else` clause, in which case `break` statements must also set
@@ -53,11 +55,15 @@ pub enum CodeGenContext {
     /// Inside a `try` block body, which lowers to a closure returning
     /// `Result<(), PyException>`; `raise` (and failed `assert`) here lower
     /// to `return Err(...)` so the except handlers can catch them.
-    TryBlock { parent: Box<CodeGenContext> },
+    TryBlock {
+        parent: Box<CodeGenContext>,
+    },
     /// Inside an `except` handler body, where the caught exception is in
     /// scope as `__rython_exc`. `parent` is the context the try statement
     /// itself appears in (handler code runs outside the try's closure).
-    ExceptHandler { parent: Box<CodeGenContext> },
+    ExceptHandler {
+        parent: Box<CodeGenContext>,
+    },
 }
 
 impl CodeGenContext {
@@ -66,8 +72,9 @@ impl CodeGenContext {
     pub fn in_try_block(&self) -> bool {
         match self {
             CodeGenContext::TryBlock { .. } => true,
-            CodeGenContext::ExceptHandler { parent }
-            | CodeGenContext::Loop { parent, .. } => parent.in_try_block(),
+            CodeGenContext::ExceptHandler { parent } | CodeGenContext::Loop { parent, .. } => {
+                parent.in_try_block()
+            }
             CodeGenContext::Async(inner) => inner.in_try_block(),
             _ => false,
         }
@@ -93,8 +100,9 @@ impl CodeGenContext {
     pub fn break_target_has_else(&self) -> bool {
         match self {
             CodeGenContext::Loop { has_else, .. } => *has_else,
-            CodeGenContext::TryBlock { parent }
-            | CodeGenContext::ExceptHandler { parent } => parent.break_target_has_else(),
+            CodeGenContext::TryBlock { parent } | CodeGenContext::ExceptHandler { parent } => {
+                parent.break_target_has_else()
+            }
             CodeGenContext::Async(inner) => inner.break_target_has_else(),
             _ => false,
         }
@@ -105,8 +113,9 @@ impl CodeGenContext {
     pub fn in_except_handler(&self) -> bool {
         match self {
             CodeGenContext::ExceptHandler { .. } => true,
-            CodeGenContext::TryBlock { parent }
-            | CodeGenContext::Loop { parent, .. } => parent.in_except_handler(),
+            CodeGenContext::TryBlock { parent } | CodeGenContext::Loop { parent, .. } => {
+                parent.in_except_handler()
+            }
             CodeGenContext::Async(inner) => inner.in_except_handler(),
             _ => false,
         }
@@ -117,8 +126,9 @@ impl CodeGenContext {
     /// return out of the enclosing try's closure).
     pub fn strip_exception_scopes(self) -> CodeGenContext {
         match self {
-            CodeGenContext::TryBlock { parent }
-            | CodeGenContext::ExceptHandler { parent } => parent.strip_exception_scopes(),
+            CodeGenContext::TryBlock { parent } | CodeGenContext::ExceptHandler { parent } => {
+                parent.strip_exception_scopes()
+            }
             other => other,
         }
     }

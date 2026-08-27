@@ -36,10 +36,10 @@ impl<'a, 'py> FromPyObject<'a, 'py> for AsyncWith {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract items (list of withitem objects)
         let items: Vec<WithItem> = extract_list(&ob, "items", "async with items")?;
-        
+
         // Extract body
         let body: Vec<Statement> = extract_list(&ob, "body", "async with body")?;
-        
+
         Ok(AsyncWith {
             items,
             body,
@@ -56,7 +56,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for WithItem {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract context_expr
         let context_expr: ExprType = ob.getattr("context_expr")?.extract()?;
-        
+
         // Extract optional_vars (optional)
         let optional_vars: Option<ExprType> = if let Ok(vars_attr) = ob.getattr("optional_vars") {
             if vars_attr.is_none() {
@@ -67,7 +67,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for WithItem {
         } else {
             None
         };
-        
+
         Ok(WithItem {
             context_expr,
             optional_vars,
@@ -76,10 +76,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for WithItem {
 }
 
 impl Node for AsyncWith {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl CodeGen for AsyncWith {
@@ -97,7 +105,9 @@ impl CodeGen for AsyncWith {
                 acc
             }
         });
-        self.body.into_iter().fold(symbols, |acc, stmt| stmt.find_symbols(acc))
+        self.body
+            .into_iter()
+            .fold(symbols, |acc, stmt| stmt.find_symbols(acc))
     }
 
     fn to_rust(
@@ -125,7 +135,9 @@ impl CodeGen for AsyncWith {
             }
         }
 
-        let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
+        let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+            .body
+            .into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let body_tokens = body_tokens?;

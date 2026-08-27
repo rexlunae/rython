@@ -4,8 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
-    Node, impl_node_with_positions, extract_list
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes, extract_list,
+    impl_node_with_positions,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -23,7 +23,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Dict {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let keys: Vec<Option<ExprType>> = extract_list(&ob, "keys", "dictionary keys")?;
         let values: Vec<ExprType> = extract_list(&ob, "values", "dictionary values")?;
-        
+
         Ok(Dict {
             keys,
             values,
@@ -35,7 +35,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Dict {
     }
 }
 
-impl_node_with_positions!(Dict { lineno, col_offset, end_lineno, end_col_offset });
+impl_node_with_positions!(Dict {
+    lineno,
+    col_offset,
+    end_lineno,
+    end_col_offset
+});
 
 impl CodeGen for Dict {
     type Context = CodeGenContext;
@@ -112,12 +117,9 @@ impl CodeGen for Dict {
             let all_str_tuples = v_distinct.iter().all(|t| match t {
                 crate::TypeInfo::Tuple(ts) => {
                     !ts.is_empty()
-                        && ts.iter().all(|e| {
-                            matches!(
-                                e,
-                                crate::TypeInfo::StrRef | crate::TypeInfo::String
-                            )
-                        })
+                        && ts
+                            .iter()
+                            .all(|e| matches!(e, crate::TypeInfo::StrRef | crate::TypeInfo::String))
                 }
                 _ => false,
             });
@@ -185,9 +187,10 @@ impl CodeGen for Dict {
                 }
                 None => {
                     // `{**other}`: a spread merges the other dict's entries.
-                    let spread = value
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let spread =
+                        value
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     spreads.push(spread);
                 }
             }
@@ -220,22 +223,21 @@ impl CodeGen for Dict {
                 // value boxes as PyValue.
                 (k.to_rust_type(), quote!(stdpython::PyValue))
             } else if let Some(first) = self
-                    .keys
-                    .iter()
-                    .zip(self.values.iter())
-                    .find(|(k, _)| k.is_none())
-                    .map(|(_, v)| v)
-                    && let crate::TypeInfo::Dict(k, v) =
-                        crate::infer_type(first, &options, &symbols)
-                {
-                    (k.to_rust_type(), v.to_rust_type())
-                } else {
-                    // An all-spread literal with no statically-known types
-                    // (`{**request_dict['context'].get('signing', {}),
-                    // **signing_context}` — botocore's utils): a boxed
-                    // PyDict<String, PyValue> (the boxed-dict divergence).
-                    (quote!(String), quote!(stdpython::PyValue))
-                };
+                .keys
+                .iter()
+                .zip(self.values.iter())
+                .find(|(k, _)| k.is_none())
+                .map(|(_, v)| v)
+                && let crate::TypeInfo::Dict(k, v) = crate::infer_type(first, &options, &symbols)
+            {
+                (k.to_rust_type(), v.to_rust_type())
+            } else {
+                // An all-spread literal with no statically-known types
+                // (`{**request_dict['context'].get('signing', {}),
+                // **signing_context}` — botocore's utils): a boxed
+                // PyDict<String, PyValue> (the boxed-dict divergence).
+                (quote!(String), quote!(stdpython::PyValue))
+            };
             Ok(quote! {
                 {
                     let mut __rython_dict = PyDict::<#k_ty, #v_ty>::from([#(#keys),*]);

@@ -37,7 +37,10 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
                     "{}",
                     PyException::new(
                         "ValueError",
-                        format!("shapes ({n},) and ({},) not aligned: {n} (dim 0) != {} (dim 0)", b.size, b.size)
+                        format!(
+                            "shapes ({n},) and ({},) not aligned: {n} (dim 0) != {} (dim 0)",
+                            b.size, b.size
+                        )
                     )
                 );
             }
@@ -56,7 +59,10 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
                     "{}",
                     PyException::new(
                         "ValueError",
-                        format!("shapes ({m},{k}) and ({},) not aligned: {k} (dim 1) != {} (dim 0)", b.size, b.size)
+                        format!(
+                            "shapes ({m},{k}) and ({},) not aligned: {k} (dim 1) != {} (dim 0)",
+                            b.size, b.size
+                        )
                     )
                 );
             }
@@ -79,7 +85,10 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
                     "{}",
                     PyException::new(
                         "ValueError",
-                        format!("shapes ({},) and ({k},{n}) not aligned: {} (dim 0) != {k} (dim 0)", a.size, a.size)
+                        format!(
+                            "shapes ({},) and ({k},{n}) not aligned: {} (dim 0) != {k} (dim 0)",
+                            a.size, a.size
+                        )
                     )
                 );
             }
@@ -103,7 +112,9 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
                     "{}",
                     PyException::new(
                         "ValueError",
-                        format!("shapes ({m},{k}) and ({k2},{n}) not aligned: {k} (dim 1) != {k2} (dim 0)")
+                        format!(
+                            "shapes ({m},{k}) and ({k2},{n}) not aligned: {k} (dim 1) != {k2} (dim 0)"
+                        )
                     )
                 );
             }
@@ -123,10 +134,7 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
         }
         _ => panic!(
             "{}",
-            PyException::new(
-                "ValueError",
-                "dot: only 1-D and 2-D arrays are supported"
-            )
+            PyException::new("ValueError", "dot: only 1-D and 2-D arrays are supported")
         ),
     }
 }
@@ -143,10 +151,7 @@ pub fn vdot(a: NdArray, b: NdArray) -> f64 {
             "{}",
             PyException::new(
                 "ValueError",
-                format!(
-                    "vdot: shapes ({},) and ({},) not aligned",
-                    a.size, b.size
-                )
+                format!("vdot: shapes ({},) and ({},) not aligned", a.size, b.size)
             ),
         );
     }
@@ -234,10 +239,7 @@ pub fn inv(a: NdArray) -> NdArray {
         if aug[piv * (2 * n) + k] == 0.0 {
             panic!(
                 "{}",
-                PyException::new(
-                    "LinAlgError",
-                    "Singular matrix (det == 0); cannot invert"
-                )
+                PyException::new("LinAlgError", "Singular matrix (det == 0); cannot invert")
             );
         }
         if piv != k {
@@ -288,10 +290,7 @@ pub fn solve(a: NdArray, b: NdArray) -> NdArray {
                 "{}",
                 PyException::new(
                     "ValueError",
-                    format!(
-                        "solve: incompatible dimensions ({n},{n}) and {:?}",
-                        b.shape
-                    )
+                    format!("solve: incompatible dimensions ({n},{n}) and {:?}", b.shape)
                 )
             );
         }
@@ -331,10 +330,7 @@ pub fn solve(a: NdArray, b: NdArray) -> NdArray {
             }
         }
         if aug[piv * (n + rhs_cols) + k] == 0.0 {
-            panic!(
-                "{}",
-                PyException::new("LinAlgError", "Singular matrix")
-            );
+            panic!("{}", PyException::new("LinAlgError", "Singular matrix"));
         }
         if piv != k {
             for j in 0..n + rhs_cols {

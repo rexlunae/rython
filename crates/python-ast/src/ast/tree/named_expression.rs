@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use pyo3::{Borrowed, PyAny, PyResult, FromPyObject, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 

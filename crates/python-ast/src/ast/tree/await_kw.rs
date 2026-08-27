@@ -1,8 +1,10 @@
 use proc_macro2::TokenStream;
-use pyo3::{Borrowed, PyAny, PyResult, FromPyObject, prelude::PyAnyMethods};
+use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 
-use crate::{extraction_failure, CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes};
+use crate::{
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes, extraction_failure,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,9 +17,15 @@ pub struct Await {
 impl<'a, 'py> FromPyObject<'a, 'py> for Await {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let value = ob.getattr("value").map_err(|e| extraction_failure("Await.value", &ob, e))?;
+        let value = ob
+            .getattr("value")
+            .map_err(|e| extraction_failure("Await.value", &ob, e))?;
         Ok(Await {
-            value: Box::new(value.extract().map_err(|e| extraction_failure("Await.value", &ob, e))?),
+            value: Box::new(
+                value
+                    .extract()
+                    .map_err(|e| extraction_failure("Await.value", &ob, e))?,
+            ),
         })
     }
 }

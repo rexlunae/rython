@@ -1,7 +1,6 @@
-/// Generic utilities for parsing Python AST objects with consistent error handling.
-
-use pyo3::{Bound, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use crate::{Node, dump};
+/// Generic utilities for parsing Python AST objects with consistent error handling.
+use pyo3::{Bound, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 
 /// Generic function for extracting Python operator types with consistent error handling.
 pub fn extract_operator_type<T>(
@@ -14,16 +13,13 @@ where
 {
     let op = ob.getattr(attr_name).map_err(|_| {
         pyo3::exceptions::PyAttributeError::new_err(
-            ob.error_message("<unknown>", format!("error getting {}", context))
+            ob.error_message("<unknown>", format!("error getting {}", context)),
         )
     })?;
 
     let op_type = op.get_type().name().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err(
-            ob.error_message(
-                "<unknown>",
-                format!("extracting type name for {}", context),
-            )
+            ob.error_message("<unknown>", format!("extracting type name for {}", context)),
         )
     })?;
 
@@ -42,61 +38,68 @@ where
     R: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
 {
     let left = ob.getattr(left_attr).map_err(|_| {
-        pyo3::exceptions::PyAttributeError::new_err(
-            ob.error_message("<unknown>", format!("error getting {} left operand", context))
-        )
+        pyo3::exceptions::PyAttributeError::new_err(ob.error_message(
+            "<unknown>",
+            format!("error getting {} left operand", context),
+        ))
     })?;
 
     let right = ob.getattr(right_attr).map_err(|_| {
-        pyo3::exceptions::PyAttributeError::new_err(
-            ob.error_message("<unknown>", format!("error getting {} right operand", context))
-        )
+        pyo3::exceptions::PyAttributeError::new_err(ob.error_message(
+            "<unknown>",
+            format!("error getting {} right operand", context),
+        ))
     })?;
 
-    let left = left.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
-        let e: pyo3::PyErr = e.into();
-        pyo3::exceptions::PyValueError::new_err(
-            format!("Failed to extract {} left operand: {}", context, e)
-        )
-    })?;
+    let left = left
+        .extract()
+        .map_err(Into::into)
+        .map_err(|e: pyo3::PyErr| {
+            let e: pyo3::PyErr = e.into();
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to extract {} left operand: {}",
+                context, e
+            ))
+        })?;
 
-    let right = right.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
-        let e: pyo3::PyErr = e.into();
-        pyo3::exceptions::PyValueError::new_err(
-            format!("Failed to extract {} right operand: {}", context, e)
-        )
-    })?;
+    let right = right
+        .extract()
+        .map_err(Into::into)
+        .map_err(|e: pyo3::PyErr| {
+            let e: pyo3::PyErr = e.into();
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to extract {} right operand: {}",
+                context, e
+            ))
+        })?;
 
     Ok((left, right))
 }
 
 /// Generic function for extracting lists of items with error handling.
-pub fn extract_list<T>(
-    ob: &Bound<PyAny>,
-    attr_name: &str,
-    context: &str,
-) -> PyResult<Vec<T>>
+pub fn extract_list<T>(ob: &Bound<PyAny>, attr_name: &str, context: &str) -> PyResult<Vec<T>>
 where
     T: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
 {
     let list_obj = ob.getattr(attr_name).map_err(|_| {
         pyo3::exceptions::PyAttributeError::new_err(
-            ob.error_message("<unknown>", format!("error getting {} list", context))
+            ob.error_message("<unknown>", format!("error getting {} list", context)),
         )
     })?;
 
-    list_obj.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
-        pyo3::exceptions::PyValueError::new_err(
-            format!("Failed to extract {} list: {}", context, e)
-        )
-    })
+    list_obj
+        .extract()
+        .map_err(Into::into)
+        .map_err(|e: pyo3::PyErr| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to extract {} list: {}",
+                context, e
+            ))
+        })
 }
 
 /// Generic function to safely extract optional attributes.
-pub fn extract_optional<T>(
-    ob: &Bound<PyAny>,
-    attr_name: &str,
-) -> Option<T>
+pub fn extract_optional<T>(ob: &Bound<PyAny>, attr_name: &str) -> Option<T>
 where
     T: for<'any, 'py> pyo3::FromPyObject<'any, 'py>,
 {
@@ -106,7 +109,9 @@ where
 }
 
 /// Generic function to extract position information from AST nodes.
-pub fn extract_position_info(ob: &Bound<PyAny>) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
+pub fn extract_position_info(
+    ob: &Bound<PyAny>,
+) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
     (
         extract_optional(&ob, "lineno"),
         extract_optional(&ob, "col_offset"),
@@ -127,10 +132,12 @@ where
 {
     fn extract_with_context(ob: &Bound<'a, PyAny>, context: &str) -> PyResult<Self> {
         ob.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
-            pyo3::exceptions::PyValueError::new_err(
-                format!("Failed to extract {} from Python: {} (object: {})", 
-                    context, e, dump(&ob, None).unwrap_or_else(|_| "unknown".to_string()))
-            )
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to extract {} from Python: {} (object: {})",
+                context,
+                e,
+                dump(&ob, None).unwrap_or_else(|_| "unknown".to_string())
+            ))
         })
     }
 }
@@ -147,9 +154,7 @@ pub fn log_extraction(ob: &Bound<PyAny>, context: &str) {
 
 /// Helper function to create standardized error messages for failed extractions.
 pub fn extraction_error(context: &str, details: &str) -> pyo3::PyErr {
-    pyo3::exceptions::PyValueError::new_err(
-        format!("Failed to extract {}: {}", context, details)
-    )
+    pyo3::exceptions::PyValueError::new_err(format!("Failed to extract {}: {}", context, details))
 }
 
 /// Build an identifier for generated code from a Python name, escaping Rust
@@ -174,8 +179,8 @@ pub fn safe_ident(name: &str) -> proc_macro2::Ident {
         | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
         | "mut" | "pub" | "ref" | "return" | "static" | "struct" | "trait" | "true" | "type"
         | "unsafe" | "use" | "where" | "while" | "async" | "await" | "abstract" | "become"
-        | "box" | "do" | "final" | "macro" | "override" | "priv" | "try" | "typeof"
-        | "unsized" | "virtual" | "yield" | "gen" => format_ident!("r#{}", name),
+        | "box" | "do" | "final" | "macro" | "override" | "priv" | "try" | "typeof" | "unsized"
+        | "virtual" | "yield" | "gen" => format_ident!("r#{}", name),
         _ => format_ident!("{}", name),
     }
 }
@@ -221,11 +226,11 @@ mod tests {
             // Create a simple Python integer which has some attributes
             let code = CString::new("42").unwrap();
             let obj = py.eval(&code, None, None).unwrap();
-            
-            // Try to extract something that probably won't exist 
+
+            // Try to extract something that probably won't exist
             let missing: Option<String> = extract_optional(&obj, "missing_attr");
             assert_eq!(missing, None);
-            
+
             // This test mainly checks that extract_optional doesn't panic
             // and properly returns None for missing attributes
         });
@@ -237,7 +242,7 @@ mod tests {
             use std::ffi::CString;
             let code = CString::new("42").unwrap();
             let obj = py.eval(&code, None, None).unwrap();
-            
+
             // Should not panic
             log_extraction(&obj, "test object");
         });
@@ -261,15 +266,14 @@ pub fn get_attr_with_context<'a>(
     context: &str,
 ) -> PyResult<Bound<'a, PyAny>> {
     ob.getattr(attr_name).map_err(|e| {
-        let type_name = ob.get_type().name()
+        let type_name = ob
+            .get_type()
+            .name()
             .map(|s| s.to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
         let enhanced_msg = format!(
             "Failed to get attribute '{}' from {} ({}): {}",
-            attr_name,
-            context,
-            type_name,
-            e
+            attr_name, context, type_name, e
         );
         pyo3::exceptions::PyAttributeError::new_err(enhanced_msg)
     })
@@ -284,20 +288,25 @@ pub fn extract_with_context<'py, T>(
 where
     T: pyo3::conversion::FromPyObjectOwned<'py>,
 {
-    value.extract().map_err(Into::into).map_err(|e: pyo3::PyErr| {
-        let type_name = value.get_type().name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string());
-        let enhanced_msg = format!(
-            "Failed to extract {} for attribute '{}': {}. Expected type: {}, got: {}",
-            context,
-            attr_name,
-            e,
-            std::any::type_name::<T>(),
-            type_name
-        );
-        pyo3::exceptions::PyTypeError::new_err(enhanced_msg)
-    })
+    value
+        .extract()
+        .map_err(Into::into)
+        .map_err(|e: pyo3::PyErr| {
+            let type_name = value
+                .get_type()
+                .name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let enhanced_msg = format!(
+                "Failed to extract {} for attribute '{}': {}. Expected type: {}, got: {}",
+                context,
+                attr_name,
+                e,
+                std::any::type_name::<T>(),
+                type_name
+            );
+            pyo3::exceptions::PyTypeError::new_err(enhanced_msg)
+        })
 }
 
 /// Extract a required attribute with enhanced error messaging  

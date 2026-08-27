@@ -33,9 +33,9 @@ pub use dtype::Dtype;
 pub use engine::{Backend, active_backend, backend_summary, set_backend};
 pub use ndarray::{IntoShape, NdArray};
 
-use ndarray::Data;
 use crate::PyException;
 use crate::PyIndex;
+use ndarray::Data;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -58,8 +58,7 @@ pub fn set_backend_by_name(name: &str) -> Result<(), String> {
         }
         None => Err(format!(
             "unknown numpy backend '{name}' (expected one of: {})",
-            ["auto", "scalar", "rayon", "simd", "cuda", "vulkan"]
-                .join(", ")
+            ["auto", "scalar", "rayon", "simd", "cuda", "vulkan"].join(", ")
         )),
     }
 }
@@ -534,7 +533,9 @@ pub fn concatenate(arrays: Vec<NdArray>, axis: i64) -> NdArray {
     let mut shape = arrays[0].shape.clone();
     shape[0] = arrays.iter().map(|a| a.shape[0]).sum();
     let total: usize = arrays.iter().map(|a| a.size).sum();
-    let dtype = arrays.iter().fold(arrays[0].dtype, |acc, a| acc.promote(a.dtype));
+    let dtype = arrays
+        .iter()
+        .fold(arrays[0].dtype, |acc, a| acc.promote(a.dtype));
     let promoted: Vec<NdArray> = arrays
         .iter()
         .map(|a| {
@@ -613,10 +614,18 @@ pub fn hstack(arrays: Vec<NdArray>) -> NdArray {
     }
     let rows = arrays[0].shape[0];
     let cols: usize = arrays.iter().map(|a| a.shape[1]).sum();
-    let dtype = arrays.iter().fold(arrays[0].dtype, |acc, a| acc.promote(a.dtype));
+    let dtype = arrays
+        .iter()
+        .fold(arrays[0].dtype, |acc, a| acc.promote(a.dtype));
     let promoted: Vec<NdArray> = arrays
         .iter()
-        .map(|a| if a.dtype == dtype { a.clone() } else { a.astype(dtype) })
+        .map(|a| {
+            if a.dtype == dtype {
+                a.clone()
+            } else {
+                a.astype(dtype)
+            }
+        })
         .collect();
     let mut out = NdArray::zeros(vec![rows, cols], dtype);
     let mut col = 0usize;
@@ -755,11 +764,11 @@ pub fn argmin(a: NdArray) -> i64 {
 // ---------------------------------------------------------------------------
 
 pub use ufunc::{
-    abs, add, arccos, arcsin, arctan, bitwise_and, bitwise_or, bitwise_xor, ceil, clip, cos,
-    cosh, divide, equal, exp, expm1, floor, floor_divide, greater, greater_equal, isfinite,
-    isinf, isnan, less, less_equal, log, log10, log1p, log2, logical_and, logical_not,
-    logical_or, logical_xor, maximum, minimum, mod_, multiply, negative, not_equal, power,
-    reciprocal, remainder, sign, sin, sinh, sqrt, square, subtract, tan, tanh, where_,
+    abs, add, arccos, arcsin, arctan, bitwise_and, bitwise_or, bitwise_xor, ceil, clip, cos, cosh,
+    divide, equal, exp, expm1, floor, floor_divide, greater, greater_equal, isfinite, isinf, isnan,
+    less, less_equal, log, log1p, log2, log10, logical_and, logical_not, logical_or, logical_xor,
+    maximum, minimum, mod_, multiply, negative, not_equal, power, reciprocal, remainder, sign, sin,
+    sinh, sqrt, square, subtract, tan, tanh, where_,
 };
 
 // ---------------------------------------------------------------------------
@@ -798,12 +807,23 @@ mod arange_tests {
         // Fractional steps: numpy's length is ceil((stop-start)/step) with
         // NO per-element bound check, so the value equal to `stop` IS
         // included when the ceil lands on it.
-        assert_eq!(f64s(&arange_f3(0.1, 0.4, 0.1)), vec![0.1, 0.2, 0.30000000000000004, 0.4]);
+        assert_eq!(
+            f64s(&arange_f3(0.1, 0.4, 0.1)),
+            vec![0.1, 0.2, 0.30000000000000004, 0.4]
+        );
         // The fill resharpens the step to delta = (start+step)-start and
         // computes fma(i, delta, start) (numpy's FMA-contracted fill).
         assert_eq!(
             f64s(&arange_f3(0.5, 2.5, 0.3)),
-            vec![0.5, 0.8, 1.1, 1.4000000000000001, 1.7000000000000002, 2.0, 2.3000000000000003]
+            vec![
+                0.5,
+                0.8,
+                1.1,
+                1.4000000000000001,
+                1.7000000000000002,
+                2.0,
+                2.3000000000000003
+            ]
         );
         assert_eq!(
             f64s(&arange_f3(0.3, 0.7, 0.1)),
@@ -811,7 +831,10 @@ mod arange_tests {
         );
         assert_eq!(arange_f3(0.0, 100.0, 0.1).size, 1000);
         assert_eq!(f64s(&arange_f3(0.0, 100.0, 0.1)).last(), Some(&99.9));
-        assert_eq!(f64s(&arange_f3(0.0, 8.0, 1.0)), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(
+            f64s(&arange_f3(0.0, 8.0, 1.0)),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        );
         assert_eq!(f64s(&arange_f3(1.0, 0.0, -0.5)), vec![1.0, 0.5]);
         assert_eq!(f64s(&arange_f3(0.0, -5.0, 1.0)), Vec::<f64>::new());
         assert_eq!(f64s(&arange_f3(2.0, 2.0, 1.0)), Vec::<f64>::new());
@@ -984,7 +1007,10 @@ mod divmod_tests {
         // Euclidean -1); np.mod -> array([1, 1, -1, -1]) — divisor sign.
         let a = array(vec![7i64, -7, 3, -3]);
         let b = array(vec![2i64, 2, -2, -2]);
-        assert_eq!(i64s(&floor_divide(a.clone(), b.clone())), vec![3, -4, -2, 1]);
+        assert_eq!(
+            i64s(&floor_divide(a.clone(), b.clone())),
+            vec![3, -4, -2, 1]
+        );
         assert_eq!(i64s(&mod_(a, b)), vec![1, 1, -1, -1]);
         // i64::MIN // -1 wraps to i64::MIN (numpy, with an overflow warning)
         assert_eq!(
@@ -1000,7 +1026,10 @@ mod divmod_tests {
         // which is floor(10.0) = 10.0 — numpy uses its fmod-based divmod);
         // np.mod(np.array([1.0]), 0.1) -> 0.09999999999999995.
         assert_eq!(f64s(&floor_divide(array(vec![1.0f64]), 0.1f64)), vec![9.0]);
-        assert_eq!(f64s(&mod_(array(vec![1.0f64]), 0.1f64)), vec![0.09999999999999995]);
+        assert_eq!(
+            f64s(&mod_(array(vec![1.0f64]), 0.1f64)),
+            vec![0.09999999999999995]
+        );
         // signed-zero corners: floor_divide(-1.0, -2.0) is +0.0,
         // floor_divide(0.0, -2.0) is -0.0, mod(0.0, -2.0) is -0.0
         let z = f64s(&floor_divide(array(vec![-1.0f64]), -2.0f64));
@@ -1026,12 +1055,32 @@ mod predicate_tests {
     /// Verified against python3 + numpy 2.x.
     #[test]
     fn predicates_match_numpy() {
-        let f = array(vec![1.0f64, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 0.0, -0.0, -2.5]);
-        assert_eq!(bools(&isfinite(f.clone())), vec![true, false, false, false, true, true, true]);
-        assert_eq!(bools(&isinf(f.clone())), vec![false, true, true, false, false, false, false]);
-        assert_eq!(bools(&isnan(f.clone())), vec![false, false, false, true, false, false, false]);
+        let f = array(vec![
+            1.0f64,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            0.0,
+            -0.0,
+            -2.5,
+        ]);
+        assert_eq!(
+            bools(&isfinite(f.clone())),
+            vec![true, false, false, false, true, true, true]
+        );
+        assert_eq!(
+            bools(&isinf(f.clone())),
+            vec![false, true, true, false, false, false, false]
+        );
+        assert_eq!(
+            bools(&isnan(f.clone())),
+            vec![false, false, false, true, false, false, false]
+        );
         // NaN is truthy, so logical_not(NaN) is False; only exact 0.0 is True
-        assert_eq!(bools(&logical_not(f)), vec![false, false, false, false, true, true, false]);
+        assert_eq!(
+            bools(&logical_not(f)),
+            vec![false, false, false, false, true, true, false]
+        );
         // ints are always finite, never inf/nan; logical_not(x) = (x == 0)
         let i = array(vec![1i64, -5, 0]);
         assert_eq!(bools(&isfinite(i.clone())), vec![true, true, true]);
@@ -1070,12 +1119,18 @@ mod reduce_tests {
         assert_eq!(sum(x(1000)), 68357.14969285714);
         // special values
         assert_eq!(sum(array(vec![-0.0f64, -0.0])), 0.0);
-        assert_eq!(sum(array(vec![1e308f64, 1e308, -1e308, -1e308])), f64::INFINITY);
+        assert_eq!(
+            sum(array(vec![1e308f64, 1e308, -1e308, -1e308])),
+            f64::INFINITY
+        );
         assert!(sum(array(vec![f64::NAN, 1.0])).is_nan());
         assert_eq!(sum(array(vec![5e-324f64, 5e-324, 5e-324])), 1.5e-323);
         // ddof edges: numpy returns inf/nan (with a warning), not an error
         assert_eq!(std(array(vec![1.0f64, 2.0, 3.0, 4.0]), 4.0), f64::INFINITY);
-        assert_eq!(std(array(vec![1.0f64, 2.0, 3.0, 4.0]), 3.0), 2.23606797749979);
+        assert_eq!(
+            std(array(vec![1.0f64, 2.0, 3.0, 4.0]), 3.0),
+            2.23606797749979
+        );
         assert!(mean(array(Vec::<f64>::new())).is_nan());
         assert!(var(array(Vec::<f64>::new()), 0.0).is_nan());
         assert_eq!(sum(array(Vec::<f64>::new())), 0.0);
@@ -1119,7 +1174,9 @@ mod weak_promotion_tests {
     }
 
     #[test]
-    #[should_panic(expected = "OverflowError: Python integer 1099511627776 out of bounds for int32")]
+    #[should_panic(
+        expected = "OverflowError: Python integer 1099511627776 out of bounds for int32"
+    )]
     fn int_scalar_out_of_int32_bounds_raises() {
         let i32a = array(vec![1i64, 2]).astype(Dtype::Int32);
         add(i32a, 1i64 << 40);

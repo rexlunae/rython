@@ -4,8 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
-    PyAttributeExtractor, extract_list,
+    CodeGen, CodeGenContext, ExprType, Node, PyAttributeExtractor, PythonOptions,
+    SymbolTableScopes, extract_list,
 };
 
 /// List comprehension (e.g., [x ** 2 for x in range(10) if x % 2 == 0])
@@ -85,10 +85,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ListComp {
         // Extract the element expression
         let elt = ob.extract_attr_with_context("elt", "list comprehension element")?;
         let elt: ExprType = elt.extract()?;
-        
+
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "list comprehension generators")?;
-        
+        let generators: Vec<Comprehension> =
+            extract_list(&ob, "generators", "list comprehension generators")?;
+
         Ok(ListComp {
             elt: Box::new(elt),
             generators,
@@ -106,10 +107,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for SetComp {
         // Extract the element expression
         let elt = ob.extract_attr_with_context("elt", "set comprehension element")?;
         let elt: ExprType = elt.extract()?;
-        
+
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "set comprehension generators")?;
-        
+        let generators: Vec<Comprehension> =
+            extract_list(&ob, "generators", "set comprehension generators")?;
+
         Ok(SetComp {
             elt: Box::new(elt),
             generators,
@@ -127,10 +129,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for GeneratorExp {
         // Extract the element expression
         let elt = ob.extract_attr_with_context("elt", "generator expression element")?;
         let elt: ExprType = elt.extract()?;
-        
+
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "generator expression generators")?;
-        
+        let generators: Vec<Comprehension> =
+            extract_list(&ob, "generators", "generator expression generators")?;
+
         Ok(GeneratorExp {
             elt: Box::new(elt),
             generators,
@@ -148,14 +151,15 @@ impl<'a, 'py> FromPyObject<'a, 'py> for DictComp {
         // Extract the key expression
         let key = ob.extract_attr_with_context("key", "dict comprehension key")?;
         let key: ExprType = key.extract()?;
-        
+
         // Extract the value expression
         let value = ob.extract_attr_with_context("value", "dict comprehension value")?;
         let value: ExprType = value.extract()?;
-        
+
         // Extract generators
-        let generators: Vec<Comprehension> = extract_list(&ob, "generators", "dict comprehension generators")?;
-        
+        let generators: Vec<Comprehension> =
+            extract_list(&ob, "generators", "dict comprehension generators")?;
+
         Ok(DictComp {
             key: Box::new(key),
             value: Box::new(value),
@@ -174,17 +178,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Comprehension {
         // Extract target
         let target = ob.extract_attr_with_context("target", "comprehension target")?;
         let target: ExprType = target.extract()?;
-        
+
         // Extract iter
         let iter = ob.extract_attr_with_context("iter", "comprehension iter")?;
         let iter: ExprType = iter.extract()?;
-        
+
         // Extract ifs (list of conditions)
-        let ifs: Vec<ExprType> = extract_list(&ob, "ifs", "comprehension conditions").unwrap_or_default();
-        
+        let ifs: Vec<ExprType> =
+            extract_list(&ob, "ifs", "comprehension conditions").unwrap_or_default();
+
         // Extract is_async
         let is_async: bool = ob.getattr("is_async")?.extract().unwrap_or(false);
-        
+
         Ok(Comprehension {
             target,
             iter,
@@ -195,31 +200,63 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Comprehension {
 }
 
 impl Node for ListComp {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl Node for SetComp {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl Node for GeneratorExp {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl Node for DictComp {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 /// Lower a comprehension's generator clauses into nested `for` loops around
@@ -236,14 +273,16 @@ fn build_comprehension_loops(
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let mut acc = inner;
     for generator in generators.iter().rev() {
-        let target = generator
-            .target
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let iter_expr = generator
-            .iter
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let target =
+            generator
+                .target
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let iter_expr =
+            generator
+                .iter
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let conditions: Result<Vec<_>, _> = generator
             .ifs
             .iter()
@@ -280,7 +319,10 @@ impl CodeGen for ListComp {
         self.generators.into_iter().fold(symbols, |acc, generator| {
             let acc = generator.target.find_symbols(acc);
             let acc = generator.iter.find_symbols(acc);
-            generator.ifs.into_iter().fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
+            generator
+                .ifs
+                .into_iter()
+                .fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
         })
     }
 
@@ -290,7 +332,9 @@ impl CodeGen for ListComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let elt = (*self.elt)
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.push(#elt); },
@@ -319,7 +363,10 @@ impl CodeGen for SetComp {
         self.generators.into_iter().fold(symbols, |acc, generator| {
             let acc = generator.target.find_symbols(acc);
             let acc = generator.iter.find_symbols(acc);
-            generator.ifs.into_iter().fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
+            generator
+                .ifs
+                .into_iter()
+                .fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
         })
     }
 
@@ -329,7 +376,9 @@ impl CodeGen for SetComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let elt = (*self.elt)
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.insert(#elt); },
@@ -358,7 +407,10 @@ impl CodeGen for GeneratorExp {
         self.generators.into_iter().fold(symbols, |acc, generator| {
             let acc = generator.target.find_symbols(acc);
             let acc = generator.iter.find_symbols(acc);
-            generator.ifs.into_iter().fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
+            generator
+                .ifs
+                .into_iter()
+                .fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
         })
     }
 
@@ -371,7 +423,9 @@ impl CodeGen for GeneratorExp {
         // Generator expressions are lowered eagerly (like a list
         // comprehension) and then turned back into an iterator; Python's lazy
         // evaluation is not modeled yet.
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let elt = (*self.elt)
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.push(#elt); },
@@ -401,7 +455,10 @@ impl CodeGen for DictComp {
         self.generators.into_iter().fold(symbols, |acc, generator| {
             let acc = generator.target.find_symbols(acc);
             let acc = generator.iter.find_symbols(acc);
-            generator.ifs.into_iter().fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
+            generator
+                .ifs
+                .into_iter()
+                .fold(acc, |acc, if_expr| if_expr.find_symbols(acc))
         })
     }
 
@@ -411,8 +468,12 @@ impl CodeGen for DictComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let key = (*self.key).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let value = (*self.value).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let key = (*self.key)
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value = (*self.value)
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.insert(#key, #value); },

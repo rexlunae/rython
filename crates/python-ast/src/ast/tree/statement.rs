@@ -3,9 +3,10 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types
 use quote::quote;
 
 use crate::{
-    dump, err_from, extraction_failure, Assign, AsyncFor, AsyncWith, AugAssign, Call, ClassDef,
-    CodeGen, CodeGenContext, Expr, ExprType, For, FunctionDef, If, Import, ImportFrom, Node,
-    PythonOptions, Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
+    Assign, AsyncFor, AsyncWith, AugAssign, Call, ClassDef, CodeGen, CodeGenContext, Expr,
+    ExprType, For, FunctionDef, If, Import, ImportFrom, Node, PythonOptions, Raise,
+    StatementNotYetImplemented, SymbolTableScopes, Try, While, With, dump, err_from,
+    extraction_failure,
 };
 
 use tracing::debug;
@@ -13,8 +14,7 @@ use tracing::debug;
 use serde::{Deserialize, Serialize};
 
 /// AST node types that can be used as a statement implement this type.
-pub trait PyStatementTrait: Clone + PartialEq {
-}
+pub trait PyStatementTrait: Clone + PartialEq {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Statement {
@@ -70,7 +70,8 @@ impl CodeGen for Statement {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
-        let result = self.statement
+        let result = self
+            .statement
             .clone()
             .to_rust(ctx, options, symbols)
             .map_err(|e| {
@@ -158,8 +159,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                     .map_err(|e| extraction_failure("async function definition", &ob, e))?,
             )),
             "Assign" => {
-                let assignment = Assign::extract(ob)
-                    .map_err(|e| extraction_failure("assignment", &ob, e))?;
+                let assignment =
+                    Assign::extract(ob).map_err(|e| extraction_failure("assignment", &ob, e))?;
                 Ok(StatementType::Assign(assignment))
             }
             "AnnAssign" => {
@@ -264,8 +265,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 Import::extract(ob).map_err(|e| extraction_failure("import", &ob, e))?,
             )),
             "ImportFrom" => Ok(StatementType::ImportFrom(
-                ImportFrom::extract(ob)
-                    .map_err(|e| extraction_failure("from-import", &ob, e))?,
+                ImportFrom::extract(ob).map_err(|e| extraction_failure("from-import", &ob, e))?,
             )),
             "Expr" => {
                 let expr = ob
@@ -361,8 +361,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
                 Ok(StatementType::AsyncFor(async_for_stmt))
             }
             "Raise" => {
-                let raise_stmt =
-                    Raise::extract(ob).map_err(|e| extraction_failure("raise statement", &ob, e))?;
+                let raise_stmt = Raise::extract(ob)
+                    .map_err(|e| extraction_failure("raise statement", &ob, e))?;
                 Ok(StatementType::Raise(raise_stmt))
             }
             "With" => {
@@ -373,10 +373,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StatementType {
             other => Err(extraction_failure(
                 "statement",
                 &ob,
-                format!(
-                    "the `{}` statement is not yet supported by rython",
-                    other
-                ),
+                format!("the `{}` statement is not yet supported by rython", other),
             )),
         }
     }
@@ -406,9 +403,7 @@ fn return_tokens(ctx: &CodeGenContext, value: TokenStream) -> TokenStream {
 pub fn body_breaks_outward(body: &[Statement]) -> bool {
     body.iter().any(|stmt| match &stmt.statement {
         StatementType::Break | StatementType::Continue => true,
-        StatementType::If(s) => {
-            body_breaks_outward(&s.body) || body_breaks_outward(&s.orelse)
-        }
+        StatementType::If(s) => body_breaks_outward(&s.body) || body_breaks_outward(&s.orelse),
         // A loop captures breaks in its BODY; only its else clause can
         // break outward.
         StatementType::For(s) => body_breaks_outward(&s.orelse),
@@ -613,18 +608,16 @@ impl CodeGen for StatementType {
                 // annotated-path repro surfaces it as the NAME `None`, not
                 // the NoneType variant); a plain-None function returns the
                 // unit value.
-                let value = if options.fn_return_is_pyvalue
-                    && crate::is_none_expr(&e.value)
-                {
+                let value = if options.fn_return_is_pyvalue && crate::is_none_expr(&e.value) {
                     quote!(PyValue::None_)
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns
                     // (the identity From passes already-boxed values).
-                    let tokens = e
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let tokens =
+                        e.clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     quote!(PyValue::from(#tokens))
                 } else {
                     let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
@@ -693,9 +686,11 @@ impl CodeGen for StatementType {
                             )?;
                             match &sub.kind {
                                 crate::SubscriptKind::Index(index) => {
-                                    let idx = index
-                                        .clone()
-                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                    let idx = index.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
                                     // A string-literal KEY is owned (dict
                                     // keys normalize to String).
                                     let idx = if matches!(
@@ -723,9 +718,8 @@ impl CodeGen for StatementType {
                                     // runtime's clear (Python's `xs[:] = []`).
                                     // An explicit step of 1 is the same
                                     // operation.
-                                    let step_is_one = crate::ast::tree::subscript::is_step_one(
-                                        step.as_deref(),
-                                    );
+                                    let step_is_one =
+                                        crate::ast::tree::subscript::is_step_one(step.as_deref());
                                     if lower.is_none()
                                         && upper.is_none()
                                         && (step.is_none() || step_is_one)
@@ -737,19 +731,31 @@ impl CodeGen for StatementType {
                                         // selected slots in place.
                                         let lo_tok = match lower {
                                             Some(e) => {
-                                                let t = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                                let t = e.clone().to_rust(
+                                                    ctx.clone(),
+                                                    options.clone(),
+                                                    symbols.clone(),
+                                                )?;
                                                 quote!(Some(#t))
                                             }
                                             None => quote!(None),
                                         };
                                         let up_tok = match upper {
                                             Some(e) => {
-                                                let t = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                                let t = e.clone().to_rust(
+                                                    ctx.clone(),
+                                                    options.clone(),
+                                                    symbols.clone(),
+                                                )?;
                                                 quote!(Some(#t))
                                             }
                                             None => quote!(None),
                                         };
-                                        let st_tok = step.clone().unwrap().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                        let st_tok = step.clone().unwrap().to_rust(
+                                            ctx.clone(),
+                                            options.clone(),
+                                            symbols.clone(),
+                                        )?;
                                         stmts.push(quote!(
                                             (#receiver).py_slice_delete_step(#lo_tok, #up_tok, #st_tok)?;
                                         ));
@@ -822,11 +828,9 @@ impl CodeGen for StatementType {
                             }
                         }
                         _ => {
-                            return Err(
-                                "del with this target shape is not supported (issue #112)"
-                                    .to_string()
-                                    .into(),
-                            );
+                            return Err("del with this target shape is not supported (issue #112)"
+                                .to_string()
+                                .into());
                         }
                     }
                 }

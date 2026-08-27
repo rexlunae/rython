@@ -27,6 +27,5 @@ pub fn create_scratch(tag: &str) -> PathBuf {
     };
     // Return the resolved path: the fallback route contains `..` components,
     // which rython's glob (and some tools) do not normalize.
-    fs::canonicalize(&created)
-        .unwrap_or(created)
+    fs::canonicalize(&created).unwrap_or(created)
 }

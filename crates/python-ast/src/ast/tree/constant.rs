@@ -1,10 +1,10 @@
 use std::fmt::*;
 
 use litrs::Literal;
-use tracing::debug;
 use proc_macro2::*;
 use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
+use tracing::debug;
 
 use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
 
@@ -216,7 +216,7 @@ impl CodeGen for Constant {
 mod tests {
     use test_log::test;
     //use super::*;
-    use crate::{symbols::SymbolTableScopes, CodeGen};
+    use crate::{CodeGen, symbols::SymbolTableScopes};
     use tracing::debug;
 
     #[test]

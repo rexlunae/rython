@@ -4,8 +4,8 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
-    BinOps, FromPythonString, PyAttributeExtractor,
+    BinOps, CodeGen, CodeGenContext, ExprType, FromPythonString, Node, PyAttributeExtractor,
+    PythonOptions, SymbolTableScopes,
 };
 
 /// Augmented assignment statement (e.g., x += 1, y -= 2, etc.)
@@ -30,16 +30,16 @@ impl<'a, 'py> FromPyObject<'a, 'py> for AugAssign {
         // Extract target
         let target = ob.extract_attr_with_context("target", "augmented assignment target")?;
         let target: ExprType = target.extract()?;
-        
+
         // Extract operator
         let op = ob.extract_attr_with_context("op", "augmented assignment operator")?;
         let op_type_str = op.extract_type_name("augmented assignment operator")?;
         let op = BinOps::parse_or_unknown(&op_type_str);
-        
+
         // Extract value
         let value = ob.extract_attr_with_context("value", "augmented assignment value")?;
         let value: ExprType = value.extract()?;
-        
+
         Ok(AugAssign {
             target,
             op,
@@ -53,10 +53,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for AugAssign {
 }
 
 impl Node for AugAssign {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl CodeGen for AugAssign {
@@ -87,10 +95,10 @@ impl CodeGen for AugAssign {
         {
             let ident = crate::safe_ident(&n.id);
             let global_ref = kind.static_ref(&ident);
-            let value = self
-                .value
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let value =
+                self.value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let elem = quote!(__rython_g);
             let combined = combine_op(&self.op, &elem, &value)?;
             return Ok(quote! {
@@ -147,7 +155,7 @@ impl CodeGen for AugAssign {
                         "augmented assignment to a slice (`x[a:b] += ...`) is not supported"
                             .to_string()
                             .into(),
-                    )
+                    );
                 }
             };
             let value = self.value.to_rust(ctx, options, symbols)?;
@@ -180,14 +188,16 @@ impl CodeGen for AugAssign {
                     &symbols,
                     true,
                 )?;
-                let load = self
-                    .target
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let load =
+                    self.target
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                 (store, load)
             }
             _ => {
-                let t = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let t = self
+                    .target
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                 (t.clone(), t)
             }
         };
@@ -221,15 +231,13 @@ impl CodeGen for AugAssign {
             BinOps::Pow => {
                 // Rust doesn't have **= operator, so we need to expand it
                 Ok(quote!(#target = py_pow(#target_load, #value)))
-            },
+            }
             BinOps::MatMult => {
                 // Matrix multiplication assignment - not directly supported in Rust
                 // Would need specific matrix library support
                 Err(format!("Matrix multiplication assignment not supported in Rust").into())
-            },
-            BinOps::Unknown => {
-                Err(format!("Unknown augmented assignment operator").into())
-            },
+            }
+            BinOps::Unknown => Err(format!("Unknown augmented assignment operator").into()),
         }
     }
 }
@@ -259,7 +267,7 @@ fn combine_op(
                 "augmented assignment operator {:?} not supported on subscripts",
                 other
             )
-            .into())
+            .into());
         }
     })
 }

@@ -442,7 +442,10 @@ impl NdArray {
             } else if d < 0 {
                 panic!(
                     "{}",
-                    PyException::new("ValueError", format!("negative dimensions are not allowed: {d}"))
+                    PyException::new(
+                        "ValueError",
+                        format!("negative dimensions are not allowed: {d}")
+                    )
                 );
             } else {
                 dims.push(d as usize);
@@ -460,7 +463,10 @@ impl NdArray {
                     "{}",
                     PyException::new(
                         "ValueError",
-                        format!("cannot reshape array of size {} into shape {:?}", self.size, shape)
+                        format!(
+                            "cannot reshape array of size {} into shape {:?}",
+                            self.size, shape
+                        )
                     )
                 );
             }
@@ -472,7 +478,10 @@ impl NdArray {
                 "{}",
                 PyException::new(
                     "ValueError",
-                    format!("cannot reshape array of size {} into shape {:?}", self.size, shape)
+                    format!(
+                        "cannot reshape array of size {} into shape {:?}",
+                        self.size, shape
+                    )
                 )
             );
         }
@@ -556,166 +565,533 @@ impl NdArray {
 // ===========================================================================
 // Printing: numpy's str()/repr() formatting
 // ===========================================================================
+//
+// This mirrors numpy's `arrayprint` for the dtypes the subset supports:
+// `FloatingFormat`/`IntegerFormat`/`BoolFormat` decide array-global cell
+// widths, and `_formatArray` walks the array wrapping at `linewidth` and
+// eliding the middle past `threshold`. Divergences here are silent — the
+// program prints, it just prints something else — so the unit tests at the
+// bottom of this file pin every rule against real `python3` output.
 
-/// numpy-style formatting for a float in a non-0d array. Differs from
-/// Python's repr: trailing `.0` becomes `.`, and scientific mantissas keep a
-/// decimal point (`1e+16` → `1.0e+16`).
-fn np_float_cell(x: f64, pad_left: usize, pad_right: usize, exp_mode: bool) -> String {
-    let s = crate::py_float_repr(x);
-    let (sign, body) = match s.strip_prefix('-') {
-        Some(r) => ("-", r),
-        None => ("", s.as_str()),
+/// numpy's default print options (`np.get_printoptions()`).
+const PRINT_PRECISION: usize = 8;
+const PRINT_LINEWIDTH: usize = 75;
+const PRINT_THRESHOLD: usize = 1000;
+const PRINT_EDGEITEMS: usize = 3;
+
+/// numpy's `dragon4_positional(x, precision, unique=True, fractional=True,
+/// trim='.')`: the decimal expansion rounded to at most `precision`
+/// fractional digits with trailing zeros removed. Returns
+/// `(integer_part_including_sign, fractional_part)` — the caller adds the
+/// point, which numpy always keeps.
+///
+/// Rust's `{:.p$}` rounds the exact binary value to `p` places the same way
+/// dragon4 does, and `unique=True` only ever *shortens* that, which the
+/// trailing-zero trim reproduces.
+fn positional_digits(x: f64, precision: usize, is_f32: bool) -> (String, String) {
+    // `unique=True` first: Rust's `{}` is the shortest decimal that round
+    // trips, and never uses exponent form. Only when that needs more than
+    // `precision` fractional digits does the precision cap round it — the
+    // order matters, since 0.3f32's shortest form is `0.3` while its 8-digit
+    // expansion is `0.30000001`.
+    let split = |s: String| -> (String, String) {
+        match s.split_once('.') {
+            Some((i, f)) => (i.to_string(), f.trim_end_matches('0').to_string()),
+            None => (s, String::new()),
+        }
     };
-    if exp_mode {
-        let (mant, exp) = body.split_once('e').expect("exp mode implies e");
-        let (int_part, frac_part) = match mant.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (mant, ""),
-        };
-        let mut frac = frac_part.to_string();
-        while frac.len() < pad_right {
-            frac.push('0');
-        }
-        format!("{}{}.{}{}", sign, int_part, frac, exp)
-    } else if body.contains('.') {
-        let (int_part, frac_part) = body.split_once('.').expect("checked");
-        let frac: String = frac_part.trim_end_matches('0').to_string();
-        format!("{}{:>width$}.{}", sign, int_part, frac, width = pad_left)
+    let shortest = if is_f32 {
+        format!("{}", x as f32)
     } else {
-        format!("{}{:>width$}.", sign, body, width = pad_left)
+        format!("{}", x)
+    };
+    let (int_part, frac) = split(shortest);
+    if frac.len() <= precision {
+        return (int_part, frac);
     }
+    split(if is_f32 {
+        format!("{:.*}", precision, x as f32)
+    } else {
+        format!("{:.*}", precision, x)
+    })
 }
 
-fn np_int_cell(x: i64, width: usize) -> String {
-    format!("{x:>width$}")
+/// Split Rust's `{:e}` output into `(integer_part_including_sign,
+/// fractional_part, exponent)`. Trailing zeros are kept — callers that want
+/// them trimmed do so themselves.
+fn split_scientific(s: &str) -> (String, String, i32) {
+    let (mant, exp) = s.split_once('e').expect("{:e} always emits an exponent");
+    let (int_part, frac) = match mant.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (mant.to_string(), String::new()),
+    };
+    (
+        int_part,
+        frac,
+        exp.parse().expect("{:e} emits a decimal exponent"),
+    )
 }
 
-/// Compute the float layout parameters for a whole float array, following
-/// numpy's FloatingFormat: pad_left is the widest integer part (sign
-/// included), pad_right the widest fractional part, and exp_mode when any
-/// finite value needs scientific notation.
-fn float_layout(vals: &[f64]) -> (usize, usize, bool) {
-    let mut pad_left = 1usize;
-    let mut pad_right = 0usize;
-    let mut exp_mode = false;
-    for &x in vals {
-        if !x.is_finite() {
-            continue;
-        }
-        let s = crate::py_float_repr(x);
-        if s.contains('e') {
-            exp_mode = true;
-            if let Some((_, f)) = s.split_once('e').and_then(|(m, _)| m.split_once('.')) {
-                pad_right = pad_right.max(f.len());
-            }
-        } else if s.contains('.') {
-            let (i, f) = s.split_once('.').expect("checked");
-            let ilen = i.len() + usize::from(s.starts_with('-'));
-            pad_left = pad_left.max(ilen);
-            let frac: String = f.trim_end_matches('0').to_string();
-            pad_right = pad_right.max(frac.len());
-        } else {
-            let ilen = s.len() + usize::from(s.starts_with('-'));
-            pad_left = pad_left.max(ilen);
-        }
+/// numpy's `dragon4_scientific(x, precision, unique=True, trim='.')`:
+/// `(mantissa_integer_part_including_sign, mantissa_fraction, exponent)`.
+fn scientific_digits(x: f64, precision: usize, is_f32: bool) -> (String, String, i32) {
+    let split = |s: String| -> (String, String, i32) {
+        let (i, f, e) = split_scientific(&s);
+        (i, f.trim_end_matches('0').to_string(), e)
+    };
+    // `unique=True` first, precision cap second — see positional_digits.
+    let shortest = if is_f32 {
+        format!("{:e}", x as f32)
+    } else {
+        format!("{:e}", x)
+    };
+    let (int_part, frac, exp) = split(shortest);
+    if frac.len() <= precision {
+        return (int_part, frac, exp);
     }
-    (pad_left, pad_right, exp_mode)
+    split(if is_f32 {
+        format!("{:.*e}", precision, x as f32)
+    } else {
+        format!("{:.*e}", precision, x)
+    })
 }
 
-/// numpy's array → string, mirroring `_formatArray`'s recursion: rows of the
-/// last axis are padded cells joined by `sep`; higher axes insert
-/// `(axes_left - 1)` newlines between nested blocks and grow the hanging
-/// indent by one space per level. `hanging` is the indent of continuation
-/// lines: 1 space for str, len("array(") + 1 for repr.
-fn format_array(a: &NdArray, sep: &str, hanging: &str) -> String {
-    if a.size == 0 {
-        return "[]".to_string();
-    }
-    // 0-d arrays print as their scalar (numpy str of a 0-d array is the
-    // scalar's own repr).
-    if a.ndim == 0 {
-        return match a.dtype {
-            Dtype::Float64 => crate::py_float_repr(a.f64()[0]),
-            Dtype::Float32 => crate::py_float_repr(a.f32()[0] as f64),
-            Dtype::Int64 => a.i64()[0].to_string(),
-            Dtype::Int32 => a.i32()[0].to_string(),
-            Dtype::Bool => a.bool()[0].to_string(),
-        };
-    }
+/// Exponent digits numpy would print for `exp` — never fewer than two
+/// (`1e-9` prints as `1.e-09`).
+fn exp_digit_count(exp: i32) -> usize {
+    exp.unsigned_abs().to_string().len().max(2)
+}
 
-    // Precompute cell strings for the whole array (the width parameters are
-    // array-global, exactly like numpy's format classes).
-    let cells: Vec<String> = match a.dtype {
-        Dtype::Bool => a
-            .bool()
+/// numpy's `FloatingFormat`: the array-global layout every float cell is
+/// rendered against.
+#[derive(Debug, Clone)]
+struct FloatFormat {
+    exp_format: bool,
+    pad_left: usize,
+    pad_right: usize,
+    /// Fractional digits — the cap in positional mode, the exact count in
+    /// exponential mode (where numpy switches to `trim='k'`).
+    precision: usize,
+    /// Exponent digits in exponential mode (numpy's `exp_size`).
+    exp_size: usize,
+    /// Render the `f32` value rather than its `f64` widening, so a float32
+    /// array prints its own dtype's digits (`0.33333334`, not
+    /// `0.3333333432674408`).
+    is_f32: bool,
+}
+
+impl FloatFormat {
+    fn new(vals: &[f64], is_f32: bool) -> FloatFormat {
+        let finite: Vec<f64> = vals.iter().copied().filter(|v| v.is_finite()).collect();
+
+        // Exponential mode, chosen from the non-zero finite magnitudes just
+        // as numpy does: a value at or past the dtype's positional cutoff,
+        // anything below 1e-4, or a spread wider than 1000x. The cutoff is
+        // numpy's `10**min(8, finfo(dtype).precision)` — 1e8 for float64,
+        // 1e6 for float32.
+        let cutoff = if is_f32 { 1e6 } else { 1e8 };
+        let mut exp_format = false;
+        let mags: Vec<f64> = finite
             .iter()
-            .map(|&b| if b { " True".to_string() } else { "False".to_string() })
-            .collect(),
+            .map(|v| v.abs())
+            .filter(|v| *v != 0.0)
+            .collect();
+        if !mags.is_empty() {
+            let max_val = mags.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let min_val = mags.iter().copied().fold(f64::INFINITY, f64::min);
+            if max_val >= cutoff || min_val < 1e-4 || max_val / min_val > 1000.0 {
+                exp_format = true;
+            }
+        }
+
+        let mut pad_left = 0usize;
+        let mut pad_right = 0usize;
+        let mut precision = PRINT_PRECISION;
+        let mut exp_size = 0usize;
+
+        if finite.is_empty() {
+            // Every cell is nan/inf; the widths come from the adjustment
+            // below (numpy zeroes both pads here).
+            precision = 0;
+        } else if exp_format {
+            let parts: Vec<(String, String, i32)> = finite
+                .iter()
+                .map(|&x| scientific_digits(x, PRINT_PRECISION, is_f32))
+                .collect();
+            exp_size = parts
+                .iter()
+                .map(|(_, _, e)| exp_digit_count(*e))
+                .max()
+                .unwrap_or(2);
+            precision = parts.iter().map(|(_, f, _)| f.len()).max().unwrap_or(0);
+            pad_left = parts.iter().map(|(i, _, _)| i.len()).max().unwrap_or(1);
+            // Only used to size non-finite cells, like numpy's comment says.
+            pad_right = exp_size + 2 + precision;
+        } else {
+            let parts: Vec<(String, String)> = finite
+                .iter()
+                .map(|&x| positional_digits(x, PRINT_PRECISION, is_f32))
+                .collect();
+            pad_left = parts.iter().map(|(i, _)| i.len()).max().unwrap_or(1);
+            pad_right = parts.iter().map(|(_, f)| f.len()).max().unwrap_or(0);
+        }
+
+        // Non-finite cells are right-aligned into `pad_left + pad_right + 1`
+        // and can widen the column.
+        if finite.len() != vals.len() {
+            let neginf = vals.iter().any(|v| v.is_infinite() && *v < 0.0);
+            let offset = (pad_right + 1) as isize;
+            let nan_need = 3isize - offset;
+            let inf_need = 3isize + isize::from(neginf) - offset;
+            let need = nan_need.max(inf_need).max(0) as usize;
+            pad_left = pad_left.max(need);
+        }
+
+        FloatFormat {
+            exp_format,
+            pad_left,
+            pad_right,
+            precision,
+            exp_size,
+            is_f32,
+        }
+    }
+
+    fn cell(&self, x: f64) -> String {
+        if !x.is_finite() {
+            let ret = if x.is_nan() {
+                "nan"
+            } else if x < 0.0 {
+                "-inf"
+            } else {
+                "inf"
+            };
+            let width = self.pad_left + self.pad_right + 1;
+            return format!("{ret:>width$}");
+        }
+        if self.exp_format {
+            // The render pass is `trim='k', min_digits=precision`: dragon4
+            // emits exactly `precision` fractional digits OF THE VALUE, not
+            // the shortest form zero-padded. The two differ whenever the
+            // shortest form is shorter than the column — 1e-5 as float32 is
+            // 9.9999997e-06 at 7 digits, not 1.0000000e-05.
+            let (int_part, frac, exp) = if self.is_f32 {
+                split_scientific(&format!("{:.*e}", self.precision, x as f32))
+            } else {
+                split_scientific(&format!("{:.*e}", self.precision, x))
+            };
+            let sign = if exp < 0 { '-' } else { '+' };
+            format!(
+                "{int_part:>pad$}.{frac}e{sign}{mag:0>digits$}",
+                pad = self.pad_left,
+                mag = exp.unsigned_abs(),
+                digits = self.exp_size,
+            )
+        } else {
+            let (int_part, frac) = positional_digits(x, PRINT_PRECISION, self.is_f32);
+            format!(
+                "{int_part:>pad_l$}.{frac:<pad_r$}",
+                pad_l = self.pad_left,
+                pad_r = self.pad_right,
+            )
+        }
+    }
+}
+
+/// The per-dtype cell renderer, built once per printed array.
+#[derive(Debug, Clone)]
+enum CellFormat {
+    Float(FloatFormat),
+    /// numpy's `IntegerFormat`: right-aligned to the widest rendered value.
+    Int(usize),
+    /// numpy's `BoolFormat`: `True` gets a leading space so it aligns with
+    /// `False` — except in a 0-d array, which prints a bare scalar.
+    Bool {
+        pad: bool,
+    },
+}
+
+impl CellFormat {
+    fn cell(&self, a: &NdArray, flat: usize) -> String {
+        match self {
+            CellFormat::Float(f) => {
+                let x = match a.dtype {
+                    Dtype::Float32 => a.f32()[flat] as f64,
+                    _ => a.f64()[flat],
+                };
+                f.cell(x)
+            }
+            CellFormat::Int(w) => {
+                let v = match a.dtype {
+                    Dtype::Int32 => a.i32()[flat] as i64,
+                    _ => a.i64()[flat],
+                };
+                format!("{v:>w$}", w = *w)
+            }
+            CellFormat::Bool { pad } => match (a.bool()[flat], pad) {
+                (true, true) => " True".to_string(),
+                (true, false) => "True".to_string(),
+                (false, _) => "False".to_string(),
+            },
+        }
+    }
+}
+
+/// The flat indices numpy's `_leading_trailing` keeps: the first and last
+/// `edge` entries along every axis. The cell widths are computed from these,
+/// because they are the only elements a summarized array ever prints.
+fn summary_indices(shape: &[usize], edge: usize) -> Vec<usize> {
+    let mut stride: usize = shape.iter().product();
+    let mut acc = vec![0usize];
+    for &n in shape {
+        stride /= n.max(1);
+        let keep: Vec<usize> = if n > 2 * edge {
+            (0..edge).chain(n - edge..n).collect()
+        } else {
+            (0..n).collect()
+        };
+        let mut next = Vec::with_capacity(acc.len() * keep.len());
+        for &base in &acc {
+            for &i in &keep {
+                next.push(base + i * stride);
+            }
+        }
+        acc = next;
+    }
+    acc
+}
+
+/// Build the cell renderer from the elements that will actually be printed
+/// (the summarized subset when the array is large enough to be elided —
+/// numpy sizes its columns from the same reduced data).
+fn cell_format(a: &NdArray, summarize: bool) -> CellFormat {
+    let idx: Option<Vec<usize>> = if summarize {
+        Some(summary_indices(&a.shape, PRINT_EDGEITEMS))
+    } else {
+        None
+    };
+    match a.dtype {
+        Dtype::Bool => CellFormat::Bool { pad: a.ndim > 0 },
         Dtype::Int64 | Dtype::Int32 => {
-            let vals: Vec<i64> = a.as_i64();
-            let lo = *vals.iter().min().unwrap_or(&0);
-            let hi = *vals.iter().max().unwrap_or(&0);
-            let width = lo.to_string().len().max(hi.to_string().len()).max(1);
-            vals.iter().map(|&x| np_int_cell(x, width)).collect()
+            let all = a.as_i64();
+            let vals: Vec<i64> = match &idx {
+                Some(ix) => ix.iter().map(|&i| all[i]).collect(),
+                None => all,
+            };
+            let max = vals.iter().copied().max().unwrap_or(0);
+            let min = vals.iter().copied().min().unwrap_or(0);
+            CellFormat::Int(max.to_string().len().max(min.to_string().len()))
         }
         Dtype::Float64 | Dtype::Float32 => {
-            let vals: Vec<f64> = a.as_f64();
-            let (pl, pr, em) = float_layout(&vals);
-            vals.iter().map(|&x| np_float_cell(x, pl, pr, em)).collect()
+            let all = a.as_f64();
+            let vals: Vec<f64> = match &idx {
+                Some(ix) => ix.iter().map(|&i| all[i]).collect(),
+                None => all,
+            };
+            CellFormat::Float(FloatFormat::new(&vals, a.dtype == Dtype::Float32))
         }
-    };
+    }
+}
 
-    fn block(
-        a: &NdArray,
-        cells: &[String],
-        axis: usize,
-        offset: usize,
-        hanging: &str,
-        sep: &str,
-    ) -> String {
-        let axes_left = a.ndim - axis;
-        if axes_left == 1 {
-            let n = a.shape[a.ndim - 1];
-            let mut line = String::new();
-            for j in 0..n {
-                if j > 0 {
-                    line.push_str(sep);
-                }
-                line.push_str(&cells[offset + j]);
-            }
-            return format!("[{line}]");
+/// numpy's `_extendLine`: append `word` to `line`, breaking first if it
+/// would overflow `line_width`. A line holding only the hanging indent
+/// never wraps — breaking there could not help.
+fn extend_line(
+    s: &mut String,
+    line: &mut String,
+    word: &str,
+    line_width: usize,
+    next_line_prefix: &str,
+) {
+    let needs_wrap = line.len() + word.len() > line_width && line.len() > next_line_prefix.len();
+    if needs_wrap {
+        s.push_str(line.trim_end());
+        s.push('\n');
+        line.clear();
+        line.push_str(next_line_prefix);
+    }
+    line.push_str(word);
+}
+
+/// numpy's `_formatArray` recursion.
+struct ArrayPrinter<'a> {
+    a: &'a NdArray,
+    fmt: CellFormat,
+    separator: &'a str,
+    summarize: bool,
+}
+
+impl ArrayPrinter<'_> {
+    fn recurse(&self, axis: usize, offset: usize, hanging: &str, curr_width: usize) -> String {
+        let axes_left = self.a.ndim - axis;
+        if axes_left == 0 {
+            return self.fmt.cell(self.a, offset);
         }
+        // Recursing adds a `[`, so continuation lines gain a space and the
+        // budget loses the closing `]`.
         let next_hanging = format!("{hanging} ");
-        let line_sep = "\n".repeat(axes_left - 1);
-        let n = a.shape[axis];
-        let stride: usize = a.shape[axis + 1..].iter().product();
+        let next_width = curr_width.saturating_sub(1);
+        let a_len = self.a.shape[axis];
+        let stride: usize = self.a.shape[axis + 1..].iter().product();
+        let show_summary = self.summarize && 2 * PRINT_EDGEITEMS < a_len;
+        let (leading, trailing) = if show_summary {
+            (PRINT_EDGEITEMS, PRINT_EDGEITEMS)
+        } else {
+            (0, a_len)
+        };
+
         let mut s = String::new();
-        for i in 0..n {
-            let nested = block(a, cells, axis + 1, offset + i * stride, &next_hanging, sep);
-            s.push_str(hanging);
-            s.push_str(&nested);
-            if i + 1 < n {
+        if axes_left == 1 {
+            let elem_width = curr_width.saturating_sub(self.separator.trim_end().len().max(1));
+            let mut line = hanging.to_string();
+            for i in 0..leading {
+                let word = self.fmt.cell(self.a, offset + i);
+                extend_line(&mut s, &mut line, &word, elem_width, hanging);
+                line.push_str(self.separator);
+            }
+            if show_summary {
+                extend_line(&mut s, &mut line, "...", elem_width, hanging);
+                line.push_str(self.separator);
+            }
+            // numpy indexes the tail from the end: -trailing ..= -2, then -1.
+            for i in (2..=trailing).rev() {
+                let word = self.fmt.cell(self.a, offset + a_len - i);
+                extend_line(&mut s, &mut line, &word, elem_width, hanging);
+                line.push_str(self.separator);
+            }
+            let word = self.fmt.cell(self.a, offset + a_len - 1);
+            extend_line(&mut s, &mut line, &word, elem_width, hanging);
+            s.push_str(&line);
+        } else {
+            let line_sep = format!(
+                "{}{}",
+                self.separator.trim_end(),
+                "\n".repeat(axes_left - 1)
+            );
+            for i in 0..leading {
+                let nested = self.recurse(axis + 1, offset + i * stride, &next_hanging, next_width);
+                s.push_str(hanging);
+                s.push_str(&nested);
                 s.push_str(&line_sep);
             }
+            if show_summary {
+                s.push_str(hanging);
+                s.push_str("...");
+                s.push_str(&line_sep);
+            }
+            for i in (2..=trailing).rev() {
+                let nested = self.recurse(
+                    axis + 1,
+                    offset + (a_len - i) * stride,
+                    &next_hanging,
+                    next_width,
+                );
+                s.push_str(hanging);
+                s.push_str(&nested);
+                s.push_str(&line_sep);
+            }
+            let nested = self.recurse(
+                axis + 1,
+                offset + (a_len - 1) * stride,
+                &next_hanging,
+                next_width,
+            );
+            s.push_str(hanging);
+            s.push_str(&nested);
         }
         format!("[{}]", &s[hanging.len()..])
     }
+}
 
-    block(a, &cells, 0, 0, hanging, sep)
+/// numpy's `array2string`. `next_line_prefix` is the indent continuation
+/// lines get: one space for `str`, plus `len("array(")` more for `repr`.
+fn format_array(a: &NdArray, separator: &str, next_line_prefix: &str, line_width: usize) -> String {
+    if a.size == 0 {
+        return "[]".to_string();
+    }
+    let summarize = a.size > PRINT_THRESHOLD;
+    let printer = ArrayPrinter {
+        a,
+        fmt: cell_format(a, summarize),
+        separator,
+        summarize,
+    };
+    printer.recurse(0, 0, next_line_prefix, line_width)
+}
+
+/// The scalar text a 0-d array shows under `str` — the element's own repr,
+/// NOT the array formatter (numpy: "the str of 0d arrays is a special case:
+/// it should appear like a scalar, so floats are not truncated by
+/// `precision`").
+fn zero_d_scalar_str(a: &NdArray) -> String {
+    match a.dtype {
+        Dtype::Float64 => crate::py_float_repr(a.f64()[0]),
+        Dtype::Float32 => crate::py_float_repr(a.f32()[0] as f64),
+        Dtype::Int64 => a.i64()[0].to_string(),
+        Dtype::Int32 => a.i32()[0].to_string(),
+        Dtype::Bool => {
+            if a.bool()[0] {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+    }
+}
+
+/// Python's tuple repr for a shape (`(0,)`, `(0, 3)`).
+fn shape_tuple(shape: &[usize]) -> String {
+    if shape.len() == 1 {
+        return format!("({},)", shape[0]);
+    }
+    let inner: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+    format!("({})", inner.join(", "))
 }
 
 /// numpy `str(array)` — brackets, space separators, column-aligned.
 impl crate::PyDisplay for NdArray {
     fn py_display(&self) -> String {
-        format_array(self, " ", " ")
+        if self.ndim == 0 {
+            return zero_d_scalar_str(self);
+        }
+        format_array(self, " ", " ", PRINT_LINEWIDTH)
     }
 }
 
-/// numpy `repr(array)` — `array(...)` with `, ` separators and the
-/// `array(` prefix length as the hanging indent.
+/// numpy `repr(array)` — `array(...)` with `, ` separators, the `array(`
+/// prefix length as the hanging indent, and a `dtype=` suffix for dtypes
+/// the repr does not imply (numpy implies float64, int64 and bool).
 impl PyRepr for NdArray {
     fn py_repr(&self) -> String {
-        format!("array({})", format_array(self, ", ", "       "))
+        let prefix = "array(";
+        // numpy shortens the budget by the suffix it will append:
+        // `array2string(..., suffix=")")` does `linewidth -= len(suffix)`.
+        let lst = format_array(self, ", ", "       ", PRINT_LINEWIDTH - 1);
+
+        // numpy appends whatever the array text cannot imply: the shape
+        // when the array is empty (other than `(0,)`) or summarized, and
+        // the dtype when it is not one of the implied ones.
+        let mut extras: Vec<String> = Vec::new();
+        if (self.size == 0 && self.shape != [0]) || self.size > PRINT_THRESHOLD {
+            extras.push(format!("shape={}", shape_tuple(&self.shape)));
+        }
+        let dtype_implied = matches!(self.dtype, Dtype::Float64 | Dtype::Int64 | Dtype::Bool);
+        if !dtype_implied || self.size == 0 {
+            extras.push(format!("dtype={}", self.dtype.name()));
+        }
+        if extras.is_empty() {
+            return format!("{prefix}{lst})");
+        }
+
+        let head = format!("{prefix}{lst},");
+        let extra_str = format!("{})", extras.join(", "));
+        let last_line_len = head.len() - head.rfind('\n').map_or(0, |i| i + 1);
+        let spacer = if last_line_len + extra_str.len() + 1 > PRINT_LINEWIDTH {
+            format!("\n{}", " ".repeat(prefix.len()))
+        } else {
+            " ".to_string()
+        };
+        format!("{head}{spacer}{extra_str}")
     }
 }
 
@@ -854,14 +1230,40 @@ impl crate::PyIndex<NdArray> for NdArray {
         };
         let stride: usize = self.shape[1..].iter().product();
         let gather = |v: &[f64]| -> Vec<f64> {
-            keep.iter().flat_map(|&i| v[i * stride..(i + 1) * stride].to_vec()).collect()
+            keep.iter()
+                .flat_map(|&i| v[i * stride..(i + 1) * stride].to_vec())
+                .collect()
         };
         let data = match &self.data {
             Data::F64(v) => Data::F64(gather(v)),
-            Data::F32(v) => Data::F32(gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as f32).collect()),
-            Data::I64(v) => Data::I64(gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as i64).collect()),
-            Data::I32(v) => Data::I32(gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as i32).collect()),
-            Data::Bool(v) => Data::Bool(gather(&v.iter().map(|&x| if x {1.0} else {0.0}).collect::<Vec<_>>()).iter().map(|&x| x != 0.0).collect()),
+            Data::F32(v) => Data::F32(
+                gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as f32)
+                    .collect(),
+            ),
+            Data::I64(v) => Data::I64(
+                gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as i64)
+                    .collect(),
+            ),
+            Data::I32(v) => Data::I32(
+                gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as i32)
+                    .collect(),
+            ),
+            Data::Bool(v) => Data::Bool(
+                gather(
+                    &v.iter()
+                        .map(|&x| if x { 1.0 } else { 0.0 })
+                        .collect::<Vec<_>>(),
+                )
+                .iter()
+                .map(|&x| x != 0.0)
+                .collect(),
+            ),
         };
         Ok(NdArray::new(shape, self.dtype, data))
     }
@@ -885,14 +1287,40 @@ impl crate::PyIndex<Vec<i64>> for NdArray {
             s
         };
         let gather = |v: &[f64]| -> Vec<f64> {
-            idxs.iter().flat_map(|&i| v[i * stride..(i + 1) * stride].to_vec()).collect()
+            idxs.iter()
+                .flat_map(|&i| v[i * stride..(i + 1) * stride].to_vec())
+                .collect()
         };
         let data = match &self.data {
             Data::F64(v) => Data::F64(gather(v)),
-            Data::F32(v) => Data::F32(gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as f32).collect()),
-            Data::I64(v) => Data::I64(gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as i64).collect()),
-            Data::I32(v) => Data::I32(gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as i32).collect()),
-            Data::Bool(v) => Data::Bool(gather(&v.iter().map(|&x| if x {1.0} else {0.0}).collect::<Vec<_>>()).iter().map(|&x| x != 0.0).collect()),
+            Data::F32(v) => Data::F32(
+                gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as f32)
+                    .collect(),
+            ),
+            Data::I64(v) => Data::I64(
+                gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as i64)
+                    .collect(),
+            ),
+            Data::I32(v) => Data::I32(
+                gather(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as i32)
+                    .collect(),
+            ),
+            Data::Bool(v) => Data::Bool(
+                gather(
+                    &v.iter()
+                        .map(|&x| if x { 1.0 } else { 0.0 })
+                        .collect::<Vec<_>>(),
+                )
+                .iter()
+                .map(|&x| x != 0.0)
+                .collect(),
+            ),
         };
         Ok(NdArray::new(shape, self.dtype, data))
     }
@@ -902,12 +1330,7 @@ impl crate::PyIndex<Vec<i64>> for NdArray {
 /// supported. Returns a copy.
 impl crate::PySlice for NdArray {
     type Output = NdArray;
-    fn py_slice(
-        &self,
-        start: Option<i64>,
-        stop: Option<i64>,
-        step: Option<i64>,
-    ) -> NdArray {
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> NdArray {
         let len = if self.ndim == 0 { 1 } else { self.shape[0] } as i64;
         let step = step.unwrap_or(1);
         if step == 0 {
@@ -916,23 +1339,30 @@ impl crate::PySlice for NdArray {
                 PyException::new("ValueError", "slice step cannot be zero")
             );
         }
+        // Python normalizes a negative bound against the length BEFORE
+        // clamping (`a[-3:]` is `a[len-3:]`). Clamping first mapped every
+        // negative bound to 0 / -1, so `a[-3:]` returned the whole array
+        // and `a[:-3]` returned nothing (issue #192).
+        let normalize = |v: i64| if v < 0 { v + len } else { v };
         let (start, stop) = if step > 0 {
             let s = match start {
-                Some(v) => v.clamp(0, len),
+                Some(v) => normalize(v).clamp(0, len),
                 None => 0,
             };
             let e = match stop {
-                Some(v) => v.clamp(0, len),
+                Some(v) => normalize(v).clamp(0, len),
                 None => len,
             };
             (s, e)
         } else {
+            // The lower bound is -1, the "before the first element"
+            // sentinel a reversed walk stops at — not a user index.
             let s = match start {
-                Some(v) => v.clamp(-1, len - 1),
+                Some(v) => normalize(v).clamp(-1, len - 1),
                 None => len - 1,
             };
             let e = match stop {
-                Some(v) => v.clamp(-1, len - 1),
+                Some(v) => normalize(v).clamp(-1, len - 1),
                 None => -1,
             };
             (s, e)
@@ -958,14 +1388,41 @@ impl crate::PySlice for NdArray {
             s
         };
         let collect = |v: &[f64]| -> Vec<f64> {
-            indices.iter().flat_map(|&i| v[i * stride..(i + 1) * stride].to_vec()).collect()
+            indices
+                .iter()
+                .flat_map(|&i| v[i * stride..(i + 1) * stride].to_vec())
+                .collect()
         };
         let data = match &self.data {
             Data::F64(v) => Data::F64(collect(v)),
-            Data::F32(v) => Data::F32(collect(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as f32).collect()),
-            Data::I64(v) => Data::I64(collect(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as i64).collect()),
-            Data::I32(v) => Data::I32(collect(&v.iter().map(|&x| x as f64).collect::<Vec<_>>()).iter().map(|&x| x as i32).collect()),
-            Data::Bool(v) => Data::Bool(collect(&v.iter().map(|&x| if x {1.0} else {0.0}).collect::<Vec<_>>()).iter().map(|&x| x != 0.0).collect()),
+            Data::F32(v) => Data::F32(
+                collect(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as f32)
+                    .collect(),
+            ),
+            Data::I64(v) => Data::I64(
+                collect(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as i64)
+                    .collect(),
+            ),
+            Data::I32(v) => Data::I32(
+                collect(&v.iter().map(|&x| x as f64).collect::<Vec<_>>())
+                    .iter()
+                    .map(|&x| x as i32)
+                    .collect(),
+            ),
+            Data::Bool(v) => Data::Bool(
+                collect(
+                    &v.iter()
+                        .map(|&x| if x { 1.0 } else { 0.0 })
+                        .collect::<Vec<_>>(),
+                )
+                .iter()
+                .map(|&x| x != 0.0)
+                .collect(),
+            ),
         };
         NdArray::new(shape, self.dtype, data)
     }
@@ -998,5 +1455,737 @@ impl IntoIterator for NdArray {
             items.push(self.py_index(i as i64).expect("in-range index"));
         }
         items.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PySlice;
+
+    fn arange10() -> NdArray {
+        NdArray::new(vec![10], Dtype::Int64, Data::I64((0..10).collect()))
+    }
+
+    /// Every expectation below is `list(np.arange(10)[...])` under
+    /// python3 + numpy. Negative bounds used to clamp to 0 / -1 instead of
+    /// normalizing against the length, so `a[-3:]` returned the whole
+    /// array and `a[:-3]` returned nothing (issue #192).
+    #[test]
+    fn slice_bounds_match_numpy() {
+        let a = arange10();
+        let cases: &[(Option<i64>, Option<i64>, Option<i64>, &[i64])] = &[
+            // Verified against python3.
+            (Some(0), Some(3), None, &[0, 1, 2]), // a[0:3]
+            (Some(2), None, None, &[2, 3, 4, 5, 6, 7, 8, 9]), // a[2:]
+            (None, Some(4), None, &[0, 1, 2, 3]), // a[:4]
+            (None, None, Some(2), &[0, 2, 4, 6, 8]), // a[::2]
+            (Some(1), None, Some(2), &[1, 3, 5, 7, 9]), // a[1::2]
+            (Some(-3), None, None, &[7, 8, 9]),   // a[-3:]
+            (None, Some(-3), None, &[0, 1, 2, 3, 4, 5, 6]), // a[:-3]
+            (Some(-5), Some(-2), None, &[5, 6, 7]), // a[-5:-2]
+            (None, Some(-11), None, &[]),         // a[:-11]
+            (Some(-20), None, None, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), // a[-20:]
+            (Some(8), Some(2), None, &[]),        // a[8:2]
+            // Negative steps.
+            (None, None, Some(-1), &[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]), // a[::-1]
+            (Some(-1), None, Some(-1), &[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]), // a[-1::-1]
+            (None, None, Some(-2), &[9, 7, 5, 3, 1]),                // a[::-2]
+            (Some(-2), Some(-8), Some(-1), &[8, 7, 6, 5, 4, 3]),     // a[-2:-8:-1]
+            (Some(-1), Some(-4), Some(-1), &[9, 8, 7]),              // a[-1:-4:-1]
+        ];
+        for (start, stop, step, expected) in cases {
+            let got = a.py_slice(*start, *stop, *step);
+            assert_eq!(
+                got.as_i64(),
+                expected.to_vec(),
+                "a[{start:?}:{stop:?}:{step:?}]"
+            );
+        }
+    }
+
+    // -- printing ----------------------------------------------------------
+    //
+    // numpy's array printing has no wiggle room: a program that prints an
+    // array must produce the same bytes CPython does. These pin every rule
+    // of `FloatingFormat`/`_formatArray` the subset reaches, because a
+    // divergence here is silent — the program prints, it just prints
+    // something else (issues #194, #195).
+
+    /// Build the array a case describes and check `str` and `repr`.
+    fn check_cases(cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)]) {
+        for (name, vals, shape, dtype, want_str, want_repr) in cases {
+            let data = match dtype {
+                Dtype::Float64 => Data::F64(vals.to_vec()),
+                Dtype::Float32 => Data::F32(vals.iter().map(|&v| v as f32).collect()),
+                Dtype::Int64 => Data::I64(vals.iter().map(|&v| v as i64).collect()),
+                Dtype::Int32 => Data::I32(vals.iter().map(|&v| v as i32).collect()),
+                Dtype::Bool => Data::Bool(vals.iter().map(|&v| v != 0.0).collect()),
+            };
+            let a = NdArray::new(shape.to_vec(), *dtype, data);
+            assert_eq!(
+                crate::py_display(&a),
+                *want_str,
+                "str({name})\n  want {want_str:?}\n   got {:?}",
+                crate::py_display(&a)
+            );
+            assert_eq!(
+                a.py_repr(),
+                *want_repr,
+                "repr({name})\n  want {want_repr:?}\n   got {:?}",
+                a.py_repr()
+            );
+        }
+    }
+
+    /// numpy prints array floats at precision=8, and pads every cell to a common width so columns line up.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_precision_and_padding() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "linspace5",
+                &[0.0, 0.25, 0.5, 0.75, 1.0],
+                &[5],
+                Dtype::Float64,
+                "[0.   0.25 0.5  0.75 1.  ]",
+                "array([0.  , 0.25, 0.5 , 0.75, 1.  ])",
+            ),
+            (
+                "thirds",
+                &[0.3333333333333333],
+                &[1],
+                Dtype::Float64,
+                "[0.33333333]",
+                "array([0.33333333])",
+            ),
+            (
+                "e",
+                &[2.718281828459045],
+                &[1],
+                Dtype::Float64,
+                "[2.71828183]",
+                "array([2.71828183])",
+            ),
+            (
+                "mixfrac",
+                &[0.1, 0.123456789012345],
+                &[2],
+                Dtype::Float64,
+                "[0.1        0.12345679]",
+                "array([0.1       , 0.12345679])",
+            ),
+            (
+                "widths",
+                &[1.5, 22.25, 333.125],
+                &[3],
+                Dtype::Float64,
+                "[  1.5    22.25  333.125]",
+                "array([  1.5  ,  22.25 , 333.125])",
+            ),
+            (
+                "ones",
+                &[1.0, 2.0, 3.0],
+                &[3],
+                Dtype::Float64,
+                "[1. 2. 3.]",
+                "array([1., 2., 3.])",
+            ),
+            (
+                "linspace11",
+                &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+                &[11],
+                Dtype::Float64,
+                "[0.  0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1. ]",
+                "array([0. , 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1. ])",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// The sign goes INSIDE the column padding: `[-1.  2.]`, never `[-  1.   2.]`.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_sign_inside_the_padding() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "neg1",
+                &[-1.0, 2.0],
+                &[2],
+                Dtype::Float64,
+                "[-1.  2.]",
+                "array([-1.,  2.])",
+            ),
+            (
+                "neg2",
+                &[-1.0, 22.0],
+                &[2],
+                Dtype::Float64,
+                "[-1. 22.]",
+                "array([-1., 22.])",
+            ),
+            (
+                "neg3",
+                &[-1.0, 2.0, -3.5],
+                &[3],
+                Dtype::Float64,
+                "[-1.   2.  -3.5]",
+                "array([-1. ,  2. , -3.5])",
+            ),
+            (
+                "negzero",
+                &[0.0, -0.0],
+                &[2],
+                Dtype::Float64,
+                "[ 0. -0.]",
+                "array([ 0., -0.])",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// inf/nan print bare (no trailing point) and right-align into the float column, widening it when they need to.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_non_finite_cells() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "nan1",
+                &[f64::NAN],
+                &[1],
+                Dtype::Float64,
+                "[nan]",
+                "array([nan])",
+            ),
+            (
+                "infnan",
+                &[f64::INFINITY, f64::NAN],
+                &[2],
+                Dtype::Float64,
+                "[inf nan]",
+                "array([inf, nan])",
+            ),
+            (
+                "neginfnan",
+                &[f64::NEG_INFINITY, f64::NAN],
+                &[2],
+                Dtype::Float64,
+                "[-inf  nan]",
+                "array([-inf,  nan])",
+            ),
+            (
+                "three_nonfinite",
+                &[f64::INFINITY, f64::NAN, f64::NEG_INFINITY],
+                &[3],
+                Dtype::Float64,
+                "[ inf  nan -inf]",
+                "array([ inf,  nan, -inf])",
+            ),
+            (
+                "one_nan",
+                &[1.0, f64::NAN],
+                &[2],
+                Dtype::Float64,
+                "[ 1. nan]",
+                "array([ 1., nan])",
+            ),
+            (
+                "onefive_inf",
+                &[1.5, f64::INFINITY],
+                &[2],
+                Dtype::Float64,
+                "[1.5 inf]",
+                "array([1.5, inf])",
+            ),
+            (
+                "mixed_nonfinite",
+                &[-1.0, f64::NAN, 2.25],
+                &[3],
+                Dtype::Float64,
+                "[-1.     nan  2.25]",
+                "array([-1.  ,   nan,  2.25])",
+            ),
+            (
+                "nan_inf",
+                &[f64::NAN, f64::INFINITY],
+                &[2],
+                Dtype::Float64,
+                "[nan inf]",
+                "array([nan, inf])",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// numpy switches the whole array to scientific notation past the dtype's cutoff, below 1e-4, or over a 1000x spread. An array mixing an exponent value with an ordinary one used to panic outright.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_exponential_mode() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "small",
+                &[1e-09, 1.0, 1000000000.0],
+                &[3],
+                Dtype::Float64,
+                "[1.e-09 1.e+00 1.e+09]",
+                "array([1.e-09, 1.e+00, 1.e+09])",
+            ),
+            (
+                "big",
+                &[1e+16, 2e+16],
+                &[2],
+                Dtype::Float64,
+                "[1.e+16 2.e+16]",
+                "array([1.e+16, 2.e+16])",
+            ),
+            (
+                "e5",
+                &[100000.0, 2.0],
+                &[2],
+                Dtype::Float64,
+                "[1.e+05 2.e+00]",
+                "array([1.e+05, 2.e+00])",
+            ),
+            (
+                "e-5",
+                &[1e-05, 1.0],
+                &[2],
+                Dtype::Float64,
+                "[1.e-05 1.e+00]",
+                "array([1.e-05, 1.e+00])",
+            ),
+            (
+                "ratio1001",
+                &[1.0, 1001.0],
+                &[2],
+                Dtype::Float64,
+                "[1.000e+00 1.001e+03]",
+                "array([1.000e+00, 1.001e+03])",
+            ),
+            (
+                "ratio1000",
+                &[1.0, 1000.0],
+                &[2],
+                Dtype::Float64,
+                "[   1. 1000.]",
+                "array([   1., 1000.])",
+            ),
+            (
+                "just_under",
+                &[99999999.0],
+                &[1],
+                Dtype::Float64,
+                "[99999999.]",
+                "array([99999999.])",
+            ),
+            (
+                "at_1e8",
+                &[100000000.0],
+                &[1],
+                Dtype::Float64,
+                "[1.e+08]",
+                "array([1.e+08])",
+            ),
+            (
+                "zero_small",
+                &[0.0, 1e-09],
+                &[2],
+                Dtype::Float64,
+                "[0.e+00 1.e-09]",
+                "array([0.e+00, 1.e-09])",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// A float32 array prints float32 digits (0.1, not 0.10000000149011612) and enters exponential mode at 1e6 rather than 1e8.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_float32_uses_its_own_dtype_digits() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "f32ones",
+                &[1.0, 1.0, 1.0, 1.0],
+                &[4],
+                Dtype::Float32,
+                "[1. 1. 1. 1.]",
+                "array([1., 1., 1., 1.], dtype=float32)",
+            ),
+            (
+                "f32third",
+                &[0.3333333333333333],
+                &[1],
+                Dtype::Float32,
+                "[0.33333334]",
+                "array([0.33333334], dtype=float32)",
+            ),
+            (
+                "f32mixed",
+                &[1.5, 2.25],
+                &[2],
+                Dtype::Float32,
+                "[1.5  2.25]",
+                "array([1.5 , 2.25], dtype=float32)",
+            ),
+            (
+                "f32_1e7",
+                &[10000000.0],
+                &[1],
+                Dtype::Float32,
+                "[1.e+07]",
+                "array([1.e+07], dtype=float32)",
+            ),
+            (
+                "f32_1e5",
+                &[100000.0],
+                &[1],
+                Dtype::Float32,
+                "[100000.]",
+                "array([100000.], dtype=float32)",
+            ),
+            (
+                "f32_tenth",
+                &[0.1, 0.2, 0.3],
+                &[3],
+                Dtype::Float32,
+                "[0.1 0.2 0.3]",
+                "array([0.1, 0.2, 0.3], dtype=float32)",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// Rows wider than linewidth=75 wrap, with a hanging indent one space deeper per axis. repr wraps one column earlier, having a `)` to append.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_line_wrapping() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "wrap20",
+                &[
+                    0.0,
+                    0.05263157894736842,
+                    0.10526315789473684,
+                    0.15789473684210525,
+                    0.21052631578947367,
+                    0.2631578947368421,
+                    0.3157894736842105,
+                    0.3684210526315789,
+                    0.42105263157894735,
+                    0.47368421052631576,
+                    0.5263157894736842,
+                    0.5789473684210527,
+                    0.631578947368421,
+                    0.6842105263157895,
+                    0.7368421052631579,
+                    0.7894736842105263,
+                    0.8421052631578947,
+                    0.8947368421052632,
+                    0.9473684210526315,
+                    1.0,
+                ],
+                &[20],
+                Dtype::Float64,
+                "[0.         0.05263158 0.10526316 0.15789474 0.21052632 0.26315789\n 0.31578947 0.36842105 0.42105263 0.47368421 0.52631579 0.57894737\n 0.63157895 0.68421053 0.73684211 0.78947368 0.84210526 0.89473684\n 0.94736842 1.        ]",
+                "array([0.        , 0.05263158, 0.10526316, 0.15789474, 0.21052632,\n       0.26315789, 0.31578947, 0.36842105, 0.42105263, 0.47368421,\n       0.52631579, 0.57894737, 0.63157895, 0.68421053, 0.73684211,\n       0.78947368, 0.84210526, 0.89473684, 0.94736842, 1.        ])",
+            ),
+            (
+                "wrap40i",
+                &[
+                    0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                    15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0,
+                    28.0, 29.0, 30.0, 31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 37.0, 38.0, 39.0,
+                ],
+                &[40],
+                Dtype::Int64,
+                "[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39]",
+                "array([ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,\n       17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,\n       34, 35, 36, 37, 38, 39])",
+            ),
+            (
+                "wrap2x20",
+                &[
+                    0.0,
+                    0.02564102564102564,
+                    0.05128205128205128,
+                    0.07692307692307693,
+                    0.10256410256410256,
+                    0.1282051282051282,
+                    0.15384615384615385,
+                    0.1794871794871795,
+                    0.20512820512820512,
+                    0.23076923076923078,
+                    0.2564102564102564,
+                    0.28205128205128205,
+                    0.3076923076923077,
+                    0.3333333333333333,
+                    0.358974358974359,
+                    0.38461538461538464,
+                    0.41025641025641024,
+                    0.4358974358974359,
+                    0.46153846153846156,
+                    0.48717948717948717,
+                    0.5128205128205128,
+                    0.5384615384615384,
+                    0.5641025641025641,
+                    0.5897435897435898,
+                    0.6153846153846154,
+                    0.6410256410256411,
+                    0.6666666666666666,
+                    0.6923076923076923,
+                    0.717948717948718,
+                    0.7435897435897436,
+                    0.7692307692307693,
+                    0.7948717948717948,
+                    0.8205128205128205,
+                    0.8461538461538461,
+                    0.8717948717948718,
+                    0.8974358974358975,
+                    0.9230769230769231,
+                    0.9487179487179487,
+                    0.9743589743589743,
+                    1.0,
+                ],
+                &[2, 20],
+                Dtype::Float64,
+                "[[0.         0.02564103 0.05128205 0.07692308 0.1025641  0.12820513\n  0.15384615 0.17948718 0.20512821 0.23076923 0.25641026 0.28205128\n  0.30769231 0.33333333 0.35897436 0.38461538 0.41025641 0.43589744\n  0.46153846 0.48717949]\n [0.51282051 0.53846154 0.56410256 0.58974359 0.61538462 0.64102564\n  0.66666667 0.69230769 0.71794872 0.74358974 0.76923077 0.79487179\n  0.82051282 0.84615385 0.87179487 0.8974359  0.92307692 0.94871795\n  0.97435897 1.        ]]",
+                "array([[0.        , 0.02564103, 0.05128205, 0.07692308, 0.1025641 ,\n        0.12820513, 0.15384615, 0.17948718, 0.20512821, 0.23076923,\n        0.25641026, 0.28205128, 0.30769231, 0.33333333, 0.35897436,\n        0.38461538, 0.41025641, 0.43589744, 0.46153846, 0.48717949],\n       [0.51282051, 0.53846154, 0.56410256, 0.58974359, 0.61538462,\n        0.64102564, 0.66666667, 0.69230769, 0.71794872, 0.74358974,\n        0.76923077, 0.79487179, 0.82051282, 0.84615385, 0.87179487,\n        0.8974359 , 0.92307692, 0.94871795, 0.97435897, 1.        ]])",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// Integer cells right-align to the widest value; bool cells pad True out to False's width.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_integers_and_bools() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "ints",
+                &[1.0, 22.0, 333.0],
+                &[3],
+                Dtype::Int64,
+                "[  1  22 333]",
+                "array([  1,  22, 333])",
+            ),
+            (
+                "negints",
+                &[-1.0, 2.0, -30.0],
+                &[3],
+                Dtype::Int64,
+                "[ -1   2 -30]",
+                "array([ -1,   2, -30])",
+            ),
+            (
+                "arange10",
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                &[10],
+                Dtype::Int64,
+                "[0 1 2 3 4 5 6 7 8 9]",
+                "array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])",
+            ),
+            (
+                "int2d",
+                &[1.0, 200.0, 30.0, 4.0],
+                &[2, 2],
+                Dtype::Int64,
+                "[[  1 200]\n [ 30   4]]",
+                "array([[  1, 200],\n       [ 30,   4]])",
+            ),
+            (
+                "bools",
+                &[1.0, 0.0, 1.0],
+                &[3],
+                Dtype::Bool,
+                "[ True False  True]",
+                "array([ True, False,  True])",
+            ),
+            (
+                "allfalse",
+                &[0.0, 0.0, 0.0],
+                &[3],
+                Dtype::Bool,
+                "[False False False]",
+                "array([False, False, False])",
+            ),
+            (
+                "i32",
+                &[1.0, 2.0, 3.0],
+                &[3],
+                Dtype::Int32,
+                "[1 2 3]",
+                "array([1, 2, 3], dtype=int32)",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// Higher axes insert (axes_left - 1) blank lines between blocks.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_nested_blocks() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "m22",
+                &[1.0, 2.0, 3.0, 4.0],
+                &[2, 2],
+                Dtype::Float64,
+                "[[1. 2.]\n [3. 4.]]",
+                "array([[1., 2.],\n       [3., 4.]])",
+            ),
+            (
+                "eye3",
+                &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                &[3, 3],
+                Dtype::Float64,
+                "[[1. 0. 0.]\n [0. 1. 0.]\n [0. 0. 1.]]",
+                "array([[1., 0., 0.],\n       [0., 1., 0.],\n       [0., 0., 1.]])",
+            ),
+            (
+                "m23",
+                &[
+                    0.0,
+                    0.09090909090909091,
+                    0.18181818181818182,
+                    0.2727272727272727,
+                    0.36363636363636365,
+                    0.45454545454545453,
+                ],
+                &[2, 3],
+                Dtype::Float64,
+                "[[0.         0.09090909 0.18181818]\n [0.27272727 0.36363636 0.45454545]]",
+                "array([[0.        , 0.09090909, 0.18181818],\n       [0.27272727, 0.36363636, 0.45454545]])",
+            ),
+            (
+                "m34",
+                &[
+                    1.0,
+                    1.1818181818181819,
+                    1.3636363636363638,
+                    1.5454545454545454,
+                    1.7272727272727273,
+                    1.9090909090909092,
+                    2.090909090909091,
+                    2.2727272727272725,
+                    2.4545454545454546,
+                    2.6363636363636367,
+                    2.8181818181818183,
+                    3.0,
+                ],
+                &[3, 4],
+                Dtype::Float64,
+                "[[1.         1.18181818 1.36363636 1.54545455]\n [1.72727273 1.90909091 2.09090909 2.27272727]\n [2.45454545 2.63636364 2.81818182 3.        ]]",
+                "array([[1.        , 1.18181818, 1.36363636, 1.54545455],\n       [1.72727273, 1.90909091, 2.09090909, 2.27272727],\n       [2.45454545, 2.63636364, 2.81818182, 3.        ]])",
+            ),
+            (
+                "c223",
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+                &[2, 2, 3],
+                Dtype::Float64,
+                "[[[ 0.  1.  2.]\n  [ 3.  4.  5.]]\n\n [[ 6.  7.  8.]\n  [ 9. 10. 11.]]]",
+                "array([[[ 0.,  1.,  2.],\n        [ 3.,  4.,  5.]],\n\n       [[ 6.,  7.,  8.],\n        [ 9., 10., 11.]]])",
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// str of a 0-d array is the element's own str — NOT truncated to precision — while repr goes through the array formatter.
+    ///
+    /// Every expectation is real `python3` + numpy output.
+    #[test]
+    fn format_zero_d_arrays() {
+        // Verified against python3.
+        let cases: &[(&str, &[f64], &[usize], Dtype, &str, &str)] = &[
+            (
+                "zerod_f",
+                &[0.3333333333333333],
+                &[],
+                Dtype::Float64,
+                "0.3333333333333333",
+                "array(0.33333333)",
+            ),
+            ("zerod_f2", &[1.5], &[], Dtype::Float64, "1.5", "array(1.5)"),
+            ("zerod_i", &[3.0], &[], Dtype::Int64, "3", "array(3)"),
+            ("zerod_b", &[1.0], &[], Dtype::Bool, "True", "array(True)"),
+        ];
+        check_cases(cases);
+    }
+
+    /// Above threshold=1000 elements numpy elides the middle, keeping
+    /// edgeitems=3 per axis, and sizes the columns from what survives.
+    /// repr then adds `shape=`, which the elided text no longer implies.
+    #[test]
+    fn format_summarization() {
+        // Verified against python3.
+        let ints = NdArray::new(vec![1001], Dtype::Int64, Data::I64((0..1001).collect()));
+        assert_eq!(
+            crate::py_display(&ints),
+            "[   0    1    2 ...  998  999 1000]"
+        );
+        assert_eq!(
+            ints.py_repr(),
+            "array([   0,    1,    2, ...,  998,  999, 1000], shape=(1001,))"
+        );
+
+        let zeros = NdArray::new(vec![2000], Dtype::Float64, Data::F64(vec![0.0; 2000]));
+        assert_eq!(crate::py_display(&zeros), "[0. 0. 0. ... 0. 0. 0.]");
+        assert_eq!(
+            zeros.py_repr(),
+            "array([0., 0., 0., ..., 0., 0., 0.], shape=(2000,))"
+        );
+
+        // Both axes elide, and the ellipsis row sits at the block level.
+        let grid = NdArray::new(
+            vec![40, 40],
+            Dtype::Float64,
+            Data::F64((0..1600).map(|i| (i % 7) as f64).collect()),
+        );
+        assert_eq!(
+            crate::py_display(&grid),
+            "[[0. 1. 2. ... 2. 3. 4.]\n [5. 6. 0. ... 0. 1. 2.]\n [3. 4. 5. ... 5. 6. 0.]\n ...\n [3. 4. 5. ... 5. 6. 0.]\n [1. 2. 3. ... 3. 4. 5.]\n [6. 0. 1. ... 1. 2. 3.]]"
+        );
+
+        // Exactly at the threshold nothing is elided.
+        let at_threshold = NdArray::new(vec![1000], Dtype::Int64, Data::I64((0..1000).collect()));
+        assert!(!crate::py_display(&at_threshold).contains("..."));
+    }
+
+    /// A summarized array's cell widths come from the elements that survive
+    /// summarization, not from the elided ones.
+    #[test]
+    fn format_summarized_widths_come_from_the_visible_edge() {
+        // Verified against python3: the elided middle is 123456.0, but only
+        // the zeros print, so the column stays narrow.
+        let mut vals = vec![0.0; 3];
+        vals.extend(std::iter::repeat_n(123_456.0, 995));
+        vals.extend([0.0; 3]);
+        let a = NdArray::new(vec![1001], Dtype::Float64, Data::F64(vals));
+        assert_eq!(crate::py_display(&a), "[0. 0. 0. ... 0. 0. 0.]");
+    }
+
+    /// A slice of a 2-D array keeps the trailing axes.
+    #[test]
+    fn slice_of_2d_keeps_row_shape() {
+        // np.arange(12).reshape(4, 3)[-2:] -> shape (2, 3), [[6,7,8],[9,10,11]]
+        // Verified against python3.
+        let m = NdArray::new(vec![4, 3], Dtype::Int64, Data::I64((0..12).collect()));
+        let got = m.py_slice(Some(-2), None, None);
+        assert_eq!(got.shape, vec![2, 3]);
+        assert_eq!(got.as_i64(), vec![6, 7, 8, 9, 10, 11]);
     }
 }

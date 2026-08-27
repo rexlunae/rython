@@ -3,9 +3,9 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, types::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
-use crate::{extraction_failure, 
-    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableScopes,
-    Node, impl_node_with_positions, PyAttributeExtractor
+use crate::{
+    CodeGen, CodeGenContext, ExprType, Node, PyAttributeExtractor, PythonOptions,
+    SymbolTableScopes, extraction_failure, impl_node_with_positions,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -25,11 +25,17 @@ impl<'a, 'py> FromPyObject<'a, 'py> for IfExp {
         let test = ob.extract_attr_with_context("test", "if expression test")?;
         let body = ob.extract_attr_with_context("body", "if expression body")?;
         let orelse = ob.extract_attr_with_context("orelse", "if expression orelse")?;
-        
-        let test = test.extract().map_err(|e| extraction_failure("getting if expression test", &ob, e))?;
-        let body = body.extract().map_err(|e| extraction_failure("getting if expression body", &ob, e))?;
-        let orelse = orelse.extract().map_err(|e| extraction_failure("getting if expression orelse", &ob, e))?;
-        
+
+        let test = test
+            .extract()
+            .map_err(|e| extraction_failure("getting if expression test", &ob, e))?;
+        let body = body
+            .extract()
+            .map_err(|e| extraction_failure("getting if expression body", &ob, e))?;
+        let orelse = orelse
+            .extract()
+            .map_err(|e| extraction_failure("getting if expression orelse", &ob, e))?;
+
         Ok(IfExp {
             test: Box::new(test),
             body: Box::new(body),
@@ -42,7 +48,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for IfExp {
     }
 }
 
-impl_node_with_positions!(IfExp { lineno, col_offset, end_lineno, end_col_offset });
+impl_node_with_positions!(IfExp {
+    lineno,
+    col_offset,
+    end_lineno,
+    end_col_offset
+});
 
 impl CodeGen for IfExp {
     type Context = CodeGenContext;
@@ -57,9 +68,11 @@ impl CodeGen for IfExp {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let test =
             crate::condition_to_rust(&self.test, ctx.clone(), options.clone(), symbols.clone())?;
-        let body = self.body.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let body = self
+            .body
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let orelse = self.orelse.to_rust(ctx, options, symbols)?;
-        
+
         Ok(quote! {
             if #test { #body } else { #orelse }
         })
@@ -71,6 +84,14 @@ mod tests {
     use super::*;
     use crate::create_parse_test;
 
-    create_parse_test!(test_if_expression, "x if condition else y", "if_exp_test.py");
-    create_parse_test!(test_nested_if_expression, "a if b else c if d else e", "if_exp_test.py");
+    create_parse_test!(
+        test_if_expression,
+        "x if condition else y",
+        "if_exp_test.py"
+    );
+    create_parse_test!(
+        test_nested_if_expression,
+        "a if b else c if d else e",
+        "if_exp_test.py"
+    );
 }

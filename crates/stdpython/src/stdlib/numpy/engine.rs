@@ -105,8 +105,12 @@ const REQUESTED_RAYON: u8 = 2;
 const REQUESTED_SIMD: u8 = 3;
 const REQUESTED_CUDA: u8 = 4;
 const REQUESTED_VULKAN: u8 = 5;
+/// Nothing has called `set_backend` yet — distinct from an explicit
+/// `set_backend(Auto)`, so the environment override can be consulted
+/// without overriding a deliberate choice.
+const REQUESTED_UNSET: u8 = u8::MAX;
 
-static REQUESTED: AtomicU8 = AtomicU8::new(REQUESTED_AUTO);
+static REQUESTED: AtomicU8 = AtomicU8::new(REQUESTED_UNSET);
 
 /// Pin the execution backend for the rest of the process. Generated code
 /// emits this from the compiler's `--numpy-backend` flag; it can also be
@@ -125,6 +129,35 @@ pub fn set_backend(b: Backend) {
     );
 }
 
+/// Parse a `RYPY_NUMPY_BACKEND` value. `None` for an unset or empty
+/// variable; `Err` for a name that is not a backend — never a silent
+/// fallback to `Auto` (issue #198).
+pub(crate) fn backend_from_env_value(raw: &str) -> Result<Option<Backend>, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    match Backend::from_str(name) {
+        Some(b) => Ok(Some(b)),
+        None => Err(format!(
+            "unknown numpy backend '{name}' in RYPY_NUMPY_BACKEND (expected one of: \
+             auto, scalar, rayon, simd, cuda, vulkan)"
+        )),
+    }
+}
+
+/// The `RYPY_NUMPY_BACKEND` override, read and validated once per process.
+fn env_backend() -> Option<Backend> {
+    static ENV: std::sync::OnceLock<Option<Backend>> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| match std::env::var("RYPY_NUMPY_BACKEND") {
+        Ok(raw) => match backend_from_env_value(&raw) {
+            Ok(b) => b,
+            Err(msg) => panic!("{}", crate::PyException::new("RuntimeError", msg)),
+        },
+        Err(_) => None,
+    })
+}
+
 fn requested_backend() -> Backend {
     match REQUESTED.load(Ordering::Relaxed) {
         REQUESTED_AUTO => Backend::Auto,
@@ -133,7 +166,9 @@ fn requested_backend() -> Backend {
         REQUESTED_SIMD => Backend::Simd,
         REQUESTED_CUDA => Backend::Cuda,
         REQUESTED_VULKAN => Backend::Vulkan,
-        _ => Backend::Auto,
+        // Nothing pinned: the environment override gets its documented
+        // turn before falling back to Auto.
+        _ => env_backend().unwrap_or(Backend::Auto),
     }
 }
 
@@ -164,10 +199,16 @@ pub fn active_backend() -> Backend {
 }
 
 fn auto_backend() -> Backend {
-    // Ranked by measured performance (issue #164): hardware backends that
-    // are actually present outrank the CPU kernels; among the software
-    // kernels, multithreaded rayon beats the single-threaded simd/scalar
-    // loops at every benchmarked size, so it outranks simd.
+    // Ranked by measured performance (issues #164, #199): hardware
+    // backends that are actually present outrank the CPU kernels.
+    //
+    // Among the software kernels rayon outranks simd because rayon's
+    // kernels fall back to the sequential loop below
+    // `rayon_eng::PARALLEL_MIN_LEN`, so it is never worse than scalar and
+    // wins above the floor. That floor is load-bearing for this ranking:
+    // before it existed rayon was 32x SLOWER on a 1 000-element kernel and
+    // `auto` picked it anyway. `simd` is currently an alias of `scalar`
+    // (no hand-written intrinsics yet), so it has nothing to add here.
     let software: Backend = if cfg!(feature = "numpy-rayon") {
         Backend::Rayon
     } else if cfg!(feature = "numpy-simd") {
@@ -259,15 +300,15 @@ pub(crate) enum UnOp {
 #[path = "scalar.rs"]
 pub(crate) mod scalar;
 
+#[cfg(feature = "numpy-cuda")]
+#[path = "cuda.rs"]
+pub(crate) mod cuda;
 #[cfg(feature = "numpy-rayon")]
 #[path = "rayon_eng.rs"]
 pub(crate) mod rayon_eng;
 #[cfg(feature = "numpy-simd")]
 #[path = "simd.rs"]
 pub(crate) mod simd;
-#[cfg(feature = "numpy-cuda")]
-#[path = "cuda.rs"]
-pub(crate) mod cuda;
 #[cfg(feature = "numpy-vulkan")]
 #[path = "vulkan.rs"]
 pub(crate) mod vulkan;
@@ -340,4 +381,46 @@ pub(crate) fn unary_i32(op: UnOp, a: &[i32]) -> Vec<i32> {
 }
 pub(crate) fn unary_bool(op: UnOp, a: &[bool]) -> Vec<bool> {
     dispatch_unary!(unary_bool, op, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RYPY_NUMPY_BACKEND` used to be documented in five places and read
+    /// by none: setting it — including to a backend that is not compiled
+    /// in, or to a name that does not exist — silently left the engine on
+    /// `auto` (issue #198). The env read itself is a process-wide
+    /// OnceLock, so the parsing is tested through this pure function.
+    #[test]
+    fn env_value_parses_every_backend_name() {
+        for (raw, expected) in [
+            ("auto", Backend::Auto),
+            ("scalar", Backend::Scalar),
+            ("rayon", Backend::Rayon),
+            ("simd", Backend::Simd),
+            ("cuda", Backend::Cuda),
+            ("vulkan", Backend::Vulkan),
+            ("  rayon  ", Backend::Rayon),
+        ] {
+            assert_eq!(
+                backend_from_env_value(raw),
+                Ok(Some(expected)),
+                "RYPY_NUMPY_BACKEND={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_value_unset_or_empty_is_no_override() {
+        assert_eq!(backend_from_env_value(""), Ok(None));
+        assert_eq!(backend_from_env_value("   "), Ok(None));
+    }
+
+    #[test]
+    fn env_value_unknown_name_is_loud() {
+        let err = backend_from_env_value("bogus").expect_err("must not silently fall back");
+        assert!(err.contains("unknown numpy backend 'bogus'"), "{err}");
+        assert!(err.contains("RYPY_NUMPY_BACKEND"), "{err}");
+    }
 }

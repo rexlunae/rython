@@ -3,8 +3,7 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
-    PyAttributeExtractor,
+    CodeGen, CodeGenContext, ExprType, Node, PyAttributeExtractor, PythonOptions, SymbolTableScopes,
 };
 
 /// Starred expression for unpacking (*args)
@@ -27,12 +26,16 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Starred {
         // Extract the value being starred
         let value = ob.extract_attr_with_context("value", "starred expression value")?;
         let value: ExprType = value.extract()?;
-        
+
         // Extract context (Load, Store, etc.) - optional
         let ctx = ob.getattr("ctx").ok().and_then(|ctx_obj| {
-            ctx_obj.get_type().name().ok().and_then(|name| name.extract().ok())
+            ctx_obj
+                .get_type()
+                .name()
+                .ok()
+                .and_then(|name| name.extract().ok())
         });
-        
+
         Ok(Starred {
             value: Box::new(value),
             ctx,
@@ -45,10 +48,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Starred {
 }
 
 impl Node for Starred {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl CodeGen for Starred {
@@ -71,9 +82,7 @@ impl CodeGen for Starred {
         // elements are NOT spread (the documented divergence; the callee
         // receives the collection as one argument). List-literal spreads
         // are handled by the List codegen before reaching here.
-        self.value
-            .clone()
-            .to_rust(ctx, options, symbols)
+        self.value.clone().to_rust(ctx, options, symbols)
     }
 }
 

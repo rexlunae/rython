@@ -4,8 +4,9 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, extraction_failure, err_from, BinOpNotYetImplemented, BinaryOperation, CodeGen, CodeGenContext, ExprType,
-    FromPythonString, PyAttributeExtractor, PythonOperator, PythonOptions, SymbolTableScopes,
+    BinOpNotYetImplemented, BinaryOperation, CodeGen, CodeGenContext, ExprType, FromPythonString,
+    PyAttributeExtractor, PythonOperator, PythonOptions, SymbolTableScopes, dump, err_from,
+    extraction_failure,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -46,7 +47,7 @@ impl FromPythonString for BinOps {
             _ => None,
         }
     }
-    
+
     fn unknown() -> Self {
         BinOps::Unknown
     }
@@ -69,12 +70,17 @@ impl PythonOperator for BinOps {
             BinOps::BitAnd => Ok(quote!(&)),
             _ => Err(err_from(BinOpNotYetImplemented(BinOp {
                 op: self.clone(),
-                left: Box::new(ExprType::Name(crate::Name { id: "unknown".to_string() })),
-                right: Box::new(ExprType::Name(crate::Name { id: "unknown".to_string() })),
-            })).into()),
+                left: Box::new(ExprType::Name(crate::Name {
+                    id: "unknown".to_string(),
+                })),
+                right: Box::new(ExprType::Name(crate::Name {
+                    id: "unknown".to_string(),
+                })),
+            }))
+            .into()),
         }
     }
-    
+
     fn is_unknown(&self) -> bool {
         matches!(self, BinOps::Unknown)
     }
@@ -89,15 +95,15 @@ pub struct BinOp {
 
 impl BinaryOperation for BinOp {
     type OperatorType = BinOps;
-    
+
     fn operator(&self) -> &Self::OperatorType {
         &self.op
     }
-    
+
     fn left(&self) -> &ExprType {
         &self.left
     }
-    
+
     fn right(&self) -> &ExprType {
         &self.right
     }
@@ -107,22 +113,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for BinOp {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         tracing::debug!("ob: {}", dump(&ob, None)?);
-        
+
         let op = ob.extract_attr_with_context("op", "binary operator")?;
         let op_type_str = op.extract_type_name("binary operator")?;
-        
+
         let left = ob.extract_attr_with_context("left", "binary operand")?;
         let right = ob.extract_attr_with_context("right", "binary operand")?;
-        
-        tracing::debug!("left: {}, right: {}", dump(&left, None)?, dump(&right, None)?);
+
+        tracing::debug!(
+            "left: {}, right: {}",
+            dump(&left, None)?,
+            dump(&right, None)?
+        );
 
         let op = BinOps::parse_or_unknown(&op_type_str);
         if matches!(op, BinOps::Unknown) {
             tracing::debug!("Found unknown BinOp {:?}", op_type_str);
         }
 
-        let left = left.extract().map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
-        let right = right.extract().map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
+        let left = left
+            .extract()
+            .map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
+        let right = right
+            .extract()
+            .map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
 
         Ok(BinOp {
             op,
@@ -146,18 +160,24 @@ impl CodeGen for BinOp {
         // Python's ** promotes based on operand types; route through the
         // stdpython py_pow helper, which implements those semantics.
         if matches!(self.op, BinOps::Pow) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             return Ok(quote!(py_pow(#left, #right)));
         }
-        
+
         // For Div, Python semantics are elementwise/numeric true division.
         // Route through the stdpython py_div helper: numeric operands
         // divide to f64, and NdArray operands (numpy) divide elementwise.
         // The `?` propagates a catchable ZeroDivisionError instead of
         // silently yielding inf/nan (issue #107).
         if matches!(self.op, BinOps::Div) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             return Ok(quote!(py_div(#left, #right)?));
         }
@@ -167,7 +187,10 @@ impl CodeGen for BinOp {
         // operands fail loudly at compile time (no impl), like CPython's
         // TypeError for unsupported types.
         if matches!(self.op, BinOps::MatMult) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             return Ok(quote!(py_matmul(#left, #right)));
         }
@@ -177,17 +200,23 @@ impl CodeGen for BinOp {
         // stdpython helpers, which implement the Python semantics. The `?`
         // propagates a catchable ZeroDivisionError (issue #75).
         if matches!(self.op, BinOps::FloorDiv) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             return Ok(quote!(py_floordiv(#left, #right)?));
         }
 
         if matches!(self.op, BinOps::Mod) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             return Ok(quote!(py_mod(#left, #right)?));
         }
-        
+
         // Python's * repeats sequences when one operand is a string:
         // "!" * 3 == "!!!". Route literal-string repetition through the
         // stdpython multiply_string helper (numeric multiplication keeps
@@ -198,7 +227,10 @@ impl CodeGen for BinOp {
             let right_is_str = matches!(&*self.right, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))))
                 || matches!(&*self.right, ExprType::JoinedStr(_));
             if left_is_str || right_is_str {
-                let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let left =
+                    self.left
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                 let right = self.right.clone().to_rust(ctx, options, symbols)?;
                 return Ok(if left_is_str {
                     quote!(multiply_string(#left, (#right) as i64))
@@ -215,7 +247,10 @@ impl CodeGen for BinOp {
         // unanchored `{integer}` receiver fails before literal fallback
         // (e.g. `1 + 2` in an unannotated position).
         if matches!(self.op, BinOps::Add) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             let left = anchor_numeric_literal(&self.left, left);
             let right = anchor_numeric_literal(&self.right, right);
@@ -226,7 +261,10 @@ impl CodeGen for BinOp {
         // for scalars, elementwise for NdArray), so `x - y` never moves
         // the variables.
         if matches!(self.op, BinOps::Sub) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             let left = anchor_numeric_literal(&self.left, left);
             let right = anchor_numeric_literal(&self.right, right);
@@ -237,7 +275,10 @@ impl CodeGen for BinOp {
         // repetition handled above: PyMul borrows both operands, so
         // `x * 2` never moves `x`.
         if matches!(self.op, BinOps::Mult) {
-            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let left = self
+                .left
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             let left = anchor_numeric_literal(&self.left, left);
             let right = anchor_numeric_literal(&self.right, right);
@@ -282,14 +323,14 @@ mod tests {
     create_parse_test!(test_divide, "8 / 2", "test_case.py");
     create_parse_test!(test_power, "2 ** 3", "test_case.py");
     create_parse_test!(test_modulo, "10 % 3", "test_case.py");
-    
+
     #[test]
     fn test_unknown_operator() {
         let unknown_op = BinOps::Unknown;
         assert!(unknown_op.is_unknown());
         assert!(unknown_op.to_rust_op().is_err());
     }
-    
+
     #[test]
     fn test_from_python_string() {
         assert_eq!(BinOps::from_python_string("Add"), Some(BinOps::Add));

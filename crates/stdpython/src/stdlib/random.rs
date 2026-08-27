@@ -341,7 +341,10 @@ where
 {
     let lambd = lambd.into();
     if lambd == 0.0 {
-        return Err(PyException::new("ZeroDivisionError", "float division by zero"));
+        return Err(PyException::new(
+            "ZeroDivisionError",
+            "float division by zero",
+        ));
     }
     Ok(-(1.0 - random()).ln() / lambd)
 }
@@ -357,7 +360,9 @@ where
     let alpha = alpha.into();
     let beta = beta.into();
     if alpha <= 0.0 || beta <= 0.0 {
-        return Err(crate::value_error("gammavariate: alpha and beta must be > 0.0"));
+        return Err(crate::value_error(
+            "gammavariate: alpha and beta must be > 0.0",
+        ));
     }
     let sg_magicconst = 1.0 + 4.5f64.ln();
     let log4 = 4.0f64.ln();
@@ -460,7 +465,10 @@ where
     let alpha = alpha.into();
     let beta = beta.into();
     if beta == 0.0 {
-        return Err(PyException::new("ZeroDivisionError", "float division by zero"));
+        return Err(PyException::new(
+            "ZeroDivisionError",
+            "float division by zero",
+        ));
     }
     let u = 1.0 - random();
     Ok(alpha * (-u.ln()).powf(1.0 / beta))
@@ -478,9 +486,7 @@ pub fn randrange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<i64
             }
             (start, stop, step)
         }
-        (None, Some(_)) => {
-            return Err(crate::type_error("Missing stop argument for randrange()"))
-        }
+        (None, Some(_)) => return Err(crate::type_error("Missing stop argument for randrange()")),
     };
 
     let width = stop - start;
@@ -599,7 +605,9 @@ where
     };
     let total = *cum_weights.last().unwrap_or(&0.0);
     if total <= 0.0 {
-        return Err(crate::value_error("Total of weights must be greater than zero"));
+        return Err(crate::value_error(
+            "Total of weights must be greater than zero",
+        ));
     }
     if !total.is_finite() {
         return Err(crate::value_error("Total of weights must be finite"));
@@ -711,7 +719,11 @@ impl SystemRandom {
             return Err(crate::value_error("k must be positive"));
         }
         let bits = 64 - (k - 1).leading_zeros().min(63);
-        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         loop {
             let r = Self::entropy_word() & mask;
             if r < k {

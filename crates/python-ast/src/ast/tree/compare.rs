@@ -1,11 +1,13 @@
 use proc_macro2::TokenStream;
-use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
+use pyo3::{
+    Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods,
+};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dump, extraction_failure, err_from, CodeGen, CodeGenContext, CompareNotYetImplemented, ExprType,
-    PythonOptions, SymbolTableScopes,
+    CodeGen, CodeGenContext, CompareNotYetImplemented, ExprType, PythonOptions, SymbolTableScopes,
+    dump, err_from, extraction_failure,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -72,16 +74,22 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Compare {
             op_list.push(op);
         }
 
-        let left = ob.getattr("left").map_err(|e| extraction_failure("left", &ob, e))?;
+        let left = ob
+            .getattr("left")
+            .map_err(|e| extraction_failure("left", &ob, e))?;
 
-        let comparators = ob.getattr("comparators").map_err(|e| extraction_failure("comparators", &ob, e))?;
+        let comparators = ob
+            .getattr("comparators")
+            .map_err(|e| extraction_failure("comparators", &ob, e))?;
         tracing::debug!(
             "left: {}, comparators: {}",
             dump(&left, None)?,
             dump(&comparators, None)?
         );
 
-        let left = left.extract().map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
+        let left = left
+            .extract()
+            .map_err(|e| extraction_failure("getting binary operator operand", &ob, e))?;
         let comparators: Vec<ExprType> = comparators
             .extract()
             .map_err(|e| extraction_failure("comparators", &ob, e))?;
@@ -159,9 +167,10 @@ impl CodeGen for Compare {
                     None
                 };
                 if let Some(operand) = none_check {
-                    let operand_tokens = operand
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let operand_tokens =
+                        operand
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     let tokens = match op {
                         Compares::Is => quote!((#operand_tokens).py_is_none()),
                         _ => quote!(!(#operand_tokens).py_is_none()),
@@ -251,9 +260,10 @@ impl CodeGen for Compare {
                     }
                 }
             }
-            let comparator = comparator_ast
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let comparator =
+                comparator_ast
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             // A GENERIC (inferred) parameter compares with an integer
             // literal converted to the parameter's own type via
             // stdpython's PyFromInt (`B::py_from_int(0)`): Rust std has no

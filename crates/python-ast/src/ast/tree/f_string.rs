@@ -4,8 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes,
-    extract_list,
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableScopes, extract_list,
 };
 
 /// Joined string (f-string, e.g., f"Hello {name}")
@@ -41,7 +40,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for JoinedStr {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract values
         let values: Vec<ExprType> = extract_list(&ob, "values", "joined string values")?;
-        
+
         Ok(JoinedStr {
             values,
             lineno: ob.lineno(),
@@ -57,7 +56,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FormattedValue {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // Extract value
         let value: ExprType = ob.getattr("value")?.extract()?;
-        
+
         // Extract conversion (optional)
         let conversion: Option<i32> = if let Ok(conv_attr) = ob.getattr("conversion") {
             let conv_val: i32 = conv_attr.extract()?;
@@ -69,7 +68,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FormattedValue {
         } else {
             None
         };
-        
+
         // Extract format_spec (optional)
         let format_spec: Option<Box<ExprType>> = if let Ok(spec_attr) = ob.getattr("format_spec") {
             if spec_attr.is_none() {
@@ -80,7 +79,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FormattedValue {
         } else {
             None
         };
-        
+
         Ok(FormattedValue {
             value: Box::new(value),
             conversion,
@@ -94,17 +93,33 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FormattedValue {
 }
 
 impl Node for JoinedStr {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl Node for FormattedValue {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl CodeGen for JoinedStr {
@@ -113,7 +128,9 @@ impl CodeGen for JoinedStr {
     type SymbolTable = SymbolTableScopes;
 
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
-        self.values.into_iter().fold(symbols, |acc, val| val.find_symbols(acc))
+        self.values
+            .into_iter()
+            .fold(symbols, |acc, val| val.find_symbols(acc))
     }
 
     fn to_rust(
@@ -134,9 +151,11 @@ impl CodeGen for JoinedStr {
                     fmt.push_str(&escape_format_braces(&constant_text(&c)));
                 }
                 ExprType::FormattedValue(fv) => {
-                    let expr = (*fv.value)
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    let expr = (*fv.value).clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
                     let (placeholder, expr) =
                         fv.rust_placeholder(expr, &ctx, &options, &symbols)?;
                     fmt.push_str(&placeholder);
@@ -201,11 +220,10 @@ impl FormattedValue {
                     // time — the whole interpolation lowers through the
                     // runtime dynamic-format helper (Python's right-align
                     // integer-in-width semantics).
-                    let spec_tokens = (*spec).clone().to_rust(
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?;
+                    let spec_tokens =
+                        (*spec)
+                            .clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                     return Ok((
                         "{}".to_string(),
                         quote!(py_dynamic_format(#value, #spec_tokens)),
@@ -224,10 +242,12 @@ impl FormattedValue {
             let lowering = crate::pyformat::translate_format_spec(&spec_text)
                 .map_err(|e| format!("f-string: {}", e))?;
             let SpecLowering::Inline(suffix) = lowering else {
-                return Err("numeric presentation types cannot combine with !r/!a (Python \
+                return Err(
+                    "numeric presentation types cannot combine with !r/!a (Python \
                             applies the spec to the repr string and raises)"
-                    .to_string()
-                    .into());
+                        .to_string()
+                        .into(),
+                );
             };
             let placeholder = if suffix.is_empty() {
                 "{}".to_string()
@@ -271,10 +291,7 @@ impl FormattedValue {
             // The `,` thousands separator (`f"{size:,}"` — rich's
             // filesize): the runtime formatter groups the integer's
             // digits.
-            SpecLowering::GroupedInt => Ok((
-                "{}".to_string(),
-                quote!(py_grouped_int(#value)),
-            )),
+            SpecLowering::GroupedInt => Ok(("{}".to_string(), quote!(py_grouped_int(#value)))),
         }
     }
 }
@@ -318,9 +335,10 @@ impl CodeGen for FormattedValue {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let value_tokens = (*self.value)
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value_tokens =
+            (*self.value)
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let (placeholder, value_tokens) =
             self.rust_placeholder(value_tokens, &ctx, &options, &symbols)?;
         Ok(quote! {

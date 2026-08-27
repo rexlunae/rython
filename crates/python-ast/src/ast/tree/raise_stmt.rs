@@ -4,8 +4,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableNode,
-    SymbolTableScopes,
+    CodeGen, CodeGenContext, ExprType, Node, PythonOptions, SymbolTableNode, SymbolTableScopes,
 };
 
 /// Raise statement (raise [exception [from cause]])
@@ -35,7 +34,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Raise {
         } else {
             None
         };
-        
+
         // Extract cause (optional)
         let cause: Option<ExprType> = if let Ok(cause_attr) = ob.getattr("cause") {
             if cause_attr.is_none() {
@@ -46,7 +45,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Raise {
         } else {
             None
         };
-        
+
         Ok(Raise {
             exc,
             cause,
@@ -59,10 +58,18 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Raise {
 }
 
 impl Node for Raise {
-    fn lineno(&self) -> Option<usize> { self.lineno }
-    fn col_offset(&self) -> Option<usize> { self.col_offset }
-    fn end_lineno(&self) -> Option<usize> { self.end_lineno }
-    fn end_col_offset(&self) -> Option<usize> { self.end_col_offset }
+    fn lineno(&self) -> Option<usize> {
+        self.lineno
+    }
+    fn col_offset(&self) -> Option<usize> {
+        self.col_offset
+    }
+    fn end_lineno(&self) -> Option<usize> {
+        self.end_lineno
+    }
+    fn end_col_offset(&self) -> Option<usize> {
+        self.end_col_offset
+    }
 }
 
 impl CodeGen for Raise {
@@ -76,7 +83,7 @@ impl CodeGen for Raise {
         } else {
             symbols
         };
-        
+
         if let Some(cause) = self.cause {
             cause.find_symbols(symbols)
         } else {
@@ -370,8 +377,7 @@ fn exception_value(
                     let msg = match call.args.len() {
                         0 => quote!(String::new()),
                         _ => {
-                            let arg =
-                                call.args[0].clone().to_rust(ctx, options, symbols)?;
+                            let arg = call.args[0].clone().to_rust(ctx, options, symbols)?;
                             quote!(format!("{}", #arg))
                         }
                     };
@@ -392,11 +398,8 @@ fn exception_value(
                                 .args
                                 .iter()
                                 .map(|a| {
-                                    a.clone().to_rust(
-                                        ctx.clone(),
-                                        options.clone(),
-                                        symbols.clone(),
-                                    )
+                                    a.clone()
+                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
                                 })
                                 .collect();
                             let args = args?;
@@ -446,9 +449,8 @@ fn resolved_is_exception_class(
             let Some(key) = crate::module_defs_key(options, &path) else {
                 return false;
             };
-            crate::module_class_def(&options, key, name).is_some_and(|(c, _)| {
-                crate::is_exception_class(&c)
-            })
+            crate::module_class_def(&options, key, name)
+                .is_some_and(|(c, _)| crate::is_exception_class(&c))
         }
         _ => false,
     }

@@ -148,7 +148,11 @@ fn handle_long_word(
     cur_len: usize,
     width: usize,
 ) {
-    let space_left = if width < 1 { 1 } else { width.saturating_sub(cur_len) };
+    let space_left = if width < 1 {
+        1
+    } else {
+        width.saturating_sub(cur_len)
+    };
     // break_long_words: chop, preferring the last hyphen in the window.
     let chunk = rest.last().expect("caller checked").clone();
     let mut end = space_left;

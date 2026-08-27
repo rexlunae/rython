@@ -18,8 +18,8 @@
 //! Pure data transformation, so this module lives on every tier (alloc +
 //! std); `format!` is the alloc crate's macro, imported explicitly.
 
-use alloc::{format, string::String, string::ToString, vec::Vec};
 use crate::PyException;
+use alloc::{format, string::String, string::ToString, vec::Vec};
 
 /// str.encode("ascii"): 7-bit ASCII bytes; a non-ASCII character raises
 /// UnicodeEncodeError like CPython's strict error handler.
@@ -65,9 +65,14 @@ pub fn decode_utf8(b: &[u8]) -> Result<String, PyException> {
     String::from_utf8(b.to_vec()).map_err(|e| {
         PyException::new(
             "UnicodeDecodeError",
-            format!("'utf-8' codec can't decode byte 0x{:x} in position {}: invalid start byte", 
-                e.utf8_error().error_len().map(|_| b[e.utf8_error().valid_up_to()]).unwrap_or(0),
-                e.utf8_error().valid_up_to()),
+            format!(
+                "'utf-8' codec can't decode byte 0x{:x} in position {}: invalid start byte",
+                e.utf8_error()
+                    .error_len()
+                    .map(|_| b[e.utf8_error().valid_up_to()])
+                    .unwrap_or(0),
+                e.utf8_error().valid_up_to()
+            ),
         )
     })
 }
@@ -167,7 +172,11 @@ pub fn encode_punycode<S: AsRef<str>>(input: S) -> Vec<u8> {
             .min()
             .expect("h < len guarantees a code point >= n");
         delta = delta
-            .checked_add((m - n).checked_mul((h + 1) as u32).expect("punycode delta overflow"))
+            .checked_add(
+                (m - n)
+                    .checked_mul((h + 1) as u32)
+                    .expect("punycode delta overflow"),
+            )
             .expect("punycode delta overflow");
         n = m;
         for c in &chars {
@@ -248,20 +257,22 @@ pub fn decode_punycode(input: &[u8]) -> Result<String, PyException> {
                 k - bias
             };
             if digit < t {
-                i = i.checked_add(digit.checked_mul(w).ok_or_else(|| {
+                i = i
+                    .checked_add(digit.checked_mul(w).ok_or_else(|| {
+                        PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
+                    })?)
+                    .ok_or_else(|| {
+                        PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
+                    })?;
+                break;
+            }
+            i = i
+                .checked_add(digit.checked_mul(w).ok_or_else(|| {
                     PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
                 })?)
                 .ok_or_else(|| {
                     PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
                 })?;
-                break;
-            }
-            i = i.checked_add(digit.checked_mul(w).ok_or_else(|| {
-                PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
-            })?)
-            .ok_or_else(|| {
-                PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
-            })?;
             w = w.checked_mul(BASE - t).ok_or_else(|| {
                 PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
             })?;
@@ -273,9 +284,15 @@ pub fn decode_punycode(input: &[u8]) -> Result<String, PyException> {
             PyException::new("UnicodeDecodeError", "punycode overflow".to_string())
         })?;
         i %= out_len;
-        output.insert(i as usize, char::from_u32(n).ok_or_else(|| {
-            PyException::new("UnicodeDecodeError", "invalid punycode code point".to_string())
-        })?);
+        output.insert(
+            i as usize,
+            char::from_u32(n).ok_or_else(|| {
+                PyException::new(
+                    "UnicodeDecodeError",
+                    "invalid punycode code point".to_string(),
+                )
+            })?,
+        );
         i += 1;
     }
     Ok(output.into_iter().collect())
@@ -297,9 +314,9 @@ mod tests {
         for s in [
             "A",
             "Bach",
-            "b\u{fc}cher",      // ü
-            "ma\u{f1}ana",      // ñ
-            "\u{4f8b}\u{3048}", // 例え
+            "b\u{fc}cher",                              // ü
+            "ma\u{f1}ana",                              // ñ
+            "\u{4f8b}\u{3048}",                         // 例え
             "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}", // こんにちは
             "hello",
             "mixed-\u{00e9}l\u{00e8}ment",
@@ -331,11 +348,13 @@ mod tests {
         assert_eq!(encode_ascii("hello").unwrap(), b"hello");
         assert!(encode_ascii("h\u{e9}llo").is_err(), "non-ASCII must raise");
         assert_eq!(decode_ascii(b"hello").unwrap(), "hello");
-        assert!(decode_ascii(&[0x68, 0xe9]).is_err(), "non-ASCII byte must raise");
+        assert!(
+            decode_ascii(&[0x68, 0xe9]).is_err(),
+            "non-ASCII byte must raise"
+        );
         assert_eq!(decode_utf8("héllo".as_bytes()).unwrap(), "héllo");
     }
 }
-
 
 /// Latin-1 (ISO-8859-1) encoding: each character maps to its code point
 /// (0-255); characters above U+00FF raise UnicodeEncodeError.
