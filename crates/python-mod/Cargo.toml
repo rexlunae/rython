@@ -2,6 +2,7 @@
 name = "python-mod"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Proc-macros that compile Python modules into Rust at build time (the Rython toolchain)"
