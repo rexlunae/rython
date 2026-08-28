@@ -227,11 +227,15 @@ Conditions implement Python truthiness through a `Truthy` trait:
 `and`/`or`/`not` recurse, comparisons pass through, and any other value
 is tested with `is_truthy()` (empty string/container and zero are
 false). This applies to *condition position*. The value-producing form
-(`x = a or b`) is lowered separately: Rust's short-circuiting
-`&&`/`||` over the raw operands (so it is correct for boolean operands
-and fails in rustc for others), plus a special case giving `a or None`
-`Option` semantics — Python's return-the-operand behavior for arbitrary
-truthy values is not modeled.
+(`x = a or b`) lowers with Python's return-the-operand semantics when
+the operands' types unify: `a and b = if truthy(a) { b } else { a }`,
+`a or b = if truthy(a) { a } else { b }`, and when exactly one operand
+is `Option<T>` with the other `T`, the `T` arm wraps in `Some` (the
+`ca_certs and expanduser(ca_certs)` shape — `str | None` and `str`).
+An ununifiable mix (`bool and str`, two different types) falls back to
+Rust's `&&`/`||`, which fails loudly in rustc (§12.1) rather than
+silently returning a bool where Python returns a value. `a or None`
+gets Option semantics via the same unification.
 
 ### 4.3 f-strings and `str.format`
 

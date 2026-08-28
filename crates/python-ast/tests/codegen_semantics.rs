@@ -11965,3 +11965,68 @@ fn a_pyvalue_self_field_return_clones_out_of_self() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// Python's `and`/`or` return OPERANDS, not booleans. The fold below
+// reproduces that when the operands' types unify — the Option/String
+// mix (`ca_certs and expanduser(ca_certs)` — urllib3) returns the
+// operand with the Option wrapping; anything else keeps the `&&`/`||`
+// approximation, which is loud in rustc (§12.1) — never a silent
+// operand-vs-bool swap. Also pins the Option<String> literal argument
+// ownership (`pick("x")` for a `str | None` parameter).
+// ---------------------------------------------------------------------
+
+#[test]
+fn and_over_option_and_value_returns_the_operand() {
+    let out = compile(
+        "def pick(ca: str | None, x: str) -> str | None:\n    return ca and x\n",
+        "andopt.py",
+    );
+    assert!(
+        out.contains("if (__rython_and) . is_truthy () { Some (x) } else { __rython_and }"),
+        "the truthy arm must wrap the value, the falsy arm the Option: {}",
+        out
+    );
+}
+
+#[test]
+fn or_over_value_and_option_returns_the_operand() {
+    let out = compile(
+        "def pick_or(ca: str, x: str | None) -> str | None:\n    return ca or x\n",
+        "oropt.py",
+    );
+    assert!(
+        out.contains("if (__rython_or) . is_truthy () { Some (__rython_or) } else { x }"),
+        "the truthy arm must wrap the value, the falsy arm the Option: {}",
+        out
+    );
+}
+
+#[test]
+fn ununifiable_operands_keep_the_loud_boolean_approximation() {
+    // `bool and String` has no static result type — the approximation
+    // stays, and rustc reports the mismatch loudly rather than the
+    // codegen silently returning a bool.
+    let out = compile(
+        "def f(flag: bool, s: str) -> str:\n    return flag and s\n",
+        "andbool.py",
+    );
+    assert!(
+        out.contains("(flag) && (s)"),
+        "ununifiable operands keep the && approximation: {}",
+        out
+    );
+}
+
+#[test]
+fn optional_str_literal_arguments_own_themselves() {
+    let out = compile(
+        "def pick(ca: str | None) -> str | None:\n    return ca\n\ndef use() -> str | None:\n    return pick(\"x\")\n",
+        "optstrlit.py",
+    );
+    assert!(
+        out.contains("Some ((\"x\") . to_string ())"),
+        "a str literal into an Option<String> slot must be owned: {}",
+        out
+    );
+}
