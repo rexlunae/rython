@@ -725,7 +725,7 @@ pub(crate) fn class_field_access(
     options: &PythonOptions,
 ) -> Option<FieldRewrite> {
     let (class, class_symbols) = crate::receiver_class(value, ctx, symbols, options)?;
-    let depth = class.field_owner_depth(attr, &class_symbols)?;
+    let depth = class.field_owner_depth(attr, &class_symbols, options)?;
     let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
     if depth == 0 {
         // The receiver's own field. Direct access works for any concrete

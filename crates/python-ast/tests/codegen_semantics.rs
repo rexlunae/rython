@@ -11410,3 +11410,61 @@ fn a_morph_reference_without_a_router_is_loud() {
         err
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #137 round 25: the external-base READ synthesis and the accessor
+// rewrite have to agree on the field set.
+//
+// Round 23 gave `infer_fields` a synthesis for attributes a class reads
+// but never assigns when its base is external and unmodeled (urllib3's
+// HTTPConnection reading `self.port` off http.client.HTTPConnection).
+// Round 24 taught `owns_field` about stores in every method — but not
+// about that synthesis, so the field was on the struct and in the trait
+// while `field_owner_depth` said no class owned it. The rewrite routing
+// `self.x` through `self.x()` inside a generic trait default then never
+// fired, and the body read the accessor METHOD as a value (E0615).
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_read_synthesized_field_routes_through_its_accessor() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            // The base must be a bare NAME, and the class must have an
+            // __init__ (infer_fields yields nothing without one) — the
+            // shape urllib3 actually uses.
+            "from http.client import HTTPConnection as _HTTPConnection\n",
+            "\n",
+            "class Conn(_HTTPConnection):\n",
+            "    def __init__(self, label: str):\n",
+            "        self.label = label\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return repr(self.port)\n",
+        ),
+        "readsynth.py",
+    );
+    // The synthesis itself must still be loud.
+    assert!(
+        warnings.iter().any(|w| w.contains("external-base divergence")
+            && w.contains("port")),
+        "the synthesis must stay loud: {:?}",
+        warnings
+    );
+    // The synthesized field is on the struct and its accessor is on the
+    // trait, so the generic default body must call the accessor.
+    assert!(
+        out.contains("pub port : stdpython :: PyValue"),
+        "the synthesis must put the field on the struct: {}",
+        out
+    );
+    assert!(
+        out.contains("fn port (& self) -> stdpython :: PyValue ;"),
+        "the trait must declare the accessor: {}",
+        out
+    );
+    assert!(
+        out.contains("repr (& (self . port ()))"),
+        "the trait default must read through the accessor, not the field: {}",
+        out
+    );
+}
