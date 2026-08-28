@@ -889,6 +889,7 @@ impl ClassDef {
         &self,
         attr: &str,
         symbols: &SymbolTableScopes,
+        options: &crate::PythonOptions,
     ) -> Option<String> {
         let chain = self.base_chain(symbols);
         let owner = chain.iter().find(|c| c.owns_field(attr))?;
@@ -911,6 +912,21 @@ impl ClassDef {
                     .find(|p| p.arg == n.id)?;
                 match param.annotation.as_deref() {
                     Some(ExprType::Name(ann)) => ann.id.clone(),
+                    // An OPTIONAL class annotation (`headers:
+                    // HTTPHeaderDict | None` — HTTPResponse): the class is
+                    // the non-None side of the union.
+                    Some(ExprType::BinOp(b)) if crate::is_none_expr(&b.left) => {
+                        match b.right.as_ref() {
+                            ExprType::Name(ann) => ann.id.clone(),
+                            _ => return None,
+                        }
+                    }
+                    Some(ExprType::BinOp(b)) if crate::is_none_expr(&b.right) => {
+                        match b.left.as_ref() {
+                            ExprType::Name(ann) => ann.id.clone(),
+                            _ => return None,
+                        }
+                    }
                     _ => return None,
                 }
             }
@@ -918,6 +934,17 @@ impl ClassDef {
         };
         match symbols.get(&class_name) {
             Some(SymbolTableNode::ClassDef(_)) => Some(class_name),
+            // An IMPORTED class field (`self.headers = HTTPHeaderDict(
+            // headers)` where HTTPHeaderDict comes from
+            // `from ._collections import HTTPHeaderDict` — urllib3's
+            // HTTPResponse): resolve through the defining module.
+            Some(SymbolTableNode::ImportFrom(_)) => {
+                if crate::resolve_class_referenced(&class_name, symbols, options).is_some() {
+                    Some(class_name)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -4966,6 +4993,41 @@ fn is_typing_base(b: &ExprType) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether the class (or a structural ancestor) declares a
+/// `MutableMapping`/`Mapping` ABC base — `typing.MutableMapping[str,
+/// str]`, `collections.abc.Mapping[K, V]`, or the bare names. That is
+/// what provides the mixin METHODS Python inherits (`get`, `pop`, ...,
+/// implemented through `__getitem__`/`__setitem__`/`__delitem__` —
+/// HTTPHeaderDict(typing.MutableMapping[str, str]) in urllib3): the
+/// call-side synthesis that reproduces them must gate on it, or a plain
+/// `__getitem__`-only class would silently gain methods CPython raises
+/// AttributeError for (the mapping-protocol slice, §7).
+pub(crate) fn class_has_mapping_abc_base(
+    class: &ClassDef,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    fn base_is_mapping(b: &ExprType) -> bool {
+        let tail = match b {
+            // `typing.MutableMapping[str, str]` / `collections.abc.Mapping[K, V]`
+            ExprType::Subscript(s) => s.value.as_ref(),
+            other => other,
+        };
+        match tail {
+            ExprType::Attribute(a) => {
+                matches!(a.attr.as_str(), "MutableMapping" | "Mapping")
+                    && matches!(a.value.as_ref(), ExprType::Name(n)
+                        if matches!(n.id.as_str(), "typing" | "collections" | "collections.abc"))
+            }
+            ExprType::Name(n) => matches!(n.id.as_str(), "MutableMapping" | "Mapping"),
+            _ => false,
+        }
+    }
+    class
+        .base_chain(symbols)
+        .iter()
+        .any(|c| c.bases.iter().any(base_is_mapping))
 }
 
 impl ClassDef {

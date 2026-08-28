@@ -6935,3 +6935,195 @@ fn type_self_dunder_name_matches_cpython() {
         stderr
     );
 }
+
+#[test]
+fn boxed_field_containment_matches_cpython() {
+    // The #137 sweep's dynamic-`in` cluster (urllib3's
+    // RecentlyUsedContainer): a PyValue-typed field (`self.box: Any`)
+    // stores concrete members wrapped in PyValue::from, and `key in
+    // self.box` dispatches on the boxed member — substring for str —
+    // through the new PyContains impls. Output verified against
+    // CPython 3.11: "True" / "False".
+    let scratch = Scratch::new("boxedcontains");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.box: Any = \"abc\"\n",
+            "\n",
+            "    def has(self, key: str) -> bool:\n",
+            "        return key in self.box\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    h = Holder()\n",
+            "    print(h.has(\"a\"))\n",
+            "    print(h.has(\"zz\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["True", "False"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}
+
+#[test]
+fn and_or_return_operands_like_cpython() {
+    // Issue #137's ca_certs-and-expanduser shape: Python's `and`/`or`
+    // return OPERANDS, not booleans. The Option/String mix folds with
+    // the operand-returning form; a str literal into an Option<String>
+    // parameter owns itself. Output verified against CPython 3.11:
+    // None / "" / "y" / "o" / "v" / "v" (the empty line is "").
+    let scratch = Scratch::new("andor");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "def pick(ca: str | None, x: str) -> str | None:\n",
+            "    return ca and x\n",
+            "\n",
+            "def pick_or(ca: str, x: str | None) -> str | None:\n",
+            "    return ca or x\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(pick(None, \"y\"))\n",
+            "    print(pick(\"\", \"y\"))\n",
+            "    print(pick(\"c\", \"y\"))\n",
+            "    print(pick_or(\"\", \"o\"))\n",
+            "    print(pick_or(\"v\", \"o\"))\n",
+            "    print(pick_or(\"v\", None))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["None", "", "y", "o", "v", "v"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}
+
+#[test]
+fn class_mapping_protocol_matches_cpython() {
+    // §7's mapping-protocol slice: a user class's own dunders receive the
+    // subscript store, membership test, and the collections.abc `.get`
+    // mixin synthesis (HTTPHeaderDict-shaped classes in urllib3). The
+    // class's methods ARE Python's behavior — including the ABC-gated
+    // get (a plain __getitem__-only class must not silently gain it).
+    // Output verified against CPython 3.11: "5" / "None" / "dflt" /
+    // "True" / "5".
+    let scratch = Scratch::new("mappingprotocol");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "from typing import MutableMapping\n",
+            "\n",
+            "class HeaderDict(MutableMapping[str, str]):\n",
+            "    def __init__(self) -> None:\n",
+            "        self._value = \"5\"\n",
+            "\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        if key == \"Retry-After\":\n",
+            "            return self._value\n",
+            "        raise KeyError(key)\n",
+            "\n",
+            "    def __setitem__(self, key: str, val: str) -> None:\n",
+            "        self._value = key + val\n",
+            "\n",
+            "    def __delitem__(self, key: str) -> None:\n",
+            "        self._value = \"\"\n",
+            "\n",
+            "    def __iter__(self) -> list[str]:\n",
+            "        ks = [\"Retry-After\"]\n",
+            "        return ks\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return 1\n",
+            "\n",
+            "    def __contains__(self, key: str) -> bool:\n",
+            "        return key == \"Retry-After\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    h = HeaderDict()\n",
+            "    print(h.get(\"Retry-After\"))\n",
+            "    print(h.get(\"Missing\"))\n",
+            "    print(h.get(\"Missing\", \"dflt\"))\n",
+            "    print(\"Retry-After\" in h)\n",
+            "    print(h[\"Retry-After\"])\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["5", "None", "dflt", "True", "5"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

@@ -11906,3 +11906,228 @@ fn type_generic_arg_dunder_name_drops_loudly() {
         warnings
     );
 }
+
+// ---------------------------------------------------------------------
+// The #137 boxed-field-arg cluster: a PyValue-typed self-field read in a
+// MOVE position (a call argument, a boxed return) clones out of the
+// shared receiver — the wrap/binding would move out of `&self` (E0507).
+// PyValue's clone is the Arc-sharing reference copy, so it reproduces
+// Python's semantics; mutable containers are NOT cloned, keeping their
+// E0507 loud (issue #79's discipline).
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_pyvalue_self_field_argument_clones_out_of_self() {
+    let out = compile(
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Resp:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._fp: Any = b\"data\"\n",
+            "\n",
+            "    def check(self) -> bool:\n",
+            "        return is_open(self._fp)\n",
+            "\n",
+            "def is_open(x: Any) -> bool:\n",
+            "    return x is not None\n",
+        ),
+        "pyvaluearg.py",
+    );
+    assert!(
+        out.contains("(self . _fp) . clone ()"),
+        "the boxed field argument must clone out of &self: {}",
+        out
+    );
+}
+
+#[test]
+fn a_pyvalue_self_field_return_clones_out_of_self() {
+    // A function whose resolved return is PyValue wraps its returns; a
+    // PyValue self-field read is already boxed and the wrap would move —
+    // it clones instead (issue #137).
+    let out = compile(
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Resp:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._fp: Any = b\"data\"\n",
+            "\n",
+            "    def raw(self):\n",
+            "        return self._fp\n",
+        ),
+        "pyvalueret.py",
+    );
+    assert!(
+        out.contains("return Ok ((self . _fp) . clone ())"),
+        "the boxed field return must clone out of &self: {}",
+        out
+    );
+}
+
+// ---------------------------------------------------------------------
+// Python's `and`/`or` return OPERANDS, not booleans. The fold below
+// reproduces that when the operands' types unify — the Option/String
+// mix (`ca_certs and expanduser(ca_certs)` — urllib3) returns the
+// operand with the Option wrapping; anything else keeps the `&&`/`||`
+// approximation, which is loud in rustc (§12.1) — never a silent
+// operand-vs-bool swap. Also pins the Option<String> literal argument
+// ownership (`pick("x")` for a `str | None` parameter).
+// ---------------------------------------------------------------------
+
+#[test]
+fn and_over_option_and_value_returns_the_operand() {
+    let out = compile(
+        "def pick(ca: str | None, x: str) -> str | None:\n    return ca and x\n",
+        "andopt.py",
+    );
+    assert!(
+        out.contains("if (__rython_and) . is_truthy () { Some (x) } else { __rython_and }"),
+        "the truthy arm must wrap the value, the falsy arm the Option: {}",
+        out
+    );
+}
+
+#[test]
+fn or_over_value_and_option_returns_the_operand() {
+    let out = compile(
+        "def pick_or(ca: str, x: str | None) -> str | None:\n    return ca or x\n",
+        "oropt.py",
+    );
+    assert!(
+        out.contains("if (__rython_or) . is_truthy () { Some (__rython_or) } else { x }"),
+        "the truthy arm must wrap the value, the falsy arm the Option: {}",
+        out
+    );
+}
+
+#[test]
+fn ununifiable_operands_keep_the_loud_boolean_approximation() {
+    // `bool and String` has no static result type — the approximation
+    // stays, and rustc reports the mismatch loudly rather than the
+    // codegen silently returning a bool.
+    let out = compile(
+        "def f(flag: bool, s: str) -> str:\n    return flag and s\n",
+        "andbool.py",
+    );
+    assert!(
+        out.contains("(flag) && (s)"),
+        "ununifiable operands keep the && approximation: {}",
+        out
+    );
+}
+
+#[test]
+fn optional_str_literal_arguments_own_themselves() {
+    let out = compile(
+        "def pick(ca: str | None) -> str | None:\n    return ca\n\ndef use() -> str | None:\n    return pick(\"x\")\n",
+        "optstrlit.py",
+    );
+    assert!(
+        out.contains("Some ((\"x\") . to_string ())"),
+        "a str literal into an Option<String> slot must be owned: {}",
+        out
+    );
+}
+
+// ---------------------------------------------------------------------
+// §7's mapping-protocol slice: a user class's own `__getitem__`/
+// `__setitem__`/`__contains__` dunders receive the subscript store,
+// membership test, and the collections.abc `.get` mixin synthesis —
+// the class's methods ARE Python's behavior (including its exceptions
+// and case-insensitivity). The routing fires only for WELL-TYPED
+// dunders (a concrete first-argument annotation); an `Any`-typed dunder
+// keeps the pre-existing loud py_index path. The `.get` synthesis is
+// gated on the MutableMapping ABC base — a plain `__getitem__`-only
+// class must not silently gain methods CPython raises AttributeError
+// for.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_class_getitem_getsetitem_and_contains_receive_the_operators() {
+    let out = compile(
+        concat!(
+            "class HeaderDict:\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        return key\n",
+            "\n",
+            "    def __setitem__(self, key: str, val: str) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    def __contains__(self, key: str) -> bool:\n",
+            "        return True\n",
+            "\n",
+            "    def probe(self) -> str:\n",
+            "        x = self[\"a\"]\n",
+            "        self[\"b\"] = \"c\"\n",
+            "        if \"d\" in self:\n",
+            "            return x\n",
+            "        return \"\"\n",
+        ),
+        "dundertrio.py",
+    );
+    assert!(
+        out.contains("(self) . __getitem__ (\"a\") ?"),
+        "the subscript read must route to __getitem__: {}",
+        out
+    );
+    assert!(
+        out.contains("(self) . __setitem__ (\"b\" , \"c\") ?"),
+        "the subscript store must route to __setitem__: {}",
+        out
+    );
+    assert!(
+        out.contains("(self) . __contains__ (\"d\") ?"),
+        "the membership test must route to __contains__: {}",
+        out
+    );
+}
+
+#[test]
+fn a_well_typed_getitem_without_the_mapping_abc_keeps_get_unrouted() {
+    // The class defines __getitem__ but does NOT subclass MutableMapping:
+    // CPython raises AttributeError on `.get` — the codegen must not
+    // synthesize it (it would be a silent divergence).
+    let out = compile(
+        concat!(
+            "class Plain:\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        return key\n",
+            "\n",
+            "    def use(self, k: str) -> str:\n",
+            "        return self[k]\n",
+        ),
+        "plainget.py",
+    );
+    assert!(
+        out.contains("(self) . __getitem__ (k) ?"),
+        "the subscript still routes: {}",
+        out
+    );
+}
+
+#[test]
+fn an_any_typed_dunder_keeps_the_loud_fallback() {
+    // `__setitem__(self, key: Any, value: Any)` cannot coerce the call's
+    // arguments either — routing would merely swap one loud error for
+    // another; the py_index path stays.
+    let out = compile(
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Pool:\n",
+            "    def __setitem__(self, key: Any, value: Any) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    def put(self, k: str, v: str) -> None:\n",
+            "        self[k] = v\n",
+        ),
+        "anydunder.py",
+    );
+    assert!(
+        !out.contains("(self) . __setitem__"),
+        "the Any-typed dunder must keep the py_set_index fallback: {}",
+        out
+    );
+}

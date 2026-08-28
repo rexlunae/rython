@@ -8,7 +8,7 @@ use crate::{
     PythonOptions, SymbolTableScopes,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum BoolOps {
     And,
     Or,
@@ -90,9 +90,12 @@ impl<'a> CodeGen for BoolOp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // Python's boolean operators return operands, not booleans; for now we
-        // approximate with Rust's short-circuiting operators, folding every
-        // operand (a BoolOp node can carry more than two).
+        // Python's boolean operators return OPERANDS, not booleans. The
+        // operand-returning forms below reproduce that exactly when the
+        // operands' types can be unified; anything else keeps the
+        // `&&`/`||` approximation, which fails loudly in rustc (§12.1)
+        // rather than silently returning a bool where Python returns a
+        // value (the ca_certs-and-expanduser shape — urllib3).
         let mut rendered = Vec::new();
         for value in self.values.clone() {
             rendered.push(value.to_rust(ctx.clone(), options.clone(), symbols.clone())?);
@@ -112,13 +115,105 @@ impl<'a> CodeGen for BoolOp {
                         }));
                     }
                 }
-                Ok(quote!(#((#rendered))||*))
+                Ok(fold(
+                    &self.values,
+                    &rendered,
+                    BoolOps::Or,
+                    &ctx,
+                    &options,
+                    &symbols,
+                ))
             }
-            BoolOps::And => Ok(quote!(#((#rendered))&&*)),
+            BoolOps::And => Ok(fold(
+                &self.values,
+                &rendered,
+                BoolOps::And,
+                &ctx,
+                &options,
+                &symbols,
+            )),
 
             _ => Err(err_from(BoolOpNotYetImplemented(self)).into()),
         }
     }
+}
+
+/// Fold the rendered operands left-to-right with Python's
+/// operand-returning semantics: `a and b = if truthy(a) { b } else {
+/// a }`, `a or b = if truthy(a) { a } else { b }`. When exactly one
+/// operand is `Option<T>` and the other is `T`, the `T` arm wraps in
+/// `Some` so the if-else arms agree (`ca_certs and
+/// expanduser(ca_certs)` — Option<String> and String). Any other mix
+/// (bool and str, two different types) falls back to the `&&`/`||`
+/// approximation — loud in rustc, never a silent operand-vs-bool swap.
+/// A chained BoolOp folds pairwise; a fold whose inner result the outer
+/// check cannot unify stays `&&`/`||`.
+fn fold(
+    values: &[crate::ExprType],
+    rendered: &[TokenStream],
+    op: BoolOps,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> TokenStream {
+    fn fold_at(
+        values: &[crate::ExprType],
+        rendered: &[TokenStream],
+        op: BoolOps,
+        i: usize,
+        ctx: &CodeGenContext,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
+    ) -> TokenStream {
+        if i == rendered.len() - 1 {
+            return rendered[i].clone();
+        }
+        let first = &rendered[i];
+        let rest = fold_at(values, rendered, op, i + 1, ctx, options, symbols);
+        let a = crate::infer_type(&values[i], options, symbols);
+        let b = crate::infer_type(&values[i + 1], options, symbols);
+        use crate::TypeInfo as T;
+        match (&a, &b) {
+            // a: Option<T>, b: T — the falsy arm holds the Option, the
+            // truthy arm wraps the plain value.
+            (T::Option(inner), b) if **inner == *b => {
+                if op == BoolOps::And {
+                    quote!({
+                        let __rython_and = #first;
+                        if (__rython_and).is_truthy() { Some(#rest) } else { __rython_and }
+                    })
+                } else {
+                    quote!({
+                        let __rython_or = #first;
+                        if (__rython_or).is_truthy() { __rython_or } else { Some(#rest) }
+                    })
+                }
+            }
+            // a: T, b: Option<T> — the truthy arm holds the plain value
+            // and wraps it; the falsy arm is already Option.
+            (a, T::Option(inner)) if *a == **inner => {
+                if op == BoolOps::And {
+                    quote!({
+                        let __rython_and = #first;
+                        if (__rython_and).is_truthy() { #rest } else { Some(__rython_and) }
+                    })
+                } else {
+                    quote!({
+                        let __rython_or = #first;
+                        if (__rython_or).is_truthy() { Some(__rython_or) } else { #rest }
+                    })
+                }
+            }
+            _ => {
+                if op == BoolOps::And {
+                    quote!((#first) && (#rest))
+                } else {
+                    quote!((#first) || (#rest))
+                }
+            }
+        }
+    }
+    fold_at(values, rendered, op, 0, ctx, options, symbols)
 }
 
 #[cfg(test)]

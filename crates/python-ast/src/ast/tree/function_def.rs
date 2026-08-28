@@ -3303,6 +3303,15 @@ pub(crate) fn lower_optional_value(
         return expr.clone().to_rust(ctx, options, symbols);
     }
     let tokens = expr.clone().to_rust(ctx, options, symbols)?;
+    // A string LITERAL lowers to `&'static str`; an Option<String> slot
+    // owns it (`pick("x")` where the parameter is `str | None`) — the
+    // same ownership the `-> str` return path applies (issue #137's
+    // and/or round).
+    if matches!(expr, ExprType::Constant(c)
+        if matches!(&c.0, Some(litrs::Literal::String(_))))
+    {
+        return Ok(quote!(Some((#tokens).to_string())));
+    }
     Ok(quote!(Some(#tokens)))
 }
 

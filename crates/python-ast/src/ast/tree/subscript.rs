@@ -155,11 +155,37 @@ impl CodeGen for Subscript {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A user-class receiver that defines `__getitem__` routes the
+        // subscript to ITS method — that IS Python's behavior (including
+        // the class's own KeyError/IndexError and any case-insensitivity;
+        // §7's mapping-protocol slice). The method must exist; anything
+        // else keeps the py_index path, loud in rustc for classes (§12.1).
+        // Slices are not routed (a slice object has no rython value).
+        // Computed BEFORE `self.value` is moved by the to_rust below.
+        let dunder_getitem =
+            crate::receiver_class(&self.value, &ctx, &symbols, &options)
+                .and_then(|(class, class_symbols)| {
+                    class
+                        .method_on_mro("__getitem__", &class_symbols)
+                        .filter(|m| crate::ast::tree::call::dunder_method_well_typed(m))
+                        .map(|method| (class, class_symbols, method))
+                });
         let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         match self.kind {
             // Python index rules via PyIndex: negatives from the end, a
             // catchable IndexError/KeyError instead of a Rust panic.
             SubscriptKind::Index(index) => {
+                if let Some((_class, _class_symbols, method)) = &dunder_getitem {
+                    return crate::ast::tree::call::dunder_method_call(
+                        method,
+                        &value,
+                        std::slice::from_ref(index.as_ref()),
+                        true,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    );
+                }
                 // Context-aware: indices are i64. `len(x)` yields usize and
                 // `xs[len(xs) - 1]` yields i64, so coerce usize → i64 here
                 // rather than depend on the runtime generic.

@@ -227,11 +227,15 @@ Conditions implement Python truthiness through a `Truthy` trait:
 `and`/`or`/`not` recurse, comparisons pass through, and any other value
 is tested with `is_truthy()` (empty string/container and zero are
 false). This applies to *condition position*. The value-producing form
-(`x = a or b`) is lowered separately: Rust's short-circuiting
-`&&`/`||` over the raw operands (so it is correct for boolean operands
-and fails in rustc for others), plus a special case giving `a or None`
-`Option` semantics — Python's return-the-operand behavior for arbitrary
-truthy values is not modeled.
+(`x = a or b`) lowers with Python's return-the-operand semantics when
+the operands' types unify: `a and b = if truthy(a) { b } else { a }`,
+`a or b = if truthy(a) { a } else { b }`, and when exactly one operand
+is `Option<T>` with the other `T`, the `T` arm wraps in `Some` (the
+`ca_certs and expanduser(ca_certs)` shape — `str | None` and `str`).
+An ununifiable mix (`bool and str`, two different types) falls back to
+Rust's `&&`/`||`, which fails loudly in rustc (§12.1) rather than
+silently returning a bool where Python returns a value. `a or None`
+gets Option semantics via the same unification.
 
 ### 4.3 f-strings and `str.format`
 
@@ -566,9 +570,20 @@ impl Point {
   `__init__`. (For other methods, the `*args`/`**kwargs` rejection
   fires at each call site; a definition that is never called slips
   through to rustc.)
-- **Dunder protocols are not modeled** — `__init__` is the only dunder
-  with semantics. Defining other dunder-named methods (`__repr__`,
-  `__eq__`, `__len__`, …) is *accepted*: they lower as ordinary
+- **Dunder protocols are mostly not modeled** — `__init__` has
+  semantics, and the MAPPING trio is wired: a user class's own
+  `__getitem__` receives `x[k]`, its `__setitem__` receives
+  `x[k] = v`, and its `__contains__` receives `k in x` — the class's
+  methods ARE Python's behavior, including its exceptions and any
+  case-insensitivity. The routing fires only for a WELL-TYPED dunder (a
+  concrete first-argument annotation; an `Any`-typed dunder cannot
+  coerce the call's arguments either, so it keeps the loud py_index
+  path). A class subclassing the `MutableMapping` ABC also gains the
+  mixin's `.get(key[, default])` via a synthesis over `__getitem__`
+  that catches `KeyError` only — gated on the ABC, so a plain
+  `__getitem__`-only class does not silently gain a method CPython
+  raises `AttributeError` for. Other dunder-named methods (`__repr__`,
+  `__eq__`, `__len__`, …) are *accepted*: they lower as ordinary
   `pub(crate)` methods with no protocol wiring, so nothing calls them
   implicitly. Protocol *uses* — printing an object, `==`, `len()`,
   operator overloading, `super()`, multiple inheritance — are out of
@@ -1107,6 +1122,9 @@ catchable `PyException`:
 - Sorting a `NaN`; `hash(nan)`.
 - Arithmetic on `None`.
 - An exception escaping a lambda body.
+- `in` on a boxed value whose member is not a container (`1 in boxed_int`),
+  or a non-str probe on the boxed str member — CPython 3.11's TypeError
+  text, but a panic (the boxed-value iteration precedent).
 - numpy shape mismatches through the OPERATOR spelling (`a + b` on
   arrays of different shapes). The function spelling `np.add(a, b)`
   raises a catchable `ValueError`; the operator traits have no fallible
