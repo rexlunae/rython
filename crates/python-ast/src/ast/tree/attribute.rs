@@ -1140,6 +1140,10 @@ pub(crate) fn receiver_option_inner(
             // A None-first local (`conn = None` then `conn = ...` —
             // urllib3's _get_conn) is an Option binding; the inner type
             // is whatever the stores join to — the unwrap never needs it.
+            // A BOXED name (PyValue — the None-mixing path stores
+            // PyValue::None_, not Some) is NOT an Option: unwrapping it
+            // would be wrong (no is_some/unwrap on PyValue).
+            Some(crate::TypeInfo::PyValue) => None,
             _ if options.optional_names.contains(&n.id) => Some(quote!(_)),
             _ => None,
         },

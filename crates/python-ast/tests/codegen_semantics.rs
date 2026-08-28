@@ -12256,3 +12256,34 @@ fn a_local_assigned_an_option_field_reads_unwrapped() {
         out
     );
 }
+
+#[test]
+fn an_option_value_in_condition_position_tests_none_ness() {
+    // `if conn:` where conn is `BaseHTTPConnection | None` — CPython's
+    // truthiness of a user object is "not None"; the generic Truthy-for-
+    // Option impl needs T: Truthy, which a user class lacks (E0599 ×12
+    // in the corpus). `!(x).py_is_none()` works for Option and boxed
+    // bindings alike (both have unconditional PyIsNone).
+    let out = compile(
+        concat!(
+            "class Conn:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._ok = True\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, conn: Conn | None) -> None:\n",
+            "        self.conn = conn\n",
+            "\n",
+            "    def state(self) -> str:\n",
+            "        if self.conn:\n",
+            "            return \"open\"\n",
+            "        return \"closed\"\n",
+        ),
+        "opttruth.py",
+    );
+    assert!(
+        out.contains("! (self . conn) . py_is_none ()"),
+        "an Option in condition position must test None-ness: {}",
+        out
+    );
+}
