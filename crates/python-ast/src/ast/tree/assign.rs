@@ -865,6 +865,31 @@ impl<'a> CodeGen for Assign {
             };
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
+                    // A user-class receiver that defines `__setitem__`
+                    // routes the store to ITS method — Python's behavior
+                    // (the class's own key semantics and exceptions;
+                    // §7's mapping-protocol slice). The method must
+                    // exist; anything else keeps py_set_index, loud in
+                    // rustc for classes (§12.1). The value passes
+                    // through the full argument mapping.
+                    if let Some((class, class_symbols)) =
+                        crate::receiver_class(&sub.value, &ctx, &symbols, &options)
+                        && let Some(method) =
+                            class
+                                .method_on_mro("__setitem__", &class_symbols)
+                                .filter(|m| crate::ast::tree::call::dunder_method_well_typed(m))
+                    {
+                        let v_expr = value_expr.clone();
+                        return crate::ast::tree::call::dunder_method_call(
+                            &method,
+                            &receiver,
+                            &[(**index).clone(), v_expr],
+                            true,
+                            &ctx,
+                            &options,
+                            &symbols,
+                        );
+                    }
                     // String-keyed dicts store `&str` indexes through
                     // py_set_index(String, V), so a &str literal index is
                     // owned at the store site.

@@ -318,7 +318,29 @@ impl CodeGen for Compare {
                 // String-keyed dicts take &String; literal `"a"` keys are
                 // owned so the generic impl applies.
                 Compares::In => {
-                    if matches!(
+                    // A user-class comparator that defines `__contains__`
+                    // routes the membership test to ITS method — Python's
+                    // behavior (the class's own key semantics; §7's
+                    // mapping-protocol slice). The method must exist;
+                    // anything else keeps py_contains, loud in rustc for
+                    // classes (§12.1).
+                    if let Some((class, class_symbols)) =
+                        crate::receiver_class(&comparator_ast, &ctx, &symbols, &options)
+                        && let Some(method) =
+                            class
+                                .method_on_mro("__contains__", &class_symbols)
+                                .filter(|m| crate::ast::tree::call::dunder_method_well_typed(m))
+                    {
+                        crate::ast::tree::call::dunder_method_call(
+                            &method,
+                            &comparator,
+                            std::slice::from_ref(left_ast),
+                            true,
+                            &ctx,
+                            &options,
+                            &symbols,
+                        )?
+                    } else if matches!(
                         comparator_ast,
                         ExprType::Name(n)
                             if matches!(
@@ -340,7 +362,25 @@ impl CodeGen for Compare {
                     }
                 }
                 Compares::NotIn => {
-                    if matches!(
+                    // The __contains__ twin of the In arm above.
+                    if let Some((class, class_symbols)) =
+                        crate::receiver_class(&comparator_ast, &ctx, &symbols, &options)
+                        && let Some(method) =
+                            class
+                                .method_on_mro("__contains__", &class_symbols)
+                                .filter(|m| crate::ast::tree::call::dunder_method_well_typed(m))
+                    {
+                        let inner = crate::ast::tree::call::dunder_method_call(
+                            &method,
+                            &comparator,
+                            std::slice::from_ref(left_ast),
+                            true,
+                            &ctx,
+                            &options,
+                            &symbols,
+                        )?;
+                        quote!(!#inner)
+                    } else if matches!(
                         comparator_ast,
                         ExprType::Name(n)
                             if matches!(

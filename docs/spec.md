@@ -570,9 +570,20 @@ impl Point {
   `__init__`. (For other methods, the `*args`/`**kwargs` rejection
   fires at each call site; a definition that is never called slips
   through to rustc.)
-- **Dunder protocols are not modeled** — `__init__` is the only dunder
-  with semantics. Defining other dunder-named methods (`__repr__`,
-  `__eq__`, `__len__`, …) is *accepted*: they lower as ordinary
+- **Dunder protocols are mostly not modeled** — `__init__` has
+  semantics, and the MAPPING trio is wired: a user class's own
+  `__getitem__` receives `x[k]`, its `__setitem__` receives
+  `x[k] = v`, and its `__contains__` receives `k in x` — the class's
+  methods ARE Python's behavior, including its exceptions and any
+  case-insensitivity. The routing fires only for a WELL-TYPED dunder (a
+  concrete first-argument annotation; an `Any`-typed dunder cannot
+  coerce the call's arguments either, so it keeps the loud py_index
+  path). A class subclassing the `MutableMapping` ABC also gains the
+  mixin's `.get(key[, default])` via a synthesis over `__getitem__`
+  that catches `KeyError` only — gated on the ABC, so a plain
+  `__getitem__`-only class does not silently gain a method CPython
+  raises `AttributeError` for. Other dunder-named methods (`__repr__`,
+  `__eq__`, `__len__`, …) are *accepted*: they lower as ordinary
   `pub(crate)` methods with no protocol wiring, so nothing calls them
   implicitly. Protocol *uses* — printing an object, `==`, `len()`,
   operator overloading, `super()`, multiple inheritance — are out of

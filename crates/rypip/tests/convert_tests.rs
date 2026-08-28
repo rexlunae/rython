@@ -7048,3 +7048,82 @@ fn and_or_return_operands_like_cpython() {
         stderr
     );
 }
+
+#[test]
+fn class_mapping_protocol_matches_cpython() {
+    // §7's mapping-protocol slice: a user class's own dunders receive the
+    // subscript store, membership test, and the collections.abc `.get`
+    // mixin synthesis (HTTPHeaderDict-shaped classes in urllib3). The
+    // class's methods ARE Python's behavior — including the ABC-gated
+    // get (a plain __getitem__-only class must not silently gain it).
+    // Output verified against CPython 3.11: "5" / "None" / "dflt" /
+    // "True" / "5".
+    let scratch = Scratch::new("mappingprotocol");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "from typing import MutableMapping\n",
+            "\n",
+            "class HeaderDict(MutableMapping[str, str]):\n",
+            "    def __init__(self) -> None:\n",
+            "        self._value = \"5\"\n",
+            "\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        if key == \"Retry-After\":\n",
+            "            return self._value\n",
+            "        raise KeyError(key)\n",
+            "\n",
+            "    def __setitem__(self, key: str, val: str) -> None:\n",
+            "        self._value = key + val\n",
+            "\n",
+            "    def __delitem__(self, key: str) -> None:\n",
+            "        self._value = \"\"\n",
+            "\n",
+            "    def __iter__(self) -> list[str]:\n",
+            "        ks = [\"Retry-After\"]\n",
+            "        return ks\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return 1\n",
+            "\n",
+            "    def __contains__(self, key: str) -> bool:\n",
+            "        return key == \"Retry-After\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    h = HeaderDict()\n",
+            "    print(h.get(\"Retry-After\"))\n",
+            "    print(h.get(\"Missing\"))\n",
+            "    print(h.get(\"Missing\", \"dflt\"))\n",
+            "    print(\"Retry-After\" in h)\n",
+            "    print(h[\"Retry-After\"])\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["5", "None", "dflt", "True", "5"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

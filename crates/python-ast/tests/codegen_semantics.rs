@@ -12030,3 +12030,104 @@ fn optional_str_literal_arguments_own_themselves() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// §7's mapping-protocol slice: a user class's own `__getitem__`/
+// `__setitem__`/`__contains__` dunders receive the subscript store,
+// membership test, and the collections.abc `.get` mixin synthesis —
+// the class's methods ARE Python's behavior (including its exceptions
+// and case-insensitivity). The routing fires only for WELL-TYPED
+// dunders (a concrete first-argument annotation); an `Any`-typed dunder
+// keeps the pre-existing loud py_index path. The `.get` synthesis is
+// gated on the MutableMapping ABC base — a plain `__getitem__`-only
+// class must not silently gain methods CPython raises AttributeError
+// for.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_class_getitem_getsetitem_and_contains_receive_the_operators() {
+    let out = compile(
+        concat!(
+            "class HeaderDict:\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        return key\n",
+            "\n",
+            "    def __setitem__(self, key: str, val: str) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    def __contains__(self, key: str) -> bool:\n",
+            "        return True\n",
+            "\n",
+            "    def probe(self) -> str:\n",
+            "        x = self[\"a\"]\n",
+            "        self[\"b\"] = \"c\"\n",
+            "        if \"d\" in self:\n",
+            "            return x\n",
+            "        return \"\"\n",
+        ),
+        "dundertrio.py",
+    );
+    assert!(
+        out.contains("(self) . __getitem__ (\"a\") ?"),
+        "the subscript read must route to __getitem__: {}",
+        out
+    );
+    assert!(
+        out.contains("(self) . __setitem__ (\"b\" , \"c\") ?"),
+        "the subscript store must route to __setitem__: {}",
+        out
+    );
+    assert!(
+        out.contains("(self) . __contains__ (\"d\") ?"),
+        "the membership test must route to __contains__: {}",
+        out
+    );
+}
+
+#[test]
+fn a_well_typed_getitem_without_the_mapping_abc_keeps_get_unrouted() {
+    // The class defines __getitem__ but does NOT subclass MutableMapping:
+    // CPython raises AttributeError on `.get` — the codegen must not
+    // synthesize it (it would be a silent divergence).
+    let out = compile(
+        concat!(
+            "class Plain:\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        return key\n",
+            "\n",
+            "    def use(self, k: str) -> str:\n",
+            "        return self[k]\n",
+        ),
+        "plainget.py",
+    );
+    assert!(
+        out.contains("(self) . __getitem__ (k) ?"),
+        "the subscript still routes: {}",
+        out
+    );
+}
+
+#[test]
+fn an_any_typed_dunder_keeps_the_loud_fallback() {
+    // `__setitem__(self, key: Any, value: Any)` cannot coerce the call's
+    // arguments either — routing would merely swap one loud error for
+    // another; the py_index path stays.
+    let out = compile(
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Pool:\n",
+            "    def __setitem__(self, key: Any, value: Any) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    def put(self, k: str, v: str) -> None:\n",
+            "        self[k] = v\n",
+        ),
+        "anydunder.py",
+    );
+    assert!(
+        !out.contains("(self) . __setitem__"),
+        "the Any-typed dunder must keep the py_set_index fallback: {}",
+        out
+    );
+}

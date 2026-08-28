@@ -6004,7 +6004,40 @@ impl<'a> CodeGen for Call {
                     // dict.get never raises: value-or-None (an Option), or the
                     // provided default. IndexMap's inherent get returns a
                     // borrowed Option, so both forms map to py_ versions.
+                    // A USER-CLASS receiver defines no `get` — the
+                    // collections.abc mixin provides it via `__getitem__`
+                    // (`response.headers.get("Retry-After")` where
+                    // HTTPHeaderDict subclasses MutableMapping — urllib3):
+                    // synthesize the mixin exactly, catching KeyError only
+                    // (any other exception propagates, Python's behavior).
                     ("get", [key]) => {
+                        if let Some((class, class_symbols)) =
+                            crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+                            && let Some(method) =
+                                class.method_on_mro("__getitem__", &class_symbols)
+                            && crate::ast::tree::class_def::class_has_mapping_abc_base(
+                                &class,
+                                &class_symbols,
+                            )
+                        {
+                            let call = crate::dunder_method_call(
+                                &method,
+                                &receiver,
+                                std::slice::from_ref(&self.args[0]),
+                                false,
+                                &ctx,
+                                &options,
+                                &symbols,
+                            )?;
+                            return Ok(quote! {
+                                match #call {
+                                    Ok(__rython_v) => Some(__rython_v),
+                                    Err(__rython_e)
+                                        if __rython_e.matches("KeyError") => None,
+                                    Err(__rython_e) => return Err(__rython_e),
+                                }
+                            });
+                        }
                         if string_keyed_dict {
                             let key = crate::render_typed(
                                 &self.args[0],
@@ -6018,6 +6051,43 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!((#receiver).py_get(&(#key))));
                     }
                     ("get", [key, default]) => {
+                        if let Some((class, class_symbols)) =
+                            crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+                            && let Some(method) =
+                                class.method_on_mro("__getitem__", &class_symbols)
+                            && crate::ast::tree::class_def::class_has_mapping_abc_base(
+                                &class,
+                                &class_symbols,
+                            )
+                        {
+                            // The DEFAULT must unify with the __getitem__
+                            // result type: a str literal owns itself
+                            // (String, not &str).
+                            let default = crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
+                            let call = crate::dunder_method_call(
+                                &method,
+                                &receiver,
+                                std::slice::from_ref(&self.args[0]),
+                                false,
+                                &ctx,
+                                &options,
+                                &symbols,
+                            )?;
+                            return Ok(quote! {
+                                match #call {
+                                    Ok(__rython_v) => __rython_v,
+                                    Err(__rython_e)
+                                        if __rython_e.matches("KeyError") => #default,
+                                    Err(__rython_e) => return Err(__rython_e),
+                                }
+                            });
+                        }
                         if string_keyed_dict {
                             let key = crate::render_typed(
                                 &self.args[0],
@@ -7578,7 +7648,7 @@ pub(crate) fn receiver_class(
         // NAME, resolved to its ClassDef below.
         ExprType::Attribute(attr) => {
             let (owner, owner_symbols) = receiver_class(&attr.value, ctx, symbols, options)?;
-            let field = owner.field_class(&attr.attr, &owner_symbols)?;
+            let field = owner.field_class(&attr.attr, &owner_symbols, options)?;
             (field, owner_symbols)
         }
         _ => return None,
@@ -8741,5 +8811,61 @@ foo(b=9)",
             "error: {}",
             err
         );
+    }
+}
+
+/// Route a SUBSCRIPT/`in`/dunder operation to a user-class's own dunder
+/// method through the FULL call-argument mapping — the same mapping a
+/// normal call receives — so arguments coerce to the method's declared
+/// parameter types (`x[key]` where `__getitem__(self, key: Any)` boxes
+/// the key, a str-typed key owns literals, ...). This is the §7
+/// mapping-protocol slice: the class's own method IS Python's behavior,
+/// including its exceptions and any case-insensitivity. `fallible` adds
+/// the `?` (subscript reads and `in` propagate; the get-synthesis
+/// matches the Result itself to catch KeyError).
+pub(crate) fn dunder_method_call(
+    method: &crate::FunctionDef,
+    recv: &TokenStream,
+    args: &[ExprType],
+    fallible: bool,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let mut sig = method.clone();
+    // The receiver parameter (`self`) is bound to the receiver
+    // expression, never an argument — the same strip the ordinary
+    // self-method call path applies (strip_self).
+    crate::strip_self(&mut sig.args);
+    let MappedArguments { prelude, args } =
+        map_call_arguments(&sig, args, &[], ctx, options, symbols)?;
+    let mname = crate::safe_ident(&method.name);
+    if fallible {
+        Ok(quote!({ #prelude (#recv).#mname(#(#args),*)? }))
+    } else {
+        Ok(quote!({ #prelude (#recv).#mname(#(#args),*) }))
+    }
+}
+
+/// Whether a dunder method has a WELL-TYPED first argument — a concrete
+/// (non-`Any`/`object`/unannotated) annotation after the receiver. The
+/// mapping-protocol routing (subscripts, `in`, get-synthesis) only fires
+/// for these: an `Any`-typed dunder (`RecentlyUsedContainer.
+/// __setitem__(self, key: Any, value: Any)` — urllib3) cannot coerce
+/// the call's arguments either, so routing would merely swap one loud
+/// rustc error for another — the pre-existing py_index path stays.
+pub(crate) fn dunder_method_well_typed(method: &crate::FunctionDef) -> bool {
+    let mut args = method.args.clone();
+    crate::strip_self(&mut args);
+    let first = args.posonlyargs.first().or_else(|| args.args.first());
+    let Some(p) = first else {
+        // Zero parameters after the receiver: a subscript with an index
+        // cannot fill it — the py_index fallback (loud) is more honest.
+        return false;
+    };
+    match p.annotation.as_deref() {
+        Some(ExprType::Name(n)) => !matches!(n.id.as_str(), "Any" | "object" | "None"),
+        Some(_) => true,
+        None => false,
     }
 }
