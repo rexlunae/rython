@@ -5352,6 +5352,89 @@ impl PyContains<&str> for str {
     }
 }
 
+// Python's `in` on a BOXED value (`k in self._container` where the field
+// is PyValue — urllib3's RecentlyUsedContainer): dispatch on the member
+// container exactly like CPython — substring for str, subsequence or
+// integer-octet for bytes, element equality for tuples, key lookup for
+// dicts — with CPython 3.11's TypeError text for non-container members
+// (§12.2: loud panic, the IntoIterator precedent). Element equality is
+// Python's `==`, not the derived PartialEq: `1 in (1, 2.0)` is True.
+impl PyContains<PyValue> for PyValue {
+    fn py_contains(&self, item: &PyValue) -> bool {
+        match self {
+            PyValue::Str(s) => match item {
+                PyValue::Str(x) => s.contains(x.as_str()),
+                other => panic!(
+                    "TypeError: 'in <string>' requires string as left operand, not {}",
+                    other.py_type_name()
+                ),
+            },
+            PyValue::Bytes(b) => match item {
+                PyValue::Bytes(x) => {
+                    // An empty needle is always contained (CPython:
+                    // b"" in b"abc" is True); windows(0) cannot express
+                    // that, so it is handled before the search.
+                    x.is_empty() || b.windows(x.len()).any(|w| w == x.as_slice())
+                }
+                PyValue::Int(o) => b.contains(&(*o as u8)),
+                other => panic!(
+                    "TypeError: a bytes-like object is required, not '{}'",
+                    other.py_type_name()
+                ),
+            },
+            PyValue::Tuple(t) => t.iter().any(|v| py_value_eq(v, item)),
+            PyValue::Dict(d) => match item {
+                PyValue::Str(k) => d.contains_key(k),
+                // The boxed dict's keys are Strings; a non-str member is
+                // never a key (an unhashable key would be CPython's
+                // TypeError, but the boxed dict cannot hold one).
+                _ => false,
+            },
+            other => panic!(
+                "TypeError: argument of type '{}' is not iterable",
+                other.py_type_name()
+            ),
+        }
+    }
+}
+
+/// Probe the boxed containers with a str/String operand — the renderers
+/// emit the literal/owned spelling at the call site (`k in boxed` where
+/// k is a String local): box it and delegate, so the semantics are
+/// identical whichever spelling reached the trait.
+impl PyContains<String> for PyValue {
+    fn py_contains(&self, item: &String) -> bool {
+        self.py_contains(&PyValue::Str(item.clone()))
+    }
+}
+
+impl PyContains<&str> for PyValue {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.py_contains(&PyValue::Str((*item).to_string()))
+    }
+}
+
+impl PyContains<str> for PyValue {
+    fn py_contains(&self, item: &str) -> bool {
+        self.py_contains(&PyValue::Str(item.to_string()))
+    }
+}
+
+/// Python's `==` on boxed members: numeric kinds compare by value across
+/// int/float/bool (CPython: `1 == 1.0`, `True == 1`); everything else is
+/// structural.
+fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
+    match (a, b) {
+        (PyValue::Int(x), PyValue::Float(y)) => (*x as f64) == *y,
+        (PyValue::Float(x), PyValue::Int(y)) => *x == (*y as f64),
+        (PyValue::Bool(x), PyValue::Int(y)) => (*x as i64) == *y,
+        (PyValue::Int(x), PyValue::Bool(y)) => *x == (*y as i64),
+        (PyValue::Bool(x), PyValue::Float(y)) => ((*x as i64) as f64) == *y,
+        (PyValue::Float(x), PyValue::Bool(y)) => *x == ((*y as i64) as f64),
+        _ => a == b,
+    }
+}
+
 impl PyContains<String> for str {
     fn py_contains(&self, item: &String) -> bool {
         self.contains(item.as_str())

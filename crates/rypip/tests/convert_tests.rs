@@ -6935,3 +6935,60 @@ fn type_self_dunder_name_matches_cpython() {
         stderr
     );
 }
+
+#[test]
+fn boxed_field_containment_matches_cpython() {
+    // The #137 sweep's dynamic-`in` cluster (urllib3's
+    // RecentlyUsedContainer): a PyValue-typed field (`self.box: Any`)
+    // stores concrete members wrapped in PyValue::from, and `key in
+    // self.box` dispatches on the boxed member — substring for str —
+    // through the new PyContains impls. Output verified against
+    // CPython 3.11: "True" / "False".
+    let scratch = Scratch::new("boxedcontains");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.box: Any = \"abc\"\n",
+            "\n",
+            "    def has(self, key: str) -> bool:\n",
+            "        return key in self.box\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    h = Holder()\n",
+            "    print(h.has(\"a\"))\n",
+            "    print(h.has(\"zz\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["True", "False"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

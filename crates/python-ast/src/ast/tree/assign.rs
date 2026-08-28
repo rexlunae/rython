@@ -750,6 +750,32 @@ impl<'a> CodeGen for Assign {
                 ExprType::Attribute(_) if value_is_none_early && attr_field_is_pyvalue(target) => {
                     quote!(#target_code = PyValue::None_;)
                 }
+                // A non-None value stored into a PyValue-typed FIELD
+                // (`self.box: Any = "abc"` — urllib3's Any-annotated
+                // fields) wraps in PyValue::from, mirroring the Name-slot
+                // rule: the field holds the boxed union, the value is a
+                // concrete member. A value that already yields a PyValue
+                // stores through unchanged; a container literal or class
+                // construction has NO boxed representation (the same
+                // exclusions the global-store path makes — those keep
+                // their pre-existing loud rustc error).
+                ExprType::Attribute(_)
+                    if !value_is_none_early
+                        && attr_field_is_pyvalue(target)
+                        && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
+                        && !matches!(
+                            &value_expr,
+                            ExprType::List(_)
+                                | ExprType::Dict(_)
+                                | ExprType::Set(_)
+                                | ExprType::ListComp(_)
+                                | ExprType::DictComp(_)
+                                | ExprType::SetComp(_)
+                                | ExprType::Tuple(_)
+                        ) =>
+                {
+                    quote!(#target_code = PyValue::from(#value);)
+                }
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
                 }

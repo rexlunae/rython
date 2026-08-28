@@ -1107,6 +1107,9 @@ catchable `PyException`:
 - Sorting a `NaN`; `hash(nan)`.
 - Arithmetic on `None`.
 - An exception escaping a lambda body.
+- `in` on a boxed value whose member is not a container (`1 in boxed_int`),
+  or a non-str probe on the boxed str member — CPython 3.11's TypeError
+  text, but a panic (the boxed-value iteration precedent).
 - numpy shape mismatches through the OPERATOR spelling (`a + b` on
   arrays of different shapes). The function spelling `np.add(a, b)`
   raises a catchable `ValueError`; the operator traits have no fallible

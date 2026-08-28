@@ -287,6 +287,62 @@ fn py_contains_matches_python_in_operator() {
 }
 
 #[test]
+fn boxed_pyvalue_containment_matches_python() {
+    // Python: "a" in "abc" / "z" in "abc" — substring on the str member.
+    assert!(PyValue::from("abc").py_contains(&PyValue::from("a")));
+    assert!(!PyValue::from("abc").py_contains(&PyValue::from("z")));
+
+    // Python: 1 in (1, 2.0) — element equality is ==, so numeric kinds
+    // compare by value across int/float/bool (the derived PartialEq
+    // would say False for 1 == 1.0).
+    let t = PyValue::Tuple(std::sync::Arc::new(vec![
+        PyValue::Int(1),
+        PyValue::Float(2.0),
+    ]));
+    assert!(t.py_contains(&PyValue::Int(1)));
+    assert!(t.py_contains(&PyValue::Float(1.0)));
+    assert!(!t.py_contains(&PyValue::Int(9)));
+
+    // Python: "k" in {"k": 1} — key lookup on the dict member; a non-str
+    // member is never a key.
+    let d = PyValue::Dict(std::sync::Arc::new(PyDict::from([(
+        "k".to_string(),
+        PyValue::Int(1),
+    )])));
+    assert!(d.py_contains(&PyValue::from("k")));
+    assert!(!d.py_contains(&PyValue::from("z")));
+    assert!(!d.py_contains(&PyValue::Int(1)));
+
+    // Python: b"a" in b"abc" (subsequence), 97 in b"abc" (octet).
+    let b = PyValue::Bytes(b"abc".to_vec());
+    assert!(b.py_contains(&PyValue::Bytes(b"a".to_vec())));
+    assert!(b.py_contains(&PyValue::Bytes(Vec::new())));
+    assert!(!b.py_contains(&PyValue::Bytes(b"z".to_vec())));
+    assert!(b.py_contains(&PyValue::Int(97)));
+    assert!(!b.py_contains(&PyValue::Int(122)));
+
+    // A str/String probe reaches the same semantics through the
+    // renderer's owned spellings (`k in boxed` where k is a String).
+    assert!(PyValue::from("abc").py_contains(&"ab".to_string()));
+    assert!(PyValue::from("abc").py_contains(&"a"));
+    assert!(!PyValue::from("abc").py_contains(&"zz".to_string()));
+}
+
+#[test]
+#[should_panic(expected = "TypeError: 'in <string>' requires string as left operand, not int")]
+fn boxed_string_containment_rejects_int_like_cpython() {
+    // Python 3.11: 1 in "abc" raises TypeError — CPython's exact text.
+    let _ = PyValue::from("abc").py_contains(&PyValue::Int(1));
+}
+
+#[test]
+#[should_panic(expected = "TypeError: argument of type 'int' is not iterable")]
+fn boxed_int_containment_is_a_type_error_like_cpython() {
+    // Python 3.11: 1 in 5 raises TypeError — CPython's exact text.
+    let _ = PyValue::Int(5).py_contains(&PyValue::Int(1));
+}
+
+#[test]
 fn py_exception_matches_handler_names() {
     let exc = PyException::new("ValueError", "bad input");
     // except ValueError: catches it
