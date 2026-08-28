@@ -6733,3 +6733,63 @@ fn singledispatch_dispatches_at_runtime_like_cpython() {
         stderr
     );
 }
+
+#[test]
+fn class_instance_global_with_list_field_builds_and_runs() {
+    // Issue #229: two defects in one repro family.
+    // (1) A module-level global bound to a class construction lowers to
+    //     `LazyLock<Klass>` whose closure returned `Klass` — but the
+    //     construction rendered `{ Klass::new(7)? }`, a `?` the closure
+    //     cannot use. The promoted-static path now strips the trailing `?`
+    //     through the brace block and panics on Err (§12.2 import-time
+    //     divergence), like every other fallible initializer.
+    // (2) `self.items = ["kept"]` inferred a `Vec<String>` field but the
+    //     store rendered `vec!["kept"]` — a Vec<&str> (E0308). The store
+    //     side now owns string-literal elements in list/set fields.
+    // Output verified against CPython 3.11: "7" / "['kept']" / "True".
+    let scratch = Scratch::new("classglobal");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Klass:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.count = n\n",
+            "        self.items = [\"kept\"]\n",
+            "\n",
+            "\n",
+            "REC = Klass(7)\n",
+            "\n",
+            "\n",
+            "def show():\n",
+            "    print(REC.count)\n",
+            "    print(REC.items)\n",
+            "    print(\"kept\" in REC.items)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    show()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["7", "['kept']", "True"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}
