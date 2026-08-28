@@ -806,12 +806,19 @@ impl ClassDef {
     /// Whether `attr` is a field assigned somewhere in this class's own
     /// `__init__`.
     fn owns_field(&self, attr: &str) -> bool {
-        let Some(init) = self.init_method() else {
-            return false;
-        };
-        let mut stores = Vec::new();
-        collect_field_stores(&init.body, &mut stores);
-        stores.iter().any(|s| s.attr == attr)
+        // EVERY method's stores, not just `__init__`'s: an attribute
+        // first assigned elsewhere is still a field of this class (issue
+        // #137 round 23 taught `infer_fields` the same thing), and the two
+        // must agree. When they disagree the field exists on the struct
+        // and in the trait's accessors, but the rewrite that routes
+        // `self.x` through `self.x()` inside a generic trait default does
+        // not fire — the body then reads the accessor METHOD as a value
+        // (E0615) or a field the generic `Self` has not got (E0609).
+        self.methods().any(|m| {
+            let mut stores = Vec::new();
+            collect_field_stores(&m.body, &mut stores);
+            stores.iter().any(|s| s.attr == attr)
+        })
     }
 
     /// Which class in the MRO chain owns the field `attr`: 0 for this class,
