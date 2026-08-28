@@ -11120,3 +11120,124 @@ fn singledispatch_arity_mismatch_is_loud() {
         err
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #222: return-type inference for parameters and computed values.
+//
+// A signature that collapses to `-> Result<(), PyException>` while the
+// body still emits `Ok(<value>)` is code rustc rejects, so these cases
+// were not cosmetic gaps. The fixes are additive: an annotated parameter
+// is typed from its annotation, and anything else falls back to the type
+// every `return` agrees on — never overriding a type an earlier rule
+// already derived.
+// ---------------------------------------------------------------------
+
+#[test]
+fn returning_an_annotated_parameter_types_the_signature() {
+    let out = compile("def g(x: int):\n    return x\n", "retparam.py");
+    assert!(
+        out.contains("fn g (x : i64) -> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_str_parameter_types_it_as_the_owned_string() {
+    // A `str` parameter arrives as `impl Into<String>` and the prologue
+    // converts it, so the returned value is an owned String.
+    let out = compile("def g(s: str):\n    return s\n", "retstr.py");
+    assert!(
+        out.contains("-> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_an_arithmetic_expression_types_the_signature() {
+    let out = compile("def h(x: int):\n    return x + 1\n", "retbin.py");
+    assert!(
+        out.contains("-> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
+    // int * float widens to float, like Python.
+    let out = compile("def h(x: int, y: float):\n    return x * y\n", "retbin2.py");
+    assert!(
+        out.contains("-> Result < f64 , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_builtin_call_types_the_signature() {
+    let out = compile("def j(xs: list[int]):\n    return len(xs)\n", "retlen.py");
+    assert!(
+        out.contains("-> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
+    let out = compile("def n(x: int):\n    return str(x)\n", "retstr2.py");
+    assert!(
+        out.contains("-> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_container_of_parameters_types_the_signature() {
+    let out = compile("def o(x: int):\n    return [x, x]\n", "retvec.py");
+    assert!(
+        out.contains("-> Result < Vec < i64 > , PyException >"),
+        "generated: {}",
+        out
+    );
+    let out = compile("def p(a: int, b: int):\n    return (a, b)\n", "rettup.py");
+    assert!(
+        out.contains("-> Result < (i64 , i64) , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_none_returning_body_still_lowers_to_unit() {
+    // The fallback must not claim a type for a body that genuinely
+    // returns Python's None — `()` is the correct lowering there.
+    let out = compile("def f(x: int):\n    return None\n", "retnone.py");
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn disagreeing_returns_still_box_rather_than_picking_a_winner() {
+    // Two returns of different types keep the existing literal-boxing
+    // behavior; the fallback refuses rather than choosing one.
+    let out = compile(
+        "def f(x: int):\n    if x:\n        return 1\n    return \"s\"\n",
+        "retmix.py",
+    );
+    assert!(
+        out.contains("-> Result < stdpython :: PyValue , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn an_untypeable_return_still_lowers_to_unit() {
+    // `sorted(xs)` has no inferred element type, so the inferrer has no
+    // answer — refused rather than guessed at.
+    let out = compile("def m(xs: list[int]):\n    return sorted(xs)\n", "retunk.py");
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
+}

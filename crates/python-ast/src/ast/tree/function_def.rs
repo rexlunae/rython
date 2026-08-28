@@ -2560,6 +2560,37 @@ pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
 }
 
 /// Map an expression to an obviously-inferable Rust type, if any.
+/// Whether a [`crate::TypeInfo`] can stand as an inferred return type
+/// (issue #222). The whitelist is deliberately narrow: only types whose
+/// `to_rust_type()` is a faithful, self-contained rendering of what the
+/// body actually produces.
+///
+/// Refused, and why:
+/// - `PyObject` — the inferrer's "no answer"; rendering it would be a
+///   guess, and a wrong return type is worse than an absent one.
+/// - `StrRef` — a `&'static str` is a Rust literal artifact, not the
+///   Python type; the literal rules earlier in the chain own that case
+///   (`resolved_return_type` documents why `-> str` means `String`).
+/// - everything else (`Option`, `Borrowed`, `PyValueMember`, `Range`,
+///   `NdArray`, `PyValue`, ...) — either owned by a dedicated rule or
+///   dependent on context this function does not have.
+fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
+    match t {
+        crate::TypeInfo::Int
+        | crate::TypeInfo::Float
+        | crate::TypeInfo::Bool
+        | crate::TypeInfo::String
+        | crate::TypeInfo::Bytes
+        | crate::TypeInfo::Class(_) => true,
+        crate::TypeInfo::Vec(e) => renderable_return_typeinfo(e),
+        crate::TypeInfo::Dict(k, v) => {
+            renderable_return_typeinfo(k) && renderable_return_typeinfo(v)
+        }
+        crate::TypeInfo::Tuple(ts) => ts.iter().all(renderable_return_typeinfo),
+        _ => false,
+    }
+}
+
 pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
@@ -3470,6 +3501,7 @@ impl FunctionDef {
         self.inferred_return_type(options)
             .or(annotated)
             .or_else(|| self.boxed_list_return_type(symbols, options))
+            .or_else(|| self.unified_return_type(symbols, options))
     }
 
     /// The `Vec<stdpython::PyValue>` return type for an unannotated
@@ -3605,6 +3637,81 @@ impl FunctionDef {
     /// returns (which implicitly return None on the fall-through path),
     /// mixed types, and uninferable values all yield None so the function
     /// stays unannotated, as before.
+    /// The LAST-RESORT return type (issue #222): the type every `return`
+    /// in the body agrees on, per the general expression inferrer.
+    ///
+    /// Deliberately the final link in `resolved_return_type`'s chain, so it
+    /// can only turn a signature that would have collapsed to `()` into a
+    /// concrete one — it never overrides a type an earlier rule derived.
+    /// That matters because the collapse is not a cosmetic wart: the body
+    /// still emits `Ok(<value>)`, so `-> Result<(), PyException>` is code
+    /// that cannot compile. Widening here strictly reduces the set of
+    /// functions that lower to something rustc rejects.
+    ///
+    /// Two guards keep it honest. Every return must infer the SAME type —
+    /// disagreement falls through to the existing literal-boxing rule
+    /// rather than picking a winner. And the type must be one this
+    /// whitelist can render faithfully: `PyObject` means the inferrer had
+    /// no answer, and `StrRef` is a literal artifact that earlier rules
+    /// already own, so both are refused rather than guessed at.
+    fn unified_return_type(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
+        if !guarantees_return(&self.body) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
+        if returns.is_empty() {
+            return None;
+        }
+        let mut unified: Option<crate::TypeInfo> = None;
+        for r in &returns {
+            let t = crate::infer_type(r, options, symbols);
+            if !renderable_return_typeinfo(&t) {
+                return None;
+            }
+            match &unified {
+                None => unified = Some(t),
+                Some(prev) if *prev == t => {}
+                Some(_) => return None,
+            }
+        }
+        unified.map(|t| t.to_rust_type())
+    }
+
+    /// The BODY-VISIBLE Rust type of an annotated parameter, or None when
+    /// the parameter is absent, unannotated, or its annotation has no
+    /// concrete Rust mapping (issue #222).
+    ///
+    /// Driven by the annotation rather than by `options.param_type_vars`
+    /// deliberately: that map is populated on `to_rust`'s per-function
+    /// options clone, so callers that ask for a signature from outside the
+    /// lowering (the PyO3 wrapper generator) would see an empty map and
+    /// compute a DIFFERENT return type than the function they wrap. The
+    /// annotation gives every caller the same answer.
+    ///
+    /// A `str` parameter arrives as `impl Into<String>` and is converted by
+    /// the body prologue, so what a `return` sees is the owned `String`.
+    /// An unannotated parameter is left alone: its type may be an inferred
+    /// generic, and that path is owned by `inferred_signature`.
+    fn annotated_param_type(&self, name: &str) -> Option<TokenStream> {
+        let param = self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+            .find(|p| p.arg == name)?;
+        let ann = param.annotation.as_deref()?;
+        if matches!(ann, ExprType::Name(n) if n.id == "str") {
+            return Some(quote!(String));
+        }
+        crate::python_annotation_to_rust_type(ann)
+    }
+
     pub fn inferred_return_type(&self, options: &crate::PythonOptions) -> Option<TokenStream> {
         // A function that can fall off the end must not get a concrete
         // return annotation: the implicit tail is `()`.
@@ -3649,7 +3756,15 @@ impl FunctionDef {
                             let ident = crate::safe_ident(class);
                             quote!(#ident)
                         }
-                        _ => return None,
+                        // Issue #222: a returned PARAMETER is not a local,
+                        // so it used to fall straight through to `None` and
+                        // the signature collapsed to unit while the body
+                        // still emitted `Ok(x)` — code that cannot compile.
+                        // An ANNOTATED parameter's type is known here.
+                        _ => match self.annotated_param_type(&name.id) {
+                            Some(t) => t,
+                            None => return None,
+                        },
                     },
                 },
                 other => simple_expr_type(other)?,

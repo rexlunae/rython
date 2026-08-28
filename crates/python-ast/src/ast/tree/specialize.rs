@@ -912,7 +912,7 @@ fn variant_expr_type(
 
 /// Every value-carrying `return` expression in the body (nested statement
 /// bodies included; nested function definitions excluded).
-fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
+pub(crate) fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
     for stmt in body {
         match &stmt.statement {
             StatementType::Return(Some(r)) => out.push(r.value.clone()),
