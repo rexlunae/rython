@@ -95,12 +95,15 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
             let x = a.as_f64();
             let y = b.as_f64();
             let mut out = vec![0.0f64; n];
-            for j in 0..n {
-                let mut acc = 0.0f64;
-                for i in 0..k {
-                    acc += x[i] * y[i * n + j];
+            // i-outer/j-inner: both y and out are walked sequentially (the
+            // j-outer spelling strides y by n each step). Accumulation per
+            // output element stays in ascending i order — bitwise same.
+            for i in 0..k {
+                let xi = x[i];
+                let y_row = &y[i * n..(i + 1) * n];
+                for j in 0..n {
+                    out[j] += xi * y_row[j];
                 }
-                out[j] = acc;
             }
             NdArray::new(vec![n], Dtype::Float64, Data::F64(out))
         }
@@ -120,14 +123,47 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
             }
             let x = a.as_f64();
             let y = b.as_f64();
+            // Row-parallel under the rayon backend: each output row is
+            // independent, and per-element accumulation stays in ascending
+            // p order, so the results are bitwise identical to the
+            // sequential spelling below. (linalg kernels otherwise don't
+            // dispatch through the engine — this is the one matmul path
+            // that parallelizes.)
+            #[cfg(feature = "numpy-rayon")]
+            if matches!(super::active_backend(), super::Backend::Rayon) {
+                use rayon::prelude::*;
+                let out: Vec<f64> = (0..m)
+                    .into_par_iter()
+                    .flat_map_iter(|i| {
+                        let mut row = vec![0.0f64; n];
+                        for p in 0..k {
+                            let aip = x[i * k + p];
+                            let y_row = &y[p * n..(p + 1) * n];
+                            for j in 0..n {
+                                row[j] += aip * y_row[j];
+                            }
+                        }
+                        row
+                    })
+                    .collect();
+                return NdArray::new(vec![m, n], Dtype::Float64, Data::F64(out));
+            }
             let mut out = vec![0.0f64; m * n];
+            // i-k-p order (NOT i-j-p): the inner loop walks y's ROW and the
+            // output row sequentially — the i-j-p spelling strides y by n
+            // every step, missing cache on each multiply and defeating
+            // auto-vectorization (1024³ took ~1.4s vs ~0.15s here). Each
+            // output element still accumulates p in ascending order, so
+            // results are bitwise identical to the naive spelling.
             for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for p in 0..k {
-                        acc += x[i * k + p] * y[p * n + j];
+                let a_row = &x[i * k..(i + 1) * k];
+                let out_row = &mut out[i * n..(i + 1) * n];
+                for p in 0..k {
+                    let aip = a_row[p];
+                    let y_row = &y[p * n..(p + 1) * n];
+                    for j in 0..n {
+                        out_row[j] += aip * y_row[j];
                     }
-                    out[i * n + j] = acc;
                 }
             }
             NdArray::new(vec![m, n], Dtype::Float64, Data::F64(out))
