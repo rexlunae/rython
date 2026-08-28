@@ -728,6 +728,15 @@ impl<'a> CodeGen for Assign {
                         // rebound by a String (`out += "x"`) must be owned
                         // from the start.
                         quote!(#target_code = (#value).to_string();)
+                    } else if let Some(clone) = self_field_read_clone(&value_expr, &ctx, &options, &symbols) {
+                        // Issue #222's local half: `box = self.scheme` —
+                        // a non-Copy field read moved into a LOCAL leaves
+                        // `&self` (E0507). Python's objects are references,
+                        // so the clone reproduces the shared value. Only
+                        // immutable field types (str/bytes) clone — mutable
+                        // containers keep the move so aliasing stays loud
+                        // (issue #79), mirroring stored_name_needs_clone.
+                        quote!(#target_code = #clone;)
                     } else {
                         quote!(#target_code = #value;)
                     }
@@ -1079,4 +1088,43 @@ fn is_container_literal(expr: &ExprType) -> bool {
 fn is_empty_container_literal(expr: &ExprType) -> bool {
     matches!(expr, ExprType::List(l) if l.is_empty())
         || matches!(expr, ExprType::Dict(d) if d.keys.is_empty())
+}
+
+/// A `self.<field>` read whose field type is an IMMUTABLE Python value
+/// (str/bytes — the types whose clones are semantically faithful),
+/// rendered as a CLONE so a store into a local does not move out of the
+/// shared receiver (`box = self.scheme` — issue #222's local half;
+/// E0507 otherwise). None for any other value shape. The use-count gate
+/// does not apply: the receiver is `&self`, so even a single move is a
+/// borrow violation — unlike the name-to-name case
+/// (`stored_name_needs_clone`), where one move is legal and only reuse
+/// poisons.
+fn self_field_read_clone(
+    value_expr: &ExprType,
+    ctx: &crate::CodeGenContext,
+    options: &crate::PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> Option<proc_macro2::TokenStream> {
+    let ExprType::Attribute(attr) = value_expr else {
+        return None;
+    };
+    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+        return None;
+    }
+    let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
+    let fields = class.infer_fields(&class_symbols, options).ok()?;
+    let (_, ty) = fields.iter().find(|(name, _)| *name == attr.attr)?;
+    let ty = ty.to_string();
+    let immutable = ty.contains("String")
+        || ty.contains("str")
+        || ty.contains("Vec < u8 >")
+        || ty.contains("Vec<u8>");
+    if !immutable {
+        return None;
+    }
+    let tokens = value_expr
+        .clone()
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+        .ok()?;
+    Some(quote!((#tokens).clone()))
 }
