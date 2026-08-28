@@ -117,6 +117,7 @@ fn pairwise_block_scalar(v: &[f64]) -> f64 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn pairwise_block_avx2(v: &[f64]) -> f64 {
     use std::arch::x86_64::*;
+    unsafe {
     let mut acc0 = _mm256_setzero_pd();
     let mut acc1 = _mm256_setzero_pd();
     let blocks = v.len() / 8;
@@ -136,6 +137,7 @@ unsafe fn pairwise_block_avx2(v: &[f64]) -> f64 {
         res += x;
     }
     res
+    }
 }
 
 /// aarch64 NEON block: four f64x2 accumulators, lanes r0..r7 in order —
