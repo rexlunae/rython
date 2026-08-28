@@ -59,27 +59,118 @@ fn pairwise_sum(v: &[f64]) -> f64 {
         }
         res
     } else if n <= 128 {
-        let mut r = [0.0f64; 8];
-        for k in 0..8 {
-            r[k] = v[k];
+        // SIMD fast paths when the platform has them: 8 SIMD lanes map
+        // ONE-TO-ONE onto the scalar r0..r7 accumulators (lane k
+        // accumulates v[block_start + k] in ascending block order), so the
+        // combine tree — and therefore the result — is bit-for-bit
+        // identical to the scalar spelling below. LLVM does not
+        // auto-vectorize the FP reduction loop (measured 2.5ms/8M vs
+        // numpy's 0.9ms), hence the explicit lanes.
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 detected above; loads stay within the slice.
+            return unsafe { pairwise_block_avx2(v) };
         }
-        let mut i = 8;
-        while i < n - (n % 8) {
-            for k in 0..8 {
-                r[k] += v[i + k];
-            }
-            i += 8;
+        #[cfg(target_arch = "aarch64")]
+        {
+            return unsafe { pairwise_block_neon(v) };
         }
-        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
-        while i < n {
-            res += v[i];
-            i += 1;
-        }
-        res
+        #[allow(unreachable_code)]
+        pairwise_block_scalar(v)
     } else {
         let mut n2 = n / 2;
         n2 -= n2 % 8;
         pairwise_sum(&v[..n2]) + pairwise_sum(&v[n2..])
+    }
+}
+
+/// The scalar <=128 block: eight accumulators, one per lane, combined in
+/// numpy's tree. Serves as the fallback on platforms without SIMD and as
+/// the tail handler for the 8-block remainder.
+fn pairwise_block_scalar(v: &[f64]) -> f64 {
+    let n = v.len();
+    let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5, mut r6, mut r7) =
+        (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    let mut i = 8;
+    while i < n - (n % 8) {
+        r0 += v[i];
+        r1 += v[i + 1];
+        r2 += v[i + 2];
+        r3 += v[i + 3];
+        r4 += v[i + 4];
+        r5 += v[i + 5];
+        r6 += v[i + 6];
+        r7 += v[i + 7];
+        i += 8;
+    }
+    let mut res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
+    while i < n {
+        res += v[i];
+        i += 1;
+    }
+    res
+}
+
+/// x86_64 AVX2 block: two f64x4 accumulators whose lanes map onto r0..r3
+/// and r4..r7 — the same eight per-lane chains the scalar block runs, so
+/// the combine tree gives bit-for-bit identical results.
+#[cfg(target_arch = "x86_64")]
+unsafe fn pairwise_block_avx2(v: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+    unsafe {
+    let mut acc0 = _mm256_setzero_pd();
+    let mut acc1 = _mm256_setzero_pd();
+    let blocks = v.len() / 8;
+    let mut b = 0;
+    while b < blocks {
+        let base = b * 8;
+        acc0 = _mm256_add_pd(acc0, _mm256_loadu_pd(v.as_ptr().add(base)));
+        acc1 = _mm256_add_pd(acc1, _mm256_loadu_pd(v.as_ptr().add(base + 4)));
+        b += 1;
+    }
+    let mut tmp = [0.0f64; 8];
+    _mm256_storeu_pd(tmp.as_mut_ptr(), acc0);
+    _mm256_storeu_pd(tmp.as_mut_ptr().add(4), acc1);
+    let tail = &v[blocks * 8..];
+    let mut res = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+    for &x in tail {
+        res += x;
+    }
+    res
+    }
+}
+
+/// aarch64 NEON block: four f64x2 accumulators, lanes r0..r7 in order —
+/// same combine tree, bitwise identical. NEON is baseline on aarch64.
+#[cfg(target_arch = "aarch64")]
+unsafe fn pairwise_block_neon(v: &[f64]) -> f64 {
+    use std::arch::aarch64::*;
+    unsafe {
+    let mut acc0 = vdupq_n_f64(0.0);
+    let mut acc1 = vdupq_n_f64(0.0);
+    let mut acc2 = vdupq_n_f64(0.0);
+    let mut acc3 = vdupq_n_f64(0.0);
+    let blocks = v.len() / 8;
+    let mut b = 0;
+    while b < blocks {
+        let base = b * 8;
+        acc0 = vaddq_f64(acc0, vld1q_f64(v.as_ptr().add(base)));
+        acc1 = vaddq_f64(acc1, vld1q_f64(v.as_ptr().add(base + 2)));
+        acc2 = vaddq_f64(acc2, vld1q_f64(v.as_ptr().add(base + 4)));
+        acc3 = vaddq_f64(acc3, vld1q_f64(v.as_ptr().add(base + 6)));
+        b += 1;
+    }
+    let mut tmp = [0.0f64; 8];
+    vst1q_f64(tmp.as_mut_ptr(), acc0);
+    vst1q_f64(tmp.as_mut_ptr().add(2), acc1);
+    vst1q_f64(tmp.as_mut_ptr().add(4), acc2);
+    vst1q_f64(tmp.as_mut_ptr().add(6), acc3);
+    let tail = &v[blocks * 8..];
+    let mut res = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+    for &x in tail {
+        res += x;
+    }
+    res
     }
 }
 
@@ -98,13 +189,13 @@ fn reduce_sum(v: &[f64]) -> f64 {
 /// `np.sum(a)` — full reduction, numpy semantics: NaN propagates, the
 /// result is f64 (see module docs), computed with numpy's pairwise
 /// summation so the value matches `python3` bit-for-bit.
-pub fn sum(a: NdArray) -> f64 {
+pub fn sum(a: &NdArray) -> f64 {
     reduce_sum(&vals(&a))
 }
 
 /// `np.prod(a)` — numpy's multiply reduce is a plain sequential loop (no
 /// pairwise), so the sequential order below is already bit-identical.
-pub fn prod(a: NdArray) -> f64 {
+pub fn prod(a: &NdArray) -> f64 {
     let mut acc = 1.0f64;
     for &x in vals(&a).iter() {
         acc *= x;
@@ -114,13 +205,13 @@ pub fn prod(a: NdArray) -> f64 {
 
 /// `np.mean(a)` — numpy: `sum / n` (true division; an empty array gives
 /// `0.0 / 0.0 = nan`, matching numpy's warning-plus-nan).
-pub fn mean(a: NdArray) -> f64 {
+pub fn mean(a: &NdArray) -> f64 {
     let v = vals(&a);
     reduce_sum(&v) / v.len() as f64
 }
 
 /// `np.max(a)` — NaN-propagating, like numpy.
-pub fn max(a: NdArray) -> Result<f64, PyException> {
+pub fn max(a: &NdArray) -> Result<f64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
         // numpy's own wording, and a CATCHABLE exception rather than a
@@ -138,7 +229,7 @@ pub fn max(a: NdArray) -> Result<f64, PyException> {
 }
 
 /// `np.min(a)` — NaN-propagating, like numpy.
-pub fn min(a: NdArray) -> Result<f64, PyException> {
+pub fn min(a: &NdArray) -> Result<f64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
         // numpy's own wording, and a CATCHABLE exception rather than a
@@ -156,7 +247,7 @@ pub fn min(a: NdArray) -> Result<f64, PyException> {
 }
 
 /// `np.std(a, ddof=0)` — population standard deviation (numpy default).
-pub fn std(a: NdArray, ddof: f64) -> f64 {
+pub fn std(a: &NdArray, ddof: f64) -> f64 {
     var(a, ddof).sqrt()
 }
 
@@ -165,7 +256,7 @@ pub fn std(a: NdArray, ddof: f64) -> f64 {
 /// squared deviations, divided by `max(n - ddof, 0)` (a zero/negative
 /// degree-of-freedom count yields `inf`/`nan` like numpy, with its
 /// warning).
-pub fn var(a: NdArray, ddof: f64) -> f64 {
+pub fn var(a: &NdArray, ddof: f64) -> f64 {
     let v = vals(&a);
     let n = v.len() as f64;
     // mean = sum / n (0.0 / 0.0 = nan for an empty array, like numpy)
@@ -178,18 +269,18 @@ pub fn var(a: NdArray, ddof: f64) -> f64 {
 }
 
 /// `np.all(a)` — true when every element is truthy.
-pub fn all(a: NdArray) -> bool {
+pub fn all(a: &NdArray) -> bool {
     a.as_bool().iter().all(|&b| b)
 }
 
 /// `np.any(a)` — true when any element is truthy.
-pub fn any(a: NdArray) -> bool {
+pub fn any(a: &NdArray) -> bool {
     a.as_bool().iter().any(|&b| b)
 }
 
 /// `np.argmax(a)` — index of the first maximum; a NaN anywhere wins the
 /// index of the first NaN, exactly like numpy.
-pub fn argmax(a: NdArray) -> Result<i64, PyException> {
+pub fn argmax(a: &NdArray) -> Result<i64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
         return Err(PyException::new(
@@ -212,7 +303,7 @@ pub fn argmax(a: NdArray) -> Result<i64, PyException> {
 }
 
 /// `np.argmin(a)` — index of the first minimum; NaN wins like numpy.
-pub fn argmin(a: NdArray) -> Result<i64, PyException> {
+pub fn argmin(a: &NdArray) -> Result<i64, PyException> {
     let v = vals(&a);
     if v.is_empty() {
         return Err(PyException::new(
@@ -240,37 +331,37 @@ pub fn argmin(a: NdArray) -> Result<i64, PyException> {
 
 impl NdArray {
     pub fn sum(&self) -> f64 {
-        sum(self.clone())
+        sum(self)
     }
     pub fn prod(&self) -> f64 {
-        prod(self.clone())
+        prod(self)
     }
     pub fn mean(&self) -> f64 {
-        mean(self.clone())
+        mean(self)
     }
     pub fn max(&self) -> Result<f64, PyException> {
-        max(self.clone())
+        max(self)
     }
     pub fn min(&self) -> Result<f64, PyException> {
-        min(self.clone())
+        min(self)
     }
     pub fn std(&self) -> f64 {
-        std(self.clone(), 0.0)
+        std(self, 0.0)
     }
     pub fn var(&self) -> f64 {
-        var(self.clone(), 0.0)
+        var(self, 0.0)
     }
     pub fn all(&self) -> bool {
-        all(self.clone())
+        all(self)
     }
     pub fn any(&self) -> bool {
-        any(self.clone())
+        any(self)
     }
     pub fn argmax(&self) -> Result<i64, PyException> {
-        argmax(self.clone())
+        argmax(self)
     }
     pub fn argmin(&self) -> Result<i64, PyException> {
-        argmin(self.clone())
+        argmin(self)
     }
 }
 
