@@ -11243,12 +11243,111 @@ fn disagreeing_returns_still_box_rather_than_picking_a_winner() {
 
 #[test]
 fn an_untypeable_return_still_lowers_to_unit() {
-    // `sorted(xs)` has no inferred element type, so the inferrer has no
-    // answer — refused rather than guessed at.
-    let out = compile("def m(xs: list[int]):\n    return sorted(xs)\n", "retunk.py");
+    // A METHOD call has no inferred type — there is no Python-level
+    // method return table — so the inferrer has no answer and refuses
+    // rather than guessing at one.
+    //
+    // (This case used `sorted(xs)` until the iterator builtins learned to
+    // carry their element type; the assertion is about the refusal, so it
+    // moved to an expression that is still genuinely untypeable.)
+    let out = compile("def m(s: str):\n    return s.splitlines()\n", "retunk.py");
     assert!(
         out.contains("-> Result < () , PyException >"),
         "generated: {}",
+        out
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #222, iterator builtins: sorted/filter/map/list carry their
+// argument's element type, so a function returning one gets a real
+// signature instead of collapsing to unit.
+//
+// Each rule mirrors the emitted lowering, not just Python semantics:
+// `sorted` renders `stdpython::sorted(&[T]) -> Vec<T>`, `filter` renders
+// `filter_fallible(f, Vec<T>) -> Result<Vec<T>, _>`, and `map` renders
+// `map_fallible(f, Vec<T>) -> Result<Vec<U>, _>` where U is the
+// callable's return type.
+// ---------------------------------------------------------------------
+
+const ITER_HELPERS: &str = concat!(
+    "def double(n: int) -> int:\n",
+    "    return n * 2\n",
+    "\n",
+    "def keep(n: int) -> bool:\n",
+    "    return n > 0\n",
+    "\n",
+);
+
+#[test]
+fn sorted_preserves_the_element_type() {
+    let out = compile(
+        &format!("{}def a(xs: list[int]):\n    return sorted(xs)\n", ITER_HELPERS),
+        "itersorted.py",
+    );
+    assert!(
+        out.contains("fn a (xs : Vec < i64 >) -> Result < Vec < i64 > , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn filter_preserves_the_element_type() {
+    let out = compile(
+        &format!("{}def c(xs: list[int]):\n    return list(filter(keep, xs))\n", ITER_HELPERS),
+        "iterfilter.py",
+    );
+    assert!(
+        out.contains("-> Result < Vec < i64 > , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn map_takes_its_element_type_from_the_callable() {
+    // The element type is the CALLABLE's return type, not the iterable's.
+    let out = compile(
+        &format!(
+            "{}def to_text(n: int) -> str:\n    return str(n)\n\n\
+             def b(xs: list[int]):\n    return list(map(to_text, xs))\n",
+            ITER_HELPERS
+        ),
+        "itermap.py",
+    );
+    assert!(
+        out.contains("-> Result < Vec < String > , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn map_over_an_unresolvable_callable_stays_untyped() {
+    // A bound method (`str.strip`) is not a name this can resolve, so the
+    // element type is refused rather than guessed at.
+    let out = compile(
+        "def d(xs: list[str]):\n    return list(map(str.strip, xs))\n",
+        "itermapunk.py",
+    );
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn sorted_over_an_untyped_iterable_stays_untyped() {
+    // No element type to carry: refused, not guessed.
+    let out = compile(
+        "def e(xs):\n    ys = sorted(xs)\n    return ys\n",
+        "itersortedunk.py",
+    );
+    assert!(
+        !out.contains("-> Result < Vec < i64 >"),
+        "must not invent an element type: {}",
         out
     );
 }
