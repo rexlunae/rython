@@ -48,6 +48,18 @@ pub enum Decorator {
     /// plain method (a property READ `obj.attr` is the documented
     /// divergence; the method must be called explicitly).
     Property,
+    /// `@functools.singledispatch` — a generic function whose
+    /// implementation is chosen by the runtime type of its FIRST
+    /// argument (issue #181). The definition it decorates is the
+    /// DEFAULT implementation; `@<name>.register(T)` definitions add
+    /// specializations. The whole family lowers to ONE function that
+    /// dispatches on the boxed argument's type tag.
+    SingleDispatch,
+    /// `@<generic>.register(T)` — one specialization of a
+    /// singledispatch generic, carrying the generic's name and the
+    /// dispatch type. The definition emits nothing on its own; it is
+    /// folded into the generic's dispatch function.
+    Register { generic: String, dispatch_type: String },
 }
 
 impl Decorator {
@@ -59,6 +71,8 @@ impl Decorator {
             Decorator::Cache(_) => "functools.lru_cache",
             Decorator::DataClass => "dataclass",
             Decorator::Property => "property",
+            Decorator::SingleDispatch => "functools.singledispatch",
+            Decorator::Register { .. } => "singledispatch register",
         }
     }
 
@@ -72,6 +86,10 @@ impl Decorator {
             Decorator::Cache(spec) => Some(MethodDecorator::Cache(*spec)),
             Decorator::DataClass => None,
             Decorator::Property => Some(MethodDecorator::None),
+            // The singledispatch family is assembled at MODULE level
+            // (the generic and its registers become one function), so
+            // neither shapes a method on its own.
+            Decorator::SingleDispatch | Decorator::Register { .. } => None,
         }
     }
 
@@ -124,9 +142,36 @@ pub fn parse_decorator(
             _ => None,
         }
     };
+    // `@<generic>.register(T)` — a singledispatch specialization. Matched
+    // on the RAW expression because the receiver name (the generic being
+    // specialized) is part of the decorator's meaning, and `name_of`
+    // deliberately discards receivers.
+    let register_form = |e: &ExprType| -> Option<Decorator> {
+        let ExprType::Call(c) = e else { return None };
+        let ExprType::Attribute(a) = c.func.as_ref() else {
+            return None;
+        };
+        if a.attr != "register" {
+            return None;
+        }
+        let ExprType::Name(generic) = a.value.as_ref() else {
+            return None;
+        };
+        // `register(str)` — the dispatch type is the single argument.
+        let [ExprType::Name(ty)] = c.args.as_slice() else {
+            return None;
+        };
+        Some(Decorator::Register {
+            generic: generic.id.clone(),
+            dispatch_type: ty.id.clone(),
+        })
+    };
     match decorators {
         [] => Ok(None),
         [single] => {
+            if let Some(d) = register_form(single) {
+                return Ok(Some(d));
+            }
             let (base, call) = match single {
                 ExprType::Call(c) => (name_of(c.func.as_ref()), Some(c)),
                 other => (name_of(other), None),
@@ -158,6 +203,10 @@ pub fn parse_decorator(
                 // per instance — the cache is a performance optimization;
                 // the function lowers uncached (documented divergence).
                 (Some("instance_cache"), None) => Ok(Some(Decorator::Property)),
+                // `@functools.singledispatch` / bare `@singledispatch`
+                // (issue #181): the decorated definition is the generic's
+                // DEFAULT implementation.
+                (Some("singledispatch"), None) => Ok(Some(Decorator::SingleDispatch)),
                 (Some("classmethod"), None) => Ok(Some(Decorator::ClassMethod)),
                 (Some("staticmethod"), None) => Ok(Some(Decorator::StaticMethod)),
                 (Some("cache"), None) => Ok(Some(Decorator::Cache(Some(None)))),
@@ -319,6 +368,11 @@ pub fn decorator_to_tokens(d: &Decorator) -> TokenStream {
             None => quote!(lru_cache),
         },
         Decorator::DataClass => quote!(dataclass),
+        // The singledispatch family never round-trips through this path:
+        // it is assembled at module level into one dispatch function, so
+        // no decorator survives onto a synthesized wrapper.
+        Decorator::SingleDispatch => quote!(singledispatch),
+        Decorator::Register { .. } => quote!(register),
     }
 }
 

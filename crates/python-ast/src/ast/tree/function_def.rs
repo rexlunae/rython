@@ -505,6 +505,20 @@ fn parse_method_decorator(
     }
     match crate::parse_decorator(decorators)? {
         None => Ok(MethodDecorator::None),
+        // Issue #181: the singledispatch family is fused at MODULE level.
+        // Reaching here means the definition is not a module-level one —
+        // nested in a function, a class, or a conditional block — where
+        // the family cannot be assembled. Say that, rather than the
+        // generic "does not apply" message.
+        Some(d @ (crate::Decorator::SingleDispatch | crate::Decorator::Register { .. })) => {
+            Err(format!(
+                "`{}` is only supported on a MODULE-LEVEL definition: rython fuses the \
+                 generic and its registrations into one dispatching function, which it \
+                 can only do when the whole family sits at module level",
+                d.describe()
+            )
+            .into())
+        }
         Some(d) => d.as_method_decorator().ok_or_else(|| {
             format!(
                 "decorator `{}` does not apply to a function definition (only \

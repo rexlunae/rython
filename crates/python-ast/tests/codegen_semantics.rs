@@ -10942,3 +10942,181 @@ fn unassigned_read_without_a_base_is_not_synthesized() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #181: functools.singledispatch
+//
+// The family is fused into ONE `isinstance`-dispatching function, which
+// the monomorphizing specialization pass then lowers into a morph per
+// registered type plus the `_any` residual. Inside each morph the
+// dispatch parameter is a CONCRETE type, so specialization bodies get
+// real `str`/`int` methods instead of method calls on a boxed value.
+// ---------------------------------------------------------------------
+
+const SINGLEDISPATCH: &str = concat!(
+    "import functools\n",
+    "\n",
+    "@functools.singledispatch\n",
+    "def describe(value):\n",
+    "    return \"other\"\n",
+    "\n",
+    "@describe.register(int)\n",
+    "def _(n):\n",
+    "    return \"int\"\n",
+    "\n",
+    "@describe.register(str)\n",
+    "def _(text):\n",
+    "    return \"str \" + text\n",
+);
+
+#[test]
+fn singledispatch_registers_become_morphs() {
+    let out = compile(SINGLEDISPATCH, "sd.py");
+    for expected in [
+        "fn describe_int",
+        "fn describe_str",
+        "fn describe_any",
+    ] {
+        assert!(out.contains(expected), "missing {expected}: {}", out);
+    }
+    // The `_`-named register definitions never emit functions of their
+    // own: they exist only as arms of the fused generic.
+    assert!(
+        !out.contains("pub fn _ ("),
+        "register definitions must be absorbed: {}",
+        out
+    );
+}
+
+#[test]
+fn singledispatch_specialization_gets_a_concrete_parameter() {
+    let out = compile(SINGLEDISPATCH, "sd2.py");
+    // The str morph binds a real String, which is the whole point: the
+    // specialization body can call str methods on it.
+    assert!(
+        out.contains("fn describe_str (value : impl Into < String >)"),
+        "the str morph must take a concrete String: {}",
+        out
+    );
+    assert!(
+        out.contains("fn describe_int (value : i64)"),
+        "the int morph must take a concrete i64: {}",
+        out
+    );
+}
+
+#[test]
+fn singledispatch_binds_the_specializations_own_parameter_name() {
+    let out = compile(SINGLEDISPATCH, "sd3.py");
+    // `def _(text)` reads `text`; the fused body binds it to the
+    // generic's parameter so the specialization body is unchanged.
+    assert!(
+        out.contains("text = value"),
+        "the specialization's parameter name must be bound: {}",
+        out
+    );
+}
+
+#[test]
+fn singledispatch_call_sites_dispatch_statically() {
+    let out = compile(
+        &format!("{}\ndef main():\n    print(describe(1))\n    print(describe(\"x\"))\n", SINGLEDISPATCH),
+        "sd4.py",
+    );
+    assert!(out.contains("describe_int (1)"), "generated: {}", out);
+    assert!(out.contains("describe_str (\"x\")"), "generated: {}", out);
+}
+
+#[test]
+fn singledispatch_shares_the_generics_parameter_name() {
+    // A specialization whose parameter is already the generic's name
+    // needs no binding statement.
+    let out = compile(
+        concat!(
+            "from functools import singledispatch\n",
+            "\n",
+            "@singledispatch\n",
+            "def describe(value):\n",
+            "    return \"other\"\n",
+            "\n",
+            "@describe.register(str)\n",
+            "def _(value):\n",
+            "    return value\n",
+        ),
+        "sd5.py",
+    );
+    assert!(out.contains("fn describe_str"), "generated: {}", out);
+    assert!(
+        !out.contains("value = value"),
+        "an identity binding must not be emitted: {}",
+        out
+    );
+}
+
+#[test]
+fn singledispatch_register_without_a_generic_is_loud() {
+    let err = compile_err(
+        concat!(
+            "def describe(value):\n",
+            "    return \"other\"\n",
+            "\n",
+            "@describe.register(str)\n",
+            "def _(text):\n",
+            "    return text\n",
+        ),
+        "sdbad.py",
+    );
+    assert!(
+        err.contains("is not a `@functools.singledispatch` definition"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
+fn singledispatch_unreadable_register_form_is_loud() {
+    // The annotation-typed form (`@describe.register` with the dispatch
+    // type on the parameter) is not read; refusing beats dropping it.
+    let err = compile_err(
+        concat!(
+            "import functools\n",
+            "\n",
+            "@functools.singledispatch\n",
+            "def describe(value):\n",
+            "    return \"other\"\n",
+            "\n",
+            "@describe.register\n",
+            "def _(text: str):\n",
+            "    return text\n",
+        ),
+        "sdann.py",
+    );
+    assert!(
+        err.contains("is not in a form rython can read"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
+fn singledispatch_arity_mismatch_is_loud() {
+    let err = compile_err(
+        concat!(
+            "import functools\n",
+            "\n",
+            "@functools.singledispatch\n",
+            "def describe(value, extra):\n",
+            "    return \"other\"\n",
+            "\n",
+            "@describe.register(str)\n",
+            "def _(text):\n",
+            "    return text\n",
+        ),
+        "sdarity.py",
+    );
+    assert!(
+        err.contains("parameter(s) but the generic"),
+        "unexpected error: {}",
+        err
+    );
+}
