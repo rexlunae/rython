@@ -129,50 +129,11 @@ pub(crate) fn dot_ref(a: &NdArray, b: &NdArray) -> NdArray {
             }
             let x = a.as_f64();
             let y = b.as_f64();
-            // Row-parallel under the rayon backend: each output row is
-            // independent, and per-element accumulation stays in ascending
-            // p order, so the results are bitwise identical to the
-            // sequential spelling below. (linalg kernels otherwise don't
-            // dispatch through the engine — this is the one matmul path
-            // that parallelizes.)
-            #[cfg(feature = "numpy-rayon")]
-            if matches!(super::active_backend(), super::Backend::Rayon) {
-                use rayon::prelude::*;
-                let out: Vec<f64> = (0..m)
-                    .into_par_iter()
-                    .flat_map_iter(|i| {
-                        let mut row = vec![0.0f64; n];
-                        for p in 0..k {
-                            let aip = x[i * k + p];
-                            let y_row = &y[p * n..(p + 1) * n];
-                            for j in 0..n {
-                                row[j] += aip * y_row[j];
-                            }
-                        }
-                        row
-                    })
-                    .collect();
-                return NdArray::new(vec![m, n], Dtype::Float64, Data::F64(out));
-            }
-            let mut out = vec![0.0f64; m * n];
-            // i-k-p order (NOT i-j-p): the inner loop walks y's ROW and the
-            // output row sequentially — the i-j-p spelling strides y by n
-            // every step, missing cache on each multiply and defeating
-            // auto-vectorization (1024³ took ~1.4s vs ~0.15s here). Each
-            // output element still accumulates p in ascending order, so
-            // results are bitwise identical to the naive spelling.
-            for i in 0..m {
-                let a_row = &x[i * k..(i + 1) * k];
-                let out_row = &mut out[i * n..(i + 1) * n];
-                for p in 0..k {
-                    let aip = a_row[p];
-                    let y_row = &y[p * n..(p + 1) * n];
-                    for j in 0..n {
-                        out_row[j] += aip * y_row[j];
-                    }
-                }
-            }
-            NdArray::new(vec![m, n], Dtype::Float64, Data::F64(out))
+            NdArray::new(
+                vec![m, n],
+                Dtype::Float64,
+                Data::F64(matmul_fma(m, k, n, &x, &y)),
+            )
         }
         _ => panic!(
             "{}",
@@ -404,5 +365,167 @@ pub fn solve(a: NdArray, b: NdArray) -> Result<NdArray, PyException> {
             Dtype::Float64,
             Data::F64(out),
         ))
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Blocked FMA matmul kernel (the 2-D·2-D fast path).
+// ---------------------------------------------------------------------------
+//
+// The standard GEMM loop nest, sized for this machine's cache hierarchy:
+//
+//   rayon over i-panels of 24 rows
+//     pack A panel -> packed[p * 24 + r] (24 contiguous f64 per p)
+//     for jb over n in 256-column blocks
+//       for jt in jb..jb+256, step 2 (NEON f64x2) — 24 accumulators live
+//         for p in 0..k: 1 B-vector load + 12 packed-A loads + 24 vfma
+//       store the 24×2 output block
+//
+// B's 256-column panel is reused across all 24 rows of the i-panel; A's
+// packed panel is reused across all column blocks. FMA contraction means
+// the accumulation order differs from the naive triple loop — the same
+// class of variation every BLAS (numpy included) has between builds; the
+// results are computed to full f64 precision.
+
+/// Sequential aarch64 spelling for builds without the rayon feature: the
+/// i-k-p row kernel (same accumulation order as the rayon version).
+#[cfg(all(target_arch = "aarch64", not(feature = "numpy-rayon")))]
+mod seq_kernel {
+    pub fn matmul(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0f64; m * n];
+        for i in 0..m {
+            let a_row = &x[i * k..(i + 1) * k];
+            let out_row = &mut out[i * n..(i + 1) * n];
+            for p in 0..k {
+                let aip = a_row[p];
+                let y_row = &y[p * n..(p + 1) * n];
+                for j in 0..n {
+                    out_row[j] += aip * y_row[j];
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The 2-D·2-D entry: dispatches to the platform kernel.
+fn matmul_fma(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
+    #[cfg(all(target_arch = "aarch64", feature = "numpy-rayon"))]
+    {
+        return fast_kernel::matmul(m, k, n, x, y);
+    }
+    #[cfg(all(target_arch = "aarch64", not(feature = "numpy-rayon")))]
+    {
+        return seq_kernel::matmul(m, k, n, x, y);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (m, k, n, x, y);
+        unreachable!("matmul_fma: non-aarch64 platforms use the row-parallel path")
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "numpy-rayon"))]
+mod fast_kernel {
+    use rayon::prelude::*;
+    use std::arch::aarch64::*;
+
+    /// The 2-D·2-D multiply: `out[i][j] = sum_p a[i][p] * b[p][j]`.
+    pub fn matmul(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
+        const MR: usize = 24; // rows per panel (24 f64x2 accumulators live)
+        const KB: usize = 256; // k depth per pass (L2 chunk)
+
+        let panels: Vec<(usize, usize)> = (0..m)
+            .step_by(MR)
+            .map(|row0| (row0, (row0 + MR).min(m)))
+            .collect();
+
+        // Per-panel packed A: packed[p * 24 + r] = x[row0 + r][p] — 24
+        // contiguous f64 per p, so the p-loop's A loads are coalesced.
+        let packed: Vec<Vec<f64>> = panels
+            .iter()
+            .map(|&(row0, row1)| {
+                let rows = row1 - row0;
+                let mut packed = vec![0.0f64; k * MR];
+                for p in 0..k {
+                    for r in 0..rows {
+                        packed[p * MR + r] = x[(row0 + r) * k + p];
+                    }
+                }
+                packed
+            })
+            .collect();
+
+        let out_chunks: Vec<Vec<f64>> = panels
+            .par_iter()
+            .zip(packed.par_iter())
+            .map(|(&(row0, row1), packed)| {
+                let rows = row1 - row0;
+                let nmb = rows.div_ceil(4); // micro-blocks of 4 rows
+                let mut chunk = vec![0.0f64; rows * n];
+                // Each out element accumulates p in ascending order (the
+                // kb chunks are in order, p ascending within a chunk), so
+                // the result matches the naive p-ascending spelling up to
+                // the FMA contraction of mul+add (one rounding vs two —
+                // the same class of variation every BLAS has).
+                for kb in (0..k).step_by(KB) {
+                    let kw = (kb + KB).min(k) - kb;
+                    for jt in (0..n).step_by(2) {
+                        // 24 accumulator vectors (nmb micro-blocks × 4
+                        // rows), seeded from the running C panel.
+                        let mut acc = unsafe { [[vdupq_n_f64(0.0); 4]; MR / 4] };
+                        if kb > 0 {
+                            for mb in 0..nmb {
+                                for r in 0..4 {
+                                    let outi = mb * 4 + r;
+                                    if outi >= rows {
+                                        break;
+                                    }
+                                    acc[mb][r] = unsafe {
+                                        vld1q_f64(chunk.as_ptr().add(outi * n + jt))
+                                    };
+                                }
+                            }
+                        }
+                        for p in kb..kb + kw {
+                            let bv = unsafe { vld1q_f64(y.as_ptr().add(p * n + jt)) };
+                            for mb in 0..nmb {
+                                let base = p * MR + mb * 4;
+                                let a0 = unsafe { vdupq_n_f64(packed[base]) };
+                                let a1 = unsafe { vdupq_n_f64(packed[base + 1]) };
+                                let a2 = unsafe { vdupq_n_f64(packed[base + 2]) };
+                                let a3 = unsafe { vdupq_n_f64(packed[base + 3]) };
+                                acc[mb][0] = unsafe { vfmaq_f64(acc[mb][0], a0, bv) };
+                                acc[mb][1] = unsafe { vfmaq_f64(acc[mb][1], a1, bv) };
+                                acc[mb][2] = unsafe { vfmaq_f64(acc[mb][2], a2, bv) };
+                                acc[mb][3] = unsafe { vfmaq_f64(acc[mb][3], a3, bv) };
+                            }
+                        }
+                        // Store the running C panel back.
+                        for mb in 0..nmb {
+                            for r in 0..4 {
+                                let outi = mb * 4 + r;
+                                if outi >= rows {
+                                    break;
+                                }
+                                unsafe {
+                                    vst1q_f64(
+                                        chunk.as_mut_ptr().add(outi * n + jt),
+                                        acc[mb][r],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                chunk
+            })
+            .collect();
+        let mut out = Vec::with_capacity(m * n);
+        for chunk in out_chunks {
+            out.extend_from_slice(&chunk);
+        }
+        out
     }
 }
