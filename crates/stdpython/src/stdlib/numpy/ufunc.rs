@@ -201,6 +201,21 @@ impl<'a> From<&'a NdArray> for BinaryOperand<'a> {
         BinaryOperand::Array(a)
     }
 }
+impl<'a> From<&'a f64> for BinaryOperand<'a> {
+    fn from(v: &'a f64) -> Self {
+        BinaryOperand::F64(*v)
+    }
+}
+impl<'a> From<&'a i64> for BinaryOperand<'a> {
+    fn from(v: &'a i64) -> Self {
+        BinaryOperand::I64(*v)
+    }
+}
+impl<'a> From<&'a bool> for BinaryOperand<'a> {
+    fn from(v: &'a bool) -> Self {
+        BinaryOperand::Bool(*v)
+    }
+}
 impl<'a> From<i64> for BinaryOperand<'a> {
     fn from(v: i64) -> Self {
         BinaryOperand::I64(v)
@@ -600,8 +615,8 @@ macro_rules! unary_ufunc {
     ($($name:ident, $op:expr),* $(,)?) => {
         $(
             #[doc = concat!("`np.", stringify!($name), "(a)` — elementwise.")]
-            pub fn $name(a: NdArray) -> NdArray {
-                NdArray::unary($op, &a)
+            pub fn $name(a: &NdArray) -> NdArray {
+                NdArray::unary($op, a)
             }
         )*
     };
@@ -632,8 +647,8 @@ macro_rules! unary_float_ufunc {
     ($($name:ident, $op:expr),* $(,)?) => {
         $(
             #[doc = concat!("`np.", stringify!($name), "(a)` — elementwise (promotes int arrays to float64).")]
-            pub fn $name(a: NdArray) -> NdArray {
-                NdArray::unary($op, &as_float_array(&a))
+            pub fn $name(a: &NdArray) -> NdArray {
+                NdArray::unary($op, &as_float_array(a))
             }
         )*
     };
@@ -727,7 +742,7 @@ pub fn clip<T: Into<f64>>(a: NdArray, min: Option<T>, max: Option<T>) -> NdArray
 /// `np.where(cond, a, b)` — select elementwise from two arrays or scalars.
 /// The condition is truthy-tested elementwise.
 pub fn where_<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
-    cond: NdArray,
+    cond: &NdArray,
     a: L,
     b: R,
 ) -> Result<NdArray, PyException> {
