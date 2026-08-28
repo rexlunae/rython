@@ -1367,6 +1367,22 @@ impl FunctionDef {
             options.optional_names = std::rc::Rc::new(optional);
             options.clone_str_attribute_returns =
                 matches!(self.returns.as_deref(), Some(ExprType::Name(n)) if n.id == "str");
+            // Issue #222's self-field half: the resolved return type (this
+            // same chain the signature below consults) decides whether an
+            // ATTRIBUTE return must clone out of the shared receiver — a
+            // non-Copy field read moved into `Ok(..)` would leave `&self`
+            // (E0507). Copy returns (int/float/bool) need no clone.
+            options.clone_field_returns = self
+                .resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name())
+                .is_some_and(|ty| {
+                    let ty = ty.to_string();
+                    !(ty == "i64"
+                        || ty == "f64"
+                        || ty == "bool"
+                        || ty == "usize"
+                        || ty == "()"
+                        || ty.is_empty())
+                });
             // Locals whose only known type is a string literal (`label =
             // "fine"`): they lower to `&'static str`, which a `-> str`
             // return must own. Reuse the literal-local inference, keyed by
@@ -3518,6 +3534,90 @@ impl FunctionDef {
             .or_else(|| self.unified_return_type(symbols, options))
             .or_else(|| self.module_path_call_return_type(symbols, options))
             .or_else(|| self.self_method_call_return_type(self_class, symbols, options))
+            .or_else(|| self.self_field_return_type(self_class, symbols, options))
+    }
+
+    /// An unannotated METHOD whose returns are all reads of fields of its
+    /// own class on `self` (`return self.scheme` — issue #222's deferred
+    /// self-field half): the field's inferred type, from the same
+    /// `infer_fields` table the struct declaration uses, so the signature
+    /// and the struct agree by construction. END of the chain; all
+    /// returns must agree. The MOVE side is separate: a non-Copy field
+    /// read in a `return` clones out of the shared receiver
+    /// (statement.rs), or the value would leave `&self` (E0507).
+    fn self_field_return_type(
+        &self,
+        self_class: Option<&str>,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
+        if !guarantees_return(&self.body) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
+        if returns.is_empty() {
+            return None;
+        }
+        let class_name = self_class?;
+        let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name) else {
+            return None;
+        };
+        let fields = class.infer_fields(symbols, options).ok()?;
+        // A one-step local indirection (`box = self.scheme; return box` —
+        // issue #222's local half): resolve the local's single assignment
+        // in the method body and type through it. Deeper chains stay out
+        // of scope (the local-type collector's own bucket).
+        let assigned_self_field = |name: &str| -> Option<TokenStream> {
+            let mut found: Option<TokenStream> = None;
+            for s in &self.body {
+                let crate::StatementType::Assign(a) = &s.statement else {
+                    continue;
+                };
+                let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+                    continue;
+                };
+                if n.id != name {
+                    continue;
+                }
+                let crate::ExprType::Attribute(attr) = &a.value else {
+                    continue;
+                };
+                if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
+                    continue;
+                }
+                found = fields
+                    .iter()
+                    .find(|(f, _)| *f == attr.attr)
+                    .map(|(_, ty)| ty.clone());
+            }
+            found
+        };
+        let mut unified: Option<TokenStream> = None;
+        for r in &returns {
+            let ty = match r {
+                ExprType::Attribute(attr) => {
+                    let ExprType::Name(recv) = attr.value.as_ref() else {
+                        return None;
+                    };
+                    if recv.id != "self" {
+                        return None;
+                    }
+                    fields
+                        .iter()
+                        .find(|(name, _)| *name == attr.attr)
+                        .map(|(_, ty)| ty.clone())?
+                }
+                ExprType::Name(n) => assigned_self_field(&n.id)?,
+                _ => return None,
+            };
+            match &unified {
+                None => unified = Some(ty),
+                Some(prev) if prev.to_string() == ty.to_string() => {}
+                _ => return None,
+            }
+        }
+        unified
     }
 
     /// An unannotated function whose returns are all CALLS to a

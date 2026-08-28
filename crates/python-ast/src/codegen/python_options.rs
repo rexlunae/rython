@@ -303,6 +303,14 @@ pub struct PythonOptions {
     /// Python's aliasing semantics exactly. Set per function.
     pub clone_str_attribute_returns: bool,
 
+    /// The CURRENT function's resolved return type is non-Copy (a String,
+    /// a container, a class instance): returning an ATTRIBUTE read then
+    /// clones the field out of the shared receiver — a bare field read
+    /// would move out of `&self` (E0507). Generalizes
+    /// `clone_str_attribute_returns`, which `-> str` also needs for the
+    /// `&'static str` → String coercion. Set per function.
+    pub clone_field_returns: bool,
+
     /// The CURRENT function's resolved return type is the boxed PyValue:
     /// `return None` lowers to `PyValue::None_` and other returns wrap in
     /// `PyValue::from` (the None-mixing unification).
@@ -561,6 +569,7 @@ impl Default for PythonOptions {
             generator_collector: std::rc::Rc::new(None),
             generator_boxes: false,
             clone_str_attribute_returns: false,
+            clone_field_returns: false,
             fn_return_is_pyvalue: false,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_none_names: std::rc::Rc::new(std::collections::HashSet::new()),

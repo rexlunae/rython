@@ -11573,6 +11573,80 @@ fn returning_a_module_path_call_types_the_signature() {
 }
 
 #[test]
+fn returning_a_self_field_types_the_signature() {
+    // The deferred self-field half: the field's inferred type comes from
+    // the same infer_fields table the struct uses.
+    let out = compile(
+        concat!(
+            "class Conn:\n",
+            "    def __init__(self, scheme: str):\n",
+            "        self.scheme = scheme\n",
+            "\n",
+            "    def direct(self):\n",
+            "        return self.scheme\n",
+        ),
+        "retselffield.py",
+    );
+    assert!(
+        out.contains("fn direct (& self ,) -> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_local_assigned_a_self_field_types_the_signature() {
+    // One-step indirection (`box = self.scheme; return box`) — the local's
+    // single self-field assignment types the return, and the STORE clones
+    // the immutable field out of the shared receiver (E0507 otherwise).
+    let out = compile(
+        concat!(
+            "class Conn:\n",
+            "    def __init__(self, scheme: str):\n",
+            "        self.scheme = scheme\n",
+            "\n",
+            "    def give(self):\n",
+            "        box = self.scheme\n",
+            "        return box\n",
+        ),
+        "retselflocal.py",
+    );
+    assert!(
+        out.contains("fn give (& self ,) -> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("= (self . scheme) . clone ()"),
+        "the local store must clone the immutable field out of &self: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_self_field_directly_clones_out_of_self() {
+    // The MOVE side: a non-Copy field read moved into `Ok(..)` would
+    // leave `&self` — the return clones it (Python objects are
+    // references; the clone reproduces the caller's value).
+    let out = compile(
+        concat!(
+            "class Conn:\n",
+            "    def __init__(self, scheme: str):\n",
+            "        self.scheme = scheme\n",
+            "\n",
+            "    def direct(self):\n",
+            "        return self.scheme\n",
+        ),
+        "retselffieldclone.py",
+    );
+    assert!(
+        out.contains("return Ok ((self . scheme) . clone ())"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn returning_an_unresolvable_module_path_call_stays_unit() {
     // The receiver is not a crate module (json is stdpython's): the rule
     // refuses rather than guessing at the runtime's return type.

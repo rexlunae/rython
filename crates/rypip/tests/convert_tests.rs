@@ -6825,14 +6825,28 @@ fn self_method_and_module_call_returns_build_and_run() {
             "    def total(self):\n",
             "        return self._retries()\n",
             "\n",
+            "class Conn:\n",
+            "    def __init__(self, scheme: str):\n",
+            "        self.scheme = scheme\n",
+            "\n",
+            "    def direct(self):\n",
+            "        return self.scheme\n",
+            "\n",
+            "    def give(self):\n",
+            "        box = self.scheme\n",
+            "        return box\n",
+            "\n",
             "def parse_wrap(s: str):\n",
             "    return helper.parse(s)\n",
             "\n",
             "if __name__ == \"__main__\":\n",
             "    r = Retry()\n",
+            "    c = Conn(\"https\")\n",
             "    print(r.total())\n",
             "    print(parse_wrap(\"ok\"))\n",
             "    print(r._retries() + 4)\n",
+            "    print(c.direct())\n",
+            "    print(c.give())\n",
         ),
     )
     .unwrap();
@@ -6859,7 +6873,7 @@ fn self_method_and_module_call_returns_build_and_run() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        vec!["3", "parsed:ok", "7"],
+        vec!["3", "parsed:ok", "7", "https", "https"],
         "stdout: {} stderr: {}",
         stdout,
         stderr

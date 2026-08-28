@@ -650,6 +650,18 @@ impl CodeGen for StatementType {
                             }
                             _ => tokens,
                         }
+                    } else if options.clone_field_returns {
+                        // A non-Copy resolved return type (the issue #222
+                        // self-field rule types `return self.scheme` as
+                        // String): the attribute read clones out of the
+                        // shared receiver — a bare field read would move
+                        // out of `&self` (E0507). Python's objects are
+                        // references, so the clone reproduces the value
+                        // the caller sees.
+                        match &e.value {
+                            ExprType::Attribute(_) => quote!((#tokens).clone()),
+                            _ => tokens,
+                        }
                     } else {
                         tokens
                     }
