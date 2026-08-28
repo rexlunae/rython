@@ -388,9 +388,11 @@ pub fn solve(a: NdArray, b: NdArray) -> Result<NdArray, PyException> {
 // class of variation every BLAS (numpy included) has between builds; the
 // results are computed to full f64 precision.
 
-/// Sequential aarch64 spelling for builds without the rayon feature: the
-/// i-k-p row kernel (same accumulation order as the rayon version).
-#[cfg(all(target_arch = "aarch64", not(feature = "numpy-rayon")))]
+/// The portable sequential fallback: the i-k-p row kernel (same
+/// accumulation order as the SIMD versions), used on platforms without
+/// the rayon feature or without the SIMD extensions the fast kernels
+/// need.
+#[cfg(not(all(target_arch = "aarch64", feature = "numpy-rayon")))]
 mod seq_kernel {
     pub fn matmul(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
         let mut out = vec![0.0f64; m * n];
@@ -409,25 +411,112 @@ mod seq_kernel {
     }
 }
 
+/// x86_64 AVX2+FMA blocked kernel: the same panel structure as the NEON
+/// kernel, with f64x4 vectors (4 columns per FMA — twice NEON's width).
+/// Runtime-detected: pre-AVX2 CPUs take the sequential fallback.
+#[cfg(all(target_arch = "x86_64", feature = "numpy-rayon"))]
+mod fast_kernel_x86 {
+    use rayon::prelude::*;
+    use std::arch::x86_64::*;
+
+    /// The 2-D·2-D multiply: `out[i][j] = sum_p a[i][p] * b[p][j]`.
+    ///
+    /// 4×4 register-blocked micro-kernel (4 f64x4 accumulators fit the 16
+    /// ymm registers, unlike the NEON 24-accumulator layout): the C block
+    /// is read-modify-written in place per jt step, B's row vector is
+    /// reused across the 4 rows of a micro-block, and A's broadcasts hit
+    /// the packed panel in L1.
+    pub fn matmul(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return super::seq_kernel::matmul(m, k, n, x, y);
+        }
+        let mut out = vec![0.0f64; m * n];
+        const MR: usize = 24; // rows per rayon panel (6 micro-blocks of 4)
+
+        // Per-panel packed A: packed[p * 24 + r] = x[row0 + r][p] — 24
+        // contiguous f64 per p, so the p-loop's A broadcasts hit L1.
+        let panels: Vec<(usize, usize)> = (0..m)
+            .step_by(MR)
+            .map(|row0| (row0, (row0 + MR).min(m)))
+            .collect();
+
+        let packed: Vec<Vec<f64>> = panels
+            .iter()
+            .map(|&(row0, row1)| {
+                let rows = row1 - row0;
+                let mut packed = vec![0.0f64; k * MR];
+                for p in 0..k {
+                    for r in 0..rows {
+                        packed[p * MR + r] = x[(row0 + r) * k + p];
+                    }
+                }
+                packed
+            })
+            .collect();
+
+        unsafe {
+            panels
+                .par_iter()
+                .zip(packed.par_iter())
+                .for_each(|(&(row0, row1), packed)| {
+                    let rows = row1 - row0;
+                    let nmb = rows.div_ceil(4); // micro-blocks of 4 rows
+                    for jt in (0..n).step_by(4) {
+                        for mb in 0..nmb {
+                            let r0 = row0 + mb * 4;
+                            let ri = (r0 + 4).min(row1);
+                            let nrows = ri - r0;
+                            // The 4 accumulator vectors for this
+                            // micro-block, seeded from C (zero on the
+                            // first k pass — C starts zeroed).
+                            let mut acc = [
+                                _mm256_loadu_pd(out.as_ptr().add(r0 * n + jt)),
+                                _mm256_loadu_pd(out.as_ptr().add((r0 + 1).min(row1) * n + jt)),
+                                _mm256_loadu_pd(out.as_ptr().add((r0 + 2).min(row1) * n + jt)),
+                                _mm256_loadu_pd(out.as_ptr().add((r0 + 3).min(row1) * n + jt)),
+                            ];
+                            for p in 0..k {
+                                let bv = _mm256_loadu_pd(y.as_ptr().add(p * n + jt));
+                                for r in 0..nrows {
+                                    let a = _mm256_set1_pd(packed[p * MR + r]);
+                                    acc[r] = _mm256_fmadd_pd(a, bv, acc[r]);
+                                }
+                            }
+                            for r in 0..nrows {
+                                _mm256_storeu_pd(
+                                    out.as_mut_ptr().add((r0 + r) * n + jt),
+                                    acc[r],
+                                );
+                            }
+                        }
+                    }
+                });
+        }
+        out
+    }
+}
+
 /// The 2-D·2-D entry: dispatches to the platform kernel.
 fn matmul_fma(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
     #[cfg(all(target_arch = "aarch64", feature = "numpy-rayon"))]
     {
-        return fast_kernel::matmul(m, k, n, x, y);
+        return fast_kernel_neon::matmul(m, k, n, x, y);
     }
-    #[cfg(all(target_arch = "aarch64", not(feature = "numpy-rayon")))]
+    #[cfg(all(target_arch = "x86_64", feature = "numpy-rayon"))]
+    {
+        return fast_kernel_x86::matmul(m, k, n, x, y);
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "numpy-rayon"),
+        all(target_arch = "x86_64", feature = "numpy-rayon")
+    )))]
     {
         return seq_kernel::matmul(m, k, n, x, y);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (m, k, n, x, y);
-        unreachable!("matmul_fma: non-aarch64 platforms use the row-parallel path")
     }
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "numpy-rayon"))]
-mod fast_kernel {
+mod fast_kernel_neon {
     use rayon::prelude::*;
     use std::arch::aarch64::*;
 
