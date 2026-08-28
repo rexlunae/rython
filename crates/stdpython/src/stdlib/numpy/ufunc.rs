@@ -136,9 +136,11 @@ fn scalar_arr_f64(v: f64) -> NdArray {
 fn scalar_arr_bool(v: bool) -> NdArray {
     NdArray::new(vec![], Dtype::Bool, Data::Bool(vec![v]))
 }
+
 fn scalar_arr_i32(v: i32) -> NdArray {
     NdArray::new(vec![], Dtype::Int32, Data::I32(vec![v]))
 }
+
 fn scalar_arr_f32(v: f32) -> NdArray {
     NdArray::new(vec![], Dtype::Float32, Data::F32(vec![v]))
 }
@@ -177,41 +179,6 @@ fn weak_promote(d: Dtype, scalar: &BinaryOperand) -> Dtype {
 /// Build a 0-d array holding `v` cast to `dtype` — the weak-promoted target.
 /// A Python int that does not fit an int32 target raises numpy's
 /// `OverflowError` ("Python integer ... out of bounds for int32").
-fn scalar_to_dtype(v: BinaryOperand, dtype: Dtype) -> NdArray {
-    match v {
-        BinaryOperand::I64(x) => match dtype {
-            Dtype::Int32 => match i32::try_from(x) {
-                Ok(v) => scalar_arr_i32(v),
-                Err(_) => panic!(
-                    "{}",
-                    crate::PyException::new(
-                        "OverflowError",
-                        format!("Python integer {x} out of bounds for int32")
-                    )
-                ),
-            },
-            Dtype::Int64 => scalar_arr_i64(x),
-            Dtype::Float32 => scalar_arr_f32(x as f32),
-            Dtype::Float64 => scalar_arr_f64(x as f64),
-            Dtype::Bool => unreachable!("weak int never promotes to bool"),
-        },
-        BinaryOperand::F64(x) => match dtype {
-            Dtype::Float32 => scalar_arr_f32(x as f32),
-            Dtype::Float64 => scalar_arr_f64(x),
-            Dtype::Bool | Dtype::Int32 | Dtype::Int64 => {
-                unreachable!("weak float never promotes to int/bool")
-            }
-        },
-        BinaryOperand::Bool(x) => match dtype {
-            Dtype::Bool => scalar_arr_bool(x),
-            Dtype::Int32 => scalar_arr_i32(x as i32),
-            Dtype::Int64 => scalar_arr_i64(x as i64),
-            Dtype::Float32 => scalar_arr_f32(if x { 1.0 } else { 0.0 }),
-            Dtype::Float64 => scalar_arr_f64(if x { 1.0 } else { 0.0 }),
-        },
-        BinaryOperand::Array(_) => unreachable!("scalar_to_dtype needs a scalar"),
-    }
-}
 
 /// The two operands of a binary op, normalized to a common broadcast shape.
 /// Accepts arrays and the three scalar kinds in any position.
@@ -219,29 +186,32 @@ fn scalar_to_dtype(v: BinaryOperand, dtype: Dtype) -> NdArray {
 /// Public because it appears in the generic bounds of the public ufunc
 /// API (`np.add`, `np.equal`, ...); treat it as an implementation detail.
 #[doc(hidden)]
-pub enum BinaryOperand {
-    Array(NdArray),
+pub enum BinaryOperand<'a> {
+    /// BORROWED: the kernel only reads its operands, so an owned array at
+    /// the call site (which cloned a full-size buffer per op — issue #200
+    /// follow-up) is never needed.
+    Array(&'a NdArray),
     I64(i64),
     F64(f64),
     Bool(bool),
 }
 
-impl From<NdArray> for BinaryOperand {
-    fn from(a: NdArray) -> Self {
+impl<'a> From<&'a NdArray> for BinaryOperand<'a> {
+    fn from(a: &'a NdArray) -> Self {
         BinaryOperand::Array(a)
     }
 }
-impl From<i64> for BinaryOperand {
+impl<'a> From<i64> for BinaryOperand<'a> {
     fn from(v: i64) -> Self {
         BinaryOperand::I64(v)
     }
 }
-impl From<f64> for BinaryOperand {
+impl<'a> From<f64> for BinaryOperand<'a> {
     fn from(v: f64) -> Self {
         BinaryOperand::F64(v)
     }
 }
-impl From<bool> for BinaryOperand {
+impl<'a> From<bool> for BinaryOperand<'a> {
     fn from(v: bool) -> Self {
         BinaryOperand::Bool(v)
     }
@@ -252,7 +222,7 @@ impl From<bool> for BinaryOperand {
 /// The INFALLIBLE spelling, for the operator traits (`a + b`), whose
 /// associated `Output` type has no room for a `Result` — a broadcast
 /// mismatch there panics with the same message (spec §12.2).
-pub(crate) fn binary<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+pub(crate) fn binary<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     op: BinOp,
     l: L,
     r: R,
@@ -264,7 +234,7 @@ pub(crate) fn binary<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
 /// panicking: `np.add(a, b)` and the rest of the module-level ufuncs
 /// propagate this with `?`, so the ValueError is catchable exactly as in
 /// CPython (issue #205).
-pub(crate) fn binary_checked<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+pub(crate) fn binary_checked<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     op: BinOp,
     l: L,
     r: R,
@@ -275,35 +245,28 @@ pub(crate) fn binary_checked<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
             let shape = broadcast_shapes(&a.shape, &b.shape)?;
             (a, b, shape)
         }
+        // Array x scalar: the scalar stays a REGISTER operand (numpy's
+        // model) — the previous spelling materialized it into a full-size
+        // array via scalar_to_dtype, an extra fill+read pass per op
+        // (issue #200 follow-up; the chain benchmark ran ~2x numpy's
+        // memory traffic because of it).
         (BinaryOperand::Array(a), BinaryOperand::I64(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[])?;
-            let d = weak_promote(a.dtype, &BinaryOperand::I64(v));
-            (a, scalar_to_dtype(BinaryOperand::I64(v), d), shape)
+            return binary_array_scalar(op, a, &BinaryOperand::I64(v), false);
         }
         (BinaryOperand::I64(v), BinaryOperand::Array(a)) => {
-            let shape = broadcast_shapes(&a.shape, &[])?;
-            let d = weak_promote(a.dtype, &BinaryOperand::I64(v));
-            (scalar_to_dtype(BinaryOperand::I64(v), d), a, shape)
+            return binary_array_scalar(op, a, &BinaryOperand::I64(v), true);
         }
         (BinaryOperand::Array(a), BinaryOperand::F64(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[])?;
-            let d = weak_promote(a.dtype, &BinaryOperand::F64(v));
-            (a, scalar_to_dtype(BinaryOperand::F64(v), d), shape)
+            return binary_array_scalar(op, a, &BinaryOperand::F64(v), false);
         }
         (BinaryOperand::F64(v), BinaryOperand::Array(a)) => {
-            let shape = broadcast_shapes(&a.shape, &[])?;
-            let d = weak_promote(a.dtype, &BinaryOperand::F64(v));
-            (scalar_to_dtype(BinaryOperand::F64(v), d), a, shape)
+            return binary_array_scalar(op, a, &BinaryOperand::F64(v), true);
         }
         (BinaryOperand::Array(a), BinaryOperand::Bool(v)) => {
-            let shape = broadcast_shapes(&a.shape, &[])?;
-            let d = weak_promote(a.dtype, &BinaryOperand::Bool(v));
-            (a, scalar_to_dtype(BinaryOperand::Bool(v), d), shape)
+            return binary_array_scalar(op, a, &BinaryOperand::Bool(v), false);
         }
         (BinaryOperand::Bool(v), BinaryOperand::Array(a)) => {
-            let shape = broadcast_shapes(&a.shape, &[])?;
-            let d = weak_promote(a.dtype, &BinaryOperand::Bool(v));
-            (scalar_to_dtype(BinaryOperand::Bool(v), d), a, shape)
+            return binary_array_scalar(op, a, &BinaryOperand::Bool(v), true);
         }
         (BinaryOperand::I64(x), BinaryOperand::I64(y)) => {
             let a = scalar_arr_i64(x);
@@ -356,16 +319,138 @@ pub(crate) fn binary_checked<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
     // same-shape `np.add(a, b)` allocated three full-size buffers to
     // produce one (issue #200).
     let a = if a.shape.as_slice() == shape.as_slice() {
-        Cow::Borrowed(&a)
+        Cow::Borrowed(a)
     } else {
-        Cow::Owned(broadcast_to(&a, &shape))
+        Cow::Owned(broadcast_to(a, &shape))
     };
     let b = if b.shape.as_slice() == shape.as_slice() {
-        Cow::Borrowed(&b)
+        Cow::Borrowed(b)
     } else {
-        Cow::Owned(broadcast_to(&b, &shape))
+        Cow::Owned(broadcast_to(b, &shape))
     };
     Ok(NdArray::binary_same_shape(op, &a, &b))
+}
+
+fn binary_array_scalar(
+    op: BinOp,
+    a: &NdArray,
+    scalar: &BinaryOperand<'_>,
+    s_left: bool,
+) -> Result<NdArray, PyException> {
+    let mut d = weak_promote(a.dtype, scalar);
+    // numpy: true_divide on INT arrays returns float64 (the array-array
+    // kernel promotes the same way via binary_same_shape).
+    if op == BinOp::Div && matches!(d, Dtype::Int32 | Dtype::Int64 | Dtype::Bool) {
+        d = Dtype::Float64;
+    }
+    // A python int bound to an int32 array that does not fit int32 raises
+    // numpy's OverflowError before any computation (scalar_to_dtype
+    // semantics — a panic, like the materialized spelling).
+    if a.dtype == Dtype::Int32 && d == Dtype::Int32 {
+        if let BinaryOperand::I64(x) = scalar {
+            if i32::try_from(*x).is_err() {
+                panic!(
+                    "{}",
+                    PyException::new(
+                        "OverflowError",
+                        format!("Python integer {x} out of bounds for int32")
+                    )
+                );
+            }
+        }
+    }
+    // COMPARISON ops (Lt..Ne) produce elementwise BOOL arrays with dtype
+    // promotion — the arithmetic kernels below cannot express that. Route
+    // them through the array-array kernel by materializing the scalar
+    // (comparisons are not in the hot elementwise-arithmetic path).
+    if matches!(
+        op,
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+    ) {
+        let scalar_arr = match (d, scalar) {
+            (Dtype::Int32, BinaryOperand::I64(x)) => {
+                match i32::try_from(*x) {
+                    Ok(v) => scalar_arr_i32(v),
+                    Err(_) => panic!(
+                        "{}",
+                        PyException::new(
+                            "OverflowError",
+                            format!("Python integer {x} out of bounds for int32")
+                        )
+                    ),
+                }
+            }
+            (Dtype::Int64, BinaryOperand::I64(x)) => scalar_arr_i64(*x),
+            (Dtype::Float32, BinaryOperand::I64(x)) => scalar_arr_f32(*x as f32),
+            (Dtype::Float32, BinaryOperand::F64(x)) => scalar_arr_f32(*x as f32),
+            (Dtype::Float64, BinaryOperand::F64(x)) => scalar_arr_f64(*x),
+            (Dtype::Float64, BinaryOperand::I64(x)) => scalar_arr_f64(*x as f64),
+            (Dtype::Bool, BinaryOperand::Bool(x)) => scalar_arr_bool(*x),
+            _ => {
+                panic!(
+                    "{}",
+                    PyException::new(
+                        "TypeError",
+                        "unsupported array/scalar dtype combination"
+                    )
+                )
+            }
+        };
+        return Ok(NdArray::binary_same_shape(op, a, &scalar_arr));
+    }
+    // A python float on an int/bool array widens to float64: promote the
+    // array (one convert pass — numpy does the same), then compute in the
+    // promoted dtype.
+    let a2 = if a.dtype == d {
+        Cow::Borrowed(a)
+    } else {
+        Cow::Owned(a.astype(d))
+    };
+    let data = match (&a2.data, scalar) {
+        (Data::F64(xs), BinaryOperand::F64(s)) => {
+            Data::F64(engine::binary_f64_scalar(op, xs, *s, s_left))
+        }
+        (Data::F64(xs), BinaryOperand::I64(s)) => {
+            Data::F64(engine::binary_f64_scalar(op, xs, *s as f64, s_left))
+        }
+        (Data::F64(xs), BinaryOperand::Bool(s)) => {
+            Data::F64(engine::binary_f64_scalar(op, xs, *s as i64 as f64, s_left))
+        }
+        (Data::F32(xs), BinaryOperand::F64(s)) => {
+            Data::F32(engine::binary_f32_scalar(op, xs, *s as f32, s_left))
+        }
+        (Data::F32(xs), BinaryOperand::I64(s)) => {
+            Data::F32(engine::binary_f32_scalar(op, xs, *s as f32, s_left))
+        }
+        (Data::F32(xs), BinaryOperand::Bool(s)) => {
+            Data::F32(engine::binary_f32_scalar(op, xs, *s as i64 as f32, s_left))
+        }
+        (Data::I64(xs), BinaryOperand::I64(s)) => {
+            Data::I64(engine::binary_i64_scalar(op, xs, *s, s_left))
+        }
+        (Data::I64(xs), BinaryOperand::Bool(s)) => {
+            Data::I64(engine::binary_i64_scalar(op, xs, *s as i64, s_left))
+        }
+        (Data::I32(xs), BinaryOperand::I64(s)) => {
+            Data::I32(engine::binary_i32_scalar(op, xs, *s as i32, s_left))
+        }
+        (Data::I32(xs), BinaryOperand::Bool(s)) => {
+            Data::I32(engine::binary_i32_scalar(op, xs, *s as i64 as i32, s_left))
+        }
+        (Data::Bool(xs), BinaryOperand::Bool(s)) => {
+            Data::Bool(engine::binary_bool_scalar(op, xs, *s, s_left))
+        }
+        _ => {
+            panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    "unsupported array/scalar dtype combination"
+                )
+            )
+        }
+    };
+    Ok(NdArray::new(a.shape.clone(), d, data))
 }
 
 /// Convert a numeric array to f64 for float-returning ufuncs (numpy
@@ -385,7 +470,7 @@ macro_rules! binary_ufunc {
     ($($name:ident, $op:expr),* $(,)?) => {
         $(
             #[doc = concat!("`np.", stringify!($name), "(a, b)` — elementwise with broadcasting.")]
-            pub fn $name<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+            pub fn $name<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
                 a: L,
                 b: R,
             ) -> Result<NdArray, PyException> {
@@ -435,31 +520,31 @@ binary_ufunc!(
 );
 
 /// `np.remainder(a, b)` — alias of np.mod.
-pub fn remainder<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(a: L, b: R) -> NdArray {
+pub fn remainder<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(a: L, b: R) -> NdArray {
     binary(BinOp::Mod, a, b)
 }
 
 /// `np.logical_and(a, b)` — truthiness of each element, then `&`.
-pub fn logical_and<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+pub fn logical_and<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     a: L,
     b: R,
 ) -> Result<NdArray, PyException> {
     logical(BinOp::BitAnd, a, b)
 }
-pub fn logical_or<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+pub fn logical_or<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     a: L,
     b: R,
 ) -> Result<NdArray, PyException> {
     logical(BinOp::BitOr, a, b)
 }
-pub fn logical_xor<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+pub fn logical_xor<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     a: L,
     b: R,
 ) -> Result<NdArray, PyException> {
     logical(BinOp::BitXor, a, b)
 }
 
-fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+fn logical<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     op: BinOp,
     a: L,
     b: R,
@@ -468,10 +553,17 @@ fn logical<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
     let (a, b) = match (a, b) {
         (BinaryOperand::Array(a), BinaryOperand::Array(b)) => {
             let shape = broadcast_shapes(&a.shape, &b.shape)?;
-            (broadcast_to(&a, &shape), broadcast_to(&b, &shape))
+            (
+                Cow::Owned(broadcast_to(a, &shape)),
+                Cow::Owned(broadcast_to(b, &shape)),
+            )
         }
-        (BinaryOperand::Array(a), b) => (a, bool_of_scalar(b)),
-        (a, BinaryOperand::Array(b)) => (bool_of_scalar(a), b),
+        (BinaryOperand::Array(a), scalar) => {
+            (Cow::Borrowed(a), Cow::Owned(bool_of_scalar(scalar)))
+        }
+        (scalar, BinaryOperand::Array(b)) => {
+            (Cow::Owned(bool_of_scalar(scalar)), Cow::Borrowed(b))
+        }
         _ => panic!(
             "{}",
             PyException::new("TypeError", "logical ops need at least one array")
@@ -488,7 +580,7 @@ fn bool_of_scalar(s: BinaryOperand) -> NdArray {
         BinaryOperand::I64(v) => scalar_arr_bool(v != 0),
         BinaryOperand::F64(v) => scalar_arr_bool(v != 0.0),
         BinaryOperand::Bool(v) => scalar_arr_bool(v),
-        BinaryOperand::Array(a) => a,
+        BinaryOperand::Array(a) => a.clone(),
     }
 }
 
@@ -634,7 +726,7 @@ pub fn clip<T: Into<f64>>(a: NdArray, min: Option<T>, max: Option<T>) -> NdArray
 
 /// `np.where(cond, a, b)` — select elementwise from two arrays or scalars.
 /// The condition is truthy-tested elementwise.
-pub fn where_<L: Into<BinaryOperand>, R: Into<BinaryOperand>>(
+pub fn where_<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
     cond: NdArray,
     a: L,
     b: R,

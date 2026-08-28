@@ -243,12 +243,36 @@ fn par_un_vec<T: Copy + Send + Sync, F: Fn(T) -> T + Sync>(a: &[T], f: F) -> Vec
     a.par_iter().map(|&x| f(x)).collect()
 }
 
+/// Broadcast-scalar sibling of [`par_bin_vec`]: the scalar stays a
+/// register operand; one parallel read+write pass (issue #200 follow-up —
+/// the previous spelling materialized the scalar into a full-size
+/// array). Under [`PARALLEL_MIN_LEN`] it runs sequentially, same as the
+/// array-array kernels.
+fn par_bin_vec_scalar<T: Copy + Send + Sync, F: Fn(T, T) -> T + Sync>(
+    a: &[T],
+    s: T,
+    s_left: bool,
+    f: F,
+) -> Vec<T> {
+    if a.len() < PARALLEL_MIN_LEN {
+        if s_left {
+            return a.iter().map(|&x| f(s, x)).collect();
+        }
+        return a.iter().map(|&x| f(x, s)).collect();
+    }
+    if s_left {
+        a.par_iter().map(|&x| f(s, x)).collect()
+    } else {
+        a.par_iter().map(|&x| f(x, s)).collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Binary kernels
 // ---------------------------------------------------------------------------
 
 macro_rules! binary_parallel {
-    ($name:ident, $t:ty, $mod:expr, $max:expr, $min:expr, $div:expr, $floordiv:expr, $mod_fn:expr, $pow:expr) => {
+    ($name:ident, $name_s:ident, $t:ty, $mod:expr, $max:expr, $min:expr, $div:expr, $floordiv:expr, $mod_fn:expr, $pow:expr) => {
         pub(crate) fn $name(op: BinOp, a: &[$t], b: &[$t]) -> Vec<$t> {
             debug_assert_eq!(a.len(), b.len());
             match op {
@@ -277,28 +301,54 @@ macro_rules! binary_parallel {
                 }
             }
         }
+
+        /// The broadcast-scalar sibling: same per-op closures, the scalar
+        /// as a register operand.
+        pub(crate) fn $name_s(op: BinOp, a: &[$t], s: $t, s_left: bool) -> Vec<$t> {
+            match op {
+                BinOp::Add => par_bin_vec_scalar(a, s, s_left, |x, y| x + y),
+                BinOp::Sub => par_bin_vec_scalar(a, s, s_left, |x, y| x - y),
+                BinOp::Mul => par_bin_vec_scalar(a, s, s_left, |x, y| x * y),
+                BinOp::Div => par_bin_vec_scalar(a, s, s_left, $div),
+                BinOp::FloorDiv => par_bin_vec_scalar(a, s, s_left, $floordiv),
+                BinOp::Mod => par_bin_vec_scalar(a, s, s_left, $mod_fn),
+                BinOp::Pow => par_bin_vec_scalar(a, s, s_left, $pow),
+                BinOp::Max => par_bin_vec_scalar(a, s, s_left, $max),
+                BinOp::Min => par_bin_vec_scalar(a, s, s_left, $min),
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    panic!(
+                        "{}",
+                        crate::PyException::new(
+                            "TypeError",
+                            format!("unsupported numpy operation on {}", $mod)
+                        )
+                    )
+                }
+            }
+        }
     };
 }
 
 binary_parallel!(
-    binary_f64, f64, "float64", np_max_f64, np_min_f64,
+    binary_f64, binary_f64_scalar, f64, "float64", np_max_f64, np_min_f64,
     |x: f64, y: f64| x / y, np_floor_div_f64, np_mod_f64,
     |a: f64, b: f64| a.powf(b)
 );
 binary_parallel!(
-    binary_f32, f32, "float32", np_max_f32, np_min_f32,
+    binary_f32, binary_f32_scalar, f32, "float32", np_max_f32, np_min_f32,
     |x: f32, y: f32| x / y, np_floor_div_f32, np_mod_f32,
     |a: f32, b: f32| a.powf(b)
 );
 binary_parallel!(
-    binary_i64, i64, "int64", |a: i64, b: i64| a.max(b), |a: i64, b: i64| a.min(b),
+    binary_i64, binary_i64_scalar, i64, "int64", |a: i64, b: i64| a.max(b), |a: i64, b: i64| a.min(b),
     int_div_unreachable,
     np_int_floor_div,
     np_int_mod,
     np_int_pow
 );
 binary_parallel!(
-    binary_i32, i32, "int32", |a: i32, b: i32| a.max(b), |a: i32, b: i32| a.min(b),
+    binary_i32, binary_i32_scalar, i32, "int32", |a: i32, b: i32| a.max(b), |a: i32, b: i32| a.min(b),
     int_div_unreachable,
     np_int32_floor_div,
     np_int32_mod,
@@ -318,6 +368,29 @@ pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool]) -> Vec<bool> {
         BinOp::Ge => par_bin_vec(a, b, |x, y| x || !y),
         BinOp::Eq => par_bin_vec(a, b, |x, y| x == y),
         BinOp::Ne => par_bin_vec(a, b, |x, y| x != y),
+        BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
+            panic!(
+                "{}",
+                crate::PyException::new(
+                    "TypeError",
+                    "unsupported numpy operation on bool arrays"
+                )
+            )
+        }
+    }
+}
+
+pub(crate) fn binary_bool_scalar(op: BinOp, a: &[bool], s: bool, s_left: bool) -> Vec<bool> {
+    match op {
+        BinOp::Add | BinOp::BitOr | BinOp::Max => par_bin_vec_scalar(a, s, s_left, |x, y| x || y),
+        BinOp::BitAnd | BinOp::Min => par_bin_vec_scalar(a, s, s_left, |x, y| x && y),
+        BinOp::BitXor | BinOp::Sub | BinOp::Mul => par_bin_vec_scalar(a, s, s_left, |x, y| x != y),
+        BinOp::Lt => par_bin_vec_scalar(a, s, s_left, |x, y| !x && y),
+        BinOp::Le => par_bin_vec_scalar(a, s, s_left, |x, y| !x || y),
+        BinOp::Gt => par_bin_vec_scalar(a, s, s_left, |x, y| x && !y),
+        BinOp::Ge => par_bin_vec_scalar(a, s, s_left, |x, y| x || !y),
+        BinOp::Eq => par_bin_vec_scalar(a, s, s_left, |x, y| x == y),
+        BinOp::Ne => par_bin_vec_scalar(a, s, s_left, |x, y| x != y),
         BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
             panic!(
                 "{}",

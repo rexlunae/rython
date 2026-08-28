@@ -370,6 +370,40 @@ pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool]) -> Vec<bool> {
 pub(crate) fn unary_f64(op: UnOp, a: &[f64]) -> Vec<f64> {
     dispatch_unary!(unary_f64, op, a)
 }
+
+/// Binary op against a BROADCAST SCALAR operand: the scalar stays a
+/// register operand (numpy's model) instead of being materialized into a
+/// full-size array — one read + one write pass, not fill + read + read +
+/// write. `s_left` selects `s op a[i]` vs `a[i] op s`. The simd backend
+/// delegates to the scalar kernels (the scalar case is memory-bound; a
+/// splat-SIMD variant can come later if a measured gap justifies it).
+macro_rules! dispatch_binary_scalar {
+    ($f:ident, $op:expr, $a:expr, $s:expr, $s_left:expr) => {{
+        match active_backend() {
+            #[cfg(feature = "numpy-rayon")]
+            Backend::Rayon => rayon_eng::$f($op, $a, $s, $s_left),
+            #[cfg(feature = "numpy-simd")]
+            Backend::Simd => simd::$f($op, $a, $s, $s_left),
+            _ => scalar::$f($op, $a, $s, $s_left),
+        }
+    }};
+}
+
+pub(crate) fn binary_f64_scalar(op: BinOp, a: &[f64], s: f64, s_left: bool) -> Vec<f64> {
+    dispatch_binary_scalar!(binary_f64_scalar, op, a, s, s_left)
+}
+pub(crate) fn binary_f32_scalar(op: BinOp, a: &[f32], s: f32, s_left: bool) -> Vec<f32> {
+    dispatch_binary_scalar!(binary_f32_scalar, op, a, s, s_left)
+}
+pub(crate) fn binary_i64_scalar(op: BinOp, a: &[i64], s: i64, s_left: bool) -> Vec<i64> {
+    dispatch_binary_scalar!(binary_i64_scalar, op, a, s, s_left)
+}
+pub(crate) fn binary_i32_scalar(op: BinOp, a: &[i32], s: i32, s_left: bool) -> Vec<i32> {
+    dispatch_binary_scalar!(binary_i32_scalar, op, a, s, s_left)
+}
+pub(crate) fn binary_bool_scalar(op: BinOp, a: &[bool], s: bool, s_left: bool) -> Vec<bool> {
+    dispatch_binary_scalar!(binary_bool_scalar, op, a, s, s_left)
+}
 pub(crate) fn unary_f32(op: UnOp, a: &[f32]) -> Vec<f32> {
     dispatch_unary!(unary_f32, op, a)
 }
