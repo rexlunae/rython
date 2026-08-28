@@ -7301,6 +7301,63 @@ fn global_computed_initializer_lowers_to_a_lazylock_static() {
 }
 
 #[test]
+fn class_instance_global_wraps_fallible_construction_in_a_panicking_match() {
+    // Issue #229: `REC = Klass(7)` promoted to `LazyLock<Klass>`. The
+    // construction renders as a brace block (`{ Klass::new(7)? }` — the
+    // argument-mapping prelude form), and the promoted-static path's
+    // trailing-`?` strip only looked at the OUTER stream's last token, so
+    // the `?` survived inside a closure that returns `Klass` (E0277). The
+    // strip now descends into a sole brace block, and the closure
+    // panics on Err like every other fallible initializer (§12.2
+    // import-time divergence). The same repro's list field
+    // (`self.items = ["kept"]`) infers `Vec<String>`; the store side
+    // owns its string-literal elements (the literal renders Vec<&str>).
+    let out = compile(
+        concat!(
+            "class Klass:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.count = n\n",
+            "        self.items = [\"kept\"]\n",
+            "\n",
+            "REC = Klass(7)\n",
+            "\n",
+            "def show() -> int:\n",
+            "    return REC.count\n",
+        ),
+        "classglobal.py",
+    );
+    assert!(
+        out.contains("pub static REC : std :: sync :: LazyLock < Klass >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("match { Klass :: new (7) }"),
+        "the fallible construction must unwrap inside a match: {}",
+        out
+    );
+    assert!(
+        out.contains("initialization failed"),
+        "the closure must panic on Err: {}",
+        out
+    );
+    // No `?` may fire before the panicking match inside REC's closure.
+    let static_start = out.find("pub static REC").expect("REC static emitted");
+    let closure = &out[static_start..];
+    let match_at = closure.find("match").expect("panicking match emitted");
+    assert!(
+        !closure[..match_at].contains('?'),
+        "a `?` cannot precede the panicking match in the LazyLock closure: {}",
+        out
+    );
+    assert!(
+        out.contains("vec ! [(\"kept\") . to_string ()]"),
+        "the list field's store must own its string elements: {}",
+        out
+    );
+}
+
+#[test]
 fn del_index_bounds_on_pypop() {
     // Issue #112: `del xs[i]` on an unannotated parameter bounds
     // `T: PyPop<i64>` (list) / `T: PyPop<String>` (string-keyed dict).

@@ -4537,6 +4537,61 @@ impl<K: Eq + Hash, V> PyContains<K> for PyDict<K, V> {
     }
 }
 
+// Python's `in` probes by CONTENT — a str operand tests a container of
+// OWNED strings regardless of Rust ownership: `"x" in vec_of_string`,
+// `"k" in string_keyed_dict`, `"x" in string_set` (issue #229: a class
+// field's Vec<String>/HashSet<String> reaches the trait directly, and a
+// literal operand lowers as `&("x")`, an &&str). The blanket &String
+// impls above keep serving String operands; these take the str side,
+// in both the borrowed and double-borrowed spellings the renderers emit.
+impl PyContains<str> for Vec<String> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.iter().any(|s| s == item)
+    }
+}
+
+impl PyContains<&str> for Vec<String> {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.iter().any(|s| s == *item)
+    }
+}
+
+impl PyContains<str> for HashSet<String> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.iter().any(|s| s == item)
+    }
+}
+
+impl PyContains<&str> for HashSet<String> {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.iter().any(|s| s == *item)
+    }
+}
+
+impl<V> PyContains<str> for PyDict<String, V> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.keys().any(|k| k == item)
+    }
+}
+
+impl<V> PyContains<&str> for PyDict<String, V> {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.keys().any(|k| k == *item)
+    }
+}
+
+impl<V> PyContains<str> for HashMap<String, V> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.keys().any(|k| k == item)
+    }
+}
+
+impl<V> PyContains<&str> for HashMap<String, V> {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.keys().any(|k| k == *item)
+    }
+}
+
 impl<K, V> Truthy for PyDict<K, V> {
     fn is_truthy(&self) -> bool {
         !self.is_empty()

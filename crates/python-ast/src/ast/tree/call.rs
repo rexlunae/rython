@@ -106,12 +106,43 @@ pub(crate) const RUNTIME_KEYWORD_SIGNATURES: &[(&str, &str, &[&str])] = &[
 /// can be re-applied AFTER an `.await`: an async function call renders with
 /// `?` (exceptions propagate), but the operator must unwrap the awaited
 /// Result, not the future. Mirrors the Await node's reordering.
+///
+/// The rendered value may be a BLOCK — a class construction lowers to
+/// `{ prelude Klass::new(..)? }` (issue #229) — so the trailing `?` can
+/// sit INSIDE a brace group. A block whose last statement ends with `?`
+/// strips there: the block still evaluates to the (now un-unwrapped)
+/// value, exactly like the bare-call form.
 pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
-    let rendered = tokens.to_string();
-    match rendered.trim_end().strip_suffix('?') {
-        Some(inner) => inner.parse().unwrap_or_else(|_| tokens.clone()),
-        None => tokens.clone(),
+    use proc_macro2::{Delimiter, Group, TokenTree};
+
+    fn strip_last(stream: proc_macro2::TokenStream) -> Option<proc_macro2::TokenStream> {
+        let mut trees: Vec<TokenTree> = stream.into_iter().collect();
+        match trees.last() {
+            Some(TokenTree::Punct(p)) if p.as_char() == '?' => {
+                trees.pop();
+                Some(trees.into_iter().collect())
+            }
+            _ => None,
+        }
     }
+
+    if let Some(stripped) = strip_last(tokens.clone()) {
+        return stripped;
+    }
+    // A single `{ ... }` block whose last statement ends with `?`: strip
+    // inside the braces and keep the block (its prelude statements, if
+    // any, still run).
+    let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    if trees.len() == 1
+        && let TokenTree::Group(g) = &trees[0]
+        && g.delimiter() == Delimiter::Brace
+        && let Some(inner) = strip_last(g.stream())
+    {
+        let mut block = Group::new(Delimiter::Brace, inner);
+        block.set_span(g.span());
+        return quote!(#block);
+    }
+    tokens.clone()
 }
 
 /// A Name resolving (through ImportFrom re-export chains) to a module-level

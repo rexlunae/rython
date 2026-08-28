@@ -256,6 +256,30 @@ fn py_contains_matches_python_in_operator() {
     let names = vec![String::from("ada"), String::from("bo")];
     assert!(names.py_contains(&String::from("bo")));
 
+    // Python: "bo" in ["ada", "bo"] — a str probe tests a container of
+    // OWNED strings by content (issue #229: the class-field shapes reach
+    // the trait with a literal operand). Both the &&str the renderer
+    // emits and the &str spelling must hold.
+    assert!(names.py_contains(&"bo"));
+    assert!(!names.py_contains(&"zz"));
+    assert!(names.py_contains("bo"));
+    assert!(!names.py_contains("zz"));
+
+    // Python: "k" in {"k": 1} — a str probe on a String-keyed dict
+    let sd = PyDict::<String, i64>::from([("k".to_string(), 1i64)]);
+    assert!(sd.py_contains(&"k"));
+    assert!(!sd.py_contains(&"z"));
+    let shm = std::collections::HashMap::from([("k".to_string(), 1i64)]);
+    assert!(shm.py_contains(&"k"));
+    assert!(!shm.py_contains(&"z"));
+
+    // Python: "x" in {"x"} — a str probe on a set of owned strings
+    let ss = std::collections::HashSet::from([String::from("x")]);
+    assert!(ss.py_contains(&"x"));
+    assert!(!ss.py_contains(&"y"));
+    assert!(ss.py_contains("x"));
+    assert!(!ss.py_contains("y"));
+
     // Python: 2 in {1, 2, 3} — set literals lower to a std HashSet
     let s = std::collections::HashSet::from([1i64, 2, 3]);
     assert!(s.py_contains(&2));

@@ -437,6 +437,76 @@ impl<'a> CodeGen for Assign {
                 })
                 .unwrap_or(false)
         };
+        // A container of string literals stored into a field whose inferred
+        // type is an OWNED String container (issue #229: `self.items =
+        // ["kept"]` — the field is Vec<String> but the literal renders
+        // `vec!["kept"]`, a Vec<&str>). The field-inference rules type a
+        // list/set of all-string-literal elements as Vec<String> /
+        // HashSet<String>; the store side owns the elements, mirroring the
+        // scalar string rule above.
+        let attr_field_string_container = |target: &ExprType| -> Option<bool> {
+            let ExprType::Attribute(attr) = target else {
+                return None;
+            };
+            let Some((class, class_symbols)) =
+                crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+            else {
+                return None;
+            };
+            class
+                .infer_fields(&class_symbols, &options)
+                .ok()
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == &attr.attr)
+                        .and_then(|(_, ty)| {
+                            let ty = ty.to_string();
+                            if ty == quote!(Vec<String>).to_string() {
+                                Some(false)
+                            } else if ty == quote!(std::collections::HashSet<String>).to_string() {
+                                Some(true)
+                            } else {
+                                None
+                            }
+                        })
+                })
+        };
+        // Render a list/set literal whose elements are ALL string constants
+        // with each element owned (a set literal keeps its HashSet::from
+        // shape — a HashSet<String>), or None when the value is not that
+        // shape. Tuples are deliberately NOT owned here: the field rules
+        // model an all-str tuple as Vec<String>, and a Vec displays as a
+        // Python list — `('a', 'b')` would silently become `['a', 'b']`.
+        // The tuple store stays its pre-existing loud rustc error.
+        let owned_str_container_value = |expr: &ExprType| -> Option<TokenStream> {
+            fn str_const(e: &ExprType) -> bool {
+                matches!(e, ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::String(_))))
+            }
+            let (elts, is_set) = match expr {
+                ExprType::List(l) => (l.as_slice(), false),
+                ExprType::Set(s) => (s.elts.as_slice(), true),
+                _ => return None,
+            };
+            if elts.is_empty() || !elts.iter().all(str_const) {
+                return None;
+            }
+            let owned: Result<Vec<_>, _> = elts
+                .iter()
+                .map(|e| {
+                    e.clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map(|tok| quote!((#tok).to_string()))
+                })
+                .collect();
+            let owned = owned.ok()?;
+            if is_set {
+                Some(quote!(std::collections::HashSet::from([#(#owned),*])))
+            } else {
+                Some(quote!(vec![#(#owned),*]))
+            }
+        };
         let render_one = |target: &ExprType,
                           value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -673,6 +743,23 @@ impl<'a> CodeGen for Assign {
                 }
                 ExprType::Attribute(_) if value_is_str_literal => {
                     quote!(#target_code = (#value).to_string();)
+                }
+                // A list/set of string literals stored into a field typed
+                // Vec<String>/HashSet<String> owns each element at the
+                // store (issue #229) — the literal renders Vec<&str>
+                // otherwise. The cheap literal-shape check runs first so
+                // only such stores pay the field-type lookup; a set-shaped
+                // field (HashSet<String>) only accepts the set-literal
+                // form, the vec fields only accept the list form.
+                ExprType::Attribute(_)
+                    if let Some(owned) = owned_str_container_value(&value_expr)
+                        && matches!(
+                            attr_field_string_container(target),
+                            Some(is_set_field)
+                                if is_set_field == matches!(value_expr, ExprType::Set(_))
+                        ) =>
+                {
+                    quote!(#target_code = #owned;)
                 }
                 ExprType::Attribute(_) if stored_name_needs_clone => {
                     quote!(#target_code = (#value).clone();)
