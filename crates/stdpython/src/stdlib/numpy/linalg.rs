@@ -516,105 +516,186 @@ fn matmul_fma(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "numpy-rayon"))]
+#[allow(unsafe_op_in_unsafe_fn)]
 mod fast_kernel_neon {
     use rayon::prelude::*;
     use std::arch::aarch64::*;
 
-    /// The 2-D·2-D multiply: `out[i][j] = sum_p a[i][p] * b[p][j]`.
-    pub fn matmul(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
-        const MR: usize = 24; // rows per panel (24 f64x2 accumulators live)
-        const KB: usize = 256; // k depth per pass (L2 chunk)
+    const MR: usize = 24; // rows per panel (6 micro-blocks of 4 rows)
+    const NB: usize = 256; // B/output columns per block (L2 chunk)
+    const KB: usize = 256; // k depth per pass (packed A+B chunks, L2)
 
+    /// The 2-D·2-D multiply: `out[i][j] = sum_p a[i][p] * b[p][j]`.
+    ///
+    /// GEMM structure: rayon over i-panels of 24 rows; A and B are both
+    /// PACKED into p-major panels so the p-loop's loads are contiguous
+    /// (the naive spelling strides B by n×8 bytes per p — a cache miss on
+    /// every access); the micro-kernel is 4 rows × 8 cols with
+    /// lane-indexed FMA — the A vector's lanes select the row multiplier
+    /// and the B vector's lanes are the column values, so there are no
+    /// scalar broadcasts. Each output element accumulates p in ascending
+    /// order, so the results match the naive spelling up to the FMA
+    /// contraction of mul+add (the same class of variation every BLAS has
+    /// between builds). The whole kernel body is one unsafe block
+    /// wrapping the NEON intrinsics and raw-pointer panel accesses.
+    pub fn matmul(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
         let panels: Vec<(usize, usize)> = (0..m)
             .step_by(MR)
             .map(|row0| (row0, (row0 + MR).min(m)))
             .collect();
 
-        // Per-panel packed A: packed[p * 24 + r] = x[row0 + r][p] — 24
-        // contiguous f64 per p, so the p-loop's A loads are coalesced.
-        let packed: Vec<Vec<f64>> = panels
+        let packed_a: Vec<Vec<f64>> = panels
             .iter()
             .map(|&(row0, row1)| {
                 let rows = row1 - row0;
-                let mut packed = vec![0.0f64; k * MR];
+                let mut pa = vec![0.0f64; k * MR];
                 for p in 0..k {
                     for r in 0..rows {
-                        packed[p * MR + r] = x[(row0 + r) * k + p];
+                        pa[p * MR + r] = x[(row0 + r) * k + p];
                     }
                 }
-                packed
+                pa
             })
             .collect();
 
+        // Pack B ONCE, p-major: packed_b[p * n + c] = y[p * n + c]. The
+        // packed rows are contiguous (n f64 per p), shared read-only by
+        // every rayon panel — packing per panel would copy B m/24 times.
+        let packed_b: Vec<f64> = y.to_vec();
+
         let out_chunks: Vec<Vec<f64>> = panels
             .par_iter()
-            .zip(packed.par_iter())
-            .map(|(&(row0, row1), packed)| {
+            .zip(packed_a.par_iter())
+            .map(|(&(row0, row1), packed_a)| {
                 let rows = row1 - row0;
-                let nmb = rows.div_ceil(4); // micro-blocks of 4 rows
+                let nmb = rows.div_ceil(4);
                 let mut chunk = vec![0.0f64; rows * n];
-                // Each out element accumulates p in ascending order (the
-                // kb chunks are in order, p ascending within a chunk), so
-                // the result matches the naive p-ascending spelling up to
-                // the FMA contraction of mul+add (one rounding vs two —
-                // the same class of variation every BLAS has).
-                for kb in (0..k).step_by(KB) {
-                    let kw = (kb + KB).min(k) - kb;
-                    for jt in (0..n).step_by(2) {
-                        // 24 accumulator vectors (nmb micro-blocks × 4
-                        // rows), seeded from the running C panel.
-                        let mut acc = unsafe { [[vdupq_n_f64(0.0); 4]; MR / 4] };
-                        if kb > 0 {
-                            for mb in 0..nmb {
-                                for r in 0..4 {
-                                    let outi = mb * 4 + r;
-                                    if outi >= rows {
-                                        break;
-                                    }
-                                    acc[mb][r] = unsafe {
-                                        vld1q_f64(chunk.as_ptr().add(outi * n + jt))
-                                    };
-                                }
-                            }
-                        }
-                        for p in kb..kb + kw {
-                            let bv = unsafe { vld1q_f64(y.as_ptr().add(p * n + jt)) };
-                            for mb in 0..nmb {
-                                let base = p * MR + mb * 4;
-                                let a0 = unsafe { vdupq_n_f64(packed[base]) };
-                                let a1 = unsafe { vdupq_n_f64(packed[base + 1]) };
-                                let a2 = unsafe { vdupq_n_f64(packed[base + 2]) };
-                                let a3 = unsafe { vdupq_n_f64(packed[base + 3]) };
-                                acc[mb][0] = unsafe { vfmaq_f64(acc[mb][0], a0, bv) };
-                                acc[mb][1] = unsafe { vfmaq_f64(acc[mb][1], a1, bv) };
-                                acc[mb][2] = unsafe { vfmaq_f64(acc[mb][2], a2, bv) };
-                                acc[mb][3] = unsafe { vfmaq_f64(acc[mb][3], a3, bv) };
-                            }
-                        }
-                        // Store the running C panel back.
+                unsafe {
+                for jb in (0..n).step_by(NB) {
+                    let jw = (jb + NB).min(n) - jb;
+                    // k-blocking: accumulate into the C chunk in KB-deep
+                    // passes (each out element's p order stays ascending).
+                    for kb in (0..k).step_by(KB) {
+                        let kw = (kb + KB).min(k) - kb;
                         for mb in 0..nmb {
-                            for r in 0..4 {
-                                let outi = mb * 4 + r;
-                                if outi >= rows {
-                                    break;
+                            let r0 = mb * 4;
+                            let nr = (r0 + 4).min(rows) - r0;
+                            for jt in (0..jw).step_by(8) {
+                                let jend = (jt + 8).min(jw);
+                                let nv = (jend - jt) / 2; // full 2-col vectors
+                                // 8 accumulator vectors: 4 rows × 2 cols.
+                                let mut acc = [[vdupq_n_f64(0.0); 4]; 4];
+                                if kb > 0 {
+                                    for r in 0..nr {
+                                        for vi in 0..nv {
+                                            acc[r][vi] = vld1q_f64(
+                                                chunk.as_ptr()
+                                                    .add((r0 + r) * n + jb + jt + vi * 2),
+                                            );
+                                        }
+                                    }
                                 }
-                                unsafe {
-                                    vst1q_f64(
-                                        chunk.as_mut_ptr().add(outi * n + jt),
-                                        acc[mb][r],
-                                    );
+                                for p in kb..kb + kw {
+                                    let a01 = vld1q_f64(packed_a.as_ptr().add(p * MR + r0));
+                                    let a23 =
+                                        vld1q_f64(packed_a.as_ptr().add(p * MR + r0 + 2));
+                                    for vi in 0..nv {
+                                        let bv = vld1q_f64(
+                                            packed_b.as_ptr().add(p * n + jb + jt + vi * 2),
+                                        );
+                                        // vfmaq_laneq_f64::<L>(r, a, b) is
+                                        // r[i] + a[i] * b[L]: the B vector is
+                                        // element-wise, the A vector's LANE
+                                        // selects the row multiplier.
+                                        acc[0][vi] = vfmaq_laneq_f64::<0>(acc[0][vi], bv, a01);
+                                        acc[1][vi] = vfmaq_laneq_f64::<1>(acc[1][vi], bv, a01);
+                                        acc[2][vi] = vfmaq_laneq_f64::<0>(acc[2][vi], bv, a23);
+                                        acc[3][vi] = vfmaq_laneq_f64::<1>(acc[3][vi], bv, a23);
+                                    }
+                                }
+                                for r in 0..nr {
+                                    for vi in 0..nv {
+                                        vst1q_f64(
+                                            chunk.as_mut_ptr()
+                                                .add((r0 + r) * n + jb + jt + vi * 2),
+                                            acc[r][vi],
+                                        );
+                                    }
+                                    // Scalar tail for the 0-1 trailing column.
+                                    if (jend - jt) % 2 == 1 {
+                                        let c = jend - 1;
+                                        let mut sv = chunk[(r0 + r) * n + jb + c];
+                                        for p in kb..kb + kw {
+                                            sv += packed_a[p * MR + r0 + r]
+                                                * packed_b[p * n + jb + c];
+                                        }
+                                        chunk[(r0 + r) * n + jb + c] = sv;
+                                    }
                                 }
                             }
                         }
                     }
+                }
                 }
                 chunk
             })
             .collect();
+
         let mut out = Vec::with_capacity(m * n);
         for chunk in out_chunks {
             out.extend_from_slice(&chunk);
         }
         out
+    }
+}
+#[cfg(all(test, target_arch = "aarch64", feature = "numpy-rayon"))]
+mod matmul_kernel_tests {
+    use super::fast_kernel_neon;
+
+    /// The naive i-j-p reference. Integer-valued inputs make the
+    /// comparison exact in any summation order (all intermediate values
+    /// stay below 2^53), so the FMA contraction can't move the result.
+    fn naive(m: usize, k: usize, n: usize, x: &[f64], y: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for p in 0..k {
+                    acc += x[i * k + p] * y[p * n + j];
+                }
+                out[i * n + j] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fma_kernel_matches_naive() {
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (4, 4, 4),
+            (7, 5, 9),    // tail micro-block
+            (8, 8, 8),
+            (24, 24, 24), // one full panel
+            (25, 7, 13),  // panel + tail, non-square
+            (3, 9, 5),
+            (30, 300, 40),  // k > KB (exercises the k-block seam)
+            (5, 300, 600),  // n > NB (exercises the j-block stride)
+            (25, 1024, 512), // both seams at once
+        ] {
+            let x: Vec<f64> = (0..m * k).map(|i| ((i * 7) % 13) as f64 - 3.0).collect();
+            let y: Vec<f64> = (0..k * n).map(|i| ((i * 5) % 11) as f64 - 2.0).collect();
+            let want = naive(m, k, n, &x, &y);
+            let got = fast_kernel_neon::matmul(m, k, n, &x, &y);
+            assert_eq!(got.len(), want.len(), "{m}x{k}x{n}");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g, w,
+                    "matmul {m}x{k}x{n} element {i} (row {}, col {}): got {g}, want {w}",
+                    i / n,
+                    i % n
+                );
+            }
+        }
     }
 }
