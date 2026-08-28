@@ -925,7 +925,7 @@ mod divmod_tests {
         // -> array([inf, -inf, -inf, nan]) — IEEE results, NO exception.
         let a = array(vec![1.0f64, -1.0, 2.5, 0.0]);
         let b = array(vec![0.0f64, 0.0, -0.0, 0.0]);
-        let r = divide(a, b).unwrap();
+        let r = divide(&a, &b).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         let v = f64s(&r);
         assert_eq!(v[0], f64::INFINITY);
@@ -940,12 +940,12 @@ mod divmod_tests {
         // -> array([1.5, 1., 2., 4.]) float64 (numpy never does int division)
         let a = array(vec![3i64, 1, 2, 4]);
         let b = array(vec![2i64, 1, 1, 1]);
-        let r = divide(a, b).unwrap();
+        let r = divide(&a, &b).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         assert_eq!(f64s(&r), vec![1.5, 1.0, 2.0, 4.0]);
         // np.divide(np.array([1, -1, 2, 0]), 0) -> array([inf, -inf, inf, nan]) float64
         let a = array(vec![1i64, -1, 2, 0]);
-        let r = divide(a, 0).unwrap();
+        let r = divide(&a, 0).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         let v = f64s(&r);
         assert_eq!(v[0], f64::INFINITY);
@@ -960,7 +960,7 @@ mod divmod_tests {
         // -> array([1., nan]) float64
         let a = array(vec![true, false]);
         let b = array(vec![true, false]);
-        let r = divide(a, b).unwrap();
+        let r = divide(&a, &b).unwrap();
         assert!(matches!(r.dtype, Dtype::Float64));
         let v = f64s(&r);
         assert_eq!(v[0], 1.0);
@@ -971,21 +971,21 @@ mod divmod_tests {
     fn floor_divide_and_mod_by_zero() {
         // np.floor_divide(np.array([1.0, -1.0, 2.5, 0.0]), 0.0) -> [inf, -inf, inf, nan]
         let a = array(vec![1.0f64, -1.0, 2.5, 0.0]);
-        let r = floor_divide(a.clone(), 0.0f64).unwrap();
+        let r = floor_divide(&a, 0.0f64).unwrap();
         let v = f64s(&r);
         assert_eq!(v[0], f64::INFINITY);
         assert_eq!(v[1], f64::NEG_INFINITY);
         assert_eq!(v[2], f64::INFINITY);
         assert!(v[3].is_nan());
         // np.mod(np.array([1.0, -1.0, 2.5, 0.0]), 0.0) -> [nan, nan, nan, nan]
-        let r = mod_(a, 0.0f64).unwrap();
+        let r = mod_(&a, 0.0f64).unwrap();
         assert!(f64s(&r).iter().all(|x| x.is_nan()));
         // np.floor_divide(np.array([5, -5, 0, 1]), 0) -> array([0, 0, 0, 0])
         let ai = array(vec![5i64, -5, 0, 1]);
-        let r = floor_divide(ai.clone(), 0i64).unwrap();
+        let r = floor_divide(&ai, 0i64).unwrap();
         assert_eq!(i64s(&r), vec![0, 0, 0, 0]);
         // np.mod(np.array([5, -5, 0, 1]), 0) -> array([0, 0, 0, 0])
-        let r = mod_(ai, 0i64).unwrap();
+        let r = mod_(&ai, 0i64).unwrap();
         assert_eq!(i64s(&r), vec![0, 0, 0, 0]);
     }
 
@@ -994,7 +994,7 @@ mod divmod_tests {
     fn power_int_negative_exponent_raises() {
         // np.power(np.array([1, 2]), -1) -> ValueError (exact numpy message)
         let a = array(vec![1i64, 2]);
-        power(a, -1i64).unwrap();
+        power(&a, -1i64).unwrap();
     }
 
     #[test]
@@ -1003,7 +1003,7 @@ mod divmod_tests {
         // np.power(np.array([1, 2]), np.array([2, -1])) -> ValueError
         let a = array(vec![1i64, 2]);
         let b = array(vec![2i64, -1]);
-        power(a, b).unwrap();
+        power(&a, &b).unwrap();
     }
 
     #[test]
@@ -1012,7 +1012,7 @@ mod divmod_tests {
         // -> array([8, 9, 1, 625])
         let a = array(vec![2i64, -3, 0, 5]);
         let b = array(vec![3i64, 2, 0, 4]);
-        let r = power(a, b).unwrap();
+        let r = power(&a, &b).unwrap();
         assert_eq!(i64s(&r), vec![8, 9, 1, 625]);
     }
 
@@ -1024,16 +1024,16 @@ mod divmod_tests {
         let a = array(vec![7i64, -7, 3, -3]);
         let b = array(vec![2i64, 2, -2, -2]);
         assert_eq!(
-            i64s(&floor_divide(a.clone(), b.clone()).unwrap()),
+            i64s(&floor_divide(&a, &b).unwrap()),
             vec![3, -4, -2, 1]
         );
-        assert_eq!(i64s(&mod_(a, b).unwrap()), vec![1, 1, -1, -1]);
+        assert_eq!(i64s(&mod_(&a, &b).unwrap()), vec![1, 1, -1, -1]);
         // i64::MIN // -1 wraps to i64::MIN (numpy, with an overflow warning)
         assert_eq!(
-            i64s(&floor_divide(array(vec![i64::MIN]), -1i64).unwrap()),
+            i64s(&floor_divide(&array(vec![i64::MIN]), -1i64).unwrap()),
             vec![i64::MIN]
         );
-        assert_eq!(i64s(&mod_(array(vec![i64::MIN]), -1i64).unwrap()), vec![0]);
+        assert_eq!(i64s(&mod_(&array(vec![i64::MIN]), -1i64).unwrap()), vec![0]);
     }
 
     #[test]
@@ -1042,20 +1042,20 @@ mod divmod_tests {
         // which is floor(10.0) = 10.0 — numpy uses its fmod-based divmod);
         // np.mod(np.array([1.0]), 0.1) -> 0.09999999999999995.
         assert_eq!(
-            f64s(&floor_divide(array(vec![1.0f64]), 0.1f64).unwrap()),
+            f64s(&floor_divide(&array(vec![1.0f64]), 0.1f64).unwrap()),
             vec![9.0]
         );
         assert_eq!(
-            f64s(&mod_(array(vec![1.0f64]), 0.1f64).unwrap()),
+            f64s(&mod_(&array(vec![1.0f64]), 0.1f64).unwrap()),
             vec![0.09999999999999995]
         );
         // signed-zero corners: floor_divide(-1.0, -2.0).unwrap() is +0.0,
         // floor_divide(0.0, -2.0).unwrap() is -0.0, mod(0.0, -2.0) is -0.0
-        let z = f64s(&floor_divide(array(vec![-1.0f64]), -2.0f64).unwrap());
+        let z = f64s(&floor_divide(&array(vec![-1.0f64]), -2.0f64).unwrap());
         assert!(z[0] == 0.0 && z[0].is_sign_positive());
-        let z = f64s(&floor_divide(array(vec![0.0f64]), -2.0f64).unwrap());
+        let z = f64s(&floor_divide(&array(vec![0.0f64]), -2.0f64).unwrap());
         assert!(z[0] == 0.0 && z[0].is_sign_negative());
-        let z = f64s(&mod_(array(vec![0.0f64]), -2.0f64).unwrap());
+        let z = f64s(&mod_(&array(vec![0.0f64]), -2.0f64).unwrap());
         assert!(z[0] == 0.0 && z[0].is_sign_negative());
     }
 }
@@ -1132,7 +1132,7 @@ mod reduce_tests {
         // boundary sizes exercise the pairwise blocks (<8, <=128, recursive)
         let x = |n: i64| {
             multiply(
-                subtract(divide(arange_f(n as f64), 7.0).unwrap(), 3.0).unwrap(),
+                &subtract(&divide(&arange_f(n as f64), 7.0).unwrap(), 3.0).unwrap(),
                 1.0000001,
             )
             .unwrap()
@@ -1176,50 +1176,50 @@ mod weak_promotion_tests {
         let b = array(vec![true, false]);
         // Python float + f32 array stays f32
         assert!(matches!(
-            add(f32a.clone(), 0.0f64).unwrap().dtype,
+            add(&f32a, 0.0f64).unwrap().dtype,
             Dtype::Float32
         ));
         assert!(matches!(
-            add(0.0f64, f32a.clone()).unwrap().dtype,
+            add(0.0f64, &f32a).unwrap().dtype,
             Dtype::Float32
         ));
         assert!(matches!(
-            divide(f32a.clone(), 0.0f64).unwrap().dtype,
+            divide(&f32a, 0.0f64).unwrap().dtype,
             Dtype::Float32
         ));
         // Python int + i32 array stays i32; + f32 stays f32
         assert!(matches!(
-            add(i32a.clone(), 1i64).unwrap().dtype,
+            add(&i32a, 1i64).unwrap().dtype,
             Dtype::Int32
         ));
         assert!(matches!(
-            add(f32a.clone(), 1i64).unwrap().dtype,
+            add(&f32a, 1i64).unwrap().dtype,
             Dtype::Float32
         ));
         // Python float + int array -> f64
         assert!(matches!(
-            add(i32a.clone(), 0.0f64).unwrap().dtype,
+            add(&i32a, 0.0f64).unwrap().dtype,
             Dtype::Float64
         ));
         assert!(matches!(
-            add(i64a.clone(), 0.0f64).unwrap().dtype,
+            add(&i64a, 0.0f64).unwrap().dtype,
             Dtype::Float64
         ));
         // bool arrays: + Python int -> int64, + Python bool stays bool
-        assert!(matches!(add(b.clone(), 1i64).unwrap().dtype, Dtype::Int64));
-        assert!(matches!(add(b.clone(), true).unwrap().dtype, Dtype::Bool));
+        assert!(matches!(add(&b, 1i64).unwrap().dtype, Dtype::Int64));
+        assert!(matches!(add(&b, true).unwrap().dtype, Dtype::Bool));
         assert!(matches!(
-            add(f32a.clone(), true).unwrap().dtype,
+            add(&f32a, true).unwrap().dtype,
             Dtype::Float32
         ));
         // int64 + Python int stays int64; comparison outputs are bool anyway
-        assert!(matches!(add(i64a, 1i64).unwrap().dtype, Dtype::Int64));
+        assert!(matches!(add(&i64a, 1i64).unwrap().dtype, Dtype::Int64));
         assert!(matches!(
-            equal(f32a.clone(), 1i64).unwrap().dtype,
+            equal(&f32a, 1i64).unwrap().dtype,
             Dtype::Bool
         ));
         // a large-but-fitting Python int scalar stays int32
-        let r = add(i32a, 1i64 << 30).unwrap();
+        let r = add(&i32a, 1i64 << 30).unwrap();
         assert!(matches!(r.dtype, Dtype::Int32));
         // (int32 arithmetic overflow wraps in release, matching numpy; in
         // debug builds it panics — documented ledger §12.2, out of contract)
@@ -1231,7 +1231,7 @@ mod weak_promotion_tests {
     )]
     fn int_scalar_out_of_int32_bounds_raises() {
         let i32a = array(vec![1i64, 2]).astype(Dtype::Int32);
-        add(i32a, 1i64 << 40).unwrap();
+        add(&i32a, 1i64 << 40).unwrap();
     }
 }
 
@@ -1282,7 +1282,7 @@ mod exception_tests {
         // np.add(np.zeros(2), np.zeros(3)) -> ValueError: operands could not
         // be broadcast together with shapes (2,) (3,)
         // Verified against python3.
-        let err = add(zeros(2i64, Dtype::Float64), zeros(3i64, Dtype::Float64))
+        let err = add(&zeros(2i64, Dtype::Float64), &zeros(3i64, Dtype::Float64))
             .expect_err("a shape mismatch must raise");
         assert_eq!(err.exception_type, "ValueError");
         assert!(

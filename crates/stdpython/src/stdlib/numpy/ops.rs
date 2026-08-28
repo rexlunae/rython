@@ -25,43 +25,43 @@ use crate::{PyException, PyRepr};
 impl crate::PyAdd<NdArray> for NdArray {
     type Output = NdArray;
     fn py_add(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Add, self.clone(), rhs.clone())
+        ufunc::binary(BinOp::Add, self, rhs)
     }
 }
 impl crate::PyAdd<i64> for NdArray {
     type Output = NdArray;
     fn py_add(&self, rhs: &i64) -> NdArray {
-        ufunc::binary(BinOp::Add, self.clone(), *rhs)
+        ufunc::binary(BinOp::Add, self, *rhs)
     }
 }
 impl crate::PyAdd<f64> for NdArray {
     type Output = NdArray;
     fn py_add(&self, rhs: &f64) -> NdArray {
-        ufunc::binary(BinOp::Add, self.clone(), *rhs)
+        ufunc::binary(BinOp::Add, self, *rhs)
     }
 }
 impl crate::PyAdd<bool> for NdArray {
     type Output = NdArray;
     fn py_add(&self, rhs: &bool) -> NdArray {
-        ufunc::binary(BinOp::Add, self.clone(), *rhs)
+        ufunc::binary(BinOp::Add, self, *rhs)
     }
 }
 impl crate::PyAdd<NdArray> for i64 {
     type Output = NdArray;
     fn py_add(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Add, *self, rhs.clone())
+        ufunc::binary(BinOp::Add, *self, rhs)
     }
 }
 impl crate::PyAdd<NdArray> for f64 {
     type Output = NdArray;
     fn py_add(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Add, *self, rhs.clone())
+        ufunc::binary(BinOp::Add, *self, rhs)
     }
 }
 impl crate::PyAdd<NdArray> for bool {
     type Output = NdArray;
     fn py_add(&self, rhs: &NdArray) -> NdArray {
-        ufunc::binary(BinOp::Add, *self, rhs.clone())
+        ufunc::binary(BinOp::Add, *self, rhs)
     }
 }
 
@@ -72,43 +72,43 @@ macro_rules! array_sub_mul {
         impl crate::$trait<NdArray> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary(BinOp::$op, self.clone(), rhs.clone())
+                ufunc::binary(BinOp::$op, self, rhs)
             }
         }
         impl crate::$trait<i64> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &i64) -> NdArray {
-                ufunc::binary(BinOp::$op, self.clone(), *rhs)
+                ufunc::binary(BinOp::$op, self, *rhs)
             }
         }
         impl crate::$trait<f64> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &f64) -> NdArray {
-                ufunc::binary(BinOp::$op, self.clone(), *rhs)
+                ufunc::binary(BinOp::$op, self, *rhs)
             }
         }
         impl crate::$trait<bool> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &bool) -> NdArray {
-                ufunc::binary(BinOp::$op, self.clone(), *rhs)
+                ufunc::binary(BinOp::$op, self, *rhs)
             }
         }
         impl crate::$trait<NdArray> for i64 {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary(BinOp::$op, *self, rhs.clone())
+                ufunc::binary(BinOp::$op, *self, rhs)
             }
         }
         impl crate::$trait<NdArray> for f64 {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary(BinOp::$op, *self, rhs.clone())
+                ufunc::binary(BinOp::$op, *self, rhs)
             }
         }
         impl crate::$trait<NdArray> for bool {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary(BinOp::$op, *self, rhs.clone())
+                ufunc::binary(BinOp::$op, *self, rhs)
             }
         }
     };
@@ -121,47 +121,47 @@ array_sub_mul!(PyMul, py_mul, Mul);
 // arrays are values, so the compound assignment rebinds via a fresh array.
 impl std::ops::AddAssign<NdArray> for NdArray {
     fn add_assign(&mut self, rhs: NdArray) {
-        *self = ufunc::binary(BinOp::Add, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Add, &*self, &rhs);
     }
 }
 impl std::ops::SubAssign<NdArray> for NdArray {
     fn sub_assign(&mut self, rhs: NdArray) {
-        *self = ufunc::binary(BinOp::Sub, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Sub, &*self, &rhs);
     }
 }
 impl std::ops::MulAssign<NdArray> for NdArray {
     fn mul_assign(&mut self, rhs: NdArray) {
-        *self = ufunc::binary(BinOp::Mul, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Mul, &*self, &rhs);
     }
 }
 impl std::ops::AddAssign<i64> for NdArray {
     fn add_assign(&mut self, rhs: i64) {
-        *self = ufunc::binary(BinOp::Add, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Add, &*self, rhs);
     }
 }
 impl std::ops::SubAssign<i64> for NdArray {
     fn sub_assign(&mut self, rhs: i64) {
-        *self = ufunc::binary(BinOp::Sub, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Sub, &*self, rhs);
     }
 }
 impl std::ops::MulAssign<i64> for NdArray {
     fn mul_assign(&mut self, rhs: i64) {
-        *self = ufunc::binary(BinOp::Mul, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Mul, &*self, rhs);
     }
 }
 impl std::ops::AddAssign<f64> for NdArray {
     fn add_assign(&mut self, rhs: f64) {
-        *self = ufunc::binary(BinOp::Add, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Add, &*self, rhs);
     }
 }
 impl std::ops::SubAssign<f64> for NdArray {
     fn sub_assign(&mut self, rhs: f64) {
-        *self = ufunc::binary(BinOp::Sub, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Sub, &*self, rhs);
     }
 }
 impl std::ops::MulAssign<f64> for NdArray {
     fn mul_assign(&mut self, rhs: f64) {
-        *self = ufunc::binary(BinOp::Mul, self.clone(), rhs);
+        *self = ufunc::binary(BinOp::Mul, &*self, rhs);
     }
 }
 
@@ -169,86 +169,86 @@ impl std::ops::MulAssign<f64> for NdArray {
 impl std::ops::Sub<NdArray> for NdArray {
     type Output = NdArray;
     fn sub(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, &self, &rhs)
     }
 }
 impl std::ops::Sub<i64> for NdArray {
     type Output = NdArray;
     fn sub(self, rhs: i64) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, &self, rhs)
     }
 }
 impl std::ops::Sub<f64> for NdArray {
     type Output = NdArray;
     fn sub(self, rhs: f64) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, &self, rhs)
     }
 }
 impl std::ops::Sub<bool> for NdArray {
     type Output = NdArray;
     fn sub(self, rhs: bool) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, &self, rhs)
     }
 }
 impl std::ops::Sub<NdArray> for i64 {
     type Output = NdArray;
     fn sub(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, self, &rhs)
     }
 }
 impl std::ops::Sub<NdArray> for f64 {
     type Output = NdArray;
     fn sub(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, self, &rhs)
     }
 }
 impl std::ops::Sub<NdArray> for bool {
     type Output = NdArray;
     fn sub(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Sub, self, rhs)
+        ufunc::binary(BinOp::Sub, self, &rhs)
     }
 }
 
 impl std::ops::Mul<NdArray> for NdArray {
     type Output = NdArray;
     fn mul(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, &self, &rhs)
     }
 }
 impl std::ops::Mul<i64> for NdArray {
     type Output = NdArray;
     fn mul(self, rhs: i64) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, &self, rhs)
     }
 }
 impl std::ops::Mul<f64> for NdArray {
     type Output = NdArray;
     fn mul(self, rhs: f64) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, &self, rhs)
     }
 }
 impl std::ops::Mul<bool> for NdArray {
     type Output = NdArray;
     fn mul(self, rhs: bool) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, &self, rhs)
     }
 }
 impl std::ops::Mul<NdArray> for i64 {
     type Output = NdArray;
     fn mul(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, self, &rhs)
     }
 }
 impl std::ops::Mul<NdArray> for f64 {
     type Output = NdArray;
     fn mul(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, self, &rhs)
     }
 }
 impl std::ops::Mul<NdArray> for bool {
     type Output = NdArray;
     fn mul(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Mul, self, rhs)
+        ufunc::binary(BinOp::Mul, self, &rhs)
     }
 }
 
@@ -259,136 +259,136 @@ impl std::ops::Mul<NdArray> for bool {
 impl crate::PyDiv<NdArray> for NdArray {
     type Output = NdArray;
     fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, self.clone(), rhs.clone()))
+        Ok(ufunc::binary(BinOp::Div, self, rhs))
     }
 }
 impl crate::PyDiv<i64> for NdArray {
     type Output = NdArray;
     fn py_div(&self, rhs: &i64) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::Div, self, *rhs))
     }
 }
 impl crate::PyDiv<f64> for NdArray {
     type Output = NdArray;
     fn py_div(&self, rhs: &f64) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::Div, self, *rhs))
     }
 }
 impl crate::PyDiv<bool> for NdArray {
     type Output = NdArray;
     fn py_div(&self, rhs: &bool) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::Div, self, *rhs))
     }
 }
 impl crate::PyDiv<NdArray> for i64 {
     type Output = NdArray;
     fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::Div, *self, rhs))
     }
 }
 impl crate::PyDiv<NdArray> for f64 {
     type Output = NdArray;
     fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::Div, *self, rhs))
     }
 }
 impl crate::PyDiv<NdArray> for bool {
     type Output = NdArray;
     fn py_div(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Div, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::Div, *self, rhs))
     }
 }
 
 impl crate::PyFloorDiv<NdArray> for NdArray {
     type Output = NdArray;
     fn py_floordiv(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::FloorDiv, self.clone(), rhs.clone()))
+        Ok(ufunc::binary(BinOp::FloorDiv, self, rhs))
     }
 }
 impl crate::PyFloorDiv<i64> for NdArray {
     type Output = NdArray;
     fn py_floordiv(&self, rhs: &i64) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::FloorDiv, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::FloorDiv, self, *rhs))
     }
 }
 impl crate::PyFloorDiv<f64> for NdArray {
     type Output = NdArray;
     fn py_floordiv(&self, rhs: &f64) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::FloorDiv, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::FloorDiv, self, *rhs))
     }
 }
 impl crate::PyFloorDiv<NdArray> for i64 {
     type Output = NdArray;
     fn py_floordiv(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::FloorDiv, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::FloorDiv, *self, rhs))
     }
 }
 impl crate::PyFloorDiv<NdArray> for f64 {
     type Output = NdArray;
     fn py_floordiv(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::FloorDiv, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::FloorDiv, *self, rhs))
     }
 }
 
 impl crate::PyMod<NdArray> for NdArray {
     type Output = NdArray;
     fn py_mod(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Mod, self.clone(), rhs.clone()))
+        Ok(ufunc::binary(BinOp::Mod, self, rhs))
     }
 }
 impl crate::PyMod<i64> for NdArray {
     type Output = NdArray;
     fn py_mod(&self, rhs: &i64) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Mod, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::Mod, self, *rhs))
     }
 }
 impl crate::PyMod<f64> for NdArray {
     type Output = NdArray;
     fn py_mod(&self, rhs: &f64) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Mod, self.clone(), *rhs))
+        Ok(ufunc::binary(BinOp::Mod, self, *rhs))
     }
 }
 impl crate::PyMod<NdArray> for i64 {
     type Output = NdArray;
     fn py_mod(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Mod, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::Mod, *self, rhs))
     }
 }
 impl crate::PyMod<NdArray> for f64 {
     type Output = NdArray;
     fn py_mod(&self, rhs: &NdArray) -> Result<NdArray, crate::PyException> {
-        Ok(ufunc::binary(BinOp::Mod, *self, rhs.clone()))
+        Ok(ufunc::binary(BinOp::Mod, *self, rhs))
     }
 }
 
 impl crate::PyPow<NdArray> for NdArray {
     type Output = NdArray;
     fn py_pow(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Pow, self, rhs)
+        ufunc::binary(BinOp::Pow, &self, &rhs)
     }
 }
 impl crate::PyPow<i64> for NdArray {
     type Output = NdArray;
     fn py_pow(self, rhs: i64) -> NdArray {
-        ufunc::binary(BinOp::Pow, self, rhs)
+        ufunc::binary(BinOp::Pow, &self, rhs)
     }
 }
 impl crate::PyPow<f64> for NdArray {
     type Output = NdArray;
     fn py_pow(self, rhs: f64) -> NdArray {
-        ufunc::binary(BinOp::Pow, self, rhs)
+        ufunc::binary(BinOp::Pow, &self, rhs)
     }
 }
 impl crate::PyPow<NdArray> for i64 {
     type Output = NdArray;
     fn py_pow(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Pow, self, rhs)
+        ufunc::binary(BinOp::Pow, self, &rhs)
     }
 }
 impl crate::PyPow<NdArray> for f64 {
     type Output = NdArray;
     fn py_pow(self, rhs: NdArray) -> NdArray {
-        ufunc::binary(BinOp::Pow, self, rhs)
+        ufunc::binary(BinOp::Pow, self, &rhs)
     }
 }
 
@@ -459,43 +459,43 @@ macro_rules! array_cmp {
         impl crate::$trait<NdArray> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary($op, self.clone(), rhs.clone())
+                ufunc::binary($op, self, rhs)
             }
         }
         impl crate::$trait<i64> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &i64) -> NdArray {
-                ufunc::binary($op, self.clone(), *rhs)
+                ufunc::binary($op, self, *rhs)
             }
         }
         impl crate::$trait<f64> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &f64) -> NdArray {
-                ufunc::binary($op, self.clone(), *rhs)
+                ufunc::binary($op, self, *rhs)
             }
         }
         impl crate::$trait<bool> for NdArray {
             type Output = NdArray;
             fn $method(&self, rhs: &bool) -> NdArray {
-                ufunc::binary($op, self.clone(), *rhs)
+                ufunc::binary($op, self, *rhs)
             }
         }
         impl crate::$trait<NdArray> for i64 {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary($op, *self, rhs.clone())
+                ufunc::binary($op, *self, rhs)
             }
         }
         impl crate::$trait<NdArray> for f64 {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary($op, *self, rhs.clone())
+                ufunc::binary($op, *self, rhs)
             }
         }
         impl crate::$trait<NdArray> for bool {
             type Output = NdArray;
             fn $method(&self, rhs: &NdArray) -> NdArray {
-                ufunc::binary($op, *self, rhs.clone())
+                ufunc::binary($op, *self, rhs)
             }
         }
     };

@@ -39,6 +39,20 @@ macro_rules! alias_un {
     };
 }
 
+macro_rules! alias_scalar {
+    ($name:ident, $t:ty) => {
+        pub(crate) fn $name(op: BinOp, a: &[$t], s: $t, s_left: bool) -> Vec<$t> {
+            scalar::$name(op, a, s, s_left)
+        }
+    };
+}
+
+alias_scalar!(binary_f64_scalar, f64);
+alias_scalar!(binary_f32_scalar, f32);
+alias_scalar!(binary_i64_scalar, i64);
+alias_scalar!(binary_i32_scalar, i32);
+alias_scalar!(binary_bool_scalar, bool);
+
 alias_un!(unary_f64, f64);
 alias_un!(unary_f32, f32);
 alias_un!(unary_i64, i64);
