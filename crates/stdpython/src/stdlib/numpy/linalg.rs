@@ -29,6 +29,12 @@ fn as_matrix(a: &NdArray, name: &str) -> (usize, usize, Vec<f64>) {
 /// - 1-D · 2-D → 1-D
 /// - 2-D · 2-D → 2-D
 pub fn dot(a: NdArray, b: NdArray) -> NdArray {
+    dot_ref(&a, &b)
+}
+
+pub(crate) fn dot_ref(a: &NdArray, b: &NdArray) -> NdArray {
+    let a = a;
+    let b = b;
     match (a.ndim, b.ndim) {
         (1, 1) => {
             let n = a.size;
@@ -177,7 +183,13 @@ pub fn dot(a: NdArray, b: NdArray) -> NdArray {
 
 /// `np.matmul(a, b)` — same shapes as dot (the `@` operator).
 pub fn matmul(a: NdArray, b: NdArray) -> NdArray {
-    dot(a, b)
+    dot_ref(&a, &b)
+}
+
+/// Borrowed spelling (the operator trait's operands are references; the
+/// `as_f64` conversions inside `dot_ref` are the only copies needed).
+pub(crate) fn matmul_ref(a: &NdArray, b: &NdArray) -> NdArray {
+    dot_ref(a, b)
 }
 
 /// `np.vdot(a, b)` — flattened dot product as a plain f64 scalar.

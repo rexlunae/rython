@@ -600,23 +600,51 @@ fn numpy_target(func: &ExprType, symbols: &SymbolTableScopes) -> Option<String> 
 // ---------------------------------------------------------------------------
 
 /// Render one positional argument.
-type NpCtx = (CodeGenContext, PythonOptions, SymbolTableScopes);
+type NpCtx = (CodeGenContext, PythonOptions, SymbolTableScopes, bool);
+
+/// Whether a numpy function's array arguments are BORROWED by the runtime
+/// (`&NdArray` params): the reduction family, the unary ufuncs, and the
+/// binary ufuncs all read their operands and build fresh outputs, so the
+/// generated call passes `&a` instead of `a.clone()` (a full 64MB memcpy
+/// per argument per call — issue #200/#220 follow-up). Functions that
+/// CONSUME or reshape their inputs (concatenate, reshape, vstack, ...)
+/// keep by-value parameters and the clone spelling.
+fn numpy_borrows_arrays(plain_name: &str) -> bool {
+    matches!(
+        plain_name,
+        // reductions (1-arg)
+        "sum" | "prod" | "mean" | "max" | "min" | "all" | "any" | "argmax" | "argmin"
+        // unary elementwise ufuncs
+            | "abs" | "negative" | "sqrt" | "exp" | "expm1" | "log" | "log1p" | "log2"
+            | "log10" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh" | "arcsin"
+            | "arccos" | "arctan" | "ceil" | "floor" | "square" | "reciprocal" | "sign"
+            | "isfinite" | "isinf" | "isnan" | "logical_not" | "where"
+        // binary elementwise ufuncs (Into<BinaryOperand<'a>> borrows)
+            | "add" | "subtract" | "multiply" | "divide" | "floor_divide" | "mod"
+            | "remainder" | "power" | "maximum" | "minimum" | "equal" | "not_equal"
+            | "less" | "less_equal" | "greater" | "greater_equal" | "bitwise_and"
+            | "bitwise_or" | "bitwise_xor" | "logical_and" | "logical_or" | "logical_xor"
+    )
+}
 
 fn np_render(expr: &ExprType, ctx: &NpCtx) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let tokens = expr
         .clone()
         .to_rust(ctx.0.clone(), ctx.1.clone(), ctx.2.clone())?;
-    // The numpy runtime functions take their array/scalar arguments BY
-    // VALUE (no borrows, unlike the Python-operator traits), while Python
-    // value semantics let a variable be re-used freely after the call.
-    // Clone PLACE arguments so `a = np.sum(x); b = np.mean(x)` still
-    // compiles. Every generated value type (NdArray, i64, f64, bool,
-    // String, Vec, Option, tuples) is Clone, so this is always safe.
+    // Array-taking numpy functions BORROW their arguments (`&NdArray`
+    // params — numpy_borrows_arrays): the generated call passes `&a`, and
+    // Python value semantics keep `a` usable after the call with no
+    // copy (a full 64MB memcpy per argument per call — issue #200/#220
+    // follow-up).
     //
-    // A temporary — the result of another call, a literal, an operator
-    // expression — has no name to survive the move, so cloning it only
-    // copies an array nobody can observe again: `np.sum(np.multiply(x, x))`
-    // paid for a full extra copy of the intermediate (issue #200).
+    // For the by-value functions (reshape/concatenate/vstack/...) a PLACE
+    // argument still needs a clone so `a = reshape(a, ...); b = a[0]`
+    // compiles. A temporary has no name to survive the move, so cloning
+    // it only copies an array nobody can observe again
+    // (`np.sum(np.multiply(x, x))` — issue #200).
+    if ctx.3 {
+        return Ok(quote!(&(#tokens)));
+    }
     match expr {
         ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_) => {
             Ok(quote!((#tokens).clone()))
@@ -890,7 +918,8 @@ fn lower_numpy_call(
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let npc = (ctx, options, symbols);
+    let borrows = numpy_borrows_arrays(fname.strip_prefix("linalg.").unwrap_or(&fname));
+    let npc = (ctx, options, symbols, borrows);
     let fname = fname.to_string();
     // An unmodeled numpy SUBMODULE (`np.random.rand`) is refused before
     // anything tries to build a Rust path out of the dotted name — that
@@ -1241,7 +1270,7 @@ fn lower_numpy_call(
                 np_render(&args[1], &npc)?,
                 np_render(&args[2], &npc)?,
             );
-            Ok(quote!(numpy::where_(#c, #a, #b)?))
+            Ok(quote!(numpy::where_(&#c, &#a, &#b)?))
         }
 
         "concatenate" => {

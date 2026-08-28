@@ -6262,10 +6262,21 @@ fn numpy_fallible_calls_propagate_with_question_mark() {
         );
         assert!(out.contains(needle), "generated: {out}");
         assert!(
-            out.contains(&format!("{needle} ((")) && out.contains(") ?"),
+            out.contains(") ?"),
             "the fallible call must propagate: {out}"
         );
     }
+    // The borrow-set numpy calls pass BORROWED temporaries (`&(numpy ::
+    // zeros (...))`) — issue #220's zero-copy args — instead of cloning.
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    x = np.add(np.zeros(2), np.zeros(3))\n",
+        "npborrow.py",
+    );
+    assert!(
+        out.contains("numpy :: add (& (numpy :: zeros"),
+        "the array args must be borrowed: {out}"
+    );
+
     // An infallible one does NOT grow a stray `?`.
     let out = compile(
         "import numpy as np\ndef f() -> None:\n    x = np.sum(np.zeros(2))\n",
