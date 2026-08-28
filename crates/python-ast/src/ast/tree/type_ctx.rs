@@ -185,6 +185,39 @@ pub fn coerce_tokens(
         // only way to compile them at all, and the alternative (rustc
         // error) is no more informative.
         (TypeInfo::Int, TypeInfo::Float) => Some(quote!((#tokens) as f64)),
+        // Option<PyValue> → PyValue (issue #137 round 27): reading an
+        // OPTIONAL boxed field where the bare boxed value is wanted.
+        // Python's None IS `PyValue::None_`, so the empty case is not a
+        // loss of information — it is the same value spelled the other
+        // way. Placed before the general `_ → PyValue` arm, which would
+        // otherwise try `PyValue::from(Option<PyValue>)` and find no impl.
+        (TypeInfo::Option(inner), TypeInfo::PyValue)
+            if matches!(**inner, TypeInfo::PyValue) =>
+        {
+            Some(quote!((#tokens).unwrap_or(stdpython::PyValue::None_)))
+        }
+        // Option<T> → PyValue: the same, for a typed optional — the inner
+        // value boxes, and the empty case is Python's None.
+        (TypeInfo::Option(inner), TypeInfo::PyValue) => {
+            let inner_boxed = coerce_tokens(quote!(__rython_v), inner, &TypeInfo::PyValue)
+                .unwrap_or_else(|| quote!(PyValue::from(__rython_v)));
+            Some(quote!(
+                match (#tokens) {
+                    Some(__rython_v) => #inner_boxed,
+                    None => stdpython::PyValue::None_,
+                }
+            ))
+        }
+        // T → Option<U> (issue #137 round 27): a concrete value stored
+        // into an OPTIONAL slot. Round 23 gave fields an `Option<T>` type
+        // when a None store joined a typed one — the declare-then-fill
+        // idiom — but nothing taught the stores to wrap, so every one of
+        // them landed as a bare `T` against an `Option<T>` target. Wrapping
+        // is exact: Python's value is present, so `Some` is what it means.
+        (from_ty, TypeInfo::Option(inner)) if from_ty != &TypeInfo::PyValue => {
+            let coerced = coerce_tokens(tokens, from_ty, inner)?;
+            Some(quote!(Some(#coerced)))
+        }
         // Anything → PyValue (issue #121): a value stored into a boxed
         // union / Any slot wraps in PyValue::from (None via From<()>).
         (_, TypeInfo::PyValue) => Some(quote!(PyValue::from((#tokens)))),

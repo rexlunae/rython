@@ -11468,3 +11468,75 @@ fn a_read_synthesized_field_routes_through_its_accessor() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #137 round 26: dropping a read needs POSITIVE evidence of boxing.
+//
+// `receiver_is_pyvalue` accepts `TypeInfo::PyObject` as well as
+// `PyValue` — and `PyObject` is the inferrer's "no answer". Round 24
+// widened a drop on the back of that helper and discarded a live value:
+// a module global bound to `Klass()` printed `None` where CPython
+// printed `['kept']`. The signal is now `PyValue`/`PyValueMember` only,
+// which a concrete class can never be.
+// ---------------------------------------------------------------------
+
+const ROUND26: &str = concat!(
+    "from typing import Any\n",
+    "\n",
+    "class Klass:\n",
+    "    def __init__(self, n: int):\n",
+    "        self.count = n\n",
+    "\n",
+    "REC = Klass(7)\n",
+    "\n",
+    "def boxed_read(v: Any):\n",
+    "    return v.whatever\n",
+    "\n",
+    "def boxed_protocol(v: Any):\n",
+    "    return v.lower()\n",
+    "\n",
+    "def concrete_read():\n",
+    "    return REC.count\n",
+);
+
+#[test]
+fn a_positively_boxed_name_read_drops_loudly() {
+    let (out, warnings) = compile_with_warnings(ROUND26, "r26a.py");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("dynamic-attribute divergence") && w.contains("whatever")),
+        "the drop must be loud: {:?}",
+        warnings
+    );
+    assert!(
+        out.contains("fn boxed_read (v : stdpython :: PyValue)"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_concrete_class_global_read_is_never_dropped() {
+    // Round 24's exact counterexample. `REC = Klass()` infers
+    // TypeInfo::Class, so the positive signal cannot match it and the
+    // live value survives.
+    let out = compile(ROUND26, "r26b.py");
+    assert!(
+        out.contains("(* REC) . clone () . count"),
+        "the concrete read must survive: {}",
+        out
+    );
+}
+
+#[test]
+fn a_protocol_method_on_a_boxed_name_is_not_dropped() {
+    // `v.lower()` on a boxed value is real code the runtime forwards —
+    // dropping its callee would emit `PyValue::None_(...)` (E0618).
+    let out = compile(ROUND26, "r26c.py");
+    assert!(
+        out.contains("v . lower ()"),
+        "a protocol method must survive: {}",
+        out
+    );
+}
