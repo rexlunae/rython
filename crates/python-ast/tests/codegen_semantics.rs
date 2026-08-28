@@ -11232,9 +11232,14 @@ fn disagreeing_returns_still_box_rather_than_picking_a_winner() {
 
 #[test]
 fn an_untypeable_return_still_lowers_to_unit() {
-    // `sorted(xs)` has no inferred element type, so the inferrer has no
-    // answer — refused rather than guessed at.
-    let out = compile("def m(xs: list[int]):\n    return sorted(xs)\n", "retunk.py");
+    // A METHOD call has no inferred type — there is no Python-level
+    // method return table — so the inferrer has no answer and refuses
+    // rather than guessing at one.
+    //
+    // (This case used `sorted(xs)` until the iterator builtins learned to
+    // carry their element type; the assertion is about the refusal, so it
+    // moved to an expression that is still genuinely untypeable.)
+    let out = compile("def m(s: str):\n    return s.splitlines()\n", "retunk.py");
     assert!(
         out.contains("-> Result < () , PyException >"),
         "generated: {}",
