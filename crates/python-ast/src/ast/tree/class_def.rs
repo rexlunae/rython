@@ -821,6 +821,34 @@ impl ClassDef {
         })
     }
 
+    /// Whether `infer_fields` puts `attr` on THIS class's struct.
+    ///
+    /// `owns_field` scans STORES, which is only half of what makes a field.
+    /// The other half is round 23's external-base READ synthesis: an
+    /// attribute the class reads but never assigns, when its base is
+    /// external to the generated crate and unmodeled (urllib3's
+    /// `HTTPConnection(_HTTPConnection)` reading `self.port`). Those land
+    /// on the struct and in the trait's accessors exactly like stored
+    /// fields, so the accessor rewrite has to see them too — otherwise a
+    /// generic trait default reads the accessor METHOD as a value (E0615).
+    ///
+    /// This asks `infer_fields` rather than re-deriving its conditions.
+    /// A hand-copied gate is how the two field sets drift apart in the
+    /// first place: an earlier cut of this missed that `infer_fields`
+    /// yields nothing for a class with no `__init__`, and so claimed a
+    /// field the struct did not have — the same disagreement as the bug,
+    /// pointing the other way.
+    pub(crate) fn has_inferred_field(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> bool {
+        self.infer_fields(symbols, options)
+            .map(|fields| fields.iter().any(|(f, _)| f == attr))
+            .unwrap_or(false)
+    }
+
     /// Which class in the MRO chain owns the field `attr`: 0 for this class,
     /// 1 for its direct base, etc. None when no class in the chain assigns
     /// the field. `self.attr` where attr is owned by an ancestor resolves
@@ -834,10 +862,22 @@ impl ClassDef {
     /// depth-0 owner for a field the struct no longer has, making
     /// `self.n = n` in a subclass's own `__init__` write to a nonexistent
     /// field.
-    pub(crate) fn field_owner_depth(&self, attr: &str, symbols: &SymbolTableScopes) -> Option<usize> {
-        self.base_chain(symbols)
-            .iter()
-            .rposition(|c| c.owns_field(attr))
+    pub(crate) fn field_owner_depth(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Option<usize> {
+        // Ownership is STORES or the external-base read synthesis: both put
+        // the field on that class's struct and in its trait's accessors, so
+        // both have to answer here or the accessor rewrite misses one kind
+        // (issue #137 round 25). The synthesis can sit on an ANCESTOR —
+        // urllib3's HTTPSConnection reads `self.host`, which HTTPConnection
+        // synthesized from its own unmodeled stdlib base — so it is part of
+        // the chain walk, not a check on the receiver's class alone.
+        self.base_chain(symbols).iter().rposition(|c| {
+            c.owns_field(attr) || c.has_inferred_field(attr, symbols, options)
+        })
     }
 
     /// The class of the value stored in field `attr`, when the field holds
