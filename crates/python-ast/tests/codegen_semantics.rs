@@ -11351,3 +11351,62 @@ fn sorted_over_an_untyped_iterable_stays_untyped() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #223: a bare reference to a monomorphized function.
+//
+// Only the morphs (`f_str`, `f_any`, ...) and, when one can be planned,
+// the dynamic router carry the original name. With no router the bare
+// name resolved to nothing and the generated crate failed E0425 with
+// nothing pointing at the construct — silently different in the one way
+// that matters, an unexplained build break. It is a conversion error now.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_morph_reference_with_a_router_still_lowers() {
+    // The router exists here (both morphs return String), so the bare
+    // name resolves to it and passing the function as a value is fine.
+    let out = compile(
+        concat!(
+            "def f(x):\n",
+            "    if isinstance(x, str):\n",
+            "        return x\n",
+            "    return \"other\"\n",
+            "\n",
+            "def g(xs):\n",
+            "    return list(map(f, xs))\n",
+        ),
+        "morphok.py",
+    );
+    assert!(out.contains("map_fallible (f ,"), "generated: {}", out);
+}
+
+#[test]
+fn a_morph_reference_without_a_router_is_loud() {
+    // The residual morph returns a value built from its untyped
+    // parameter, so no morph return type derives and no router can be
+    // planned — the reference has nothing to resolve to.
+    let err = compile_err(
+        concat!(
+            "import functools\n",
+            "\n",
+            "@functools.singledispatch\n",
+            "def pick(value):\n",
+            "    return sorted(value)\n",
+            "\n",
+            "@pick.register(int)\n",
+            "def _(n):\n",
+            "    return [n]\n",
+            "\n",
+            "def use(xs):\n",
+            "    return list(map(pick, xs))\n",
+        ),
+        "morphbad.py",
+    );
+    assert!(
+        err.contains("is used as a value")
+            && err.contains("no dynamic router could be planned"),
+        "unexpected error: {}",
+        err
+    );
+}
