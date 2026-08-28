@@ -371,6 +371,15 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
+            // The ITERATOR builtins carry their argument's element type
+            // through (issue #222), so they are typed before the
+            // name-only table below, which cannot see arguments.
+            ExprType::Name(n)
+                if iterator_builtin_type(&n.id, call, options, symbols).is_some() =>
+            {
+                iterator_builtin_type(&n.id, call, options, symbols)
+                    .expect("just checked")
+            }
             ExprType::Name(n) => match builtin_call_type(&n.id) {
                 Some(t) => t,
                 None => match symbols.get(&n.id) {
@@ -422,6 +431,92 @@ fn infer_type_inner(
 /// previously kept byte-identical copies: len()/count() must agree with
 /// the `as i64` codegen emission everywhere, or an empty container pins
 /// to different element types on different paths.
+/// The element type an iterable expression yields, when it is knowable.
+/// Only the shapes whose element type is genuinely carried: a `Vec`, and
+/// a `range` (whose elements are Python ints). A string is deliberately
+/// absent — iterating one yields single-character strings, which is a
+/// different type from the receiver and not what any caller here wants.
+fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
+    match t {
+        TypeInfo::Vec(e) => Some((**e).clone()),
+        TypeInfo::Range => Some(TypeInfo::Int),
+        TypeInfo::Borrowed(inner) => iterable_element_type(inner),
+        _ => None,
+    }
+}
+
+/// The declared return type of a function referenced BY NAME (`map(double,
+/// xs)` — the `double`), resolved through the symbol table. Only an
+/// annotated module function answers; anything else leaves `map` untyped
+/// rather than guessing at the element type.
+fn named_fn_return_type(
+    e: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TypeInfo> {
+    let ExprType::Name(n) = e else { return None };
+    match symbols.get(&n.id) {
+        Some(SymbolTableNode::FunctionDef(f)) => {
+            resolve_alias_typeinfo(f.returns.as_deref()?, symbols, options)
+        }
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let path = i.resolved_module_path(options);
+            let (f, _) = crate::module_function_def(options, &path, &n.id)?;
+            resolve_alias_typeinfo(
+                f.returns.as_deref()?,
+                &module_symbols(options, &path),
+                options,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The ITERATOR builtins, typed from their arguments (issue #222).
+///
+/// Each rule mirrors what the lowering actually emits, not merely what
+/// Python means — the inferred type has to be the type of the rendered
+/// Rust expression or the signature and the body disagree:
+///
+/// - `sorted(xs)`   -> `stdpython::sorted(&[T]) -> Vec<T>`
+/// - `filter(f, xs)` -> `filter_fallible(f, Vec<T>) -> Result<Vec<T>, _>`
+/// - `map(f, xs)`   -> `map_fallible(f, Vec<T>) -> Result<Vec<U>, _>`
+/// - `list(x)`      -> `list(x) -> Vec<L::Item>`
+///
+/// `None` whenever the element type is not knowable — an untyped
+/// iterable, or a `map` over a callable this cannot resolve (a lambda, a
+/// bound method like `str.strip`). The caller then falls back to the
+/// name-only table, so `list` keeps its boxed-element answer.
+fn iterator_builtin_type(
+    name: &str,
+    call: &crate::Call,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TypeInfo> {
+    let elem_of = |e: &ExprType| iterable_element_type(&infer_type(e, options, symbols));
+    match name {
+        // sorted/filter preserve the element type; the iterable is the
+        // last positional argument (`sorted(xs)`, `filter(pred, xs)`).
+        "sorted" => Some(TypeInfo::Vec(Box::new(elem_of(call.args.first()?)?))),
+        "filter" | "list" | "reversed" => {
+            Some(TypeInfo::Vec(Box::new(elem_of(call.args.last()?)?)))
+        }
+        // map's element type is the CALLABLE's return type, not the
+        // iterable's. Two arguments only: `map(f, a, b)` lowers through
+        // map2 and is left to the name-only table.
+        "map" if call.args.len() == 2 => {
+            let f = call.args.first()?;
+            // The iterable must still be a real iterable — an untyped one
+            // means the lowering itself is on shaky ground.
+            elem_of(call.args.last()?)?;
+            Some(TypeInfo::Vec(Box::new(named_fn_return_type(
+                f, options, symbols,
+            )?)))
+        }
+        _ => None,
+    }
+}
+
 fn builtin_call_type(name: &str) -> Option<TypeInfo> {
     Some(match name {
         // len()/count() lower to `len(&x) as i64` — Python ints are i64
