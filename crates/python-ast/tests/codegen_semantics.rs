@@ -11315,6 +11315,36 @@ fn an_untypeable_return_still_lowers_to_unit() {
     );
 }
 
+#[test]
+fn a_chained_external_call_field_boxes_instead_of_failing() {
+    // urllib3's ZstdDecoder: `self._obj = zstd.ZstdDecompressor().
+    // decompressobj()` — a method call on a CALL RESULT whose chain root
+    // is an external module. The direct `mod.fn()` field shape had an
+    // external-boxing rule; the chained twin fell through to the loud
+    // "cannot infer a type" error and aborted the WHOLE urllib3
+    // conversion at response.py. The chain now boxes the same way, and
+    // the try/except fallback (`zstd = None` shadowing the aliased
+    // import) counts as external too.
+    let out = compile(
+        concat!(
+            "try:\n",
+            "    import zstandard as zstd\n",
+            "except (AttributeError, ImportError, ValueError):\n",
+            "    zstd = None\n",
+            "\n",
+            "class ZstdDecoder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._obj = zstd.ZstdDecompressor().decompressobj()\n",
+        ),
+        "extchainfield.py",
+    );
+    assert!(
+        out.contains("pub _obj : stdpython :: PyValue"),
+        "the chained external call must box the field: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // Issue #222, iterator builtins: sorted/filter/map/list carry their
 // argument's element type, so a function returning one gets a real
@@ -11405,6 +11435,154 @@ fn sorted_over_an_untyped_iterable_stays_untyped() {
     assert!(
         !out.contains("-> Result < Vec < i64 >"),
         "must not invent an element type: {}",
+        out
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #222, self-method and module-path call returns: an unannotated
+// method returning a call to another method of its own class
+// (`return self._retries()`), and a function returning a crate-module
+// function by path (`return helper.parse(s)`), both used to collapse to
+// `-> Result<(), PyException>` while the body emitted `Ok(call?)` —
+// rustc rejects that shape. The two rules sit at the END of the
+// resolution chain: they can only replace a unit signature, all returns
+// must agree, and unresolvable callees refuse rather than guess.
+// ---------------------------------------------------------------------
+
+#[test]
+fn returning_a_self_method_call_types_the_signature() {
+    // The callee is itself unannotated, so its own all-returns
+    // unification (`return 3` → int) types the caller — one level deep.
+    let out = compile(
+        concat!(
+            "class Retry:\n",
+            "    def _retries(self):\n",
+            "        return 3\n",
+            "\n",
+            "    def total(self):\n",
+            "        return self._retries()\n",
+        ),
+        "retselfcall.py",
+    );
+    assert!(
+        out.contains("fn total (& self ,) -> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_self_method_call_with_annotation_types_the_signature() {
+    // An annotated callee resolves through its annotation, alias-aware.
+    let out = compile(
+        concat!(
+            "class Retry:\n",
+            "    def _retries(self) -> int:\n",
+            "        return 3\n",
+            "\n",
+            "    def total(self):\n",
+            "        return self._retries()\n",
+        ),
+        "retselfann.py",
+    );
+    assert!(
+        out.contains("fn total (& self ,) -> Result < i64 , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_disagreeing_self_method_return_stays_unit() {
+    // Two returns naming different methods with different types refuse —
+    // the signature keeps its unit fallback rather than picking a winner.
+    let out = compile(
+        concat!(
+            "class C:\n",
+            "    def a(self) -> int:\n",
+            "        return 1\n",
+            "\n",
+            "    def b(self) -> str:\n",
+            "        return \"s\"\n",
+            "\n",
+            "    def pick(self, flag: int):\n",
+            "        if flag:\n",
+            "            return self.a()\n",
+            "        return self.b()\n",
+        ),
+        "retselfmix.py",
+    );
+    assert!(
+        out.contains("fn pick (& self , flag : i64) -> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_none_annotated_self_method_stays_unit() {
+    // A `-> None` callee's value is Python None — the unit signature is
+    // already the correct lowering, so the rule declines.
+    let out = compile(
+        concat!(
+            "class C:\n",
+            "    def reset(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    def run(self):\n",
+            "        return self.reset()\n",
+        ),
+        "retselfnone.py",
+    );
+    assert!(
+        out.contains("fn run (& self ,) -> Result < () , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_a_module_path_call_types_the_signature() {
+    // `from . import helper` then `return helper.parse(s)` — the callee's
+    // return annotation, resolved in its DEFINING module.
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["mainmod".to_string(), "helper".to_string()],
+        std::rc::Rc::new(
+            parse("def parse(s: str) -> str:\n    return s\n", "helper.py").unwrap(),
+        ),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        module_path: vec!["mainmod".to_string()],
+        this_module_path: vec!["mainmod".to_string()],
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        "from . import helper\n\ndef f(s: str):\n    return helper.parse(s)\n",
+        "retmodcall.py",
+        options,
+    )
+    .expect("module converts");
+    assert!(
+        out.contains("fn f (s : impl Into < String >) -> Result < String , PyException >"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn returning_an_unresolvable_module_path_call_stays_unit() {
+    // The receiver is not a crate module (json is stdpython's): the rule
+    // refuses rather than guessing at the runtime's return type.
+    let out = compile(
+        "import json\n\ndef f(s: str):\n    return json.loads(s)\n",
+        "retmodunk.py",
+    );
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "generated: {}",
         out
     );
 }

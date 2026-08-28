@@ -2070,7 +2070,7 @@ impl FunctionDef {
         // `Result<PyValue, _>` signature carried unwrapped `Ok(val)`
         // bodies — E0308 on the issue's flagify shape).
         options.fn_return_is_pyvalue = matches!(
-            self.resolved_return_type(&symbols, &options),
+            self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()),
             Some(ref ty) if ty.to_string() == "stdpython :: PyValue"
         ) || (self.returns.is_none()
             // A unified return exists whenever the collector ran — for a
@@ -2089,7 +2089,7 @@ impl FunctionDef {
             // params), resolved_return_type has no answer — box.
             || (self.returns.is_none()
                 && !inferred_signature.is_generic()
-                && self.resolved_return_type(&symbols, &options).is_none()
+                && self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()).is_none()
                 && literal_returns_need_boxing(&self.body));
 
         // Issue #125: thread narrowed-Option state through the body. After
@@ -2223,7 +2223,7 @@ impl FunctionDef {
                 quote!(-> Result<(), PyException>)
             }
         } else {
-            match self.resolved_return_type(&symbols, &options) {
+            match self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()) {
                 Some(ty) => quote!(-> Result<#ty, PyException>),
                 // Mixed literal returns (`return 1` / `return None` under
                 // annotated params) box to PyValue; the body statements
@@ -2319,7 +2319,7 @@ impl FunctionDef {
                     }
                 })
                 .collect();
-            let ret = match self.resolved_return_type(&symbols, &options) {
+            let ret = match self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()) {
                 Some(ty) => quote!(#ty),
                 None => quote!(()),
             };
@@ -3404,6 +3404,20 @@ impl FunctionDef {
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<TokenStream> {
+        self.resolved_return_type_in(symbols, options, None)
+    }
+
+    /// [`resolved_return_type`] with the ENCLOSING CLASS (issue #222): a
+    /// method whose returns are calls to other methods of its own class
+    /// (`return self._retries()`) can only be typed when the class is
+    /// known. Callers inside the lowering pass `ctx.enclosing_class_name()`;
+    /// class-less callers use the plain [`resolved_return_type`].
+    pub fn resolved_return_type_in(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+        self_class: Option<&str>,
+    ) -> Option<TokenStream> {
         // A bare `str` annotation is authoritative: the inferred type for a
         // literal-returning body (`&'static str`) is a Rust literal artifact,
         // not the Python type, and the mismatch breaks every call site
@@ -3502,6 +3516,132 @@ impl FunctionDef {
             .or(annotated)
             .or_else(|| self.boxed_list_return_type(symbols, options))
             .or_else(|| self.unified_return_type(symbols, options))
+            .or_else(|| self.module_path_call_return_type(symbols, options))
+            .or_else(|| self.self_method_call_return_type(self_class, symbols, options))
+    }
+
+    /// An unannotated function whose returns are all CALLS to a
+    /// crate-module function by path (`return helper.parse(s)` — issue
+    /// #222: the ~11 module-function-call sites in urllib3): the callee's
+    /// return annotation, resolved ALIAS-AWARE in its DEFINING module, so
+    /// the signature compiles against the body's `Ok(path::call(...)?)`.
+    /// Sits at the END of the chain — it can only replace a signature
+    /// that would otherwise be unit. All returns must name the same
+    /// type; an annotation that resolves to no answer (PyValue/Any) or a
+    /// `-> None` callee declines, never guesses.
+    fn module_path_call_return_type(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
+        if !guarantees_return(&self.body) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
+        if returns.is_empty() {
+            return None;
+        }
+        let mut unified: Option<TokenStream> = None;
+        for r in &returns {
+            let ExprType::Call(call) = r else {
+                return None;
+            };
+            let ExprType::Attribute(attr) = call.func.as_ref() else {
+                return None;
+            };
+            let ExprType::Name(recv) = attr.value.as_ref() else {
+                return None;
+            };
+            if recv.id == "self" {
+                return None;
+            }
+            let path = crate::ast::tree::call::module_path_of_chain(
+                &ExprType::Name(recv.clone()),
+                symbols,
+                options,
+            )?;
+            let (f, defining_symbols) =
+                crate::module_function_def(options, &path, &attr.attr)?;
+            let ann = f.returns.as_deref()?;
+            if crate::is_none_expr(ann) {
+                return None;
+            }
+            let ti = crate::resolve_alias_typeinfo(ann, &defining_symbols, options)?;
+            if !renderable_return_typeinfo(&ti) {
+                return None;
+            }
+            let ty = ti.to_rust_type();
+            match &unified {
+                None => unified = Some(ty),
+                Some(prev) if prev.to_string() == ty.to_string() => {}
+                _ => return None,
+            }
+        }
+        unified
+    }
+
+    /// An unannotated METHOD whose returns are all calls to methods of
+    /// its own class on `self` (`return self._retries()` — issue #222:
+    /// the ~8 self-method-call sites in urllib3): the callee method's
+    /// return annotation, or — when the callee is itself unannotated —
+    /// its own all-returns unification (ONE level deep; the recursion
+    /// never re-enters the self rules, so mutual recursion between
+    /// methods cannot spin). END of the chain; all returns must agree;
+    /// a `-> None` callee declines (the unit signature is already
+    /// correct for it).
+    fn self_method_call_return_type(
+        &self,
+        self_class: Option<&str>,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
+        if !guarantees_return(&self.body) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
+        if returns.is_empty() {
+            return None;
+        }
+        let class_name = self_class?;
+        let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name) else {
+            return None;
+        };
+        let mut unified: Option<TokenStream> = None;
+        for r in &returns {
+            let ExprType::Call(call) = r else {
+                return None;
+            };
+            let ExprType::Attribute(attr) = call.func.as_ref() else {
+                return None;
+            };
+            let ExprType::Name(recv) = attr.value.as_ref() else {
+                return None;
+            };
+            if recv.id != "self" {
+                return None;
+            }
+            let method = class.method_on_mro(&attr.attr, symbols)?;
+            let ty = if let Some(ann) = method.returns.as_deref() {
+                if crate::is_none_expr(ann) {
+                    return None;
+                }
+                let ti = crate::resolve_alias_typeinfo(ann, symbols, options)?;
+                if !renderable_return_typeinfo(&ti) {
+                    return None;
+                }
+                ti.to_rust_type()
+            } else {
+                method.unified_return_type(symbols, options)?
+            };
+            match &unified {
+                None => unified = Some(ty),
+                Some(prev) if prev.to_string() == ty.to_string() => {}
+                _ => return None,
+            }
+        }
+        unified
     }
 
     /// The `Vec<stdpython::PyValue>` return type for an unannotated

@@ -6793,3 +6793,75 @@ fn class_instance_global_with_list_field_builds_and_runs() {
         stderr
     );
 }
+
+#[test]
+fn self_method_and_module_call_returns_build_and_run() {
+    // Issue #222: an unannotated method returning a call to another
+    // method of its own class (`return self._retries()` — urllib3's
+    // Retry.total) used to collapse to `-> Result<(), PyException>`
+    // while the body emitted `Ok(self._retries()?)` — rustc rejects
+    // that shape. The return now derives from the callee method's own
+    // all-returns unification (one level deep). A sibling-module call
+    // (`helper.parse(s)`) derives from the callee's annotation in its
+    // DEFINING module — the same repro family, the module half.
+    // Output verified against CPython 3.11: "3" / "parsed:ok" / "7".
+    let scratch = Scratch::new("selfmethodret");
+    let pkg = scratch.path().join("app");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "from . import helper\n",
+            "\n",
+            "class Retry:\n",
+            "    def _retries(self):\n",
+            "        return 3\n",
+            "\n",
+            "    def total(self):\n",
+            "        return self._retries()\n",
+            "\n",
+            "def parse_wrap(s: str):\n",
+            "    return helper.parse(s)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    r = Retry()\n",
+            "    print(r.total())\n",
+            "    print(parse_wrap(\"ok\"))\n",
+            "    print(r._retries() + 4)\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("helper.py"),
+        concat!(
+            "def parse(s: str) -> str:\n",
+            "    return \"parsed:\" + s\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["3", "parsed:ok", "7"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

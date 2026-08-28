@@ -3930,6 +3930,58 @@ fn infer_field_type(
                 {
                     return Some(quote!(stdpython::PyValue));
                 }
+                // A method call on a CALL RESULT rooted in an external
+                // module (`zstd.ZstdDecompressor().decompressobj()` —
+                // urllib3's ZstdDecoder): the chain's root is a foreign
+                // module, so the intermediate result and the method's
+                // result are both foreign objects — a boxed PyValue.
+                // (The direct `mod.fn()` shape is the import_sym branch
+                // below; this is its CHAINED twin, whose receiver is a
+                // Call the dotted-key walk cannot follow.)
+                if let ExprType::Call(inner) = a.value.as_ref()
+                    && let Some(root) = crate::root_name(inner.func.as_ref())
+                    && let Some(sym) = symbols.get(root)
+                {
+                    // `import x as y` binds y as an ALIAS of the import —
+                    // follow it to the Import node (import.rs's
+                    // registration shape).
+                    let sym = match sym {
+                        SymbolTableNode::Alias(canonical) => {
+                            symbols.get(canonical).unwrap_or(sym)
+                        }
+                        other => other,
+                    };
+                    let external = match sym {
+                        SymbolTableNode::Import(i) => i
+                            .names
+                            .first()
+                            .map(|al| {
+                                al.name
+                                    .split('.')
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                            })
+                            .is_some_and(|path: Vec<String>| {
+                                !options.module_defs.contains_key(&path)
+                            }),
+                        SymbolTableNode::ImportFrom(i) => !options
+                            .module_defs
+                            .contains_key(&i.resolved_module_path(options)),
+                        // `try: import x except (...):: x = None` — the
+                        // Assign(None) fallback shadows the import (the
+                        // tuple-handler shape registers the store): the
+                        // chained call is still external.
+                        SymbolTableNode::Assign { value, .. }
+                            if crate::is_none_expr(value) =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if external {
+                        return Some(quote!(stdpython::PyValue));
+                    }
+                }
                 // A stdlib MODULE call (`zlib.decompressobj()`,
                 // `hashlib.md5()`, `brotli.Decompressor()`,
                 // `OpenSSL.SSL.Context(...)`) — a foreign object with no
