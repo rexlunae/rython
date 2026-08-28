@@ -690,7 +690,21 @@ pub fn render_typed(
     }
     let tokens = expr
         .clone()
-        .to_rust(ctx, options.clone(), symbols.clone())?;
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+    let tokens = match self_field_move_clone(expr, &ctx, &options, &symbols) {
+        // A self-field read of a clone-safe field in a MOVE position
+        // (every render_typed caller is one): clone out of the shared
+        // receiver — a bare read would move out of `&self` (E0507).
+        // Clone-safe = Copy scalars (no clone needed, excluded below),
+        // immutable values (String, Vec<u8>), or the boxed PyValue
+        // whose Arc shares dict/tuple members and value-copies the
+        // immutable scalars — Python reference semantics either way.
+        // MUTABLE containers (Vec<T>, PyDict, class instances) are NOT
+        // cloned: a clone would silently break aliasing, so the E0507
+        // stays loud (issue #79's discipline).
+        Some(clone) => clone,
+        None => tokens,
+    };
     let Some(expected) = expected else {
         return Ok(tokens);
     };
@@ -712,6 +726,43 @@ pub fn render_typed(
             Ok(tokens)
         }
     }
+}
+
+/// Whether `expr` is a `self.<field>` read whose field type is
+/// clone-safe (see [`render_typed`]): Copy scalars return None (no clone
+/// needed); immutable values and the Arc-sharing PyValue return the
+/// clone; mutable containers return None so the E0507 stays loud.
+pub(crate) fn self_field_move_clone(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TokenStream> {
+    let ExprType::Attribute(attr) = expr else {
+        return None;
+    };
+    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+        return None;
+    }
+    let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
+    let fields = class.infer_fields(&class_symbols, options).ok()?;
+    let ty = fields
+        .iter()
+        .find(|(name, _)| *name == attr.attr)
+        .map(|(_, ty)| ty.to_string())?;
+    let clone_safe = ty.contains("PyValue")
+        || ty.contains("String")
+        || ty.contains("Vec < u8 >")
+        || ty.contains("Vec<u8>")
+        || ty.contains("&'static str");
+    if !clone_safe {
+        return None;
+    }
+    let tokens = expr
+        .clone()
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+        .ok()?;
+    Some(quote!((#tokens).clone()))
 }
 
 /// Render an expression in a move-prone position (a call argument or a

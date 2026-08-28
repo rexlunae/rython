@@ -11906,3 +11906,62 @@ fn type_generic_arg_dunder_name_drops_loudly() {
         warnings
     );
 }
+
+// ---------------------------------------------------------------------
+// The #137 boxed-field-arg cluster: a PyValue-typed self-field read in a
+// MOVE position (a call argument, a boxed return) clones out of the
+// shared receiver — the wrap/binding would move out of `&self` (E0507).
+// PyValue's clone is the Arc-sharing reference copy, so it reproduces
+// Python's semantics; mutable containers are NOT cloned, keeping their
+// E0507 loud (issue #79's discipline).
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_pyvalue_self_field_argument_clones_out_of_self() {
+    let out = compile(
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Resp:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._fp: Any = b\"data\"\n",
+            "\n",
+            "    def check(self) -> bool:\n",
+            "        return is_open(self._fp)\n",
+            "\n",
+            "def is_open(x: Any) -> bool:\n",
+            "    return x is not None\n",
+        ),
+        "pyvaluearg.py",
+    );
+    assert!(
+        out.contains("(self . _fp) . clone ()"),
+        "the boxed field argument must clone out of &self: {}",
+        out
+    );
+}
+
+#[test]
+fn a_pyvalue_self_field_return_clones_out_of_self() {
+    // A function whose resolved return is PyValue wraps its returns; a
+    // PyValue self-field read is already boxed and the wrap would move —
+    // it clones instead (issue #137).
+    let out = compile(
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "class Resp:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._fp: Any = b\"data\"\n",
+            "\n",
+            "    def raw(self):\n",
+            "        return self._fp\n",
+        ),
+        "pyvalueret.py",
+    );
+    assert!(
+        out.contains("return Ok ((self . _fp) . clone ())"),
+        "the boxed field return must clone out of &self: {}",
+        out
+    );
+}

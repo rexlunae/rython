@@ -621,11 +621,23 @@ impl CodeGen for StatementType {
                     quote!(())
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns
-                    // (the identity From passes already-boxed values).
+                    // (the identity From passes already-boxed values). A
+                    // self-field read of a PyValue-typed field is already
+                    // boxed and cloning it is the Arc-sharing reference
+                    // copy (Python semantics) — the wrap would MOVE it out
+                    // of the shared receiver (E0507, issue #137).
                     let tokens = e
                         .clone()
                         .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    quote!(PyValue::from(#tokens))
+                    match crate::ast::tree::type_ctx::self_field_move_clone(
+                        &e.value,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    ) {
+                        Some(clone) => quote!(#clone),
+                        None => quote!(PyValue::from(#tokens)),
+                    }
                 } else {
                     let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
                     // A `-> str` function's return value must be an owned
