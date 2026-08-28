@@ -10838,3 +10838,107 @@ fn method_call_on_external_bound_name_drops_loudly() {
         warnings.borrow()
     );
 }
+
+/// Issue #137 round 23: an attribute FIRST assigned outside `__init__`
+/// is a real Python attribute — attributes are created on assignment,
+/// wherever that assignment lives — so it must become a struct field
+/// (urllib3's `self.sock = ...` in connect()).
+#[test]
+fn attribute_assigned_only_in_a_method_becomes_a_field() {
+    let out = compile(
+        "class Conn:\n    def __init__(self):\n        self.opened = False\n\n\
+         \x20   def connect(self) -> None:\n        self.tries = 3\n",
+        "methodattr.py",
+    );
+    assert!(
+        out.contains("pub tries : i64"),
+        "the method-assigned attribute must be a field: {}",
+        out
+    );
+}
+
+/// The whole-class JOIN: `self.x = None` in one method and a typed store
+/// in another describe ONE attribute that is a value OR None — exactly
+/// Rust's `Option<T>`. Typing it `T` breaks the None store; boxing it
+/// throws the type away.
+#[test]
+fn none_and_typed_stores_join_to_option() {
+    let out = compile(
+        "class Conn:\n    def __init__(self):\n        self.opened = False\n\n\
+         \x20   def connect(self) -> None:\n        self.count = 5\n\n\
+         \x20   def close(self) -> None:\n        self.count = None\n",
+        "joinattr.py",
+    );
+    assert!(
+        out.contains("pub count : Option < i64 >"),
+        "None plus a typed store must join to Option<T>: {}",
+        out
+    );
+}
+
+/// A declared annotation is a FIRST PREFERENCE that observed stores
+/// override: when every store agrees on a concrete type, what the class
+/// actually stores is the better evidence. An inconclusive join keeps
+/// the annotation.
+#[test]
+fn confident_stores_override_a_class_annotation() {
+    let out = compile(
+        "class Box:\n    payload: str\n\n\
+         \x20   def __init__(self):\n        self.ready = False\n\n\
+         \x20   def fill(self) -> None:\n        self.payload = 7\n",
+        "annoverride.py",
+    );
+    assert!(
+        out.contains("pub payload : i64"),
+        "the agreeing store must override the annotation: {}",
+        out
+    );
+}
+
+/// An attribute a class READS but never assigns, where the base is
+/// EXTERNAL (unmodeled), belongs to that base. It lowers to a BOXED
+/// field so the reads compile, and the degradation is LOUD — nothing
+/// populates it.
+#[test]
+fn unassigned_read_with_an_external_base_boxes_loudly() {
+    let (out, warnings) = compile_with_warnings(
+        "from http.client import HTTPConnection as _HTTPConnection\n\n\
+         class Conn(_HTTPConnection):\n    def __init__(self):\n        self.opened = False\n\n\
+         \x20   def describe(self) -> bool:\n        return self.sock\n",
+        "extbase.py",
+    );
+    assert!(
+        out.contains("pub sock : stdpython :: PyValue"),
+        "the external base's attribute must box: {}",
+        out
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("external-base divergence") && w.contains("sock")),
+        "the degradation must be loud: {:?}",
+        warnings
+    );
+}
+
+/// The boxed synthesis is gated on an UNMODELED base: with no base, a
+/// read of a never-assigned attribute is a genuine Python AttributeError
+/// and must NOT be papered over with a silently empty field.
+#[test]
+fn unassigned_read_without_a_base_is_not_synthesized() {
+    let out = compile(
+        "class Plain:\n    def __init__(self):\n        self.opened = False\n\n\
+         \x20   def describe(self) -> bool:\n        return self.opened\n",
+        "nobase.py",
+    );
+    assert!(
+        !out.contains("pub missing"),
+        "no base means no synthesis: {}",
+        out
+    );
+    assert!(
+        out.contains("pub opened : bool"),
+        "the real field still lands: {}",
+        out
+    );
+}

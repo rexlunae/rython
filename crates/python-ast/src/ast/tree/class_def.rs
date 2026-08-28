@@ -1483,6 +1483,193 @@ impl ClassDef {
                 }
             }
         }
+
+        // Issue #137 round 23: an attribute FIRST assigned OUTSIDE
+        // `__init__` (`self.sock = self._new_conn()` in urllib3's
+        // connect(), `self.proxy_is_verified = False` in its proxy path)
+        // is a real Python attribute — attributes are created on
+        // assignment, wherever that assignment lives — but only
+        // `__init__` was scanned, so the struct had no field and every
+        // read failed (E0609, 400 errors in urllib3's crate).
+        //
+        // Each other method contributes its stores, typed against its OWN
+        // locals: a sibling method's local sharing the name must never
+        // type this field. An uninferable value takes the boxed PyValue
+        // rather than failing the conversion — the value is genuinely
+        // unknown here, and the boxed reads/writes carry the existing
+        // dynamic divergences. `__init__` still wins every name it knows.
+        let mut method_field_stores: std::collections::BTreeMap<String, Vec<ObservedStore>> =
+            std::collections::BTreeMap::new();
+        for method in self.methods() {
+            if method.name == "__init__" {
+                continue;
+            }
+            let mut method_types: std::collections::HashMap<String, TokenStream> =
+                std::collections::HashMap::new();
+            crate::collect_local_types(&method.body, &mut method_types);
+            let mut method_stores = Vec::new();
+            collect_field_stores(&method.body, &mut method_stores);
+            for store in method_stores {
+                // A store to a PROPERTY name invokes the setter, not a
+                // field write (same contract as the __init__ pass).
+                if self.is_property_setter(&store.attr) {
+                    continue;
+                }
+                if fields.iter().any(|(name, _)| *name == store.attr) {
+                    continue;
+                }
+                // `self.last = self.value` — a store FROM another
+                // attribute carries that attribute's type. Without this
+                // the value reads as unknown and the new field boxes,
+                // colliding with the typed field it was copied from.
+                let from_sibling_field = match store.value {
+                    ExprType::Attribute(a)
+                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+                    {
+                        fields
+                            .iter()
+                            .find(|(f, _)| *f == a.attr)
+                            .map(|(_, t)| t.clone())
+                            .or_else(|| class_annotations.get(&a.attr).cloned())
+                    }
+                    _ => None,
+                };
+                let observed = if crate::is_none_expr(store.value) {
+                    // A `None` store is the DECLARE half of Python's
+                    // ubiquitous declare-then-fill idiom, not a type.
+                    ObservedStore::NoneLiteral
+                } else if let Some(t) = from_sibling_field {
+                    ObservedStore::Typed(t.to_string())
+                } else {
+                    match infer_field_type(
+                        store.value,
+                        &method_types,
+                        symbols,
+                        options,
+                        &self.name,
+                    ) {
+                        Some(t) => ObservedStore::Typed(t.to_string()),
+                        None => ObservedStore::Unknown,
+                    }
+                };
+                method_field_stores
+                    .entry(store.attr.clone())
+                    .or_default()
+                    .push(observed);
+            }
+        }
+
+        // JOIN each method-assigned attribute's stores into ONE field
+        // type. Python's `self.sock = None` in one method and `self.sock
+        // = self._new_conn()` in another describe a single attribute
+        // whose value is a socket OR None — `Option<Socket>` in Rust, and
+        // nothing else is correct: typing it `Socket` breaks the None
+        // store, typing it `PyValue` throws away the socket. Stores that
+        // disagree on a CONCRETE type, or any store whose value cannot be
+        // typed, fall back to the boxed value (the dynamic-attribute
+        // divergence) rather than picking one arbitrarily.
+        for (attr, observed) in method_field_stores {
+            if fields.iter().any(|(name, _)| *name == attr) {
+                continue;
+            }
+            let has_none = observed
+                .iter()
+                .any(|o| matches!(o, ObservedStore::NoneLiteral));
+            let any_unknown = observed
+                .iter()
+                .any(|o| matches!(o, ObservedStore::Unknown));
+            let mut concrete: Vec<&String> = observed
+                .iter()
+                .filter_map(|o| match o {
+                    ObservedStore::Typed(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            concrete.sort();
+            concrete.dedup();
+            // A confident join — every store agreed on one concrete
+            // type — WINS over a declared annotation: the annotation is a
+            // first preference, and what the class actually stores is the
+            // better evidence when the two disagree. An inconclusive join
+            // (no concrete store, disagreeing stores, or a value rython
+            // cannot read) falls back to the annotation, then to the
+            // boxed value.
+            let joined = match (any_unknown, concrete.as_slice()) {
+                (false, [only]) => {
+                    let parsed: TokenStream = only
+                        .parse()
+                        .unwrap_or_else(|_| quote!(stdpython::PyValue));
+                    // An already-optional type absorbs the None store.
+                    Some(if !has_none || only.starts_with("Option <") {
+                        parsed
+                    } else {
+                        quote!(Option<#parsed>)
+                    })
+                }
+                _ => None,
+            };
+            let ty = joined
+                .or_else(|| class_annotations.get(&attr).cloned())
+                .unwrap_or_else(|| quote!(stdpython::PyValue));
+            fields.push((attr, ty));
+        }
+
+        // An attribute this class READS but never assigns, with no
+        // annotation to declare it, belongs to a BASE rython does not
+        // model: urllib3's `HTTPConnection(http.client.HTTPConnection)`
+        // reads `self.host`, `self.port` and `self.timeout`, which the
+        // stdlib base owns. Python finds them on the base at runtime; the
+        // generated struct had no field at all, so every read failed to
+        // compile.
+        //
+        // They become BOXED fields — their shape is genuinely unknown
+        // here — and the degradation is LOUD: the -W channel records that
+        // the base is unmodeled, so nobody mistakes the boxed None for
+        // the value the real base would have supplied. Only classes with
+        // an UNMODELED base qualify: in a fully modeled hierarchy a read
+        // of a never-assigned attribute is a real AttributeError, and
+        // papering over it would be exactly the silent difference the
+        // project forbids.
+        let names_a_base = self.bases.iter().any(|b| {
+            matches!(b, ExprType::Name(n) if n.id != "object" && !is_metadata_base_name(&n.id))
+        });
+        if names_a_base && self.base_class_with_options(symbols, options).is_none() {
+            let mut reads = std::collections::BTreeSet::new();
+            for method in self.methods() {
+                collect_self_attr_reads(&method.body, &mut reads);
+            }
+            for name in reads {
+                if fields.iter().any(|(f, _)| *f == name) {
+                    continue;
+                }
+                // A dunder is the introspection protocol (`self.__class__`,
+                // `self.__name__`), not a data attribute; a method or
+                // property of this class is not a field either.
+                if name.starts_with("__") {
+                    continue;
+                }
+                if self.methods().any(|m| m.name == name) || self.is_property_setter(&name) {
+                    continue;
+                }
+                if let Some(ty) = class_annotations.get(&name) {
+                    fields.push((name, ty.clone()));
+                    continue;
+                }
+                let message = format!(
+                    "attribute `self.{}` of class `{}` is never assigned in the class: \
+                     it belongs to a base that is external to the generated crate and \
+                     is not modeled, so it lowers to a BOXED field that nothing \
+                     populates (the external-base divergence)",
+                    name, self.name
+                );
+                let mut warnings = options.definition_warnings.borrow_mut();
+                if !warnings.iter().any(|w| *w == message) {
+                    warnings.push(message);
+                }
+                drop(warnings);
+                fields.push((name, quote!(stdpython::PyValue)));
+            }
+        }
         Ok(fields)
     }
 
@@ -3561,6 +3748,28 @@ fn infer_field_type(
             {
                 Some(quote!(datetime::timedelta))
             }
+            // `self.sock = self._new_conn()` — a call to THIS class's own
+            // method (urllib3's connect()): the method's return
+            // annotation types the field, the same contract issue #123
+            // gave imported functions. Without it a method-assigned field
+            // falls back to the boxed PyValue and every typed use of it
+            // mismatches.
+            ExprType::Attribute(a)
+                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+            {
+                let Some(SymbolTableNode::ClassDef(cls)) = symbols.get(class_name) else {
+                    return None;
+                };
+                let method = cls.methods().find(|m| m.name == a.attr)?;
+                let ann = method.returns.as_deref()?;
+                if crate::is_none_expr(ann) {
+                    return None;
+                }
+                crate::python_annotation_to_rust_type(ann).or_else(|| {
+                    crate::resolve_alias_typeinfo(ann, symbols, options)
+                        .map(|t| t.to_rust_type())
+                })
+            }
             ExprType::Name(n) => match symbols.get(&n.id) {
                 Some(SymbolTableNode::ClassDef(_)) => {
                     let ident = crate::safe_ident(&n.id);
@@ -4709,5 +4918,173 @@ impl ClassDef {
         }
 
         formatted.join("\n")
+    }
+}
+
+/// One observed `self.x = ...` store, for the whole-class attribute JOIN
+/// (issue #137 round 23): a `None` literal declares the attribute without
+/// typing it, a typed value contributes its Rust type (compared by its
+/// rendered spelling), and a value whose shape rython cannot read forces
+/// the boxed fallback.
+#[derive(Debug)]
+enum ObservedStore {
+    NoneLiteral,
+    Typed(String),
+    Unknown,
+}
+
+/// Every `self.X` attribute READ in a body, recursing through control
+/// flow and nested expressions (issue #137 round 23). Used to find the
+/// attributes a class uses but never assigns — the ones its base owns.
+///
+/// Expression and statement shapes this does not model contribute
+/// NOTHING, deliberately: a missed read leaves the status quo (the
+/// attribute stays unknown and the generated crate fails loudly on it),
+/// which is always safer than synthesizing a field the class does not
+/// really have.
+fn collect_self_attr_reads(
+    body: &[Statement],
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    fn walk_expr(e: &ExprType, out: &mut std::collections::BTreeSet<String>) {
+        match e {
+            ExprType::Attribute(a) => {
+                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                    out.insert(a.attr.clone());
+                }
+                walk_expr(&a.value, out);
+            }
+            ExprType::Call(c) => {
+                walk_expr(&c.func, out);
+                for a in &c.args {
+                    walk_expr(a, out);
+                }
+                for kw in &c.keywords {
+                    walk_expr(&kw.value, out);
+                }
+            }
+            ExprType::BinOp(op) => {
+                walk_expr(&op.left, out);
+                walk_expr(&op.right, out);
+            }
+            ExprType::BoolOp(op) => {
+                for v in &op.values {
+                    walk_expr(v, out);
+                }
+            }
+            ExprType::UnaryOp(op) => walk_expr(&op.operand, out),
+            ExprType::Compare(cmp) => {
+                walk_expr(&cmp.left, out);
+                for c in &cmp.comparators {
+                    walk_expr(c, out);
+                }
+            }
+            ExprType::IfExp(e) => {
+                walk_expr(&e.test, out);
+                walk_expr(&e.body, out);
+                walk_expr(&e.orelse, out);
+            }
+            ExprType::NamedExpr(e) => walk_expr(&e.right, out),
+            ExprType::Dict(d) => {
+                for k in d.keys.iter().flatten() {
+                    walk_expr(k, out);
+                }
+                for v in &d.values {
+                    walk_expr(v, out);
+                }
+            }
+            ExprType::Set(s) => {
+                for e in &s.elts {
+                    walk_expr(e, out);
+                }
+            }
+            ExprType::List(elts) => {
+                for e in elts {
+                    walk_expr(e, out);
+                }
+            }
+            ExprType::Tuple(t) => {
+                for e in &t.elts {
+                    walk_expr(e, out);
+                }
+            }
+            ExprType::Subscript(sub) => {
+                walk_expr(&sub.value, out);
+                match &sub.kind {
+                    crate::SubscriptKind::Index(i) => walk_expr(i, out),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        for o in [lower, upper, step].into_iter().flatten() {
+                            walk_expr(o, out);
+                        }
+                    }
+                }
+            }
+            ExprType::Starred(s) => walk_expr(&s.value, out),
+            ExprType::Await(e) => walk_expr(&e.value, out),
+            ExprType::Yield(y) => {
+                if let Some(v) = &y.value {
+                    walk_expr(v, out);
+                }
+            }
+            ExprType::YieldFrom(y) => walk_expr(&y.value, out),
+            ExprType::FormattedValue(f) => walk_expr(&f.value, out),
+            ExprType::JoinedStr(j) => {
+                for v in &j.values {
+                    walk_expr(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in body {
+        match &stmt.statement {
+            StatementType::Expr(e) => walk_expr(&e.value, out),
+            StatementType::Call(c) => walk_expr(&ExprType::Call(c.clone()), out),
+            StatementType::Return(Some(e)) => walk_expr(&e.value, out),
+            StatementType::Assign(a) => {
+                walk_expr(&a.value, out);
+                for t in &a.targets {
+                    walk_expr(t, out);
+                }
+            }
+            StatementType::AugAssign(a) => {
+                walk_expr(&a.target, out);
+                walk_expr(&a.value, out);
+            }
+            StatementType::If(i) => {
+                walk_expr(&i.test, out);
+                collect_self_attr_reads(&i.body, out);
+                collect_self_attr_reads(&i.orelse, out);
+            }
+            StatementType::While(w) => {
+                walk_expr(&w.test, out);
+                collect_self_attr_reads(&w.body, out);
+                collect_self_attr_reads(&w.orelse, out);
+            }
+            StatementType::For(f) => {
+                walk_expr(&f.iter, out);
+                collect_self_attr_reads(&f.body, out);
+                collect_self_attr_reads(&f.orelse, out);
+            }
+            StatementType::AsyncFor(f) => {
+                walk_expr(&f.iter, out);
+                collect_self_attr_reads(&f.body, out);
+                collect_self_attr_reads(&f.orelse, out);
+            }
+            StatementType::With(w) => collect_self_attr_reads(&w.body, out),
+            StatementType::AsyncWith(w) => collect_self_attr_reads(&w.body, out),
+            StatementType::Try(t) => {
+                collect_self_attr_reads(&t.body, out);
+                for h in &t.handlers {
+                    collect_self_attr_reads(&h.body, out);
+                }
+                collect_self_attr_reads(&t.orelse, out);
+                collect_self_attr_reads(&t.finalbody, out);
+            }
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                collect_self_attr_reads(&f.body, out);
+            }
+            _ => {}
+        }
     }
 }
