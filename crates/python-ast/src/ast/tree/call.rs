@@ -1730,20 +1730,9 @@ impl<'a> CodeGen for Call {
         // value's own PROTOCOL surface stays exempt on name receivers —
         // is_*/as_*/py_* and the rewrite-table names the later pipeline
         // lowers (decode, encode, split, strip, ...) resolve normally.
-        let pyvalue_protocol_method = |name: &str| {
-            name.starts_with("is_")
-                || name.starts_with("as_")
-                || name.starts_with("py_")
-                || matches!(
-                    name,
-                    "decode" | "encode" | "into_bytes_like" | "clone" | "to_string"
-                        | "split" | "rsplit" | "strip" | "lstrip" | "rstrip" | "join"
-                        | "lower" | "upper" | "startswith" | "endswith" | "replace"
-                        | "format" | "count" | "find" | "group" | "items" | "keys"
-                        | "values" | "get" | "append" | "pop" | "read" | "readline"
-                        | "close" | "getvalue" | "write"
-                )
-        };
+        // One definition, shared with the read-side drop in attribute.rs.
+        let pyvalue_protocol_method =
+            crate::ast::tree::attribute::pyvalue_protocol_method;
         // A NAME receiver drops only on the PRECISE pattern: the name is
         // bound to a call into an EXTERNAL module, which lowered to the
         // boxed None (`conn = h2.connection.H2Connection(...)`, `log =
@@ -1773,7 +1762,20 @@ impl<'a> CodeGen for Call {
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && (matches!(attr.value.as_ref(), ExprType::Attribute(_))
                 || (!pyvalue_protocol_method(&attr.attr)
-                    && name_is_dropped_external_value(attr.value.as_ref())))
+                    && (name_is_dropped_external_value(attr.value.as_ref())
+                        // Issue #137 round 26: a POSITIVELY boxed name drops
+                        // the whole call here. It has to: the read-side drop
+                        // in attribute.rs now fires for such a receiver, so
+                        // leaving the call to render its callee through that
+                        // path would emit `PyValue::None_(...)` — a value
+                        // called as a function (E0618). The two sides share
+                        // one signal so they cannot disagree about what is
+                        // boxed.
+                        || crate::ast::tree::attribute::receiver_is_boxed_positively(
+                            attr.value.as_ref(),
+                            &symbols,
+                            &options,
+                        ))))
             && crate::ast::tree::attribute::receiver_is_pyvalue(
                 &attr.value,
                 &ctx,

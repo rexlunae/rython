@@ -331,6 +331,16 @@ impl<'a> CodeGen for Attribute {
         // Computed before `self.value`/`symbols` are moved below.
         let pyvalue_receiver = receiver_is_pyvalue(&self.value, &ctx, &symbols, &options);
         let receiver_is_field_chain = matches!(self.value.as_ref(), ExprType::Attribute(_));
+        // Issue #137 round 26: a plain NAME receiver drops too, but only on
+        // POSITIVE evidence of boxing — never on `TypeInfo::PyObject`, the
+        // inferrer's "no answer", which is what round 24 keyed on through
+        // `receiver_is_pyvalue` and why it discarded a live value.
+        //
+        // A protocol method is excluded: `b.lower()` on a boxed value is
+        // real code the runtime forwards, and this path renders the callee
+        // of such a call.
+        let positively_boxed_name = receiver_is_boxed_positively(&self.value, &symbols, &options)
+            && !pyvalue_protocol_method(&self.attr);
         // A PROPERTY GETTER read (`self.url` — urllib3's geturl, where url
         // is `@property def url`): the property lowers as a plain method
         // returning Result, so the read routes to the getter CALL and
@@ -464,7 +474,7 @@ impl<'a> CodeGen for Attribute {
             // qualify: a plain Name receiver may be a CALLEE being rendered
             // (`b.lower()` renders its func through this path), and its
             // dynamic protocol methods must not be boxed away.
-            if pyvalue_receiver && receiver_is_field_chain {
+            if pyvalue_receiver && (receiver_is_field_chain || positively_boxed_name) {
                 warnings.borrow_mut().push(format!(
                     "`{}.{}` is dropped: the receiver is a boxed PyValue \
                      (dynamic-attribute divergence)",
@@ -905,6 +915,60 @@ fn field_chain_ends_in_pyvalue(
 /// or a field chain ending at a PyValue-typed field. Attribute reads and
 /// method calls ON such a receiver have no static shape — the
 /// dynamic-attribute divergence.
+/// Methods that exist on `stdpython::PyValue` itself — the boxed value's
+/// own protocol (accessors, conversions) and the duck-typed method names
+/// the runtime forwards. A call to one of these on a boxed receiver is
+/// REAL code, not a dynamic-dispatch divergence, so it must never be
+/// dropped.
+///
+/// One definition, used by both the call-side drop (call.rs) and the
+/// read-side one below; they were separate copies, which is how the two
+/// sides drift apart.
+pub(crate) fn pyvalue_protocol_method(name: &str) -> bool {
+    name.starts_with("is_")
+        || name.starts_with("as_")
+        || name.starts_with("py_")
+        || matches!(
+            name,
+            "decode" | "encode" | "into_bytes_like" | "clone" | "to_string"
+                | "split" | "rsplit" | "strip" | "lstrip" | "rstrip" | "join"
+                | "lower" | "upper" | "startswith" | "endswith" | "replace"
+                | "format" | "count" | "find" | "group" | "items" | "keys"
+                | "values" | "get" | "append" | "pop" | "read" | "readline"
+                | "close" | "getvalue" | "write"
+        )
+}
+
+/// Whether a receiver is POSITIVELY boxed, as opposed to merely untyped.
+///
+/// `receiver_is_pyvalue` accepts `TypeInfo::PyObject` too, and `PyObject`
+/// is the inferrer's "no answer" — so that helper cannot tell a boxed
+/// value from one it failed to type. Round 24 widened a drop on the back
+/// of it and discarded a live value; the revert note recorded the rule
+/// this encodes: absence of evidence is not evidence of boxing.
+///
+/// `PyValue` is the boxed heterogeneous value (an `Any`/`object`/wide-union
+/// annotation, or a join that genuinely disagreed) and `PyValueMember` is
+/// that value narrowed by isinstance. Neither can be a concrete class: a
+/// module global bound to `Klass()` infers `TypeInfo::Class`, which is
+/// exactly the counterexample round 24 tripped over.
+pub(crate) fn receiver_is_boxed_positively(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Name(n) = expr else {
+        return false;
+    };
+    if n.id == "self" {
+        return false;
+    }
+    matches!(
+        crate::infer_type(expr, options, symbols),
+        crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
+    )
+}
+
 pub(crate) fn receiver_is_pyvalue(
     expr: &ExprType,
     ctx: &CodeGenContext,
