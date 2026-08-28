@@ -84,6 +84,52 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // `type(self).__name__` — the class name string for repr/error
+        // messages (urllib3's ConnectionPool/Retry/Timeout reprs). The
+        // `type(self)` call alone lowers to the name string (call.rs's
+        // type() rule), but this attribute READ on it would emit a
+        // dangling `.__name__` on a String (E0609); the whole expression
+        // IS the class name. `type(x).__name__` for a NON-self receiver
+        // routes through the boxed value's runtime type name
+        // (`PyValue::py_type_name` — "str"/"int"/... exactly Python's
+        // spelling), so urllib3's `type(x).__name__` TypeError messages
+        // carry CPython's text instead of an E0609.
+        if self.attr == "__name__"
+            && let ExprType::Call(call) = self.value.as_ref()
+            && matches!(call.func.as_ref(), ExprType::Name(n) if n.id == "type")
+            && call.args.len() == 1
+        {
+            if matches!(call.args.first(), Some(ExprType::Name(n)) if n.id == "self")
+                && let Some(enclosing) = ctx.enclosing_class_name()
+            {
+                let name = crate::safe_ident(enclosing);
+                return Ok(quote!(stringify!(#name).to_string()));
+            }
+            // The runtime path needs a CONCRETE argument: an inferred
+            // generic parameter would need a `PyValue: From<T>` bound
+            // this cannot add. Non-generic names and expressions only.
+            let arg = call.args.first().expect("len checked above");
+            let generic_param = matches!(arg, ExprType::Name(n)
+                if options.param_type_vars.contains_key(&n.id));
+            if generic_param {
+                options.definition_warnings.borrow_mut().push(
+                    "type(x).__name__ on an inferred generic parameter is dropped: \
+                     the boxed conversion needs a concrete type (the \
+                     class-as-value divergence)"
+                        .to_string(),
+                );
+                return Ok(quote!(stdpython::PyValue::None_));
+            }
+            let recv = arg
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            options.definition_warnings.borrow_mut().push(
+                "type(x).__name__ on a non-self receiver lowers through the boxed \
+                 value's runtime type name (the class-as-value divergence)"
+                    .to_string(),
+            );
+            return Ok(quote!(stdpython::py_value_type_name(&stdpython::PyValue::from(#recv)).to_string()));
+        }
         // Inheritance-aware field access, computed before `self.value` is
         // moved below: `self.name` where `name` is a base class's field, or
         // `dog.name` where `dog` is a derived-class instance, must reach

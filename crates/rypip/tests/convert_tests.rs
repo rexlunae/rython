@@ -6879,3 +6879,59 @@ fn self_method_and_module_call_returns_build_and_run() {
         stderr
     );
 }
+
+#[test]
+fn type_self_dunder_name_matches_cpython() {
+    // The #137 sweep's class-name repr family: `type(self).__name__` IS
+    // the class name string (urllib3's reprs), and `type(x).__name__` on
+    // a concrete receiver routes through the boxed value's runtime type
+    // name. Output verified against CPython 3.11: "Pool" / "int".
+    let scratch = Scratch::new("typename");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "class Pool:\n",
+            "    def __init__(self, host: str):\n",
+            "        self.host = host\n",
+            "\n",
+            "    def typename(self) -> str:\n",
+            "        return type(self).__name__\n",
+            "\n",
+            "def name_of(x: int) -> str:\n",
+            "    return type(x).__name__\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    p = Pool(\"example.com\")\n",
+            "    print(p.typename())\n",
+            "    print(name_of(3))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["Pool", "int"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

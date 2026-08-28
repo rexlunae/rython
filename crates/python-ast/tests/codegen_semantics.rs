@@ -11849,3 +11849,60 @@ fn a_protocol_method_on_a_boxed_name_is_not_dropped() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// `type(self).__name__` and `type(x).__name__` (the #137 sweep's
+// class-name repr family): the whole expression IS the class name. The
+// self receiver resolves statically; a concrete non-self receiver routes
+// through the boxed value's runtime type name (CPython's spelling); an
+// inferred GENERIC receiver drops loudly (no `PyValue: From<T>` bound
+// can be added here).
+// ---------------------------------------------------------------------
+
+#[test]
+fn type_self_dunder_name_is_the_class_name() {
+    let out = compile(
+        concat!(
+            "class Pool:\n",
+            "    def __init__(self, host: str):\n",
+            "        self.host = host\n",
+            "\n",
+            "    def typename(self) -> str:\n",
+            "        return type(self).__name__\n",
+        ),
+        "typename.py",
+    );
+    assert!(
+        out.contains("stringify ! (Pool) . to_string ()"),
+        "type(self).__name__ must be the class name string: {}",
+        out
+    );
+}
+
+#[test]
+fn type_concrete_arg_dunder_name_uses_the_runtime_type_name() {
+    let out = compile(
+        "def name_of(x: int) -> str:\n    return type(x).__name__\n",
+        "typenamearg.py",
+    );
+    assert!(
+        out.contains("py_value_type_name"),
+        "type(x).__name__ on a concrete receiver uses the runtime type name: {}",
+        out
+    );
+}
+
+#[test]
+fn type_generic_arg_dunder_name_drops_loudly() {
+    let (_, warnings) = compile_with_warnings(
+        "def name_of(x):\n    return type(x).__name__\n",
+        "typenamegen.py",
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("type(x).__name__ on an inferred generic parameter is dropped")),
+        "the generic receiver must warn: {:?}",
+        warnings
+    );
+}
