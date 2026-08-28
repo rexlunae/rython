@@ -365,8 +365,8 @@ Consequences, all enforced loudly:
 
 - `import math as m` (aliasing a runtime module) is a conversion error;
   `numpy` is the exception (it is a real path, so aliasing works).
-- `from typing import …` and `from functools import partial/lru_cache/cache`
-  lower to nothing.
+- `from typing import …` and `from functools import
+  partial/lru_cache/cache/singledispatch` lower to nothing.
 - Importing a module that neither the runtime nor an FFI manifest
   provides is **not** caught at conversion time: it lowers to a bare
   `use name;` and fails as a rustc resolution error in the generated
@@ -486,8 +486,11 @@ divergence).
 
 ### 6.3 Decorators
 
-The only supported decorators are `functools.lru_cache` (all spellings:
-bare, called, `maxsize=n`, `maxsize=None`) and `functools.cache`. Any
+The supported decorators are `functools.lru_cache` (all spellings:
+bare, called, `maxsize=n`, `maxsize=None`), `functools.cache`,
+`functools.singledispatch` with its `@<generic>.register(T)`
+specializations (§6.5), `classmethod`, `staticmethod`, `property` (and
+its `.setter`/`.getter`/`.deleter` spellings), and `dataclass`. Any
 other decorator — including multiple decorators — is a loud error:
 *"rython refuses to silently ignore it."*
 
@@ -503,6 +506,25 @@ available under `--no-std`.
 Supported over statically-known functions: lowers to a move closure
 binding the leading arguments. Keyword arguments, dynamic targets, and
 over-binding are loud errors.
+
+### 6.5 `functools.singledispatch`
+
+A `@functools.singledispatch` generic and its `@<generic>.register(T)`
+specializations are one FAMILY of definitions bound to one name. rython
+fuses the family into the single `isinstance`-dispatching function that
+expresses the same dispatch, and the monomorphizing specialization pass
+(§10.1's `isinstance` model, `ast::tree::specialize`) lowers that into
+one Rust function per registered type plus the `_any` residual, with a dynamic
+router where every morph derives a return type. Inside a morph the
+dispatch parameter is CONCRETE, so a `register(str)` body gets a real
+`String` — ordinary `str` methods, not method calls on a boxed value.
+
+Constraints, all loud: only `@<generic>.register(<type>)` with a single
+bare type name is read (the annotation-typed and two-argument forms are
+not); the generic and every specialization must live in one module; and
+each specialization must share the generic's positional signature.
+Dispatch is first-match in REGISTRATION order rather than CPython's MRO
+walk (§12.3).
 
 ---
 
@@ -1127,6 +1149,7 @@ accepted as permanent spec:
 | `np.dot` returns an ARRAY for the 1-D x 1-D case unless both operands are provably 1-D at conversion time, where numpy returns a scalar; the printed form is identical either way, so only arithmetic on the result differs | Model limit of one static type per expression (issue #206) |
 | numpy `RuntimeWarning`s (integer divide by zero, invalid value) are not emitted; the VALUES match numpy exactly | Model limit; no `warnings` machinery on the numpy path |
 | Verified stdlib divergences (json/defaultdict ordering, `math.remainder`, `strftime` edge cases, `glob` paths, `pathlib` edges, `string.Template`, …) | Tracked as defects in issue #82 |
+| `functools.singledispatch` picks the FIRST registered type the argument matches, not CPython's MRO walk; a registration on a base class followed by one on its subclass resolves to the base | Model limit (issue #181); disjoint concrete registrations — what real code writes — agree exactly |
 
 ---
 

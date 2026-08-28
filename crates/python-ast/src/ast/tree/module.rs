@@ -88,7 +88,14 @@ impl CodeGen for Module {
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let mut symbols = symbols;
         symbols.new_scope();
-        for s in self.raw.body {
+        // Issue #181: registration happens on the DESUGARED body, so the
+        // fused singledispatch generic (and not the `_`-named register
+        // definitions it absorbed) is what call sites resolve against. A
+        // family this pass refuses is left alone here; `to_rust` raises
+        // the conversion error.
+        let body = crate::ast::tree::singledispatch::desugar_module(self.raw.body.clone())
+            .unwrap_or(self.raw.body);
+        for s in body {
             symbols = s.clone().find_symbols(symbols);
         }
         symbols
@@ -112,6 +119,13 @@ impl CodeGen for Module {
         // connection.py). Fold before every body analysis below so store
         // counts, mutable-global detection, and emission all see the
         // branch that actually runs.
+        // Issue #181: fuse each `@functools.singledispatch` family into the
+        // one `isinstance`-dispatching function that expresses it, before
+        // any body analysis below — the shape the monomorphizing
+        // specialization pass already lowers (ast::tree::singledispatch).
+        self.raw.body = crate::ast::tree::singledispatch::desugar_module(self.raw.body)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
         let (folded_body, newly_live) = fold_static_import_trys(&self.raw.body, &options);
         self.raw.body = folded_body;
         // Handler statements the fold made live were invisible to

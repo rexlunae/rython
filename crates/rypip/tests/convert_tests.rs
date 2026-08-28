@@ -6677,3 +6677,59 @@ fn generic_sum_matches_python_at_runtime() {
         "sum() semantics diverged from CPython"
     );
 }
+
+#[test]
+fn singledispatch_dispatches_at_runtime_like_cpython() {
+    // Issue #181: `@functools.singledispatch` plus `@<generic>.register(T)`
+    // is fused into one isinstance-dispatching function, which the
+    // specialization pass monomorphizes. Each call site routes to the
+    // morph its argument's static type selects; the float falls through
+    // to the generic's own body. Output verified against CPython 3.11:
+    // "int 42" / "str HI" / "other 2.5".
+    let scratch = Scratch::new("singledispatch");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import functools\n",
+            "\n",
+            "@functools.singledispatch\n",
+            "def describe(value):\n",
+            "    return \"other \" + str(value)\n",
+            "\n",
+            "@describe.register(int)\n",
+            "def _(n):\n",
+            "    return \"int \" + str(n * 2)\n",
+            "\n",
+            "@describe.register(str)\n",
+            "def _(text):\n",
+            "    return \"str \" + text.upper()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(describe(21))\n",
+            "    print(describe(\"hi\"))\n",
+            "    print(describe(2.5))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["int 42", "str HI", "other 2.5"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

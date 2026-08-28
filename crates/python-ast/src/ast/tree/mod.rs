@@ -88,6 +88,9 @@ pub use dict::*;
 pub mod decorator;
 pub use decorator::*;
 
+pub mod singledispatch;
+pub use singledispatch::*;
+
 pub mod set;
 pub use set::*;
 

@@ -113,7 +113,14 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "starmap"
                 | "compress"
         ),
-        StdModule::Functools => matches!(name, "reduce" | "partial" | "lru_cache" | "cache"),
+        // singledispatch has no runtime item either, but it IS a known
+        // functools name: the decorator is handled at conversion time
+        // (issue #181), so the import drops silently below rather than
+        // warning about a missing runtime counterpart.
+        StdModule::Functools => matches!(
+            name,
+            "reduce" | "partial" | "lru_cache" | "cache" | "singledispatch"
+        ),
         StdModule::Hashlib => {
             matches!(name, "md5" | "sha1" | "sha256" | "sha512" | "new")
         }
@@ -999,13 +1006,17 @@ impl CodeGen for ImportFrom {
         let mut seen_traits: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for alias in self.names.iter() {
-            // functools.partial/lru_cache/cache have no runtime symbols:
-            // partial lowers to a closure at each call site, and the
-            // cache decorators rewrite the function definition itself,
-            // so the imports emit nothing (an uncalled bare reference is
-            // then a loud unresolved-name error).
+            // functools.partial/lru_cache/cache/singledispatch have no
+            // runtime symbols: partial lowers to a closure at each call
+            // site, and the cache and singledispatch decorators rewrite
+            // the function definitions themselves, so the imports emit
+            // nothing (an uncalled bare reference is then a loud
+            // unresolved-name error).
             if self.module == "functools"
-                && matches!(alias.name.as_str(), "partial" | "lru_cache" | "cache")
+                && matches!(
+                    alias.name.as_str(),
+                    "partial" | "lru_cache" | "cache" | "singledispatch"
+                )
             {
                 continue;
             }
