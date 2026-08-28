@@ -90,6 +90,34 @@ impl CodeGen for Name {
             let idents: Vec<_> = parts.iter().map(|part| crate::safe_ident(part)).collect();
             Ok(quote!(#(#idents)::*))
         } else {
+            // Issue #223: a bare reference to a MONOMORPHIZED function
+            // (`map(yield_lines, xs)` — the name as a value, not a call).
+            //
+            // Only the morphs (`f_str`, `f_any`, ...) and, when one could
+            // be planned, the dynamic router carry the original name. With
+            // no router there is nothing for this reference to resolve to,
+            // and emitting the bare ident produced a dangling name that
+            // surfaced as an unexplained E0425 in the generated crate.
+            // Fail here instead, naming the construct — the value-path twin
+            // of the guard call.rs raises for a call that cannot dispatch.
+            //
+            // A static CALL never reaches this: call.rs emits the mangled
+            // morph and returns before rendering the callee name.
+            if let Some(spec) = options.specialized_fns.get(&self.id)
+                && spec.router.is_none()
+            {
+                return Err(format!(
+                    "`{0}` is used as a value, but it is monomorphized over its \
+                     isinstance-dispatched parameter(s) and no dynamic router could \
+                     be planned for it (a morph's return type could not be derived, \
+                     or a non-axis parameter lacks a concrete annotation), so the \
+                     name exists only as its per-type morphs; annotate the \
+                     parameter(s) and return type, or call `{0}` directly rather \
+                     than passing it as a value",
+                    self.id
+                )
+                .into());
+            }
             let name = crate::safe_ident(&self.id);
             // Issue #125: a name narrowed by `if x is not None:` (or by an
             // if/else whose branches both leave x non-None) still holds an
