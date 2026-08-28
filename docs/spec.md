@@ -1125,6 +1125,11 @@ catchable `PyException`:
 - `in` on a boxed value whose member is not a container (`1 in boxed_int`),
   or a non-str probe on the boxed str member — CPython 3.11's TypeError
   text, but a panic (the boxed-value iteration precedent).
+- Access THROUGH an `Option`-typed receiver (`self.timeout.
+  connect_timeout()` where the field is `Timeout | None`) unwraps the
+  Option — CPython's AttributeError on a None receiver, but a panic with
+  CPython's message. Guarded access (`if x is not None:`) is unaffected:
+  the unwrap only fires if the guard lied.
 - numpy shape mismatches through the OPERATOR spelling (`a + b` on
   arrays of different shapes). The function spelling `np.add(a, b)`
   raises a catchable `ValueError`; the operator traits have no fallible
