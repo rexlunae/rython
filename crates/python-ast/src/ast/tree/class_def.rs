@@ -1518,10 +1518,28 @@ impl ClassDef {
                 if fields.iter().any(|(name, _)| *name == store.attr) {
                     continue;
                 }
+                // `self.last = self.value` — a store FROM another
+                // attribute carries that attribute's type. Without this
+                // the value reads as unknown and the new field boxes,
+                // colliding with the typed field it was copied from.
+                let from_sibling_field = match store.value {
+                    ExprType::Attribute(a)
+                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+                    {
+                        fields
+                            .iter()
+                            .find(|(f, _)| *f == a.attr)
+                            .map(|(_, t)| t.clone())
+                            .or_else(|| class_annotations.get(&a.attr).cloned())
+                    }
+                    _ => None,
+                };
                 let observed = if crate::is_none_expr(store.value) {
                     // A `None` store is the DECLARE half of Python's
                     // ubiquitous declare-then-fill idiom, not a type.
                     ObservedStore::NoneLiteral
+                } else if let Some(t) = from_sibling_field {
+                    ObservedStore::Typed(t.to_string())
                 } else {
                     match infer_field_type(
                         store.value,
