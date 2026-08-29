@@ -776,6 +776,15 @@ String, list, dict, and set methods cover the CPython surface for the
 supported types, pinned to CPython edge cases (code-point `len`,
 Unicode-correct `capitalize`/`title` titlecasing, Python's whitespace
 and `splitlines` boundary sets, `str`/`repr` quoting and escapes).
+Old-style `%`-formatting works on `str` and `bytes` (round 34): the
+full conversion set (`%s %r %a %d %i %u %o %x %X %e %E %f %g %G %c %b`
+and `%%`), flags/width/precision incl. `*`, the `%(name)s` mapping form
+with a dict RHS, and CPython's exact TypeErrors/ValueErrors for bad
+codes, wrong value kinds, and argument-count mismatches — pinned to
+CPython transcripts. `str(x)`/`print(x)`/f-string `{x}` on a class
+INSTANCE route through the class's `__str__` (falling back to
+`__repr__`, then the default object repr; §12.3 notes the dropped
+address).
 Deliberate hole: **sets have no `repr`** — printing a set would expose
 unordered iteration, so it is a compile error rather than
 nondeterministic output.
@@ -1190,6 +1199,8 @@ accepted as permanent spec:
 | `functools.singledispatch` picks the FIRST registered type the argument matches, not CPython's MRO walk; a registration on a base class followed by one on its subclass resolves to the base | Model limit (issue #181); disjoint concrete registrations — what real code writes — agree exactly |
 | A CLASS NAME in value position lowers to its NAME STRING (`[ChecksumError]` → `vec!["ChecksumError".to_string()]`; `pool_classes_by_scheme` → `PyDict<String, String>`) — the class object's only runtime-relevant data, since exceptions are string-tagged; identity comparisons of class values compare names, and a dynamic `except <boxed value>:` matches the strings | Model limit (issue #137 round 33); the class's runtime attributes and hierarchy beyond exact-name matching are unmodeled, and a call THROUGH an indirect class value (`pool_cls(...)` read from the dict) fails in rustc (§12.1) |
 | A `type(x).__name__` on a non-`self` receiver lowers through the boxed value's runtime type name, and on an inferred generic parameter is dropped as the boxed None | Model limit; `type(self).__name__` is exact |
+| The default object repr of a class instance (`str(x)` without `__str__`/`__repr__`) prints `<module.ClassName object>` — CPython appends `at 0x…`, a nondeterministic address (CPython's own output varies run to run) that rython cannot model | Model limit (round 34); a `__str__`/`__repr__` that raises aborts loudly (the §12.2 raise-in-infallible family), and a class whose `__str__` uses `type(self).__name__` shows the defining class's name |
+| Old-style `%`-formatting of a DICT as a positional value (`"%s" % {...}`) raises "not enough arguments" instead of CPython's dict repr — the mapping form (`%(name)s`) is exact | Model limit (round 34); positional-vs-mapping mixing follows CPython's rejection |
 
 ---
 

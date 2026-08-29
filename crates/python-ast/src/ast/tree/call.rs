@@ -3263,9 +3263,39 @@ impl<'a> CodeGen for Call {
                         }
                         match (rendered.len(), encoding) {
                             // str(x): the runtime str() (PyToString bound —
-                            // works for generic inferred params).
+                            // works for generic inferred params), EXCEPT a
+                            // class instance, Option, or boxed value, whose
+                            // str() is Python's DISPLAY (__str__/__repr__/
+                            // the object repr — round 34): those route
+                            // through py_display.
                             (1, None) => {
                                 let a = &rendered[0];
+                                // A GENERIC parameter keeps the runtime
+                                // str() (PyToString bound — the generic
+                                // machinery adds it); a concrete class
+                                // instance, Option, or boxed value routes
+                                // through py_display (round 34).
+                                let generic = matches!(
+                                    &self.args[0],
+                                    crate::ExprType::Name(n)
+                                        if options.param_type_vars.contains_key(&n.id)
+                                );
+                                if !generic
+                                    && matches!(
+                                        crate::infer_type(
+                                            &self.args[0],
+                                            &options,
+                                            &symbols
+                                        ),
+                                        crate::TypeInfo::Class(_)
+                                            | crate::TypeInfo::Option(_)
+                                            | crate::TypeInfo::PyValue
+                                            | crate::TypeInfo::PyValueMember(_)
+                                            | crate::TypeInfo::PyObject
+                                    )
+                                {
+                                    return Ok(quote!(py_display(&(#a))));
+                                }
                                 return Ok(quote!(str(#a)));
                             }
                             // str(bytes, encoding=...) — decode the bytes

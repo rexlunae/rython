@@ -7358,3 +7358,135 @@ fn class_values_extend_and_dynamic_except_match_cpython() {
         stderr
     );
 }
+
+#[test]
+fn class_instance_display_matches_cpython() {
+    // Round 34's display cluster: str(x)/print(x)/f-string `{x}` on a
+    // class INSTANCE route through py_display — the class's __str__
+    // (falling back to __repr__, then the default object repr). The
+    // default repr drops the nondeterministic address CPython prints
+    // (documented §12.3 divergence; CPython's own output varies run to
+    // run) and the module prefix for the crate root. Output verified
+    // against CPython: Pool(host='x') / <... object> / fstring=Pool(...)
+    // / a message containing str(pool).
+    let scratch = Scratch::new("classdisp");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "class PoolError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, host: str):\n",
+            "        self._host = host\n",
+            "\n",
+            "    def __str__(self) -> str:\n",
+            "        return f\"Pool(host={self._host!r})\"\n",
+            "\n",
+            "class RawConnection:\n",
+            "    def __init__(self):\n",
+            "        self._x = 1\n",
+            "\n",
+            "def boom():\n",
+            "    raise PoolError(Pool(\"example.com\"), \"Pool is closed.\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(Pool(\"x\"))\n",
+            "    print(str(RawConnection()))\n",
+            "    print(f\"fstring={Pool('y')}\")\n",
+            "    try:\n",
+            "        boom()\n",
+            "    except PoolError as e:\n",
+            "        print(str(e))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "Pool(host='x')", "stdout: {}", stdout);
+    assert!(
+        lines[1].starts_with('<') && lines[1].contains("RawConnection object"),
+        "default repr: {}",
+        stdout
+    );
+    assert_eq!(lines[2], "fstring=Pool(host='y')", "stdout: {}", stdout);
+    assert!(
+        lines[3].contains("Pool(host='example.com')"),
+        "the __str__ must be honored inside the message: {}",
+        stdout
+    );
+}
+
+#[test]
+fn percent_formatting_matches_cpython_end_to_end() {
+    // Round 34's %-operator cluster: `b"%x\r\n%b\r\n" % (len, chunk)`
+    // (urllib3's chunked framing), a 3-arity str `%` building a regex,
+    // and the %r mapping. Output verified against CPython.
+    let scratch = Scratch::new("pctfmt");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "def frame(chunk: bytes) -> bytes:\n",
+            "    return b\"%x\\r\\n%b\\r\\n\" % (len(chunk), chunk)\n",
+            "\n",
+            "def pat(name: str, host: str) -> str:\n",
+            "    return \"^(%s|%s)(?::0*?(|0|[1-9][0-9]{0,4}))?$\" % (name, host)\n",
+            "\n",
+            "def hostline(hostname: str) -> str:\n",
+            "    return \"hostname %r doesn't match\" % (hostname,)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(frame(b\"hello\"))\n",
+            "    print(pat(\"x\", \"y\"))\n",
+            "    print(hostline(\"example.com\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "b'5\\r\\nhello\\r\\n'",
+            "^(x|y)(?::0*?(|0|[1-9][0-9]{0,4}))?$",
+            "hostname 'example.com' doesn't match",
+        ],
+        "stdout: {}",
+        stdout
+    );
+}

@@ -84,6 +84,11 @@ pub(crate) mod flt {
     pub(crate) fn abs(x: f64) -> f64 { libm::fabs(x) }
 
     #[cfg(feature = "std")]
+    pub(crate) fn log10(x: f64) -> f64 { x.log10() }
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn log10(x: f64) -> f64 { libm::log10(x) }
+
+    #[cfg(feature = "std")]
     pub(crate) fn signum(x: f64) -> f64 { x.signum() }
     #[cfg(not(feature = "std"))]
     pub(crate) fn signum(x: f64) -> f64 {
@@ -276,6 +281,12 @@ impl PyDisplay for String {
 }
 
 impl<T: PyDisplay + ?Sized> PyDisplay for &T {
+    fn py_display(&self) -> String {
+        (**self).py_display()
+    }
+}
+
+impl<T: PyDisplay + ?Sized> PyDisplay for &mut T {
     fn py_display(&self) -> String {
         (**self).py_display()
     }
@@ -788,6 +799,30 @@ impl PyMod<i64> for i64 {
     }
 }
 
+// Old-style %-formatting on str and bytes (round 34): the `%` operator
+// with a str/bytes LHS and a single value or tuple RHS is Python's
+// printf formatting (percent_format.rs), not modulo.
+impl<R: crate::percent_format::PyFormatRhs> PyMod<R> for &str {
+    type Output = String;
+    fn py_mod(&self, rhs: &R) -> Result<String, PyException> {
+        crate::percent_format::py_format_str(self.as_bytes(), rhs)
+    }
+}
+
+impl<R: crate::percent_format::PyFormatRhs> PyMod<R> for String {
+    type Output = String;
+    fn py_mod(&self, rhs: &R) -> Result<String, PyException> {
+        crate::percent_format::py_format_str(self.as_bytes(), rhs)
+    }
+}
+
+impl<R: crate::percent_format::PyFormatRhs> PyMod<R> for Vec<u8> {
+    type Output = Vec<u8>;
+    fn py_mod(&self, rhs: &R) -> Result<Vec<u8>, PyException> {
+        crate::percent_format::py_format_bytes(self, rhs)
+    }
+}
+
 impl PyMod<f64> for f64 {
     type Output = f64;
     fn py_mod(&self, rhs: &f64) -> Result<f64, PyException> {
@@ -922,6 +957,8 @@ pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
 pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_div(&b)
 }
+
+
 
 /// Python `@` (matrix multiplication): routes to the numpy linalg backend
 /// for arrays.
@@ -5810,6 +5847,7 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 // ============================================================================
 
 mod builtin_exceptions;
+mod percent_format;
 
 /// Python Standard Library modules
 pub mod stdlib;
@@ -6797,5 +6835,139 @@ pub fn py_extend_values(out: &mut Vec<PyValue>, value: &PyValue) -> Result<(), P
                 other.py_type_name()
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod percent_format_tests {
+    use super::*;
+
+    fn s(fmt: &str, rhs: impl crate::percent_format::PyFormatRhs) -> String {
+        fmt.py_mod(&rhs).unwrap()
+    }
+    fn b(fmt: &[u8], rhs: impl crate::percent_format::PyFormatRhs) -> Vec<u8> {
+        fmt.to_vec().py_mod(&rhs).unwrap()
+    }
+
+    /// The old-style %-operator, pinned against CPython 3.14 (the
+    /// reference transcript is in the literals below — every one was
+    /// produced by running the expression under python3).
+    #[test]
+    fn percent_formatting_matches_cpython() {
+        assert_eq!(s("%s %s", ("a", "b")), "a b");
+        assert_eq!(s("%d", 42), "42");
+        assert_eq!(s("%d", -7), "-7");
+        assert_eq!(s("%x", 255), "ff");
+        assert_eq!(s("%X", 255), "FF");
+        assert_eq!(s("%o", 8), "10");
+        assert_eq!(s("%05d", 42), "00042");
+        assert_eq!(s("%5d", 42), "   42");
+        assert_eq!(s("%-5d", 42), "42   ");
+        assert_eq!(s("%+d", 42), "+42");
+        assert_eq!(s("% d", 42), " 42");
+        assert_eq!(s("%.2f", 3.14159), "3.14");
+        assert_eq!(s("%f", 2.5), "2.500000");
+        assert_eq!(s("%e", 5000.0), "5.000000e+03");
+        assert_eq!(s("%E", 5000.0), "5.000000E+03");
+        assert_eq!(s("%g", 0.00001), "1e-05");
+        assert_eq!(s("%g", 1234.5), "1234.5");
+        assert_eq!(s("%r", "hi"), "'hi'");
+        assert_eq!(s("%c", 65), "A");
+        assert_eq!(s("%%", ()), "%");
+        assert_eq!(s("100%%", ()), "100%");
+        assert_eq!(s("%s", Option::<String>::None), "None");
+        assert_eq!(s("%d", 3.9), "3");
+        assert_eq!(s("%10s", "ab"), "        ab");
+        assert_eq!(s("%.3s", "abcdef"), "abc");
+        assert_eq!(s("%#x", 255), "0xff");
+        assert_eq!(s("%#o", 8), "0o10");
+        assert_eq!(s("%5.1f", 3.14159), "  3.1");
+        assert_eq!(s("%-8s", "ab"), "ab      ");
+        assert_eq!(s("%08.2f", 3.14159), "00003.14");
+        assert_eq!(s("%g", 100.0), "100");
+        assert_eq!(s("%g", 0.0001), "0.0001");
+        assert_eq!(s("%g", 12345678.0), "1.23457e+07");
+        assert_eq!(s("%.0f", 2.7), "3");
+        assert_eq!(s("%+d", -5), "-5");
+        assert_eq!(s("%d", 2i64.pow(40)), "1099511627776");
+        assert_eq!(s("%x", -255), "-ff");
+        assert_eq!(s("%s", 3.5), "3.5");
+        assert_eq!(s("%s", true), "True");
+        assert_eq!(s("%r", true), "True");
+        assert_eq!(s("%r", 3.14), "3.14");
+        assert_eq!(s("%r", Option::<String>::None), "None");
+        assert_eq!(s("%s", b"bytes".to_vec()), "b'bytes'");
+        assert_eq!(s("%r", b"bytes".to_vec()), "b'bytes'");
+        assert_eq!(s("%10.3s", "abcdefgh"), "       abc");
+        assert_eq!(s("%*s", (10i64, "ab")), "        ab");
+        assert_eq!(s("%.*f", (2i64, 3.14159)), "3.14");
+        assert_eq!(s("%s", (1i64,)), "1");
+        assert_eq!(s("%d", (5i64,)), "5");
+
+        // The mapping form: %(name)s addresses a dict RHS (CPython
+        // verified — url.py's `_IPV6_PAT` built from `x % _subs`).
+        #[cfg(feature = "std")]
+        {
+            let m: crate::PyDict<String, i64> = crate::PyDict::from([("a".to_string(), 1)]);
+            assert_eq!(s("%(a)s", m.clone()), "1");
+            let m: crate::PyDict<String, i64> = crate::PyDict::from([("a".to_string(), 255)]);
+            assert_eq!(s("%(a)d", m.clone()), "255");
+            assert_eq!(s("%%(a)s", crate::PyDict::<String, i64>::new()), "%(a)s");
+
+            let e = "%(missing)s"
+                .to_string()
+                .py_mod(&crate::PyDict::<String, i64>::new())
+                .unwrap_err();
+            assert_eq!(e.exception_type, "KeyError");
+            assert_eq!(e.message, "missing");
+            let e = "%(a)s".to_string().py_mod(&(1i64,)).unwrap_err();
+            assert_eq!(e.exception_type, "TypeError");
+            assert!(e.message.contains("format requires a mapping"), "{}", e.message);
+        }
+
+        assert_eq!(b(b"%x", 255), b"ff");
+        assert_eq!(b(b"%b", b"data".to_vec()), b"data");
+        assert_eq!(b(b"%d", 5), b"5");
+        assert_eq!(b(b"(%s)", b"x".to_vec()), b"(x)");
+    }
+
+    /// The loud failures match CPython's typed errors.
+    #[test]
+    fn percent_formatting_errors_match_cpython() {
+        let e = "%b".to_string().py_mod(&b"x".to_vec()).unwrap_err();
+        assert_eq!(e.exception_type, "ValueError");
+        assert!(
+            e.message.contains("unsupported format character 'b'"),
+            "{}",
+            e.message
+        );
+        let e = "%d".to_string().py_mod(&"x").unwrap_err();
+        assert_eq!(e.exception_type, "TypeError");
+        assert!(
+            e.message.contains("a real number is required, not str"),
+            "{}",
+            e.message
+        );
+        let e = "%q".to_string().py_mod(&1i64).unwrap_err();
+        assert_eq!(e.exception_type, "ValueError");
+        assert!(
+            e.message.contains("unsupported format character 'q'"),
+            "{}",
+            e.message
+        );
+        let e = "%s %s".to_string().py_mod(&("a",)).unwrap_err();
+        assert_eq!(e.exception_type, "TypeError");
+        assert!(
+            e.message.contains("not enough arguments for format string"),
+            "{}",
+            e.message
+        );
+        let e = "%s".to_string().py_mod(&(1i64, 2i64)).unwrap_err();
+        assert_eq!(e.exception_type, "TypeError");
+        assert!(
+            e.message.contains("not all arguments converted during string formatting"),
+            "{}",
+            e.message
+        );
     }
 }
