@@ -3091,6 +3091,48 @@ impl CodeGen for ClassDef {
             quote!()
         };
 
+        // str(x)/print(x)/f-string `{x}` on a class INSTANCE route
+        // through py_display (Python's str, not Rust's Display — round
+        // 34's display cluster). CPython's str() calls __str__ (falling
+        // back to __repr__ when only that is defined), then the default
+        // object repr `<module.ClassName object at 0x...>` — the address
+        // is nondeterministic (CPython's own output varies run to run),
+        // so the repr drops it (§12.3 cosmetic divergence). A
+        // __str__/__repr__ that raises becomes a loud abort (the §12.2
+        // raise-in-infallible divergence — the display surface is
+        // infallible, like len()).
+        let display_impl = if options.with_std_python && !is_exception_class(&self) {
+            let defines_dunder = |name: &str| -> bool {
+                self.methods().any(|m| m.name == name)
+                    || self
+                        .base_chain(&symbols)
+                        .iter()
+                        .any(|a| a.methods().any(|m| m.name == name))
+            };
+            let display_expr = if defines_dunder("__str__") {
+                quote!(self.__str__().unwrap_or_else(|e| panic!("{}", e)))
+            } else if defines_dunder("__repr__") {
+                quote!(self.__repr__().unwrap_or_else(|e| panic!("{}", e)))
+            } else {
+                let module = options.module_path.join(".");
+                let class_display = if module.is_empty() {
+                    self.name.clone()
+                } else {
+                    format!("{module}.{}", self.name)
+                };
+                quote!(format!("<{} object>", #class_display))
+            };
+            quote! {
+                impl stdpython::PyDisplay for #class_name {
+                    fn py_display(&self) -> String {
+                        #display_expr
+                    }
+                }
+            }
+        } else {
+            quote!()
+        };
+
         Ok(quote! {
             #docs
             #[derive(Clone, Default)]
@@ -3108,6 +3150,7 @@ impl CodeGen for ClassDef {
             #class_lazylock_constants
             #inherits_tree
             #len_impl
+            #display_impl
             #trait_stream
             impl #class_name {
                 #class_constants

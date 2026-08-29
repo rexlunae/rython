@@ -12561,3 +12561,85 @@ fn raise_from_a_real_cause_keeps_the_documented_folding() {
         out
     );
 }
+
+#[test]
+fn class_instances_display_through_str_or_default_repr() {
+    // Round 34: str(x)/print(x)/f-string {x} on a class instance route
+    // through py_display; the generated PyDisplay impl calls __str__ when
+    // the class defines one, else emits the default object repr. And a
+    // class instance in an exception message wraps in py_display (not raw
+    // format!, which would demand a Rust Display).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, host: str):\n",
+            "        self._host = host\n",
+            "\n",
+            "    def __str__(self) -> str:\n",
+            "        return f\"Pool(host={self._host!r})\"\n",
+            "\n",
+            "class Raw:\n",
+            "    pass\n",
+            "\n",
+            "def boom():\n",
+            "    raise PoolError(Pool(\"x\"), \"closed.\")\n",
+            "\n",
+            "print(str(Raw()))\n",
+            "print(Pool(\"y\"))\n",
+        ),
+        "disp.py",
+    );
+    assert!(
+        out.contains("impl stdpython :: PyDisplay for Pool")
+            || out.contains("impl stdpython::PyDisplay for Pool"),
+        "the class must get a PyDisplay impl: {}",
+        out
+    );
+    assert!(
+        out.contains("self . __str__ () . unwrap_or_else")
+            || out.contains("self.__str__().unwrap_or_else"),
+        "a class with __str__ must route display through it: {}",
+        out
+    );
+    assert!(
+        out.contains("\"<{} object>\"") && out.contains("\"Raw\""),
+        "a class without __str__/__repr__ uses the default object repr: {}",
+        out
+    );
+    assert!(
+        out.contains("print (& ({ Pool :: new")
+            || out.contains("print(&({ Pool::new"),
+        "a class instance in print compiles through the PyDisplay bound: {}",
+        out
+    );
+}
+
+#[test]
+fn exception_message_args_wrap_class_instances_in_py_display() {
+    // The raise-site message flattening wraps class instances, Options,
+    // and boxed values in py_display (Python's str) — a raw format! would
+    // fail to compile (no Rust Display on a class struct).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, host: str):\n",
+            "        self._host = host\n",
+            "\n",
+            "def boom():\n",
+            "    raise PoolError(Pool(\"x\"), \"closed.\")\n",
+        ),
+        "disp.py",
+    );
+    assert!(
+        out.contains("py_display (& ({ Pool :: new")
+            || out.contains("py_display(&({ Pool::new"),
+        "the message arg must wrap the class instance: {}",
+        out
+    );
+}

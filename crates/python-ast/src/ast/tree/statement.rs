@@ -524,7 +524,15 @@ impl CodeGen for StatementType {
                     crate::condition_to_rust(&test, ctx.clone(), options.clone(), symbols.clone())?;
                 let msg_tokens = match msg {
                     Some(m) => {
-                        let m = m.to_rust(ctx.clone(), options, symbols)?;
+                        // Python's str() is py_display, not Rust's Display
+                        // (round 34): a class instance/Option/boxed value
+                        // message formats through py_display.
+                        let m = crate::ast::tree::raise_stmt::message_arg(
+                            &m,
+                            ctx.clone(),
+                            options,
+                            symbols,
+                        )?;
                         quote!(format!("{}", #m))
                     }
                     None => quote!(String::new()),

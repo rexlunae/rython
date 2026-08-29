@@ -91,6 +91,15 @@ std::thread), `time`, `unicodedata`-style codec handling,
 ### File I/O in no_std mode
 ✅ **In-memory buffers on the alloc tier**: `io.StringIO` and `io.BytesIO` (Python's cursor semantics, byte/char-exact write counts, the closed-file ValueError) build with `--no-default-features --features alloc` — a target with no OS has no disk, so the in-memory file surface IS its file I/O. Disk files (`open()`, directory handling via `os`/`pathlib`/`glob`) stay std-only.
 
+### String formatting
+✅ **Old-style `%`-formatting** on `str` and `bytes` (round 34): the full
+conversion set (`%s %r %a %d %i %u %o %x %X %e %E %f %g %G %c %b` and
+`%%`), flags/width/precision incl. `*`, the `%(name)s` mapping form with
+a dict RHS, and CPython's exact TypeErrors/ValueErrors — pinned to
+CPython transcripts. `str(x)`/`print(x)`/f-string `{x}` on a class
+instance route through its `__str__`/`__repr__`, else the default
+object repr.
+
 ### Exception System
 ✅ **Complete built-in exception tree**: every CPython built-in exception
 name is modeled, and `except` matching walks the real hierarchy —

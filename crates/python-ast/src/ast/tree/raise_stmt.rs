@@ -1,6 +1,42 @@
 use proc_macro2::TokenStream;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
+
+/// An exception-message argument, rendered for `format!("{}", ...)`:
+/// Python's str() is py_display, not Rust's Display — a class INSTANCE,
+/// Option, or boxed value in a message formats through py_display (the
+/// generated class PyDisplay impl routes __str__/__repr__/the object
+/// repr — round 34), where a raw `format!` would demand a Rust Display
+/// the type does not have (E0277).
+pub(crate) fn message_arg(
+    expr: &crate::ExprType,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let rendered = expr.clone().to_rust(ctx, options.clone(), symbols.clone())?;
+    // A GENERIC parameter keeps the raw format arg (its concrete type is
+    // bound elsewhere); a concrete class instance/Option/boxed value
+    // needs py_display.
+    let generic = matches!(expr, crate::ExprType::Name(n)
+        if options.param_type_vars.contains_key(&n.id));
+    let needs_display = !generic
+        && matches!(
+            crate::infer_type(expr, &options, &symbols),
+            crate::TypeInfo::Class(_)
+                | crate::TypeInfo::Option(_)
+                | crate::TypeInfo::PyValue
+                | crate::TypeInfo::PyValueMember(_)
+                | crate::TypeInfo::PyObject
+        );
+    if needs_display {
+        Ok(quote!(py_display(&(#rendered))))
+    } else {
+        Ok(rendered)
+    }
+}
+
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -363,7 +399,7 @@ fn exception_value(
                 let msg = match call.args.len() {
                     0 => quote!(String::new()),
                     _ => {
-                        let arg = call.args[0].clone().to_rust(ctx, options, symbols)?;
+                        let arg = message_arg(&call.args[0], ctx, options, symbols)?;
                         quote!(format!("{}", #arg))
                     }
                 };
@@ -376,8 +412,7 @@ fn exception_value(
                     let msg = match call.args.len() {
                         0 => quote!(String::new()),
                         _ => {
-                            let arg =
-                                call.args[0].clone().to_rust(ctx, options, symbols)?;
+                            let arg = message_arg(&call.args[0], ctx, options, symbols)?;
                             quote!(format!("{}", #arg))
                         }
                     };
@@ -390,7 +425,7 @@ fn exception_value(
                     let msg = match call.args.len() {
                         0 => quote!(String::new()),
                         1 => {
-                            let arg = call.args[0].clone().to_rust(ctx, options, symbols)?;
+                            let arg = message_arg(&call.args[0], ctx, options, symbols)?;
                             quote!(format!("{}", #arg))
                         }
                         _ => {
@@ -398,7 +433,8 @@ fn exception_value(
                                 .args
                                 .iter()
                                 .map(|a| {
-                                    a.clone().to_rust(
+                                    message_arg(
+                                        a,
                                         ctx.clone(),
                                         options.clone(),
                                         symbols.clone(),
