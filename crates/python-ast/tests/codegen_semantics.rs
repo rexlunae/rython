@@ -3321,6 +3321,53 @@ fn plain_option_param_still_narrows() {
 }
 
 #[test]
+fn class_member_union_param_is_not_optional() {
+    // Round 42: `Retry | bool | int | None` (urllib3's retries) resolves
+    // to the boxed PyValue — the class member makes the union boxable,
+    // and the box absorbs None — so stores must NOT Some-wrap (they go
+    // through PyValue::from; a class-instance member has no boxed repr
+    // and stays loudly unboxable). The symbol-aware alias resolver sees
+    // this even though the class member is not a builtin scalar.
+    let out = compile(
+        "class Retry:\n\
+         \x20   pass\n\
+         \n\
+         def f(retries: Retry | bool | int | None = None) -> int:\n\
+         \x20   if retries is None:\n\
+         \x20       retries = 5\n\
+         \x20   return 0\n",
+        "classmember.py",
+    );
+    assert!(
+        out.contains("retries = PyValue :: from (5)") || out.contains("retries = PyValue::from(5)"),
+        "class-member union param stores must go through PyValue::from: {}",
+        out
+    );
+    assert!(
+        !out.contains("retries = Some"),
+        "class-member union param stores must not Some-wrap: {}",
+        out
+    );
+    // A genuine `Retry | None` is Option<Retry> — the narrow class-only
+    // optional keeps its Option slot.
+    let out2 = compile(
+        "class Retry:\n\
+         \x20   pass\n\
+         \n\
+         def g(x: Retry | None = None) -> int:\n\
+         \x20   if x is not None:\n\
+         \x20       return 1\n\
+         \x20   return 0\n",
+        "classonly.py",
+    );
+    assert!(
+        out2.contains("x : Option < Retry >") || out2.contains("x: Option<Retry>"),
+        "a class-only optional stays Option-typed: {}",
+        out2
+    );
+}
+
+#[test]
 fn typing_imports_lower_to_nothing() {
     let out = compile("from typing import Optional\nx = 1\n", "typing.py");
     assert!(!out.contains("typing"), "generated: {}", out);
