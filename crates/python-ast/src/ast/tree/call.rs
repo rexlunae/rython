@@ -3095,6 +3095,25 @@ impl<'a> CodeGen for Call {
                             ));
                             return Ok(quote!(stdpython::PyValue::None_));
                         }
+                        // A BOXED/unknown argument (`set(self._container.
+                        // keys())` — urllib3's HTTPHeaderDict.keys, where
+                        // the keys() member of the boxed dict is an
+                        // unmodeled value): the set's content is unknown —
+                        // the boxed None (the empty-set divergence family).
+                        // The ident spelling (not the string literal —
+                        // round 36 fixes the old `"set"(...)` string-call).
+                        if rendered.iter().any(|r| {
+                            r.to_string().contains("PyValue::None_")
+                                || r.to_string().contains("PyValue :: None_")
+                        }) {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "{}() over an unmodeled value lowers as the boxed \
+                                 None (the set-content divergence)",
+                                bname
+                            ));
+                            return Ok(quote!(stdpython::PyValue::None_));
+                        }
+                        let bname = crate::safe_ident(&bname);
                         return Ok(quote!(#bname(#(#rendered),*)));
                     }
                     "frozenset" => {
@@ -4464,6 +4483,27 @@ impl<'a> CodeGen for Call {
         // arguments against the class's real __init__ signature, and an
         // inherited __init__ must resolve through the defining module's
         // base chain, not the importer's scope.
+        // `type(self)(args)` — the class-object construction (`result =
+        // type(self)(maybe_constructable)` — urllib3's
+        // HTTPHeaderDict.__ror__): CPython constructs a new instance of
+        // the runtime class. Lower exactly like `{Class}(args)` — rebuild
+        // the call with the class name as the callee and run the same
+        // construction lowering (full signature mapping).
+        if let ExprType::Call(inner) = self.func.as_ref()
+            && matches!(inner.func.as_ref(), ExprType::Name(f) if f.id == "type")
+            && inner.args.len() == 1
+            && matches!(
+                inner.args.first(),
+                Some(ExprType::Name(a)) if a.id == "self"
+            )
+            && let Some(enclosing) = ctx.enclosing_class_name()
+        {
+            let mut rewritten = self.clone();
+            rewritten.func = Box::new(ExprType::Name(crate::Name {
+                id: enclosing.to_string(),
+            }));
+            return rewritten.to_rust(ctx, options, symbols);
+        }
         if let ExprType::Name(n) = self.func.as_ref() {
             if n.id == "RLResolver" {
             }
@@ -8576,6 +8616,45 @@ fn map_call_arguments_inner(
             return Ok(quote!(stdpython::PyValue::None_));
         }
         if optional {
+            // An `X | None` parameter whose X has no Rust type
+            // (`headers: ValidHTTPHeaderSource | None` — urllib3's
+            // HTTPHeaderDict) lowers the PARAM to the plain boxed PyValue,
+            // not an Option — wrapping the argument in Some would
+            // mismatch. The None default boxes as PyValue::None_, and a
+            // present argument coerces to the boxed value (a PyValue
+            // passes through; a class instance cannot be boxed and stays a
+            // loud rustc error).
+            // The `X | None` UNION form only (not `Optional[T]` — that
+            // always lowers to a real Option), and only when X resolves to
+            // the boxed PyValue.
+            if param.annotation.as_deref().is_some_and(|ann| {
+                matches!(
+                    ann,
+                    ExprType::BinOp(op)
+                        if matches!(op.op, crate::BinOps::BitOr)
+                            && (crate::is_none_expr(&op.left)
+                                || crate::is_none_expr(&op.right))
+                ) && matches!(
+                    crate::resolve_alias_typeinfo(ann, symbols, &options),
+                    Some(crate::TypeInfo::PyValue)
+                )
+            }) {
+                if crate::is_none_expr(expr) {
+                    return Ok(quote!(stdpython::PyValue::None_));
+                }
+                // A present argument renders RAW: a PyValue passes
+                // through (the param IS the boxed value), while a class
+                // instance stays a loud mismatch (the boxed value cannot
+                // hold one) — the coercion would only move the error
+                // kind, not fix it.
+                return crate::render_typed_reused(
+                    expr,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    None,
+                );
+            }
             crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())
         } else {
             // Type-aware lowering: coerce the argument to the parameter's

@@ -12718,3 +12718,61 @@ fn factory_local_property_reads_route_through_the_getter() {
         out
     );
 }
+
+#[test]
+fn type_self_construction_lowers_to_the_class_constructor() {
+    // `result = type(self)(maybe_constructable)` (urllib3's
+    // HTTPHeaderDict.__ror__): the class OBJECT is constructed — CPython
+    // builds a new instance of the runtime class — so the call lowers to
+    // the same-class construction (::new with the signature mapping),
+    // never a class-name string being called (the old E0618 string-call).
+    let out = compile(
+        concat!(
+            "class A:\n",
+            "    def __init__(self, x: int = 0):\n",
+            "        self.x = x\n",
+            "\n",
+            "    def duplicate(self) -> A:\n",
+            "        return type(self)(self.x)\n",
+        ),
+        "cls.py",
+    );
+    assert!(
+        out.contains("A :: new (self . x)")
+            || out.contains("A::new(self.x)"),
+        "type(self)(...) must construct the class: {}",
+        out
+    );
+    assert!(
+        !out.contains("stringify!") || !out.contains("to_string () ("),
+        "the old string-call must be gone: {}",
+        out
+    );
+}
+
+#[test]
+fn set_literal_call_uses_the_runtime_conversion() {
+    // `set("abc")` — the set conversion of a string (urllib3's
+    // `_UNRESERVED_CHARS = set("...")`): a set of one-char strings via
+    // the runtime `set()` — never a `"set"(...)` string-call (the old
+    // E0618 bug).
+    let out = compile(
+        concat!(
+            "_UNRESERVED_CHARS = set(\"ABCabc\")\n",
+            "\n",
+            "def has(ch: str) -> bool:\n",
+            "    return ch in _UNRESERVED_CHARS\n",
+        ),
+        "sets.py",
+    );
+    assert!(
+        out.contains("set (\"ABCabc\")") || out.contains("set(\"ABCabc\")"),
+        "set(...) must call the runtime conversion: {}",
+        out
+    );
+    assert!(
+        !out.contains("\"set\"("),
+        "the string-call form is gone: {}",
+        out
+    );
+}

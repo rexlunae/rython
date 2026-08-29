@@ -765,9 +765,11 @@ other
 inferred-generic shapes lower to false with the class-as-value
 divergence warning), and the
 `bool`/`int`/`float`/`str`/`list`/`dict`/`frozenset` conversions.
-(`set(xs)` and `tuple(xs)` conversion *calls* are not implemented —
-they lower unresolved and fail in rustc, §12.1; set and tuple
-*literals* work.) `iter(callable, sentinel)` (issue #155) is supported
+(`set(xs)` works for the string shape — the set of its characters,
+urllib3's `_UNRESERVED_CHARS = set("...")` — and a boxed set-of-strings
+boxes as a Tuple of Str members; other `set(xs)` shapes and `tuple(xs)`
+conversion *calls* are not implemented — they lower unresolved and fail
+in rustc, §12.1; set and tuple *literals* work.) `iter(callable, sentinel)` (issue #155) is supported
 as a for-loop iterable — `for x in iter(f, sentinel):` desugars to a
 loop calling `f()` until the result equals the sentinel (bound once,
 before the loop); anywhere else the two-argument form is a loud error.
@@ -1115,7 +1117,7 @@ in generated code rather than a conversion-time message:
 
 - `eval`, `exec`, `compile`, `globals`, `locals`, `getattr`, `setattr`
   lower to unresolved calls and fail in rustc; so do the unimplemented
-  `set(xs)` and `tuple(xs)` conversion calls.
+  `set(xs)` (beyond the string shape) and `tuple(xs)` conversion calls.
 - Importing a module neither the runtime nor an FFI manifest provides
   lowers to a bare `use name;` and fails at resolution in rustc.
 - Reading a non-constant module global from inside a function fails in
