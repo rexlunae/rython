@@ -3268,6 +3268,59 @@ fn optional_returning_calls_store_and_pass_without_rewrap() {
 }
 
 #[test]
+fn boxed_union_param_stores_plain_pyvalue() {
+    // Round 40: a `int | str | None` parameter resolves to the BOXED
+    // PyValue (the box already contains None — issue #121's
+    // boxable-union rule), so it is NOT an Option slot: plain stores go
+    // through PyValue::from, never Some(...) (urllib3's `cert_reqs =
+    // resolve_cert_reqs(None)` was Some-wrapping and failing to build).
+    // The syntactic optional-ness (`is_optional_annotation`) must not
+    // override the resolved type.
+    let out = compile(
+        "def f(cert_reqs: int | str | None = None) -> int:\n\
+         \x20   if cert_reqs is None:\n\
+         \x20       cert_reqs = 5\n\
+         \x20   return 0\n",
+        "boxedparam.py",
+    );
+    assert!(
+        out.contains("cert_reqs = PyValue :: from (5)")
+            || out.contains("cert_reqs = PyValue::from(5)"),
+        "boxed-union param stores must go through PyValue::from: {}",
+        out
+    );
+    assert!(
+        !out.contains("cert_reqs = Some"),
+        "boxed-union param stores must not Some-wrap: {}",
+        out
+    );
+}
+
+#[test]
+fn plain_option_param_still_narrows() {
+    // Round 40 guard: the optional_names exclusion must apply ONLY to
+    // boxed-union annotations — a genuine `int | None` parameter stays an
+    // Option slot and still unwraps under `is not None` narrowing.
+    let out = compile(
+        "def g(x: int | None) -> int:\n\
+         \x20   if x is not None:\n\
+         \x20       return x + 1\n\
+         \x20   return 0\n",
+        "plainopt.py",
+    );
+    assert!(
+        out.contains("x : Option < i64 >") || out.contains("x: Option<i64>"),
+        "plain optional param must stay Option-typed: {}",
+        out
+    );
+    assert!(
+        out.contains("unwrap ()") || out.contains("unwrap()"),
+        "narrowed read must unwrap: {}",
+        out
+    );
+}
+
+#[test]
 fn typing_imports_lower_to_nothing() {
     let out = compile("from typing import Optional\nx = 1\n", "typing.py");
     assert!(!out.contains("typing"), "generated: {}", out);

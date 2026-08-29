@@ -5702,6 +5702,52 @@ fn option_aug_assign_and_option_slot_store_match_python() {
 }
 
 #[test]
+fn boxed_union_param_accepts_none_like_python() {
+    // Round 40: a `int | str | None` parameter resolves to the boxed
+    // PyValue — the box absorbs None, so plain stores must go through
+    // PyValue::from, never the Option-slot Some wrap (urllib3's
+    // `cert_reqs = resolve_cert_reqs(None)` was Some-wrapping and the
+    // generated crate failed to build). The syntactic optional-ness
+    // (`is_optional_annotation`) must not override the resolved type.
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("boxedparam");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def resolve(v):\n",
+            "    return v\n",
+            "\n",
+            "def set_cert(cert_reqs: int | str | None = None):\n",
+            "    if cert_reqs is None:\n",
+            "        cert_reqs = resolve(None)\n",
+            "    return cert_reqs\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(set_cert(None))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["None"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned
