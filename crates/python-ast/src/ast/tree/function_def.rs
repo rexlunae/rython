@@ -1359,7 +1359,21 @@ impl FunctionDef {
                 .chain(self.args.kwonlyargs.iter())
             {
                 if let Some(ann) = p.annotation.as_deref() {
-                    if crate::is_optional_annotation(ann) {
+                    // An "optional" annotation (`Optional[T]`, `T | None`)
+                    // makes the parameter an Option slot. EXCEPT a union
+                    // whose members resolve to the boxed PyValue (`int |
+                    // str | None` — urllib3's cert_reqs): the box already
+                    // contains None, so the name is PyValue, not Option,
+                    // and must not be Some-wrapped (round 40). The
+                    // annotation_type_info result is the authority — it
+                    // maps `Optional[bool | str]`/`bool | str | None` to
+                    // PyValue for exactly this reason.
+                    if crate::is_optional_annotation(ann)
+                        && !matches!(
+                            crate::annotation_type_info(ann),
+                            Some(crate::TypeInfo::PyValue)
+                        )
+                    {
                         optional.insert(p.arg.clone());
                     }
                 }
@@ -1865,6 +1879,7 @@ impl FunctionDef {
                 .map(|(name, _)| name.clone())
                 .collect()
         };
+
         options.pyvalue_into_params = std::rc::Rc::new(pyvalue_into_params);
         options.param_type_vars = std::rc::Rc::new(final_param_types);
         // An INFERRED String return needs the same literal-owning

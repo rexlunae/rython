@@ -131,7 +131,7 @@ declaration — loud, but at the wrong layer (§12.1).
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
 | `bytes \| bytearray` | `Vec<u8>` | Members mapping to the same Rust type collapse to it |
 | `str \| bytes` (and `\| bytearray`) | `stdpython::StrOrBytes` | Heterogeneous pair; narrowed by `is_str()`/`is_bytes()`; `str()`/`print()` render bytes in their `b'...'` repr form |
-| any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. Operators on a boxed value are not modeled — they fail the build loudly rather than guessing |
+| any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. Operators on a boxed value are not modeled — they fail the build loudly rather than guessing. A union containing None is NOT an Option slot — the box absorbs None, so `None`-defaulted parameters of such a type (`cert_reqs: int \| str \| None` — urllib3) store plain values through `PyValue::from`, never a `Some(...)` wrap (round 40) |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
 
 Dict keys normalize `&str → String`, so `{"a": 1}` is `PyDict<String, i64>`
