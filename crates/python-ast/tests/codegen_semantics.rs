@@ -12643,3 +12643,78 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
         out
     );
 }
+
+#[test]
+fn derived_trait_base_accessors_are_inherent_and_qualified() {
+    // Issue #137's E0034 cluster: a derived class implements BOTH its own
+    // trait and every ancestor trait, each declaring `base` with a
+    // different return type — `self.base()` on the concrete receiver would
+    // be ambiguous. The struct gets INHERENT base()/base_mut() accessors
+    // (inherent methods win over trait ones), and generic trait-default
+    // bodies qualify the first hop with the own trait.
+    let out = compile(
+        concat!(
+            "class Base:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "\n",
+            "class Mid(Base):\n",
+            "    def __init__(self):\n",
+            "        super().__init__()\n",
+            "        self.y = 0\n",
+            "\n",
+            "class Leaf(Mid):\n",
+            "    def __init__(self):\n",
+            "        super().__init__()\n",
+            "        self.z = 0\n",
+            "\n",
+            "    def read_x(self) -> int:\n",
+            "        return self.x\n",
+        ),
+        "inherit.py",
+    );
+    assert!(
+        out.contains("pub (crate) fn base (& self) -> & Mid")
+            || out.contains("pub(crate) fn base(&self) -> &Mid"),
+        "the derived struct needs an inherent base accessor: {}",
+        out
+    );
+    assert!(
+        out.contains("< Self as LeafTrait > :: base (self)")
+            || out.contains("<Self as LeafTrait>::base(self)"),
+        "generic trait-default bodies must qualify the first base hop: {}",
+        out
+    );
+}
+
+#[test]
+fn factory_local_property_reads_route_through_the_getter() {
+    // Issue #137's E0615 cluster: `timeout_obj = self._get_timeout(
+    // timeout)` (whose return annotation names Timeout) makes
+    // `timeout_obj.connect_timeout` a PROPERTY read — the attribute path
+    // resolves the factory local's class and routes the read through the
+    // getter call, instead of emitting a method-as-value E0615.
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    @property\n",
+            "    def connect_timeout(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "class Pool:\n",
+            "    def _get_timeout(self, timeout) -> Timeout:\n",
+            "        return Timeout()\n",
+            "\n",
+            "    def go(self):\n",
+            "        timeout_obj = self._get_timeout(1)\n",
+            "        return timeout_obj.connect_timeout\n",
+        ),
+        "timeout.py",
+    );
+    assert!(
+        out.contains("timeout_obj . connect_timeout ()")
+            || out.contains("timeout_obj.connect_timeout()"),
+        "the factory local's property read must call the getter: {}",
+        out
+    );
+}

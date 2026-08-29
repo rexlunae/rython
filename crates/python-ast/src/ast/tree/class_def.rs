@@ -3091,6 +3091,28 @@ impl CodeGen for ClassDef {
             quote!()
         };
 
+        // The INHERENT base accessors: the derived struct's `base()` /
+        // `base_mut()` reach its own embedded `__rython_base`. Inherent
+        // methods take precedence over the trait ones, so a concrete
+        // receiver's `self.base()` cannot be ambiguous — the derived class
+        // implements BOTH its own trait and every ancestor trait, and each
+        // declares a `base` accessor with a different return type (E0034 —
+        // urllib3's HTTPSConnectionPool). Generic trait-default bodies keep
+        // resolving through their own trait's declaration.
+        let base_inherent_accessors = if let Some(b) = base {
+            let b_ident = crate::safe_ident(&b.name);
+            quote! {
+                pub(crate) fn base(&self) -> & #b_ident {
+                    &self.__rython_base
+                }
+                pub(crate) fn base_mut(&mut self) -> &mut #b_ident {
+                    &mut self.__rython_base
+                }
+            }
+        } else {
+            quote!()
+        };
+
         // str(x)/print(x)/f-string `{x}` on a class INSTANCE route
         // through py_display (Python's str, not Rust's Display — round
         // 34's display cluster). CPython's str() calls __str__ (falling
@@ -3157,6 +3179,7 @@ impl CodeGen for ClassDef {
                 #class_const_accessors
                 #constructor
                 #init_forwarder
+                #base_inherent_accessors
                 #methods_stream
             }
         })
@@ -3223,6 +3246,36 @@ impl ClassDef {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let class_name = crate::safe_ident(&self.name);
         let trait_name = format_ident!("{}Trait", self.name);
+
+        // The per-class trait is PUBLIC (inherited methods are called
+        // cross-module: the struct is `pub` and re-exported, so the traits
+        // carrying its methods must be nameable wherever the struct is) and
+        // declares the direct base's trait as a supertrait. Computed here,
+        // BEFORE the accessor declarations: when the supertrait is present
+        // it already carries `base`/`base_mut`, so re-declaring them in the
+        // derived trait would make every `self.base()` on a receiver
+        // implementing both traits ambiguous (E0034 — urllib3's
+        // HTTPSConnectionPool implements HTTPConnectionPoolTrait AND
+        // HTTPSConnectionPoolTrait; both used to declare `base`).
+        let chain = self.cross_module_chain(symbols, options);
+        let supertrait = base
+            .as_ref()
+            .filter(|b| chain.get(1).is_some_and(|(c, _, _, _)| c.name == b.name))
+            .map(|b| {
+                let b_trait = format_ident!("{}Trait", b.name);
+                // A CROSS-MODULE base's trait is named by its crate path
+                // (this module imports the STRUCT, not its trait —
+                // `PoolManagerTrait: crate::_request_methods::
+                // RequestMethodsTrait`, urllib3).
+                match chain.get(1).and_then(|(_, _, _, p)| p.as_ref()) {
+                    Some(path) => {
+                        let segs: Vec<_> =
+                            path.iter().map(|p| crate::safe_ident(p)).collect();
+                        quote!(: crate #(::#segs)* :: #b_trait)
+                    }
+                    None => quote!(: #b_trait),
+                }
+            });
 
         // ---- Own trait ----
         let mut own_accessor_decls = TokenStream::new();
@@ -3365,38 +3418,11 @@ impl ClassDef {
             });
         }
 
-        // The per-class trait is PUBLIC (inherited methods are called
-        // cross-module: the struct is `pub` and re-exported, so the traits
-        // carrying its methods must be nameable wherever the struct is) and
-        // declares the direct base's trait as a supertrait. Trait default
-        // bodies are generic over `Self: {Name}Trait` only, so a new method
-        // that calls an inherited method (`def bar(self): self.foo()` where
-        // foo lives on the base) resolves `foo` through the supertrait
-        // bound; ancestor methods are not on the concrete `Self` otherwise.
-        // The chain is needed here already: a base whose OWN module never
-        // emits its trait (RequestMethods — a plain struct subclassed only
-        // cross-module, urllib3) cannot be a supertrait; the embedding and
-        // its base() accessors still stand, and the chain (which follows
-        // only trait-bearing bases) is empty past self.
-        let chain = self.cross_module_chain(symbols, options);
-        let supertrait = base
-            .as_ref()
-            .filter(|b| chain.get(1).is_some_and(|(c, _, _, _)| c.name == b.name))
-            .map(|b| {
-                let b_trait = format_ident!("{}Trait", b.name);
-                // A CROSS-MODULE base's trait is named by its crate path
-                // (this module imports the STRUCT, not its trait —
-                // `PoolManagerTrait: crate::_request_methods::
-                // RequestMethodsTrait`, urllib3).
-                match chain.get(1).and_then(|(_, _, _, p)| p.as_ref()) {
-                    Some(path) => {
-                        let segs: Vec<_> =
-                            path.iter().map(|p| crate::safe_ident(p)).collect();
-                        quote!(: crate #(::#segs)* :: #b_trait)
-                    }
-                    None => quote!(: #b_trait),
-                }
-            });
+        // Trait default bodies are generic over `Self: {Name}Trait` only,
+        // so a new method that calls an inherited method (`def bar(self):
+        // self.foo()` where foo lives on the base) resolves `foo` through
+        // the supertrait bound; ancestor methods are not on the concrete
+        // `Self` otherwise.
         let own_trait = quote! {
             pub trait #trait_name #supertrait {
                 #own_accessor_decls

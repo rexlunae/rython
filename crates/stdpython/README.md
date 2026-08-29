@@ -86,7 +86,7 @@ std::thread), `time`, `unicodedata`-style codec handling,
 
 ### Networking
 ✅ **Sockets**: `socket.socket(AF_INET/AF_INET6, SOCK_STREAM/SOCK_DGRAM)`, `bind`/`listen`/`accept`, `connect`, `send`/`sendall`/`recv`, `sendto`/`recvfrom`, `settimeout` (TimeoutError "timed out"), `getsockname`/`getpeername`, `close`, `gethostname()` — errors raise the real CPython hierarchy (`ConnectionRefusedError` IS-A `ConnectionError` IS-A `OSError`) with `[Errno N]` messages  
-✅ **HTTP client**: `urllib.request.urlopen()` for http/https behind the opt-in `http-ureq` feature (see below) — `.status`, `read()`, `getcode()`, `getheader()`, HTTPError/URLError wired into the exception tree
+✅ **HTTP client**: `urllib.request.urlopen()` for http/https behind the opt-in `http-ureq` feature (see below) — `.status`, `.version`, `.reason`, `read()`, `getcode()`, `getheader()`, HTTPError/URLError wired into the exception tree
 
 ### File I/O in no_std mode
 ✅ **In-memory buffers on the alloc tier**: `io.StringIO` and `io.BytesIO` (Python's cursor semantics, byte/char-exact write counts, the closed-file ValueError) build with `--no-default-features --features alloc` — a target with no OS has no disk, so the in-memory file surface IS its file I/O. Disk files (`open()`, directory handling via `os`/`pathlib`/`glob`) stay std-only.
