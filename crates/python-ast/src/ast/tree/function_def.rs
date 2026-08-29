@@ -1361,16 +1361,19 @@ impl FunctionDef {
                 if let Some(ann) = p.annotation.as_deref() {
                     // An "optional" annotation (`Optional[T]`, `T | None`)
                     // makes the parameter an Option slot. EXCEPT a union
-                    // whose members resolve to the boxed PyValue (`int |
-                    // str | None` — urllib3's cert_reqs): the box already
-                    // contains None, so the name is PyValue, not Option,
-                    // and must not be Some-wrapped (round 40). The
-                    // annotation_type_info result is the authority — it
-                    // maps `Optional[bool | str]`/`bool | str | None` to
-                    // PyValue for exactly this reason.
+                    // whose members resolve to the boxed PyValue — `int |
+                    // str | None` (urllib3's cert_reqs) AND class-member
+                    // unions `Retry | bool | int | None` (urllib3's
+                    // retries): the box already contains None, so the name
+                    // is PyValue, not Option, and must not be Some-wrapped
+                    // (rounds 40/41). The symbol-aware alias resolver is
+                    // the authority — it maps `Optional[bool | str]`,
+                    // `bool | str | None` AND `Retry | bool | int | None`
+                    // to PyValue for exactly this reason, while `Retry |
+                    // None` resolves to Option<Retry>.
                     if crate::is_optional_annotation(ann)
                         && !matches!(
-                            crate::annotation_type_info(ann),
+                            crate::resolve_alias_typeinfo(ann, &symbols, &options),
                             Some(crate::TypeInfo::PyValue)
                         )
                     {
