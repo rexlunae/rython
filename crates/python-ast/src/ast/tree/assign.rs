@@ -437,6 +437,34 @@ impl<'a> CodeGen for Assign {
                 })
                 .unwrap_or(false)
         };
+        // A store into an OPTION-typed FIELD (`self.chunk_left =
+        // self.chunk_left - amt`, `self._start_connect =
+        // time.monotonic()` — urllib3): Python's `int | None` slot absorbs
+        // any int/float; the Rust slot is Option<T>, so a non-None,
+        // non-Option value wraps in Some (mirroring the optional_names
+        // name-store rule above). A value that already yields an Option
+        // (another optional field, dict.get, an Optional-returning call)
+        // stores through unchanged — wrapping again would nest.
+        let attr_field_is_option = |target: &ExprType| -> bool {
+            let ExprType::Attribute(attr) = target else {
+                return false;
+            };
+            let Some((class, class_symbols)) =
+                crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+            else {
+                return false;
+            };
+            class
+                .infer_fields(&class_symbols, &options)
+                .ok()
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == &attr.attr)
+                        .map(|(_, ty)| ty.to_string().starts_with("Option <"))
+                })
+                .unwrap_or(false)
+        };
         // A container of string literals stored into a field whose inferred
         // type is an OWNED String container (issue #229: `self.items =
         // ["kept"]` — the field is Vec<String> but the literal renders
@@ -798,6 +826,25 @@ impl<'a> CodeGen for Assign {
                 }
                 ExprType::Attribute(_) if stored_name_needs_clone => {
                     quote!(#target_code = (#value).clone();)
+                }
+                // A non-None, non-Option value stored into an OPTION-typed
+                // FIELD wraps in Some (Python's `int | None` slot absorbs a
+                // plain int — urllib3's `self.chunk_left = self.chunk_left
+                // - amt` and `self._start_connect = time.monotonic()`).
+                // None stores keep plain None; an already-Option value
+                // (another optional field, dict.get) stores through
+                // unchanged — wrapping again would nest. Only fields whose
+                // class-table type is Option qualify (the receiver_class
+                // dispatch is conservative by design, so a generic-trait
+                // body whose receiver cannot be pinned stays on the plain
+                // store and keeps its pre-existing loud error rather than
+                // silently changing shape).
+                ExprType::Attribute(_)
+                    if !value_is_none_early
+                        && attr_field_is_option(target)
+                        && !value_yields_option =>
+                {
+                    quote!(#target_code = Some(#value);)
                 }
                 _ => quote!(#target_code = #value;),
             })

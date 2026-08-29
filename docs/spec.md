@@ -191,10 +191,23 @@ suggesting both fixes.
 A name that is `None` on any assignment path, or annotated
 `Optional[T]`, becomes `Option<T>`: non-`None` stores are wrapped in
 `Some(…)`, and values that already produce an `Option` (`dict.get`, an
-optional-returning call) pass through unwrapped. Places where CPython
+optional-returning call) pass through unwrapped. The same `Some(…)`
+wrap applies to a plain value stored into an `Option`-typed FIELD
+(`self._start_connect = time.monotonic()` where the field is
+`float | None` — urllib3): Python's `int | None` slot absorbs a plain
+`int`. Places where CPython
 would put `None` *inside* a typed container that Rython cannot represent
 (a non-participating regex group in `re.split`, `groupdict` of an
 unmatched group) fail loudly instead of inventing a value.
+
+Augmented assignment to an `Option` target (`self.chunk_left -= n`,
+`options |= x`) operates on the INNER value — `-=` unwraps, subtracts
+through the runtime `py_sub`, and re-wraps; `|=` ORs the inner value.
+A `None` target at that point is CPython's `TypeError: unsupported
+operand type(s) for -=: 'NoneType' and 'int'` — a loud §12.2 panic
+with the message (guarded code never hits it). An `Option`-typed RHS
+of `-` (`self.chunk_left - amt` where `amt: int | None`) likewise
+unwraps with the loud panic.
 
 ---
 
@@ -1146,7 +1159,9 @@ catchable `PyException`:
   overflow-adjacent arithmetic as out of contract until the opt-in
   bigint tier exists.
 - Sorting a `NaN`; `hash(nan)`.
-- Arithmetic on `None`.
+- Arithmetic on `None` (including aug-assign `-=`/`|=` on an `Option`
+  target whose value is `None`, and a `-` whose RHS is `None` — the
+  Option-unwrap panics carry CPython's TypeError text).
 - An exception escaping a lambda body.
 - `in` on a boxed value whose member is not a container (`1 in boxed_int`),
   or a non-str probe on the boxed str member — CPython 3.11's TypeError
