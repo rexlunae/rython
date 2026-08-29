@@ -5803,6 +5803,56 @@ fn hierarchy_trait_display_bound_allows_self_in_messages() {
 }
 
 #[test]
+fn option_and_or_fold_returns_operands_like_python() {
+    // Round 43: `ca and s` / `ca or "http"` where ca is `str | None`
+    // (urllib3's `ca_certs and expanduser(ca_certs)`, `scheme or
+    // "http"`) — the operand-returning fold uses the Option arm even when
+    // the second operand's type is unknown (a call) or a string literal
+    // (which is OWNED at the wrap). Transcript pinned against python3.
+    let scratch = Scratch::new("fold");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def pick(ca: str | None, s: str) -> str | None:\n",
+            "    return ca and s\n",
+            "\n",
+            "def pick_or(ca: str | None) -> str | None:\n",
+            "    return ca or \"http\"\n",
+            "\n",
+            "def scheme_or(ca: str | None, s: str) -> str | None:\n",
+            "    return ca or s\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(pick(\"x\", \"y\"))\n",
+            "    print(pick(None, \"y\"))\n",
+            "    print(pick_or(\"x\"))\n",
+            "    print(pick_or(None))\n",
+            "    print(scheme_or(\"x\", \"y\"))\n",
+            "    print(scheme_or(None, \"y\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["y", "None", "x", "http", "x", "y"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned

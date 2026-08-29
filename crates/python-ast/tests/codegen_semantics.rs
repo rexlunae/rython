@@ -12456,6 +12456,49 @@ fn ununifiable_operands_keep_the_loud_boolean_approximation() {
 }
 
 #[test]
+fn option_and_untyped_call_uses_the_option_arm() {
+    // Round 43: `ca and expanduser(ca)` (urllib3's ca_certs) — the first
+    // operand is Option<String>, the second is a CALL whose return type
+    // infers PyObject (method/module-call returns are unresolved) but
+    // renders the inner String. The fold must still use the
+    // operand-returning Option arm (Some-wrap the truthy arm), not the
+    // `&&` boolean approximation (which rustc rejects — Option has no
+    // bool operator).
+    let out = compile(
+        "def pick(ca: str | None, fn) -> str | None:\n    return ca and fn(ca)\n",
+        "andcall.py",
+    );
+    assert!(
+        out.contains("__rython_and") && out.contains("is_truthy () { Some (")
+            || out.contains("__rython_and") && out.contains("is_truthy() { Some("),
+        "Option and an untyped call must use the operand-returning fold: {}",
+        out
+    );
+    assert!(
+        !out.contains("(ca) && (fn"),
+        "must not fall back to the && approximation: {}",
+        out
+    );
+}
+
+#[test]
+fn option_or_string_literal_owns_the_literal() {
+    // Round 43: `scheme or "http"` (urllib3) — the falsy arm Some-wraps
+    // the string literal and OWNS it (`Some(("http").to_string())`), so
+    // the Option<String> slot typechecks (a raw &str literal would make
+    // Option<&str> vs Option<String>).
+    let out = compile(
+        "def pick(scheme: str | None) -> str | None:\n    return scheme or \"http\"\n",
+        "orlit.py",
+    );
+    assert!(
+        out.contains("Some ((\"http\") . to_string ())") || out.contains("Some((\"http\").to_string())"),
+        "the literal arm must own the string: {}",
+        out
+    );
+}
+
+#[test]
 fn optional_str_literal_arguments_own_themselves() {
     let out = compile(
         "def pick(ca: str | None) -> str | None:\n    return ca\n\ndef use() -> str | None:\n    return pick(\"x\")\n",

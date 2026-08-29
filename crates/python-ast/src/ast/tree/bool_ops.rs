@@ -173,34 +173,54 @@ fn fold(
         let a = crate::infer_type(&values[i], options, symbols);
         let b = crate::infer_type(&values[i + 1], options, symbols);
         use crate::TypeInfo as T;
+        // Whether the operand can hold the Option's inner type: the
+        // concrete match (`ca and x` where both are str), a STRING
+        // literal (`ca and "fixed"` — the literal infers StrRef, not
+        // String), or an UNKNOWN type (`ca and expanduser(ca)` — the
+        // call's return infers PyObject because method/module-call
+        // returns are unresolved, but the rendered expression IS the
+        // inner type). An unknown operand falls back to the Option arm
+        // and lets rustc judge: `Some(#rest)` into the Option<T> context
+        // is loud if #rest is not T — the same loudness the && fallback
+        // would have, but correct for the unifiable case.
+        fn inner_matches(inner: &T, other: &T) -> bool {
+            inner == other
+                || matches!(other, T::PyObject)
+                || (matches!(inner, T::String) && matches!(other, T::StrRef))
+                || (matches!(inner, T::Bytes) && matches!(other, T::StrRef))
+        }
         match (&a, &b) {
             // a: Option<T>, b: T — the falsy arm holds the Option, the
             // truthy arm wraps the plain value.
-            (T::Option(inner), b) if **inner == *b => {
+            (T::Option(inner), b) if inner_matches(inner, b) => {
                 if op == BoolOps::And {
+                    let wrapped = some_arm(&values[i + 1], quote!(#rest));
                     quote!({
                         let __rython_and = #first;
-                        if (__rython_and).is_truthy() { Some(#rest) } else { __rython_and }
+                        if (__rython_and).is_truthy() { #wrapped } else { __rython_and }
                     })
                 } else {
+                    let wrapped = some_arm(&values[i + 1], quote!(#rest));
                     quote!({
                         let __rython_or = #first;
-                        if (__rython_or).is_truthy() { __rython_or } else { Some(#rest) }
+                        if (__rython_or).is_truthy() { __rython_or } else { #wrapped }
                     })
                 }
             }
             // a: T, b: Option<T> — the truthy arm holds the plain value
             // and wraps it; the falsy arm is already Option.
-            (a, T::Option(inner)) if *a == **inner => {
+            (a, T::Option(inner)) if inner_matches(inner, a) => {
                 if op == BoolOps::And {
+                    let wrapped = some_arm(&values[i], quote!(__rython_and));
                     quote!({
                         let __rython_and = #first;
-                        if (__rython_and).is_truthy() { #rest } else { Some(__rython_and) }
+                        if (__rython_and).is_truthy() { #rest } else { #wrapped }
                     })
                 } else {
+                    let wrapped = some_arm(&values[i], quote!(__rython_or));
                     quote!({
                         let __rython_or = #first;
-                        if (__rython_or).is_truthy() { Some(__rython_or) } else { #rest }
+                        if (__rython_or).is_truthy() { #wrapped } else { #rest }
                     })
                 }
             }
@@ -214,6 +234,21 @@ fn fold(
         }
     }
     fold_at(values, rendered, op, 0, ctx, options, symbols)
+}
+
+/// Wrap a plain arm in `Some(...)`. A string LITERAL lowers to
+/// `&'static str`, but an Option<String> slot owns its string — the
+/// literal must be owned at the wrap (`scheme or "http"` where scheme is
+/// `str | None` — urllib3): the same ownership the optional-store path
+/// applies. Any other operand wraps as-is.
+fn some_arm(expr: &crate::ExprType, tokens: TokenStream) -> TokenStream {
+    if matches!(expr, crate::ExprType::Constant(c)
+        if matches!(&c.0, Some(litrs::Literal::String(_))))
+    {
+        quote!(Some((#tokens).to_string()))
+    } else {
+        quote!(Some(#tokens))
+    }
 }
 
 #[cfg(test)]

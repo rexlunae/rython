@@ -245,10 +245,15 @@ the operands' types unify: `a and b = if truthy(a) { b } else { a }`,
 `a or b = if truthy(a) { a } else { b }`, and when exactly one operand
 is `Option<T>` with the other `T`, the `T` arm wraps in `Some` (the
 `ca_certs and expanduser(ca_certs)` shape — `str | None` and `str`).
-An ununifiable mix (`bool and str`, two different types) falls back to
-Rust's `&&`/`||`, which fails loudly in rustc (§12.1) rather than
-silently returning a bool where Python returns a value. `a or None`
-gets Option semantics via the same unification.
+The `Option` arm also fires when the other operand's type is UNKNOWN (a
+call whose return is unresolved but renders the inner type) or a string
+LITERAL (which is owned at the wrap — `Some(("http").to_string())` for
+`scheme or "http"`), and a BoolOp with an Option operand yields an
+Option for store purposes (round 43). An ununifiable mix (`bool and
+str`, two different types) falls back to Rust's `&&`/`||`, which fails
+loudly in rustc (§12.1) rather than silently returning a bool where
+Python returns a value. `a or None` gets Option semantics via the same
+unification.
 
 ### 4.3 f-strings and `str.format`
 
