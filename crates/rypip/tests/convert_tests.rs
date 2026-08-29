@@ -5853,6 +5853,60 @@ fn option_and_or_fold_returns_operands_like_python() {
 }
 
 #[test]
+fn option_comparison_matches_python() {
+    // Round 43: `amt != 0` / `amt == 0` / `amt < cl` with `int | None`
+    // operands (urllib3's `amt != 0`, `amt < self.chunk_left`): the
+    // Option LHS unwraps the inner for the comparison; a None LHS
+    // answers Python's EQUALITY semantics (`None == x` is False, `None
+    // != x` is True) while ordered compares on None are a loud §12.2
+    // panic. Transcript pinned against python3.
+    let scratch = Scratch::new("optcmp");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def ne(amt: int | None) -> bool:\n",
+            "    return amt != 0\n",
+            "\n",
+            "def eq(amt: int | None) -> bool:\n",
+            "    return amt == 0\n",
+            "\n",
+            "def both(amt: int | None, cl: int | None) -> bool:\n",
+            "    if amt is not None and cl is not None:\n",
+            "        return amt < cl\n",
+            "    return False\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(ne(None))\n",
+            "    print(ne(0))\n",
+            "    print(ne(3))\n",
+            "    print(eq(None))\n",
+            "    print(eq(0))\n",
+            "    print(both(3, 5))\n",
+            "    print(both(None, 5))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["True", "False", "True", "False", "True", "True", "False"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned

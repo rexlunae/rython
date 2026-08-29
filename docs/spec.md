@@ -1170,6 +1170,13 @@ catchable `PyException`:
 - Arithmetic on `None` (including aug-assign `-=`/`|=` on an `Option`
   target whose value is `None`, and a `-` whose RHS is `None` — the
   Option-unwrap panics carry CPython's TypeError text).
+- An ORDERED comparison (`<`/`<=`/`>`/`>=`) on an `Option` whose value
+  is `None` (`amt < self.chunk_left` where either is `int | None` —
+  urllib3) — CPython's `'<' not supported between instances of
+  'NoneType' and 'int'` TypeError, but a panic with the exact text (the
+  `is not None` guard in real code prevents it). Equality (`==`/`!=`)
+  with None is NOT a panic: Python answers `False`/`True`, and the
+  Option LHS comparison unwraps the inner value accordingly (round 43).
 - An exception escaping a lambda body.
 - `in` on a boxed value whose member is not a container (`1 in boxed_int`),
   or a non-str probe on the boxed str member — CPython 3.11's TypeError
