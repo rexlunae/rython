@@ -356,6 +356,12 @@ fn infer_type_inner(
                 crate::BinOps::Add => {
                     if is_stringy(&l) && is_stringy(&r) {
                         TypeInfo::String
+                    } else if matches!(l, TypeInfo::Bytes) && matches!(r, TypeInfo::Bytes) {
+                        // bytes + bytes is bytes (`x + b"c"` — the runtime
+                        // py_add for Vec<u8> pairs concatenate): typing it
+                        // keeps later display/repr through the bytes path
+                        // (issue #137's bytes-display round).
+                        TypeInfo::Bytes
                     } else if is_numeric(&l) && is_numeric(&r) {
                         numeric_join(&l, &r)
                     } else {
@@ -1251,6 +1257,18 @@ fn analyze_statement_types(
                             call_return_typeinfo(c, symbols, options)
                                 .unwrap_or_else(|| syntactic_type(&assign.value))
                         }
+                        // A BINOP value needs the context-aware inferrer:
+                        // `y = x + b"c"` is bytes (bytes + bytes), which
+                        // the context-free syntactic_type cannot see (its
+                        // operands are names). The two paths agree
+                        // everywhere else; this is the one shape where
+                        // only infer_type has the operand types.
+                        ExprType::BinOp(_) => match (options, symbols) {
+                            (Some(options), Some(symbols)) => {
+                                infer_type(&assign.value, options, symbols)
+                            }
+                            _ => syntactic_type(&assign.value),
+                        },
                         _ => syntactic_type(&assign.value),
                     },
                 };

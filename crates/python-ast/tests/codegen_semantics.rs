@@ -12287,3 +12287,86 @@ fn an_option_value_in_condition_position_tests_none_ness() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// The bytes-display slice (issue #137): Python displays a bytes value as
+// `b'ab'`, NOT the int-list the blanket Vec<T> display renders. print of
+// a bytes-typed argument routes through the runtime's CPython-verified
+// py_bytes_repr, and bytes + bytes infers Bytes (so a concatenated
+// value keeps the bytes path).
+// ---------------------------------------------------------------------
+
+#[test]
+fn printing_a_bytes_value_uses_the_bytes_repr() {
+    let out = compile(
+        "def show():\n    print(b\"ab\")\n\ndef add(x: bytes) -> bytes:\n    return x + b\"c\"\n",
+        "bytesprint.py",
+    );
+    assert!(
+        out.contains("py_bytes_repr"),
+        "print of a bytes value must route through py_bytes_repr: {}",
+        out
+    );
+    assert!(
+        out.contains("fn add (x : Vec < u8 >) -> Result < Vec < u8 > , PyException >"),
+        "bytes + bytes must infer bytes: {}",
+        out
+    );
+}
+
+#[test]
+fn bytes_join_uses_the_runtime_helper() {
+    let out = compile(
+        "def assemble(parts: list[bytes]) -> bytes:\n    return b\"\".join(parts)\n",
+        "bytesjoin.py",
+    );
+    assert!(
+        out.contains("bytes_join"),
+        "bytes join must route to the runtime helper: {}",
+        out
+    );
+}
+
+// ---------------------------------------------------------------------
+// `raise X from None` (issue #137): CPython sets the cause to None —
+// no cause text at all — and the None literal cannot format (E0277 ×17
+// in the corpus). The from-None shape skips the §12.3 cause folding;
+// `raise X from Y` (a real cause) keeps it.
+// ---------------------------------------------------------------------
+
+#[test]
+fn raise_from_none_skips_the_cause_text() {
+    let out = compile(
+        concat!(
+            "def fail():\n",
+            "    raise KeyError(\"outer\") from None\n",
+        ),
+        "raisefromnone.py",
+    );
+    assert!(
+        !out.contains("from None") || out.contains("KeyError"),
+        "from None must not fold cause text into the message: {}",
+        out
+    );
+    assert!(
+        !out.contains("format ! (\"{}\" , None)"),
+        "the None literal must not be formatted: {}",
+        out
+    );
+}
+
+#[test]
+fn raise_from_a_real_cause_keeps_the_documented_folding() {
+    let out = compile(
+        concat!(
+            "def fail(e):\n",
+            "    raise KeyError(\"outer\") from e\n",
+        ),
+        "raisefromcause.py",
+    );
+    assert!(
+        out.contains("from"),
+        "the §12.3 cause folding stays for a real cause: {}",
+        out
+    );
+}

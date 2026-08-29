@@ -6669,3 +6669,21 @@ mod pyvalue_round21_tests {
         let _ = PyValue::Int(1).into_bytes_like();
     }
 }
+
+/// Python's `sep.join(parts)` for BYTES (`b"".join(data_parts)` —
+/// urllib3's chunked response assembly): concatenate the byte slices
+/// with the separator between them. A str element would be CPython's
+/// TypeError — the typed signature (Vec<Vec<u8>>) makes a str element a
+/// loud build error instead.
+pub fn bytes_join(sep: &[u8], parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        parts.iter().map(Vec::len).sum::<usize>() + sep.len().saturating_mul(parts.len().saturating_sub(1)),
+    );
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(sep);
+        }
+        out.extend_from_slice(part);
+    }
+    out
+}

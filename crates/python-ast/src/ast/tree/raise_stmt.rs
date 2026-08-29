@@ -95,8 +95,13 @@ impl CodeGen for Raise {
                 let mut tokens =
                     exception_value(&exc, ctx.clone(), options.clone(), symbols.clone())?;
                 if let Some(cause) = self.cause {
-                    // `raise X from Y`: keep the cause visible in the message
-                    // rather than dropping it.
+                    // `raise X from None` — CPython sets the cause to None
+                    // (no cause text at all); the `None` literal cannot
+                    // format either (E0277 ×17 in the corpus). Other
+                    // causes keep the documented §12.3 folding.
+                    if crate::is_none_expr(&cause) {
+                        // fall through with the plain message
+                    } else {
                     let cause_tokens = cause.to_rust(ctx.clone(), options, symbols)?;
                     tokens = quote! {
                         {
@@ -106,6 +111,7 @@ impl CodeGen for Raise {
                             __rython_raised
                         }
                     };
+                    }
                 }
                 tokens
             }
