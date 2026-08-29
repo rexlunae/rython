@@ -18,11 +18,17 @@
 use crate::PyException;
 
 /// The response object urlopen returns (CPython's http.client.HTTPResponse
-/// surface: `.status`, `read()`, `getcode()`, `geturl()`, `getheader()`).
+/// surface: `.status`, `.version`, `.reason`, `read()`, `getcode()`,
+/// `geturl()`, `getheader()`).
 #[derive(Debug)]
 pub struct HTTPResponse {
     /// Python `resp.status` (an attribute in CPython, a pub field here).
     pub status: i64,
+    /// Python `resp.version` — the HTTP version (10 for HTTP/1.0, 11 for
+    /// HTTP/1.1).
+    pub version: i64,
+    /// Python `resp.reason` — the status phrase ("OK", "Not Found", ...).
+    pub reason: String,
     url: String,
     body: Vec<u8>,
     pos: usize,
@@ -88,8 +94,20 @@ pub fn urlopen<S: AsRef<str>>(url: S) -> Result<HTTPResponse, PyException> {
                 .body_mut()
                 .read_to_vec()
                 .map_err(|e| PyException::new("URLError", format!("<urlopen error {}>", e)))?;
+            let version = match resp.version() {
+                ureq::http::Version::HTTP_10 => 10,
+                ureq::http::Version::HTTP_11 => 11,
+                _ => 11,
+            };
+            let reason = resp
+                .status()
+                .canonical_reason()
+                .unwrap_or("")
+                .to_string();
             Ok(HTTPResponse {
                 status,
+                version,
+                reason,
                 url: url.to_string(),
                 body,
                 pos: 0,

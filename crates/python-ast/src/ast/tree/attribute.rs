@@ -1,4 +1,5 @@
 use proc_macro2::TokenStream;
+use quote::format_ident;
 use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyTypeMethods};
 use quote::quote;
 
@@ -391,8 +392,9 @@ impl<'a> CodeGen for Attribute {
         // is `@property def url`): the property lowers as a plain method
         // returning Result, so the read routes to the getter CALL and
         // unwraps (`self.url()?`). Computed before the moves below.
-        let property_getter = crate::receiver_class(&self.value, &ctx, &symbols, &options)
-            .is_some_and(|(class, _)| class.has_property_getter(&self.attr));
+        let property_getter =
+            crate::receiver_class_for_read(&self.value, &ctx, &symbols, &options)
+                .is_some_and(|(class, _)| class.has_property_getter(&self.attr));
         let warnings = options.definition_warnings.clone();
         // Issue #137's Option-aware access: a READ through an
         // Option-typed receiver (`self.timeout.connect_timeout` where the
@@ -404,6 +406,14 @@ impl<'a> CodeGen for Attribute {
         // reads already); guarded access stays exact. Computed BEFORE
         // `self.value` is moved by the to_rust below.
         let option_receiver = receiver_option_inner(&self.value, &ctx, &symbols, &options);
+        // The generic trait-default context (`Self: {Class}Trait`), captured
+        // before `ctx` is moved: the base-accessor hops generated below must
+        // be qualified with the OWN trait to dodge the own-vs-ancestor
+        // ambiguity (E0034).
+        let trait_ctx_class: Option<String> = match &ctx {
+            CodeGenContext::Trait { class, generic: true, .. } => Some(class.clone()),
+            _ => None,
+        };
         let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
         if let Some(_inner) = option_receiver {
             let attr_name = self.attr.clone();
@@ -610,8 +620,23 @@ impl<'a> CodeGen for Attribute {
                     // accessor clones it out (an ancestor's field is not on
                     // the generic Self; a bare field access would move out
                     // of the shared reference).
-                    let chain = base_accessor_chain(depth);
-                    Ok(quote!(#value_tokens #chain.#attr()))
+                    //
+                    // In a GENERIC trait default the first base hop is
+                    // ambiguous (E0034): the own trait AND every ancestor
+                    // trait declare `base`, each returning ITS own base
+                    // type. Qualify the first link with the own trait; the
+                    // remaining hops land on concrete types, where the
+                    // inherent accessor wins.
+                    if let Some(class) = &trait_ctx_class {
+                        let trait_name = format_ident!("{}Trait", class);
+                        let rest = base_accessor_chain(depth.saturating_sub(1));
+                        Ok(quote!(
+                            <Self as #trait_name>::base(#value_tokens) #rest.#attr()
+                        ))
+                    } else {
+                        let chain = base_accessor_chain(depth);
+                        Ok(quote!(#value_tokens #chain.#attr()))
+                    }
                 }
             }
         }
@@ -718,8 +743,19 @@ pub(crate) fn to_rust_place_expr(
                     Ok(quote!(#recv_place #chain.#attr_ident))
                 }
                 Some(FieldRewrite::AccessorChain { depth }) => {
-                    let chain = base_mut_accessor_chain(depth);
-                    Ok(quote!(#recv_place #chain.#attr_ident))
+                    // The mutable twin of the load form's qualification
+                    // (see above): the first base_mut hop on the generic
+                    // Self is ambiguous between the own trait and the
+                    // ancestor traits — qualify it.
+                    let place = if let CodeGenContext::Trait { class, generic: true, .. } = &ctx {
+                        let trait_name = format_ident!("{}Trait", class);
+                        let rest = base_mut_accessor_chain(depth.saturating_sub(1));
+                        quote!(<Self as #trait_name>::base_mut(#recv_place) #rest)
+                    } else {
+                        let chain = base_mut_accessor_chain(depth);
+                        quote!(#recv_place #chain)
+                    };
+                    Ok(quote!(#place.#attr_ident))
                 }
             }
         }
@@ -799,7 +835,7 @@ pub(crate) fn class_field_access(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<FieldRewrite> {
-    let (class, class_symbols) = crate::receiver_class(value, ctx, symbols, options)?;
+    let (class, class_symbols) = crate::receiver_class_for_read(value, ctx, symbols, options)?;
     let depth = class.field_owner_depth(attr, &class_symbols, options)?;
     let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
     if depth == 0 {

@@ -7817,7 +7817,17 @@ pub(crate) fn receiver_class(
         }
         _ => return None,
     };
-    match class_symbols.get(&class_name) {
+    receiver_class_tail(&class_name, class_symbols, options)
+}
+
+/// Resolve a class NAME to its ClassDef (and the defining module's symbol
+/// table): same-module, or an imported class through its defining module.
+fn receiver_class_tail(
+    class_name: &str,
+    class_symbols: SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    match class_symbols.get(class_name) {
         Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), class_symbols)),
         // An imported class (`from .animals import Dog`): the binding is a
         // name, so resolve through the DEFINING module's AST, where the
@@ -7826,13 +7836,73 @@ pub(crate) fn receiver_class(
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
             if options.module_defs.contains_key(&path) {
-                crate::module_class_def(options, &path, &class_name)
+                crate::module_class_def(options, &path, class_name)
             } else {
                 None
             }
         }
         _ => None,
     }
+}
+
+/// The attribute-READ path's receiver resolution: [`receiver_class`] plus
+/// the FACTORY-LOCAL shapes (`x = self._make()` / `x = imported_factory(
+/// ...)` whose return annotation names the class). The attribute path
+/// needs these so PROPERTY reads and base-chain field walks route
+/// correctly on such locals (`timeout_obj.connect_timeout` — urllib3,
+/// whose `_get_timeout` returns `Timeout`; issue #137's E0615 cluster).
+/// The METHOD-DISPATCH path deliberately keeps the conservative
+/// [`receiver_class`]: resolving a callee's full signature from a
+/// factory-inferred receiver perturbs dropped-default inlining (E0425
+/// regressions) with no compensating gain.
+pub(crate) fn receiver_class_for_read(
+    recv: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    if let Some(r) = receiver_class(recv, ctx, symbols, options) {
+        return Some(r);
+    }
+    let ExprType::Name(n) = recv else {
+        return None;
+    };
+    let Some(SymbolTableNode::Assign {
+        value: ExprType::Call(call),
+        ..
+    }) = symbols.get(&n.id)
+    else {
+        return None;
+    };
+    let class_name = match call.func.as_ref() {
+        // A SELF-METHOD factory: `c = self._make()` — the class comes
+        // from the method's return annotation. Only the bare `self`
+        // receiver: a deeper receiver would recurse through arbitrary
+        // assign chains (cycle risk).
+        ExprType::Attribute(attr)
+            if matches!(
+                attr.value.as_ref(),
+                ExprType::Name(s) if s.id == "self"
+            ) =>
+        {
+            let (owner, _) = receiver_class(&attr.value, ctx, symbols, options)?;
+            let method = owner.methods().find(|m| m.name == attr.attr)?;
+            method.return_class_name(options)?
+        }
+        // An IMPORTED factory (`parsed_url = parse_url(url)` — urllib3,
+        // whose parse_url is imported from util.url): resolve the function
+        // through its defining module and take its return class.
+        ExprType::Name(cn) => {
+            let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id) else {
+                return None;
+            };
+            let path = i.resolved_module_path(options);
+            let (f, _) = crate::module_function_def(options, &path, &cn.id)?;
+            f.return_class_name(options)?
+        }
+        _ => return None,
+    };
+    receiver_class_tail(&class_name, symbols.clone(), options)
 }
 
 /// Whether `recv` is a `self.<field>` expression whose field's inferred
