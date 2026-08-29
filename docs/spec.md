@@ -799,7 +799,10 @@ codes, wrong value kinds, and argument-count mismatches — pinned to
 CPython transcripts. `str(x)`/`print(x)`/f-string `{x}` on a class
 INSTANCE route through the class's `__str__` (falling back to
 `__repr__`, then the default object repr; §12.3 notes the dropped
-address).
+address). A hierarchy trait whose DEFAULT body formats `self` in an
+exception message (`raise ClosedPoolError(self)` — urllib3) declares
+`Self: PyDisplay` on the trait — every implementor carries the
+generated impl, so the bound is always satisfiable (round 41).
 Deliberate hole: **sets have no `repr`** — printing a set would expose
 unordered iteration, so it is a compile error rather than
 nondeterministic output.

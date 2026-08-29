@@ -5748,6 +5748,61 @@ fn boxed_union_param_accepts_none_like_python() {
 }
 
 #[test]
+fn hierarchy_trait_display_bound_allows_self_in_messages() {
+    // Round 41: a trait-DEFAULT body that formats `self` in an exception
+    // message (`raise PoolError(self)` — urllib3's _get_conn raises
+    // ClosedPoolError(self)) lowers through py_display, which needs
+    // `Self: PyDisplay`. The generated hierarchy trait now declares the
+    // bound (every implementor carries the round-34 PyDisplay impl).
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("dispbound");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class PoolError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Base:\n",
+            "    def __init__(self):\n",
+            "        self.x = 1\n",
+            "\n",
+            "class Pool(Base):\n",
+            "    def __str__(self) -> str:\n",
+            "        return \"Pool<%d>\" % self.x\n",
+            "    def _get(self):\n",
+            "        raise PoolError(self)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    p = Pool()\n",
+            "    print(str(p))\n",
+            "    try:\n",
+            "        p._get()\n",
+            "    except Exception as e:\n",
+            "        print(e)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["Pool<1>", "Pool<1>"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned
