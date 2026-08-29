@@ -404,6 +404,132 @@ impl CodeGen for Compare {
 
                 _ => return Err(err_from(CompareNotYetImplemented(self)).into()),
             };
+            // An OPTION-typed LHS (`amt != 0` where amt is `int | None` —
+            // urllib3's _read_next_chunk, guarded by `amt is not None`):
+            // the runtime PyEq/PyNe/PyLt blanket impls need
+            // `Option<i64>: PartialEq<i64>`, which does not exist (Option
+            // only compares with Option). Python compares the INNER value
+            // when non-None; a None LHS answers Python's equality
+            // semantics (`None == x` is False, `None != x` is True — the
+            // values are merely unequal) while an ORDERED compare on None
+            // is CPython's TypeError — a loud §12.2 panic with the
+            // message. The `is None` guard in real code makes the panic
+            // unreachable; the equality answers are always reachable. The
+            // py_* six ops are wrapped; `is`/`is not`/`in` keep their own
+            // None-aware lowerings.
+            let tokens = if let crate::TypeInfo::Option(inner) =
+                crate::infer_type(left_ast, &options, &symbols)
+            {
+                let inner_ty = (*inner).clone();
+                let is_py_cmp = matches!(
+                    op,
+                    Compares::Eq
+                        | Compares::NotEq
+                        | Compares::Lt
+                        | Compares::LtE
+                        | Compares::Gt
+                        | Compares::GtE
+                );
+                if is_py_cmp {
+                    // An OPTION-typed comparator (`amt < self.chunk_left`
+                    // where BOTH are `int | None` — urllib3's
+                    // _handle_chunk): unwrap it the same way, with the
+                    // loud ordered-compare panic (both sides are guarded
+                    // `is not None`).
+                    fn type_name(t: &crate::TypeInfo) -> &'static str {
+                        match t {
+                            crate::TypeInfo::Int => "int",
+                            crate::TypeInfo::Float => "float",
+                            crate::TypeInfo::String | crate::TypeInfo::StrRef => "str",
+                            crate::TypeInfo::Bytes => "bytes",
+                            _ => "NoneType",
+                        }
+                    }
+                    let comparator = if matches!(
+                        crate::infer_type(comparator_ast, &options, &symbols),
+                        crate::TypeInfo::Option(_)
+                    ) || matches!(
+                        comparator_ast,
+                        crate::ExprType::Attribute(attr)
+                            if matches!(
+                                attr.value.as_ref(),
+                                crate::ExprType::Name(n) if n.id == "self"
+                            )
+                                && crate::ast::tree::aug_assign::self_field_rust_ty(
+                                    &attr.attr,
+                                    &ctx,
+                                    &options,
+                                    &symbols,
+                                )
+                                .is_some_and(|t| t.starts_with("Option <"))
+                    )
+                    {
+                        let cmp_ty = type_name(&inner_ty);
+                        let op_name = match op {
+                            Compares::Eq => "==",
+                            Compares::NotEq => "!=",
+                            Compares::Lt => "<",
+                            Compares::LtE => "<=",
+                            Compares::Gt => ">",
+                            Compares::GtE => ">=",
+                            _ => "?",
+                        };
+                        let msg = format!(
+                            "'{}' not supported between instances of 'NoneType' and '{}'",
+                            op_name, cmp_ty
+                        );
+                        quote! {
+                            match (#comparator).clone() {
+                                Some(__rython_r) => __rython_r,
+                                None => panic!(#msg),
+                            }
+                        }
+                    } else {
+                        quote!(#comparator)
+                    };
+                    let inner_cmp = match op {
+                        Compares::Eq => quote!((__rython_v).py_eq(&(#comparator))),
+                        Compares::NotEq => quote!((__rython_v).py_ne(&(#comparator))),
+                        Compares::Lt => quote!((__rython_v).py_lt(&(#comparator))),
+                        Compares::LtE => quote!((__rython_v).py_le(&(#comparator))),
+                        Compares::Gt => quote!((__rython_v).py_gt(&(#comparator))),
+                        Compares::GtE => quote!((__rython_v).py_ge(&(#comparator))),
+                        _ => unreachable!(),
+                    };
+                    // Equality with None is not an error (Python answers
+                    // False/True); ordered comparison of None is a
+                    // TypeError.
+                    let none_arm = match op {
+                        Compares::Eq => quote!(false),
+                        Compares::NotEq => quote!(true),
+                        _ => {
+                            let op_name = match op {
+                                Compares::Lt => "<",
+                                Compares::LtE => "<=",
+                                Compares::Gt => ">",
+                                Compares::GtE => ">=",
+                                _ => "?",
+                            };
+                            let ty_name = type_name(&inner_ty);
+                            let msg = format!(
+                                "'{}' not supported between instances of 'NoneType' and '{}'",
+                                op_name, ty_name
+                            );
+                            quote!(panic!(#msg))
+                        }
+                    };
+                    quote! {
+                        match (#left).clone() {
+                            Some(__rython_v) => #inner_cmp,
+                            None => #none_arm,
+                        }
+                    }
+                } else {
+                    tokens
+                }
+            } else {
+                tokens
+            };
 
             index += 1;
             left = comparator;

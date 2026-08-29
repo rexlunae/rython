@@ -3164,6 +3164,16 @@ pub(crate) fn expr_yields_option(
             };
             arm(&e.body) || arm(&e.orelse)
         }
+        // `a and b` / `a or b` yield an Option when an operand is an
+        // Option: the operand-returning fold returns the Option (or
+        // wraps the plain arm), so the BoolOp's value IS an Option — a
+        // store into an Option slot passes it through instead of
+        // double-wrapping (`self.ca_certs = ca_certs and
+        // expanduser(ca_certs)` — urllib3).
+        ExprType::BoolOp(bo) => bo
+            .values
+            .iter()
+            .any(|v| expr_yields_option(v, options, symbols)),
         _ => false,
     }
 }

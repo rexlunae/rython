@@ -12456,6 +12456,105 @@ fn ununifiable_operands_keep_the_loud_boolean_approximation() {
 }
 
 #[test]
+fn option_and_untyped_call_uses_the_option_arm() {
+    // Round 43: `ca and expanduser(ca)` (urllib3's ca_certs) — the first
+    // operand is Option<String>, the second is a CALL whose return type
+    // infers PyObject (method/module-call returns are unresolved) but
+    // renders the inner String. The fold must still use the
+    // operand-returning Option arm (Some-wrap the truthy arm), not the
+    // `&&` boolean approximation (which rustc rejects — Option has no
+    // bool operator).
+    let out = compile(
+        "def pick(ca: str | None, fn) -> str | None:\n    return ca and fn(ca)\n",
+        "andcall.py",
+    );
+    assert!(
+        out.contains("__rython_and") && out.contains("is_truthy () { Some (")
+            || out.contains("__rython_and") && out.contains("is_truthy() { Some("),
+        "Option and an untyped call must use the operand-returning fold: {}",
+        out
+    );
+    assert!(
+        !out.contains("(ca) && (fn"),
+        "must not fall back to the && approximation: {}",
+        out
+    );
+}
+
+#[test]
+fn option_or_string_literal_owns_the_literal() {
+    // Round 43: `scheme or "http"` (urllib3) — the falsy arm Some-wraps
+    // the string literal and OWNS it (`Some(("http").to_string())`), so
+    // the Option<String> slot typechecks (a raw &str literal would make
+    // Option<&str> vs Option<String>).
+    let out = compile(
+        "def pick(scheme: str | None) -> str | None:\n    return scheme or \"http\"\n",
+        "orlit.py",
+    );
+    assert!(
+        out.contains("Some ((\"http\") . to_string ())") || out.contains("Some((\"http\").to_string())"),
+        "the literal arm must own the string: {}",
+        out
+    );
+}
+
+#[test]
+fn option_lhs_compare_unwraps_with_equality_semantics() {
+    // Round 43: `amt != 0` where amt is `int | None` (urllib3's
+    // _read_next_chunk) — the Option LHS unwraps the inner for the
+    // comparison; a None LHS answers Python's EQUALITY semantics
+    // (`None == x` is False, `None != x` is True), while an ORDERED
+    // compare on None is CPython's TypeError — a loud §12.2 panic with
+    // the exact message.
+    let out = compile(
+        "def ne(amt: int | None) -> bool:\n    return amt != 0\n\n\
+         def eq(amt: int | None) -> bool:\n    return amt == 0\n\n\
+         def lt(amt: int | None) -> bool:\n    return amt < 5\n",
+        "optcmp.py",
+    );
+    assert!(
+        out.contains("Some (__rython_v) => (__rython_v) . py_ne (& (0))")
+            || out.contains("Some(__rython_v) => (__rython_v).py_ne(&(0))"),
+        "the inner value must compare: {}",
+        out
+    );
+    assert!(
+        out.contains("None => true") && out.contains("None => false"),
+        "a None LHS must answer Python's equality semantics: {}",
+        out
+    );
+    assert!(
+        out.contains("'<' not supported between instances of 'NoneType' and 'int'"),
+        "an ordered compare on None must panic with CPython's message: {}",
+        out
+    );
+}
+
+#[test]
+fn option_both_sides_compare_unwrap_both() {
+    // Round 43: `amt < self.chunk_left` where BOTH are `int | None`
+    // (urllib3's _handle_chunk, guarded `is not None` on both): each
+    // side unwraps with the loud panic.
+    let out = compile(
+        "class R:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.chunk_left: int | None = None\n\
+         \x20   def f(self, amt: int | None) -> bool:\n\
+         \x20       if amt is not None and self.chunk_left is not None:\n\
+         \x20           return amt < self.chunk_left\n\
+         \x20       return False\n",
+        "optcmp2.py",
+    );
+    assert!(
+        out.contains("match (self . chunk_left) . clone ()")
+            || out.contains("match (self.chunk_left()).clone()")
+            || out.contains("match (self.chunk_left).clone()"),
+        "the Option comparator must be unwrapped too: {}",
+        out
+    );
+}
+
+#[test]
 fn optional_str_literal_arguments_own_themselves() {
     let out = compile(
         "def pick(ca: str | None) -> str | None:\n    return ca\n\ndef use() -> str | None:\n    return pick(\"x\")\n",

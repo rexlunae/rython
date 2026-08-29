@@ -245,10 +245,15 @@ the operands' types unify: `a and b = if truthy(a) { b } else { a }`,
 `a or b = if truthy(a) { a } else { b }`, and when exactly one operand
 is `Option<T>` with the other `T`, the `T` arm wraps in `Some` (the
 `ca_certs and expanduser(ca_certs)` shape — `str | None` and `str`).
-An ununifiable mix (`bool and str`, two different types) falls back to
-Rust's `&&`/`||`, which fails loudly in rustc (§12.1) rather than
-silently returning a bool where Python returns a value. `a or None`
-gets Option semantics via the same unification.
+The `Option` arm also fires when the other operand's type is UNKNOWN (a
+call whose return is unresolved but renders the inner type) or a string
+LITERAL (which is owned at the wrap — `Some(("http").to_string())` for
+`scheme or "http"`), and a BoolOp with an Option operand yields an
+Option for store purposes (round 43). An ununifiable mix (`bool and
+str`, two different types) falls back to Rust's `&&`/`||`, which fails
+loudly in rustc (§12.1) rather than silently returning a bool where
+Python returns a value. `a or None` gets Option semantics via the same
+unification.
 
 ### 4.3 f-strings and `str.format`
 
@@ -1165,6 +1170,13 @@ catchable `PyException`:
 - Arithmetic on `None` (including aug-assign `-=`/`|=` on an `Option`
   target whose value is `None`, and a `-` whose RHS is `None` — the
   Option-unwrap panics carry CPython's TypeError text).
+- An ORDERED comparison (`<`/`<=`/`>`/`>=`) on an `Option` whose value
+  is `None` (`amt < self.chunk_left` where either is `int | None` —
+  urllib3) — CPython's `'<' not supported between instances of
+  'NoneType' and 'int'` TypeError, but a panic with the exact text (the
+  `is not None` guard in real code prevents it). Equality (`==`/`!=`)
+  with None is NOT a panic: Python answers `False`/`True`, and the
+  Option LHS comparison unwraps the inner value accordingly (round 43).
 - An exception escaping a lambda body.
 - `in` on a boxed value whose member is not a container (`1 in boxed_int`),
   or a non-str probe on the boxed str member — CPython 3.11's TypeError
