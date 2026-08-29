@@ -12776,3 +12776,28 @@ fn set_literal_call_uses_the_runtime_conversion() {
         out
     );
 }
+
+#[test]
+fn call_through_a_boxed_value_drops_loudly() {
+    // Issue #122's callable-as-value divergence: a call whose callee is a
+    // boxed/String/Option VALUE (a `pool_cls(...)`-style class-name local,
+    // or an unresolvable self member like `self._tunnel()` — a method
+    // inherited from an external base) lowers to the warned no-op (the
+    // boxed None), never a `value(...)` E0618 string-call or an E0599.
+    let out = compile_with_warnings(
+        concat!(
+            "def take(cb) -> str:\n",
+            "    return cb(\"x\")\n",
+            "\n",
+            "def run():\n",
+            "    f = take\n",
+            "    return f(\"y\")\n",
+        ),
+        "cb.py",
+    );
+    assert!(
+        out.0.contains("PyValue :: None_") || out.0.contains("PyValue::None_"),
+        "the call through the callable value must lower to the boxed None: {}",
+        out.0
+    );
+}
