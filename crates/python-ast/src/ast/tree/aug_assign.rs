@@ -170,6 +170,12 @@ impl CodeGen for AugAssign {
             });
         }
 
+        // The `self.<field>` target's Rust type, captured before the moves
+        // below: an Option or boxed field changes the aug-op (the inner
+        // arithmetic).
+        let target_field_rust_ty =
+            target_field_ty(&self.target, &ctx, &options, &symbols);
+
         // An attribute target (`self.age += 1`) is a read-modify-write on a
         // place. In a generic trait default the LOAD accessor clones
         // (`self.age()`) while the STORE must go through the mutable accessor
@@ -195,6 +201,13 @@ impl CodeGen for AugAssign {
                 (t.clone(), t)
             }
         };
+        // Whether the RHS is itself Option-typed (needed by the Option
+        // target arm below) — captured before `to_rust` moves `self.value`.
+        let value_is_option = matches!(
+            crate::infer_type(&self.value, &options, &symbols),
+            crate::TypeInfo::Option(_)
+        );
+
         let value = self.value.to_rust(ctx, options, symbols)?;
 
         // Generate the appropriate augmented assignment operator
@@ -202,7 +215,53 @@ impl CodeGen for AugAssign {
             // `+=` mirrors Python's `+` (string concat, list concat,
             // numeric promotion) via PyAdd.
             BinOps::Add => Ok(quote!(#target = (#target_load).py_add(&(#value)))),
-            BinOps::Sub => Ok(quote!(#target -= #value)),
+            BinOps::Sub => {
+                // An OPTION-typed target (`self.length_remaining -= n`
+                // where the field is `i64 | None` — urllib3's
+                // HTTPResponse): the Python guards with `is not None`
+                // before subtracting; the aug-assign operates on the
+                // INNER value. A None here is CPython's TypeError — a
+                // loud §12.2 panic with the message (the guard in real
+                // code prevents it). A BOXED (PyValue) target does the
+                // read-modify-write through the runtime py_sub (the
+                // boxed int arithmetic).
+                match &target_field_rust_ty {
+                    Some(t) if t.starts_with("Option <") => {
+                        // The RHS may itself be Option-typed
+                        // (`self.chunk_left -= amt` where amt is
+                        // `int | None` — urllib3's _fp_read): unwrap both.
+                        let value = if value_is_option {
+                            quote! {
+                                match (#value).clone() {
+                                    Some(__rython_w) => __rython_w,
+                                    None => panic!(
+                                        "unsupported operand type(s) for -=: 'NoneType' and 'i64'"
+                                    ),
+                                }
+                            }
+                        } else {
+                            quote!(#value)
+                        };
+                        Ok(quote! {
+                            #target = {
+                                let __rython_w = #value;
+                                match (#target_load).clone() {
+                                    Some(__rython_v) => {
+                                        Some((__rython_v).py_sub(&__rython_w))
+                                    }
+                                    None => panic!(
+                                        "unsupported operand type(s) for -=: 'NoneType' and 'i64'"
+                                    ),
+                                }
+                            }
+                        })
+                    }
+                    Some(t) if t == "stdpython :: PyValue" => {
+                        Ok(quote!(#target = (#target_load).py_sub(&(#value))))
+                    }
+                    _ => Ok(quote!(#target -= #value)),
+                }
+            }
             BinOps::Mult => Ok(quote!(#target *= #value)),
             // Python's `/` is TRUE division: `x /= 2` on an int yields a
             // float. Route through py_div (numeric → f64, numpy arrays →
@@ -218,7 +277,23 @@ impl CodeGen for AugAssign {
             BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target_load, #value)?)),
             BinOps::Mod => Ok(quote!(#target = py_mod(#target_load, #value)?)),
             BinOps::BitAnd => Ok(quote!(#target &= #value)),
-            BinOps::BitOr => Ok(quote!(#target |= #value)),
+            BinOps::BitOr => {
+                // An Option-typed target (`ssl_options |= X` where the
+                // local is `int | None` — urllib3's ssl_): OR the inner
+                // value; a None is CPython's TypeError (loud §12.2 panic
+                // — the guard in real code prevents it).
+                match &target_field_rust_ty {
+                    Some(t) if t.starts_with("Option <") => Ok(quote! {
+                        #target = match (#target_load).clone() {
+                            Some(__rython_v) => Some(__rython_v | (#value)),
+                            None => panic!(
+                                "unsupported operand type(s) for |=: 'NoneType' and 'i64'"
+                            ),
+                        }
+                    }),
+                    _ => Ok(quote!(#target |= #value)),
+                }
+            }
             BinOps::BitXor => Ok(quote!(#target ^= #value)),
             BinOps::LShift => Ok(quote!(#target <<= #value)),
             BinOps::RShift => Ok(quote!(#target >>= #value)),
@@ -284,4 +359,60 @@ mod tests {
     create_parse_test!(test_bitxor_assign, "x ^= 7", "test.py");
     create_parse_test!(test_lshift_assign, "x <<= 2", "test.py");
     create_parse_test!(test_rshift_assign, "x >>= 3", "test.py");
+}
+
+/// The Rust type of a `self.<field>` through the class table.
+pub(crate) fn self_field_rust_ty(
+    field: &str,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
+    let class_name = ctx.enclosing_class_name()?;
+    let crate::SymbolTableNode::ClassDef(class) = symbols.get(class_name)? else {
+        return None;
+    };
+    let fields = class.infer_fields(symbols, options).ok()?;
+    fields
+        .iter()
+        .find(|(n, _)| *n == field)
+        .map(|(_, t)| t.to_string())
+}
+
+/// The RUST type of an aug-assign target, when it is known: a
+/// `self.<field>` through the class table, an OPTION-typed name
+/// (`connect -= 1` where the parameter is `int | None` — urllib3's
+/// Retry), or a local assigned from a self-field (`total = self.total`).
+/// An Option or boxed target needs the inner arithmetic — the Option
+/// unwrap or the runtime py_sub.
+fn target_field_ty(
+    target: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
+    match target {
+        ExprType::Attribute(attr)
+            if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+        {
+            self_field_rust_ty(&attr.attr, ctx, options, symbols)
+        }
+        ExprType::Name(n) => {
+            if let Some(t) = options.name_types.get(&n.id) {
+                return Some(t.to_rust_type().to_string());
+            }
+            // A local assigned from a self-field (`total = self.total` —
+            // urllib3's Retry): the field's type.
+            if let Some(crate::SymbolTableNode::Assign {
+                value: ExprType::Attribute(attr),
+                ..
+            }) = symbols.get(&n.id)
+                && matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+            {
+                return self_field_rust_ty(&attr.attr, ctx, options, symbols);
+            }
+            None
+        }
+        _ => None,
+    }
 }

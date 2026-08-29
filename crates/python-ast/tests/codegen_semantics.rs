@@ -918,6 +918,152 @@ fn power_aug_assign_uses_py_pow() {
 }
 
 #[test]
+fn option_field_aug_assign_unwraps_inner() {
+    // A `-=` on an `int | None` field (urllib3's `self.chunk_left -=
+    // ...`): the target is Option, so the read-modify-write must operate
+    // on the INNER value through the runtime py_sub, not Rust's `-=` on
+    // the Option (which has no such operator). A None target is CPython's
+    // TypeError — a loud §12.2 panic with the message (the `is not None`
+    // guard in real code prevents it).
+    let out = compile(
+        "class Counter:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.count: int | None = None\n\
+         \x20   def dec(self, n: i64):\n\
+         \x20       if self.count is not None:\n\
+         \x20           self.count -= n\n",
+        "optdecr.py",
+    );
+    assert!(
+        out.contains("py_sub (& __rython_w)") || out.contains("py_sub(&__rython_w)"),
+        "Option-target -= must unwrap and py_sub the inner value: {}",
+        out
+    );
+    assert!(
+        out.contains("unsupported operand type(s) for -=: 'NoneType' and 'i64'"),
+        "the None-target panic must carry CPython's message: {}",
+        out
+    );
+}
+
+#[test]
+fn option_field_aug_assign_pyvalue_target_uses_runtime() {
+    // A `-=` on a boxed PyValue field routes through the runtime py_sub
+    // (the boxed int arithmetic) — the read-modify-write on the box.
+    let out = compile(
+        "class Counter:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.count: object = 5\n\
+         \x20   def dec(self, n):\n\
+         \x20       self.count -= n\n",
+        "pyvaldecr.py",
+    );
+    assert!(
+        out.contains("py_sub (& (") || out.contains("py_sub(&("),
+        "PyValue-target -= must route through py_sub: {}",
+        out
+    );
+}
+
+#[test]
+fn option_field_bitor_aug_assign_unwraps_inner() {
+    // A `|=` on an `int | None` local (urllib3's `options |= ...` after
+    // `options = 0` inside the None guard): the Option unwrap is the INNER
+    // value OR'd with the RHS.
+    let out = compile(
+        "def orit(x: int | None) -> int | None:\n\
+         \x20   if x is None:\n\
+         \x20       x = 0\n\
+         \x20       x |= 2\n\
+         \x20   return x\n",
+        "optor.py",
+    );
+    assert!(
+        out.contains("__rython_v | (2)") || out.contains("__rython_v |(2)"),
+        "Option-target |= must OR the inner value: {}",
+        out
+    );
+    assert!(
+        out.contains("unsupported operand type(s) for |=: 'NoneType' and 'i64'"),
+        "the None-target panic must carry CPython's message: {}",
+        out
+    );
+}
+
+#[test]
+fn sub_with_option_rhs_unwraps_loudly() {
+    // `x - y` where y is `int | None` (urllib3's `self.chunk_left - amt`
+    // and `time.monotonic() - self._start_connect`): the runtime Option
+    // blanket unwraps an Option LHS, but a None RHS needs a bound the
+    // blanket cannot provide — unwrap the RHS with the loud TypeError
+    // panic instead (guarded code never hits it).
+    let out = compile(
+        "def diff(x: float, y: float | None) -> float:\n\
+         \x20   return x - y\n",
+        "optdiff.py",
+    );
+    assert!(
+        out.contains("match (y) . clone ()") || out.contains("match (y).clone()"),
+        "Option-typed RHS of - must be unwrapped: {}",
+        out
+    );
+    assert!(
+        out.contains("unsupported operand type(s) for -: 'float' and 'NoneType'"),
+        "the RHS-None panic must name the LHS type: {}",
+        out
+    );
+}
+
+#[test]
+fn option_field_store_wraps_in_some() {
+    // A plain value stored into an `int | None` field (urllib3's
+    // `self._start_connect = time.monotonic()` and `self.chunk_left =
+    // self.chunk_left - amt`) wraps in Some — Python's `int | None` slot
+    // absorbs a plain int. None stores keep plain None; an already-Option
+    // value stores through unchanged.
+    let out = compile(
+        "class Timer:\n\
+         \x20   def __init__(self):\n\
+         \x20       self._start: float | None = None\n\
+         \x20   def start(self):\n\
+         \x20       self._start = 1.0\n\
+         \x20   def reset(self):\n\
+         \x20       self._start = None\n",
+        "optstore.py",
+    );
+    assert!(
+        out.contains("self . _start = Some (1.0)") || out.contains("self._start = Some(1.0)"),
+        "a plain value into an Option field must wrap in Some: {}",
+        out
+    );
+    assert!(
+        out.contains("self . _start = None") || out.contains("self._start = None"),
+        "a None store into an Option field stays plain None: {}",
+        out
+    );
+}
+
+#[test]
+fn option_field_store_of_option_value_passes_through() {
+    // `self.a = self.b` where BOTH fields are Option must NOT double-wrap
+    // (Some(Some(..))): an already-Option value stores through unchanged.
+    let out = compile(
+        "class Pair:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.a: int | None = None\n\
+         \x20       self.b: int | None = None\n\
+         \x20   def copy(self):\n\
+         \x20       self.a = self.b\n",
+        "optpassthru.py",
+    );
+    assert!(
+        !out.contains("Some (Some") && !out.contains("Some(Some"),
+        "an Option value into an Option field must not double-wrap: {}",
+        out
+    );
+}
+
+#[test]
 fn list_literals_keep_element_types() {
     let out = compile("nums = [1, 2, 3]", "list.py");
     assert!(out.contains("vec ! [1 , 2 , 3]"), "generated: {}", out);

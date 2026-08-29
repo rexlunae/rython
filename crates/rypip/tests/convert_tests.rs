@@ -5623,6 +5623,85 @@ fn string_aug_assign_accumulation_matches_python_transcript() {
 }
 
 #[test]
+fn option_aug_assign_and_option_slot_store_match_python() {
+    // Round 39: `-=`/`|=` on `int | None` targets (urllib3's
+    // `self.chunk_left -= ...`, `options |= ...`) operate on the INNER
+    // value through the runtime py_sub / plain `|`, with a loud §12.2
+    // panic on None (CPython's TypeError); a plain value stored into an
+    // Option-typed field (`self._start_connect = time.monotonic()`,
+    // `self.chunk_left = self.chunk_left - amt`) wraps in Some, and an
+    // Option-typed RHS of `-` unwraps. Transcript pinned against python3.
+    let scratch = Scratch::new("opt-aug");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def chunk_ops(length_remaining: int | None, amt: int | None):\n",
+            "    if length_remaining is not None and amt is not None:\n",
+            "        length_remaining -= amt\n",
+            "    return length_remaining\n",
+            "\n",
+            "class SSLBuilder:\n",
+            "    def __init__(self):\n",
+            "        self.options: int | None = None\n",
+            "    def build(self, options: int | None) -> int | None:\n",
+            "        if options is None:\n",
+            "            options = 0\n",
+            "            options |= 2\n",
+            "        self.options = options\n",
+            "        return self.options\n",
+            "\n",
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.count: int | None = None\n",
+            "    def dec(self, n: int):\n",
+            "        if self.count is not None:\n",
+            "            self.count -= n\n",
+            "    def store_plain(self, v: float):\n",
+            "        self._start = v\n",
+            "        return self._start\n",
+            "    def sub_r(self, amt: int | None):\n",
+            "        if self.count is not None and amt is not None:\n",
+            "            self.count = self.count - amt\n",
+            "        return self.count\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(chunk_ops(10, 3))\n",
+            "    print(chunk_ops(None, 3))\n",
+            "    print(chunk_ops(10, None))\n",
+            "    b = SSLBuilder()\n",
+            "    print(b.build(None))\n",
+            "    print(b.build(4))\n",
+            "    c = Counter()\n",
+            "    c.dec(4)\n",
+            "    print(c.count)\n",
+            "    c.store_plain(2.5)\n",
+            "    print(c._start)\n",
+            "    c.count = 10\n",
+            "    print(c.sub_r(2))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["7", "None", "10", "2", "4", "None", "2.5", "8"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned

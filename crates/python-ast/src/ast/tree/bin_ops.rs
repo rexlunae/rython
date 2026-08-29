@@ -236,10 +236,37 @@ impl CodeGen for BinOp {
         // for scalars, elementwise for NdArray), so `x - y` never moves
         // the variables.
         if matches!(self.op, BinOps::Sub) {
+            // An OPTION-typed RHS (`x - y` where y is `int | None` —
+            // urllib3's `self.chunk_left - amt` and
+            // `time.monotonic() - self._start_connect`): the runtime
+            // Option blanket unwraps an Option LHS, but a None RHS would
+            // need `i64: PySub<Option<i64>>` (not implemented — the
+            // blanket's bound runs the other way). Python raises TypeError
+            // when either operand is None; unwrap the RHS with the loud
+            // §12.2 panic (the `is not None` guard in real code prevents
+            // it). Computed before the operand renders move ctx/options.
+            let option_rhs = is_option_expr(&self.right, &ctx, &options, &symbols);
+            let lhs_name = if option_rhs {
+                py_operand_name(&self.left, &ctx, &options, &symbols)
+            } else {
+                ""
+            };
             let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             let left = anchor_numeric_literal(&self.left, left);
             let right = anchor_numeric_literal(&self.right, right);
+            let right = if option_rhs {
+                let msg = format!(
+                    "unsupported operand type(s) for -: '{}' and 'NoneType'",
+                    lhs_name
+                );
+                quote!(match (#right).clone() {
+                    Some(__rython_w) => __rython_w,
+                    None => panic!(#msg),
+                })
+            } else {
+                right
+            };
             return Ok(quote!((#left).py_sub(&(#right))));
         }
 
@@ -299,6 +326,86 @@ fn anchor_numeric_literal(expr: &ExprType, tokens: TokenStream) -> TokenStream {
         Some(ty) => quote!((#tokens) as #ty),
         None => tokens,
     }
+}
+
+/// Whether an expression lowers to an `Option<...>`: a name typed through
+/// the per-function maps (`amt: int | None` — urllib3's `_handle_chunk`)
+/// or a `self.<field>` whose field is Option (the field table, since
+/// `infer_type` sees only the syntactic shape). Used to unwrap an
+/// Option-typed RHS of `-` (the runtime Option blanket unwraps the LHS).
+fn is_option_expr(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    if matches!(crate::infer_type(expr, options, symbols), crate::TypeInfo::Option(_)) {
+        return true;
+    }
+    if let ExprType::Attribute(attr) = expr
+        && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+    {
+        if let Some(t) = crate::ast::tree::aug_assign::self_field_rust_ty(
+            &attr.attr,
+            ctx,
+            options,
+            symbols,
+        ) {
+            return t.starts_with("Option <");
+        }
+    }
+    false
+}
+
+/// The CPython type name of an operand for the loud TypeError message
+/// when the OTHER operand is None (`x - None`): the LHS's inner type
+/// (`Option<i64>` → `int`, `f64` → `float`). Resolves the same sources
+/// as [`is_option_expr`] — the per-function type maps, a `self.<field>`
+/// through the class table, and `time.monotonic()` (f64).
+fn py_operand_name(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> &'static str {
+    fn operand_name(t: &crate::TypeInfo) -> &'static str {
+        match t {
+            crate::TypeInfo::Int => "int",
+            crate::TypeInfo::Float => "float",
+            crate::TypeInfo::Option(inner) => operand_name(inner.as_ref()),
+            _ => "int",
+        }
+    }
+    let from_infer = operand_name(&crate::infer_type(expr, options, symbols));
+    if from_infer != "int" {
+        return from_infer;
+    }
+    // infer_type sees a `self.<field>` only syntactically (PyObject): the
+    // class-table type carries the inner numeric kind.
+    if let ExprType::Attribute(attr) = expr
+        && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+        && let Some(t) = crate::ast::tree::aug_assign::self_field_rust_ty(
+            &attr.attr,
+            ctx,
+            options,
+            symbols,
+        )
+    {
+        if t.contains("f64") {
+            return "float";
+        }
+        if t.contains("i64") {
+            return "int";
+        }
+    }
+    // `time.monotonic()` returns f64.
+    if let ExprType::Call(call) = expr
+        && let ExprType::Attribute(attr) = call.func.as_ref()
+        && attr.attr == "monotonic"
+    {
+        return "float";
+    }
+    from_infer
 }
 
 #[cfg(test)]
