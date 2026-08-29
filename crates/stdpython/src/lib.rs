@@ -6372,6 +6372,33 @@ where
 {
     PySet::new()
 }
+/// Python's `set(iterable)` conversion for the shapes the codegen
+/// produces: a string literal becomes the set of its characters
+/// (urllib3's `_UNRESERVED_CHARS = set("...")`), and a boxed value the
+/// empty/unknown set. The set-of-one-char-strings model matches CPython's
+/// `set("abc") == {'a','b','c'}`.
+pub fn set<S: AsRef<str>>(s: S) -> crate::HashSet<String> {
+    s.as_ref().chars().map(|c| c.to_string()).collect()
+}
+
+/// A set of strings boxes as a Tuple of Str members (the list-as-tuple
+/// divergence — the boxed model has no Set member; containment matches
+/// members the same way).
+impl From<crate::HashSet<String>> for PyValue {
+    fn from(value: crate::HashSet<String>) -> Self {
+        let mut members: Vec<PyValue> =
+            value.into_iter().map(PyValue::Str).collect();
+        // HashSet iteration order is nondeterministic — sort for a stable
+        // boxed form.
+        members.sort_by(|a, b| match (a, b) {
+            (PyValue::Str(x), PyValue::Str(y)) => x.cmp(y),
+            _ => core::cmp::Ordering::Equal,
+        });
+        PyValue::Tuple(Arc::new(members))
+    }
+}
+
+
 
 /// Helper function for tuple creation (common in compiled code)
 pub fn py_tuple<T>(items: Vec<T>) -> PyTuple<T> {
