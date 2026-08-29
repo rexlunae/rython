@@ -6916,6 +6916,78 @@ impl<'a> CodeGen for Call {
             return Ok(quote!(stdpython::PyValue::None_));
         }
 
+        // A call through a SELF member that is neither a method nor a
+        // field of the receiver's class (`self._tunnel()` — urllib3's
+        // connection.connect, where _tunnel is a method INHERITED FROM
+        // the external http.client base; the dispatch already ruled out
+        // the class's own methods, and the field walk found nothing): the
+        // member is an unmodeled callable VALUE — drop the call loudly
+        // (the callable-as-value divergence, #122), exactly like the
+        // called-parameter arm above.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let Some((class, class_symbols)) =
+                crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+            && !class.methods().any(|m| m.name == attr.attr)
+            && (crate::ast::tree::attribute::class_field_access(
+                &attr.value,
+                &attr.attr,
+                &ctx,
+                &symbols,
+                &options,
+            )
+            .is_none()
+                // A FIELD the model types as the boxed PyValue (the
+                // runtime-modeled accessor — `self._tunnel()` returns a
+                // boxed value, not a callable).
+                || class.infer_fields(&class_symbols, &options).ok().is_some_and(
+                    |fields| {
+                        fields
+                            .iter()
+                            .find(|(n, _)| *n == attr.attr)
+                            .is_some_and(|(_, t)| {
+                                let s = t.to_string();
+                                s == "stdpython :: PyValue" || s == "PyObject"
+                            })
+                    },
+                ))
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "call to `{}.{}(...)` is dropped: the member is neither a \
+                 method nor a field of `{}` (the member is an unmodeled \
+                 callable value — the callable-as-value divergence)",
+                crate::ast::tree::call::expr_chain_spelling(&attr.value),
+                attr.attr,
+                class.name
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+
+        // A call through a VALUE the model cannot hold as a callable
+        // (the callable-as-value divergence, #122): the callee's inferred
+        // type is a boxed value / string / Option — or the callee is
+        // itself a CALL whose result is called (`pool_cls(scheme=...)`
+        // where pool_cls is the class-name string read from
+        // pool_classes_by_scheme) — drop the call loudly, exactly like
+        // the called-parameter arm above.
+        let value_callee = match self.func.as_ref() {
+            ExprType::Call(_) => true,
+            e => matches!(
+                crate::infer_type(e, &options, &symbols),
+                crate::TypeInfo::PyValue
+                    | crate::TypeInfo::String
+                    | crate::TypeInfo::Option(_)
+                    | crate::TypeInfo::PyValueMember(_)
+            ),
+        };
+        if value_callee {
+            options.definition_warnings.borrow_mut().push(format!(
+                "call through value `{}` is dropped (callables cannot be \
+                 runtime values in rython — the callable-as-value divergence)",
+                expr_chain_spelling(self.func.as_ref())
+            ));
+            return Ok(quote!(stdpython::PyValue::None_));
+        }
+
         // A call through a SIBLING-MODULE member that is NOT a module-level
         // function (`http2_probe.acquire_and_get(...)` — urllib3's
         // connection.py, where probe.py's acquire_and_get is a module-level
