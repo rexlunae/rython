@@ -311,6 +311,23 @@ fn infer_type_inner(
             if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id) {
                 return infer_type(value, options, symbols);
             }
+            // A CLASS NAME read as a VALUE (`[ChecksumError]`,
+            // `EXCEPTION_MAP['k']` — botocore's retryhandler): classes as
+            // values lower to their NAME STRINGS — the exception model is
+            // string-tagged, so the name is the class object's only
+            // runtime-relevant data (round 33 design). Direct construction
+            // and isinstance/except never read the name as a value, so
+            // they are unaffected. A same-module ClassDef, an alias of
+            // one, or an IMPORTED class (resolved through its defining
+            // module) all qualify; an imported FUNCTION does not.
+            if matches!(symbols.get(&n.id), Some(SymbolTableNode::ClassDef(_)))
+                || matches!(symbols.get(&n.id), Some(SymbolTableNode::Alias(c))
+                    if matches!(symbols.get(c), Some(SymbolTableNode::ClassDef(_))))
+                || (matches!(symbols.get(&n.id), Some(SymbolTableNode::ImportFrom(_)))
+                    && crate::resolve_class_referenced(&n.id, symbols, options).is_some())
+            {
+                return TypeInfo::String;
+            }
             TypeInfo::PyObject
         }
         ExprType::List(l) => {
@@ -569,6 +586,11 @@ fn builtin_call_type(name: &str) -> Option<TypeInfo> {
         "bool" => TypeInfo::Bool,
         "list" => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
         "dict" => TypeInfo::Dict(Box::new(TypeInfo::PyObject), Box::new(TypeInfo::PyObject)),
+        // `tuple(x)` always yields a tuple — the boxed value (the call's
+        // lowering is PyValue::from(x); round 33's
+        // `return tuple(retryable_exceptions)` in botocore's retryhandler
+        // types the function boxed, so its callers see a PyValue).
+        "tuple" => TypeInfo::PyValue,
         _ => return None,
     })
 }
@@ -670,11 +692,14 @@ pub fn render_typed(
     symbols: SymbolTableScopes,
     expected: Option<TypeInfo>,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    // A class name used as a VALUE (`merge_setting(..., dict_class=OrderedDict)`
-    // — requests' sessions): classes are compile-time types, not runtime
-    // values (the classes-as-values divergence), so the value lowers to the
-    // boxed None. This is a value-position renderer — callees and type
-    // positions never come through here.
+    // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
+    // ..., dict_class=OrderedDict)` — requests' sessions): classes as
+    // values lower to their NAME STRINGS — the exception model is
+    // string-tagged, so the name is the class object's only
+    // runtime-relevant data (round 33 design; the old model dropped the
+    // value to boxed None). This is a value-position renderer — callees
+    // and type positions never come through here; direct construction
+    // and isinstance/except are static and unaffected.
     if let ExprType::Name(n) = expr
         && (matches!(symbols.get(&n.id), Some(SymbolTableNode::ClassDef(_)))
             || matches!(
@@ -687,12 +712,12 @@ pub fn render_typed(
             // resolve through the defining module.
             || crate::ast::tree::call::resolve_construction_class(&n.id, &symbols, &options).is_some())
     {
-        options.definition_warnings.borrow_mut().push(format!(
-            "class `{}` used as a value lowers to the boxed None (classes cannot be \
-             runtime values in rython)",
-            n.id
-        ));
-        return Ok(quote!(stdpython::PyValue::None_));
+        // The RAW Python name — the exception model matches on it (a
+        // raised `ChecksumError` is `PyException::new("ChecksumError",
+        // ...)`, so a class VALUE must carry the same spelling, not the
+        // mangled Rust ident).
+        let name = n.id.clone();
+        return Ok(quote!(#name.to_string()));
     }
     let tokens = expr
         .clone()
@@ -1264,6 +1289,22 @@ fn analyze_statement_types(
                         // everywhere else; this is the one shape where
                         // only infer_type has the operand types.
                         ExprType::BinOp(_) => match (options, symbols) {
+                            (Some(options), Some(symbols)) => {
+                                infer_type(&assign.value, options, symbols)
+                            }
+                            _ => syntactic_type(&assign.value),
+                        },
+                        // A CONTAINER literal likewise needs the
+                        // context-aware inferrer: a dict/list of CLASS
+                        // VALUES (`pool_classes_by_scheme = {"http":
+                        // HTTPConnectionPool}` — urllib3's poolmanager)
+                        // types Dict(String, String) through the
+                        // class-as-value rule (round 33) — the same
+                        // answer the literal LOWERING gives — where
+                        // syntactic_type would see untyped elements and
+                        // the module static boxes the whole dict.
+                        _ if crate::ast::tree::assign::is_container_literal(&assign.value) => match (options, symbols)
+                        {
                             (Some(options), Some(symbols)) => {
                                 infer_type(&assign.value, options, symbols)
                             }
@@ -2494,6 +2535,196 @@ fn count_target_reads(target: &ExprType, info: &mut FunctionTypeInfo) {
             }
         }
         _ => count_expr_reads(target, info),
+    }
+}
+
+/// Whether a name is READ AS A VALUE anywhere in the body. A pure None
+/// check (`x is None` / `x is not None`) does NOT count — issue #117's
+/// None-defaulted unannotated parameters are otherwise the concrete
+/// `Option<()>` (nothing but None can be stored in them), and a store
+/// target is not a read either. A read in any other position means the
+/// parameter genuinely carries a Python value, so it must be typed to
+/// hold one (the boxed `PyValue` — round 33's `retryable_exceptions=None`
+/// in botocore's MaxAttemptsDecorator, stored into a field and later
+/// matched against in `except self._retryable_exceptions:`).
+pub(crate) fn name_read_as_value(name: &str, stmts: &[Statement]) -> bool {
+    stmts.iter().any(|s| statement_reads_name_as_value(name, s))
+}
+
+fn statement_reads_name_as_value(name: &str, s: &Statement) -> bool {
+    use crate::StatementType as ST;
+    match &s.statement {
+        ST::Expr(e) => expr_reads_name_as_value(name, &e.value),
+        ST::Assign(a) => {
+            expr_reads_name_as_value(name, &a.value)
+                || a.targets
+                    .iter()
+                    .any(|t| target_reads_name_as_value(name, t))
+        }
+        ST::AugAssign(a) => {
+            expr_reads_name_as_value(name, &a.target)
+                || expr_reads_name_as_value(name, &a.value)
+        }
+        ST::Return(Some(e)) => expr_reads_name_as_value(name, &e.value),
+        ST::Assert { test, msg } => {
+            expr_reads_name_as_value(name, test)
+                || msg
+                    .as_ref()
+                    .is_some_and(|m| expr_reads_name_as_value(name, m))
+        }
+        ST::Raise(r) => {
+            r.exc.as_ref().is_some_and(|e| expr_reads_name_as_value(name, e))
+                || r.cause.as_ref().is_some_and(|e| expr_reads_name_as_value(name, e))
+        }
+        ST::If(i) => {
+            expr_reads_name_as_value(name, &i.test)
+                || i.body.iter().any(|b| statement_reads_name_as_value(name, b))
+                || i.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
+        }
+        ST::While(w) => {
+            expr_reads_name_as_value(name, &w.test)
+                || w.body.iter().any(|b| statement_reads_name_as_value(name, b))
+                || w.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
+        }
+        ST::For(f) => {
+            expr_reads_name_as_value(name, &f.iter)
+                || f.body.iter().any(|b| statement_reads_name_as_value(name, b))
+                || f.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
+        }
+        ST::With(w) => {
+            w.items.iter().any(|item| {
+                expr_reads_name_as_value(name, &item.context_expr)
+                    || item
+                        .optional_vars
+                        .as_ref()
+                        .is_some_and(|v| target_reads_name_as_value(name, v))
+            }) || w.body.iter().any(|b| statement_reads_name_as_value(name, b))
+        }
+        ST::Try(t) => {
+            t.body.iter().any(|b| statement_reads_name_as_value(name, b))
+                || t.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
+                || t.finalbody.iter().any(|b| statement_reads_name_as_value(name, b))
+                || t.handlers.iter().any(|h| {
+                    h.exception_type
+                        .as_ref()
+                        .is_some_and(|et| expr_reads_name_as_value(name, et))
+                        || h.body.iter().any(|b| statement_reads_name_as_value(name, b))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn target_reads_name_as_value(name: &str, t: &ExprType) -> bool {
+    match t {
+        ExprType::Name(_) => false, // the store target itself: no read
+        ExprType::Subscript(s) => {
+            expr_reads_name_as_value(name, &s.value)
+                || match &s.kind {
+                    crate::SubscriptKind::Index(i) => expr_reads_name_as_value(name, i),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        [lower, upper, step]
+                            .into_iter()
+                            .flatten()
+                            .any(|b| expr_reads_name_as_value(name, b))
+                    }
+                }
+        }
+        ExprType::Attribute(a) => expr_reads_name_as_value(name, &a.value),
+        ExprType::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .any(|e| target_reads_name_as_value(name, e)),
+        _ => expr_reads_name_as_value(name, t),
+    }
+}
+
+fn expr_reads_name_as_value(name: &str, e: &ExprType) -> bool {
+    match e {
+        ExprType::Name(n) => n.id == name,
+        ExprType::Attribute(a) => expr_reads_name_as_value(name, &a.value),
+        ExprType::Call(c) => {
+            expr_reads_name_as_value(name, &c.func)
+                || c.args.iter().any(|a| expr_reads_name_as_value(name, a))
+                || c.keywords
+                    .iter()
+                    .any(|k| expr_reads_name_as_value(name, &k.value))
+        }
+        ExprType::BinOp(b) => {
+            expr_reads_name_as_value(name, &b.left)
+                || expr_reads_name_as_value(name, &b.right)
+        }
+        ExprType::BoolOp(b) => b
+            .values
+            .iter()
+            .any(|v| expr_reads_name_as_value(name, v)),
+        ExprType::Compare(c) => {
+            // `x is None` / `x is not None` is a presence check, not a
+            // value read — the Option<()> parameter's only legal use.
+            let none_check = matches!(c.left.as_ref(), ExprType::Name(n) if n.id == name)
+                && c.ops
+                    .iter()
+                    .zip(c.comparators.iter())
+                    .all(|(op, rhs)| {
+                        matches!(op, crate::Compares::Is | crate::Compares::IsNot)
+                            && crate::is_none_expr(rhs)
+                    });
+            if none_check {
+                return false;
+            }
+            expr_reads_name_as_value(name, &c.left)
+                || c.comparators
+                    .iter()
+                    .any(|r| expr_reads_name_as_value(name, r))
+        }
+        ExprType::UnaryOp(u) => expr_reads_name_as_value(name, &u.operand),
+        ExprType::IfExp(i) => {
+            expr_reads_name_as_value(name, &i.test)
+                || expr_reads_name_as_value(name, &i.body)
+                || expr_reads_name_as_value(name, &i.orelse)
+        }
+        ExprType::Subscript(s) => {
+            expr_reads_name_as_value(name, &s.value)
+                || match &s.kind {
+                    crate::SubscriptKind::Index(i) => expr_reads_name_as_value(name, i),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        [lower, upper, step]
+                            .into_iter()
+                            .flatten()
+                            .any(|b| expr_reads_name_as_value(name, b))
+                    }
+                }
+        }
+        ExprType::Tuple(t) => t.elts.iter().any(|e| expr_reads_name_as_value(name, e)),
+        ExprType::List(l) => l.iter().any(|e| expr_reads_name_as_value(name, e)),
+        ExprType::Dict(d) => {
+            d.keys
+                .iter()
+                .flatten()
+                .any(|k| expr_reads_name_as_value(name, k))
+                || d.values.iter().any(|v| expr_reads_name_as_value(name, v))
+        }
+        ExprType::Set(s) => s.elts.iter().any(|e| expr_reads_name_as_value(name, e)),
+        ExprType::ListComp(lc) => {
+            expr_reads_name_as_value(name, &lc.elt)
+                || lc.generators
+                    .iter()
+                    .any(|g| expr_reads_name_as_value(name, &g.iter))
+        }
+        ExprType::Starred(s) => expr_reads_name_as_value(name, &s.value),
+        ExprType::JoinedStr(js) => js
+            .values
+            .iter()
+            .any(|v| expr_reads_name_as_value(name, v)),
+        ExprType::FormattedValue(fv) => expr_reads_name_as_value(name, &fv.value),
+        ExprType::Lambda(l) => expr_reads_name_as_value(name, &l.body),
+        ExprType::Yield(y) => y
+            .value
+            .as_ref()
+            .is_some_and(|v| expr_reads_name_as_value(name, v)),
+        ExprType::YieldFrom(yf) => expr_reads_name_as_value(name, &yf.value),
+        ExprType::Await(a) => expr_reads_name_as_value(name, &a.value),
+        _ => false,
     }
 }
 

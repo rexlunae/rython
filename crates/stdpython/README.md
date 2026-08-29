@@ -97,7 +97,13 @@ name is modeled, and `except` matching walks the real hierarchy —
 `except LookupError:` catches `IndexError`/`KeyError`, `except OSError:`
 catches `FileNotFoundError` and friends, while `except Exception:`
 correctly does NOT catch `SystemExit`/`KeyboardInterrupt`/`GeneratorExit`
-(tree verified against python3 3.14 `__mro__` dumps).
+(the tree is the interpreter's own data: python-ast dumps every builtin
+exception's real `__mro__` through PyO3 and the checked-in table is
+verified against the live interpreter by the `exception_tree_is_current`
+test). A dynamic `except <boxed value>:` (`except
+self._retryable_exceptions:`) matches the runtime value with
+`matches_value` — Str members match by name, tuples match any member,
+and a non-catchable value raises CPython's TypeError.
 
 ## What's Not Implemented
 

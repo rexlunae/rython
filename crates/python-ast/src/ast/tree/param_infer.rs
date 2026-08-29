@@ -384,6 +384,7 @@ pub fn collect_called_params(
 ) -> std::collections::HashSet<String> {
     let info = crate::analyze_function_types(body, None, None);
     let mut collector = Collector {
+        none_returns: false,
         unannotated: &std::collections::HashSet::new(),
         name_types: &info.name_types,
         symbols,
@@ -510,6 +511,7 @@ pub fn infer_unannotated_signature(
     };
 
     let mut collector = Collector {
+        none_returns: false,
         unannotated: &unannotated,
         name_types,
         symbols,
@@ -902,6 +904,16 @@ pub fn infer_unannotated_signature(
         None
     } else {
         let mut inferred: Option<TokenStream> = None;
+        // A bare `return` or a fall-through path returns Python's None on
+        // that path: seed the unification with the unit value so a typed
+        // return alongside it hits the None-mixing arm and boxes to
+        // PyValue — `return [ChecksumError]` + `return exceptions` +
+        // fall-through (botocore's _extract_retryable_exception) is
+        // `Vec<String> | Vec<PyValue> | None`, which has no static type
+        // (issue #122 step 3). A None-only function stays unit.
+        if !crate::guarantees_return(body) || collector.none_returns {
+            inferred = Some(quote!(()));
+        }
         let returns: Vec<ExprType> = collector.returns.clone();
         for ret in &returns {
             let ty = return_type_of(ret, &mut collector, &param_types)?;
@@ -1358,6 +1370,23 @@ fn return_type_of(
         // _windows_shell_split): a Vec whose element type is unknown —
         // boxed PyValue elements (the empty-pin divergence).
         ExprType::List(l) if l.is_empty() => Ok(quote!(Vec<stdpython::PyValue>)),
+        // A NON-EMPTY list literal (`return [ChecksumError]` — botocore's
+        // retryhandler): a Vec of the elements' unified type — class
+        // values type as String (round 33), so `[ChecksumError]` is
+        // Vec<String>. Disagreeing elements box like the literal lowering.
+        ExprType::List(l) => {
+            let mut elt: Option<TokenStream> = None;
+            for e in l {
+                let t = return_type_of(e, collector, param_types)?;
+                match &elt {
+                    None => elt = Some(t),
+                    Some(prev) if prev.to_string() == t.to_string() => {}
+                    _ => return Ok(quote!(Vec<stdpython::PyValue>)),
+                }
+            }
+            let e = elt.ok_or_else(err)?;
+            Ok(quote!(Vec<#e>))
+        }
         // A dict literal (`{'access_key': token['accessToken']
         // ['accessKeyId'], ...}` — botocore's _token_to_credentials): a
         // boxed PyDict<String, PyValue> (the boxed-dict divergence).
@@ -1642,6 +1671,11 @@ fn return_type_of(
                     "len" => return Ok(quote!(i64)),
                     "isinstance" => return Ok(quote!(bool)),
                     "hasattr" => return Ok(quote!(bool)),
+                    // `return tuple(x)` always yields a tuple — the boxed
+                    // value (the call's lowering is PyValue::from(x);
+                    // round 33's `return tuple(retryable_exceptions)` in
+                    // botocore's retryhandler).
+                    "tuple" => return Ok(quote!(stdpython::PyValue)),
                     "abs" => {
                         if let Some(arg) = c.args.first()
                             && let ExprType::Name(n) = arg
@@ -2288,6 +2322,7 @@ fn callee_return_type(
     let info = crate::analyze_function_types(&callee.body, None, None);
     let result = {
         let mut inner = Collector {
+            none_returns: false,
             unannotated: &inner_unannotated,
             name_types: &info.name_types,
             symbols: collector.symbols,
@@ -2810,6 +2845,7 @@ pub fn check_call_sites(
 ) -> Result<(), String> {
     let empty = HashSet::new();
     let mut collector = Collector {
+        none_returns: false,
         unannotated: &empty,
         name_types,
         symbols,
@@ -2966,6 +3002,9 @@ struct Collector<'a> {
     /// Local names that alias a parameter (`x = p` → x ↦ p).
     alias: HashMap<String, String>,
     returns: Vec<ExprType>,
+    /// Whether the body contains a bare `return` (Python returns None
+    /// there — the M1 unification must see it, issue #122 step 3).
+    none_returns: bool,
     reassigned: HashSet<String>,
     /// Parameters reassigned with a STR value (`name = f"..."` — botocore's
     /// xform_name): pinned to String instead of rejected.
@@ -3304,7 +3343,9 @@ impl<'a> Collector<'a> {
                     self.returns.push(e.value.clone());
                     self.walk_expr(&e.value, false);
                 }
-                StatementType::Return(None) => {}
+                StatementType::Return(None) => {
+                    self.none_returns = true;
+                }
                 StatementType::If(s) => {
                     self.walk_expr(&s.test, true);
                     self.walk(&s.body);
@@ -4503,6 +4544,7 @@ impl<'a> Collector<'a> {
         }
         let info = crate::analyze_function_types(&callee.body, None, None);
         let mut inner = Collector {
+            none_returns: false,
             unannotated: &unannotated,
             name_types: &info.name_types,
             symbols: self.symbols,

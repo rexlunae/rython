@@ -2646,6 +2646,26 @@ impl<const N: usize> From<&[u8; N]> for PyValue {
     }
 }
 
+// A list of strings boxed as a value (`PyValue::from(vec![
+// "ChecksumError".to_string()])` — the heterogeneous-return boxing of
+// botocore's retryhandler): the boxed model has no distinct List member,
+// so a boxed string list is a Tuple of Str members (the list-as-tuple
+// divergence, round 33 — extend/matching treat both identically, and the
+// member types are preserved).
+impl From<Vec<String>> for PyValue {
+    fn from(value: Vec<String>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Str).collect()))
+    }
+}
+
+// A list of ALREADY-BOXED members (`PyValue::from(exceptions)` where the
+// local is Vec<PyValue>) boxes as a Tuple of the members.
+impl From<Vec<PyValue>> for PyValue {
+    fn from(value: Vec<PyValue>) -> Self {
+        PyValue::Tuple(Arc::new(value))
+    }
+}
+
 impl From<StrOrBytes> for PyValue {
     fn from(value: StrOrBytes) -> Self {
         match value {
@@ -5481,38 +5501,69 @@ impl PyException {
     /// Whether this exception is caught by an `except <name>:` clause.
     ///
     /// Python semantics: the clause matches when `<name>` is the raised
-    /// type itself or one of its ancestors. The tree is CPython's
-    /// built-in exception hierarchy, modeled as the [`crate::builtin_exceptions`]
-    /// enum (verified by dumping `__mro__` for
-    /// every built-in exception under python3 3.14), so
-    /// `except LookupError:` now catches IndexError/KeyError,
-    /// `except OSError:` catches FileNotFoundError and friends, and
-    /// `except Exception:` correctly does NOT catch SystemExit,
-    /// KeyboardInterrupt or GeneratorExit — the old exact-name check
-    /// missed all of that (spec §12.3 defect class, fixed here).
+    /// type itself or one of its ancestors. The tree is the interpreter's
+    /// own data — python-ast dumps every builtin exception's real
+    /// `__mro__` (plus the stdlib-module exceptions the runtime models)
+    /// through PyO3, and the checked-in `BUILTIN_EXCEPTION_MRO` table
+    /// carries it (regenerated and verified by python-ast's
+    /// `exception_tree_is_current` test), so `except LookupError:`
+    /// catches IndexError/KeyError, `except OSError:` catches
+    /// FileNotFoundError and friends, aliases match both directions
+    /// (`EnvironmentError` IS `OSError` — the same class object, so both
+    /// spellings' MROs are identical), and `except Exception:` correctly
+    /// does NOT catch SystemExit, KeyboardInterrupt or GeneratorExit —
+    /// the old hand-copied tree missed parts of that (spec §12.3 defect
+    /// class, fixed here).
     pub fn matches(&self, name: &str) -> bool {
-        use crate::builtin_exceptions::BuiltinException;
+        use crate::builtin_exceptions::BUILTIN_EXCEPTION_MRO;
         // Exact name equality covers user-defined classes and builtins
         // alike (a raised MyError is caught by `except MyError:`).
         if self.exception_type == name {
             return true;
         }
-        // Both names parse into the built-in tree exactly once (the
-        // aliases EnvironmentError/IOError canonicalize to OSError there,
-        // so `except IOError:` catches a raised OSError and vice versa —
-        // CPython treats them as the same class object); the ancestry
-        // question is then a compile-checked enum walk.
-        match (
-            BuiltinException::from_name(&self.exception_type),
-            BuiltinException::from_name(name),
-        ) {
-            (Some(raised), Some(target)) => raised.is_caught_by(target),
-            // A raised type outside the built-in tree (a user class)
-            // keeps the historical broad posture: only Exception and
-            // BaseException are treated as catching it.
-            (None, _) => name == "Exception" || name == "BaseException",
-            // A built-in raised type is never caught by an unknown name.
-            (Some(_), None) => false,
+        // A builtin raised type: walk its interpreter-derived MRO. The
+        // target canonicalizes first — `except EnvironmentError:` and
+        // `except OSError:` name the same class object, so the raised
+        // OSError's MRO must match the alias spelling too.
+        if let Some((_, mro)) = BUILTIN_EXCEPTION_MRO
+            .iter()
+            .find(|(n, _)| *n == self.exception_type)
+        {
+            let target = crate::builtin_exceptions::canonical_name(name).unwrap_or(name);
+            return mro.contains(&target);
+        }
+        // A raised type outside the built-in tree (a user class) keeps
+        // the broad posture: only Exception and BaseException are
+        // treated as catching it (rython does not know user-class
+        // hierarchies — the class-as-value divergence).
+        name == "Exception" || name == "BaseException"
+    }
+
+    /// Whether an `except <value>:` clause with a BOXED runtime value
+    /// catches this exception (round 33 — botocore's
+    /// `except self._retryable_exceptions as e:` where the field holds a
+    /// tuple of class-name strings, or None). A Str member matches by
+    /// name (the class-as-value model); a Tuple matches when any member
+    /// matches, checked in order; anything else — including None — is
+    /// CPython's TypeError ("catching classes that do not inherit from
+    /// BaseException is not allowed"), raised as a typed exception at
+    /// the point the clause is evaluated, exactly as CPython evaluates
+    /// it lazily.
+    pub fn matches_value(&self, value: &PyValue) -> Result<bool, PyException> {
+        match value {
+            PyValue::Str(name) => Ok(self.matches(name)),
+            PyValue::Tuple(members) => {
+                for member in members.iter() {
+                    if self.matches_value(member)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Err(PyException::new(
+                "TypeError",
+                "catching classes that do not inherit from BaseException is not allowed",
+            )),
         }
     }
 }
@@ -6686,4 +6737,65 @@ pub fn bytes_join(sep: &[u8], parts: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(part);
     }
     out
+}
+
+/// Python's `list.extend(x)` where x is a BOXED value (a boxed tuple of
+/// names — `retryable_exceptions.extend(retry_exception)` where
+/// retry_exception is the heterogeneous return of botocore's
+/// `_extract_retryable_exception`, round 33): a Tuple member appends its
+/// Str elements (a boxed string list boxes as a Tuple of Str); a
+/// Str/Dict member is CPython's TypeError — a loud error; anything else
+/// appends the member itself (a boxed value in a boxed-element vec).
+pub fn py_extend_strings(out: &mut Vec<String>, value: &PyValue) -> Result<(), PyException> {
+    match value {
+        PyValue::Tuple(t) => {
+            for member in t.iter() {
+                match member {
+                    PyValue::Str(s) => out.push(s.clone()),
+                    other => {
+                        return Err(PyException::new(
+                            "TypeError",
+                            &format!(
+                                "TypeError: a bytes-like object is required, not '{}'",
+                                other.py_type_name()
+                            ),
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        }
+        PyValue::Str(s) => {
+            out.push(s.clone());
+            Ok(())
+        }
+        other => Err(PyException::new(
+            "TypeError",
+            &format!(
+                "TypeError: '{}' object is not iterable",
+                other.py_type_name()
+            ),
+        )),
+    }
+}
+
+/// The boxed-element twin: a Tuple member appends its members as-is.
+pub fn py_extend_values(out: &mut Vec<PyValue>, value: &PyValue) -> Result<(), PyException> {
+    match value {
+        PyValue::Tuple(t) => {
+            out.extend(t.iter().cloned());
+            Ok(())
+        }
+        PyValue::Str(s) => {
+            out.push(PyValue::Str(s.clone()));
+            Ok(())
+        }
+        other => Err(PyException::new(
+            "TypeError",
+            &format!(
+                "TypeError: '{}' object is not iterable",
+                other.py_type_name()
+            ),
+        )),
+    }
 }

@@ -5772,6 +5772,52 @@ impl<'a> CodeGen for Call {
                     ("append", [value]) => {
                         return Ok(quote!((#receiver).push(#value)));
                     }
+                    // list.extend(x) with a PyValue/heterogeneous argument
+                    // (botocore's `retryable_exceptions.extend(
+                    // retry_exception)` where retry_exception is the
+                    // boxed return of _extract_retryable_exception — round
+                    // 33): the runtime's py_extend reads the boxed
+                    // tuple's members into the Vec. A Vec<String> receiver
+                    // takes the strings path, a boxed-element receiver
+                    // (PyValue, or PyObject from the empty-literal
+                    // divergence — `[]` lowers to Vec<PyValue>) the
+                    // members path. A typed Vec arg keeps the inherent
+                    // extend, element-converting for a boxed-element
+                    // receiver (`exceptions.extend([ChecksumError])` —
+                    // Vec<PyValue> + Vec<String>).
+                    ("extend", [value]) => {
+                        let recv_ty = crate::infer_type(&attr.value, &options, &symbols);
+                        if let crate::TypeInfo::Vec(inner) = &recv_ty {
+                            let arg_ty = crate::infer_type(&self.args[0], &options, &symbols);
+                            let runtime = crate::safe_ident(&options.stdpython);
+                            let boxed = matches!(
+                                **inner,
+                                crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+                            );
+                            match &arg_ty {
+                                crate::TypeInfo::Vec(_) => {
+                                    if boxed {
+                                        return Ok(quote!(
+                                            (#receiver).extend(
+                                                (#value).into_iter().map(stdpython::PyValue::from)
+                                            )
+                                        ));
+                                    }
+                                    return Ok(quote!((#receiver).extend(#value)));
+                                }
+                                _ => {
+                                    if matches!(**inner, crate::TypeInfo::String) {
+                                        return Ok(quote!(
+                                            #runtime::py_extend_strings(&mut (#receiver), &(#value))?
+                                        ));
+                                    }
+                                    return Ok(quote!(
+                                        #runtime::py_extend_values(&mut (#receiver), &(#value))?
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     // list.count(x): the PyListOps method takes a reference.
                     ("count", [value]) => {
                         return Ok(quote!((#receiver).count(&(#value))));
@@ -6882,20 +6928,24 @@ impl<'a> CodeGen for Call {
         for (i, arg) in self.args.into_iter().enumerate() {
             let rust_arg = if let Some(param) = pos_params.get(i) {
                 // A CALLABLE parameter (`dict_class: type`): the argument
-                // (a class name) lowers to the boxed None — the
-                // callables-as-data divergence.
+                // (a class name) lowers to its NAME STRING — the callee
+                // cannot CALL through it (the callable-as-value drop at
+                // the callee's own call sites), but the string is the
+                // class object's runtime value (round 33 design).
                 if param
                     .annotation
                     .as_deref()
                     .is_some_and(crate::ast::tree::arguments::is_type_annotation)
                 {
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "callable argument for `{}` (a `type`-annotated parameter) \
-                         lowers to the boxed None (callables cannot be runtime \
-                         values in rython)",
-                        param.arg
-                    ));
-                    quote!(stdpython::PyValue::None_)
+                    if crate::is_class_value_expr(&arg, &symbols) {
+                        let ExprType::Name(n) = &arg else {
+                            unreachable!("is_class_value_expr matched a Name");
+                        };
+                        let name = n.id.clone();
+                        quote!(#name.to_string())
+                    } else {
+                        quote!(stdpython::PyValue::None_)
+                    }
                 } else if crate::is_class_value_expr(&arg, &symbols)
                     && param.annotation.as_deref().and_then(crate::call_arg_expected_type)
                         .is_some_and(|t| {
@@ -6906,15 +6956,13 @@ impl<'a> CodeGen for Call {
                     // A CLASS passed to a PyValue-typed parameter
                     // (`merge_setting(..., CaseInsensitiveDict)` — requests'
                     // sessions.py, where dict_class: type maps to the boxed
-                    // PyValue): a class as a VALUE is unrepresentable — the
-                    // boxed None (the callables-as-data divergence).
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "callable argument for `{}` (a class name passed to a \
-                         PyValue parameter) lowers to the boxed None (callables \
-                         cannot be runtime values in rython)",
-                        param.arg
-                    ));
-                    quote!(stdpython::PyValue::None_)
+                    // PyValue): the name string, boxed — a class as a value
+                    // IS its name (round 33 design).
+                    let ExprType::Name(n) = &arg else {
+                        unreachable!("is_class_value_expr matched a Name");
+                    };
+                    let name = n.id.clone();
+                    quote!(stdpython::PyValue::from(#name.to_string()))
                 } else {
                     let expected = param
                         .annotation
@@ -6946,17 +6994,14 @@ impl<'a> CodeGen for Call {
             } else {
                 // A CLASS NAME passed as a call argument without a resolved
                 // signature (`merge_setting(request.headers, self.headers,
-                // CaseInsensitiveDict)` — requests' sessions.py, where the
-                // callee's dict_class: type param maps to the boxed PyValue
-                // but the callee signature isn't resolved in this context):
-                // classes cannot be runtime values — the boxed None (the
-                // callables-as-data divergence).
+                // CaseInsensitiveDict)` — requests' sessions.py): classes
+                // as values lower to their NAME STRINGS (round 33 design).
                 if crate::is_class_value_expr(&arg, &symbols) {
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "callable argument (a class name) lowers to the boxed None \
-                         (callables cannot be runtime values in rython)"
-                    ));
-                    quote!(stdpython::PyValue::None_)
+                    let ExprType::Name(n) = &arg else {
+                        unreachable!("is_class_value_expr matched a Name");
+                    };
+                    let name = n.id.clone();
+                    quote!(#name.to_string())
                 } else {
                     arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
                 }
@@ -8407,11 +8452,22 @@ fn map_call_arguments_inner(
             return Ok(quote!(#class_ident::#ident()));
         }
         // A CALLABLE parameter (`dict_class: type = OrderedDict` —
-        // requests' sessions): rython cannot hold a class/function as a
-        // value (the callables-as-data divergence), so any argument passed
-        // for it lowers to the boxed None.
-        if param.annotation.as_deref().is_some_and(crate::ast::tree::arguments::is_type_annotation)
+        // requests' sessions): a CLASS argument lowers to its NAME STRING
+        // (the class object's runtime value — the class-as-value model,
+        // round 33); any other callable (a function) cannot be a runtime
+        // value and lowers to the boxed None (the callable-as-value
+        // divergence).
+        if param
+            .annotation
+            .as_deref()
+            .is_some_and(crate::ast::tree::arguments::is_type_annotation)
         {
+            if crate::is_class_value_expr(expr, symbols) {
+                if let ExprType::Name(n) = expr {
+                    let name = n.id.clone();
+                    return Ok(quote!(#name.to_string()));
+                }
+            }
             options.definition_warnings.borrow_mut().push(format!(
                 "callable argument for `{}` (a `type`-annotated parameter) lowers to \
                  the boxed None (callables cannot be runtime values in rython)",
@@ -8429,7 +8485,24 @@ fn map_call_arguments_inner(
             let expected = param
                 .annotation
                 .as_deref()
-                .and_then(crate::call_arg_expected_type);
+                .and_then(crate::call_arg_expected_type)
+                .or_else(|| {
+                    // A None-defaulted unannotated parameter whose VALUE is
+                    // used in the callee (`retryable_exceptions=None`
+                    // stored into a field — botocore's
+                    // MaxAttemptsDecorator, round 33): the callee types it
+                    // as the boxed PyValue, so call-site arguments —
+                    // including the dropped None default, which boxes to
+                    // PyValue::None_ — coerce to the boxed value.
+                    if param.annotation.is_none()
+                        && crate::param_has_none_default(param, func)
+                        && crate::name_read_as_value(&param.arg, &func.body)
+                    {
+                        Some(crate::TypeInfo::PyValue)
+                    } else {
+                        None
+                    }
+                });
             crate::render_typed_reused(
                 expr,
                 ctx.clone(),

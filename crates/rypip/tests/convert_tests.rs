@@ -7257,3 +7257,104 @@ fn bytes_display_and_join_match_cpython() {
         stderr
     );
 }
+
+#[test]
+fn class_values_extend_and_dynamic_except_match_cpython() {
+    // The round-33 class-as-value pipeline, end to end (botocore's
+    // retryhandler.py shapes): classes as values are their name strings,
+    // lists of them extend through the boxed heterogeneous container,
+    // `except self._retryable_exceptions:` matches the RUNTIME boxed
+    // value via matches_value (a non-catchable value — None — raises
+    // CPython's TypeError exactly when CPython does), and `tuple(...)`
+    // of the collected names boxes. Output verified against CPython:
+    // caught / True / typeerror: catching classes that do not inherit
+    // from BaseException is not allowed.
+    let scratch = Scratch::new("classval");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "class ChecksumError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class ConnectionError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "EXCEPTION_MAP = {\n",
+            "    \"GENERAL_CONNECTION_ERROR\": [\n",
+            "        ConnectionError,\n",
+            "        ChecksumError,\n",
+            "    ],\n",
+            "}\n",
+            "\n",
+            "def extract(kind: str):\n",
+            "    if kind == \"a\":\n",
+            "        return [ChecksumError]\n",
+            "    elif kind == \"b\":\n",
+            "        exceptions = []\n",
+            "        exceptions.extend(EXCEPTION_MAP[\"GENERAL_CONNECTION_ERROR\"])\n",
+            "        return exceptions\n",
+            "\n",
+            "def collect(kind: str):\n",
+            "    retryable = []\n",
+            "    for k in [\"a\", \"b\"]:\n",
+            "        ex = extract(k)\n",
+            "        if ex is not None:\n",
+            "            retryable.extend(ex)\n",
+            "    return tuple(retryable)\n",
+            "\n",
+            "class Decorator:\n",
+            "    def __init__(self, retryable_exceptions=None):\n",
+            "        self._retryable_exceptions = retryable_exceptions\n",
+            "\n",
+            "    def check(self, value: int):\n",
+            "        try:\n",
+            "            if value == 1:\n",
+            "                raise ChecksumError(\"boom\")\n",
+            "            return False\n",
+            "        except self._retryable_exceptions as e:\n",
+            "            print(\"caught\")\n",
+            "            return True\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    d = Decorator(retryable_exceptions=collect(\"x\"))\n",
+            "    print(d.check(1))\n",
+            "    d2 = Decorator()\n",
+            "    try:\n",
+            "        print(d2.check(1))\n",
+            "    except TypeError as e:\n",
+            "        print(\"typeerror:\", e)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "caught",
+            "True",
+            "typeerror: catching classes that do not inherit from BaseException is not allowed",
+        ],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

@@ -254,6 +254,13 @@ impl CodeGen for Try {
         };
         let mut arms: Vec<TokenStream> = Vec::new();
         let mut has_catch_all = false;
+        // (static guard, dynamic value, bind, arm body) per handler. A
+        // DYNAMIC handler (`except self._retryable_exceptions:` — round
+        // 33) switches the whole statement to the lazy if-chain form
+        // below; static-only statements keep the match-arm guards.
+        let mut entries: Vec<(Option<TokenStream>, Option<TokenStream>, TokenStream, TokenStream)> =
+            Vec::new();
+        let mut any_dynamic = false;
         for handler in self.handlers {
             // A bare `except ImportError:` handler (`try: from tokenize
             // import detect_encoding / except ImportError:` — distlib's
@@ -279,9 +286,19 @@ impl CodeGen for Try {
                 );
                 continue;
             }
+            let dynamic = match &handler.exception_type {
+                None => None,
+                Some(t) => dynamic_exception_value(t, &ctx, &options, &symbols)?,
+            };
+            if dynamic.is_some() {
+                any_dynamic = true;
+            }
             let guard = match &handler.exception_type {
                 None => None,
-                Some(t) => exception_match_guard(t, &symbols, &options)?,
+                Some(t) if dynamic.is_none() => {
+                    exception_match_guard(t, &symbols, &options)?
+                }
+                Some(_) => None,
             };
             let bind = match &handler.name {
                 Some(name) => {
@@ -303,16 +320,62 @@ impl CodeGen for Try {
                 &break_return,
                 "handler body terminates on every path",
             )?;
-            match guard {
-                Some(g) => arms.push(quote! {
-                    Err(__rython_exc) if #g => { #bind #arm_body }
-                }),
-                None => {
-                    has_catch_all = true;
-                    arms.push(quote! {
-                        Err(__rython_exc) => { #bind #arm_body }
-                    });
-                    break; // later handlers are unreachable, as in Python
+            if guard.is_none() && dynamic.is_none() {
+                has_catch_all = true;
+                entries.push((None, None, bind, arm_body));
+                break; // later handlers are unreachable, as in Python
+            }
+            entries.push((guard, dynamic, bind, arm_body));
+        }
+
+        // A DYNAMIC handler (a boxed, runtime-valued except type —
+        // `except self._retryable_exceptions:`): the whole handler list
+        // becomes a lazy if-chain inside ONE Err arm, so each guard is
+        // evaluated in order only once an exception propagates — and a
+        // dynamic guard's `?` (its TypeError — a non-catchable except
+        // value, CPython's "catching classes that do not inherit from
+        // BaseException is not allowed") is a real raise exactly when
+        // CPython raises it. Match-arm guards cannot thread `?`, hence
+        // the switch.
+        if any_dynamic {
+            let mut chain = quote!(#finally_tokens return Err(__rython_exc););
+            for (guard, dynamic, bind, body) in entries.into_iter().rev() {
+                match (guard, dynamic) {
+                    (_, Some(value)) => {
+                        chain = quote! {
+                            if __rython_exc.matches_value(&(#value))? { #bind #body }
+                            else { #chain }
+                        };
+                    }
+                    (Some(g), None) => {
+                        chain = quote! {
+                            if #g { #bind #body }
+                            else { #chain }
+                        };
+                    }
+                    // The catch-all handler (the loop broke on it): it is
+                    // the innermost else — nothing falls through it.
+                    (None, None) => {
+                        chain = quote!({ #bind #body });
+                    }
+                }
+            }
+            arms.push(quote! {
+                Err(__rython_exc) => { #chain }
+            });
+        } else {
+            // Static-only handlers: each arm carries its own guard; a
+            // catch-all handler (the loop broke on it) is the unguarded
+            // arm.
+            for (guard, dynamic, bind, body) in entries {
+                debug_assert!(dynamic.is_none());
+                match guard {
+                    Some(g) => arms.push(quote! {
+                        Err(__rython_exc) if #g => { #bind #body }
+                    }),
+                    None => arms.push(quote! {
+                        Err(__rython_exc) => { #bind #body }
+                    }),
                 }
             }
         }
@@ -347,8 +410,10 @@ impl CodeGen for Try {
 
         // An exception no handler matched propagates as an Err — to the
         // enclosing try's closure when there is one, otherwise out of the
-        // function, as in Python. The finally body still runs first.
-        if !has_catch_all {
+        // function, as in Python. The finally body still runs first. (The
+        // dynamic if-chain carries its own fall-through as the innermost
+        // else, so nothing is added here for it.)
+        if !has_catch_all && !any_dynamic {
             arms.push(quote! {
                 Err(__rython_exc) => { #finally_tokens return Err(__rython_exc); }
             });
@@ -562,6 +627,57 @@ pub(crate) fn try_body_contains_import(body: &[crate::Statement]) -> bool {
         ) || matches!(&s.statement, crate::StatementType::Try(t)
             if try_body_contains_import(&t.body))
     })
+}
+
+/// A BOXED, runtime-valued exception type in an except clause
+/// (`except self._retryable_exceptions:` — botocore's retryhandler,
+/// round 33): the class-as-value model keeps the catchable name list in
+/// a PyValue (a Str member, or a Tuple of Str members — lists box as
+/// tuples), so the handler cannot use a static `matches` guard; it
+/// lowers to the runtime's `matches_value`, evaluated lazily when the
+/// exception propagates, exactly as CPython evaluates the except
+/// expression then (a non-catchable value raises the TypeError there).
+///
+/// Statically-known class names — and module-root dotted aliases like
+/// `socket.timeout`, which the static arm canonicalizes — stay on the
+/// static path; anything else in except position stays a loud conversion
+/// error.
+fn dynamic_exception_value(
+    exception_type: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    // A SELF-field whose type the class table boxes:
+    // `self._retryable_exceptions` (assigned a boxed tuple, or None).
+    // infer_type cannot see this — field reads infer as PyObject — so
+    // consult the field table first.
+    if let ExprType::Attribute(attr) = exception_type
+        && let ExprType::Name(n) = attr.value.as_ref()
+        && n.id == "self"
+        && let Some(class_name) = ctx.enclosing_class_name()
+        && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+        && let Ok(fields) = class.infer_fields(symbols, options)
+        && let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr)
+    {
+        let ty_str = ty.to_string();
+        let boxed = ty_str.contains("PyValue")
+            || ty_str == "PyObject"
+            || ty_str.starts_with("Option <");
+        if boxed {
+            return exception_type
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                .map(Some);
+        }
+    }
+    match crate::infer_type(exception_type, options, symbols) {
+        crate::TypeInfo::PyValue => exception_type
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())
+            .map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn exception_match_guard(

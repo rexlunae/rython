@@ -7001,14 +7001,36 @@ fn iteration_bounds_flow_through_a_callee() {
 }
 
 #[test]
-fn loop_element_return_with_fall_through_is_a_loud_error() {
-    // `for x in p: return x` can fall through (empty p → Python None):
-    // the inferred generic return cannot coexist with a unit fall-through.
-    let err = compile_err(
+fn loop_element_return_with_fall_through_boxes_to_pyvalue() {
+    // `for x in p: return x` can fall through (empty p → Python None).
+    // The generic element return and the None fall-through unify through
+    // the boxed PyValue (issue #122 step 3 — verified against python3:
+    // first([1,2,3]) → 1, first([]) → None), so the function converts
+    // with a boxed return instead of refusing.
+    let out = compile(
         "def first(p):\n    for x in p:\n        return x\n",
         "iter4.py",
     );
-    assert!(err.contains("fall through"), "error: {}", err);
+    assert!(
+        out.contains("-> Result < stdpython :: PyValue , PyException >"),
+        "boxed return: {}",
+        out
+    );
+    assert!(
+        out.contains("stdpython :: PyValue : From < B >"),
+        "the element must satisfy the boxed conversion: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: from (x)"),
+        "the element return must box: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: None_"),
+        "the fall-through must be the boxed None: {}",
+        out
+    );
 }
 
 #[test]
@@ -8365,22 +8387,191 @@ fn imported_class_method_keyword_values_resolve_in_caller_scope() {
         options,
     )
     .expect("converts");
-    // The merge_setting call's third argument (dict_class=OrderedDict) must
-    // lower to the boxed None — the class-as-value divergence — not a raw
-    // class-name token (E0423 `expected value, found struct`). The temp
-    // prelude binds it as __rython_arg_2 before the call.
+    // The merge_setting call's third argument (dict_class=OrderedDict)
+    // must lower to the class's NAME STRING — the class object's runtime
+    // value under the class-as-value model (round 33) — not a raw
+    // class-name token (E0423) and not the pre-round-33 boxed None. The
+    // temp prelude binds it as __rython_arg_2 before the call.
     let call_idx = out.find("merge_setting (").expect("call present");
     let prelude_start = out[..call_idx].rfind("let __rython_arg_").map(|i| i).unwrap_or(0);
     let block = &out[prelude_start..call_idx + 200];
     assert!(
-        block.contains("stdpython :: PyValue :: None_") || block.contains("PyValue::None_"),
-        "class-value arg for dict_class must box to None, got: {}",
+        block.contains("\"OrderedDict\" . to_string ()")
+            || block.contains("\"OrderedDict\".to_string()"),
+        "class-value arg for dict_class must lower to its name string, got: {}",
         block
     );
     assert!(
-        !block.contains("OrderedDict"),
-        "class name must not render raw as an argument: {}",
+        !block.contains("PyValue::None_") && !block.contains("PyValue :: None_"),
+        "the class arg must not box to None: {}",
         block
+    );
+}
+
+#[test]
+fn class_value_lists_box_and_extend_across_fallthrough() {
+    // The round-33 class-as-value model, end to end (botocore's
+    // retryhandler.py shapes, verified against python3): a class NAME in
+    // value position lowers to its name string; a list of classes is
+    // Vec<String>; `exceptions.extend([...])` into a boxed-element Vec
+    // element-converts; and the elif fall-through makes the function's
+    // return the boxed PyValue (None on the fall-through).
+    let out = compile(
+        concat!(
+            "class ChecksumError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class ConnectionError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def extract(kind: str):\n",
+            "    if kind == \"a\":\n",
+            "        return [ChecksumError]\n",
+            "    elif kind == \"b\":\n",
+            "        exceptions = []\n",
+            "        exceptions.extend([ConnectionError, ChecksumError])\n",
+            "        return exceptions\n",
+        ),
+        "retryhandler.py",
+    );
+    assert!(
+        out.contains("-> Result < stdpython :: PyValue , PyException >"),
+        "fall-through must box the return: {}",
+        out
+    );
+    assert!(
+        out.contains("\"ChecksumError\" . to_string ()")
+            || out.contains("\"ChecksumError\".to_string()"),
+        "class names must lower to strings: {}",
+        out
+    );
+    assert!(
+        out.contains("map (stdpython :: PyValue :: from)")
+            || out.contains(".map(stdpython::PyValue::from)"),
+        "the extend into the boxed Vec must element-convert: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: None_"),
+        "the fall-through must be the boxed None: {}",
+        out
+    );
+}
+
+#[test]
+fn dynamic_except_on_a_boxed_field_uses_matches_value() {
+    // botocore's `except self._retryable_exceptions as e:` — the
+    // exception list is a RUNTIME boxed value (a tuple of class-name
+    // strings, or None), so the handler lowers to the lazy
+    // matches_value if-chain instead of a static matches guard, and the
+    // None-defaulted constructor parameter carries the boxed value
+    // (round 33).
+    let out = compile(
+        concat!(
+            "class ChecksumError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Decorator:\n",
+            "    def __init__(self, retryable_exceptions=None):\n",
+            "        self._retryable_exceptions = retryable_exceptions\n",
+            "\n",
+            "    def check(self, value: int):\n",
+            "        try:\n",
+            "            raise ChecksumError(\"boom\")\n",
+            "        except self._retryable_exceptions as e:\n",
+            "            return True\n",
+        ),
+        "retryhandler.py",
+    );
+    assert!(
+        out.contains("matches_value (& (self . _retryable_exceptions)) ?")
+            || out.contains("matches_value(&(self._retryable_exceptions))?"),
+        "the dynamic handler must guard with matches_value: {}",
+        out
+    );
+    assert!(
+        out.contains("retryable_exceptions : stdpython :: PyValue")
+            || out.contains("retryable_exceptions: stdpython::PyValue"),
+        "the value-used None-defaulted param must carry the boxed value: {}",
+        out
+    );
+    assert!(
+        !out.contains("Option < () >"),
+        "the value-used param must not stay Option<()>: {}",
+        out
+    );
+}
+
+#[test]
+fn none_defaulted_value_used_parameter_boxes_at_the_call_site() {
+    // A free function whose None-defaulted unannotated parameter is used
+    // as a value (`y = x; return y` — round 33) types the parameter as
+    // the boxed PyValue (impl Into, boxed by the prologue), and call
+    // sites coerce plain arguments (including an omitted default → the
+    // boxed None).
+    let out = compile(
+        concat!(
+            "def store(x=None):\n",
+            "    y = x\n",
+            "    return y\n",
+            "\n",
+            "print(store(5))\n",
+            "print(store())\n",
+        ),
+        "optval.py",
+    );
+    assert!(
+        out.contains("x : impl Into < stdpython :: PyValue >")
+            || out.contains("x: impl Into<stdpython::PyValue>"),
+        "the value-used None-defaulted free-function param must box: {}",
+        out
+    );
+    assert!(
+        out.contains("let x : stdpython :: PyValue = x . into () ;")
+            || out.contains("let x: stdpython::PyValue = x.into();"),
+        "the prologue must box the parameter: {}",
+        out
+    );
+    // The direct-call path relies on the impl Into bound (a plain `5`
+    // coerces through Into), while the omitted default boxes explicitly.
+    assert!(
+        out.contains("store (5)"),
+        "call-site arguments must pass through the Into bound: {}",
+        out
+    );
+    assert!(
+        out.contains("store (stdpython :: PyValue :: None_)")
+            || out.contains("store(stdpython::PyValue::None_)"),
+        "the omitted default must box to the boxed None: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_call_return_types_as_boxed() {
+    // `return tuple(retryable_exceptions)` (botocore's retryhandler)
+    // always yields a tuple — the boxed value — so the function's
+    // return type resolves to Result<PyValue, _> and the body's
+    // PyValue::from(...) matches the signature.
+    let out = compile(
+        concat!(
+            "def collect(kind: str):\n",
+            "    retryable = []\n",
+            "    retryable.extend([\"a\", \"b\"])\n",
+            "    return tuple(retryable)\n",
+        ),
+        "retryhandler.py",
+    );
+    assert!(
+        out.contains("-> Result < stdpython :: PyValue , PyException >"),
+        "tuple() return must type boxed: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: from (retryable)")
+            || out.contains("PyValue::from(retryable)"),
+        "the return body must box the tuple: {}",
+        out
     );
 }
 
