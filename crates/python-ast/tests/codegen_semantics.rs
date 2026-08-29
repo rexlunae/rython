@@ -12287,3 +12287,42 @@ fn an_option_value_in_condition_position_tests_none_ness() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// The bytes-display slice (issue #137): Python displays a bytes value as
+// `b'ab'`, NOT the int-list the blanket Vec<T> display renders. print of
+// a bytes-typed argument routes through the runtime's CPython-verified
+// py_bytes_repr, and bytes + bytes infers Bytes (so a concatenated
+// value keeps the bytes path).
+// ---------------------------------------------------------------------
+
+#[test]
+fn printing_a_bytes_value_uses_the_bytes_repr() {
+    let out = compile(
+        "def show():\n    print(b\"ab\")\n\ndef add(x: bytes) -> bytes:\n    return x + b\"c\"\n",
+        "bytesprint.py",
+    );
+    assert!(
+        out.contains("py_bytes_repr"),
+        "print of a bytes value must route through py_bytes_repr: {}",
+        out
+    );
+    assert!(
+        out.contains("fn add (x : Vec < u8 >) -> Result < Vec < u8 > , PyException >"),
+        "bytes + bytes must infer bytes: {}",
+        out
+    );
+}
+
+#[test]
+fn bytes_join_uses_the_runtime_helper() {
+    let out = compile(
+        "def assemble(parts: list[bytes]) -> bytes:\n    return b\"\".join(parts)\n",
+        "bytesjoin.py",
+    );
+    assert!(
+        out.contains("bytes_join"),
+        "bytes join must route to the runtime helper: {}",
+        out
+    );
+}

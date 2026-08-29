@@ -7201,3 +7201,59 @@ fn option_receiver_access_matches_cpython() {
         stderr
     );
 }
+
+#[test]
+fn bytes_display_and_join_match_cpython() {
+    // The bytes-display slice: print(b"ab") renders b'ab' (not the
+    // int-list the Vec<T> display gives), bytes + bytes concatenates and
+    // displays as bytes, and b"".join / b"-".join route through the
+    // runtime bytes surface. Output verified against CPython 3.11:
+    // b'ab' / b'abc' / b'a-b' / b''.
+    let scratch = Scratch::new("bytesdisp");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "def join_sep(parts: list[bytes]) -> bytes:\n",
+            "    return b\"-\".join(parts)\n",
+            "\n",
+            "def assemble(parts: list[bytes]) -> bytes:\n",
+            "    return b\"\".join(parts)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    x = b\"ab\"\n",
+            "    print(x)\n",
+            "    y = x + b\"c\"\n",
+            "    print(y)\n",
+            "    print(join_sep([b\"a\", b\"b\"]))\n",
+            "    print(assemble([]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["b'ab'", "b'abc'", "b'a-b'", "b''"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

@@ -2797,7 +2797,22 @@ impl<'a> CodeGen for Call {
                         if sep.is_none() && end.is_none() && flush.is_none() {
                             match rendered.as_slice() {
                                 [] => return Ok(quote!(println!())),
-                                [a] => return Ok(quote!(print(&(#a)))),
+                                // A BYTES argument prints its CPython form
+                                // (`b'ab'`), not the int-list the blanket
+                                // Vec<T> display renders (issue #137): route
+                                // through the runtime's verified
+                                // py_bytes_repr.
+                                [a] => {
+                                    if crate::ast::tree::call::receiver_is_bytes_like(
+                                        &self.args[0],
+                                        &options,
+                                        &symbols,
+                                    ) {
+                                        let runtime = crate::safe_ident(&options.stdpython);
+                                        return Ok(quote!(print(&(#runtime::py_bytes_repr(&(#a))))));
+                                    }
+                                    return Ok(quote!(print(&(#a))));
+                                }
                                 _ => {}
                             }
                         }
@@ -6015,6 +6030,21 @@ impl<'a> CodeGen for Call {
                         let runtime = crate::safe_ident(&options.stdpython);
                         return Ok(quote!(#runtime::stdlib::codec::decode_utf8(&(#receiver))?));
                     }
+                    // bytes sep.join(parts) — `b"".join(data_parts)`
+                    // (urllib3's chunked response assembly): the bytes
+                    // twin of str join, through the runtime's bytes
+                    // surface. Only when the receiver is genuinely a
+                    // bytes value; a str receiver keeps the PyStrOps path.
+                    ("join", [parts])
+                        if crate::ast::tree::call::receiver_is_bytes_like(
+                            &attr.value,
+                            &options,
+                            &symbols,
+                        ) =>
+                    {
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        return Ok(quote!(#runtime::bytes_join(&(#receiver), &(#parts))));
+                    }
                     // list.pop() returns the last element or raises IndexError
                     // (Vec::pop returns an Option). A GENERIC receiver (an
                     // unannotated parameter with a PyPop bound, issue #109
@@ -8926,5 +8956,44 @@ pub(crate) fn dunder_method_well_typed(method: &crate::FunctionDef) -> bool {
         Some(ExprType::Name(n)) => !matches!(n.id.as_str(), "Any" | "object" | "None"),
         Some(_) => true,
         None => false,
+    }
+}
+
+/// Whether a receiver is a BYTES value (`b"..."`, a Vec<u8>-typed name) —
+/// the bytes twin of `receiver_is_str_like`: bytes methods (join, ...)
+/// dispatch to the runtime's bytes surface.
+pub(crate) fn receiver_is_bytes_like(
+    receiver: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    match receiver {
+        ExprType::Constant(c) => matches!(
+            &c.0,
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_))
+        ),
+        ExprType::Name(n) => {
+            options
+                .local_types
+                .get(&n.id)
+                .is_some_and(|t| t.contains("Vec < u8 >") || t.contains("Vec<u8>"))
+                || options
+                    .name_types
+                    .get(&n.id)
+                    .is_some_and(|t| matches!(t, crate::TypeInfo::Bytes))
+        }
+        ExprType::Call(c) => {
+            // A `.to_vec()` of a bytes literal (`b"ab".to_vec()`).
+            matches!(c.func.as_ref(), ExprType::Attribute(a)
+                if a.attr == "to_vec"
+                    && matches!(a.value.as_ref(), ExprType::Constant(cc)
+                        if matches!(&cc.0, Some(litrs::Literal::Byte(_))
+                            | Some(litrs::Literal::ByteString(_)))))
+                // A call whose return annotation is bytes
+                // (`print(join_sep([...]))` where join_sep -> bytes).
+                || crate::call_return_typeinfo(c, Some(symbols), Some(options))
+                    .is_some_and(|t| matches!(t, crate::TypeInfo::Bytes))
+        }
+        _ => false,
     }
 }
