@@ -1111,6 +1111,10 @@ pub struct FunctionTypeInfo {
     /// Names assigned an empty `[]`/`{}` literal whose element type was
     /// pinned by a later use; maps to the pinned container type.
     pub empty_pinned: HashMap<String, TypeInfo>,
+    /// Names assigned None on some path (or seeded from an Option-typed
+    /// self-field by the class-aware analysis): Option bindings whose
+    /// access lowering unwraps (issue #137's Option-aware access).
+    pub optional_names: HashSet<String>,
 }
 
 /// Walk a statement list, counting reads and collecting `name = expr`
@@ -1119,6 +1123,65 @@ pub struct FunctionTypeInfo {
 /// (`cached_mess_ratio = lru_cache(...)(mess_ratio)`) to their return type
 /// (issue #127).
 pub fn analyze_function_types(
+    body: &[Statement],
+    options: Option<&PythonOptions>,
+    symbols: Option<&SymbolTableScopes>,
+) -> FunctionTypeInfo {
+    analyze_function_types_with_class(body, options, symbols, None)
+}
+
+/// [`analyze_function_types`] with the ENCLOSING CLASS (issue #137's
+/// Option-aware access): a local assigned from a field of the method's
+/// own class (`resp_options = self._response_options` — urllib3) types
+/// from the field table — a `Timeout | None` field makes the local an
+/// Option, so later access through it unwraps like any Option receiver.
+/// Seeded only for locals the plain analysis could not type.
+pub fn analyze_function_types_with_class(
+    body: &[Statement],
+    options: Option<&PythonOptions>,
+    symbols: Option<&SymbolTableScopes>,
+    self_class: Option<&str>,
+) -> FunctionTypeInfo {
+    let mut info = analyze_function_types_inner(body, options, symbols);
+    if let Some(class_name) = self_class
+        && let (Some(options), Some(symbols)) = (options, symbols)
+        && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+        && let Ok(fields) = class.infer_fields(symbols, options)
+    {
+        for stmt in body {
+            let crate::StatementType::Assign(a) = &stmt.statement else {
+                continue;
+            };
+            let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+                continue;
+            };
+            if info.name_types.contains_key(&n.id) || info.optional_names.contains(&n.id) {
+                continue;
+            }
+            let crate::ExprType::Attribute(attr) = &a.value else {
+                continue;
+            };
+            if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
+                continue;
+            }
+            if let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr) {
+                if ty.to_string().starts_with("Option <") {
+                    // name_types only — the local IS the Option (its
+                    // stores are already Option and must not Some-wrap
+                    // again), and reads unwrap through the Option
+                    // receiver lowering.
+                    info.name_types.insert(
+                        n.id.clone(),
+                        crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                    );
+                }
+            }
+        }
+    }
+    info
+}
+
+fn analyze_function_types_inner(
     body: &[Statement],
     options: Option<&PythonOptions>,
     symbols: Option<&SymbolTableScopes>,
@@ -1153,6 +1216,9 @@ fn analyze_statement_types(
             // annotation pins it — an annotated assignment's annotation
             // wins, so `xs: list[float] = []` pins the empty literal).
             if let [ExprType::Name(name)] = assign.targets.as_slice() {
+                if crate::is_none_expr(&assign.value) {
+                    info.optional_names.insert(name.id.clone());
+                }
                 let mut t = match assign
                     .annotation
                     .as_ref()

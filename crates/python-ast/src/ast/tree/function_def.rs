@@ -1489,7 +1489,23 @@ impl FunctionDef {
         // pinned by later use. Annotation-derived types win over
         // assignment-inferred ones, matching local_types above.
         {
-            let mut info = crate::analyze_function_types(&effective_body, Some(&options), Some(&symbols));
+            let mut info = crate::analyze_function_types_with_class(
+                &effective_body,
+                Some(&options),
+                Some(&symbols),
+                ctx.enclosing_class_name(),
+            );
+            // None-assigned locals (and locals seeded from Option fields
+            // by the class-aware analysis) are Option bindings: the
+            // access lowering unwraps them (issue #137's Option-aware
+            // access), so the codegen's optional set must include them,
+            // not just the Optional-annotated PARAMETERS.
+            if !info.optional_names.is_empty() {
+                let mut merged: std::collections::HashSet<String> =
+                    (*options.optional_names).clone();
+                merged.extend(info.optional_names.iter().cloned());
+                options.optional_names = std::rc::Rc::new(merged);
+            }
             for p in self
                 .args
                 .args
@@ -1673,6 +1689,7 @@ impl FunctionDef {
                 name_types: options.name_types.as_ref().clone(),
                 empty_pinned: options.empty_pinned.as_ref().clone(),
                 annotated_names: std::collections::HashSet::new(),
+                optional_names: std::collections::HashSet::new(),
             };
             crate::pin_empty_containers(&effective_body, &mut info, Some(&symbols), Some(&options));
             options.use_counts = std::rc::Rc::new(info.use_counts);

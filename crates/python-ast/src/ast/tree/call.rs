@@ -4859,7 +4859,15 @@ impl<'a> CodeGen for Call {
                             )?);
                         }
                         let method_name = crate::safe_ident(&attr.attr);
-                        return Ok(quote!(self.#method_name(#(#args),*)));
+                        // The `?` is essential: the recursive call is
+                        // fallible (every user method returns Result), and
+                        // WITHOUT it the Result leaks into the caller's
+                        // value and every later `.attr`/method on it fails
+                        // (urllib3's `httplib_response =
+                        // super().getresponse()` then
+                        // `httplib_response.msg` — E0609 on
+                        // `Result<HTTPResponse, PyException>`).
+                        return Ok(quote!(self.#method_name(#(#args),*)?));
                     }
                 };
                 let method = match base.method_on_mro(&attr.attr, &symbols) {
@@ -5128,6 +5136,39 @@ impl<'a> CodeGen for Call {
                                 symbols.clone(),
                             )?
                         };
+                    // Issue #137's Option-aware access, the known-class
+                    // method path: a receiver that is an Option-typed
+                    // value (`self.timeout.connect_timeout()` where the
+                    // field is `Timeout | None`) unwraps before the call —
+                    // CPython's AttributeError-on-None as a loud §12.2
+                    // panic. Computed BEFORE attr.value is moved above.
+                    let receiver = if let Some(_inner) =
+                        crate::ast::tree::attribute::receiver_option_inner(
+                            &attr.value,
+                            &ctx,
+                            &symbols,
+                            &options,
+                        )
+                    {
+                        let mname = attr.attr.clone();
+                        if mutates_receiver {
+                            quote!((#receiver).as_mut().unwrap_or_else(|| {
+                                panic!(
+                                    "AttributeError: 'NoneType' object has no attribute '{}'",
+                                    #mname
+                                )
+                            }))
+                        } else {
+                            quote!((#receiver).clone().unwrap_or_else(|| {
+                                panic!(
+                                    "AttributeError: 'NoneType' object has no attribute '{}'",
+                                    #mname
+                                )
+                            }))
+                        }
+                    } else {
+                        receiver
+                    };
                     let method_name = crate::safe_ident(&attr.attr);
                     return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
                 }
@@ -5159,6 +5200,15 @@ impl<'a> CodeGen for Call {
             let mutating_self_field = ctx.in_generic_trait()
                 && matches!(attr.value.as_ref(), ExprType::Attribute(_))
                 && crate::ast::tree::attribute::chain_root_is_self(&attr.value);
+            // Issue #137's Option-aware access, the CALL side: a method
+            // call through an Option-typed receiver (`conn.close()` where
+            // conn is `BaseHTTPConnection | None` — urllib3's
+            // _get_conn) unwraps it first. A &mut-taking method uses the
+            // mutable unwrap; a &self method clones. CPython raises
+            // AttributeError on a None receiver — a loud §12.2 panic here.
+            // Computed BEFORE attr.value is moved below.
+            let option_receiver =
+                crate::ast::tree::attribute::receiver_option_inner(&attr.value, &ctx, &symbols, &options);
             let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
                 || mutating_self_field)
                 && crate::ast::tree::scope::mutates_receiver(&attr.attr)
@@ -5186,6 +5236,15 @@ impl<'a> CodeGen for Call {
                 attr.value
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            };
+            let receiver = if let Some(_inner) = option_receiver {
+                if crate::ast::tree::scope::mutates_receiver(&attr.attr) {
+                    quote!((#receiver).as_mut().unwrap())
+                } else {
+                    quote!((#receiver).clone().unwrap())
+                }
+            } else {
+                receiver
             };
 
             // String-keyed dicts (from a literal or a `dict[str, V]`

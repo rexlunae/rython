@@ -12131,3 +12131,159 @@ fn an_any_typed_dunder_keeps_the_loud_fallback() {
         out
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #137's Option-aware access: a read, method call, or store
+// THROUGH an Option-typed receiver (`self.timeout.connect_timeout()`
+// where the field is `Timeout | None` — urllib3) unwraps the Option
+// first. CPython raises AttributeError on a None receiver; rython
+// lowers that as a loud §12.2 panic with CPython's message. Guarded
+// access (`if x is not None:`) is narrowed and never reaches the
+// unwrap; a &mut-taking method unwraps mutably, a &self method clones.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_method_call_through_an_option_field_unwraps() {
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    def __init__(self, value: float) -> None:\n",
+            "        self._value = value\n",
+            "\n",
+            "    def connect_timeout(self) -> float:\n",
+            "        return self._value\n",
+            "\n",
+            "class Conn:\n",
+            "    def __init__(self, timeout: Timeout | None) -> None:\n",
+            "        self.timeout = timeout\n",
+            "\n",
+            "    def total(self) -> float:\n",
+            "        return self.timeout.connect_timeout()\n",
+        ),
+        "optmethod.py",
+    );
+    assert!(
+        out.contains("(self . timeout) . clone () . unwrap_or_else"),
+        "the method call must unwrap the Option field: {}",
+        out
+    );
+}
+
+#[test]
+fn a_read_through_an_option_field_unwraps() {
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    def __init__(self, value: float) -> None:\n",
+            "        self._value = value\n",
+            "\n",
+            "class Conn:\n",
+            "    def __init__(self, timeout: Timeout | None) -> None:\n",
+            "        self.timeout = timeout\n",
+            "\n",
+            "    def label(self) -> float:\n",
+            "        return self.timeout._value\n",
+        ),
+        "optread.py",
+    );
+    assert!(
+        out.contains("(self . timeout) . clone () . unwrap_or_else"),
+        "the read must unwrap the Option field: {}",
+        out
+    );
+    assert!(
+        out.contains("no attribute '{}'"),
+        "the panic must carry CPython's AttributeError text: {}",
+        out
+    );
+}
+
+#[test]
+fn a_guarded_option_read_still_unwraps_with_the_panic_net() {
+    // `if self.timeout is not None:` — the guard renders as a
+    // py_is_none test; attribute receivers are not NAME-narrowed, so the
+    // branch read unwraps with the panic as the safety net (the panic
+    // can only fire if the guard lied — CPython's AttributeError on a
+    // None receiver, §12.2).
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    def __init__(self, value: float) -> None:\n",
+            "        self._value = value\n",
+            "\n",
+            "class Conn:\n",
+            "    def __init__(self, timeout: Timeout | None) -> None:\n",
+            "        self.timeout = timeout\n",
+            "\n",
+            "    def label(self) -> float:\n",
+            "        if self.timeout is not None:\n",
+            "            return self.timeout._value\n",
+            "        return 0.0\n",
+        ),
+        "optguarded.py",
+    );
+    assert!(
+        out.contains("unwrap_or_else"),
+        "guarded attribute reads still unwrap (the panic never fires): {}",
+        out
+    );
+}
+
+#[test]
+fn a_local_assigned_an_option_field_reads_unwrapped() {
+    // `resp_options = self._response_options` (an Option field): the
+    // local types as Option from the field table, and reads through it
+    // unwrap (the local-seeding half).
+    let out = compile(
+        concat!(
+            "class Opts:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.request_url: str | None = None\n",
+            "\n",
+            "class Resp:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._opts: Opts | None = None\n",
+            "\n",
+            "    def url(self) -> str:\n",
+            "        opts = self._opts\n",
+            "        return opts.request_url\n",
+        ),
+        "optlocal.py",
+    );
+    assert!(
+        out.contains("(opts) . clone () . unwrap_or_else"),
+        "reads through the field-seeded local must unwrap: {}",
+        out
+    );
+}
+
+#[test]
+fn an_option_value_in_condition_position_tests_none_ness() {
+    // `if conn:` where conn is `BaseHTTPConnection | None` — CPython's
+    // truthiness of a user object is "not None"; the generic Truthy-for-
+    // Option impl needs T: Truthy, which a user class lacks (E0599 ×12
+    // in the corpus). `!(x).py_is_none()` works for Option and boxed
+    // bindings alike (both have unconditional PyIsNone).
+    let out = compile(
+        concat!(
+            "class Conn:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._ok = True\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, conn: Conn | None) -> None:\n",
+            "        self.conn = conn\n",
+            "\n",
+            "    def state(self) -> str:\n",
+            "        if self.conn:\n",
+            "            return \"open\"\n",
+            "        return \"closed\"\n",
+        ),
+        "opttruth.py",
+    );
+    assert!(
+        out.contains("! (self . conn) . py_is_none ()"),
+        "an Option in condition position must test None-ness: {}",
+        out
+    );
+}

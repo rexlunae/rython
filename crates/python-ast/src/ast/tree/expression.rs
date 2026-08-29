@@ -787,7 +787,26 @@ pub fn condition_to_rust(    expr: &ExprType,
             expr.clone().to_rust(ctx, options, symbols)
         }
         other => {
-            let tokens = other.clone().to_rust(ctx, options, symbols)?;
+            let tokens = other.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // An Option/boxed-optional value in condition position (`if
+            // conn:` where conn is `BaseHTTPConnection | None` — urllib3):
+            // Python's truthiness is "not None" — a user object without
+            // __bool__/__len__ is always truthy, and None is false. The
+            // generic `Truthy for Option<T>` impl needs `T: Truthy`,
+            // which a user class lacks (E0599 ×12 in the corpus);
+            // `!(x).py_is_none()` works for Option AND boxed bindings
+            // (both have unconditional PyIsNone) and reproduces CPython
+            // exactly for these shapes.
+            if crate::ast::tree::attribute::receiver_option_inner(
+                other,
+                &ctx,
+                &symbols,
+                &options,
+            )
+            .is_some()
+            {
+                return Ok(quote!(!(#tokens).py_is_none()));
+            }
             Ok(quote!((#tokens).is_truthy()))
         }
     }

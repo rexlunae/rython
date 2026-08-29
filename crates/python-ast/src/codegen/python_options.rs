@@ -267,6 +267,12 @@ pub struct PythonOptions {
     /// no known type satisfies). The transpiler drains this after codegen;
     /// shared across option clones so pushes land in one place.
     pub definition_warnings: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    /// Per-conversion memo of `(class, field) -> field's rendered type is
+    /// Option<...>` for the Option-aware receiver lowering: the base-chain
+    /// field walk is too expensive to redo per attribute read (issue
+    /// #137). The field table is stable per module, so the memo is sound.
+    pub option_field_cache:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(String, String), bool>>>,
 
     /// Names in the CURRENT scope that hold an Option (assigned None on
     /// some path, or annotated Optional): non-None stores into them wrap
@@ -563,6 +569,9 @@ impl Default for PythonOptions {
             lossy_warnings: true,
             owned_str_literals: std::rc::Rc::new(std::collections::HashSet::new()),
             definition_warnings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            option_field_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new()
+            )),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
             dict_forced_kv: std::rc::Rc::new(None),

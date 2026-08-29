@@ -7127,3 +7127,77 @@ fn class_mapping_protocol_matches_cpython() {
         stderr
     );
 }
+
+#[test]
+fn option_receiver_access_matches_cpython() {
+    // Issue #137's Option-aware access: a method call and a field read
+    // THROUGH an Option-typed field (`self.timeout.connect_timeout()`
+    // where timeout is `Timeout | None`) unwrap the Option — CPython's
+    // AttributeError-on-None as a loud §12.2 panic that can only fire if
+    // the value was actually None. Output verified against CPython 3.11:
+    // "5.0" / "5.0" / "5.0".
+    let scratch = Scratch::new("optionaccess");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "class Timeout:\n",
+            "    def __init__(self, value: float) -> None:\n",
+            "        self._value = value\n",
+            "\n",
+            "    def connect_timeout(self) -> float:\n",
+            "        return self._value\n",
+            "\n",
+            "    def _value_str(self) -> str:\n",
+            "        return str(self._value)\n",
+            "\n",
+            "class Conn:\n",
+            "    def __init__(self, timeout: Timeout | None) -> None:\n",
+            "        self.timeout = timeout\n",
+            "\n",
+            "    def total(self) -> float:\n",
+            "        return self.timeout.connect_timeout()\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.timeout._value_str()\n",
+            "\n",
+            "    def maybe(self) -> str:\n",
+            "        if self.timeout is not None:\n",
+            "            return self.timeout._value_str()\n",
+            "        return \"none\"\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    c = Conn(Timeout(5.0))\n",
+            "    print(c.total())\n",
+            "    print(c.label())\n",
+            "    print(c.maybe())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["5.0", "5.0", "5.0"],
+        "stdout: {} stderr: {}",
+        stdout,
+        stderr
+    );
+}

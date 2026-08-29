@@ -394,7 +394,26 @@ impl<'a> CodeGen for Attribute {
         let property_getter = crate::receiver_class(&self.value, &ctx, &symbols, &options)
             .is_some_and(|(class, _)| class.has_property_getter(&self.attr));
         let warnings = options.definition_warnings.clone();
-        let value_tokens = self.value.to_rust(ctx, options, symbols)?;
+        // Issue #137's Option-aware access: a READ through an
+        // Option-typed receiver (`self.timeout.connect_timeout` where the
+        // field is `Timeout | None`, `resp.headers.get(...)` where resp is
+        // an Option param — urllib3) unwraps the Option first — CPython
+        // would raise AttributeError on a None receiver, which rython
+        // represents as a loud §12.2 panic with CPython's message. A
+        // narrowed receiver never reaches here (narrowed_names unwraps
+        // reads already); guarded access stays exact. Computed BEFORE
+        // `self.value` is moved by the to_rust below.
+        let option_receiver = receiver_option_inner(&self.value, &ctx, &symbols, &options);
+        let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
+        if let Some(_inner) = option_receiver {
+            let attr_name = self.attr.clone();
+            value_tokens = quote!((#value_tokens).clone().unwrap_or_else(|| {
+                panic!(
+                    "AttributeError: 'NoneType' object has no attribute '{}'",
+                    #attr_name
+                )
+            }));
+        }
         let value_str = value_tokens.to_string();
         let attr = crate::safe_ident(&self.attr);
         // Debug-form of the receiver for -W messages (captured before the
@@ -1099,4 +1118,95 @@ pub(crate) fn external_module_root(
         return None;
     }
     Some(root)
+}
+
+/// The Option's INNER Rust type when an expression's runtime value is
+/// `Option<T>` (issue #137's Option-aware access): a name whose
+/// recorded type is `TypeInfo::Option`, a `self.<field>` read whose
+/// field the class table types Option, a deeper chain (recurse to the
+/// root), or a call whose return annotation is Optional. None for
+/// anything else — a non-Option receiver never unwraps. Access through
+/// an Option receiver is CPython's AttributeError-on-None, which rython
+/// lowers as a loud §12.2 panic at the access site.
+pub(crate) fn receiver_option_inner(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<proc_macro2::TokenStream> {
+    match expr {
+        ExprType::Name(n) => match options.name_types.get(&n.id) {
+            Some(crate::TypeInfo::Option(inner)) => Some(inner.to_rust_type()),
+            // A None-first local (`conn = None` then `conn = ...` —
+            // urllib3's _get_conn) is an Option binding; the inner type
+            // is whatever the stores join to — the unwrap never needs it.
+            // A BOXED name (PyValue — the None-mixing path stores
+            // PyValue::None_, not Some) is NOT an Option: unwrapping it
+            // would be wrong (no is_some/unwrap on PyValue).
+            Some(crate::TypeInfo::PyValue) => None,
+            _ if options.optional_names.contains(&n.id) => Some(quote!(_)),
+            _ => None,
+        },
+        ExprType::Attribute(attr) => {
+            // `self.<field>` (or `<obj>.<field>`): the field's inferred
+            // Rust type comes from the OWNER class's field table.
+            let owner: Option<(crate::ClassDef, SymbolTableScopes)> = match attr.value.as_ref() {
+                ExprType::Name(n) if n.id == "self" => {
+                    let class_name = ctx.enclosing_class_name()?;
+                    match symbols.get(class_name) {
+                        Some(crate::SymbolTableNode::ClassDef(c)) => {
+                            Some((c.clone(), symbols.clone()))
+                        }
+                        _ => None,
+                    }
+                }
+                other => crate::receiver_class(other, ctx, symbols, options),
+            };
+            if let Some((class, class_symbols)) = owner {
+                let key = (class.name.clone(), attr.attr.clone());
+                if let Some(cached) = options
+                    .option_field_cache
+                    .borrow()
+                    .get(&key)
+                    .cloned()
+                {
+                    return if cached { Some(quote!(_)) } else { None };
+                }
+                // The field may be INHERITED (`self.proxy` on
+                // HTTPConnectionPool, whose base ConnectionPool stores it
+                // in its own __init__): search the whole base chain's
+                // field tables.
+                let mut is_option = false;
+                for c in class.base_chain(&class_symbols) {
+                    if let Ok(fields) = c.infer_fields(&class_symbols, options) {
+                        if let Some((_, ty)) =
+                            fields.iter().find(|(name, _)| *name == attr.attr)
+                        {
+                            let ty = ty.to_string();
+                            is_option = ty
+                                .strip_prefix("Option <")
+                                .is_some_and(|s| s.strip_suffix('>').is_some());
+                            break;
+                        }
+                    }
+                }
+                options
+                    .option_field_cache
+                    .borrow_mut()
+                    .insert(key, is_option);
+                return if is_option { Some(quote!(_)) } else { None };
+            }
+            // A deeper chain: recurse to the base (`a.b.c` — is `a.b`
+            // Option?).
+            receiver_option_inner(&attr.value, ctx, symbols, options)
+        }
+        ExprType::Call(call) => {
+            let t = crate::call_return_typeinfo(call, Some(symbols), Some(options))?;
+            match t {
+                crate::TypeInfo::Option(inner) => Some(inner.to_rust_type()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
