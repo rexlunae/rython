@@ -1,249 +1,35 @@
-//! The built-in Python exception tree, as an enum.
+//! The built-in Python exception tree — derived from the interpreter.
 //!
 //! Exception types are an OPEN set at runtime — generated programs raise
 //! user-defined classes whose names cannot exist here — so `PyException`
-//! carries its type as a string. But the BUILT-IN subset is closed, and
-//! per the AGENTS.md parse-into-enums rule it is modeled as
-//! [`BuiltinException`]: the name string is parsed exactly once, at
-//! [`BuiltinException::from_name`], and everything downstream — ancestry
-//! walks for `except` matching, PyO3 surfacing — is an exhaustive `match`
-//! on the enum, so a new exception type cannot be added half-way (a
-//! variant missing from [`parent`](BuiltinException::parent) or
-//! [`pyo3_err`](BuiltinException::pyo3_err) is a compile error, not a
-//! runtime miss). The tree itself is generated from python3 3.14
-//! `__mro__` dumps.
+//! carries its type as a string. The BUILT-IN subset's hierarchy comes
+//! from the live Python interpreter: python-ast dumps every
+//! `BaseException` subclass's real `__mro__` through PyO3 (the same
+//! path that produces parse trees — `dump_builtin_exception_tree`), and
+//! the checked-in generated file below carries that data: the MRO
+//! table, the one name→enum boundary, and the canonical-name map, all
+//! rendered from the same interpreter dump so none can drift from the
+//! others. python-ast's `exception_tree_is_current` test verifies the
+//! checked-in file against the live interpreter on every run — a
+//! divergence (new exception, restructured MRO, new alias) is a loud
+//! test failure, and `RYTHON_REGEN=1` regenerates the file.
 //!
-//! python-ast does not depend on this crate, so its syntactic classifier
-//! (`raise_stmt::BUILTIN_EXCEPTION_NAMES`) is a separate boundary
-//! registry; this module is the runtime's authority.
+//! What cannot be derived stays hand-written here: the PyO3 surfacing
+//! of each exception (a mapping onto pyo3's error API, not tree data)
+//! and the runtime `matches` walk (in `PyException`), which is
+//! hand-written but reads interpreter-derived data.
 
-/// Emits the enum together with its name mapping and (test-only) variant
-/// list from ONE row per exception, so those three can never drift.
-macro_rules! builtin_exceptions {
-    (
-        $($variant:ident => $name:literal),* $(,)?
-    ) => {
-        /// One variant per built-in exception type the runtime can match
-        /// on, plus the stdlib-module exceptions the socket/urllib
-        /// runtimes raise (the URLError family, gaierror/herror) —
-        /// closed-world, so `except` ancestry is a compile-checked walk
-        /// instead of a string table.
-        ///
-        /// The historical aliases EnvironmentError/IOError are NOT
-        /// variants: `from_name` canonicalizes them to
-        /// [`OSError`](Self::OSError), which they alias in CPython
-        /// (`EnvironmentError is OSError` → True).
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        pub(crate) enum BuiltinException {
-            $($variant),*
-        }
+include!("builtin_exceptions_gen.rs");
 
-        impl BuiltinException {
-            /// The ONE string→enum boundary. Returns `None` for names
-            /// outside the built-in tree (user-defined classes).
-            pub(crate) fn from_name(name: &str) -> Option<Self> {
-                match name {
-                    $($name => Some(Self::$variant),)*
-                    // Historical aliases of OSError (CPython: the same
-                    // class object).
-                    "EnvironmentError" | "IOError" => Some(Self::OSError),
-                    // ssl.CertificateError IS SSLCertVerificationError
-                    // (an alias since Python 3.7).
-                    "CertificateError" => Some(Self::SSLCertVerificationError),
-                    _ => None,
-                }
-            }
-
-            /// The canonical Python name (what CPython prints).
-            #[cfg(test)]
-            pub(crate) fn name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $name),*
-                }
-            }
-
-            /// Every variant, in declaration order — emitted by the same
-            /// macro row as the name mapping, so it cannot drift.
-            #[cfg(test)]
-            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),*];
-        }
-    };
-}
-
-builtin_exceptions! {
-    BaseException => "BaseException",
-    Exception => "Exception",
-    SystemExit => "SystemExit",
-    KeyboardInterrupt => "KeyboardInterrupt",
-    GeneratorExit => "GeneratorExit",
-    ArithmeticError => "ArithmeticError",
-    AssertionError => "AssertionError",
-    AttributeError => "AttributeError",
-    BufferError => "BufferError",
-    EOFError => "EOFError",
-    ImportError => "ImportError",
-    ModuleNotFoundError => "ModuleNotFoundError",
-    LookupError => "LookupError",
-    MemoryError => "MemoryError",
-    NameError => "NameError",
-    OSError => "OSError",
-    ReferenceError => "ReferenceError",
-    RuntimeError => "RuntimeError",
-    StopIteration => "StopIteration",
-    StopAsyncIteration => "StopAsyncIteration",
-    SyntaxError => "SyntaxError",
-    SystemError => "SystemError",
-    TypeError => "TypeError",
-    ValueError => "ValueError",
-    Warning => "Warning",
-    // Arithmetic leaves.
-    FloatingPointError => "FloatingPointError",
-    OverflowError => "OverflowError",
-    ZeroDivisionError => "ZeroDivisionError",
-    // Lookup leaves.
-    IndexError => "IndexError",
-    KeyError => "KeyError",
-    // Name leaf.
-    UnboundLocalError => "UnboundLocalError",
-    // OSError subtree.
-    BlockingIOError => "BlockingIOError",
-    ChildProcessError => "ChildProcessError",
-    ConnectionError => "ConnectionError",
-    BrokenPipeError => "BrokenPipeError",
-    ConnectionAbortedError => "ConnectionAbortedError",
-    ConnectionRefusedError => "ConnectionRefusedError",
-    ConnectionResetError => "ConnectionResetError",
-    FileExistsError => "FileExistsError",
-    FileNotFoundError => "FileNotFoundError",
-    InterruptedError => "InterruptedError",
-    IsADirectoryError => "IsADirectoryError",
-    NotADirectoryError => "NotADirectoryError",
-    PermissionError => "PermissionError",
-    ProcessLookupError => "ProcessLookupError",
-    TimeoutError => "TimeoutError",
-    // urllib.error family (the http-ureq runtime raises these):
-    // URLError IS-A OSError and HTTPError IS-A URLError in CPython.
-    URLError => "URLError",
-    HTTPError => "HTTPError",
-    ContentTooShortError => "ContentTooShortError",
-    // socket-module exceptions (socket.timeout IS TimeoutError; verified
-    // against python3: gaierror/herror → OSError).
-    Gaierror => "gaierror",
-    Herror => "herror",
-    // ssl-module exceptions (the ssl-rustls runtime raises SSLError):
-    // SSLError IS-A OSError; the leaves subclass SSLError, and
-    // SSLCertVerificationError MULTIPLY inherits (SSLError, ValueError) —
-    // the second ancestry is explicit in is_caught_by. CertificateError
-    // is its alias (canonicalized in from_name). Verified against python3.
-    SSLError => "SSLError",
-    SSLZeroReturnError => "SSLZeroReturnError",
-    SSLWantReadError => "SSLWantReadError",
-    SSLWantWriteError => "SSLWantWriteError",
-    SSLSyscallError => "SSLSyscallError",
-    SSLEOFError => "SSLEOFError",
-    SSLCertVerificationError => "SSLCertVerificationError",
-    // RuntimeError leaves.
-    NotImplementedError => "NotImplementedError",
-    RecursionError => "RecursionError",
-    PythonFinalizationError => "PythonFinalizationError",
-    // Syntax tree.
-    IndentationError => "IndentationError",
-    TabError => "TabError",
-    IncompleteInputError => "_IncompleteInputError",
-    // Unicode tree (hangs off ValueError).
-    UnicodeError => "UnicodeError",
-    UnicodeDecodeError => "UnicodeDecodeError",
-    UnicodeEncodeError => "UnicodeEncodeError",
-    UnicodeTranslateError => "UnicodeTranslateError",
-    // Exception groups. ExceptionGroup MULTIPLY inherits
-    // (BaseExceptionGroup, Exception) — the second ancestry is explicit
-    // in is_caught_by.
-    BaseExceptionGroup => "BaseExceptionGroup",
-    ExceptionGroup => "ExceptionGroup",
-    // Warning tree.
-    BytesWarning => "BytesWarning",
-    DeprecationWarning => "DeprecationWarning",
-    EncodingWarning => "EncodingWarning",
-    FutureWarning => "FutureWarning",
-    ImportWarning => "ImportWarning",
-    PendingDeprecationWarning => "PendingDeprecationWarning",
-    ResourceWarning => "ResourceWarning",
-    RuntimeWarning => "RuntimeWarning",
-    SyntaxWarning => "SyntaxWarning",
-    UnicodeWarning => "UnicodeWarning",
-    UserWarning => "UserWarning",
-}
-
+#[cfg(feature = "std")]
 impl BuiltinException {
-    /// The DIRECT parent (`None` for BaseException, the root). Exhaustive:
-    /// adding a variant without placing it in the tree fails to compile.
-    pub(crate) fn parent(self) -> Option<Self> {
-        use BuiltinException::*;
-        Some(match self {
-            BaseException => return None,
-            Exception | SystemExit | KeyboardInterrupt | GeneratorExit | BaseExceptionGroup => {
-                BaseException
-            }
-            ArithmeticError | AssertionError | AttributeError | BufferError | EOFError
-            | ImportError | LookupError | MemoryError | NameError | OSError | ReferenceError
-            | RuntimeError | StopIteration | StopAsyncIteration | SyntaxError | SystemError
-            | TypeError | ValueError | Warning => Exception,
-            ModuleNotFoundError => ImportError,
-            FloatingPointError | OverflowError | ZeroDivisionError => ArithmeticError,
-            IndexError | KeyError => LookupError,
-            UnboundLocalError => NameError,
-            BlockingIOError | ChildProcessError | ConnectionError | FileExistsError
-            | FileNotFoundError | InterruptedError | IsADirectoryError | NotADirectoryError
-            | PermissionError | ProcessLookupError | TimeoutError | URLError | Gaierror
-            | Herror | SSLError => OSError,
-            SSLZeroReturnError | SSLWantReadError | SSLWantWriteError | SSLSyscallError
-            | SSLEOFError | SSLCertVerificationError => SSLError,
-            BrokenPipeError | ConnectionAbortedError | ConnectionRefusedError
-            | ConnectionResetError => ConnectionError,
-            HTTPError | ContentTooShortError => URLError,
-            NotImplementedError | RecursionError | PythonFinalizationError => RuntimeError,
-            IndentationError | IncompleteInputError => SyntaxError,
-            TabError => IndentationError,
-            UnicodeError => ValueError,
-            UnicodeDecodeError | UnicodeEncodeError | UnicodeTranslateError => UnicodeError,
-            ExceptionGroup => BaseExceptionGroup,
-            BytesWarning | DeprecationWarning | EncodingWarning | FutureWarning | ImportWarning
-            | PendingDeprecationWarning | ResourceWarning | RuntimeWarning | SyntaxWarning
-            | UnicodeWarning | UserWarning => Warning,
-        })
-    }
-
-    /// Whether `except <target>:` catches a raised `self` — the target is
-    /// the type itself or one of its ancestors. ExceptionGroup's second
-    /// base (it multiply inherits BaseExceptionGroup AND Exception in
-    /// CPython) is the one edge the single-parent walk cannot express.
-    pub(crate) fn is_caught_by(self, target: Self) -> bool {
-        if self == target {
-            return true;
-        }
-        if self == Self::ExceptionGroup && target == Self::Exception {
-            return true;
-        }
-        // SSLCertVerificationError's second base: (SSLError, ValueError).
-        if self == Self::SSLCertVerificationError && target == Self::ValueError {
-            return true;
-        }
-        let mut current = self.parent();
-        while let Some(ancestor) = current {
-            if ancestor == target {
-                return true;
-            }
-            current = ancestor.parent();
-        }
-        false
-    }
-
     /// The real Python exception this type surfaces as through PyO3, so
     /// `raise ValueError(...)` reaches Python callers as an actual
-    /// ValueError. Exhaustive — a new variant must decide its surfacing.
-    /// pyo3 0.29 wraps no IndentationError/TabError/_IncompleteInputError
-    /// (SyntaxErrors in CPython's tree) and none of the stdlib-module
-    /// exceptions (OSErrors); each surfaces through that ancestor.
+    /// ValueError. Exhaustive — a new variant (a new exception in the
+    /// interpreter dump) must decide its surfacing. pyo3 0.29 wraps no
+    /// IndentationError/TabError/_IncompleteInputError (SyntaxErrors in
+    /// CPython's tree) and none of the stdlib-module exceptions
+    /// (OSErrors); each surfaces through that ancestor.
     #[cfg(feature = "std")]
     pub(crate) fn pyo3_err(self, msg: String) -> pyo3::PyErr {
         use pyo3::exceptions::*;
@@ -321,85 +107,115 @@ impl BuiltinException {
             SyntaxWarning => PySyntaxWarning::new_err(msg),
             UnicodeWarning => PyUnicodeWarning::new_err(msg),
             UserWarning => PyUserWarning::new_err(msg),
+            // ssl._GiveupOnSendfile — a plain Exception subclass pyo3
+            // does not wrap.
+            GiveupOnSendfile => PyException::new_err(msg),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BuiltinException::{self, *};
+    use crate::PyException;
 
-    #[test]
-    fn names_round_trip() {
-        for v in BuiltinException::ALL {
-            assert_eq!(
-                BuiltinException::from_name(v.name()),
-                Some(*v),
-                "{} does not round-trip",
-                v.name()
-            );
-        }
-    }
-
-    #[test]
-    fn every_chain_bottoms_out_at_base_exception() {
-        // parent() is exhaustive, but a wrong arm could still form a cycle
-        // or a second root; the walk is bounded well past the tree's depth.
-        for v in BuiltinException::ALL {
-            let mut current = *v;
-            for _ in 0..16 {
-                match current.parent() {
-                    Some(p) => current = p,
-                    None => break,
-                }
-            }
-            assert_eq!(
-                current,
-                BaseException,
-                "{}'s ancestry does not reach BaseException",
-                v.name()
-            );
-        }
+    fn caught_by(raised: &str, target: &str) -> bool {
+        PyException::new(raised, "m").matches(target)
     }
 
     #[test]
     fn alias_and_group_special_cases_hold() {
-        // Verified against python3 3.14: EnvironmentError/IOError ARE
-        // OSError (aliases), and ExceptionGroup additionally IS-A
-        // Exception even though its MRO lists BaseExceptionGroup first.
-        assert_eq!(
-            BuiltinException::from_name("EnvironmentError"),
-            Some(OSError)
-        );
-        assert_eq!(BuiltinException::from_name("IOError"), Some(OSError));
-        // ssl aliases and the multiple-inheritance edge (verified against
-        // python3: CertificateError is SSLCertVerificationError, and
-        // SSLCertVerificationError.__bases__ == (SSLError, ValueError)).
-        assert_eq!(
-            BuiltinException::from_name("CertificateError"),
-            Some(SSLCertVerificationError)
-        );
-        assert!(SSLCertVerificationError.is_caught_by(ValueError));
-        assert!(SSLCertVerificationError.is_caught_by(SSLError));
-        assert!(SSLError.is_caught_by(OSError));
-        assert!(!SSLError.is_caught_by(ValueError));
-        assert!(ExceptionGroup.is_caught_by(Exception));
-        assert!(!BaseExceptionGroup.is_caught_by(Exception));
-        assert!(!SystemExit.is_caught_by(Exception));
-        assert!(SystemExit.is_caught_by(BaseException));
+        // Multiple inheritance and aliases come from the interpreter's
+        // MRO data (ExceptionGroup additionally IS-A Exception even
+        // though its MRO lists BaseExceptionGroup first;
+        // SSLCertVerificationError IS-A ValueError as its second base).
+        assert!(caught_by("SSLCertVerificationError", "ValueError"));
+        assert!(caught_by("SSLCertVerificationError", "SSLError"));
+        assert!(caught_by("SSLError", "OSError"));
+        assert!(!caught_by("SSLError", "ValueError"));
+        assert!(caught_by("ExceptionGroup", "Exception"));
+        assert!(!caught_by("BaseExceptionGroup", "Exception"));
+        assert!(!caught_by("SystemExit", "Exception"));
+        assert!(caught_by("SystemExit", "BaseException"));
+        // EnvironmentError/IOError ARE OSError — both directions.
+        assert!(caught_by("EnvironmentError", "OSError"));
+        assert!(caught_by("IOError", "OSError"));
+        assert!(caught_by("OSError", "EnvironmentError"));
     }
 
     #[test]
     fn stdlib_module_exceptions_walk_into_the_builtin_tree() {
         // `except OSError:` must catch a raised URLError or gaierror
-        // (python3-verified MROs; the rypip urllib e2e test pins the
+        // (interpreter-derived MROs; the rypip urllib e2e test pins the
         // URLError case end to end).
-        assert!(URLError.is_caught_by(OSError));
-        assert!(HTTPError.is_caught_by(URLError));
-        assert!(HTTPError.is_caught_by(OSError));
-        assert!(ContentTooShortError.is_caught_by(URLError));
-        assert!(Gaierror.is_caught_by(OSError));
-        assert!(Herror.is_caught_by(OSError));
-        assert!(!URLError.is_caught_by(ConnectionError));
+        assert!(caught_by("URLError", "OSError"));
+        assert!(caught_by("HTTPError", "URLError"));
+        assert!(caught_by("HTTPError", "OSError"));
+        assert!(caught_by("ContentTooShortError", "URLError"));
+        assert!(caught_by("gaierror", "OSError"));
+        assert!(caught_by("herror", "OSError"));
+        assert!(!caught_by("URLError", "ConnectionError"));
+        // socket.timeout IS TimeoutError.
+        assert!(caught_by("timeout", "OSError"));
+        assert!(caught_by("TimeoutError", "OSError"));
+    }
+
+    #[test]
+    fn unknown_raised_types_keep_the_broad_posture() {
+        // A raised type outside the builtin table (a user class) is
+        // caught only by Exception and BaseException — the documented
+        // divergence (rython does not know user-class hierarchies).
+        assert!(caught_by("MyError", "Exception"));
+        assert!(caught_by("MyError", "BaseException"));
+        assert!(!caught_by("MyError", "OSError"));
+        assert!(!caught_by("MyError", "MyOtherError"));
+    }
+
+    // The enum registry (from_name + variants) exists only for the
+    // std-tier PyO3 surfacing; the matching semantics above are
+    // tier-independent and run in the alloc tier too.
+    #[cfg(feature = "std")]
+    mod registry {
+        // The enum lives at this module's top level (the include!);
+        // `super` here is the tests module, so reach the enum by path.
+        use crate::builtin_exceptions::*;
+
+        #[test]
+        fn names_round_trip() {
+            for v in BuiltinException::ALL {
+                assert_eq!(
+                    BuiltinException::from_name(v.name()),
+                    Some(*v),
+                    "{} does not round-trip",
+                    v.name()
+                );
+            }
+        }
+
+        #[test]
+        fn canonicalization_is_the_alias_boundary() {
+            // The aliases canonicalize to the class object they ARE —
+            // interpreter data, pinned by python-ast's exception_tree
+            // tests against the live interpreter.
+            assert_eq!(
+                BuiltinException::from_name("EnvironmentError"),
+                Some(BuiltinException::OSError)
+            );
+            assert_eq!(
+                BuiltinException::from_name("IOError"),
+                Some(BuiltinException::OSError)
+            );
+            assert_eq!(
+                BuiltinException::from_name("CertificateError"),
+                Some(BuiltinException::SSLCertVerificationError)
+            );
+            assert_eq!(
+                BuiltinException::from_name("timeout"),
+                Some(BuiltinException::TimeoutError)
+            );
+            assert_eq!(
+                BuiltinException::from_name("_GiveupOnSendfile"),
+                Some(BuiltinException::GiveupOnSendfile)
+            );
+        }
     }
 }

@@ -1122,7 +1122,7 @@ impl<'a> CodeGen for Assign {
     }
 }
 
-fn is_container_literal(expr: &ExprType) -> bool {
+pub(crate) fn is_container_literal(expr: &ExprType) -> bool {
     matches!(
         expr,
         ExprType::List(_)

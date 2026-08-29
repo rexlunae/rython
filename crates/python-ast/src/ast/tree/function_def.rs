@@ -1722,35 +1722,7 @@ impl FunctionDef {
             .iter()
             .chain(self.args.args.iter())
             .chain(self.args.kwonlyargs.iter())
-            .filter(|p| p.annotation.is_none())
-            .filter(|p| {
-                let pos = self
-                    .args
-                    .posonlyargs
-                    .iter()
-                    .chain(self.args.args.iter())
-                    .position(|q| q.arg == p.arg);
-                let from = self.args.posonlyargs.len() + self.args.args.len()
-                    - self.args.defaults.len();
-                match pos {
-                    Some(i) if i >= from => self
-                        .args
-                        .defaults
-                        .get(i - from)
-                        .is_some_and(|d| crate::is_none_expr(d)),
-                    _ => {
-                        let kw = self
-                            .args
-                            .kwonlyargs
-                            .iter()
-                            .zip(self.args.kw_defaults.iter())
-                            .find(|(q, _)| q.arg == p.arg);
-                        kw.is_some_and(|(_, d)| {
-                            d.as_deref().is_some_and(crate::is_none_expr)
-                        })
-                    }
-                }
-            })
+            .filter(|p| crate::param_has_none_default(p, &self))
             .map(|p| p.arg.clone())
             .collect();
         let mut inferred_signature = {
@@ -1861,10 +1833,20 @@ impl FunctionDef {
         // `impl Into<PyObject>`), and the stdlib-method-bound parameters
         // into method-call dispatch (M2).
         // None-defaulted unannotated parameters are concrete Option<()> —
-        // nothing but None can ever be stored in them (issue #117).
+        // nothing but None can ever be stored in them (issue #117) —
+        // UNLESS the parameter's value is genuinely used
+        // (`self._retryable_exceptions = retryable_exceptions` —
+        // botocore's MaxAttemptsDecorator, round 33): it then carries a
+        // real Python value (a boxed exception-name list) and types as
+        // the boxed PyValue, so call sites pass values and the dropped
+        // None default boxes to PyValue::None_.
         let mut final_param_types = inferred_signature.param_types.clone();
         for name in &none_defaulted {
-            final_param_types.insert(name.clone(), quote!(Option<()>));
+            if crate::name_read_as_value(name, &effective_body) {
+                final_param_types.insert(name.clone(), quote!(stdpython::PyValue));
+            } else {
+                final_param_types.insert(name.clone(), quote!(Option<()>));
+            }
         }
         // A FREE function's value-pinned parameters (inferred boxed
         // PyValue — issue #161) render `impl Into<stdpython::PyValue>`
@@ -2111,7 +2093,6 @@ impl FunctionDef {
             // concrete (a value-pinned PyValue, issue #161); a method's
             // synthesized signature never carries one, so methods keep
             // their own path.
-            && guarantees_return(&self.body)
             && matches!(
                 &inferred_signature.return_type,
                 Some(ty) if ty.to_string() == "stdpython :: PyValue"
@@ -2252,6 +2233,17 @@ impl FunctionDef {
                         .to_string()
                         .into(),
                 );
+            } else if matches!(
+                &inferred_signature.return_type,
+                Some(ty) if ty.to_string() == "stdpython :: PyValue"
+            ) {
+                // A fall-through path with the BOXED-PyValue return (the
+                // None-mixing unification — `return [ChecksumError]` +
+                // `return exceptions` + fall-through, botocore's
+                // retryhandler): None is already one of the boxed value's
+                // members, so the type stands and the fall-through renders
+                // PyValue::None_ (issue #122 step 3).
+                quote!(-> Result<stdpython::PyValue, PyException>)
             } else {
                 quote!(-> Result<(), PyException>)
             }
@@ -2615,6 +2607,11 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
         | crate::TypeInfo::String
         | crate::TypeInfo::Bytes
         | crate::TypeInfo::Class(_) => true,
+        // The boxed PyValue IS a concrete answer (`return tuple(x)` —
+        // round 33's botocore retryhandler): a guaranteed boxed return
+        // declares Result<PyValue, _>, and the body already emits the
+        // boxed values. Only the NO-ANSWER PyObject keeps refusing.
+        crate::TypeInfo::PyValue => true,
         crate::TypeInfo::Vec(e) => renderable_return_typeinfo(e),
         crate::TypeInfo::Dict(k, v) => {
             renderable_return_typeinfo(k) && renderable_return_typeinfo(v)
@@ -3294,6 +3291,40 @@ fn first_yield_type(
     None
 }
 
+/// Whether `param` is a None-defaulted, unannotated parameter of `func`
+/// (issue #117): the default is the None literal and there is no
+/// annotation to pin a type. Such parameters are concrete `Option<()>`
+/// unless their value is used (round 33), in which case they carry the
+/// boxed `PyValue`. Shared by the callee's signature generation and the
+/// call site's argument coercion, so the two cannot disagree.
+pub(crate) fn param_has_none_default(param: &crate::Parameter, func: &crate::FunctionDef) -> bool {
+    if param.annotation.is_some() {
+        return false;
+    }
+    let pos_params: Vec<&crate::Parameter> = func
+        .args
+        .posonlyargs
+        .iter()
+        .chain(func.args.args.iter())
+        .collect();
+    let from = func.args.posonlyargs.len() + func.args.args.len() - func.args.defaults.len();
+    if let Some(pos) = pos_params.iter().position(|q| q.arg == param.arg) {
+        return pos >= from
+            && func
+                .args
+                .defaults
+                .get(pos - from)
+                .is_some_and(|d| crate::is_none_expr(d));
+    }
+    let kw = func
+        .args
+        .kwonlyargs
+        .iter()
+        .zip(func.args.kw_defaults.iter())
+        .find(|(q, _)| q.arg == param.arg);
+    kw.is_some_and(|(_, d)| d.as_deref().is_some_and(|d| crate::is_none_expr(d)))
+}
+
 /// Lower an expression destined for an Option slot (a store into an
 /// optional-tracked name, or an Optional-annotated parameter): values that
 /// already yield an Option (and None itself) pass through, plain values
@@ -3925,27 +3956,47 @@ impl FunctionDef {
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<TokenStream> {
-        if !guarantees_return(&self.body) {
-            return None;
-        }
         let mut returns = Vec::new();
         crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
         if returns.is_empty() {
             return None;
         }
+        // A fall-through path (or a bare `return`) yields Python's None:
+        // `return [ChecksumError]` + `return exceptions` + fall-through
+        // (botocore's _extract_retryable_exception) is
+        // `list[str] | list[Any] | None` — no static type — the boxed
+        // PyValue, exactly the None-mixing unification the literal
+        // partial-return rule already applies (issue #122 step 3).
+        // Without a None path, disagreeing returns keep refusing.
+        let has_none = !guarantees_return(&self.body)
+            || self
+                .body
+                .iter()
+                .any(|s| matches!(&s.statement, crate::StatementType::Return(None)));
         let mut unified: Option<crate::TypeInfo> = None;
         for r in &returns {
             let t = crate::infer_type(r, options, symbols);
-            if !renderable_return_typeinfo(&t) {
-                return None;
-            }
             match &unified {
                 None => unified = Some(t),
                 Some(prev) if *prev == t => {}
+                Some(_) if has_none => {
+                    return Some(quote!(stdpython::PyValue));
+                }
                 Some(_) => return None,
             }
         }
-        unified.map(|t| t.to_rust_type())
+        match (unified, has_none) {
+            // No None path: the type survives ONLY when renderable — an
+            // unrenderable (PyObject "no answer") return still refuses
+            // rather than guessing (the #224 discipline).
+            (Some(t), false) if renderable_return_typeinfo(&t) => Some(t.to_rust_type()),
+            // A None path makes the function heterogeneous by definition
+            // — boxed PyValue, whether the returns agree or not (an
+            // unrenderable/PyValue-containing return is exactly the
+            // dynamic case this models).
+            (Some(_), true) => Some(quote!(stdpython::PyValue)),
+            _ => None,
+        }
     }
 
     /// The BODY-VISIBLE Rust type of an annotated parameter, or None when

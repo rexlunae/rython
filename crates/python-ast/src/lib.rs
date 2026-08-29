@@ -40,3 +40,8 @@ pub use rust_bind::*;
 
 pub mod rust_module;
 pub use rust_module::*;
+
+/// The builtin exception hierarchy, dumped from the live interpreter
+/// (the generator behind stdpython's checked-in exception tree).
+pub mod exception_tree;
+pub use exception_tree::*;

@@ -118,6 +118,20 @@ impl CodeGen for Name {
                 )
                 .into());
             }
+            // A CLASS NAME read as a VALUE (`[ChecksumError]` — a bare
+            // name in a container, comparison, or argument position):
+            // classes as values lower to their NAME STRINGS (round 33
+            // design — the exception model is string-tagged). The raw
+            // Python spelling, matching what the raise side emits.
+            if matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ClassDef(_)))
+                || matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::Alias(c))
+                    if matches!(symbols.get(c), Some(crate::SymbolTableNode::ClassDef(_))))
+                || (matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ImportFrom(_)))
+                    && crate::resolve_class_referenced(&self.id, &symbols, &options).is_some())
+            {
+                let name = self.id.clone();
+                return Ok(quote!(#name.to_string()));
+            }
             let name = crate::safe_ident(&self.id);
             // Issue #125: a name narrowed by `if x is not None:` (or by an
             // if/else whose branches both leave x non-None) still holds an

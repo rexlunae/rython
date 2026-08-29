@@ -608,16 +608,31 @@ matches when its name is the raised type or one of its ancestors, so
 catches the whole file-exception subtree, and — like CPython —
 `except Exception:` does NOT catch `SystemExit`, `KeyboardInterrupt` or
 `GeneratorExit` (they hang off `BaseException` directly). The tree is
-generated from python3 3.14 `__mro__` dumps; the `EnvironmentError`/
-`IOError` aliases resolve to `OSError` for matching, and the stdlib
-exception aliases (`socket.timeout` IS `TimeoutError`, the
-`socket.error`/`gaierror`/`herror` family IS `OSError` — CPython aliases
-the class objects) canonicalize at conversion time on both the raise and
-the except side, however they were imported or renamed (issue #137). An exception type
+the interpreter's own data: python-ast dumps every builtin
+`BaseException` subclass's real `__mro__` (plus the stdlib-module
+exceptions the runtime models — `urllib.error`, `socket`, `ssl`,
+`codeop`) through PyO3 — the same path that produces parse trees — and
+the checked-in table in stdpython carries it (regenerated and verified
+by python-ast's `exception_tree_is_current` test, so the runtime can
+never silently diverge from the reference interpreter). The
+`EnvironmentError`/`IOError` aliases resolve to `OSError` for matching
+(they are the same class object), and the stdlib exception aliases
+(`socket.timeout` IS `TimeoutError`, the `socket.error`/`gaierror`/
+`herror` family IS `OSError` — CPython aliases the class objects)
+canonicalize at conversion time on both the raise and the except side,
+however they were imported or renamed (issue #137). An exception type
 outside the built-in tree is caught only by `Exception`,
 `BaseException`, or its exact name. `except (A, B)` ORs the names; a
 dotted name matches on its final attribute; a bare `except:` catches
-all. (A bare `except:` anywhere but last is a `SyntaxError` in CPython's
+all. An `except` whose type is a *runtime value* — a field or name
+holding the boxed exception-name list (`except
+self._retryable_exceptions:` — botocore's retryhandler, where the list
+arrives as a `tuple` of class-name strings or `None`) matches through
+`PyException::matches_value`: a Str member matches by name, a Tuple
+matches when any member does, and any other value raises CPython's
+`TypeError` ("catching classes that do not inherit from BaseException
+is not allowed") exactly when CPython evaluates the clause. (A bare
+`except:` anywhere but last is a `SyntaxError` in CPython's
 parser — which rython uses — so the not-last case never reaches
 conversion.) `except E as e` binds a copy of the exception; `str(e)` is
 the message, `repr(e)` is `Type('message')`. An uncaught exception exits
@@ -1173,6 +1188,8 @@ accepted as permanent spec:
 | numpy `RuntimeWarning`s (integer divide by zero, invalid value) are not emitted; the VALUES match numpy exactly | Model limit; no `warnings` machinery on the numpy path |
 | Verified stdlib divergences (json/defaultdict ordering, `math.remainder`, `strftime` edge cases, `glob` paths, `pathlib` edges, `string.Template`, …) | Tracked as defects in issue #82 |
 | `functools.singledispatch` picks the FIRST registered type the argument matches, not CPython's MRO walk; a registration on a base class followed by one on its subclass resolves to the base | Model limit (issue #181); disjoint concrete registrations — what real code writes — agree exactly |
+| A CLASS NAME in value position lowers to its NAME STRING (`[ChecksumError]` → `vec!["ChecksumError".to_string()]`; `pool_classes_by_scheme` → `PyDict<String, String>`) — the class object's only runtime-relevant data, since exceptions are string-tagged; identity comparisons of class values compare names, and a dynamic `except <boxed value>:` matches the strings | Model limit (issue #137 round 33); the class's runtime attributes and hierarchy beyond exact-name matching are unmodeled, and a call THROUGH an indirect class value (`pool_cls(...)` read from the dict) fails in rustc (§12.1) |
+| A `type(x).__name__` on a non-`self` receiver lowers through the boxed value's runtime type name, and on an inferred generic parameter is dropped as the boxed None | Model limit; `type(self).__name__` is exact |
 
 ---
 

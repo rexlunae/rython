@@ -3624,19 +3624,26 @@ fn infer_field_type(
             match symbols.get(&n.id) {
                 Some(SymbolTableNode::Assign { value, .. }) => const_type(value).or_else(|| {
                     // A dict of CLASSES (`pool_classes_by_scheme = {"http":
-                    // HTTPConnectionPool, ...}` — urllib3's PoolManager) or
+                    // HTTPConnectionPool, ...}` — urllib3's PoolManager):
+                    // class values are their NAME STRINGS (round 33), so
+                    // the dict is PyDict<String, String>. A dict holding
                     // CALLABLES (`key_fn_by_scheme = {"http":
-                    // functools.partial(...)}`): class/callable values have
-                    // no rython value equivalent — the dict is the boxed
-                    // PyDict (documented divergence).
-                    if let ExprType::Dict(d) = value
-                        && d.values.iter().all(|v| {
-                            crate::is_class_value_expr(v, symbols)
-                                || matches!(v, ExprType::Call(_))
-                                || matches!(v, ExprType::Lambda(_))
-                        })
-                    {
-                        Some(quote!(PyDict<String, PyValue>))
+                    // functools.partial(...)}` — callables cannot be
+                    // runtime values) is the boxed PyDict (documented
+                    // divergence).
+                    if let ExprType::Dict(d) = value {
+                        let all_classes = d.values.iter().all(|v| crate::is_class_value_expr(v, symbols));
+                        let has_callable = d
+                            .values
+                            .iter()
+                            .any(|v| matches!(v, ExprType::Call(_) | ExprType::Lambda(_)));
+                        if all_classes {
+                            Some(quote!(PyDict<String, String>))
+                        } else if has_callable {
+                            Some(quote!(PyDict<String, PyValue>))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
