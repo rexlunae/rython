@@ -6971,13 +6971,31 @@ impl<'a> CodeGen for Call {
         // the called-parameter arm above.
         let value_callee = match self.func.as_ref() {
             ExprType::Call(_) => true,
-            e => matches!(
-                crate::infer_type(e, &options, &symbols),
-                crate::TypeInfo::PyValue
-                    | crate::TypeInfo::String
-                    | crate::TypeInfo::Option(_)
-                    | crate::TypeInfo::PyValueMember(_)
-            ),
+            e => {
+                let mut drop = matches!(
+                    crate::infer_type(e, &options, &symbols),
+                    crate::TypeInfo::PyValue
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Option(_)
+                        | crate::TypeInfo::PyValueMember(_)
+                );
+                // A local assigned from a CONTAINER subscript
+                // (`pool_cls = self.pool_classes_by_scheme[scheme]` —
+                // urllib3's _new_pool, where the PyDict<String, String>
+                // field holds CLASS NAMES): the local carries a container
+                // value (a class name or a boxed member) — calling it is
+                // the callable-as-value drop.
+                if !drop
+                    && let ExprType::Name(n) = e
+                    && let Some(SymbolTableNode::Assign {
+                        value: ExprType::Subscript(_),
+                        ..
+                    }) = symbols.get(&n.id)
+                {
+                    drop = true;
+                }
+                drop
+            }
         };
         if value_callee {
             options.definition_warnings.borrow_mut().push(format!(
