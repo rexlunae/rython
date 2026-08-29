@@ -12817,6 +12817,42 @@ fn class_instances_display_through_str_or_default_repr() {
 }
 
 #[test]
+fn hierarchy_trait_carries_py_display_bound() {
+    // Round 41: a trait-DEFAULT body that formats `self` in an exception
+    // message (`raise ClosedPoolError(self)` — urllib3's _get_conn)
+    // lowers through py_display, which needs `Self: PyDisplay` — the
+    // concrete class always carries the generated impl, so the trait
+    // declares the bound (every implementor satisfies it).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Base:\n",
+            "    def __init__(self):\n",
+            "        self.x = 1\n",
+            "\n",
+            "class Pool(Base):\n",
+            "    def _get(self):\n",
+            "        raise PoolError(self)\n",
+        ),
+        "dispbound.py",
+    );
+    assert!(
+        out.contains("pub trait PoolTrait : BaseTrait where Self : stdpython :: PyDisplay")
+            || out.contains("pub trait PoolTrait: BaseTrait where Self: stdpython::PyDisplay"),
+        "the hierarchy trait must declare Self: PyDisplay: {}",
+        out
+    );
+    assert!(
+        out.contains("pub trait BaseTrait where Self : stdpython :: PyDisplay")
+            || out.contains("pub trait BaseTrait where Self: stdpython::PyDisplay"),
+        "the base trait must declare Self: PyDisplay: {}",
+        out
+    );
+}
+
+#[test]
 fn exception_message_args_wrap_class_instances_in_py_display() {
     // The raise-site message flattening wraps class instances, Options,
     // and boxed values in py_display (Python's str) — a raw format! would

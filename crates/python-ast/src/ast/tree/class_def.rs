@@ -3422,9 +3422,18 @@ impl ClassDef {
         // so a new method that calls an inherited method (`def bar(self):
         // self.foo()` where foo lives on the base) resolves `foo` through
         // the supertrait bound; ancestor methods are not on the concrete
-        // `Self` otherwise.
+        // `Self` otherwise. A default body that formats `self` in an
+        // exception message (`raise ClosedPoolError(self)` — urllib3)
+        // lowers through py_display, which needs `Self: PyDisplay`; the
+        // concrete class always carries the generated impl (round 34),
+        // so the bound is satisfiable by every implementor (round 41).
+        let display_bound = if options.with_std_python {
+            quote!(where Self: stdpython::PyDisplay)
+        } else {
+            quote!()
+        };
         let own_trait = quote! {
-            pub trait #trait_name #supertrait {
+            pub trait #trait_name #supertrait #display_bound {
                 #own_accessor_decls
                 #own_method_defaults
                 #super_trampolines
