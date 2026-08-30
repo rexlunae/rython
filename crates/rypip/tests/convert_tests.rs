@@ -5907,6 +5907,53 @@ fn option_comparison_matches_python() {
 }
 
 #[test]
+fn typing_any_dict_return_types_like_python() {
+    // Round 44: `dict[str, typing.Any]` return annotations (urllib3's
+    // `_merge_pool_kwargs`) — `typing.Any` maps to the boxed PyValue, so
+    // the method's signature is `Result<PyDict<String, PyValue>>` instead
+    // of collapsing to unit while the body emits `Ok(dict)` (which cannot
+    // compile). Transcript pinned against python3.
+    let scratch = Scratch::new("typany");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Any\n",
+            "\n",
+            "def merge(override: dict[str, Any] | None) -> dict[str, Any]:\n",
+            "    base: dict[str, Any] = {\"a\": 1}\n",
+            "    if override:\n",
+            "        for k, v in override.items():\n",
+            "            base[k] = v\n",
+            "    return base\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    d: dict[str, Any] = {\"b\": 2}\n",
+            "    print(merge(d))\n",
+            "    print(merge(None))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["{'a': 1, 'b': 2}", "{'a': 1}"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned
