@@ -361,6 +361,15 @@ fn pyo3_conversion_generates_bindings() {
         "manifest: {}",
         manifest
     );
+    // The bindings call `.map_err(pyo3::PyErr::from)`, which needs
+    // stdpython's `From<PyException> for pyo3::PyErr` — the one thing
+    // behind its `pyo3-interop` feature. Ordinary conversions leave it off
+    // (see the surface test), so this mode has to ask for it.
+    assert!(
+        manifest.contains("pyo3-interop"),
+        "--pyo3 must enable stdpython's pyo3-interop feature: {}",
+        manifest
+    );
     // The generated build script requests pyo3's extension-module link
     // args: without them a macOS linker rejects the cdylib's undefined
     // `_Py_*` symbols (they resolve against the loading interpreter).
@@ -8105,19 +8114,19 @@ fn the_stdpython_dependency_carries_only_the_surfaces_the_package_imports() {
             "plain",
             "def main() -> None:\n    print(\"hi\")\n",
             &[],
-            &["ssl-rustls", "re-regex", "http-ureq"],
+            &["ssl-rustls", "re-regex", "http-ureq", "pyo3-interop"],
         ),
         (
             "re",
             "import re\n\ndef main() -> None:\n    print(re.search(\"a\", \"a\") is not None)\n",
             &["re-regex"],
-            &["ssl-rustls", "http-ureq"],
+            &["ssl-rustls", "http-ureq", "pyo3-interop"],
         ),
         (
             "ssl",
             "import ssl\n\ndef main() -> None:\n    print(ssl.OPENSSL_VERSION)\n",
             &["ssl-rustls"],
-            &["re-regex", "http-ureq"],
+            &["re-regex", "http-ureq", "pyo3-interop"],
         ),
         // Discovery has to reach every statement form conversion emits,
         // not just module level: an import nested in an async function or
@@ -8126,7 +8135,7 @@ fn the_stdpython_dependency_carries_only_the_surfaces_the_package_imports() {
             "async-nested",
             "async def probe() -> None:\n    import re\n    print(re.search(\"a\", \"a\") is not None)\n",
             &["re-regex"],
-            &["ssl-rustls", "http-ureq"],
+            &["ssl-rustls", "http-ureq", "pyo3-interop"],
         ),
     ];
     for (tag, source, present, absent) in cases {

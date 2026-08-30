@@ -920,15 +920,23 @@ see it.
 The third is `re`: stdpython's `re-regex` feature wraps the regex
 crate, likewise in `default` and likewise requested by `import re`.
 
+The fourth, `pyo3-interop`, is not import-driven: it carries the
+`From<PyException> for pyo3::PyErr` surfacing and the `PyAny`/
+`PyObject` aliases, which only rypip's `--pyo3` extension-module mode
+names, so that flag is what enables it.
+
 Because the surfaces are opt-in, the generated manifest names the
 tier and the surfaces explicitly — `default-features = false,
 features = ["std", …]` — rather than inheriting stdpython's defaults.
-A converted package that imports neither `ssl` nor `re` then compiles
-neither rustls nor the regex engine: 54 dependency crates drop to 35,
-and the dependency build's CPU cost falls by about 40%. Getting a
-detection predicate too narrow is loud in the prime directive's
-sense — the generated crate names a module that was not compiled in,
-and the build fails — never a silent loss of the surface.
+A converted package that imports none of them and needs no bindings
+compiles neither rustls, nor the regex engine, nor pyo3 and its
+proc-macro chain: **54 dependency crates drop to 23, and the
+dependency build's CPU cost falls by about two thirds** (52.4s to
+16.6s on a converted `print("hi")`), leaving the std tier only three
+crates above the alloc tier. Getting a detection predicate too narrow
+is loud in the prime directive's sense — the generated crate names a
+module that was not compiled in, and the build fails — never a silent
+loss of the surface.
 
 Known stdlib divergences from CPython that are verified but not yet
 fixed are tracked in issue #82; they are defects, not spec.

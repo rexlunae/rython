@@ -111,11 +111,12 @@ pub(crate) mod flt {
     pub(crate) fn copysign(x: f64, y: f64) -> f64 { libm::copysign(x, y) }
 }
 
-// PyO3 only available with std
-#[cfg(feature = "std")]
+// PyO3 lives behind its own surface feature (which implies std): only
+// generated extension modules name these.
+#[cfg(feature = "pyo3-interop")]
 pub use pyo3::PyAny;
 /// Alias kept for generated code; pyo3 0.29 removed the `PyObject` name.
-#[cfg(feature = "std")]
+#[cfg(feature = "pyo3-interop")]
 pub type PyObject = pyo3::Py<pyo3::PyAny>;
 
 // ============================================================================
@@ -5608,7 +5609,7 @@ impl PyException {
 /// Map a raised PyException onto the corresponding real Python exception
 /// class, so PyO3 bindings surface `raise ValueError(...)` as an actual
 /// ValueError to Python callers.
-#[cfg(feature = "std")]
+#[cfg(feature = "pyo3-interop")]
 impl From<PyException> for pyo3::PyErr {
     fn from(e: PyException) -> pyo3::PyErr {
         let msg = e.message.clone();
