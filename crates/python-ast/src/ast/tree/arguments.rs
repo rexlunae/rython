@@ -278,6 +278,32 @@ pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
     matches!(annotation, ExprType::Name(n) if n.id == "type")
 }
 
+/// A STRING-LITERAL annotation (`verify: "bool | str | None"` — requests'
+/// adapters.py writes its annotations as quoted strings; CPython's
+/// `typing.get_type_hints` evaluates them): re-parse the string's content
+/// as a Python expression so the annotation authorities (type_ctx's
+/// `annotation_type_info`, Parameter::to_rust) see the real union instead
+/// of a bare string Constant. Returns None when the annotation is not a
+/// string literal or the content cannot be parsed (round 56).
+pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
+    let ExprType::Constant(c) = annotation else {
+        return None;
+    };
+    let Some(litrs::Literal::String(s)) = &c.0 else {
+        return None;
+    };
+    let text = s.value();
+    // `typing.Tuple[str, str] | str | None` parses as one expression. A
+    // bare `x: T` statement carries the annotation on AnnotatedName.
+    let module = crate::parse(&format!("x: {text}\n"), "<annotation>").ok()?;
+    let body = &module.raw.body;
+    let stmt = body.first()?;
+    let crate::StatementType::AnnotatedName { annotation, .. } = &stmt.statement else {
+        return None;
+    };
+    Some(annotation.clone())
+}
+
 pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
     // ONE annotation authority (issue #137's systemic review of rounds
     // 38–47): the leaf mapping lives in `annotation_type_info` (with the
@@ -308,10 +334,16 @@ impl CodeGen for Parameter {
 
         // Generate type annotation if present
         if let Some(annotation) = self.annotation {
+            // A STRING-LITERAL annotation (`verify: "bool | str | None"` —
+            // requests' adapters.py quotes its annotations): re-parse the
+            // content so the checks below see the real expression (round
+            // 56), like typing.get_type_hints.
+            let annotation: ExprType =
+                unquote_annotation(&annotation).unwrap_or(*annotation);
             // A str parameter accepts anything convertible to String, so
             // call sites can pass &str literals as well as owned Strings;
             // the function prologue converts it (`let s: String = s.into()`).
-            if matches!(&*annotation, ExprType::Name(n) if n.id == "str") {
+            if matches!(&annotation, ExprType::Name(n) if n.id == "str") {
                 return Ok(quote!(#param_name: impl Into<String>));
             }
             // A bare `type` annotation (`dict_class: type = OrderedDict` —
@@ -337,7 +369,7 @@ impl CodeGen for Parameter {
                     if let Some(t) = crate::resolve_alias_typeinfo(&annotation, &symbols, &options)
                     {
                         t.to_rust_type()
-                    } else if let ExprType::BinOp(op) = &*annotation
+                    } else if let ExprType::BinOp(op) = &annotation
                         && matches!(op.op, crate::BinOps::BitOr)
                         && let Some(members) = crate::union_members(&annotation)
                         && !members.is_empty()

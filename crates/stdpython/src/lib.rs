@@ -2663,6 +2663,30 @@ macro_rules! pyvalue_from {
 }
 pyvalue_from!(i64 => Int, f64 => Float, bool => Bool, String => Str, Vec<u8> => Bytes);
 
+// Box a Python TUPLE value: `PyValue::from(("a".to_string(), 1))` — a
+// module-level tuple VALUE (`basestring = (str, bytes)` — requests'
+// compat; `NETRC_FILES = (".netrc", "_netrc")` — requests' utils) boxes
+// as Tuple members, matching the boxed model's list-as-tuple divergence
+// (round 33). Each element converts through its own Into<PyValue>, so
+// nested tuples and mixed element types compose.
+macro_rules! pyvalue_tuple_from {
+    ($($n:ident),+ $(,)?) => {
+        impl<$($n: Into<PyValue>),+> From<($($n,)+)> for PyValue {
+            fn from(value: ($($n,)+)) -> Self {
+                #[allow(non_snake_case)]
+                let ($($n,)+) = value;
+                PyValue::Tuple(Arc::new(alloc::vec![$(($n).into(),)+]))
+            }
+        }
+    };
+}
+pyvalue_tuple_from!(A);
+pyvalue_tuple_from!(A, B);
+pyvalue_tuple_from!(A, B, C);
+pyvalue_tuple_from!(A, B, C, D);
+pyvalue_tuple_from!(A, B, C, D, E);
+pyvalue_tuple_from!(A, B, C, D, E, F);
+
 impl From<&str> for PyValue {
     fn from(value: &str) -> Self {
         PyValue::Str(value.to_string())

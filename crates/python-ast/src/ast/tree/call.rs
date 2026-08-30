@@ -2150,7 +2150,18 @@ impl<'a> CodeGen for Call {
                     | "tuple"
                     | "next"
                     | "id"
-            ) && symbols.get(bname).is_none()
+            ) && (symbols.get(bname).is_none()
+                // An import of a BUILTIN-CLASS self-alias (`from .compat
+                // import str` where compat does `str = str` — requests'
+                // py2 shim): the self-alias emits no runtime item, so the
+                // name still IS the builtin — dispatch to the builtin arm
+                // (the generic import path would render a dangling static
+                // read, `(*str).clone()(...)`).
+                || crate::ast::tree::module::import_binds_builtin_self_alias(
+                    bname,
+                    &symbols,
+                    &options,
+                ))
                 // A loop element shadowing the builtin (`for filter in ...:
                 // filter(**kwargs)` — botocore's docs client): the call
                 // through the untyped element is dropped at the generic
@@ -9117,8 +9128,7 @@ fn map_call_arguments_inner(
             .annotation
             .as_deref()
             .is_some_and(crate::ast::tree::arguments::is_type_annotation)
-        {
-            if crate::is_class_value_expr(expr, symbols) {
+        {            if crate::is_class_value_expr(expr, symbols) {
                 if let ExprType::Name(n) = expr {
                     let name = n.id.clone();
                     return Ok(quote!(#name.to_string()));
@@ -9130,6 +9140,38 @@ fn map_call_arguments_inner(
                 param.arg
             ));
             return Ok(quote!(stdpython::PyValue::None_));
+        }
+        // An UNANNOTATED parameter with a CLASS default (`dict_class =
+        // OrderedDict` — requests' merge_setting, where dict_class has no
+        // annotation): the inlined default is the class object, whose
+        // rython value is its NAME STRING (round 33). Without this, the
+        // default renders as a bare struct name — E0423 (the struct lives
+        // in the type namespace). Only a CLASS: a stdpython-module item
+        // must be a class per the registry (OrderedDict), and a local
+        // name must resolve to a ClassDef — function defaults stay the
+        // callable-as-value drop (a bare function name is E0425, loud).
+        if param.annotation.is_none()
+            && let ExprType::Name(n) = expr
+            && match symbols.get(&n.id) {
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let root = i.module.split('.').next().unwrap_or("");
+                    crate::ast::tree::import::stdpython_module_class(root, &n.id)
+                        || crate::ast::tree::import::stdpython_module_class(
+                            root,
+                            &i.names
+                                .iter()
+                                .find(|a| a.asname.as_deref() == Some(&n.id))
+                                .map(|a| a.name.as_str())
+                                .unwrap_or(&n.id),
+                        )
+                }
+                Some(SymbolTableNode::ClassDef(_))
+                | Some(SymbolTableNode::Alias(_)) => crate::is_class_value_expr(expr, symbols),
+                _ => false,
+            }
+        {
+            let name = n.id.clone();
+            return Ok(quote!(#name.to_string()));
         }
         if optional {
             // An `X | None` parameter whose X has no Rust type

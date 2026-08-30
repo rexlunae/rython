@@ -13882,3 +13882,222 @@ fn call_through_a_boxed_value_drops_loudly() {
         out.0
     );
 }
+
+#[test]
+fn unannotated_class_default_lowers_to_the_name_string() {
+    // Round 56: `def merge_setting(request_setting, session_setting,
+    // dict_class=OrderedDict)` (requests' sessions.py — dict_class has NO
+    // annotation): the call site omits dict_class, so the inlined default
+    // is the class object, whose rython value is its NAME STRING (round
+    // 33). Previously the default rendered as a bare struct name — E0423
+    // (the struct lives in the type namespace). All 21 requests E0423s.
+    let out = compile(
+        concat!(
+            "from collections import OrderedDict\n",
+            "def merge_setting(a, b, dict_class=OrderedDict):\n",
+            "    return dict_class\n",
+            "def f(x, y):\n",
+            "    return merge_setting(x, y)\n",
+        ),
+        "classdefault.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("merge_setting(x,y,\"OrderedDict\".to_string())"),
+        "the inlined class default must lower to the name string: {}",
+        out
+    );
+}
+
+#[test]
+fn string_literal_annotation_unquotes_to_the_real_type() {
+    // Round 56: `def _urllib3_request_context(request, verify: "bool |
+    // str | None", ...)` — requests' adapters.py writes its annotations as
+    // QUOTED STRINGS (CPython's typing.get_type_hints evaluates them). The
+    // annotation authorities must re-parse the string content, or the
+    // parameter renders as a literal `"bool | str | None"` type — a parse
+    // error that breaks every use of the parameter (the 8 verify +
+    // 6 client_cert E0425s).
+    let out = compile(
+        concat!(
+            "def f(verify: \"bool | str | None\"):\n",
+            "    if verify is None:\n",
+            "        return 0\n",
+            "    return 1\n",
+        ),
+        "strann.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("verify:stdpython::PyValue"),
+        "the quoted union must unquote to the boxed PyValue param: {}",
+        out
+    );
+    assert!(
+        !flat.contains("\"bool|str|None\""),
+        "the raw string must not render as a Rust type: {}",
+        out
+    );
+}
+
+#[test]
+fn builtin_class_names_in_value_position_lower_to_name_strings() {
+    // Round 56: a bare BUILTIN class name read as a VALUE (`basestring =
+    // (str, bytes)`, `HEADER_VALIDATORS = {bytes: ..., str: ...}` —
+    // requests' compat/_internal_utils): builtin classes are class
+    // objects, and the class-as-value model names them by their name
+    // string. Previously the tuple/dict rendered bare `str`/`bytes`
+    // idents — E0425 (or, worse, resolved to the stdpython::str function
+    // through the glob, silently wrong). Both requests errors.
+    let out = compile(
+        concat!(
+            "builtin_str = str\n",
+            "str = str\n",
+            "bytes = bytes\n",
+            "basestring = (str, bytes)\n",
+            "numeric_types = (int, float)\n",
+            "integer_types = (int,)\n",
+            "HEADER_VALIDATORS = {bytes: 1, str: 2}\n",
+        ),
+        "builtinval.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("basestring=(\"str\".to_string(),\"bytes\".to_string())"),
+        "a builtin-class tuple must lower to name strings: {}",
+        out
+    );
+    assert!(
+        flat.contains("numeric_types=(\"int\".to_string(),\"float\".to_string())"),
+        "the int/float tuple must lower to name strings: {}",
+        out
+    );
+    assert!(
+        flat.contains("integer_types=(\"int\".to_string(),)"),
+        "the 1-tuple must lower to the name string: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyDict::from([(\"bytes\".to_string(),1),(\"str\".to_string(),2)])"),
+        "builtin-class dict keys must lower to name strings: {}",
+        out
+    );
+}
+
+#[test]
+fn compat_builtin_self_alias_import_drops_and_calls_dispatch_to_builtin() {
+    // Round 56: `str = str` / `bytes = bytes` (requests' compat py2 shims)
+    // drop as no-ops, so a sibling's `from .compat import str` has NO
+    // runtime item to re-export — the import must drop (a `pub use
+    // crate::compat::str` is E0603: nothing public behind it), and the
+    // name still means the BUILTIN: `str(x)` / `str(x, encoding)` calls
+    // dispatch to the builtin arms (decode_by_name for the encoding form).
+    let compat = parse("str = str\nbytes = bytes\n", "compat.py").unwrap();
+    let caller = parse(
+        concat!(
+            "from compat import str, bytes\n",
+            "def conv(x: bytes, enc: str) -> str:\n",
+            "    return str(x, encoding=enc)\n",
+            "def conv2(x: str) -> str:\n",
+            "    return str(x)\n",
+            "def conv3(x: str) -> bytes:\n",
+            "    return bytes(x)\n",
+        ),
+        "caller.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["compat".to_string()], std::rc::Rc::new(compat));
+    // The defining module's runtime-item drop only applies in a
+    // MULTI-module conversion (module_defs.len() > 1) — a lone module
+    // must assume an unknown absolute import is a crate sibling.
+    defs.insert(vec!["caller".to_string()], std::rc::Rc::new(caller.clone()));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
+    let out = caller
+        .to_rust(
+            CodeGenContext::Module("caller".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("pub use crate::compat::str")
+            && !flat.contains("pub use crate::compat::bytes"),
+        "the builtin self-alias imports must drop (no public item to point at): {}",
+        out
+    );
+    assert!(
+        flat.contains("decode_by_name(&(x),enc)?"),
+        "str(x, encoding=enc) must dispatch to the decode arm: {}",
+        out
+    );
+    assert!(
+        flat.contains("returnOk(str(x))"),
+        "str(x) must dispatch to the builtin str(): {}",
+        out
+    );
+    assert!(
+        flat.contains("(x).into_bytes_like()"),
+        "bytes(x) must dispatch to the builtin bytes arm: {}",
+        out
+    );
+}
+
+#[test]
+fn for_loop_target_read_only_in_del_keeps_its_name() {
+    // Round 56: `for key in none_keys: del merged_setting[key]` —
+    // requests' merge_setting. The del statement READS the loop target,
+    // but the reference walk missed Delete targets, so the loop analysis
+    // declared `key` unused and lowered the target to `_` while the
+    // body's `py_pop(key)` still referenced it (E0425 in the generated
+    // crate).
+    let out = compile(
+        concat!(
+            "def merge_setting(d, none_keys):\n",
+            "    for key in none_keys:\n",
+            "        del d[key]\n",
+            "    return d\n",
+        ),
+        "delloop.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("forkeyinnone_keys{"),
+        "the loop target must keep its name (read by the del): {}",
+        out
+    );
+    assert!(
+        flat.contains("py_pop(key)?"),
+        "the del must still read the named key: {}",
+        out
+    );
+}
+
+#[test]
+fn range_annotation_maps_to_py_range() {
+    // Round 56: `offsets: range` — the builtin range class as a
+    // parameter annotation (charset_normalizer's cut_sequence_chunks).
+    // The annotation authority mapped int/float/str/bytes but not range,
+    // so the parameter rendered a bare `range` ident — E0573.
+    let out = compile(
+        concat!(
+            "def cut(sequences: bytes, offsets: range, chunk_size: int):\n",
+            "    for i in offsets:\n",
+            "        yield i\n",
+        ),
+        "rangeann.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("offsets:PyRange"),
+        "the range annotation must map to the runtime PyRange: {}",
+        out
+    );
+}

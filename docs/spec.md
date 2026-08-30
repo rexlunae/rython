@@ -542,6 +542,28 @@ boxed tuple/list; the boxed-model list-as-tuple divergence applies
 (§12.3). Non-serializable values passed to `json.dumps` convert to JSON
 Null rather than raising TypeError (the §12 loud-fallback divergence).
 
+Round 56: the class-as-value model's value positions now cover the
+BUILTIN classes. A bare `str`/`bytes`/`int`/`float`/`bool`/`list`/
+`dict`/`tuple`/`set`/`frozenset`/`object`/`type`/`bytearray` name in a
+tuple, dict key, or argument position (`basestring = (str, bytes)`,
+`HEADER_VALIDATORS = {bytes: ..., str: ...}` — requests' compat/
+_internal_utils) lowers to its name string, exactly like a user class
+(round 33) — one predicate (`is_builtin_class_name`) for the value
+renderer, the builtin-call dispatch, and the import handling. A
+module-level BUILTIN-CLASS SELF-alias (`str = str`, `bytes = bytes` —
+requests' py2 shims) is a no-op drop, so a sibling's `from .compat
+import str` emits no runtime item and drops loudly; the name still means
+the builtin, and calls through it dispatch to the builtin arms
+(`str(x, encoding)` → the codec decode). Python TUPLE values box as
+Tuple members through new `From<(T,)>`..`From<(T,..,T)>` impls (the
+boxed model had no tuple path at all — idna's 800 `PyValue: From<(A,
+B)>` errors). The loop-target reference walk now reads `del d[k]`
+targets, so `for key in none_keys: del d[key]` keeps its name (it was
+declared unused and lowered to `_` while the body's `py_pop(key)` still
+referenced it). And the `range` class as a parameter annotation
+(`offsets: range` — charset_normalizer) maps to the runtime `PyRange`,
+the same type `range(...)` calls infer.
+
 ---
 
 ## 6. Functions
