@@ -3678,6 +3678,40 @@ fn reassigned_unannotated_param_boxes_with_warning() {
 }
 
 #[test]
+fn boxed_isinstance_dispatch_without_router_drops_loudly() {
+    // Round 54: an isinstance-dispatched call whose axis argument is a
+    // boxed/unknown value and whose dynamic router could not be planned
+    // (an unannotated non-axis parameter) drops loudly with a warning
+    // naming the rewrite, instead of failing the whole module (requests'
+    // `_validate_header_part(header, name, 0)` — the last requests
+    // blocker; the package now converts).
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "def _v(header, header_part, idx):\n",
+            "    if isinstance(header_part, str):\n",
+            "        return 1\n",
+            "    elif isinstance(header_part, bytes):\n",
+            "        return 2\n",
+            "    return 0\n",
+            "def check(header):\n",
+            "    name, value = header\n",
+            "    _v(header, name, 0)\n",
+        ),
+        "dispatchboxed.py",
+    );
+    assert!(
+        out.contains("stdpython :: PyValue :: None_") || out.contains("PyValue :: None_"),
+        "the undispatchable call must drop: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("is dropped") && w.contains("dynamic router")),
+        "the drop must warn with the rewrite: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn version_gate_bare_form_splices_module_defs() {
     // Round 51: `if sys.version_info >= (3, 11):` at MODULE level — the
     // bare (non-subscripted) form — was never statically evaluated (the

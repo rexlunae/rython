@@ -475,6 +475,15 @@ Consequences, all enforced loudly:
   the same static decision: the runtime item when it exists
   (promoted to a `pub use` alias at module level), else the default.
 
+An isinstance-DISPATCHED call whose axis argument is a boxed or
+statically-unknown value, when no dynamic router could be planned (an
+unannotated non-axis parameter, or an underivable morph return type),
+DROPS loudly with a warning naming the rewrite instead of failing the
+whole module (round 54 — requests' `_validate_header_part(header, name,
+0)`, the last requests conversion blocker; the package now converts).
+The dropped dispatch is the documented dynamic-dispatch divergence: the
+isinstance checks cannot run on an unknown value.
+
 An UNANNOTATED parameter that is REASSIGNED inside the function
 (`hooks = hooks or {}`, `hook_data = _hook_data` — requests'
 `dispatch_hook`) cannot keep one inferred generic type: it lowers as
