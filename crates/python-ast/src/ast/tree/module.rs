@@ -607,6 +607,30 @@ impl CodeGen for Module {
                         }
                     }
                 }
+                // A TUPLE-UNPACK target (`a, b = value` — idna's
+                // `_STATUS_VALID, ... = b"VMDI"`): each element name
+                // binds the value at its position; promote the ones
+                // functions read (a module-init local is invisible to
+                // function bodies — E0425), mirroring the plain-name arm.
+                if let Some(pairs) = assign_unpack_indices(a) {
+                    // ALL elements when ANY qualifies (the init statement
+                    // unpacks the whole value; a partial promotion would
+                    // re-assign the static positions — E0070).
+                    let any = pairs.iter().any(|(n, _i)| {
+                        module_assign_counts.get(n) == Some(&1)
+                            && function_free_reads.contains(n)
+                            && !matches!(
+                                symbols.get(n),
+                                Some(crate::SymbolTableNode::ImportFrom(_))
+                                    | Some(crate::SymbolTableNode::Import(_))
+                            )
+                    });
+                    if any {
+                        for (n, _i) in pairs {
+                            promoted_statics.insert(n.clone());
+                        }
+                    }
+                }
             }
         }
         }
@@ -808,6 +832,10 @@ impl CodeGen for Module {
         let mut pending_docstring = self.get_module_docstring().is_some()
             && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
         let mut seen_non_doc_statement = false;
+        // Names the shared RHS statics of promoted tuple-unpacks
+        // (`__rython_unpack_0`, ...) get; one per unpack assignment, in
+        // source order.
+        let mut unpack_counter = 0usize;
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
             // Issue #118: module-level argparse. Parser-building statements
             // vanish; the parse_args assignment becomes the typed-namespace
@@ -1285,13 +1313,32 @@ impl CodeGen for Module {
             // chain lowering would otherwise hide the values in
             // __module_init__).
             if let crate::StatementType::Assign(a) = &s.statement {
-                let promoted: Vec<String> = match assign_name_targets(a) {
+                let mut promoted: Vec<String> = match assign_name_targets(a) {
                     Some(names) => names
                         .into_iter()
                         .filter(|n| promoted_statics.contains(n))
                         .collect(),
                     None => Vec::new(),
                 };
+                // A TUPLE-UNPACK whose elements were promoted (idna's
+                // `_STATUS_VALID, ... = b"VMDI"`): assign_name_targets
+                // returns None for the tuple target, so collect the
+                // promoted element names here — the static emission below
+                // extracts each element at its position.
+                if promoted.is_empty()
+                    && let Some(pairs) = assign_unpack_indices(a)
+                    && let Some(first) = pairs
+                        .iter()
+                        .find(|(n, _)| promoted_statics.contains(n))
+                {
+                    promoted.push(first.0.clone());
+                    promoted.extend(
+                        pairs
+                            .iter()
+                            .filter(|(n, _)| n != &first.0 && promoted_statics.contains(n))
+                            .map(|(n, _)| n.clone()),
+                    );
+                }
                 if promoted.is_empty() {
                     // fall through to the ordinary Assign lowering
                 } else {
@@ -1315,8 +1362,41 @@ impl CodeGen for Module {
                 } else {
                     stripped
                 };
+                // A TUPLE-UNPACK promotion (`_STATUS_VALID, ... =
+                // b"VMDI"` — idna): one SHARED static evaluates the RHS
+                // exactly ONCE (Devin review on #263, Finding 4: per-name
+                // statics each re-ran the RHS, so side effects repeated
+                // and the names could come from different results); each
+                // promoted name's static projects its element from it,
+                // boxing the element WITHOUT a truncating `as i64`
+                // (Finding 3: `a, b = (1.5, 2.5)` boxed 1 instead of
+                // 1.5 — only the bytes-unpack element (u8) boxes as an
+                // Int, through its own From impl).
+                let unpack_pairs = assign_unpack_indices(a);
+                // A BYTES-LITERAL RHS (`b"VMDI"` — idna) indexes to u8
+                // elements, which box as Ints; any other RHS element
+                // boxes as-is (no `as i64` truncation — Devin review on
+                // #263, Finding 3: `a, b = (1.5, 2.5)` must stay 1.5).
+                let rhs_is_bytes_literal = matches!(
+                    &a.value,
+                    crate::ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::ByteString(_)))
+                );
+                let shared_ident = unpack_pairs.as_ref().map(|_| {
+                    let ident = crate::safe_ident(&format!("__rython_unpack_{}", unpack_counter));
+                    unpack_counter += 1;
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
+                    });
+                    module_init_stmts.push(quote!(let _ = &*#ident;));
+                    ident
+                });
                 for n in promoted {
                     let ident = crate::safe_ident(&n);
+                    let unpack_at = unpack_pairs
+                        .as_ref()
+                        .and_then(|pairs| pairs.iter().find(|(pn, _)| pn == &n).map(|(_, i)| *i));
                     // The static's type: the codegen's inferred type when
                     // known, a few recognized stdlib constructors, else the
                     // boxed PyValue (the value model's dynamic fallback).
@@ -1325,10 +1405,35 @@ impl CodeGen for Module {
                     let (ty, wrapped) =
                         match module_init_static_ty(&n, &a.value, &options) {
                             Some(ty) => (ty, value_tokens.clone()),
-                            None => (
-                                quote!(stdpython::PyValue),
-                                quote!(stdpython::PyValue::from(#value_tokens.clone())),
-                            ),
+                            None => {
+                                let boxed = match (unpack_at, &shared_ident) {
+                                    (Some(i), Some(shared)) => {
+                                        let idx = i as i64;
+                                        let projected = if rhs_is_bytes_literal {
+                                            quote!(PyValue::from(__rython_elt as i64))
+                                        } else {
+                                            quote!(PyValue::from(__rython_elt))
+                                        };
+                                        quote! {
+                                            match (*#shared).clone().py_index(#idx) {
+                                                Ok(__rython_elt) => #projected,
+                                                Err(__rython_e) => panic!(
+                                                    "module-level `{}` element {} \
+                                                     initialization failed: {}",
+                                                    stringify!(#n),
+                                                    #idx,
+                                                    __rython_e
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    _ => value_tokens.clone(),
+                                };
+                                (
+                                    quote!(stdpython::PyValue),
+                                    quote!(stdpython::PyValue::from(#boxed)),
+                                )
+                            }
                         };
                     stream.extend(quote! {
                         pub static #ident: std::sync::LazyLock<#ty> =
@@ -2093,6 +2198,29 @@ fn single_assign_name(stmts: &[crate::Statement]) -> Option<String> {
     }
 }
 
+/// The (name, index) pairs of a module-level TUPLE-UNPACK target
+/// (`_STATUS_VALID, _STATUS_MAPPED, _STATUS_DEVIATION, _STATUS_IGNORED =
+/// b"VMDI"` — idna's core.py): each element name binds the value at its
+/// position. A plain single-Name target (or any other shape) returns
+/// None — its callers handle the simple form. ALL elements must be plain
+/// Names (a nested unpack stays unhandled).
+fn assign_unpack_indices(a: &crate::Assign) -> Option<Vec<(String, usize)>> {
+    if a.targets.len() != 1 {
+        return None;
+    }
+    let crate::ExprType::Tuple(t) = &a.targets[0] else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(t.elts.len());
+    for (i, elt) in t.elts.iter().enumerate() {
+        let crate::ExprType::Name(n) = elt else {
+            return None;
+        };
+        out.push((n.id.clone(), i));
+    }
+    Some(out)
+}
+
 /// Count stores to each name across MODULE scope: top-level assignments
 /// plus everything nested in module-level control flow — if/while/for
 /// bodies (and the for target itself, which rebinds every iteration),
@@ -2204,6 +2332,13 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
     if options.module_defs.len() <= 1 || options.this_module_path.is_empty() {
         return names;
     }
+    // MODULE-LEVEL sibling imports only. A FUNCTION-LOCAL sibling import
+    // (`from .uts46data import uts46data` inside idna's methods) is NOT
+    // promoted: the imported value may be a huge heterogeneous table
+    // whose boxed-static type change cascades through the consumers'
+    // inference (idna 3.10 measured 87 -> 179 rustc errors in round 57);
+    // the module-level import of a name still promotes it (the common
+    // cross-module constant pattern).
     let this_path = &options.this_module_path;
     for (path, module) in options.module_defs.iter() {
         if *path == *this_path {
@@ -2344,6 +2479,34 @@ pub(crate) fn module_promoted_static_names(
                                 | Some(crate::SymbolTableNode::Import(_))
                         )
                     {
+                        names.insert(n.clone());
+                    }
+                }
+            }
+            // A module-level TUPLE-UNPACK (`_STATUS_VALID, _STATUS_MAPPED,
+            // _STATUS_DEVIATION, _STATUS_IGNORED = b"VMDI"` — idna's
+            // core.py): each element name is a single store binding the
+            // value at its position. Promote the ones functions read or
+            // siblings import, like the plain-name arm (a module-init
+            // local is invisible to function bodies and sibling imports —
+            // E0425/E0432).
+            if let Some(pairs) = assign_unpack_indices(a) {
+                // Promote ALL elements when ANY qualifies: the init
+                // statement unpacks the WHOLE value, so a partially
+                // promoted unpack would re-assign the static positions
+                // (`(*_STATUS_VALID).clone() = ...` — E0070).
+                let any = pairs.iter().any(|(n, _i)| {
+                    counts.get(n) == Some(&1)
+                        && !global_written.contains(n)
+                        && (free_reads.contains(n) || sibling.contains(n))
+                        && !matches!(
+                            symbols.get(n),
+                            Some(crate::SymbolTableNode::ImportFrom(_))
+                                | Some(crate::SymbolTableNode::Import(_))
+                        )
+                });
+                if any {
+                    for (n, _i) in pairs {
                         names.insert(n.clone());
                     }
                 }

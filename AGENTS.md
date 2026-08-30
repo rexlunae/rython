@@ -46,6 +46,17 @@ message text, ordering, and float formatting.
 
 ### Working rules
 
+- **Review consumption is a merge precondition** (issue #137's R1): every
+  review-bot thread ends in either a responsive commit with a pin test, or
+  a written waiver citing a `docs/spec.md` §12 entry — then the thread is
+  resolved. Never merge with an unresolved thread; a shipped
+  wrong-semantics finding (the #260 bool-fold reversal) is the cost of
+  treating review as advisory.
+- **Fetch the remote head before proposing or starting anything**
+  (issue #137's process rule 1): with multiple agents landing PRs, a stale
+  local `origin/main` is the default state. `git fetch origin` + check
+  `origin/main` first, and re-measure against the real remote head before
+  claiming a delta or building on a base.
 - **Every behavior claim needs a CPython-verified test.** End-to-end
   tests (`crates/rypip/tests/convert_tests.rs`) pin expected output as
   literals captured from real `python3` runs — mark them

@@ -3414,7 +3414,11 @@ fn range_replace_mechanics_match_python() {
     assert_eq!(kept, vec![1]);
 }
 
-#[cfg(feature = "http-ureq")]
+// Gated on plain std (the default feature set): urllib.parse is pure
+// string handling since round 57's un-gating (the retrospective's R6
+// correction — these tests previously required the http-ureq feature,
+// which CI does not enable, so the fidelity bugs shipped unchecked).
+#[cfg(feature = "std")]
 mod urllib_parse_pins {
     use stdpython::*;
 
@@ -3456,6 +3460,24 @@ fn urllib_parse_matches_cpython() {
     // urldefrag: split at the first #.
     assert_eq!(urldefrag("http://x.com/a#frag").unwrap(), ("http://x.com/a".to_string(), "frag".to_string()));
     assert_eq!(urldefrag("http://x.com/a").unwrap(), ("http://x.com/a".to_string(), String::new()));
+    // The retrospective's R6 findings on #260, each verified against
+    // python3 (CPython 3.11):
+    //   urlsplit("http://example.com/p;q?x=1").path  == "/p;q" (params
+    //   NOT split out; the round-55 version deleted ";q").
+    let sp = urlsplit("http://example.com/p;q?x=1").unwrap();
+    assert_eq!((sp.path.as_str(), sp.params.as_str()), ("/p;q", ""));
+    //   urlparse("http://[::1]:8080/a").hostname() == "::1" (IPv6
+    //   brackets stripped).
+    let ipv6 = urlparse("http://[::1]:8080/a").unwrap();
+    assert_eq!(ipv6.hostname(), Some("::1".to_string()));
+    //   urlparse("http://user@name:pass@example.com/").username() ==
+    //   "user@name" (the LAST @ splits userinfo from host).
+    let ui = urlparse("http://user@name:pass@example.com/").unwrap();
+    assert_eq!(ui.username(), Some("user@name".to_string()));
+    assert_eq!(ui.password(), Some("pass".to_string()));
+    assert_eq!(ui.hostname(), Some("example.com".to_string()));
+    //   urlparse("HTTP://EXAMPLE.COM/").scheme == "http" (lowercased).
+    assert_eq!(urlparse("HTTP://EXAMPLE.COM/").unwrap().scheme, "http");
 }
 
 #[test]
@@ -3515,4 +3537,64 @@ fn pyvalue_from_tuple_boxes_as_tuple_members() {
         panic!("a 6-tuple must box as a Tuple, got {:?}", six);
     };
     assert_eq!(members.len(), 6);
+}
+
+// A BOXED list's membership test against a string (round 57): a list
+// that boxes because one element is `str | None` (`encoding_iana in
+// [specified_encoding, "ascii", "utf_8"]` — charset_normalizer's
+// from_sequence) compares the Str members by value, exactly like Python's
+// `x in [.., None-or-str, ..]` — the None element never matches.
+#[test]
+fn boxed_list_py_contains_matches_str_members_by_value() {
+    use stdpython::*;
+    let list: Vec<PyValue> = vec![
+        PyValue::from("ascii"),
+        PyValue::from("utf_8"),
+        stdpython::PyValue::None_,
+    ];
+    assert!(list.py_contains(&"ascii"), "a Str member matches");
+    assert!(list.py_contains(&"utf_8"), "a later Str member matches");
+    assert!(!list.py_contains(&"latin1"), "an absent member does not match");
+    // The String operand spelling the renderers emit for an owned name.
+    let needle = "utf_8".to_string();
+    assert!(list.py_contains(&needle), "an owned String operand matches");
+}
+
+// The boxed-index-by-int projection a promoted tuple-unpack uses (round
+// 57, Devin review #263 Findings 3+4): `PyValue::from((1.5, 2.5))
+// .py_index(i)` yields the Float members unchanged (no truncation), and
+// a boxed BYTES value indexes to its Int elements. Verified against
+// python3: (1.5, 2.5)[0] == 1.5; b"VMDI"[0] == 86.
+#[test]
+fn boxed_index_by_int_projects_unpack_elements() {
+    use stdpython::*;
+    let t: PyValue = (1.5, 2.5).into();
+    assert_eq!(t.py_index(0i64).unwrap(), PyValue::from(1.5));
+    assert_eq!(t.py_index(1i64).unwrap(), PyValue::from(2.5));
+    assert!(t.py_index(2i64).is_err(), "out of range is an IndexError");
+    let b: PyValue = b"VMDI".to_vec().into();
+    assert_eq!(b.py_index(0i64).unwrap(), PyValue::from(86));
+    assert_eq!(b.py_index(3i64).unwrap(), PyValue::from(73));
+    // Negative indexes normalize to the last element (CPython
+    // `b"VMDI"[-1]` == 73), and out-of-range reads raise the exact
+    // per-type messages (Devin review on #263):
+    //   b"ab"[5] -> IndexError('index out of range')
+    //   (1, 2)[5] -> IndexError('tuple index out of range')
+    //   "ab"[5] -> IndexError('string index out of range')
+    assert_eq!(b.py_index(-1i64).unwrap(), PyValue::from(73));
+    let err = b.py_index(4i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "index out of range"));
+    let t: PyValue = (1, 2).into();
+    assert_eq!(t.py_index(-1i64).unwrap(), PyValue::from(2));
+    let err = t.py_index(5i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "tuple index out of range"));
+    let st: PyValue = "ab".into();
+    assert_eq!(st.py_index(-1i64).unwrap(), PyValue::from("b"));
+    let err = st.py_index(5i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "string index out of range"));
+    // Not-subscriptable values raise CPython's per-type TypeError text.
+    let err = PyValue::from(5i64).py_index(0i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'int' object is not subscriptable"));
+    let err = stdpython::PyValue::None_.py_index(0i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'NoneType' object is not subscriptable"));
 }

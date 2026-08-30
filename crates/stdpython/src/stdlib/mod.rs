@@ -145,8 +145,9 @@ pub mod ssl;
 
 /// Python urllib package (urllib.request) - HTTP(S) client wrapped over
 /// the ureq crate. Feature-gated per the platform-surface convention:
-/// only crates that import urllib.request enable `http-ureq` (rypip does
-/// this automatically for converted packages).
-#[cfg(feature = "http-ureq")]
+/// urllib.request needs `http-ureq` (rypip enables it for converted
+/// packages that import it); the parse submodule is pure string handling
+/// and stays under plain std.
+#[cfg(feature = "std")]
 pub mod urllib;
 

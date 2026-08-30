@@ -311,26 +311,25 @@ fn fold(
             // must stay `&&` (the local is `bool`; boxing would break
             // every `== &false` use).
             (T::Bool, T::PyValue) | (T::PyValue, T::Bool) => {
-                let bool_is_first = matches!(a, T::Bool);
+                // Python `a and b` returns a when a is falsy, else b;
+                // `a or b` returns a when a is truthy, else b — in BOTH
+                // orders the FIRST operand decides and the SECOND is the
+                // alternative. The round-55 fold special-cased the
+                // bool-first order and SWAPPED the arms for the
+                // value-first order (`x and True` returned x on a truthy
+                // x instead of True — the retrospective's shipped
+                // wrong-semantics finding on #260). Order-independent:
+                // `and` -> truthy ? rest : first; `or` -> truthy ?
+                // first : rest.
                 if op == BoolOps::And {
-                    let (value_arm, bool_arm) = if bool_is_first {
-                        (rest.clone(), first.clone())
-                    } else {
-                        (first.clone(), rest.clone())
-                    };
                     quote!({
                         let __rython_and = #first;
-                        if (__rython_and).is_truthy() { PyValue::from(#value_arm) } else { PyValue::from(#bool_arm) }
+                        if (__rython_and).is_truthy() { PyValue::from(#rest) } else { PyValue::from((__rython_and).clone()) }
                     })
                 } else {
-                    let (value_arm, bool_arm) = if bool_is_first {
-                        (rest.clone(), first.clone())
-                    } else {
-                        (first.clone(), rest.clone())
-                    };
                     quote!({
                         let __rython_or = #first;
-                        if (__rython_or).is_truthy() { PyValue::from(#bool_arm) } else { PyValue::from(#value_arm) }
+                        if (__rython_or).is_truthy() { PyValue::from((__rython_or).clone()) } else { PyValue::from(#rest) }
                     })
                 }
             }

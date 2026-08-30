@@ -281,6 +281,62 @@ impl ExprType {
                 // `Vec<String>` with `"a".to_string()`. Incompatible kinds
                 // ([1, "a"]) are a loud conversion-time error rather than
                 // a cryptic rustc mismatch inside generated code.
+                // A FORCED element type (a `-> List[Union[...]]` return
+                // whose element boxes — idna's `_seg_N` tables, round 57)
+                // overrides the inference: every fixed element boxes,
+                // and a Starred element SPREADS its collection exactly
+                // like the normal path (Devin review on #263: the first
+                // version emitted the spread as one list element).
+                if let Some(forced) = &*options.forced_list_elt {
+                    let expected = Some(forced.clone());
+                    let mut elements = Vec::new();
+                    let mut spreads: Vec<TokenStream> = Vec::new();
+                    for li in &l {
+                        if let ExprType::Starred(starred) = li {
+                            let inner = crate::render_reused(
+                                &starred.value,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            spreads.push(quote!(#inner));
+                            continue;
+                        }
+                        elements.push(crate::render_typed(
+                            li,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            expected.clone(),
+                        )?);
+                    }
+                    if spreads.is_empty() {
+                        return Ok(quote!(vec![#(#elements),*]));
+                    }
+                    // Source-order interleave of fixed and spread
+                    // segments (`[*a, x, *b]` extends a, pushes x, then
+                    // extends b — the same shape the non-forced starred
+                    // path emits below).
+                    let mut segments: Vec<TokenStream> = Vec::new();
+                    let mut si = 0usize;
+                    let mut ei = 0usize;
+                    for li in &l {
+                        if let ExprType::Starred(_) = li {
+                            let s = spreads[si].clone();
+                            segments.push(quote!(__rython_list.extend(#s);));
+                            si += 1;
+                        } else {
+                            let e = elements[ei].clone();
+                            segments.push(quote!(__rython_list.push(#e);));
+                            ei += 1;
+                        }
+                    }
+                    return Ok(quote!({
+                        let mut __rython_list = Vec::new();
+                        #(#segments)*
+                        __rython_list
+                    }));
+                }
                 let mut has_starred = false;
                 let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
                 for li in &l {
@@ -304,6 +360,15 @@ impl ExprType {
                     if !distinct.contains(t) {
                         distinct.push(t.clone());
                     }
+                }
+                // Unify the DISTINCT types (a repeat of an early element at
+                // the END of the literal must not re-absorb the result:
+                // `[(0, "3"), (65, "M", "a"), (76, "V")]` — idna's
+                // _seg tables mix 2- and 3-tuples — folding the raw
+                // element list ends on a 2-tuple and `unify(PyObject,
+                // Tuple2)` snaps expected back to Tuple2, hiding the
+                // heterogeneity from the boxable-union check below).
+                for t in &distinct {
                     expected = crate::unify(expected, t.clone());
                 }
                 if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {

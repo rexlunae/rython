@@ -303,6 +303,27 @@ pub struct PythonOptions {
     /// literal (`{**aliases, **{...}}`). None = infer from the literal.
     pub dict_forced_kv: std::rc::Rc<Option<(crate::TypeInfo, crate::TypeInfo)>>,
 
+    /// The element type the CURRENT function's `-> List[Union[...]]`
+    /// return annotation resolves to, when the element boxes (`_seg_N`
+    /// tables in idna's uts46data: `List[Union[Tuple[int, str], Tuple[
+    /// int, str, str]]]`). Read ONLY by the Return lowering (Devin
+    /// review on #263: setting forced_list_elt on the shared options
+    /// retagged every list literal in the function); the Return clones
+    /// the options with `forced_list_elt` set so the returning list
+    /// boxes each element while local lists and call arguments keep
+    /// their own inference. None = no boxed-element return annotation.
+    pub fn_return_list_elt: std::rc::Rc<Option<crate::TypeInfo>>,
+
+    /// The element type a RETURNING list literal must box to. Set ONLY
+    /// on a Return statement's own options clone (from
+    /// `fn_return_list_elt`) — never on the shared per-function options,
+    /// so local list literals keep their own inference. The list literal
+    /// alone cannot see a `List[Union[...]]` return annotation (a
+    /// homogeneous segment of 2-tuples infers `Vec<(i64, &str)>`), so
+    /// the return statement threads the annotation's element type in and
+    /// every element boxes (`PyValue::from((0, "3"))`). None = infer.
+    pub forced_list_elt: std::rc::Rc<Option<crate::TypeInfo>>,
+
     /// Whether the CURRENT function's return annotation is `str`: returning
     /// an attribute chain then clones the String field out of the shared
     /// receiver. Python strings are immutable, so the clone reproduces
@@ -575,6 +596,8 @@ impl Default for PythonOptions {
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
             dict_forced_kv: std::rc::Rc::new(None),
+            fn_return_list_elt: std::rc::Rc::new(None),
+            forced_list_elt: std::rc::Rc::new(None),
             generator_collector: std::rc::Rc::new(None),
             generator_boxes: false,
             clone_str_attribute_returns: false,

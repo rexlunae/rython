@@ -4536,6 +4536,54 @@ impl<K: Eq + Hash, V> PyPopDefault<K, V> for HashMap<K, V> {
 /// Indexing a BOXED dict (`credentials['Credentials']` where the outer
 /// value is a boxed PyValue — issue #180): a boxed dict member indexes
 /// like the dict it holds; anything else raises CPython's TypeError.
+impl PyIndex<i64> for PyValue {
+    type Output = PyValue;
+    fn py_index(&self, key: i64) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Bytes(b) => {
+                let i = normalize_index(key, b.len())
+                    .ok_or_else(|| PyException::new("IndexError", "index out of range"))?;
+                Ok(PyValue::Int(b[i] as i64))
+            }
+            PyValue::Tuple(members) => {
+                let i = normalize_index(key, members.len())
+                    .ok_or_else(|| PyException::new("IndexError", "tuple index out of range"))?;
+                Ok(members[i].clone())
+            }
+            PyValue::Str(s) => {
+                let n = s.chars().count();
+                let i = normalize_index(key, n)
+                    .ok_or_else(|| PyException::new("IndexError", "string index out of range"))?;
+                Ok(PyValue::Str(s.chars().nth(i).unwrap().to_string()))
+            }
+            // CPython's per-type not-subscriptable TypeError texts (the
+            // round-57 projection never reaches these — the unpack RHS
+            // boxes as Bytes/Tuple — but a user's `boxed[i]` must not
+            // silently diverge).
+            PyValue::Int(_) => Err(PyException::new(
+                "TypeError",
+                "'int' object is not subscriptable",
+            )),
+            PyValue::Float(_) => Err(PyException::new(
+                "TypeError",
+                "'float' object is not subscriptable",
+            )),
+            PyValue::Bool(_) => Err(PyException::new(
+                "TypeError",
+                "'bool' object is not subscriptable",
+            )),
+            PyValue::None_ => Err(PyException::new(
+                "TypeError",
+                "'NoneType' object is not subscriptable",
+            )),
+            _ => Err(PyException::new(
+                "TypeError",
+                "indices must be integers or slices",
+            )),
+        }
+    }
+}
+
 impl PyIndex<&str> for PyValue {
     type Output = PyValue;
     fn py_index(&self, key: &str) -> Result<PyValue, PyException> {
@@ -4629,6 +4677,33 @@ impl<K: Eq + Hash, V> PyContains<K> for PyDict<K, V> {
 impl PyContains<str> for Vec<String> {
     fn py_contains(&self, item: &str) -> bool {
         self.iter().any(|s| s == item)
+    }
+}
+
+// A BOXED list's membership test against a string (`encoding_iana in
+// [specified_encoding, "ascii", "utf_8"]` where specified_encoding is
+// `str | None`, so the list boxes to Vec<PyValue> — charset_normalizer's
+// from_sequence): compare the Str members by value, like the typed
+// Vec<String> impls above. The str/String/&str spellings the renderers
+// emit all delegate to the same member compare.
+impl PyContains<str> for Vec<PyValue> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.iter()
+            .any(|m| matches!(m, PyValue::Str(s) if s == item))
+    }
+}
+
+impl PyContains<&str> for Vec<PyValue> {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.iter()
+            .any(|m| matches!(m, PyValue::Str(s) if s == *item))
+    }
+}
+
+impl PyContains<String> for Vec<PyValue> {
+    fn py_contains(&self, item: &String) -> bool {
+        self.iter()
+            .any(|m| matches!(m, PyValue::Str(s) if s == item))
     }
 }
 
@@ -5962,9 +6037,13 @@ pub use stdlib::socket;
 /// implies std — on by default).
 #[cfg(feature = "ssl-rustls")]
 pub use stdlib::ssl;
-/// Python urllib.request (ureq-backed; gated on the http-ureq feature,
-/// which implies std).
-#[cfg(feature = "http-ureq")]
+/// Python urllib: the `parse` submodule (urlparse/urlsplit/urljoin/
+/// urlencode/quote/unquote/...) is pure string handling, available under
+/// plain std; the `request` submodule (urlopen) is ureq-backed and keeps
+/// its own http-ureq gate. The parse tests run in the default workspace
+/// suite (the retrospective's R6 correction on #260 — they were gated
+/// behind http-ureq, which CI does not enable).
+#[cfg(feature = "std")]
 pub use stdlib::urllib;
 // The Match-method trait must be in scope for m.group()/m.span() to
 // resolve through the Option layer in generated code.

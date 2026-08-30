@@ -2143,6 +2143,26 @@ impl FunctionDef {
                 && self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()).is_none()
                 && literal_returns_need_boxing(&self.body));
 
+        // A `-> List[Union[...]]` return whose element resolves to the
+        // boxed PyValue (`_seg_N` in idna's uts46data: `List[Union[
+        // Tuple[int, str], Tuple[int, str, str]]]`): a RETURNING list
+        // literal must box each element (`PyValue::from((0, "3"))`) — the
+        // literal alone sees only homogeneous 2-tuples and infers
+        // `Vec<(i64, &str)>`, mismatching the annotation. The return
+        // statement threads this in (round 57).
+        options.fn_return_list_elt = std::rc::Rc::new(
+            self.returns.as_deref().and_then(|ann| {
+                match crate::annotation_type_info(ann) {
+                    Some(crate::TypeInfo::Vec(inner))
+                        if matches!(*inner, crate::TypeInfo::PyValue) =>
+                    {
+                        Some((*inner).clone())
+                    }
+                    _ => None,
+                }
+            }),
+        );
+
         // Issue #125: thread narrowed-Option state through the body. After
         // `if x is not None: <body> else: <else>` where BOTH branches leave
         // x holding a non-None value, x is non-None for the rest of the

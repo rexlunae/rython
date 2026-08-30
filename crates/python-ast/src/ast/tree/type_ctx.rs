@@ -1212,6 +1212,49 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                         None
                     }
                 }
+                // `Union[A, B, ...]` — the subscript spelling of `A | B`
+                // (idna's `List[Union[Tuple[int, str], Tuple[int, str,
+                // str]]]` — the _seg table annotations): members resolve
+                // through the same mapping, a None member makes
+                // Option<T>, and a boxable member mix widens to the boxed
+                // PyValue — exactly the BinOp-union semantics.
+                "Union" => {
+                    let members = match &sub.kind {
+                        crate::SubscriptKind::Index(i) => match i.as_ref() {
+                            crate::ExprType::Tuple(t) => t.elts.clone(),
+                            single => vec![single.clone()],
+                        },
+                        _ => return None,
+                    };
+                    if members.is_empty() {
+                        return None;
+                    }
+                    let non_none: Vec<&crate::ExprType> =
+                        members.iter().filter(|m| !crate::is_none_expr(m)).collect();
+                    if non_none.len() != members.len() {
+                        // Union[X, None] — Optional[X] when X resolves.
+                        if let Some(inner) = (non_none.len() == 1)
+                            .then(|| annotation_type_info(non_none[0]))
+                            .flatten()
+                        {
+                            if matches!(inner, TypeInfo::PyValue) {
+                                return Some(inner);
+                            }
+                            return Some(TypeInfo::Option(Box::new(inner)));
+                        }
+                    }
+                    let resolved: Option<Vec<TypeInfo>> =
+                        members.iter().map(|m| annotation_type_info(m)).collect();
+                    if let Some(resolved) = resolved {
+                        if resolved.iter().any(|t| matches!(t, TypeInfo::PyValue)) {
+                            return Some(TypeInfo::PyValue);
+                        }
+                        if !resolved.is_empty() && resolved.iter().all(is_boxable_value_type) {
+                            return Some(TypeInfo::PyValue);
+                        }
+                    }
+                    None
+                }
                 "Optional" => {
                     if let crate::SubscriptKind::Index(elt) = &sub.kind {
                         let inner = annotation_type_info(elt)?;
@@ -1299,7 +1342,8 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                 if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
                     && matches!(
                         a.attr.as_str(),
-                        "List" | "Dict" | "Set" | "FrozenSet" | "Tuple" | "Optional" | "Literal"
+                        "List" | "Dict" | "Set" | "FrozenSet" | "Tuple" | "Optional"
+                            | "Literal" | "Union"
                     ) =>
             {
                 let container = match a.attr.as_str() {
@@ -1308,6 +1352,7 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                     "Set" | "FrozenSet" => "set",
                     "Tuple" => "tuple",
                     "Optional" => "Optional",
+                    "Union" => "Union",
                     _ => "Literal",
                 };
                 if let crate::SubscriptKind::Index(elt) = &sub.kind {

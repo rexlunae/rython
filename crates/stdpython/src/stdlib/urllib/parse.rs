@@ -30,10 +30,12 @@ impl ParseResult {
             return None;
         }
         // Strip the port (`host:8080` -> `host`); a bracketed IPv6 host
-        // keeps its brackets (`[::1]:8080` -> `[::1]`).
+        // loses its brackets too (`[::1]:8080` -> `::1` — CPython's
+        // hostname strips them; the round-55 version kept them against
+        // CPython, the retrospective's R6 finding).
         let host = if host.starts_with('[') {
             match host.find(']') {
-                Some(end) => &host[..=end],
+                Some(end) => &host[1..end],
                 None => host,
             }
         } else {
@@ -61,15 +63,18 @@ impl ParseResult {
         port.parse::<i64>().ok()
     }
 
-    /// The userinfo's username (`None` without an `@`).
+    /// The userinfo's username (`None` without an `@`). The LAST `@`
+    /// splits the userinfo from the host (CPython: `user@name:pass@host`
+    /// -> username `"user@name"` — the round-55 split_once('@') used the
+    /// FIRST `@` and returned `"user"`, the retrospective's R6 finding).
     pub fn username(&self) -> Option<String> {
-        let (userinfo, _) = self.netloc.split_once('@')?;
+        let (userinfo, _) = self.netloc.rsplit_once('@')?;
         Some(userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo).to_string())
     }
 
     /// The userinfo's password (`None` without a `:` in the userinfo).
     pub fn password(&self) -> Option<String> {
-        let (userinfo, _) = self.netloc.split_once('@')?;
+        let (userinfo, _) = self.netloc.rsplit_once('@')?;
         userinfo.split_once(':').map(|(_, p)| p.to_string())
     }
 
@@ -166,10 +171,13 @@ pub fn urlparse<S: AsStrLike + ?Sized>(url: &S) -> Result<ParseResult, PyExcepti
 }
 
 /// Parse a URL into its components, params empty (CPython `urlsplit`).
+/// Unlike urlparse, urlsplit does NOT split `;params` out of the path:
+/// `urlsplit("http://example.com/p;q")` has path `"/p;q"` and params
+/// `""` (the round-55 version ran the param-splitting parse and then
+/// blanked params, DELETING the `;q` from the path — the
+/// retrospective's R6 finding).
 pub fn urlsplit<S: AsStrLike + ?Sized>(url: &S) -> Result<ParseResult, PyException> {
-    let mut r = urlparse_inner(url.as_str_like());
-    r.params = String::new();
-    Ok(r)
+    Ok(urlsplit_inner(url.as_str_like()))
 }
 
 fn urlparse_inner(url: &str) -> ParseResult {
@@ -178,10 +186,27 @@ fn urlparse_inner(url: &str) -> ParseResult {
     let (path, query, fragment) = split_query_fragment(&path_query_fragment);
     let (path, params) = split_params(&path);
     ParseResult {
-        scheme: scheme.to_string(),
+        // CPython lowercases the scheme (`urlparse("HTTP://e/")` ->
+        // scheme "http" — the round-55 version kept the original case,
+        // the retrospective's R6 finding).
+        scheme: scheme.to_ascii_lowercase(),
         netloc,
         path,
         params,
+        query,
+        fragment,
+    }
+}
+
+fn urlsplit_inner(url: &str) -> ParseResult {
+    let (scheme, rest) = split_scheme(url);
+    let (netloc, path_query_fragment) = split_netloc(rest);
+    let (path, query, fragment) = split_query_fragment(&path_query_fragment);
+    ParseResult {
+        scheme: scheme.to_ascii_lowercase(),
+        netloc,
+        path,
+        params: String::new(),
         query,
         fragment,
     }
@@ -410,6 +435,6 @@ pub fn quote_plus<S: AsStrLike + ?Sized>(s: &S) -> Result<String, PyException> {
 /// `unquote` with `+` decoded as a space (CPython `unquote_plus`).
 pub fn unquote_plus<S: AsStrLike + ?Sized>(s: &S) -> Result<String, PyException> {
     let s = s.as_str_like();
-    let mut out = unquote(&s.replace('+', " "))?;
+    let out = unquote(&s.replace('+', " "))?;
     Ok(out)
 }

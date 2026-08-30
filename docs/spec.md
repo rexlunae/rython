@@ -542,6 +542,16 @@ boxed tuple/list; the boxed-model list-as-tuple divergence applies
 (§12.3). Non-serializable values passed to `json.dumps` convert to JSON
 Null rather than raising TypeError (the §12 loud-fallback divergence).
 
+Round 57's corrective fixes on the round-55 urllib.parse surface
+(the retrospective's R6 findings, each pinned against python3): the
+`scheme` is now LOWERCASED (`urlparse("HTTP://e/").scheme` == "http"),
+`urlsplit` no longer deletes `;params` from the path (urlsplit does NOT
+split params — the path keeps `/p;q`, params stays empty), `hostname`
+strips IPv6 BRACKETS (`[::1]` -> `::1`), and `username`/`password` split
+the userinfo at the LAST `@` (`user@name:pass@host` -> username
+"user@name"). The `urllib.parse` tests are un-gated from the `http-ureq`
+feature so they run in the default workspace suite.
+
 Round 56: the class-as-value model's value positions now cover the
 BUILTIN classes. A bare `str`/`bytes`/`int`/`float`/`bool`/`list`/
 `dict`/`tuple`/`set`/`frozenset`/`object`/`type`/`bytearray` name in a
@@ -563,6 +573,25 @@ declared unused and lowered to `_` while the body's `py_pop(key)` still
 referenced it). And the `range` class as a parameter annotation
 (`offsets: range` — charset_normalizer) maps to the runtime `PyRange`,
 the same type `range(...)` calls infer.
+
+Round 57 (idna's data tables): a list literal whose elements are tuples
+of DIFFERENT arities (`[(0, "3"), (65, "M", "a"), ...]` — idna's `_seg`
+tables) boxes each element as PyValue — the element-type fold was
+order-dependent, so a trailing short tuple re-absorbed the heterogeneous
+result and every other row mismatched the inferred element type. The
+`Union[A, B]` SUBSCRIPT annotation (idna's `List[Union[Tuple[int, str],
+Tuple[int, str, str]]]`) now resolves like the `A | B` spelling — the
+boxed union — and a function whose return annotation is a
+`List[Union[...]]`-style boxed-element list threads the element type
+into its RETURNING list literals, which box each element. And a
+module-level TUPLE-UNPACK (`_STATUS_VALID, _STATUS_MAPPED, ... =
+b"VMDI"` — idna's core.py) promotes each name functions read to a
+static that extracts the value at its position (a module-init local is
+invisible to function bodies — E0425). FUNCTION-LOCAL sibling imports
+are deliberately NOT promoted (idna 3.10's `from .uts46data import
+uts46data` inside a method: promoting the huge table cascaded through
+the consumers' inference, 87 -> 179 rustc errors — measured and
+reverted).
 
 ---
 

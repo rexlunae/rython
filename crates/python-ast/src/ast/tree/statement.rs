@@ -675,7 +675,26 @@ impl CodeGen for StatementType {
                             )),
                         ));
                     }
-                    let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
+                    let tokens = e
+                        .clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    // A `-> List[Union[...]]` return whose element boxes
+                    // (idna's `_seg_N` tables): force the RETURNING list
+                    // literal's element type so each element boxes
+                    // (`PyValue::from((0, "3"))`) instead of inferring a
+                    // homogeneous `Vec<(i64, &str)>` that mismatches the
+                    // annotation (round 57).
+                    let tokens = if matches!(e.value, ExprType::List(_))
+                        && let Some(elt) = &*options.fn_return_list_elt
+                    {
+                        let mut ret_options = options.clone();
+                        ret_options.forced_list_elt =
+                            std::rc::Rc::new(Some(elt.clone()));
+                        e.clone()
+                            .to_rust(ctx.clone(), ret_options, symbols)?
+                    } else {
+                        tokens
+                    };
                     // A `-> str` function's return value must be an owned
                     // String (the annotation is authoritative — see
                     // FunctionDef::resolved_return_type). An attribute chain
