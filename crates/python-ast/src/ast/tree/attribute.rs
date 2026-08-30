@@ -1089,10 +1089,86 @@ pub(crate) fn receiver_is_pyvalue(
             )
         }
         ExprType::Attribute(_) => field_chain_ends_in_pyvalue(expr, ctx, symbols, options),
-        ExprType::Call(c) => matches!(
-            crate::call_return_typeinfo(c, Some(symbols), Some(options)),
-            Some(crate::TypeInfo::PyValue | crate::TypeInfo::PyObject)
-        ),
+        ExprType::Call(c) => {
+            matches!(
+                crate::call_return_typeinfo(c, Some(symbols), Some(options)),
+                Some(crate::TypeInfo::PyValue | crate::TypeInfo::PyObject)
+            )
+            // A call into an EXTERNAL module (`files("certifi")` —
+            // importlib.resources) drops to the boxed None (the
+            // external-module divergence): a method on its result is a
+            // boxed-receiver call.
+            || receiver_call_is_external_drop(expr, symbols, options)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a CALL expression is a call into an EXTERNAL module whose
+/// result drops to the boxed None (`files("certifi")`,
+/// `ssl.SSLContext(...)`) — so a method chained on its result is a
+/// boxed-receiver call, not a static method lookup (certifi's
+/// `files("certifi").joinpath(...).read_text(...)`).
+pub(crate) fn receiver_call_is_external_drop(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Call(c) = expr else {
+        return false;
+    };
+    crate::ast::tree::attribute::external_module_root(&c.func, symbols, options).is_some()
+        || chain_root_is_external(&c.func, symbols, options)
+}
+
+/// Whether an expression is a READ of a BOXED mutable global — the value
+/// is the boxed PyValue, which a typed (non-PyValue) return cannot
+/// express; the exact point of divergence is a loud panic.
+pub(crate) fn is_boxed_global_read(
+    expr: &ExprType,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Name(n) = expr else {
+        return false;
+    };
+    matches!(
+        options.mutable_statics.get(&n.id),
+        Some(crate::MutableGlobalKind::Boxed)
+            | Some(crate::MutableGlobalKind::Computed { boxed: true })
+    )
+}
+
+/// Whether an expression is a CALL CHAIN rooted in an EXTERNAL module
+/// (`files("certifi").joinpath(...)`): the whole chain drops to the boxed
+/// None (external-module divergence), so returning it from a typed
+/// function is a loud runtime panic, not a placeholder.
+pub(crate) fn is_external_drop_chain(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Call(c) = expr else {
+        return false;
+    };
+    chain_root_is_external(&c.func, symbols, options)
+}
+
+/// Walk an expression chain (calls and attributes) to its root NAME and
+/// ask whether that name resolves to an EXTERNAL module import — the
+/// chain then drops to the boxed None, so a method chained on it is a
+/// boxed-receiver call (`files("certifi").joinpath("cacert.pem").
+/// read_text(...)` — certifi: the whole chain is importlib.resources).
+fn chain_root_is_external(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    match expr {
+        ExprType::Call(c) => chain_root_is_external(&c.func, symbols, options),
+        ExprType::Attribute(a) => chain_root_is_external(&a.value, symbols, options),
+        ExprType::Name(n) => {
+            crate::ast::tree::import::resolves_to_external_import(&n.id, options, symbols)
+        }
         _ => false,
     }
 }

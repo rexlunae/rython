@@ -928,7 +928,7 @@ fn np_path(name: &str) -> (String, TokenStream) {
 /// call renders as `f(...)`, and anything else falls back to the Debug form
 /// (terminal). The -W channel is for humans; a raw AST Debug dump is not a
 /// diagnostic (issue #209).
-fn expr_chain_spelling(e: &ExprType) -> String {
+pub(crate) fn expr_chain_spelling(e: &ExprType) -> String {
     match e {
         ExprType::Name(n) => n.id.clone(),
         ExprType::Attribute(a) => {
@@ -1792,6 +1792,11 @@ impl<'a> CodeGen for Call {
         };
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && (matches!(attr.value.as_ref(), ExprType::Attribute(_))
+                || crate::ast::tree::attribute::receiver_call_is_external_drop(
+                    attr.value.as_ref(),
+                    &symbols,
+                    &options,
+                )
                 || (!pyvalue_protocol_method(&attr.attr)
                     && (name_is_dropped_external_value(attr.value.as_ref())
                         // Issue #137 round 26: a POSITIVELY boxed name drops

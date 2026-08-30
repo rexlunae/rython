@@ -7438,6 +7438,67 @@ fn and_or_return_operands_like_cpython() {
 }
 
 #[test]
+fn certifi_shaped_resource_chain_converts_cleanly_and_panics_loudly() {
+    // Round 51: certifi's core.py — version-gated module defs spliced at
+    // conversion time, importlib.resources chains dropped (external-module
+    // divergence), and the typed return of a dropped chain a loud runtime
+    // panic. The real certifi (2025.1.31) measures 0 rustc errors with
+    // this design; this minimal fixture pins the shapes so the milestone
+    // cannot silently regress.
+    let scratch = Scratch::new("certifishape");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "import sys\n",
+            "from importlib.resources import files\n",
+            "\n",
+            "if sys.version_info >= (3, 11):\n",
+            "    def where() -> str:\n",
+            "        return \"cacert\"\n",
+            "    def contents() -> str:\n",
+            "        return files(\"probe\").joinpath(\"cacert.pem\").read_text(\"ascii\")\n",
+            "\n",
+            "def use_util() -> int:\n",
+            "    from . import util\n",
+            "    return util.helper()\n",
+        ),
+    )
+    .unwrap();
+    // A SECOND module makes rypip's crate-wide resolution authoritative:
+    // with a single-module package every import is assumed a sibling, so
+    // importlib.resources would not drop as external (the real certifi
+    // has core.py + __init__.py — two modules).
+    fs::write(pkg.join("util.py"), "def helper() -> int:\n    return 7\n").unwrap();
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &scratch.path().join("crate"), &ConvertOptions::default())
+        .expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the certifi-shaped package must convert AND build with zero errors"
+    );
+    let code = fs::read_to_string(krate.root.join("src/probe/lib.rs"))
+        .unwrap_or_else(|_| fs::read_to_string(krate.root.join("src/lib.rs")).unwrap());
+    assert!(
+        code.contains("panic!") && code.contains("external-module"),
+        "the typed return of the dropped importlib.resources chain must panic: {}",
+        code
+    );
+    assert!(
+        code.contains("pub fn r#where"),
+        "the version-gated def must be a module item (r#where): {}",
+        code
+    );
+}
+
+#[test]
 fn class_mapping_protocol_matches_cpython() {
     // §7's mapping-protocol slice: a user class's own dunders receive the
     // subscript store, membership test, and the collections.abc `.get`

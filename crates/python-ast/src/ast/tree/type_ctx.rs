@@ -407,7 +407,23 @@ fn infer_type_inner(
             if let Some(t) = options.name_types.get(&n.id) {
                 return t.clone();
             }
-            // 3. The symbol table's recorded assignment.
+            // 3. A MUTABLE module global: its static's value type is the
+            // name's type — a Boxed static is the boxed PyValue, so a
+            // method call on the global drops like any boxed receiver
+            // (`_CACERT_CTX.__exit__(...)` — certifi's atexit cleanup).
+            // Checked BEFORE the symbol-table Assign below: the global's
+            // recorded initializer (`_CACERT_CTX = None`) is not its type.
+            if let Some(kind) = options.mutable_statics.get(&n.id) {
+                match kind {
+                    crate::MutableGlobalKind::Boxed
+                    | crate::MutableGlobalKind::Computed { boxed: true } => {
+                        return TypeInfo::PyValue;
+                    }
+                    crate::MutableGlobalKind::Str => return TypeInfo::String,
+                    _ => {}
+                }
+            }
+            // 4. The symbol table's recorded assignment.
             if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id) {
                 return infer_type(value, options, symbols);
             }

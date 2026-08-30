@@ -137,6 +137,17 @@ impl CodeGen for Module {
             symbols = s.clone().find_symbols(symbols);
         }
 
+        // Issue #137: module-level VERSION-GATED blocks (`if
+        // sys.version_info >= (3, 11):` — certifi's core.py) and
+        // static-name gates (`if brotli is not None:` where the module
+        // folded the import to `brotli = None`): rython's target version
+        // is fixed (3.11.0), so the taken branch is decided at conversion
+        // time and its statements are spliced into the module body BEFORE
+        // every pass below — a version-gated `def` is a module ITEM, not
+        // a nested function inside __module_init__ (which rustc rejects
+        // and the module re-exports cannot see).
+        self.raw.body = splice_gated_branches(self.raw.body, &options);
+
         // Capture the module's source filename before fields of `self` are
         // moved, so statement errors can point at the user's Python file.
         let module_filename = self
@@ -2888,6 +2899,33 @@ fn module_global_class_stores(
 /// Returns the folded body plus the HANDLER statements the fold made
 /// live (spliced in place of a try whose imports all fail): those were
 /// skipped by Try::find_symbols and need registering.
+/// Replace module-level `if` blocks whose branch is statically decided
+/// (`sys.version_info` gates and single-store-name gates) with the taken
+/// branch's statements, recursively. Defs and class bodies inside the
+/// taken branch then lower as ordinary module items.
+fn splice_gated_branches(
+    body: Vec<crate::Statement>,
+    options: &PythonOptions,
+) -> Vec<crate::Statement> {
+    let mut out = Vec::with_capacity(body.len());
+    for s in body {
+        if let crate::StatementType::If(i) = &s.statement {
+            let taken = crate::ast::tree::if_stmt::version_gate_taken(&i.test)
+                .or_else(|| crate::ast::tree::if_stmt::static_name_gate_taken(&i.test, options));
+            if let Some(taken) = taken {
+                let branch = if taken { &i.body } else { &i.orelse };
+                let branch = splice_gated_branches(branch.clone(), options);
+                for b in branch {
+                    out.push(b);
+                }
+                continue;
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
 pub(crate) fn fold_static_import_trys(
     body: &[crate::Statement],
     options: &crate::PythonOptions,

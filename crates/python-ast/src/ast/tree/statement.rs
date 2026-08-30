@@ -647,6 +647,34 @@ impl CodeGen for StatementType {
                         None => quote!(PyValue::from(#tokens)),
                     }
                 } else {
+                    // A non-PyValue function RETURNING a value that drops
+                    // to the boxed None — a call chain rooted in an
+                    // EXTERNAL module (`files("certifi").joinpath(...).
+                    // read_text(...)` — certifi's contents()): the value
+                    // genuinely cannot exist in the generated crate, so
+                    // the exact point of divergence is a LOUD runtime
+                    // panic (the external-module divergence), never a
+                    // plausible-looking placeholder. The conversion-time
+                    // -W warnings accompany it.
+                    if crate::ast::tree::attribute::is_external_drop_chain(
+                        &e.value,
+                        &symbols,
+                        &options,
+                    ) || crate::ast::tree::attribute::is_boxed_global_read(
+                        &e.value,
+                        &options,
+                    ) {
+                        let spelling = crate::ast::tree::call::expr_chain_spelling(&e.value);
+                        return Ok(return_tokens(
+                            &ctx,
+                            quote!(panic!(
+                                "rython: the value `{}` cannot be returned as the \
+                                 function's typed result (external-module / boxed-global \
+                                 divergence): it was dropped at conversion time",
+                                #spelling
+                            )),
+                        ));
+                    }
                     let tokens = e.clone().to_rust(ctx.clone(), options.clone(), symbols)?;
                     // A `-> str` function's return value must be an owned
                     // String (the annotation is authoritative — see
