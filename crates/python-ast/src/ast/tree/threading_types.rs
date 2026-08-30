@@ -13,7 +13,7 @@ use quote::quote;
 
 /// A type of the stdpython `threading` runtime module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ThreadingType {
+pub enum ThreadingType {
     Thread,
     Lock,
     RLock,
