@@ -170,8 +170,13 @@ fn fold(
         }
         let first = &rendered[i];
         let rest = fold_at(values, rendered, op, i + 1, ctx, options, symbols);
-        let a = crate::infer_type(&values[i], options, symbols);
-        let b = crate::infer_type(&values[i + 1], options, symbols);
+        // infer_type cannot see `self.<field>` (it has no class context),
+        // so a self-field operand's Option-ness is resolved through the
+        // class table's field type (`self.path or "/"` — urllib3's Url:
+        // the field is Option<String>; the fold's Option arm needs to
+        // know, or the operand-returning semantics fall to `||`).
+        let a = fold_operand_type(&values[i], ctx, options, symbols);
+        let b = fold_operand_type(&values[i + 1], ctx, options, symbols);
         use crate::TypeInfo as T;
         // Whether the operand can hold the Option's inner type: the
         // concrete match (`ca and x` where both are str), a STRING
@@ -193,17 +198,85 @@ fn fold(
             // a: Option<T>, b: T — the falsy arm holds the Option, the
             // truthy arm wraps the plain value.
             (T::Option(inner), b) if inner_matches(inner, b) => {
+                // The truthy arm's operand is rendered against the UNWRAPPED
+                // inner: `ca_certs and os.path.expanduser(ca_certs)` passes
+                // the STRING (the inner value) to expanduser, never the
+                // Option (CPython: falsy None → None, truthy string →
+                // expanduser(string)). Re-render the operand with the Option
+                // name narrowed to its inner type so the call argument
+                // reads `(#name).clone().unwrap()` (round 48). When the
+                // narrowing fires the truthy arm re-reads the NAME, so the
+                // fold's bind must CLONE (the move would poison it) — the
+                // bind holds the Option for the truthiness test and the
+                // falsy arm; the name stays owned for the inner read.
+                let (narrowed_rest, bind_clone) = match narrow_option_operand(
+                    &values[i],
+                    &values[i + 1],
+                    inner,
+                    ctx,
+                    options,
+                    symbols,
+                ) {
+                    Some(tokens) => (tokens, true),
+                    None => (quote!(#rest), false),
+                };
+                let bound = if bind_clone {
+                    quote!(let __rython_and = (#first).clone();)
+                } else {
+                    quote!(let __rython_and = #first;)
+                };
                 if op == BoolOps::And {
-                    let wrapped = some_arm(&values[i + 1], quote!(#rest));
+                    let wrapped = some_arm(&values[i + 1], narrowed_rest);
                     quote!({
-                        let __rython_and = #first;
+                        #bound
                         if (__rython_and).is_truthy() { #wrapped } else { __rython_and }
                     })
-                } else {
-                    let wrapped = some_arm(&values[i + 1], quote!(#rest));
+                } else if matches!(b, T::PyObject)
+                    // A NAME-typed Option operand (`scheme or "http"` —
+                    // a `str | None` parameter): keep the round-43
+                    // Option-producing fold (the result feeds Option
+                    // slots and `-> T | None` returns). Only a
+                    // SELF-FIELD Option operand (`self.path or "/"` —
+                    // urllib3's Url, whose `-> str` property needs the
+                    // plain value) unwraps-or-defaults to T (round 48).
+                    || matches!(values[i], crate::ExprType::Name(_))
+                {
+                    // UNKNOWN other operand or a NAME operand: keep the
+                    // Option-producing fold (rustc judges the Some-wrap).
+                    let wrapped = some_arm(&values[i + 1], narrowed_rest);
                     quote!({
                         let __rython_or = #first;
                         if (__rython_or).is_truthy() { __rython_or } else { #wrapped }
+                    })
+                } else {
+                    // `Option<T> or T` with a CONCRETE other operand
+                    // (`self.path or "/"` — urllib3's Url): Python's
+                    // result is never None (None is falsy, so the
+                    // concrete default wins) — UNWRAP the Some to the
+                    // inner value and default to the operand. A
+                    // truthy Some("") returns the empty string (the
+                    // documented Option-truthiness gap: CPython "" is
+                    // falsy and would take the default). A string
+                    // literal default is owned (String, not &str).
+                    let default = if matches!(&values[i + 1], crate::ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_))))
+                    {
+                        quote!((#rest).to_string())
+                    } else {
+                        quote!(#rest)
+                    };
+                    // A SELF-FIELD operand reads through the shared
+                    // receiver — the match must CLONE it (a bare
+                    // `match self.path` moves out of `&self`, E0507).
+                    // A NAME operand is excluded above (stays the
+                    // Option-producing fold).
+                    let bound = quote!(let __rython_field = (#first).clone(););
+                    quote!({
+                        #bound
+                        match __rython_field {
+                            Some(__rython_inner) => __rython_inner,
+                            None => #default,
+                        }
                     })
                 }
             }
@@ -249,6 +322,87 @@ fn some_arm(expr: &crate::ExprType, tokens: TokenStream) -> TokenStream {
     } else {
         quote!(Some(#tokens))
     }
+}
+
+/// The fold's operand type: [`infer_type`] plus the SELF-FIELD case it
+/// cannot see (`self.path` — the field's class-table type; urllib3's Url
+/// stores `Option<String>` fields, and `self.path or "/"` must fold with
+/// the Option arm, not fall to `||`). A `self.<field>` read whose field
+/// the class table types `Option < ... >` is `Option(PyObject)` for the
+/// fold's purposes — the inner type's exact identity only matters for
+/// the Some-wrap, which the fold's own inner_matches lets rustc judge.
+fn fold_operand_type(
+    expr: &crate::ExprType,
+    ctx: &crate::CodeGenContext,
+    options: &crate::PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> crate::TypeInfo {
+    let inferred = crate::infer_type(expr, options, symbols);
+    if !matches!(inferred, crate::TypeInfo::PyObject) {
+        return inferred;
+    }
+    let crate::ExprType::Attribute(attr) = expr else {
+        return inferred;
+    };
+    if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
+        return inferred;
+    }
+    let field_ty = crate::ast::tree::aug_assign::self_field_rust_ty(&attr.attr, ctx, options, symbols);
+    if field_ty.as_deref().is_some_and(|t| t.starts_with("Option <")) {
+        // The inner type from the field's Rust type, so the fold's
+        // inner_matches can unify with the other operand (`self.path or
+        // "/"` — Option<String> and a &str literal).
+        let inner = if field_ty.as_deref().is_some_and(|t| t.contains("String")) {
+            crate::TypeInfo::String
+        } else if field_ty.as_deref().is_some_and(|t| t.contains("i64")) {
+            crate::TypeInfo::Int
+        } else if field_ty.as_deref().is_some_and(|t| t.contains("f64")) {
+            crate::TypeInfo::Float
+        } else if field_ty.as_deref().is_some_and(|t| t.contains("bool")) {
+            crate::TypeInfo::Bool
+        } else {
+            crate::TypeInfo::PyObject
+        };
+        crate::TypeInfo::Option(Box::new(inner))
+    } else {
+        inferred
+    }
+}
+
+/// Re-render the truthy operand of an Option fold with the Option NAME
+/// narrowed to its INNER type, so references to it read the unwrapped
+/// value: `ca_certs and os.path.expanduser(ca_certs)` must pass the
+/// STRING to expanduser, not the Option (round 48). Fires only when the
+/// Option operand is a NAME (the narrowed binding the inner read needs)
+/// and the operand actually references it; otherwise the plain render
+/// stands (the Option-pass-through fallback, loud in rustc when wrong).
+fn narrow_option_operand(
+    option_operand: &crate::ExprType,
+    other_operand: &crate::ExprType,
+    inner: &crate::TypeInfo,
+    ctx: &crate::CodeGenContext,
+    options: &crate::PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> Option<TokenStream> {
+    let crate::ExprType::Name(n) = option_operand else {
+        return None;
+    };
+    if !crate::expr_references(other_operand, &n.id) {
+        return None;
+    }
+    let mut narrowed = options.narrowed_names.as_ref().clone();
+    // Narrow to the OPTION itself: the narrowed_names match has no
+    // explicit Option arm, so the read falls to the `clone().unwrap()`
+    // default — exactly the Option-inner unwrap the fold's truthy arm
+    // needs (`expanduser(ca_certs)` receives the STRING, never the
+    // Option; the Option-slot is unwrapped at the read).
+    narrowed.insert(n.id.clone(), crate::TypeInfo::Option(Box::new((*inner).clone())));
+    let mut narrowed_options = options.clone();
+    narrowed_options.narrowed_names = std::rc::Rc::new(narrowed);
+    other_operand
+        .clone()
+        .to_rust(ctx.clone(), narrowed_options, symbols.clone())
+        .ok()
 }
 
 #[cfg(test)]

@@ -12729,6 +12729,57 @@ fn option_or_string_literal_owns_the_literal() {
 }
 
 #[test]
+fn self_field_option_or_concrete_unwraps_to_plain() {
+    // Round 48: `self.path or "/"` where the field is `str | None`
+    // (urllib3's Url) — the fold's Option arm UNWRAPS the Some to the
+    // inner value and defaults to the concrete operand (Python's result
+    // is never None). A NAME-typed Option operand (`scheme or "http"`)
+    // keeps the round-43 Option-producing fold; only the self-FIELD
+    // case (whose Option-ness infer_type cannot see) unwraps.
+    let out = compile(
+        "class U:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self.path: str | None = None\n\
+         \x20   def request_uri(self) -> str:\n\
+         \x20       return self.path or \"/\"\n",
+        "fieldor.py",
+    );
+    assert!(
+        out.contains("match __rython_field {")
+            || out.contains("match __rython_field {")
+            || out.contains("Some (__rython_inner) => __rython_inner"),
+        "the self-field Option or-fold must unwrap to the inner: {}",
+        out
+    );
+    assert!(
+        out.contains("None => (\"/\") . to_string ()") || out.contains("None => (\"/\").to_string()"),
+        "the concrete default must be owned: {}",
+        out
+    );
+}
+
+#[test]
+fn option_and_call_narrows_the_inner_argument() {
+    // Round 48: `ca_certs and os.path.expanduser(ca_certs)` where
+    // ca_certs is `str | None` (urllib3) — the truthy arm passes the
+    // UNWRAPPED inner string to the call (`expanduser` expects a path),
+    // never the Option. The fold narrows the name for the operand's
+    // re-render.
+    let out = compile(
+        "def exp(p: str) -> str:\n\
+         \x20   return p\n\
+         \ndef pick(ca: str | None) -> str | None:\n\
+         \x20   return ca and exp(ca)\n",
+        "andcall.py",
+    );
+    assert!(
+        out.contains("(ca) . clone () . unwrap ()") || out.contains("(ca).clone().unwrap()"),
+        "the truthy arm must pass the unwrapped inner: {}",
+        out
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the
