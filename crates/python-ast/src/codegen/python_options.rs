@@ -303,6 +303,16 @@ pub struct PythonOptions {
     /// literal (`{**aliases, **{...}}`). None = infer from the literal.
     pub dict_forced_kv: std::rc::Rc<Option<(crate::TypeInfo, crate::TypeInfo)>>,
 
+    /// The element type a RETURNING list literal must box to — set from a
+    /// `-> List[Union[...]]` return annotation whose element resolves to
+    /// the boxed PyValue (`_seg_N` tables in idna's uts46data: `List[
+    /// Union[Tuple[int, str], Tuple[int, str, str]]]`). The list literal
+    /// alone cannot see the union (a homogeneous segment of 2-tuples
+    /// infers `Vec<(i64, &str)>`), so the return statement threads the
+    /// annotation's element type in and every element boxes
+    /// (`PyValue::from((0, "3"))`). None = infer from the literal.
+    pub forced_list_elt: std::rc::Rc<Option<crate::TypeInfo>>,
+
     /// Whether the CURRENT function's return annotation is `str`: returning
     /// an attribute chain then clones the String field out of the shared
     /// receiver. Python strings are immutable, so the clone reproduces
@@ -575,6 +585,7 @@ impl Default for PythonOptions {
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
             narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
             dict_forced_kv: std::rc::Rc::new(None),
+            forced_list_elt: std::rc::Rc::new(None),
             generator_collector: std::rc::Rc::new(None),
             generator_boxes: false,
             clone_str_attribute_returns: false,

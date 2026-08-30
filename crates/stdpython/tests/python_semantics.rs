@@ -3414,7 +3414,11 @@ fn range_replace_mechanics_match_python() {
     assert_eq!(kept, vec![1]);
 }
 
-#[cfg(feature = "http-ureq")]
+// Gated on plain std (the default feature set): urllib.parse is pure
+// string handling since round 57's un-gating (the retrospective's R6
+// correction — these tests previously required the http-ureq feature,
+// which CI does not enable, so the fidelity bugs shipped unchecked).
+#[cfg(feature = "std")]
 mod urllib_parse_pins {
     use stdpython::*;
 
@@ -3456,6 +3460,24 @@ fn urllib_parse_matches_cpython() {
     // urldefrag: split at the first #.
     assert_eq!(urldefrag("http://x.com/a#frag").unwrap(), ("http://x.com/a".to_string(), "frag".to_string()));
     assert_eq!(urldefrag("http://x.com/a").unwrap(), ("http://x.com/a".to_string(), String::new()));
+    // The retrospective's R6 findings on #260, each verified against
+    // python3 (CPython 3.11):
+    //   urlsplit("http://example.com/p;q?x=1").path  == "/p;q" (params
+    //   NOT split out; the round-55 version deleted ";q").
+    let sp = urlsplit("http://example.com/p;q?x=1").unwrap();
+    assert_eq!((sp.path.as_str(), sp.params.as_str()), ("/p;q", ""));
+    //   urlparse("http://[::1]:8080/a").hostname() == "::1" (IPv6
+    //   brackets stripped).
+    let ipv6 = urlparse("http://[::1]:8080/a").unwrap();
+    assert_eq!(ipv6.hostname(), Some("::1".to_string()));
+    //   urlparse("http://user@name:pass@example.com/").username() ==
+    //   "user@name" (the LAST @ splits userinfo from host).
+    let ui = urlparse("http://user@name:pass@example.com/").unwrap();
+    assert_eq!(ui.username(), Some("user@name".to_string()));
+    assert_eq!(ui.password(), Some("pass".to_string()));
+    assert_eq!(ui.hostname(), Some("example.com".to_string()));
+    //   urlparse("HTTP://EXAMPLE.COM/").scheme == "http" (lowercased).
+    assert_eq!(urlparse("HTTP://EXAMPLE.COM/").unwrap().scheme, "http");
 }
 
 #[test]
@@ -3515,4 +3537,25 @@ fn pyvalue_from_tuple_boxes_as_tuple_members() {
         panic!("a 6-tuple must box as a Tuple, got {:?}", six);
     };
     assert_eq!(members.len(), 6);
+}
+
+// A BOXED list's membership test against a string (round 57): a list
+// that boxes because one element is `str | None` (`encoding_iana in
+// [specified_encoding, "ascii", "utf_8"]` — charset_normalizer's
+// from_sequence) compares the Str members by value, exactly like Python's
+// `x in [.., None-or-str, ..]` — the None element never matches.
+#[test]
+fn boxed_list_py_contains_matches_str_members_by_value() {
+    use stdpython::*;
+    let list: Vec<PyValue> = vec![
+        PyValue::from("ascii"),
+        PyValue::from("utf_8"),
+        stdpython::PyValue::None_,
+    ];
+    assert!(list.py_contains(&"ascii"), "a Str member matches");
+    assert!(list.py_contains(&"utf_8"), "a later Str member matches");
+    assert!(!list.py_contains(&"latin1"), "an absent member does not match");
+    // The String operand spelling the renderers emit for an owned name.
+    let needle = "utf_8".to_string();
+    assert!(list.py_contains(&needle), "an owned String operand matches");
 }

@@ -5,4 +5,7 @@
 //! them.
 
 pub mod parse;
+/// urllib.request is ureq-backed (http-ureq feature); parse has no
+/// network dependency.
+#[cfg(feature = "http-ureq")]
 pub mod request;

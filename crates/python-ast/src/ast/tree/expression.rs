@@ -281,6 +281,33 @@ impl ExprType {
                 // `Vec<String>` with `"a".to_string()`. Incompatible kinds
                 // ([1, "a"]) are a loud conversion-time error rather than
                 // a cryptic rustc mismatch inside generated code.
+                // A FORCED element type (a `-> List[Union[...]]` return
+                // whose element boxes — idna's `_seg_N` tables, round 57)
+                // overrides the inference: every element boxes.
+                if let Some(forced) = &*options.forced_list_elt {
+                    let expected = Some(forced.clone());
+                    let mut elements = Vec::new();
+                    for li in &l {
+                        if let ExprType::Starred(starred) = li {
+                            let inner = crate::render_reused(
+                                &starred.value,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            elements.push(quote!(#inner));
+                            continue;
+                        }
+                        elements.push(crate::render_typed(
+                            li,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            expected.clone(),
+                        )?);
+                    }
+                    return Ok(quote!(vec![#(#elements),*]));
+                }
                 let mut has_starred = false;
                 let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
                 for li in &l {
@@ -304,6 +331,15 @@ impl ExprType {
                     if !distinct.contains(t) {
                         distinct.push(t.clone());
                     }
+                }
+                // Unify the DISTINCT types (a repeat of an early element at
+                // the END of the literal must not re-absorb the result:
+                // `[(0, "3"), (65, "M", "a"), (76, "V")]` — idna's
+                // _seg tables mix 2- and 3-tuples — folding the raw
+                // element list ends on a 2-tuple and `unify(PyObject,
+                // Tuple2)` snaps expected back to Tuple2, hiding the
+                // heterogeneity from the boxable-union check below).
+                for t in &distinct {
                     expected = crate::unify(expected, t.clone());
                 }
                 if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {

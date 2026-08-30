@@ -14101,3 +14101,149 @@ fn range_annotation_maps_to_py_range() {
         out
     );
 }
+
+#[test]
+fn mixed_arity_tuple_list_boxes_heterogeneous_elements() {
+    // Round 57: a list literal whose elements are tuples of DIFFERENT
+    // arities (`[(0, "3"), (65, "M", "a"), (76, "V")]` — idna's _seg
+    // tables) boxes each element as PyValue. The element-type fold was
+    // order-dependent: a trailing 2-tuple re-absorbed the heterogeneous
+    // result (`unify(PyObject, Tuple2)` snaps back to Tuple2), hiding the
+    // mix from the boxable-union check — every 3-tuple then mismatched
+    // the inferred Vec<(i64, &str)> (E0308 per row).
+    let out = compile(
+        concat!(
+            "def _seg_0():\n",
+            "    return [\n",
+            "        (0, \"3\"),\n",
+            "        (65, \"M\", \"a\"),\n",
+            "        (76, \"V\"),\n",
+            "    ]\n",
+        ),
+        "seglist.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("PyValue::from(((65,\"M\",\"a\")))")
+            && flat.contains("PyValue::from(((76,\"V\")))"),
+        "mixed-arity tuple list elements must box as PyValue: {}",
+        out
+    );
+}
+
+#[test]
+fn list_of_union_tuples_return_annotation_boxes_elements() {
+    // Round 57: `-> List[Union[Tuple[int, str], Tuple[int, str, str]]]`
+    // (idna's _seg annotations) — the Union subscript resolved to
+    // nothing (the annotation authority only knew the `A | B` spelling),
+    // so the return type defaulted to `()` and the homogeneous segments
+    // of a boxed-element list stayed Vec<(i64, &str)> (E0308). The Union
+    // subscript maps to the boxed PyValue, and the RETURNING list boxes
+    // each element.
+    let out = compile(
+        concat!(
+            "from typing import List, Tuple, Union\n",
+            "def _seg_0() -> List[Union[Tuple[int, str], Tuple[int, str, str]]]:\n",
+            "    return [(0, \"3\"), (65, \"M\", \"a\")]\n",
+        ),
+        "segann.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fn_seg_0()->Result<Vec<stdpython::PyValue>"),
+        "the Union-typed return must resolve to Vec<PyValue>: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyValue::from(((0,\"3\")))"),
+        "the returning list must box each element: {}",
+        out
+    );
+}
+
+#[test]
+fn module_tuple_unpack_promotes_names_read_by_functions() {
+    // Round 57: a module-level TUPLE-UNPACK (`_STATUS_VALID,
+    // _STATUS_MAPPED, ... = b"VMDI"` — idna's core.py) binds each name
+    // to the value at its position; the names functions read must be
+    // promoted to statics extracting their element (a module-init local
+    // is invisible to function bodies — E0425).
+    let out = compile(
+        concat!(
+            "_STATUS_VALID, _STATUS_MAPPED, _STATUS_DEVIATION, _STATUS_IGNORED = b\"VMDI\"\n",
+            "def encode(domain):\n",
+            "    if domain == _STATUS_VALID:\n",
+            "        return 1\n",
+            "    if domain == _STATUS_MAPPED:\n",
+            "        return 2\n",
+            "    return 0\n",
+        ),
+        "statusunpack.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("pubstatic_STATUS_VALID:std::sync::LazyLock<stdpython::PyValue>")
+            && flat.contains("pubstatic_STATUS_MAPPED:"),
+        "function-read unpack names must promote to statics: {}",
+        out
+    );
+    assert!(
+        flat.contains("py_index(0i64)") && flat.contains("py_index(1i64)"),
+        "each promoted name's static must extract its element at its position: {}",
+        out
+    );
+    assert!(
+        !flat.contains("letmut_STATUS_VALID"),
+        "promoted names must not remain module-init locals: {}",
+        out
+    );
+}
+
+#[test]
+fn boxed_bool_fold_returns_the_python_operand_in_both_orders() {
+    // The retrospective's shipped wrong-semantics finding on #260: the
+    // (Bool, PyValue) / (PyValue, Bool) fold special-cased the bool-first
+    // order and SWAPPED the arms for the value-first order — `y and x`
+    // (y boxed, x bool) returned y on a truthy y instead of x, and
+    // `y or x` returned x on a truthy y. Python `a and b` is a if a is
+    // falsy else b; `a or b` is a if a is truthy else b — order-
+    // independent. Verified against python3: for y=1, x=False, `y and x`
+    // is False (x), `y or x` is 1 (y); for y=0, x=True, `y and x` is 0
+    // (y), `y or x` is True (x).
+    let out = compile(
+        concat!(
+            "def f(x: bool, y: object):\n",
+            "    a = y and x\n",
+            "    b = y or x\n",
+            "    c = x and y\n",
+            "    d = x or y\n",
+            "    return a, b, c, d\n",
+        ),
+        "boxedbool.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    // `y and x`: truthy y -> the bool (x); `y or x`: truthy y -> the
+    // value (y).
+    assert!(
+        flat.contains("let__rython_and=y;if(__rython_and).is_truthy(){PyValue::from(x)}else{PyValue::from(y)}"),
+        "value-first AND must return the bool on a truthy value: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_or=y;if(__rython_or).is_truthy(){PyValue::from(y)}else{PyValue::from(x)}"),
+        "value-first OR must return the value on a truthy value: {}",
+        out
+    );
+    // `x and y` (bool first): truthy x -> the value (y); `x or y`:
+    // truthy x -> the bool (x).
+    assert!(
+        flat.contains("let__rython_and=x;if(__rython_and).is_truthy(){PyValue::from(y)}else{PyValue::from(x)}"),
+        "bool-first AND must return the value on a truthy bool: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_or=x;if(__rython_or).is_truthy(){PyValue::from(x)}else{PyValue::from(y)}"),
+        "bool-first OR must return the bool on a truthy bool: {}",
+        out
+    );
+}

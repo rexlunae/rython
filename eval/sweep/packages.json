@@ -14,17 +14,17 @@
     {
       "name": "idna",
       "requirement": "idna==3.10",
-      "note": "Round 56: the new tuple->PyValue From impls cut the boxed-tuple E0277 wall from 957 to 157."
+      "note": "Round 57: mixed-arity tuple lists box as PyValue, the Union[A, B] subscript annotation resolves, and module-level tuple-unpacks promote (73)."
     },
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Round 56: the range annotation fix (313)."
+      "note": "Round 57: boxed-list py_contains for str/String operands (312)."
     },
     {
       "name": "requests",
       "requirement": "requests==2.32.3",
-      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse surface + class registry (69). Round 56: unannotated class defaults, quoted annotations, builtin-class value positions, compat self-alias imports, tuple boxing, del-read loop targets, range annotations (29)."
+      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse + class registry (69). Round 56: builtin-class values, tuple boxing, compat imports, del reads, range annotations (29). Round 57: module tuple-unpack promotion (25)."
     }
   ]
 }

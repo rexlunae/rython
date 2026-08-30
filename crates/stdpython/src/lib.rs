@@ -4632,6 +4632,33 @@ impl PyContains<str> for Vec<String> {
     }
 }
 
+// A BOXED list's membership test against a string (`encoding_iana in
+// [specified_encoding, "ascii", "utf_8"]` where specified_encoding is
+// `str | None`, so the list boxes to Vec<PyValue> — charset_normalizer's
+// from_sequence): compare the Str members by value, like the typed
+// Vec<String> impls above. The str/String/&str spellings the renderers
+// emit all delegate to the same member compare.
+impl PyContains<str> for Vec<PyValue> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.iter()
+            .any(|m| matches!(m, PyValue::Str(s) if s == item))
+    }
+}
+
+impl PyContains<&str> for Vec<PyValue> {
+    fn py_contains(&self, item: &&str) -> bool {
+        self.iter()
+            .any(|m| matches!(m, PyValue::Str(s) if s == *item))
+    }
+}
+
+impl PyContains<String> for Vec<PyValue> {
+    fn py_contains(&self, item: &String) -> bool {
+        self.iter()
+            .any(|m| matches!(m, PyValue::Str(s) if s == item))
+    }
+}
+
 impl PyContains<&str> for Vec<String> {
     fn py_contains(&self, item: &&str) -> bool {
         self.iter().any(|s| s == *item)
@@ -5962,9 +5989,13 @@ pub use stdlib::socket;
 /// implies std — on by default).
 #[cfg(feature = "ssl-rustls")]
 pub use stdlib::ssl;
-/// Python urllib.request (ureq-backed; gated on the http-ureq feature,
-/// which implies std).
-#[cfg(feature = "http-ureq")]
+/// Python urllib: the `parse` submodule (urlparse/urlsplit/urljoin/
+/// urlencode/quote/unquote/...) is pure string handling, available under
+/// plain std; the `request` submodule (urlopen) is ureq-backed and keeps
+/// its own http-ureq gate. The parse tests run in the default workspace
+/// suite (the retrospective's R6 correction on #260 — they were gated
+/// behind http-ureq, which CI does not enable).
+#[cfg(feature = "std")]
 pub use stdlib::urllib;
 // The Match-method trait must be in scope for m.group()/m.span() to
 // resolve through the Option layer in generated code.
