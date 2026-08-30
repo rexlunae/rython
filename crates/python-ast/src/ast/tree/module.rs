@@ -832,6 +832,10 @@ impl CodeGen for Module {
         let mut pending_docstring = self.get_module_docstring().is_some()
             && (self.raw.body.len() > 1 || self.looks_like_module_docstring());
         let mut seen_non_doc_statement = false;
+        // Names the shared RHS statics of promoted tuple-unpacks
+        // (`__rython_unpack_0`, ...) get; one per unpack assignment, in
+        // source order.
+        let mut unpack_counter = 0usize;
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
             // Issue #118: module-level argparse. Parser-building statements
             // vanish; the parse_args assignment becomes the typed-namespace
@@ -1358,12 +1362,40 @@ impl CodeGen for Module {
                 } else {
                     stripped
                 };
+                // A TUPLE-UNPACK promotion (`_STATUS_VALID, ... =
+                // b"VMDI"` — idna): one SHARED static evaluates the RHS
+                // exactly ONCE (Devin review on #263, Finding 4: per-name
+                // statics each re-ran the RHS, so side effects repeated
+                // and the names could come from different results); each
+                // promoted name's static projects its element from it,
+                // boxing the element WITHOUT a truncating `as i64`
+                // (Finding 3: `a, b = (1.5, 2.5)` boxed 1 instead of
+                // 1.5 — only the bytes-unpack element (u8) boxes as an
+                // Int, through its own From impl).
+                let unpack_pairs = assign_unpack_indices(a);
+                // A BYTES-LITERAL RHS (`b"VMDI"` — idna) indexes to u8
+                // elements, which box as Ints; any other RHS element
+                // boxes as-is (no `as i64` truncation — Devin review on
+                // #263, Finding 3: `a, b = (1.5, 2.5)` must stay 1.5).
+                let rhs_is_bytes_literal = matches!(
+                    &a.value,
+                    crate::ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::ByteString(_)))
+                );
+                let shared_ident = unpack_pairs.as_ref().map(|_| {
+                    let ident = crate::safe_ident(&format!("__rython_unpack_{}", unpack_counter));
+                    unpack_counter += 1;
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                            std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
+                    });
+                    module_init_stmts.push(quote!(let _ = &*#ident;));
+                    ident
+                });
                 for n in promoted {
                     let ident = crate::safe_ident(&n);
-                    // A TUPLE-UNPACK promotion (`_STATUS_VALID, ... =
-                    // b"VMDI"` — idna): each name's static extracts its
-                    // element at the target position, not the whole RHS.
-                    let unpack_at = assign_unpack_indices(a)
+                    let unpack_at = unpack_pairs
+                        .as_ref()
                         .and_then(|pairs| pairs.iter().find(|(pn, _)| pn == &n).map(|(_, i)| *i));
                     // The static's type: the codegen's inferred type when
                     // known, a few recognized stdlib constructors, else the
@@ -1374,14 +1406,17 @@ impl CodeGen for Module {
                         match module_init_static_ty(&n, &a.value, &options) {
                             Some(ty) => (ty, value_tokens.clone()),
                             None => {
-                                let boxed = match unpack_at {
-                                    Some(i) => {
+                                let boxed = match (unpack_at, &shared_ident) {
+                                    (Some(i), Some(shared)) => {
                                         let idx = i as i64;
+                                        let projected = if rhs_is_bytes_literal {
+                                            quote!(PyValue::from(__rython_elt as i64))
+                                        } else {
+                                            quote!(PyValue::from(__rython_elt))
+                                        };
                                         quote! {
-                                            match (#value_tokens).py_index(#idx) {
-                                                Ok(__rython_elt) => PyValue::from(
-                                                    __rython_elt as i64
-                                                ),
+                                            match (*#shared).clone().py_index(#idx) {
+                                                Ok(__rython_elt) => #projected,
                                                 Err(__rython_e) => panic!(
                                                     "module-level `{}` element {} \
                                                      initialization failed: {}",
@@ -1392,7 +1427,7 @@ impl CodeGen for Module {
                                             }
                                         }
                                     }
-                                    None => value_tokens.clone(),
+                                    _ => value_tokens.clone(),
                                 };
                                 (
                                     quote!(stdpython::PyValue),

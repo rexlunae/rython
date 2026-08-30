@@ -2150,7 +2150,7 @@ impl FunctionDef {
         // literal alone sees only homogeneous 2-tuples and infers
         // `Vec<(i64, &str)>`, mismatching the annotation. The return
         // statement threads this in (round 57).
-        options.forced_list_elt = std::rc::Rc::new(
+        options.fn_return_list_elt = std::rc::Rc::new(
             self.returns.as_deref().and_then(|ann| {
                 match crate::annotation_type_info(ann) {
                     Some(crate::TypeInfo::Vec(inner))

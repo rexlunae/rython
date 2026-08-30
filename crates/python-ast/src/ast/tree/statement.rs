@@ -685,7 +685,7 @@ impl CodeGen for StatementType {
                     // homogeneous `Vec<(i64, &str)>` that mismatches the
                     // annotation (round 57).
                     let tokens = if matches!(e.value, ExprType::List(_))
-                        && let Some(elt) = &*options.forced_list_elt
+                        && let Some(elt) = &*options.fn_return_list_elt
                     {
                         let mut ret_options = options.clone();
                         ret_options.forced_list_elt =

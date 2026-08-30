@@ -4536,6 +4536,35 @@ impl<K: Eq + Hash, V> PyPopDefault<K, V> for HashMap<K, V> {
 /// Indexing a BOXED dict (`credentials['Credentials']` where the outer
 /// value is a boxed PyValue — issue #180): a boxed dict member indexes
 /// like the dict it holds; anything else raises CPython's TypeError.
+impl PyIndex<i64> for PyValue {
+    type Output = PyValue;
+    fn py_index(&self, key: i64) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Bytes(b) => b
+                .get(key as usize)
+                .map(|&o| PyValue::Int(o as i64))
+                .ok_or_else(|| PyException::new("IndexError", "index out of range")),
+            PyValue::Tuple(members) => members
+                .get(key as usize)
+                .cloned()
+                .ok_or_else(|| PyException::new("IndexError", "index out of range")),
+            PyValue::Str(s) => {
+                if key < 0 {
+                    return Err(PyException::new("IndexError", "index out of range"));
+                }
+                s.chars()
+                    .nth(key as usize)
+                    .map(|c| PyValue::Str(c.to_string()))
+                    .ok_or_else(|| PyException::new("IndexError", "index out of range"))
+            }
+            _ => Err(PyException::new(
+                "TypeError",
+                "indices must be integers or slices",
+            )),
+        }
+    }
+}
+
 impl PyIndex<&str> for PyValue {
     type Output = PyValue;
     fn py_index(&self, key: &str) -> Result<PyValue, PyException> {

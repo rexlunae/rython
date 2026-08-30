@@ -3559,3 +3559,22 @@ fn boxed_list_py_contains_matches_str_members_by_value() {
     let needle = "utf_8".to_string();
     assert!(list.py_contains(&needle), "an owned String operand matches");
 }
+
+// The boxed-index-by-int projection a promoted tuple-unpack uses (round
+// 57, Devin review #263 Findings 3+4): `PyValue::from((1.5, 2.5))
+// .py_index(i)` yields the Float members unchanged (no truncation), and
+// a boxed BYTES value indexes to its Int elements. Verified against
+// python3: (1.5, 2.5)[0] == 1.5; b"VMDI"[0] == 86.
+#[test]
+fn boxed_index_by_int_projects_unpack_elements() {
+    use stdpython::*;
+    let t: PyValue = (1.5, 2.5).into();
+    assert_eq!(t.py_index(0i64).unwrap(), PyValue::from(1.5));
+    assert_eq!(t.py_index(1i64).unwrap(), PyValue::from(2.5));
+    assert!(t.py_index(2i64).is_err(), "out of range is an IndexError");
+    let b: PyValue = b"VMDI".to_vec().into();
+    assert_eq!(b.py_index(0i64).unwrap(), PyValue::from(86));
+    assert_eq!(b.py_index(3i64).unwrap(), PyValue::from(73));
+    // Out of range is an IndexError.
+    assert!(b.py_index(4i64).is_err(), "out of range is an IndexError");
+}

@@ -14247,3 +14247,102 @@ fn boxed_bool_fold_returns_the_python_operand_in_both_orders() {
         out
     );
 }
+
+#[test]
+fn boxed_return_list_annotation_does_not_retag_local_lists() {
+    // Devin review on #263 (Finding 1): the first version set the forced
+    // list element on the SHARED function options, so a `-> List[Union[
+    // ...]]` return annotation boxed EVERY list literal in the function
+    // — local lists and call arguments gained unintended element types.
+    // The forced element now rides only on the Return statement's own
+    // options clone: the returned list boxes, a local list keeps its
+    // own inference.
+    let out = compile(
+        concat!(
+            "from typing import List, Tuple, Union\n",
+            "def f() -> List[Union[Tuple[int, str], Tuple[int, str, str]]]:\n",
+            "    local = [1, 2]\n",
+            "    return [(0, \"3\"), (65, \"M\", \"a\")]\n",
+        ),
+        "retlocal.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("PyValue::from(((0,\"3\")))"),
+        "the RETURNED list must box each element: {}",
+        out
+    );
+    assert!(
+        flat.contains("local=vec![1,2]"),
+        "a LOCAL list must keep its own Vec<i64> inference: {}",
+        out
+    );
+    assert!(
+        !flat.contains("local=vec![PyValue::from(1),PyValue::from(2)]"),
+        "the local list must NOT be retagged as boxed: {}",
+        out
+    );
+}
+
+#[test]
+fn boxed_return_list_annotation_spreads_starred_elements() {
+    // Devin review on #263 (Finding 2): under a boxed-element return
+    // annotation, `*xs` was emitted as ONE list element instead of
+    // spreading the collection. The forced branch now interleaves
+    // fixed elements and spreads in source order.
+    let out = compile(
+        concat!(
+            "from typing import List, Tuple, Union\n",
+            "def f(xs: list) -> List[Union[Tuple[int, str], Tuple[int, str, str]]]:\n",
+            "    return [(0, \"3\"), *xs, (65, \"M\", \"a\")]\n",
+        ),
+        "starret.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("__rython_list.extend("),
+        "a starred element must SPREAD into the returned list: {}",
+        out
+    );
+    assert!(
+        flat.contains("__rython_list.push(PyValue::from(((65,\"M\",\"a\")))"),
+        "the fixed elements after the spread must still box, in order: {}",
+        out
+    );
+}
+
+#[test]
+fn module_tuple_unpack_emits_shared_rhs_static_and_typed_projections() {
+    // Devin review on #263 (Findings 3+4): the first version of the
+    // unpack promotion emitted one static PER NAME, each re-evaluating
+    // the whole RHS (`a, b = make()` ran make() twice — side effects
+    // repeat, names from different results) and truncating every element
+    // through `as i64` (`a, b = (1.5, 2.5)` boxed 1 instead of 1.5).
+    // One shared `__rython_unpack_N` static now evaluates the RHS once;
+    // each name projects its element from it, boxed as-is.
+    let out = compile(
+        concat!(
+            "a, b = (1.5, 2.5)\n",
+            "def f():\n",
+            "    return a, b\n",
+        ),
+        "unpackrhs.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("pubstatic__rython_unpack_0:std::sync::LazyLock<stdpython::PyValue>"),
+        "one shared RHS static must hold the evaluated value: {}",
+        out
+    );
+    assert!(
+        flat.contains("(*__rython_unpack_0).clone().py_index(0i64)")
+            && flat.contains("(*__rython_unpack_0).clone().py_index(1i64)"),
+        "each name's static must PROJECT its element from the shared RHS: {}",
+        out
+    );
+    assert!(
+        !flat.contains("py_index(0i64){Ok(__rython_elt)=>PyValue::from(__rython_eltasi64)"),
+        "the projection must NOT truncate the element through as i64: {}",
+        out
+    );
+}

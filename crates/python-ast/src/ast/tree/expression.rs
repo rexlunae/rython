@@ -283,10 +283,14 @@ impl ExprType {
                 // a cryptic rustc mismatch inside generated code.
                 // A FORCED element type (a `-> List[Union[...]]` return
                 // whose element boxes — idna's `_seg_N` tables, round 57)
-                // overrides the inference: every element boxes.
+                // overrides the inference: every fixed element boxes,
+                // and a Starred element SPREADS its collection exactly
+                // like the normal path (Devin review on #263: the first
+                // version emitted the spread as one list element).
                 if let Some(forced) = &*options.forced_list_elt {
                     let expected = Some(forced.clone());
                     let mut elements = Vec::new();
+                    let mut spreads: Vec<TokenStream> = Vec::new();
                     for li in &l {
                         if let ExprType::Starred(starred) = li {
                             let inner = crate::render_reused(
@@ -295,7 +299,7 @@ impl ExprType {
                                 options.clone(),
                                 symbols.clone(),
                             )?;
-                            elements.push(quote!(#inner));
+                            spreads.push(quote!(#inner));
                             continue;
                         }
                         elements.push(crate::render_typed(
@@ -306,7 +310,32 @@ impl ExprType {
                             expected.clone(),
                         )?);
                     }
-                    return Ok(quote!(vec![#(#elements),*]));
+                    if spreads.is_empty() {
+                        return Ok(quote!(vec![#(#elements),*]));
+                    }
+                    // Source-order interleave of fixed and spread
+                    // segments (`[*a, x, *b]` extends a, pushes x, then
+                    // extends b — the same shape the non-forced starred
+                    // path emits below).
+                    let mut segments: Vec<TokenStream> = Vec::new();
+                    let mut si = 0usize;
+                    let mut ei = 0usize;
+                    for li in &l {
+                        if let ExprType::Starred(_) = li {
+                            let s = spreads[si].clone();
+                            segments.push(quote!(__rython_list.extend(#s);));
+                            si += 1;
+                        } else {
+                            let e = elements[ei].clone();
+                            segments.push(quote!(__rython_list.push(#e);));
+                            ei += 1;
+                        }
+                    }
+                    return Ok(quote!({
+                        let mut __rython_list = Vec::new();
+                        #(#segments)*
+                        __rython_list
+                    }));
                 }
                 let mut has_starred = false;
                 let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
