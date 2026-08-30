@@ -372,6 +372,12 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
                 if n.id == "socket" && attr.attr == "socket" {
                     return Some(quote!(socket::Socket));
                 }
+                // `typing.Any` — the boxed heterogeneous value, same as
+                // the bare `Any` name (urllib3's `dict[str, typing.Any]`
+                // return annotations — round 44).
+                if n.id == "typing" && attr.attr == "Any" {
+                    return Some(quote!(stdpython::PyValue));
+                }
             }
             let is_np = matches!(attr.value.as_ref(), ExprType::Name(n) if crate::is_numpy_alias(&n.id));
             if !is_np {

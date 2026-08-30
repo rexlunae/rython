@@ -3374,6 +3374,36 @@ fn typing_imports_lower_to_nothing() {
 }
 
 #[test]
+fn typing_any_annotation_maps_to_boxed_pyvalue() {
+    // Round 44: `dict[str, typing.Any]` — a return annotation whose value
+    // type is `typing.Any` (urllib3's `_merge_pool_kwargs`): the `Any`
+    // maps to the boxed PyValue, so the method's signature is
+    // `Result<PyDict<String, PyValue>>` instead of collapsing to unit
+    // while the body still emits `Ok(dict)` (which cannot compile).
+    let out = compile(
+        "import typing\n\
+         def merge(override: dict[str, typing.Any] | None) -> dict[str, typing.Any]:\n\
+         \x20   base: dict[str, typing.Any] = {}\n\
+         \x20   if override:\n\
+         \x20       for k, v in override.items():\n\
+         \x20           base[k] = v\n\
+         \x20   return base\n",
+        "typany.py",
+    );
+    assert!(
+        out.contains("Result < PyDict < String , stdpython :: PyValue > , PyException >")
+            || out.contains("Result<PyDict<String, stdpython::PyValue>, PyException>"),
+        "a dict[str, typing.Any] return must type the boxed value dict: {}",
+        out
+    );
+    assert!(
+        !out.contains("-> Result < () , PyException >"),
+        "the return must not collapse to unit: {}",
+        out
+    );
+}
+
+#[test]
 fn membership_uses_py_contains() {
     let out = compile("found = x in items", "in.py");
     assert!(out.contains("py_contains"), "generated: {}", out);
