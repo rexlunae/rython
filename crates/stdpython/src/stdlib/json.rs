@@ -736,6 +736,47 @@ python_function! {
     }
 }
 
+/// A boxed PyValue converted to the JSON model (the `dumps(pyvalue)`
+/// from-import shape — charset_normalizer's `dumps(self.__dict__, ...)`):
+/// scalars map directly, a dict maps to an object, a tuple/list to an
+/// array, anything else to Null (the value is not JSON-serializable in
+/// rython's model; CPython would raise TypeError — the null is the §12
+/// loud-fallback divergence).
+pub fn pyvalue_to_json(value: &crate::PyValue) -> JSONValue {
+    use crate::PyValue;
+    match value {
+        PyValue::None_ => JSONValue::Null,
+        PyValue::Bool(b) => JSONValue::Bool(*b),
+        PyValue::Int(i) => JSONValue::Int(*i),
+        PyValue::Float(f) => JSONValue::Float(*f),
+        PyValue::Str(s) => JSONValue::String(s.clone()),
+        PyValue::Bytes(b) => JSONValue::String(String::from_utf8_lossy(b).into_owned()),
+        PyValue::Tuple(t) => {
+            JSONValue::Array(t.iter().map(pyvalue_to_json).collect())
+        }
+        PyValue::Dict(d) => {
+            let mut obj: crate::PyDict<String, JSONValue> = core::default::Default::default();
+            for (k, v) in d.iter() {
+                obj.insert(k.clone(), pyvalue_to_json(v));
+            }
+            JSONValue::Object(obj)
+        }
+    }
+}
+
+/// `dumps` for a BOXED value (`from json import dumps;
+/// dumps(self.__dict__, ...)`): convert and serialize. The keyword
+/// arguments rython models (indent) pass through; ensure_ascii is a
+/// no-op (the encoder is already ASCII-safe). The object may be a
+/// PyValue OR a PyDict/other Into<PyValue> shape (charset_normalizer's
+/// `self.__dict__()` returns PyDict<String, PyValue>).
+pub fn dumps_pyvalue<T: Into<crate::PyValue>>(
+    obj: T,
+    indent: Option<usize>,
+) -> Result<String, PyException> {
+    Ok(dumps(&pyvalue_to_json(&obj.into()), indent))
+}
+
 #[cfg(feature = "std")]
 python_function! {
     /// json.dump - serialize object to JSON and write to file

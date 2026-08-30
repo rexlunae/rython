@@ -3413,3 +3413,67 @@ fn range_replace_mechanics_match_python() {
         .collect();
     assert_eq!(kept, vec![1]);
 }
+
+#[cfg(feature = "http-ureq")]
+mod urllib_parse_pins {
+    use stdpython::*;
+
+#[test]
+fn urllib_parse_matches_cpython() {
+    use stdpython::urllib::parse::*;
+    // Verified against python3 (urllib.parse, CPython 3.11):
+    let p = urlparse("https://user:pass@example.com:8080/path/to?a=1&b=2#frag").unwrap();
+    assert_eq!(p.scheme, "https");
+    assert_eq!(p.netloc, "user:pass@example.com:8080");
+    assert_eq!(p.path, "/path/to");
+    assert_eq!(p.params, "");
+    assert_eq!(p.query, "a=1&b=2");
+    assert_eq!(p.fragment, "frag");
+    assert_eq!(p.hostname(), Some("example.com".to_string()));
+    assert_eq!(p.port(), Some(8080));
+    assert_eq!(p.username(), Some("user".to_string()));
+    assert_eq!(p.password(), Some("pass".to_string()));
+    assert_eq!(p.geturl(), "https://user:pass@example.com:8080/path/to?a=1&b=2#frag");
+    // urlsplit: params empty.
+    let s = urlsplit("https://example.com/a?x=1").unwrap();
+    assert_eq!((s.scheme.as_str(), s.netloc.as_str(), s.path.as_str(), s.query.as_str(), s.fragment.as_str()),
+               ("https", "example.com", "/a", "x=1", ""));
+    // urlunparse: six components.
+    assert_eq!(
+        urlunparse(("https", "example.com", "/p", "", "q=1", "f")).unwrap(),
+        "https://example.com/p?q=1#f"
+    );
+    // urljoin: relative resolution and absolute-target precedence.
+    assert_eq!(urljoin("http://example.com/a/b/c", "../../d").unwrap(), "http://example.com/d");
+    assert_eq!(urljoin("http://example.com/a", "https://other.com/x").unwrap(), "https://other.com/x");
+    // quote: unreserved pass, everything else %XX.
+    assert_eq!(quote("a b&c=d", None).unwrap(), "a%20b%26c%3Dd");
+    assert_eq!(quote("a b&c=d", Some("&")).unwrap(), "a%20b&c%3Dd");
+    assert_eq!(quote_plus("a b&c").unwrap(), "a+b%26c");
+    // unquote: %XX decodes.
+    assert_eq!(unquote("a%20b%26c").unwrap(), "a b&c");
+    assert_eq!(unquote_plus("a+b%20c").unwrap(), "a b c");
+    // urldefrag: split at the first #.
+    assert_eq!(urldefrag("http://x.com/a#frag").unwrap(), ("http://x.com/a".to_string(), "frag".to_string()));
+    assert_eq!(urldefrag("http://x.com/a").unwrap(), ("http://x.com/a".to_string(), String::new()));
+}
+
+#[test]
+fn urllib_urlencode_matches_cpython() {
+    use stdpython::urllib::parse::urlencode;
+    use stdpython::PyValue;
+    // Verified against python3:
+    //   urlencode({"a": 1, "b": "x y"}) == "a=1&b=x+y"
+    let mut d = PyDict::new();
+    d.insert("a".to_string(), PyValue::Int(1));
+    d.insert("b".to_string(), PyValue::Str("x y".to_string()));
+    assert_eq!(urlencode(&PyValue::from(d), false).unwrap(), "a=1&b=x+y");
+    //   urlencode([("a", 1), ("a", 2)], doseq=True) == "a=1&a=2"
+    let pairs = PyValue::from(vec![
+        PyValue::from(vec![PyValue::Str("a".to_string()), PyValue::Int(1)]),
+        PyValue::from(vec![PyValue::Str("a".to_string()), PyValue::Int(2)]),
+    ]);
+    assert_eq!(urlencode(&pairs, true).unwrap(), "a=1&a=2");
+}
+
+}

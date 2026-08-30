@@ -15,6 +15,65 @@ pub(crate) fn is_stdpython_module(name: &str) -> bool {
     crate::StdModule::from_name(name).is_some()
 }
 
+/// Whether a from-importable item of the stdpython module `module` is a
+/// CLASS (a runtime struct constructed with `Name::new(...)`) rather than
+/// a module function or constant. The call lowering needs the
+/// distinction: `urlparse(url)` is a plain call, while `OrderedDict(...)`
+/// is a construction — treating functions as classes produced
+/// `urlparse::new(...)` (E0433: a function used as a module path) for
+/// every requests/urllib3 call site (round 55).
+pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
+    use crate::StdModule;
+    let Some(module) = StdModule::from_name(module) else {
+        return false;
+    };
+    match module {
+        // StringIO/BytesIO are FUNCTIONS in the runtime (`pub fn
+        // StringIO()`), not structs — the io dispatch handles them.
+        StdModule::Io => false,
+        StdModule::Threading => crate::ThreadingType::from_name(name).is_some(),
+        StdModule::Socket => matches!(name, "socket"),
+        StdModule::Ssl => matches!(name, "SSLContext" | "SSLSocket"),
+        // urllib: urlopen and the parse submodule's items are ALL
+        // functions (urlparse/urlsplit/urljoin/urlencode/quote/...).
+        StdModule::Urllib => false,
+        StdModule::Collections => matches!(name, "OrderedDict" | "defaultdict" | "deque"),
+        StdModule::Re => false,
+        StdModule::Itertools => false,
+        StdModule::Functools => false,
+        StdModule::Hashlib => false,
+        StdModule::Json => false,
+        // datetime's date/datetime/timedelta are handled by
+        // render_datetime_ctor; time/timezone construct through
+        // stdpython_class (`time::new(...)` — the runtime structs).
+        StdModule::Datetime => {
+            matches!(name, "datetime" | "date" | "time" | "timedelta" | "timezone")
+        }
+        StdModule::Os => false,
+        StdModule::Pathlib => matches!(name, "PurePath" | "Path"),
+        StdModule::Tempfile => {
+            matches!(name, "NamedTemporaryFile" | "TemporaryDirectory" | "SpooledTemporaryFile")
+        }
+        StdModule::Subprocess => matches!(name, "CompletedProcess"),
+        StdModule::Csv => false,
+        StdModule::String => matches!(name, "Template"),
+        StdModule::Venv => matches!(name, "EnvBuilder"),
+        // Functions/constants only.
+        StdModule::Sys
+        | StdModule::Time
+        | StdModule::Math
+        | StdModule::Random
+        | StdModule::Warnings
+        | StdModule::Textwrap
+        | StdModule::Heapq
+        | StdModule::Copy
+        | StdModule::Glob
+        | StdModule::Sysconfig
+        | StdModule::Argparse => false,
+        StdModule::Numpy | StdModule::Asyncio => false,
+    }
+}
+
 /// Whether a TYPE-CHECKING import of `name` from the stdpython module
 /// `module` can emit a `use`: the item must have a KNOWN runtime
 /// counterpart in stdpython's module (an `if TYPE_CHECKING:` import of
@@ -87,7 +146,27 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         // URLError/HTTPError are string-tagged exceptions matched by name
         // (no runtime item), so `from urllib.error import URLError` drops
         // with the annotation-only warning — except matching still works.
-        StdModule::Urllib => matches!(name, "request" | "urlopen"),
+        StdModule::Urllib => matches!(
+            name,
+            // The request submodule and its items.
+            "request"
+                | "urlopen"
+                // The parse submodule (round 55): the functions requests'
+                // compat.py imports — urlparse/urlsplit/urlunparse/
+                // urljoin/urlencode/quote/unquote/urldefrag. The dotted
+                // path resolves through the same flattened registry.
+                | "parse"
+                | "urlparse"
+                | "urlsplit"
+                | "urlunparse"
+                | "urljoin"
+                | "urlencode"
+                | "quote"
+                | "quote_plus"
+                | "unquote"
+                | "unquote_plus"
+                | "urldefrag",
+        ),
         StdModule::Collections => {
             matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
         }

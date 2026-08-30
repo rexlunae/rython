@@ -3612,6 +3612,25 @@ pub(crate) fn module_def_has_runtime_item(
                         return true;
                     }
                 }
+                // A stdpython-module RE-EXPORT (`from urllib.parse import
+                // urlparse` — requests' compat, round 55): the import
+                // emits a `pub use stdpython::...` when the name has a
+                // runtime item, so it IS a runtime item of this module.
+                ST::ImportFrom(i) => {
+                    if !in_type_checking {
+                        let first = i.module.split('.').next().unwrap_or("");
+                        let hit = i.names.iter().any(|a| {
+                            let imported = a.asname.as_deref().unwrap_or(&a.name);
+                            imported == name
+                                && crate::ast::tree::import::stdpython_module_item(
+                                    first, &a.name,
+                                )
+                        });
+                        if hit {
+                            return true;
+                        }
+                    }
+                }
                 ST::If(i) => {
                     // `if TYPE_CHECKING:` (bare) or `if typing.TYPE_CHECKING:`
                     // (attribute) marks a compile-time-only block.

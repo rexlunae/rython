@@ -245,14 +245,17 @@ fn resolve_builtin_alias(
 
 /// Follow an ImportFrom re-export chain (`from .compat import OrderedDict`
 /// where compat does `from collections import OrderedDict`) through the
-/// generated crate's modules; true when the chain ends in a stdpython
-/// module — the name is a stdpython class, whose construction lowers to the
-/// runtime `::new` (the stdpython-construction divergence).
+/// generated crate's modules; returns the terminal STDPYTHON
+/// (module root, item name) the chain ends in (`("collections",
+/// "OrderedDict")`), or None when the chain does not end in a stdpython
+/// module. The caller checks `stdpython_module_class(root, name)` — the
+/// re-exported item may be a FUNCTION (requests' compat re-exports
+/// `urlparse` from urllib.parse; calls must NOT lower as constructions).
 fn stdpython_reexport_chain(
     name: &str,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
-) -> bool {
+) -> Option<(String, String)> {
     let mut current = name.to_string();
     let mut syms = symbols.clone();
     for _ in 0..16 {
@@ -260,9 +263,10 @@ fn stdpython_reexport_chain(
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
                 let Some(key) = crate::module_defs_key(options, &path) else {
-                    return crate::is_stdpython_module(
-                        ifm.module.split('.').next().unwrap_or(""),
-                    );
+                    // Terminal hop: the import binds into a stdpython (or
+                    // external) module — `current` is the item name there.
+                    let root = ifm.module.split('.').next().unwrap_or("").to_string();
+                    return crate::is_stdpython_module(&root).then(|| (root, current.clone()));
                 };
                 // Re-export chain: hop into the defining module's scope.
                 let defining = ifm
@@ -276,10 +280,77 @@ fn stdpython_reexport_chain(
                 syms = module.clone().find_symbols(SymbolTableScopes::new());
                 current = defining;
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    false
+    None
+}
+
+/// The urllib.parse function an imported Name callee resolves to
+/// (`urlparse`, `urlsplit`, ...), following the same re-export chain as
+/// stdpython_reexport_chain (requests' compat re-exports them from
+/// `urllib.parse`). Returns the canonical runtime item name, or None
+/// when the name does not resolve to a urllib.parse function.
+fn urllib_parse_fn(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<&'static str> {
+    const PARSE_FNS: &[&str] = &[
+        "urlparse",
+        "urlsplit",
+        "urlunparse",
+        "urljoin",
+        "urlencode",
+        "quote",
+        "quote_plus",
+        "unquote",
+        "unquote_plus",
+        "urldefrag",
+    ];
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..16 {
+        match syms.get(&current) {
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                // Direct `from urllib.parse import urlparse`: the item
+                // may be ALIASED (`import urlparse as up`). Owned copy so
+                // the borrow of the scope ends before the return.
+                let root = ifm.module.split('.').next().unwrap_or("");
+                let canonical: String = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                if root == "urllib" {
+                    if let Some(f) = PARSE_FNS.iter().copied().find(|f| *f == canonical.as_str()) {
+                        return Some(f);
+                    }
+                }
+                // Re-export chain through a sibling module (requests'
+                // compat): hop into the defining module's scope.
+                let path = ifm.resolved_module_path(options);
+                let Some(key) = crate::module_defs_key(options, &path) else {
+                    return None;
+                };
+                let defining = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let module = &options.module_defs[key];
+                let module: &crate::Module = module;
+                syms = module.clone().find_symbols(SymbolTableScopes::new());
+                current = defining;
+            }
+            // `import urllib.parse as p` then `p.urlparse(...)` is an
+            // Attribute callee, not a Name — handled elsewhere.
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// datetime constructors: `date` / `datetime` / `timedelta`. Shared by the
@@ -446,10 +517,33 @@ impl Call {
         options: PythonOptions,
         symbols: SymbolTableScopes,
     ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+        // Qualified (`warnings.warn(msg)`) or a Name from-imported from a
+        // stdpython module (`from warnings import warn; warn(msg)` —
+        // charset_normalizer's legacy.py, round 55): both resolve against
+        // the signed runtime signature. A Name callee bound by a
+        // from-import carries the module in the symbol.
         let (root, attr) = match self.func.as_ref() {
             ExprType::Attribute(a) => match crate::ast::tree::call::root_name(&a.value) {
                 Some(root) => (root.to_string(), a.attr.clone()),
                 None => return Ok(None),
+            },
+            ExprType::Name(n) => match symbols.get(&n.id) {
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let root = i.module.split('.').next().unwrap_or("").to_string();
+                    if !crate::is_stdpython_module(&root) {
+                        return Ok(None);
+                    }
+                    // The canonical item name: the from-import may ALIAS
+                    // (`from warnings import warn as w`).
+                    let canonical = i
+                        .names
+                        .iter()
+                        .find(|a| a.asname.as_deref() == Some(&n.id))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| n.id.clone());
+                    (root, canonical)
+                }
+                _ => return Ok(None),
             },
             _ => return Ok(None),
         };
@@ -526,7 +620,26 @@ impl Call {
                 Some(expr) => {
                     let rendered =
                         expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    rendered_args.push(quote!(Some(#rendered)));
+                    // The signed runtime signatures take `Option<&str>`
+                    // for the MESSAGE/ACTION params, `Option<i64>` for
+                    // stacklevel/lineno: a string LITERAL renders as
+                    // `Some("...")` (Option<&str>); an owned String
+                    // (`warn(format!(...))` — charset_normalizer's
+                    // legacy.py) needs `.as_str()` to coerce into the
+                    // Option<&str> slot. Numeric params (stacklevel,
+                    // lineno) must NOT get `.as_str()`.
+                    let is_str_param = params
+                        .get(i)
+                        .is_some_and(|p| matches!(*p, "message" | "action" | "filename" | "module"));
+                    let wrapped = if is_str_param
+                        && !matches!(expr, crate::ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_))))
+                    {
+                        quote!(Some((#rendered).as_str()))
+                    } else {
+                        quote!(Some(#rendered))
+                    };
+                    rendered_args.push(wrapped);
                 }
                 None => rendered_args.push(quote!(None)),
             }
@@ -3648,6 +3761,202 @@ impl<'a> CodeGen for Call {
             }
         }
 
+        // urllib.parse functions (round 55): `urlparse(url)`,
+        // `urlsplit(url)`, `urljoin(base, url)`, `urlunparse(parts)`,
+        // `urlencode(query, doseq=...)`, `quote(s, safe=...)`,
+        // `quote_plus/unquote/unquote_plus(s)`, `urldefrag(url)`.
+        // Reachable directly (`from urllib.parse import urlparse`) or via
+        // a re-export chain (requests' compat re-exports them). The
+        // runtime functions take string-like args (PyValue/String/&str
+        // all work through AsStrLike) and return Result — the call
+        // renders with `?` so exceptions propagate like Python.
+        if let ExprType::Name(n) = self.func.as_ref()
+            && let Some(fname) = urllib_parse_fn(&n.id, &symbols, &options)
+        {
+            let mut rendered = Vec::new();
+            for arg in &self.args {
+                rendered.push(arg.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            let mut doseq = quote!(false);
+            let mut safe: Option<TokenStream> = None;
+            for kw in &self.keywords {
+                match (kw.arg.as_deref(), fname) {
+                    (Some("doseq"), "urlencode") => {
+                        doseq = kw.value.clone().to_rust(
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?;
+                    }
+                    (Some("safe"), "quote") | (Some("safe"), "quote_plus") => {
+                        safe = Some(kw.value.clone().to_rust(
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?);
+                    }
+                    (Some(other), _) => {
+                        return Err(format!(
+                            "{}() got an unexpected keyword argument '{}'",
+                            fname, other
+                        )
+                        .into());
+                    }
+                    (None, _) => {
+                        return Err(format!("{}() does not accept **kwargs", fname).into());
+                    }
+                }
+            }
+            let f = crate::safe_ident(fname);
+            let p = quote!(stdpython::urllib::parse::#f);
+            return match fname {
+                // The 6-part sequence: Python accepts a list or tuple of
+                // str-or-None. A literal sequence renders as a boxed
+                // tuple so the runtime can extract the six components;
+                // a dynamic value passes through boxed.
+                "urlunparse" => {
+                    if rendered.len() != 1 || !self.keywords.is_empty() {
+                        return Err(
+                            "urlunparse() takes exactly one sequence argument".to_string().into(),
+                        );
+                    }
+                    let parts = match self.args.first() {
+                        Some(crate::ExprType::List(l)) => l.clone(),
+                        Some(crate::ExprType::Tuple(t)) => t.elts.clone(),
+                        _ => {
+                            // A dynamic sequence: pass the boxed value.
+                            let arg = &rendered[0];
+                            return Ok(quote!(#p(&(PyValue::from(#arg)))?));
+                        }
+                    };
+                    if parts.len() != 6 {
+                        return Err(
+                            "urlunparse() requires a 6-element sequence".to_string().into(),
+                        );
+                    }
+                    let mut boxed = Vec::new();
+                    for part in parts {
+                        if crate::ast::tree::function_def::is_none_expr(&part) {
+                            boxed.push(quote!(stdpython::PyValue::None_));
+                        } else {
+                            let r =
+                                part.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            boxed.push(quote!(PyValue::from(#r)));
+                        }
+                    }
+                    Ok(quote!(#p(&(PyValue::from(vec![#(#boxed),*])))?))
+                }
+                "urlencode" => {
+                    if rendered.is_empty() || rendered.len() > 1 {
+                        return Err(
+                            "urlencode() takes exactly one query argument".to_string().into(),
+                        );
+                    }
+                    let q = &rendered[0];
+                    Ok(quote!(#p(&(#q), #doseq)?))
+                }
+                "quote" => {
+                    if rendered.is_empty() || rendered.len() > 1 {
+                        return Err("quote() takes exactly one string argument".to_string().into());
+                    }
+                    let s = &rendered[0];
+                    match safe {
+                        Some(safe) => Ok(quote!(#p(&(#s), Some(&(#safe)))?)),
+                        None => Ok(quote!(#p(&(#s), None)?)),
+                    }
+                }
+                "quote_plus" => {
+                    if rendered.is_empty() || rendered.len() > 1 || safe.is_some() {
+                        return Err(
+                            "quote_plus() takes exactly one string argument".to_string().into(),
+                        );
+                    }
+                    let s = &rendered[0];
+                    Ok(quote!(#p(&(#s))?))
+                }
+                "urljoin" => {
+                    if rendered.len() != 2 {
+                        return Err("urljoin() takes a base and a url".to_string().into());
+                    }
+                    let (base, url) = (&rendered[0], &rendered[1]);
+                    Ok(quote!(#p(&(#base), &(#url))?))
+                }
+                _ => {
+                    if rendered.len() != 1 {
+                        return Err(format!("{}() takes exactly one string argument", fname)
+                            .to_string()
+                            .into());
+                    }
+                    let s = &rendered[0];
+                    Ok(quote!(#p(&(#s))?))
+                }
+            };
+        }
+
+        // `from json import dumps; dumps(pyvalue, ...)` (charset_normalizer's
+        // models.py — `dumps(self.__dict__, ensure_ascii=True, indent=4)`):
+        // json does not dispatch from import, so the call would fall to the
+        // generic path and mismatch the `&JSONValue` signature. The runtime
+        // converts the boxed value (pyvalue_to_json) — round 55.
+        if let ExprType::Name(n) = self.func.as_ref() {
+            let from_json = match symbols.get(&n.id) {
+                Some(SymbolTableNode::ImportFrom(i)) => i.module == "json",
+                Some(SymbolTableNode::Alias(canonical)) => {
+                    matches!(
+                        symbols.get(canonical),
+                        Some(SymbolTableNode::ImportFrom(i)) if i.module == "json"
+                    )
+                }
+                _ => false,
+            };
+            if from_json && n.id == "dumps" {
+                let mut rendered = Vec::new();
+                for arg in &self.args {
+                    rendered.push(arg.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
+                }
+                let mut indent: Option<TokenStream> = None;
+                for kw in &self.keywords {
+                    match kw.arg.as_deref() {
+                        // ensure_ascii/check_circular/allow_nan/sort_keys:
+                        // rython's encoder is already ASCII-safe; the
+                        // remaining options are accepted and ignored (the
+                        // documented divergence — CPython's exact float
+                        // formatting and key sorting are unmodeled).
+                        Some("indent") => {
+                            indent = Some(kw.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?);
+                        }
+                        Some(_) | None => {}
+                    }
+                }
+                let obj = match rendered.as_slice() {
+                    [obj] => obj.clone(),
+                    _ => {
+                        return Err("json.dumps() takes exactly one object argument"
+                            .to_string()
+                            .into());
+                    }
+                };
+                let indent = match indent {
+                    Some(i) => quote!(Some(#i)),
+                    None => quote!(None),
+                };
+                let p = quote!(stdpython::json::dumps_pyvalue);
+                return Ok(quote!(#p(#obj, #indent)?));
+            }
+        }
+
         // functools.partial over a STATICALLY-KNOWN function: the
         // signature comes from the symbol table, so the call lowers to a
         // move closure binding the leading arguments, with the remaining
@@ -3817,16 +4126,45 @@ impl<'a> CodeGen for Call {
             let dispatches_qualified = |name: &str| {
                 crate::StdModule::from_name(name).is_some_and(|m| m.dispatches_qualified())
             };
-            let target: Option<(String, Option<&'static str>)> = match self.func.as_ref() {
-                ExprType::Name(n) => match symbols.get(&n.id) {
-                    Some(SymbolTableNode::ImportFrom(import))
-                        if crate::StdModule::from_name(&import.module)
-                            .is_some_and(|m| m.dispatches_from_import()) =>
-                    {
-                        Some((n.id.clone(), None))
+            let target: Option<(String, Option<&'static str>, String)> = match self.func.as_ref() {
+                ExprType::Name(n) => {
+                    // An ALIASED import (`from re import compile as
+                    // re_compile` — charset_normalizer's constant.py):
+                    // the symbol table binds the alias to the canonical
+                    // name. The dispatch arms match the ORIGINAL name,
+                    // but the generated call must use the BOUND name
+                    // (only `re_compile` is in scope — the alias
+                    // re-export; rendering `compile` would be E0425).
+                    let resolved: Option<(String, String)> = match symbols.get(&n.id) {
+                        Some(SymbolTableNode::ImportFrom(import)) => {
+                            let canonical = import
+                                .names
+                                .iter()
+                                .find(|a| a.asname.as_deref() == Some(&n.id))
+                                .map(|a| a.name.clone())
+                                .unwrap_or_else(|| n.id.clone());
+                            Some((import.module.clone(), canonical))
+                        }
+                        Some(SymbolTableNode::Alias(canonical)) => {
+                            match symbols.get(canonical) {
+                                Some(SymbolTableNode::ImportFrom(import)) => {
+                                    Some((import.module.clone(), canonical.clone()))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    match resolved {
+                        Some((module, canonical))
+                            if crate::StdModule::from_name(&module)
+                                .is_some_and(|m| m.dispatches_from_import()) =>
+                        {
+                            Some((canonical, None, n.id.clone()))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                },
+                }
                 ExprType::Attribute(attr) => {
                     // The module name may be an ALIAS (`import json as
                     // _json` — urllib3): follow it to the runtime module.
@@ -3852,14 +4190,14 @@ impl<'a> CodeGen for Call {
                             if module.dispatches_qualified()
                                 && !module_name_shadowed(&root, &symbols) =>
                         {
-                            Some((attr.attr.clone(), Some(module.name())))
+                            Some((attr.attr.clone(), Some(module.name()), attr.attr.clone()))
                         }
                         _ => None,
                     }
                 },
                 _ => None,
             };
-            let known = target.as_ref().is_some_and(|(f, _)| {
+            let known = target.as_ref().is_some_and(|(f, _, _)| {
                 matches!(
                     f.as_str(),
                     "reduce"
@@ -3899,7 +4237,7 @@ impl<'a> CodeGen for Call {
                         | "DEFAULT_BUFFER_SIZE"
                 )
             });
-            if let (Some((fname, module_prefix)), true) = (target, known) {
+            if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
                 // wrap/fill accept width=, the re functions accept
                 // flags= (and sub also count=); everything else takes no
                 // keywords.
@@ -4109,7 +4447,14 @@ impl<'a> CodeGen for Call {
                     }
                 }
                 let qual = |name: &str| {
-                    let f = crate::safe_ident(name);
+                    // An aliased from-import (`compile as re_compile`):
+                    // the canonical name is in the known list, but only
+                    // the BOUND name is in scope — render it instead.
+                    let f = if name == fname && render_name != fname {
+                        crate::safe_ident(&render_name)
+                    } else {
+                        crate::safe_ident(name)
+                    };
                     match module_prefix {
                         Some(m) => {
                             let m = format_ident!("{}", m);
@@ -4692,14 +5037,46 @@ impl<'a> CodeGen for Call {
                             n.id.as_str(),
                             "getdefaulttimeout" | "setdefaulttimeout" | "gethostname"
                         ));
+            // `stdpython_class`: the from-imported (or re-exported) item is
+            // a CLASS in the runtime — construction lowers to `X::new(...)`.
+            // Function items (urlparse, quote, re.compile, warnings.warn,
+            // json.dumps, ...) are plain calls: treating them as classes
+            // produced `urlparse::new(...)` (E0433 — a function used as a
+            // module path) at every requests/urllib3/charset_normalizer call
+            // site (round 55). Direct from-imports check the module's class
+            // registry; re-export chains (requests' compat re-exports
+            // urllib.parse's functions) check the terminal item.
             let stdpython_class = !stdpython_fn
                 && match symbols.get(&n.id) {
                     Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
-                        crate::is_stdpython_module(ifm.module.split('.').next().unwrap_or(""))
-                            || stdpython_reexport_chain(&n.id, &symbols, &options)
+                        let root = ifm.module.split('.').next().unwrap_or("");
+                        if crate::is_stdpython_module(root) {
+                            // The imported name may be an ALIAS (`from
+                            // socket import socket as socket_cls`): the
+                            // registry key is the ORIGINAL item name.
+                            let canonical = ifm
+                                .names
+                                .iter()
+                                .find(|a| a.asname.as_deref() == Some(&n.id))
+                                .map(|a| a.name.as_str())
+                                .unwrap_or(&n.id);
+                            crate::ast::tree::import::stdpython_module_class(root, canonical)
+                        } else {
+                            stdpython_reexport_chain(&n.id, &symbols, &options).is_some_and(
+                                |(module, name)| {
+                                    crate::ast::tree::import::stdpython_module_class(
+                                        &module, &name,
+                                    )
+                                },
+                            )
+                        }
                     }
                     Some(crate::SymbolTableNode::Alias(canonical)) => {
-                        stdpython_reexport_chain(canonical, &symbols, &options)
+                        stdpython_reexport_chain(canonical, &symbols, &options).is_some_and(
+                            |(module, name)| {
+                                crate::ast::tree::import::stdpython_module_class(&module, &name)
+                            },
+                        )
                     }
                     _ => false,
                 };
