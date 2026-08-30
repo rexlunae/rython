@@ -1910,6 +1910,7 @@ pub fn convert(
         write_cargo_toml(
             package,
             &[],
+            &std::collections::HashSet::new(),
             out_dir,
             opts,
             has_binary,
@@ -2186,6 +2187,7 @@ pub fn convert(
     write_cargo_toml(
         package,
         &python_deps,
+        &reachable,
         out_dir,
         opts,
         has_binary,
@@ -2490,7 +2492,16 @@ fn convert_driver(
         .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats));
     fs::write(src_dir.join("main.rs"), format_rust(&main))?;
 
-    write_cargo_toml(package, &python_deps, out_dir, opts, true, &manifest, false)?;
+    write_cargo_toml(
+        package,
+        &python_deps,
+        &reachable,
+        out_dir,
+        opts,
+        true,
+        &manifest,
+        false,
+    )?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -3013,19 +3024,25 @@ impl SurfaceFeature {
 /// The surfaces the package's imports ask for. Parses each module once and
 /// tests every root against it, rather than re-parsing per feature.
 ///
-/// Discovery has to span everything the conversion transpiles into the
-/// crate, not just the root package: vendored `[python-modules]` deps are
-/// written as sibling modules, so an `import re` in one of them needs the
-/// surface just as much as one in the entry module.
+/// Discovery spans exactly what the conversion transpiles into the crate,
+/// no more and no less. Vendored `[python-modules]` deps are written as
+/// sibling modules, so an `import re` in one of them needs the surface
+/// just as much as one in the entry module -- but only if the module is
+/// import-reachable, since `convert` skips the rest (a dependency's CLI
+/// helper or test utility). Every module of the root package is a
+/// reachability seed, so only dependency modules can be filtered out.
 fn package_surface_features(
     package: &PyPackage,
     python_deps: &[(String, PyPackage)],
+    reachable: &std::collections::HashSet<Vec<String>>,
 ) -> Vec<SurfaceFeature> {
     let mut needed: Vec<SurfaceFeature> = Vec::new();
-    let modules = package
-        .modules
-        .iter()
-        .chain(python_deps.iter().flat_map(|(_, dep)| dep.modules.iter()));
+    let modules = package.modules.iter().chain(
+        python_deps
+            .iter()
+            .flat_map(|(_, dep)| dep.modules.iter())
+            .filter(|m| reachable.contains(&m.path)),
+    );
     for module in modules {
         let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) else {
             continue;
@@ -3301,6 +3318,7 @@ fn cargo_version(v: &str) -> String {
 fn write_cargo_toml(
     package: &PyPackage,
     python_deps: &[(String, PyPackage)],
+    reachable: &std::collections::HashSet<Vec<String>>,
     out_dir: &Path,
     opts: &ConvertOptions,
     has_binary: bool,
@@ -3381,7 +3399,7 @@ fn write_cargo_toml(
             features.push("async-tokio");
         }
         features.extend(
-            package_surface_features(package, python_deps)
+            package_surface_features(package, python_deps, reachable)
                 .into_iter()
                 .map(SurfaceFeature::cargo_feature),
         );

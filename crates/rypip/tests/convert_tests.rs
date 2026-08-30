@@ -8206,3 +8206,61 @@ fn a_vendored_dependencys_imports_reach_the_surface_feature_list() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "True", "stdout: {}", stdout);
 }
+
+#[test]
+fn an_unreachable_vendored_module_does_not_add_a_surface() {
+    // `convert` transpiles only import-reachable modules, so a vendored
+    // dependency the program never imports contributes no code to the
+    // crate -- and must contribute no stdpython features either. The
+    // feature list has to track what is emitted, in both directions.
+    let scratch = Scratch::new("surface-unreachable");
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/used.py"),
+        "def shout(text: str) -> str:\n    return text.upper()\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/unused.py"),
+        "import re\n\ndef looks_like(text: str) -> bool:\n    return re.search(\"a\", text) is not None\n",
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("quietapp")).unwrap();
+    fs::write(scratch.path().join("quietapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("quietapp/main.py"),
+        concat!(
+            "import used\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(used.shout(\"cat\"))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nused = { path = \"vendor/used.py\" }\n         unused = { path = \"vendor/unused.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+    let dep = manifest
+        .lines()
+        .find(|l| l.starts_with("stdpython = "))
+        .unwrap_or_else(|| panic!("no stdpython dependency in: {}", manifest));
+    assert!(
+        !dep.contains("re-regex"),
+        "an unreachable vendored module's `import re` must not add the surface: {dep}"
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/quietapp"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "CAT", "stdout: {}", stdout);
+}
