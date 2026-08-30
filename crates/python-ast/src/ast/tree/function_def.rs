@@ -3399,6 +3399,21 @@ pub(crate) fn lower_optional_value(
     if is_none_expr(expr) || expr_yields_option(expr, &options, &symbols) {
         return expr.clone().to_rust(ctx, options, symbols);
     }
+    // A NAME whose recorded type is itself an Option (`host =
+    // _normalize_host(...)` where the callee returns `str | None` —
+    // urllib3's parse_url) passes through an Option slot unwrapped: the
+    // value already IS the Option. The runtime Option-slot machinery
+    // tracks None-assigned names and Optional params in optional_names,
+    // but a local assigned from an Option-returning CALL only lands in
+    // name_types (round 47) — wrapping it in Some would nest.
+    if let ExprType::Name(_) = expr
+        && matches!(
+            crate::infer_type(expr, &options, &symbols),
+            crate::TypeInfo::Option(_)
+        )
+    {
+        return expr.clone().to_rust(ctx, options, symbols);
+    }
     let tokens = expr.clone().to_rust(ctx, options, symbols)?;
     // A string LITERAL lowers to `&'static str`; an Option<String> slot
     // owns it (`pick("x")` where the parameter is `str | None`) — the

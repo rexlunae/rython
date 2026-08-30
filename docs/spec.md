@@ -201,7 +201,16 @@ suggesting both fixes.
 A name that is `None` on any assignment path, or annotated
 `Optional[T]`, becomes `Option<T>`: non-`None` stores are wrapped in
 `Some(…)`, and values that already produce an `Option` (`dict.get`, an
-optional-returning call) pass through unwrapped. The same `Some(…)`
+optional-returning call) pass through unwrapped. The `typing.Optional[T]`
+spelling resolves the same way — a `typing.NamedTuple` field annotated
+`typing.Optional[str]` (`Url` — urllib3) is an `Option<String>` field,
+not a boxed PyValue (round 47; the alias-aware resolver previously
+lumped the `typing.Optional` Subscript into the boxed-union tolerance).
+A TUPLE-target store of all-`None` literals (`auth, host, port = None,
+None, None` — urllib3's parse_url) marks each name an Option binding,
+mirroring the single-name rule, so a later Option-returning store passes
+through the name unwrapped instead of nesting `Some(Some(…))` (round
+47). The same `Some(…)`
 wrap applies to a plain value stored into an `Option`-typed FIELD
 (`self._start_connect = time.monotonic()` where the field is
 `float | None` — urllib3): Python's `int | None` slot absorbs a plain

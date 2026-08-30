@@ -7504,6 +7504,79 @@ fn class_mapping_protocol_matches_cpython() {
 }
 
 #[test]
+fn typing_optional_namedtuple_fields_match_cpython() {
+    // Round 47: `typing.NamedTuple("Url", [("scheme",
+    // typing.Optional[str]), ...])` — urllib3's Url — types each field as
+    // `Option<String>`/`Option<i64>` (the alias-aware resolver previously
+    // boxed `typing.Optional[T]` as PyValue), and a tuple-target store of
+    // all-None literals (`host = None` on the else path) keeps the name an
+    // Option binding so a later Option-returning store passes through.
+    // Output verified against CPython 3.11.
+    let scratch = Scratch::new("typopt");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "from typing import NamedTuple, Optional\n",
+            "\n",
+            "class Url(NamedTuple):\n",
+            "    scheme: Optional[str]\n",
+            "    host: Optional[str]\n",
+            "    port: Optional[int]\n",
+            "\n",
+            "def norm(h: Optional[str]) -> Optional[str]:\n",
+            "    return h\n",
+            "\n",
+            "def parse(url: str) -> Url:\n",
+            "    scheme = None\n",
+            "    host = None\n",
+            "    port = None\n",
+            "    if url:\n",
+            "        host = norm(host)\n",
+            "    return Url(scheme, host, port)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(parse(\"x\"))\n",
+            "    print(parse(\"\"))\n",
+            "    u = Url(\"https\", \"example.com\", 80)\n",
+            "    print(u.scheme, u.host, u.port)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // CPython prints `Url(scheme=None, host=None, port=None)`; rython's
+    // NamedTuple instances display as `<Url object>` (the class-instance
+    // display divergence, §12) — the field VALUES are what matter.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "<Url object>",
+            "<Url object>",
+            "https example.com 80",
+        ],
+        "stdout: {}",
+        stdout
+    );
+}
+
+#[test]
 fn dict_returning_self_method_and_string_slots_match_cpython() {
     // Round 46: a local assigned from a DICT-returning self-method call
     // (`ctx = self._merge(None)` where _merge is `-> dict[str, object]`)

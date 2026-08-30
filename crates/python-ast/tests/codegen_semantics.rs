@@ -3447,6 +3447,58 @@ fn membership_uses_py_contains() {
 }
 
 #[test]
+fn typing_optional_namedtuple_fields_are_option_slots() {
+    // Round 47: `typing.NamedTuple("Url", [("scheme",
+    // typing.Optional[str]), ...])` — urllib3's Url — types each field as
+    // `Option<String>`/`Option<i64>`, NOT the boxed PyValue (the
+    // alias-aware resolver previously lumped `typing.Optional[T]` into
+    // the boxed-union tolerance). The synthesized `__init__` stores pass
+    // the Option params through unwrapped.
+    let out = compile(
+        "from typing import NamedTuple\n\
+         class Url(NamedTuple):\n\
+         \x20   scheme: typing.Optional[str]\n\
+         \x20   port: typing.Optional[int]\n",
+        "typopt.py",
+    );
+    assert!(
+        out.contains("pub scheme : Option < String >")
+            || out.contains("pub scheme: Option<String>"),
+        "a typing.Optional[str] NamedTuple field must be Option<String>: {}",
+        out
+    );
+    assert!(
+        out.contains("pub port : Option < i64 >") || out.contains("pub port: Option<i64>"),
+        "a typing.Optional[int] NamedTuple field must be Option<i64>: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_all_none_store_marks_names_optional() {
+    // Round 47: `auth, host, port = None, None, None` (urllib3's
+    // parse_url) marks each name an Option binding — the tuple-target
+    // analysis previously only tracked single-name None stores, so the
+    // names stayed PyObject and a later Option-returning store
+    // double-wrapped when the name was passed to an Option slot. The
+    // tuple-None store is the missing half (round 47).
+    let out = compile(
+        "def take(x: int) -> int | None:\n\
+         \x20   return x if x else None\n\
+         \ndef f(flag: bool) -> None:\n\
+         \x20   a, b, c = None, None, None\n\
+         \x20   if flag:\n\
+         \x20       a = take(1)\n",
+        "tupnone.py",
+    );
+    assert!(
+        out.contains("a = take (1) ?") || out.contains("a = take(1)?"),
+        "the Option-assigned local must pass its later store through: {}",
+        out
+    );
+}
+
+#[test]
 fn local_from_dict_returning_self_method_owns_string_keys() {
     // Round 46: `request_context = self._merge_pool_kwargs(pool_kwargs)`
     // (urllib3's PoolManager) — the local's type comes from the callee's
