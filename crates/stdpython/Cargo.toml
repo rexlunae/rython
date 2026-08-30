@@ -18,8 +18,8 @@ categories = ["development-tools", "no-std"]
 #   default ("std")                          → the full runtime
 # A strictly-core tier (no alloc) is not implemented yet and fails loudly.
 [features]
-default = ["std", "ssl-rustls"]
-std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "dep:regex", "indexmap/std"]
+default = ["std", "ssl-rustls", "re-regex"]
+std = ["alloc", "dep:pyo3", "dep:libc", "dep:getrandom", "indexmap/std"]
 alloc = ["dep:hashbrown", "dep:libm", "dep:md-5", "dep:sha1", "dep:sha2"]
 
 # numpy backends: "numpy" (or none) = always-on sequential engine;
@@ -36,6 +36,14 @@ numpy-vulkan = []
 # dependency; plain async library crates (which never call asyncio) do not
 # need it.
 async-tokio = ["std", "dep:tokio", "tokio/rt-multi-thread", "tokio/time", "tokio/macros"]
+
+# The re module (regular expressions) wraps the regex crate — the
+# platform-surface convention again: the engine is a third of the std
+# tier's build cost, and a converted package that never imports `re`
+# should not pay for it. rypip enables it on the generated crate's
+# stdpython dependency when the converted package imports re; it stays
+# in `default` so stdpython's own build and tests are unchanged.
+re-regex = ["std", "dep:regex"]
 
 # The urllib.request module (HTTP/HTTPS client) wraps the ureq crate —
 # the platform-surface convention: one feature per surface, named

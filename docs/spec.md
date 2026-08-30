@@ -911,11 +911,24 @@ feature wraps the ureq crate (with rustls, so `https://` works) and
 `features = ["http-ureq"]` on the generated stdpython dependency.
 
 The second is `ssl`: stdpython's `ssl-rustls` feature wraps the
-rustls crate (client-side TLS). Unlike the other surfaces it is ON
-by default — TLS is load-bearing for the top converted packages
-(urllib3, requests) — so generated crates get it through the default
-features; `--no-default-features` (plus the features kept) turns it
-off, and the alloc/no_std tiers never see it.
+rustls crate (client-side TLS). It stays in stdpython's own `default`
+— TLS is load-bearing for the top converted packages (urllib3,
+requests) — but generated crates do not ride those defaults (below),
+so `import ssl` is what turns it on. The alloc/no_std tiers never
+see it.
+
+The third is `re`: stdpython's `re-regex` feature wraps the regex
+crate, likewise in `default` and likewise requested by `import re`.
+
+Because the surfaces are opt-in, the generated manifest names the
+tier and the surfaces explicitly — `default-features = false,
+features = ["std", …]` — rather than inheriting stdpython's defaults.
+A converted package that imports neither `ssl` nor `re` then compiles
+neither rustls nor the regex engine: 54 dependency crates drop to 35,
+and the dependency build's CPU cost falls by about 40%. Getting a
+detection predicate too narrow is loud in the prime directive's
+sense — the generated crate names a module that was not compiled in,
+and the build fails — never a silent loss of the surface.
 
 Known stdlib divergences from CPython that are verified but not yet
 fixed are tracked in issue #82; they are defects, not spec.

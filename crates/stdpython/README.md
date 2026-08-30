@@ -143,6 +143,14 @@ opt-in cargo **feature** instead of growing a mandatory dependency.
   crate (with rustls, so `https://` works) behind the **`http-ureq`**
   feature — `import urllib.request` in a converted package puts
   `features = ["http-ureq"]` on the generated stdpython dependency.
+- TLS and regular expressions follow: `ssl` sits behind **`ssl-rustls`**
+  and `re` behind **`re-regex`**. Both stay in this crate's own
+  `default` (so building or testing stdpython itself is unchanged), but
+  generated crates request the tier and its surfaces explicitly —
+  `default-features = false, features = ["std", …]` — so a converted
+  package that imports neither compiles neither rustls nor the regex
+  engine. That is 54 dependency crates down to 35, and roughly 40% less
+  CPU in the dependency build.
 
 ## Usage
 

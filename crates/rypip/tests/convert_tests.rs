@@ -4768,7 +4768,11 @@ fn async_binary_builds_and_runs_on_the_tokio_runtime() {
     assert!(toml.contains("tokio"), "Cargo.toml: {}", toml);
     assert!(toml.contains("async-tokio"), "Cargo.toml: {}", toml);
     assert!(toml.contains("default = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
-    assert!(toml.contains("features = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
+    assert!(
+        toml.contains("features = [\"std\", \"async-tokio\"]"),
+        "Cargo.toml: {}",
+        toml
+    );
     // The entry module's code is feature-gated.
     let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
     assert!(
@@ -8084,4 +8088,179 @@ fn percent_formatting_matches_cpython_end_to_end() {
         "stdout: {}",
         stdout
     );
+}
+
+#[test]
+fn the_stdpython_dependency_carries_only_the_surfaces_the_package_imports() {
+    // Platform surfaces are per-feature (the convention stdpython's own
+    // Cargo.toml states), and the generated manifest opts into exactly the
+    // ones the package's imports ask for rather than riding stdpython's
+    // defaults: a package that never imports `ssl` or `re` must not
+    // compile rustls or the regex engine. Getting a predicate too narrow
+    // is loud, never silent — the generated crate names a module that was
+    // not compiled in — and the re/urllib end-to-end tests above are the
+    // proof that the surfaces are sufficient when they ARE requested.
+    let cases: [(&str, &str, &[&str], &[&str]); 4] = [
+        (
+            "plain",
+            "def main() -> None:\n    print(\"hi\")\n",
+            &[],
+            &["ssl-rustls", "re-regex", "http-ureq"],
+        ),
+        (
+            "re",
+            "import re\n\ndef main() -> None:\n    print(re.search(\"a\", \"a\") is not None)\n",
+            &["re-regex"],
+            &["ssl-rustls", "http-ureq"],
+        ),
+        (
+            "ssl",
+            "import ssl\n\ndef main() -> None:\n    print(ssl.OPENSSL_VERSION)\n",
+            &["ssl-rustls"],
+            &["re-regex", "http-ureq"],
+        ),
+        // Discovery has to reach every statement form conversion emits,
+        // not just module level: an import nested in an async function or
+        // a class body counts exactly like a top-level one.
+        (
+            "async-nested",
+            "async def probe() -> None:\n    import re\n    print(re.search(\"a\", \"a\") is not None)\n",
+            &["re-regex"],
+            &["ssl-rustls", "http-ureq"],
+        ),
+    ];
+    for (tag, source, present, absent) in cases {
+        let scratch = Scratch::new(&format!("surface-{tag}"));
+        let file = scratch.path().join("probe.py");
+        fs::write(&file, source).unwrap();
+        let out = scratch.path().join("crate");
+        let pkg = rypip::discover(&file).expect("discover");
+        let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+        let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+        let dep = manifest
+            .lines()
+            .find(|l| l.starts_with("stdpython = "))
+            .unwrap_or_else(|| panic!("no stdpython dependency in: {}", manifest));
+        assert!(
+            dep.contains("default-features = false") && dep.contains("\"std\""),
+            "{tag}: the std tier must be requested explicitly: {dep}"
+        );
+        for feature in present {
+            assert!(dep.contains(feature), "{tag}: expected {feature} in: {dep}");
+        }
+        for feature in absent {
+            assert!(!dep.contains(feature), "{tag}: unexpected {feature} in: {dep}");
+        }
+    }
+}
+
+#[test]
+fn a_vendored_dependencys_imports_reach_the_surface_feature_list() {
+    // `[python-modules]` deps are transpiled into the same crate as sibling
+    // modules, so their imports drive the generated manifest's feature list
+    // exactly like the entry module's. Without this the crate would name
+    // `stdpython::re` with the regex engine gated out.
+    let scratch = Scratch::new("surface-vendored");
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/matcher.py"),
+        "import re\n\ndef looks_like(text: str) -> bool:\n    return re.search(\"a\", text) is not None\n",
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("matchapp")).unwrap();
+    fs::write(scratch.path().join("matchapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("matchapp/main.py"),
+        concat!(
+            "import matcher\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(matcher.looks_like(\"cat\"))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nmatcher = { path = \"vendor/matcher.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+    let dep = manifest
+        .lines()
+        .find(|l| l.starts_with("stdpython = "))
+        .unwrap_or_else(|| panic!("no stdpython dependency in: {}", manifest));
+    assert!(
+        dep.contains("re-regex"),
+        "a vendored dependency's `import re` must enable the surface: {dep}"
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/matchapp"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "True", "stdout: {}", stdout);
+}
+
+#[test]
+fn an_unreachable_vendored_module_does_not_add_a_surface() {
+    // `convert` transpiles only import-reachable modules, so a vendored
+    // dependency the program never imports contributes no code to the
+    // crate -- and must contribute no stdpython features either. The
+    // feature list has to track what is emitted, in both directions.
+    let scratch = Scratch::new("surface-unreachable");
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/used.py"),
+        "def shout(text: str) -> str:\n    return text.upper()\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/unused.py"),
+        "import re\n\ndef looks_like(text: str) -> bool:\n    return re.search(\"a\", text) is not None\n",
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("quietapp")).unwrap();
+    fs::write(scratch.path().join("quietapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("quietapp/main.py"),
+        concat!(
+            "import used\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(used.shout(\"cat\"))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nused = { path = \"vendor/used.py\" }\n         unused = { path = \"vendor/unused.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+    let dep = manifest
+        .lines()
+        .find(|l| l.starts_with("stdpython = "))
+        .unwrap_or_else(|| panic!("no stdpython dependency in: {}", manifest));
+    assert!(
+        !dep.contains("re-regex"),
+        "an unreachable vendored module's `import re` must not add the surface: {dep}"
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/quietapp"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "CAT", "stdout: {}", stdout);
 }

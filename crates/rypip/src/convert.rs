@@ -1905,7 +1905,18 @@ pub fn convert(
         }
         let has_binary = false;
         let warnings = Vec::new();
-        write_cargo_toml(package, out_dir, opts, has_binary, &manifest, kernel.uses_shim)?;
+        // Kernel modules take the alloc-tier branch below, which carries no
+        // surface features, so there are no vendored deps to consider.
+        write_cargo_toml(
+            package,
+            &[],
+            &std::collections::HashSet::new(),
+            out_dir,
+            opts,
+            has_binary,
+            &manifest,
+            kernel.uses_shim,
+        )?;
         if !opts.rust_for_linux {
             // rust-for-linux modules are registered in the kernel tree's
             // Kbuild Makefile (rust-obj-m += <name>.o), not a standalone one.
@@ -2175,6 +2186,8 @@ pub fn convert(
 
     write_cargo_toml(
         package,
+        &python_deps,
+        &reachable,
         out_dir,
         opts,
         has_binary,
@@ -2479,7 +2492,16 @@ fn convert_driver(
         .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats));
     fs::write(src_dir.join("main.rs"), format_rust(&main))?;
 
-    write_cargo_toml(package, out_dir, opts, true, &manifest, false)?;
+    write_cargo_toml(
+        package,
+        &python_deps,
+        &reachable,
+        out_dir,
+        opts,
+        true,
+        &manifest,
+        false,
+    )?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -2950,15 +2972,94 @@ fn package_async_flags(package: &PyPackage) -> (bool, bool) {
     (uses_async, imports_asyncio)
 }
 
-/// Whether any module of the package imports urllib (urllib.request):
-/// drives stdpython's ureq-backed `http-ureq` feature on the generated
-/// crate's dependency, the same way asyncio drives `async-tokio`.
-fn package_imports_urllib(package: &PyPackage) -> bool {
-    package.modules.iter().any(|module| {
-        parse_enhanced(&module.source, parse_filename(module))
-            .map(|ast| python_ast::module_imports_root(&ast.raw.body, "urllib"))
-            .unwrap_or(false)
-    })
+/// A stdpython platform surface: a heavyweight dependency that only some
+/// converted packages need, gated behind its own Cargo feature (the
+/// convention `crates/stdpython/Cargo.toml` states — one feature per
+/// surface, so the default build stays dependency-light).
+///
+/// A package opts into a surface by importing the Python module it backs,
+/// so the mapping is import-root -> feature and lives here alone: the
+/// feature names appear in exactly one place rather than scattered across
+/// the emission sites. Guessing too narrowly is safe in the prime
+/// directive's sense — the generated crate then names a module that isn't
+/// compiled in and fails loudly, it never silently loses the surface.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum SurfaceFeature {
+    /// `re` — the regex crate (a third of the std tier's build cost).
+    ReRegex,
+    /// `ssl` — TLS over rustls. Not implied by `http-ureq`: ureq carries
+    /// its own rustls, and stdpython's `ssl` module stands alone.
+    SslRustls,
+    /// `urllib.request` — the ureq-backed HTTP client.
+    HttpUreq,
+}
+
+impl SurfaceFeature {
+    /// Every surface, in the order features are emitted.
+    const ALL: [SurfaceFeature; 3] = [
+        SurfaceFeature::ReRegex,
+        SurfaceFeature::SslRustls,
+        SurfaceFeature::HttpUreq,
+    ];
+
+    /// The stdpython Cargo feature this surface turns on.
+    fn cargo_feature(self) -> &'static str {
+        match self {
+            SurfaceFeature::ReRegex => "re-regex",
+            SurfaceFeature::SslRustls => "ssl-rustls",
+            SurfaceFeature::HttpUreq => "http-ureq",
+        }
+    }
+
+    /// The Python import root that pulls the surface in.
+    fn import_root(self) -> &'static str {
+        match self {
+            SurfaceFeature::ReRegex => "re",
+            SurfaceFeature::SslRustls => "ssl",
+            SurfaceFeature::HttpUreq => "urllib",
+        }
+    }
+}
+
+/// The surfaces the package's imports ask for. Parses each module once and
+/// tests every root against it, rather than re-parsing per feature.
+///
+/// Discovery spans exactly what the conversion transpiles into the crate,
+/// no more and no less. Vendored `[python-modules]` deps are written as
+/// sibling modules, so an `import re` in one of them needs the surface
+/// just as much as one in the entry module -- but only if the module is
+/// import-reachable, since `convert` skips the rest (a dependency's CLI
+/// helper or test utility). Every module of the root package is a
+/// reachability seed, so only dependency modules can be filtered out.
+fn package_surface_features(
+    package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
+    reachable: &std::collections::HashSet<Vec<String>>,
+) -> Vec<SurfaceFeature> {
+    let mut needed: Vec<SurfaceFeature> = Vec::new();
+    let modules = package.modules.iter().chain(
+        python_deps
+            .iter()
+            .flat_map(|(_, dep)| dep.modules.iter())
+            .filter(|m| reachable.contains(&m.path)),
+    );
+    for module in modules {
+        let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) else {
+            continue;
+        };
+        for surface in SurfaceFeature::ALL {
+            if !needed.contains(&surface)
+                && python_ast::module_imports_root(&ast.raw.body, surface.import_root())
+            {
+                needed.push(surface);
+            }
+        }
+        if needed.len() == SurfaceFeature::ALL.len() {
+            break;
+        }
+    }
+    needed.sort();
+    needed
 }
 
 /// Conversion-level PythonOptions shared by every module of one conversion
@@ -3216,6 +3317,8 @@ fn cargo_version(v: &str) -> String {
 
 fn write_cargo_toml(
     package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
+    reachable: &std::collections::HashSet<Vec<String>>,
     out_dir: &Path,
     opts: &ConvertOptions,
     has_binary: bool,
@@ -3280,30 +3383,34 @@ fn write_cargo_toml(
             ),
         }
     } else {
-        // The std tier of stdpython, with the feature-gated surfaces the
-        // package actually uses: the tokio-backed asyncio module (async
-        // code or `import asyncio`) and the ureq-backed urllib.request
-        // HTTP client (`import urllib.request` — the platform-surface
-        // feature convention).
-        let mut features: Vec<&str> = Vec::new();
+        // The std tier of stdpython plus exactly the feature-gated
+        // surfaces the package actually uses: the tokio-backed asyncio
+        // module (async code or `import asyncio`) and the surfaces
+        // `package_surface_features` reads off the imports.
+        //
+        // The list is emitted with `default-features = false` rather than
+        // riding stdpython's defaults, so a package that never imports
+        // `ssl` or `re` does not compile rustls or the regex engine —
+        // together about two thirds of the std tier's dependency build.
+        // stdpython's own `default` still carries them, so nothing else
+        // that depends on it is affected.
+        let mut features: Vec<&str> = vec!["std"];
         if needs_async_stdpython {
             features.push("async-tokio");
         }
-        if package_imports_urllib(package) {
-            features.push("http-ureq");
-        }
-        let feature_list = if features.is_empty() {
-            String::new()
-        } else {
-            format!(
-                ", features = [{}]",
-                features
-                    .iter()
-                    .map(|f| format!("\"{}\"", f))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+        features.extend(
+            package_surface_features(package, python_deps, reachable)
+                .into_iter()
+                .map(SurfaceFeature::cargo_feature),
+        );
+        let feature_list = format!(
+            ", default-features = false, features = [{}]",
+            features
+                .iter()
+                .map(|f| format!("\"{}\"", f))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         match (&stdpython_source, opts.no_std) {
             (StdpythonSource::Path(path), true) => format!(
                 "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
@@ -3319,11 +3426,7 @@ fn write_cargo_toml(
                 version,
             ),
             (StdpythonSource::Registry(version), false) => {
-                if feature_list.is_empty() {
-                    format!("stdpython = \"{}\"", version)
-                } else {
-                    format!("stdpython = {{ version = \"{}\"{} }}", version, feature_list)
-                }
+                format!("stdpython = {{ version = \"{}\"{} }}", version, feature_list)
             }
         }
     };
