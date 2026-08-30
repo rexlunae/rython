@@ -5840,6 +5840,22 @@ impl<'a> CodeGen for Call {
                     // list.append(x) pushes one element; Vec::append (inherent)
                     // concatenates another Vec — silently different.
                     ("append", [value]) => {
+                        // A str literal appended to a Vec<String> local
+                        // (`lines.append("\r\n")` — urllib3's
+                        // render_headers) is a &'static str; the Vec holds
+                        // owned Strings, so the literal owns at the push
+                        // site (mirroring the String-name store rule).
+                        if let crate::TypeInfo::Vec(inner) =
+                            crate::infer_type(&attr.value, &options, &symbols)
+                            && matches!(*inner, crate::TypeInfo::String)
+                            && matches!(
+                                self.args.first(),
+                                Some(ExprType::Constant(c))
+                                    if matches!(&c.0, Some(litrs::Literal::String(_)))
+                            )
+                        {
+                            return Ok(quote!((#receiver).push((#value).to_string())));
+                        }
                         return Ok(quote!((#receiver).push(#value)));
                     }
                     // list.extend(x) with a PyValue/heterogeneous argument
@@ -6384,6 +6400,22 @@ impl<'a> CodeGen for Call {
                     // IndexError a bounded deque raises at its maxlen
                     // (issue #82).
                     ("insert", [idx, value]) => {
+                        // A str literal inserted into a Vec<String> local
+                        // (`output.insert(0, "")` — urllib3's
+                        // _remove_path_dot_segments) is a &'static str; the
+                        // Vec holds owned Strings, so the literal owns at the
+                        // insert site.
+                        if let crate::TypeInfo::Vec(inner) =
+                            crate::infer_type(&attr.value, &options, &symbols)
+                            && matches!(*inner, crate::TypeInfo::String)
+                            && matches!(
+                                self.args.get(1),
+                                Some(ExprType::Constant(c))
+                                    if matches!(&c.0, Some(litrs::Literal::String(_)))
+                            )
+                        {
+                            return Ok(quote!((#receiver).py_insert(#idx, (#value).to_string())?));
+                        }
                         return Ok(quote!((#receiver).py_insert(#idx, #value)?));
                     }
                     // partition/rpartition raise ValueError on an empty

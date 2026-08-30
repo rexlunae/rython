@@ -7504,6 +7504,90 @@ fn class_mapping_protocol_matches_cpython() {
 }
 
 #[test]
+fn dict_returning_self_method_and_string_slots_match_cpython() {
+    // Round 46: a local assigned from a DICT-returning self-method call
+    // (`ctx = self._merge(None)` where _merge is `-> dict[str, object]`)
+    // types from the callee's return annotation, so the subscript stores
+    // own their string keys and absorb Option/None values into the boxed
+    // dict (`ctx["scheme"] = scheme or "http"`, `ctx["port"] = None`).
+    // A str literal stored into a String-typed NAME (`method = "GET"`),
+    // appended/inserted into a Vec<String>, or destructured into a
+    // String-typed tuple slot all own themselves. Output verified against
+    // CPython 3.11.
+    let scratch = Scratch::new("selfdict");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "class P:\n",
+            "    def _merge(self, override: dict[str, object] | None) -> dict[str, object]:\n",
+            "        return {}\n",
+            "\n",
+            "    def go(self, scheme: str | None) -> None:\n",
+            "        ctx = self._merge(None)\n",
+            "        ctx[\"scheme\"] = scheme or \"http\"\n",
+            "        ctx[\"port\"] = None\n",
+            "        print(ctx[\"scheme\"], ctx[\"port\"])\n",
+            "\n",
+            "def redirect(method: str, flag: bool) -> str:\n",
+            "    method = method.upper()\n",
+            "    if flag:\n",
+            "        method = \"GET\"\n",
+            "    return method\n",
+            "\n",
+            "def vecs(seed_a: str, seed_b: str) -> tuple[list[str], list[str]]:\n",
+            "    lines = []\n",
+            "    lines.append(seed_a)\n",
+            "    lines.append(\"\\r\\n\")\n",
+            "    out = []\n",
+            "    out.insert(0, \"\")\n",
+            "    out.append(seed_b)\n",
+            "    return lines, out\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    p = P()\n",
+            "    p.go(None)\n",
+            "    p.go(\"https\")\n",
+            "    print(redirect(\"get\", True))\n",
+            "    print(redirect(\"post\", False))\n",
+            "    print(vecs(\"ab\", \"cd\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "http None",
+            "https None",
+            "GET",
+            "POST",
+            "(['ab', '\\r\\n'], ['', 'cd'])",
+        ],
+        "stdout: {}",
+        stdout
+    );
+}
+
+#[test]
 fn option_receiver_access_matches_cpython() {
     // Issue #137's Option-aware access: a method call and a field read
     // THROUGH an Option-typed field (`self.timeout.connect_timeout()`
