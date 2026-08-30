@@ -5954,6 +5954,50 @@ fn typing_any_dict_return_types_like_python() {
 }
 
 #[test]
+fn option_param_local_stores_match_python() {
+    // Round 45: a local assigned from an OPTION-typed parameter
+    // (`release_this_conn = release_conn` where the param is `bool |
+    // None` — urllib3's urlopen) is itself an Option binding: a later
+    // plain store (`= False`) Some-wraps, so the binding stays
+    // Option<bool> and the generated crate typechecks. Transcript pinned
+    // against python3.
+    let scratch = Scratch::new("optlocal");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def f(release_conn: bool | None = None) -> bool:\n",
+            "    release_this_conn = release_conn\n",
+            "    if release_this_conn is None:\n",
+            "        release_this_conn = False\n",
+            "    return not (release_this_conn is None)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(f(None))\n",
+            "    print(f(True))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["True", "True"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn del_statement_matches_python_transcript() {
     // Issue #112: `del xs[i]` (list, incl. negative index) and `del d["k"]`
     // (string-keyed dict) lower through py_pop and diff against a pinned

@@ -1463,6 +1463,27 @@ impl FunctionDef {
                         known.insert(param.arg.clone(), format!("threading.{}", t.name()));
                     }
                 }
+                // A `T | None` param annotation (`release_conn: bool |
+                // None` — urllib3): record the dotted form so infer_type
+                // resolves the name to an Option (a local assigned from
+                // it is itself an Option binding — round 45).
+                if let Some(ExprType::BinOp(op)) = param.annotation.as_deref()
+                    && matches!(op.op, crate::BinOps::BitOr)
+                {
+                    // `bool | None` — one side is a Name, the other is the
+                    // None literal (a Constant node). Record the dotted
+                    // form so infer_type resolves the name to an Option.
+                    let name_side: Option<&ExprType> = if crate::is_none_expr(&op.right) {
+                        Some(op.left.as_ref())
+                    } else if crate::is_none_expr(&op.left) {
+                        Some(op.right.as_ref())
+                    } else {
+                        None
+                    };
+                    if let Some(ExprType::Name(n)) = name_side {
+                        known.insert(param.arg.clone(), format!("{} | None", n.id));
+                    }
+                }
                 // A dotted threading annotation (`lock: threading.Lock`):
                 // same recording as above.
                 if let Some(ExprType::Attribute(ann)) = param.annotation.as_deref()

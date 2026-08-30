@@ -3404,6 +3404,36 @@ fn typing_any_annotation_maps_to_boxed_pyvalue() {
 }
 
 #[test]
+fn local_assigned_from_option_param_some_wraps_stores() {
+    // Round 45: a local assigned from an OPTION-typed parameter
+    // (`release_this_conn = release_conn` where the param is `bool |
+    // None` — urllib3's urlopen) is itself an Option binding: later
+    // plain stores (`= False`) wrap in Some, so the binding stays
+    // Option<bool> and the generated crate typechecks. The param's
+    // `T | None` annotation resolves through local_types (py_type now
+    // parses the union) and infer_type (the Assign Name-value arm now
+    // consults it).
+    let out = compile(
+        "def f(release_conn: bool | None = None) -> bool | None:\n\
+         \x20   release_this_conn = release_conn\n\
+         \x20   release_this_conn = False\n\
+         \x20   return release_this_conn\n",
+        "optlocal.py",
+    );
+    assert!(
+        out.contains("release_this_conn = Some (false)")
+            || out.contains("release_this_conn = Some(false)"),
+        "a plain store into an Option-assigned local must Some-wrap: {}",
+        out
+    );
+    assert!(
+        out.contains("release_this_conn = release_conn"),
+        "the Option param value must pass through: {}",
+        out
+    );
+}
+
+#[test]
 fn membership_uses_py_contains() {
     let out = compile("found = x in items", "in.py");
     assert!(out.contains("py_contains"), "generated: {}", out);

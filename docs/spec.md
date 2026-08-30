@@ -196,7 +196,11 @@ optional-returning call) pass through unwrapped. The same `Some(…)`
 wrap applies to a plain value stored into an `Option`-typed FIELD
 (`self._start_connect = time.monotonic()` where the field is
 `float | None` — urllib3): Python's `int | None` slot absorbs a plain
-`int`. Places where CPython
+`int`. A LOCAL assigned from an `Option`-typed parameter
+(`release_this_conn = release_conn` where the param is `bool | None` —
+urllib3's urlopen) is likewise an Option binding: its later plain
+stores wrap in `Some(…)` (round 45; the `T | None` parameter annotation
+resolves through the local-type map). Places where CPython
 would put `None` *inside* a typed container that Rython cannot represent
 (a non-participating regex group in `re.split`, `groupdict` of an
 unmatched group) fail loudly instead of inventing a value.
