@@ -3617,6 +3617,67 @@ fn tuple_destructure_string_literal_owns_into_string_slot() {
 }
 
 #[test]
+fn one_type_authority_annotation_rendering_pins() {
+    // Round 49 (issue #137's systemic review of rounds 38–47): the three
+    // annotation resolvers collapsed into one TypeInfo authority, with the
+    // generated structs as the drift arbiter. Pins the fixed answers:
+    // `set[T]`/`frozenset[T]` are HashSet (set literals generate HashSet —
+    // urllib3's PoolKey fields are Option<HashSet<(String, String)>>),
+    // `socket.socket`/`threading.Event` are runtime handles (wait.py /
+    // ssltransport.py compile that way), `type[X]` is the opaque
+    // Option<()>, and the typing-module spellings map like the bare
+    // containers.
+    let out = compile(
+        concat!(
+            "from typing import Tuple, Optional\n",
+            "class PoolKey:\n",
+            "    def __init__(self, key_headers: frozenset[tuple[str, str]] | None,\n",
+            "                 ready: threading.Event, sock: socket.socket,\n",
+            "                 tp: type[BaseException] | None, pair: Tuple[int, str],\n",
+            "                 maybe: Optional[str]) -> None:\n",
+            "        self.key_headers = key_headers\n",
+            "        self.ready = ready\n",
+            "        self.sock = sock\n",
+            "        self.tp = tp\n",
+            "        self.pair = pair\n",
+            "        self.maybe = maybe\n",
+        ),
+        "typeauth.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Option<std::collections::HashSet<(String,String)>>"),
+        "frozenset[tuple[str, str]] | None must be Option<HashSet<...>> (PoolKey-verified): {}",
+        out
+    );
+    assert!(
+        flat.contains("threading::Event"),
+        "threading.Event must render the runtime handle: {}",
+        out
+    );
+    assert!(
+        flat.contains("socket::Socket"),
+        "socket.socket must render socket::Socket: {}",
+        out
+    );
+    assert!(
+        flat.contains("Option<Option<()>>"),
+        "type[BaseException] | None must be Option<Option<()>> (the class marker): {}",
+        out
+    );
+    assert!(
+        flat.contains("(i64,String)"),
+        "Tuple[int, str] must map like the bare tuple: {}",
+        out
+    );
+    assert!(
+        flat.contains("Option<String>"),
+        "Optional[str] must map like the bare Optional: {}",
+        out
+    );
+}
+
+#[test]
 fn multiple_lossy_conversions_fold_into_one_attribute() {
     // Rust allows only one #[deprecated] per item, so a function with both a
     // dropped default and an ignored return annotation must fold both notes

@@ -48,6 +48,12 @@ pub enum TypeInfo {
     Bytes,
     /// `Vec<T>`
     Vec(Box<TypeInfo>),
+    /// `std::collections::HashSet<T>` — `set[T]` / `frozenset[T]`
+    /// annotations: set literals lower to HashSet, so an annotated set is
+    /// that type, not a Vec (the two resolvers disagreed here; the
+    /// generated structs are the arbiter — urllib3's PoolKey fields are
+    /// `Option<HashSet<(String, String)>>`).
+    HashSet(Box<TypeInfo>),
     /// `PyDict<K, V>`
     Dict(Box<TypeInfo>, Box<TypeInfo>),
     /// a Rust tuple
@@ -77,6 +83,16 @@ pub enum TypeInfo {
     Class(String),
     /// a borrow (`&[T]`, `&str`) from iteration or indexing
     Borrowed(Box<TypeInfo>),
+    /// `threading::<Name>` — a threading-module runtime handle annotation
+    /// (`ready: threading.Event`, `lock: threading.Lock`): a real shared
+    /// handle in the runtime, not a boxed PyValue.
+    Threading(crate::ThreadingType),
+    /// `socket::Socket` — the `socket.socket` annotation.
+    Socket,
+    /// `type[X]` / `Type[X]` — a CLASS value. rython cannot hold classes
+    /// as values (the callables-as-data divergence): the tolerated opaque
+    /// type is `Option<()>`.
+    ClassValue,
     PyObject,
 }
 
@@ -105,12 +121,22 @@ impl TypeInfo {
                 let t = inner.to_rust_type();
                 quote!(Vec<#t>)
             }
+            TypeInfo::HashSet(inner) => {
+                let t = inner.to_rust_type();
+                quote!(std::collections::HashSet<#t>)
+            }
             TypeInfo::Dict(k, v) => {
                 let k = k.to_rust_type();
                 let v = v.to_rust_type();
                 quote!(PyDict<#k, #v>)
             }
             TypeInfo::Tuple(ts) => {
+                // A Rust 1-tuple needs the trailing comma (`(i64,)`); the
+                // naive repetition renders `(i64)`, which is just i64.
+                if ts.len() == 1 {
+                    let only = ts[0].to_rust_type();
+                    return quote!((#only,));
+                }
                 let ts = ts.iter().map(|t| t.to_rust_type());
                 quote!((#(#ts),*))
             }
@@ -133,6 +159,9 @@ impl TypeInfo {
                 let t = inner.to_rust_type();
                 quote!(&#t)
             }
+            TypeInfo::Threading(t) => t.rust_path(),
+            TypeInfo::Socket => quote!(socket::Socket),
+            TypeInfo::ClassValue => quote!(Option<()>),
             TypeInfo::PyObject => quote!(_),
         }
     }
@@ -146,6 +175,7 @@ impl TypeInfo {
             TypeInfo::StrRef | TypeInfo::String => "str".into(),
             TypeInfo::Bytes => "bytes".into(),
             TypeInfo::Vec(_) => "list".into(),
+            TypeInfo::HashSet(_) => "set".into(),
             TypeInfo::Dict(_, _) => "dict".into(),
             TypeInfo::Tuple(_) => "tuple".into(),
             TypeInfo::Option(_) => "Optional".into(),
@@ -156,6 +186,9 @@ impl TypeInfo {
             TypeInfo::PyValueMember(_) => "any member".into(),
             TypeInfo::Class(name) => name.clone(),
             TypeInfo::Borrowed(_) => "borrowed".into(),
+            TypeInfo::Threading(t) => t.name().into(),
+            TypeInfo::Socket => "socket".into(),
+            TypeInfo::ClassValue => "type".into(),
             TypeInfo::PyObject => "unknown".into(),
         }
     }
@@ -989,7 +1022,11 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             "float" => Some(TypeInfo::Float),
             "bool" => Some(TypeInfo::Bool),
             "str" => Some(TypeInfo::String),
-            "bytes" => Some(TypeInfo::Bytes),
+            // `bytearray` is a bytes-like type: same Vec<u8> lowering as
+            // `bytes` (the tokens resolver always mapped it; the core
+            // drifted — a `b: bytearray` parameter rendered a bare
+            // `bytearray` ident that rustc rejected).
+            "bytes" | "bytearray" => Some(TypeInfo::Bytes),
             // ssl.TLSVersion is an IntEnum: plain ints in the runtime.
             "TLSVersion" => Some(TypeInfo::Int),
             // `Any` (typing.Any) and `object`: a value of unknown type —
@@ -1021,10 +1058,14 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                     }
                 }
                 "set" | "Set" | "frozenset" => {
-                    // A `set[T]` annotation in the syntax-only pass: the
-                    // element resolves in the symbols-aware pass.
+                    // `set[T]` / `frozenset[T]` — set literals lower to
+                    // HashSet, so the annotated type is HashSet<T> (the
+                    // tokens resolver always said so; the syntax-only pass
+                    // drifted to Vec and the generated structs are the
+                    // arbiter — urllib3's PoolKey fields compile as
+                    // `Option<HashSet<(String, String)>>`).
                     if let crate::SubscriptKind::Index(elt) = &sub.kind {
-                        Some(TypeInfo::Vec(Box::new(annotation_type_info(elt)?)))
+                        Some(TypeInfo::HashSet(Box::new(annotation_type_info(elt)?)))
                     } else {
                         None
                     }
@@ -1083,6 +1124,10 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                     }
                 }
                 "Literal" => Some(TypeInfo::PyValue),
+                // `type[X]` / `Type[X]` — a CLASS value: rython cannot
+                // hold classes as values (the callables-as-data
+                // divergence); the tolerated opaque type is Option<()>.
+                "type" | "Type" => Some(TypeInfo::ClassValue),
                 "dict" | "Dict" => {
                     if let crate::SubscriptKind::Index(kv) = &sub.kind
                         && let ExprType::Tuple(t) = kv.as_ref()
@@ -1114,8 +1159,72 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                     None
                 }
             }
+            // `typing.List[...]` / `typing.Dict[...]` / `typing.Set[...]` /
+            // `typing.Tuple[...]` / `typing.Optional[...]` /
+            // `typing.Literal[...]` — the typing-module spellings of the
+            // bare generics (urllib3's `_TYPE_VERSION_INFO =
+            // typing.Tuple[int, int, int, str, int]`, NamedTuple call-form
+            // fields `typing.Optional[str]`). One definition, so the
+            // tokens resolver and the TypeInfo resolver cannot drift.
+            ExprType::Attribute(a)
+                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                    && matches!(
+                        a.attr.as_str(),
+                        "List" | "Dict" | "Set" | "FrozenSet" | "Tuple" | "Optional" | "Literal"
+                    ) =>
+            {
+                let container = match a.attr.as_str() {
+                    "List" => "list",
+                    "Dict" => "dict",
+                    "Set" | "FrozenSet" => "set",
+                    "Tuple" => "tuple",
+                    "Optional" => "Optional",
+                    _ => "Literal",
+                };
+                if let crate::SubscriptKind::Index(elt) = &sub.kind {
+                    annotation_type_info(&ExprType::Subscript(crate::Subscript {
+                        value: Box::new(ExprType::Name(crate::ast::tree::name::Name {
+                            id: container.to_string(),
+                        })),
+                        kind: crate::SubscriptKind::Index(Box::new((**elt).clone())),
+                        lineno: sub.lineno,
+                        col_offset: sub.col_offset,
+                        end_lineno: sub.end_lineno,
+                        end_col_offset: sub.end_col_offset,
+                    }))
+                } else {
+                    None
+                }
+            }
             _ => None,
         },
+        // `threading.Event` / `socket.socket` / `numpy.ndarray` /
+        // `typing.Any` attribute annotations: concrete runtime types (or
+        // the boxed value for Any), known syntactically — one definition,
+        // so the tokens resolver and the TypeInfo resolver cannot drift.
+        ExprType::Attribute(attr) => {
+            if let ExprType::Name(n) = attr.value.as_ref() {
+                if n.id == "threading" {
+                    return crate::ThreadingType::from_name(&attr.attr).map(TypeInfo::Threading);
+                }
+                if n.id == "socket" && attr.attr == "socket" {
+                    return Some(TypeInfo::Socket);
+                }
+                if n.id == "typing" && attr.attr == "Any" {
+                    return Some(TypeInfo::PyValue);
+                }
+                if crate::is_numpy_alias(&n.id) {
+                    return match attr.attr.as_str() {
+                        "ndarray" => Some(TypeInfo::NdArray),
+                        "float64" | "float32" => Some(TypeInfo::Float),
+                        "int64" | "int32" => Some(TypeInfo::Int),
+                        "bool_" => Some(TypeInfo::Bool),
+                        _ => None,
+                    };
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1932,6 +2041,13 @@ fn resolve_alias_typeinfo_inner(
         // (`list[CharsetMatch] | None`). A boxed PyValue already contains
         // None (`CertType = ... | None` → PyValue, not Option<PyValue>).
         ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            // `str | bytes` (and `str | bytes | bytearray`) is the
+            // StrOrBytes heterogeneous union, not a boxed PyValue — the
+            // syntax core knew this, the alias-aware arm drifted (issue
+            // #137's systemic review).
+            if crate::is_str_bytes_union(ann) {
+                return Some(TypeInfo::StrOrBytes);
+            }
             if crate::is_none_expr(&op.left) {
                 if let Some(t) = resolve_alias_typeinfo(&op.right, symbols, options) {
                     if matches!(t, TypeInfo::PyValue) {
@@ -1974,6 +2090,21 @@ fn resolve_alias_typeinfo_inner(
                 && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "typing")
             {
                 return Some(TypeInfo::PyValue);
+            }
+            // `threading.Event` / `socket.socket` attribute annotations:
+            // concrete runtime handles — resolved BEFORE the module loop
+            // (threading/socket are external modules, which would box
+            // them; the tokens resolver always mapped them, so the
+            // authority must too).
+            if let ExprType::Name(n) = attr.value.as_ref() {
+                if n.id == "threading" {
+                    if let Some(t) = crate::ThreadingType::from_name(&attr.attr) {
+                        return Some(TypeInfo::Threading(t));
+                    }
+                }
+                if n.id == "socket" && attr.attr == "socket" {
+                    return Some(TypeInfo::Socket);
+                }
             }
             let ExprType::Name(module) = attr.value.as_ref() else {
                 // A NESTED module chain (`OpenSSL.SSL.Connection` — a
@@ -2261,8 +2392,8 @@ fn resolve_alias_typeinfo_inner(
                     if matches!(
                         n.id.as_str(),
                         "Union" | "IO" | "Iterable" | "Sequence" | "Iterator" | "Generator"
-                            | "Callable" | "SupportsRead" | "SupportsItems" | "Mapping"
-                            | "MutableMapping" | "Type" | "Optional" | "Literal" | "Any"
+                            | "Callable" | "SupportsRead" | "SupportsItems"
+                            | "MutableMapping" | "Optional" | "Literal" | "Any"
                     ) =>
                 {
                     return Some(TypeInfo::PyValue);
@@ -2270,13 +2401,15 @@ fn resolve_alias_typeinfo_inner(
                 // A subscripted name that is a real symbol (`Morsel[
                 // dict[str, str]]` — an imported class generic from
                 // http.cookiejar) is a boxed value — except the container
-                // generics, which resolve through the second match below.
+                // generics, which resolve through the second match below
+                // (`Mapping` and `type`/`Type` included: both have
+                // structural forms in the syntax core).
                 ExprType::Name(n)
                     if symbols.get(&n.id).is_some()
                         && !matches!(
                             n.id.as_str(),
                             "list" | "List" | "tuple" | "Tuple" | "dict" | "Dict" | "set"
-                                | "Set" | "Optional"
+                                | "Set" | "Optional" | "Mapping" | "type" | "Type"
                         ) =>
                 {
                     return Some(TypeInfo::PyValue);
@@ -2290,14 +2423,16 @@ fn resolve_alias_typeinfo_inner(
                         "Tuple" => "tuple",
                         "Dict" => "dict",
                         "Set" => "set",
+                        "Mapping" => "Mapping",
+                        "Type" => "type",
                         // Other typing generics (`IO[Any]`,
                         // `Iterable[bytes | str]`, `Union[...]`,
                         // `Callable[...]`) are tolerated inside a boxed
                         // PyValue union (urllib3's `_TYPE_BODY`).
                         "Union" | "IO" | "Iterable" | "Callable" | "SupportsRead"
-                        | "SupportsItems" | "Mapping" | "MutableMapping" | "Optional"
+                        | "SupportsItems" | "MutableMapping" | "Optional"
                         | "Literal" | "Any" | "Sequence" | "Iterator" | "Generator"
-                        | "Type" | "ClassVar" | "Collection" | "Container" => {
+                        | "ClassVar" | "Collection" | "Container" => {
                             return Some(TypeInfo::PyValue);
                         }
                         _ => return annotation_type_info(ann),
@@ -2349,6 +2484,23 @@ fn resolve_alias_typeinfo_inner(
                 )),
                 ("tuple" | "Tuple", crate::SubscriptKind::Index(elt)) => {
                     if let ExprType::Tuple(t) = elt.as_ref() {
+                        // `tuple[T, ...]` — a variadic tuple → Vec<T>
+                        // (the syntax core handles it; the alias-aware arm
+                        // drifted and resolved the Ellipsis to None —
+                        // issue #137's systemic review).
+                        if t.elts.len() == 2
+                            && matches!(
+                                &t.elts[1],
+                                ExprType::Constant(c)
+                                    if c.0
+                                        .as_ref()
+                                        .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
+                            )
+                        {
+                            return Some(TypeInfo::Vec(Box::new(resolve_alias_typeinfo(
+                                &t.elts[0], symbols, options,
+                            )?)));
+                        }
                         let mut infos = Vec::with_capacity(t.elts.len());
                         for e in &t.elts {
                             infos.push(resolve_alias_typeinfo(e, symbols, options)?);
@@ -2372,10 +2524,12 @@ fn resolve_alias_typeinfo_inner(
                 }
                 // A `set[T]` annotation (`would_be_installed:
                 // set[NormalizedName]` — pip's check): the set lowers as a
-                // Vec of the element type (set-ops on Vecs compile; the
-                // set semantics are the documented divergence).
+                // HashSet of the element type — set literals generate
+                // HashSet, so annotated sets are that type (the generated
+                // structs are the arbiter; the earlier Vec answer drifted
+                // from the tokens resolver).
                 ("set" | "Set" | "frozenset", crate::SubscriptKind::Index(elt)) => {
-                    Some(TypeInfo::Vec(Box::new(resolve_alias_typeinfo(
+                    Some(TypeInfo::HashSet(Box::new(resolve_alias_typeinfo(
                         elt, symbols, options,
                     )?)))
                 }
@@ -3021,5 +3175,122 @@ pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {
         ExprType::YieldFrom(yf) => expr_references(&yf.value, name),
         ExprType::Await(a) => expr_references(&a.value, name),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{parse, PythonOptions, StatementType, SymbolTableScopes};
+
+    /// Parse `def f(x: <ann>): pass` and return the annotation ExprType.
+    fn annotation_of(ann: &str) -> ExprType {
+        let src = format!("def f(x: {ann}):\n    pass\n");
+        let module = parse(&src, "ann.py").expect("parse failed");
+        let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+            panic!("expected a function def");
+        };
+        f.args.args[0]
+            .annotation
+            .as_deref()
+            .expect("annotation")
+            .clone()
+    }
+
+    /// The single type authority (issue #137's systemic review of rounds
+    /// 38–47): for every leaf annotation, the symbols-aware resolver with
+    /// an EMPTY symbol table must agree with the syntax-only core — the
+    /// alias/import layers may only ADD resolution on top, never change
+    /// the leaf answer. This pins the one definition so a future arm added
+    /// to one resolver but not the other is loud at the source, not in a
+    /// corpus measurement several rounds later.
+    #[test]
+    fn alias_resolver_agrees_with_syntax_core_on_leaves() {
+        let empty = SymbolTableScopes::new();
+        let options = PythonOptions::default();
+        for ann in [
+            "int",
+            "float",
+            "bool",
+            "str",
+            "bytes",
+            "bytearray",
+            "bytes | bytearray",
+            "str | bytes",
+            "Any",
+            "object",
+            "Literal[3]",
+            "list[int]",
+            "List[str]",
+            "set[int]",
+            "Set[str]",
+            "frozenset[int]",
+            "dict[str, int]",
+            "Dict[str, bool]",
+            "tuple[int, str]",
+            "tuple[int, ...]",
+            "tuple[int]",
+            "Mapping[str, int]",
+            "typing.Mapping[str, int]",
+            "typing.List[int]",
+            "typing.Dict[str, int]",
+            "typing.Tuple[int, str]",
+            "typing.Set[int]",
+            "Optional[int]",
+            "typing.Optional[str]",
+            "int | None",
+            "None | str",
+            "bool | str | None",
+            "int | str",
+            "threading.Event",
+            "threading.Lock",
+            "socket.socket",
+            "type[BaseException]",
+            "Type[BaseException]",
+            "memoryview",
+            "memoryview[int]",
+        ] {
+            let core = annotation_type_info(&annotation_of(ann));
+            let alias = resolve_alias_typeinfo(&annotation_of(ann), &empty, &options);
+            assert_eq!(
+                alias, core,
+                "resolver disagreement on `{ann}`: alias-aware gave {alias:?}, \
+                 syntax core gave {core:?}",
+            );
+        }
+    }
+
+    /// The fixed drift points, pinned to the corpus-verified answers:
+    /// `set[T]` is HashSet<T> (set literals generate HashSet — urllib3's
+    /// PoolKey fields are Option<HashSet<(String, String)>>) and a 1-tuple
+    /// renders with the trailing comma.
+    #[test]
+    fn set_and_one_tuple_render_corpus_verified_types() {
+        let empty = SymbolTableScopes::new();
+        let options = PythonOptions::default();
+        let set = resolve_alias_typeinfo(&annotation_of("frozenset[tuple[str, str]]"), &empty, &options)
+            .expect("frozenset must resolve");
+        assert_eq!(
+            set.to_rust_type().to_string().replace(' ', ""),
+            "std::collections::HashSet<(String,String)>",
+            "frozenset[tuple[str, str]] must be HashSet (PoolKey-verified)"
+        );
+        // `tuple[int]` (a 1-tuple ANNOTATION) was never supported by
+        // either resolver (both require a tuple of elements); the 1-tuple
+        // rendering bug lived in to_rust_type for TypeInfo::Tuple built
+        // elsewhere (tuple-literal inference) — pinned directly.
+        let one = TypeInfo::Tuple(vec![TypeInfo::Int]);
+        assert_eq!(
+            one.to_rust_type().to_string().replace(' ', ""),
+            "(i64,)",
+            "a 1-tuple must render with the trailing comma, not (i64)"
+        );
+        let class = annotation_type_info(&annotation_of("type[BaseException]"))
+            .expect("type[X] resolves");
+        assert_eq!(
+            class.to_rust_type().to_string().replace(' ', ""),
+            "Option<()>",
+            "type[X] is the tolerated opaque class marker"
+        );
     }
 }

@@ -2527,6 +2527,7 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::StrRef | TypeInfo::String => "str".to_string(),
         TypeInfo::Bytes => "bytes".to_string(),
         TypeInfo::Vec(_) => "list".to_string(),
+        TypeInfo::HashSet(_) => "set".to_string(),
         TypeInfo::Dict(..) => "dict".to_string(),
         TypeInfo::Tuple(_) => "tuple".to_string(),
         TypeInfo::Option(_) => "optional".to_string(),
@@ -2537,6 +2538,9 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::PyValueMember(_) => "any".to_string(),
         TypeInfo::Class(c) => c.clone(),
         TypeInfo::Borrowed(_) => "borrowed".to_string(),
+        TypeInfo::Threading(_) => "threading object".to_string(),
+        TypeInfo::Socket => "socket".to_string(),
+        TypeInfo::ClassValue => "type".to_string(),
         TypeInfo::PyObject => "unknown".to_string(),
     }
 }

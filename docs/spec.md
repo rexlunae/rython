@@ -123,6 +123,7 @@ declaration — loud, but at the wrong layer (§12.1).
 | `bool` | `bool` | |
 | `str` | `String` (fields, returns, elements); `impl Into<String>` as a parameter | String *literals* are `&'static str` internally and are coerced to `String` where an owned string is expected |
 | `bytes` | `Vec<u8>` | Literals lower to Rust byte strings |
+| `bytearray` | `Vec<u8>` | Bytes-like, same lowering as `bytes` |
 | `list[T]` | `Vec<T>` | |
 | `dict[K, V]` | `PyDict<K, V>` | `PyDict` is an insertion-ordered `IndexMap` alias — Python 3.7+ dict ordering is preserved |
 | `set[T]` | `std::collections::HashSet<T>` | |
@@ -134,6 +135,12 @@ declaration — loud, but at the wrong layer (§12.1).
 | `str \| bytes` (and `\| bytearray`) | `stdpython::StrOrBytes` | Heterogeneous pair; narrowed by `is_str()`/`is_bytes()`; `str()`/`print()` render bytes in their `b'...'` repr form |
 | any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. Operators on a boxed value are not modeled — they fail the build loudly rather than guessing. A union containing None is NOT an Option slot — the box absorbs None, so `None`-defaulted parameters of such a type (`cert_reqs: int \| str \| None`, `retries: Retry \| bool \| int \| None` — urllib3) store plain values through `PyValue::from`, never a `Some(...)` wrap (rounds 40/42). A class-instance member has no boxed repr — storing one stays loudly unboxable (`PyValue: From<Retry>` fails) |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
+| `socket.socket` | `socket::Socket` | The runtime socket handle — `wait.py`'s `sock: socket.socket` parameters compile as real `Socket` values, not boxed PyValues |
+| `threading.Thread/Lock/RLock/Event/Semaphore` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
+| `type[X]` / `Type[X]` | `Option<()>` | A CLASS value: rython cannot hold classes as values (the callables-as-data divergence); the tolerated opaque marker |
+| `typing.Tuple/Dict/List/Set/FrozenSet/Optional/Literal/…` | like the bare containers | The typing-module spellings map identically to the bare `tuple[...]`/`dict[...]`/… (one resolver, one answer) |
+
+All of the above resolve through ONE annotation authority (`resolve_alias_typeinfo` over the syntax core `annotation_type_info`; the old token-level resolver `python_annotation_to_rust_type` is a thin `TypeInfo::to_rust_type()` wrapper, issue #137's review of rounds 38–47). `set[T]`/`frozenset[T]` are `HashSet` everywhere — the generated structs are the arbiter (urllib3's PoolKey fields are `Option<HashSet<(String, String)>>`), and 1-tuples render `(T,)` with the trailing comma.
 
 Dict keys normalize `&str → String`, so `{"a": 1}` is `PyDict<String, i64>`
 and matches a `dict[str, int]` annotation.
