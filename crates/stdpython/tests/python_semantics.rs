@@ -3477,3 +3477,42 @@ fn urllib_urlencode_matches_cpython() {
 }
 
 }
+
+// A Python TUPLE value boxes as Tuple members (round 56): `PyValue::from(
+// ("str".to_string(), "bytes".to_string()))` — the module-level
+// class-as-value tuples requests' compat produces (`basestring = (str,
+// bytes)`, `numeric_types = (int, float)`). Verified against python3: a
+// tuple of the name strings, indexed like the Python tuple.
+#[test]
+fn pyvalue_from_tuple_boxes_as_tuple_members() {
+    use stdpython::*;
+    // (str, bytes) as name strings — requests' compat basestring.
+    let t: PyValue = ("str".to_string(), "bytes".to_string()).into();
+    let PyValue::Tuple(members) = &t else {
+        panic!("a 2-tuple must box as a Tuple, got {:?}", t);
+    };
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0], PyValue::from("str"));
+    assert_eq!(members[1], PyValue::from("bytes"));
+    // A mixed tuple (String, i64) — each element converts through its
+    // own Into<PyValue>.
+    let mixed: PyValue = ("name".to_string(), 3).into();
+    let PyValue::Tuple(members) = &mixed else {
+        panic!("a mixed tuple must box as a Tuple, got {:?}", mixed);
+    };
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0], PyValue::from("name"));
+    assert_eq!(members[1], PyValue::from(3));
+    // A 1-tuple (integer_types = (int,)) keeps its trailing comma shape.
+    let one: PyValue = ("int".to_string(),).into();
+    let PyValue::Tuple(members) = &one else {
+        panic!("a 1-tuple must box as a Tuple, got {:?}", one);
+    };
+    assert_eq!(members.len(), 1);
+    // The 6-arity impl (urlunparse-style tuple values).
+    let six: PyValue = ("a", 1, 2.5, true, "b", 6i64).into();
+    let PyValue::Tuple(members) = &six else {
+        panic!("a 6-tuple must box as a Tuple, got {:?}", six);
+    };
+    assert_eq!(members.len(), 6);
+}

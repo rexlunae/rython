@@ -813,8 +813,41 @@ fn numeric_join(a: &TypeInfo, b: &TypeInfo) -> TypeInfo {
     }
 }
 
-/// Render an expression, then coerce it to the expected type when the
-/// inference says a conversion is needed.
+/// Lower a bare BUILTIN class name in VALUE position (`basestring =
+/// (str, bytes)`, `{bytes: ..., str: ...}` — requests' compat/
+/// _internal_utils): the builtin classes are class objects too, and the
+/// class-as-value model names them by their name string (round 33).
+/// Only when the name is NOT shadowed by a user binding (`str = "s"`, a
+/// `def str(...)`, a class named `str`) — a self-assignment (`str =
+/// str`, dropped as a no-op in module.rs's fold_static_import_trys) or
+/// an import of one leaves the name meaning the builtin. VALUE-position
+/// only: annotations never route through this (a `xs: list` parameter
+/// keeps its own lowering), so it lives in the value renderers (tuple
+/// elements, render_typed), not in Name::to_rust.
+pub(crate) fn builtin_class_value(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TokenStream> {
+    let ExprType::Name(n) = expr else {
+        return None;
+    };
+    if !crate::ast::tree::assign::is_builtin_class_name(&n.id) {
+        return None;
+    }
+    let unshadowed = match symbols.get(&n.id) {
+        None => true,
+        Some(_) => {
+            crate::ast::tree::module::import_binds_builtin_self_alias(&n.id, symbols, options)
+        }
+    };
+    if !unshadowed {
+        return None;
+    }
+    let name = n.id.clone();
+    Some(quote!(#name.to_string()))
+}
+
 pub fn render_typed(
     expr: &ExprType,
     ctx: CodeGenContext,
@@ -848,6 +881,12 @@ pub fn render_typed(
         // mangled Rust ident).
         let name = n.id.clone();
         return Ok(quote!(#name.to_string()));
+    }
+    // A bare BUILTIN class name in value position (`{bytes: ...,
+    // str: ...}` dict keys — requests' _internal_utils): the builtin
+    // classes are class values too — their name strings (round 56).
+    if let Some(tokens) = builtin_class_value(expr, &symbols, &options) {
+        return Ok(tokens);
     }
     let tokens = expr
         .clone()
@@ -1053,6 +1092,13 @@ pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
 /// type codegen produces for it. Used to derive the expected type of a
 /// call argument from the callee's parameter annotation.
 pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
+    // A STRING-LITERAL annotation (`verify: "bool | str | None"` —
+    // requests' adapters.py writes quoted annotations): re-parse the
+    // string's content as the real expression, like typing.get_type_hints
+    // (round 56). Otherwise the string Constant maps to TypeInfo::String
+    // and every use of the parameter breaks.
+    let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
+    let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
     // `T | None` (and `None | T`) is Option<T>; the inner type resolves
     // through the same mapping. A union of two non-None members that map
     // to the same TypeInfo (bytes | bytearray) is that type. `str | bytes`
@@ -1101,6 +1147,10 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             "float" => Some(TypeInfo::Float),
             "bool" => Some(TypeInfo::Bool),
             "str" => Some(TypeInfo::String),
+            // `offsets: range` — the builtin range class as a type
+            // annotation (charset_normalizer's cut_sequence_chunks): the
+            // runtime PyRange (the same type `range(...)` calls infer).
+            "range" => Some(TypeInfo::Range),
             // `bytearray` is a bytes-like type: same Vec<u8> lowering as
             // `bytes` (the tokens resolver always mapped it; the core
             // drifted — a `b: bytearray` parameter rendered a bare
@@ -3129,6 +3179,14 @@ fn statement_references(stmt: &Statement, name: &str) -> bool {
         StatementType::Raise(r) => {
             r.exc.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
                 || r.cause.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
+        }
+        // `del d[k]` reads the subscript's key (`for key in none_keys:
+        // del merged_setting[key]` — requests' merge_setting): without
+        // this arm the loop-target analysis declared `key` unused and
+        // lowered the target to `_` while the body's `py_pop(key)` still
+        // referenced it (E0425 in the generated crate).
+        StatementType::Delete(targets) => {
+            targets.iter().any(|t| expr_references(t, name))
         }
         StatementType::If(s) => {
             expr_references(&s.test, name)

@@ -3608,6 +3608,20 @@ pub(crate) fn module_def_has_runtime_item(
                         && a.targets.iter().any(|t| {
                             matches!(t, crate::ExprType::Name(n) if n.id == name)
                         })
+                        // A dropped BUILTIN-CLASS SELF-alias (`str = str` /
+                        // `bytes = bytes` — requests' compat's py2 shim):
+                        // the no-op self-assign is removed by
+                        // fold_static_import_trys and emits no runtime
+                        // item, so a sibling re-export of the name
+                        // (`from .compat import str` — auth.py) must NOT
+                        // emit `use crate::requests::compat::str` (E0603:
+                        // nothing public to point at). The name still means
+                        // the builtin (calls dispatch to the builtin arm;
+                        // the import drops loudly in import.rs).
+                        && !(a.targets.len() == 1
+                            && matches!(&a.targets[0], crate::ExprType::Name(n) if n.id == name)
+                            && matches!(&a.value, crate::ExprType::Name(v) if v.id == name)
+                            && crate::ast::tree::assign::is_builtin_class_name(name))
                     {
                         return true;
                     }
@@ -3709,6 +3723,57 @@ pub(crate) fn module_def_has_runtime_item(
     // importer's `from .util import SKIP_HEADER` resolves. Follow the
     // chain to the defining module's item.
     module_reexports_item(options, path, name, &mut std::collections::HashSet::new())
+}
+
+/// Whether the binding of `name` in THIS scope resolves to a dropped
+/// BUILTIN-CLASS self-alias (`str = str`, `bytes = bytes` — requests'
+/// compat's py2 shims): the no-op self-assign is removed by
+/// fold_static_import_trys, so the name still means the BUILTIN class —
+/// a call is the builtin conversion (`str(x, encoding)`), a value read is
+/// the class-as-value name string. Follows the local symbol: a bare name
+/// (None — the caller's unbound case), a self-alias, a self-assignment,
+/// or an ImportFrom chain into a defining module whose canonical binding
+/// is such a self-alias. Returns false for a name shadowed by a real
+/// user definition (a function, class, or value of the same name).
+pub(crate) fn import_binds_builtin_self_alias(
+    name: &str,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> bool {
+    let mut current = name.to_string();
+    let mut syms = symbols.clone();
+    for _ in 0..8 {
+        match syms.get(&current) {
+            Some(crate::SymbolTableNode::Alias(c)) => {
+                if c == &current {
+                    return crate::ast::tree::assign::is_builtin_class_name(&current);
+                }
+                current = c.clone();
+            }
+            Some(crate::SymbolTableNode::Assign { value, .. }) => {
+                return crate::ast::tree::assign::is_builtin_class_name(&current)
+                    && matches!(value, crate::ExprType::Name(n) if n.id == current);
+            }
+            Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                let path = ifm.resolved_module_path(options);
+                let Some(key) = crate::module_defs_key(options, &path) else {
+                    return false;
+                };
+                let defining = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let module = &options.module_defs[key];
+                let module: &crate::Module = module;
+                syms = module.clone().find_symbols(crate::SymbolTableScopes::new());
+                current = defining;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Whether the module at `path` binds `name` as a stdlib EXCEPTION ALIAS

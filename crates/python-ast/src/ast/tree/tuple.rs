@@ -45,9 +45,25 @@ impl CodeGen for Tuple {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let elements: Result<Vec<_>, _> = self.elts
+        let elements: Result<Vec<_>, _> = self
+            .elts
             .into_iter()
-            .map(|elt| elt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
+            .map(|elt| {
+                // A bare BUILTIN class name element (`basestring = (str,
+                // bytes)`, `numeric_types = (int, float)` — requests'
+                // compat): the builtin classes are class values — their
+                // name strings (round 56). Value-position only: an
+                // annotation tuple never routes through here.
+                if let Some(tokens) = crate::ast::tree::type_ctx::builtin_class_value(
+                    &elt,
+                    &symbols,
+                    &options,
+                ) {
+                    Ok(tokens)
+                } else {
+                    elt.to_rust(ctx.clone(), options.clone(), symbols.clone())
+                }
+            })
             .collect();
         
         let elements = elements?;

@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 55: the bool-and-boxed-value fold fix and the urllib.parse calls (~1086 rustc errors, measurable; every round's delta is measured against this)."
+      "note": "The historical #137 corpus. Round 55: the bool-and-boxed-value fold fix and the urllib.parse calls (~1086 rustc errors). Round 56: flat (1085)."
     },
     {
       "name": "certifi",
@@ -14,17 +14,17 @@
     {
       "name": "idna",
       "requirement": "idna==3.10",
-      "note": "Comparable in size to urllib3, never tracked round to round."
+      "note": "Round 56: the new tuple->PyValue From impls cut the boxed-tuple E0277 wall from 957 to 157."
     },
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Unblocked in round 53 (reassigned-param boxing): converts and builds (~314 rustc errors after round 55's re-alias dispatch + warn signature + json dumps arm, measurable)."
+      "note": "Round 56: the range annotation fix (313)."
     },
     {
       "name": "requests",
       "requirement": "requests==2.32.3",
-      "note": "Round 54 (boxed isinstance-dispatch drops loudly) unblocked conversion; round 55 added the urllib.parse runtime surface (urlparse/urlsplit/urljoin/urlunparse/urlencode/quote/unquote/urldefrag) and the class-vs-function import registry (~69 rustc errors, measurable)."
+      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse surface + class registry (69). Round 56: unannotated class defaults, quoted annotations, builtin-class value positions, compat self-alias imports, tuple boxing, del-read loop targets, range annotations (29)."
     }
   ]
 }

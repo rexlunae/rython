@@ -50,7 +50,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
 /// `pub type` AND promoted a static of the same name (E0428), or skipped
 /// the store without ever declaring the alias (E0412).
 pub(crate) fn is_builtin_scalar_name(name: &str) -> bool {
-    matches!(name, "str" | "bytes" | "bytearray" | "int" | "float" | "bool")
+    // The scalar subset of the builtin CLASS names: the ones whose alias
+    // assignment maps to a Rust scalar type. Derived from
+    // `is_builtin_class_name` so the two name sets cannot drift.
+    is_builtin_class_name(name)
+        && matches!(name, "str" | "bytes" | "bytearray" | "int" | "float" | "bool")
+}
+
+/// The builtin CLASS names a value position can reference as the class
+/// OBJECT (`basestring = (str, bytes)`, `{bytes: ..., str: ...}` —
+/// requests' compat/_internal_utils; isinstance targets). Under the
+/// class-as-value model a class object's runtime value is its NAME
+/// STRING (round 33), and the builtin classes are class objects too —
+/// `str`/`bytes`/... in a tuple, dict key, or argument lower to
+/// `"str".to_string()` / `"bytes".to_string()`. ONE list for the value
+/// renderer (name.rs), the from-import self-alias handling (import.rs),
+/// and the builtin-call dispatch (call.rs) — a partial edit would leave
+/// a bare builtin name in generated code (E0425) or shadow a user
+/// binding.
+pub(crate) fn is_builtin_class_name(name: &str) -> bool {
+    matches!(
+        name,
+        "str" | "bytes" | "bytearray" | "int" | "float" | "bool" | "list" | "dict"
+            | "tuple" | "set" | "frozenset" | "object" | "type"
+    )
 }
 
 /// When `value` is a builtin-scalar type NAME, the Rust type its alias
