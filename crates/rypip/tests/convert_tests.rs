@@ -4768,7 +4768,11 @@ fn async_binary_builds_and_runs_on_the_tokio_runtime() {
     assert!(toml.contains("tokio"), "Cargo.toml: {}", toml);
     assert!(toml.contains("async-tokio"), "Cargo.toml: {}", toml);
     assert!(toml.contains("default = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
-    assert!(toml.contains("features = [\"async-tokio\"]"), "Cargo.toml: {}", toml);
+    assert!(
+        toml.contains("features = [\"std\", \"async-tokio\"]"),
+        "Cargo.toml: {}",
+        toml
+    );
     // The entry module's code is feature-gated.
     let main = fs::read_to_string(out.join("src/main.rs")).unwrap();
     assert!(
@@ -8084,4 +8088,59 @@ fn percent_formatting_matches_cpython_end_to_end() {
         "stdout: {}",
         stdout
     );
+}
+
+#[test]
+fn the_stdpython_dependency_carries_only_the_surfaces_the_package_imports() {
+    // Platform surfaces are per-feature (the convention stdpython's own
+    // Cargo.toml states), and the generated manifest opts into exactly the
+    // ones the package's imports ask for rather than riding stdpython's
+    // defaults: a package that never imports `ssl` or `re` must not
+    // compile rustls or the regex engine. Getting a predicate too narrow
+    // is loud, never silent — the generated crate names a module that was
+    // not compiled in — and the re/urllib end-to-end tests above are the
+    // proof that the surfaces are sufficient when they ARE requested.
+    let cases: [(&str, &str, &[&str], &[&str]); 3] = [
+        (
+            "plain",
+            "def main() -> None:\n    print(\"hi\")\n",
+            &[],
+            &["ssl-rustls", "re-regex", "http-ureq"],
+        ),
+        (
+            "re",
+            "import re\n\ndef main() -> None:\n    print(re.search(\"a\", \"a\") is not None)\n",
+            &["re-regex"],
+            &["ssl-rustls", "http-ureq"],
+        ),
+        (
+            "ssl",
+            "import ssl\n\ndef main() -> None:\n    print(ssl.OPENSSL_VERSION)\n",
+            &["ssl-rustls"],
+            &["re-regex", "http-ureq"],
+        ),
+    ];
+    for (tag, source, present, absent) in cases {
+        let scratch = Scratch::new(&format!("surface-{tag}"));
+        let file = scratch.path().join("probe.py");
+        fs::write(&file, source).unwrap();
+        let out = scratch.path().join("crate");
+        let pkg = rypip::discover(&file).expect("discover");
+        let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+        let manifest = fs::read_to_string(krate.root.join("Cargo.toml")).unwrap();
+        let dep = manifest
+            .lines()
+            .find(|l| l.starts_with("stdpython = "))
+            .unwrap_or_else(|| panic!("no stdpython dependency in: {}", manifest));
+        assert!(
+            dep.contains("default-features = false") && dep.contains("\"std\""),
+            "{tag}: the std tier must be requested explicitly: {dep}"
+        );
+        for feature in present {
+            assert!(dep.contains(feature), "{tag}: expected {feature} in: {dep}");
+        }
+        for feature in absent {
+            assert!(!dep.contains(feature), "{tag}: unexpected {feature} in: {dep}");
+        }
+    }
 }

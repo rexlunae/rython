@@ -90,8 +90,10 @@ pub mod copy;
 /// Python textwrap module - text dedent/indent helpers
 pub mod textwrap;
 
-/// Python re module - regular expressions (regex-crate backed)
-#[cfg(feature = "std")]
+/// Python re module - regular expressions (regex-crate backed).
+/// Feature-gated per the platform-surface convention: `re-regex` implies
+/// std and is on by default.
+#[cfg(feature = "re-regex")]
 pub mod re;
 
 /// Python io module (StringIO/BytesIO); PyFile itself lives at the crate

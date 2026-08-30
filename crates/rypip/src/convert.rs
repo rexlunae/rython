@@ -2950,15 +2950,76 @@ fn package_async_flags(package: &PyPackage) -> (bool, bool) {
     (uses_async, imports_asyncio)
 }
 
-/// Whether any module of the package imports urllib (urllib.request):
-/// drives stdpython's ureq-backed `http-ureq` feature on the generated
-/// crate's dependency, the same way asyncio drives `async-tokio`.
-fn package_imports_urllib(package: &PyPackage) -> bool {
-    package.modules.iter().any(|module| {
-        parse_enhanced(&module.source, parse_filename(module))
-            .map(|ast| python_ast::module_imports_root(&ast.raw.body, "urllib"))
-            .unwrap_or(false)
-    })
+/// A stdpython platform surface: a heavyweight dependency that only some
+/// converted packages need, gated behind its own Cargo feature (the
+/// convention `crates/stdpython/Cargo.toml` states — one feature per
+/// surface, so the default build stays dependency-light).
+///
+/// A package opts into a surface by importing the Python module it backs,
+/// so the mapping is import-root -> feature and lives here alone: the
+/// feature names appear in exactly one place rather than scattered across
+/// the emission sites. Guessing too narrowly is safe in the prime
+/// directive's sense — the generated crate then names a module that isn't
+/// compiled in and fails loudly, it never silently loses the surface.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum SurfaceFeature {
+    /// `re` — the regex crate (a third of the std tier's build cost).
+    ReRegex,
+    /// `ssl` — TLS over rustls. Not implied by `http-ureq`: ureq carries
+    /// its own rustls, and stdpython's `ssl` module stands alone.
+    SslRustls,
+    /// `urllib.request` — the ureq-backed HTTP client.
+    HttpUreq,
+}
+
+impl SurfaceFeature {
+    /// Every surface, in the order features are emitted.
+    const ALL: [SurfaceFeature; 3] = [
+        SurfaceFeature::ReRegex,
+        SurfaceFeature::SslRustls,
+        SurfaceFeature::HttpUreq,
+    ];
+
+    /// The stdpython Cargo feature this surface turns on.
+    fn cargo_feature(self) -> &'static str {
+        match self {
+            SurfaceFeature::ReRegex => "re-regex",
+            SurfaceFeature::SslRustls => "ssl-rustls",
+            SurfaceFeature::HttpUreq => "http-ureq",
+        }
+    }
+
+    /// The Python import root that pulls the surface in.
+    fn import_root(self) -> &'static str {
+        match self {
+            SurfaceFeature::ReRegex => "re",
+            SurfaceFeature::SslRustls => "ssl",
+            SurfaceFeature::HttpUreq => "urllib",
+        }
+    }
+}
+
+/// The surfaces the package's imports ask for. Parses each module once and
+/// tests every root against it, rather than re-parsing per feature.
+fn package_surface_features(package: &PyPackage) -> Vec<SurfaceFeature> {
+    let mut needed: Vec<SurfaceFeature> = Vec::new();
+    for module in &package.modules {
+        let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) else {
+            continue;
+        };
+        for surface in SurfaceFeature::ALL {
+            if !needed.contains(&surface)
+                && python_ast::module_imports_root(&ast.raw.body, surface.import_root())
+            {
+                needed.push(surface);
+            }
+        }
+        if needed.len() == SurfaceFeature::ALL.len() {
+            break;
+        }
+    }
+    needed.sort();
+    needed
 }
 
 /// Conversion-level PythonOptions shared by every module of one conversion
@@ -3280,30 +3341,34 @@ fn write_cargo_toml(
             ),
         }
     } else {
-        // The std tier of stdpython, with the feature-gated surfaces the
-        // package actually uses: the tokio-backed asyncio module (async
-        // code or `import asyncio`) and the ureq-backed urllib.request
-        // HTTP client (`import urllib.request` — the platform-surface
-        // feature convention).
-        let mut features: Vec<&str> = Vec::new();
+        // The std tier of stdpython plus exactly the feature-gated
+        // surfaces the package actually uses: the tokio-backed asyncio
+        // module (async code or `import asyncio`) and the surfaces
+        // `package_surface_features` reads off the imports.
+        //
+        // The list is emitted with `default-features = false` rather than
+        // riding stdpython's defaults, so a package that never imports
+        // `ssl` or `re` does not compile rustls or the regex engine —
+        // together about two thirds of the std tier's dependency build.
+        // stdpython's own `default` still carries them, so nothing else
+        // that depends on it is affected.
+        let mut features: Vec<&str> = vec!["std"];
         if needs_async_stdpython {
             features.push("async-tokio");
         }
-        if package_imports_urllib(package) {
-            features.push("http-ureq");
-        }
-        let feature_list = if features.is_empty() {
-            String::new()
-        } else {
-            format!(
-                ", features = [{}]",
-                features
-                    .iter()
-                    .map(|f| format!("\"{}\"", f))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+        features.extend(
+            package_surface_features(package)
+                .into_iter()
+                .map(SurfaceFeature::cargo_feature),
+        );
+        let feature_list = format!(
+            ", default-features = false, features = [{}]",
+            features
+                .iter()
+                .map(|f| format!("\"{}\"", f))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         match (&stdpython_source, opts.no_std) {
             (StdpythonSource::Path(path), true) => format!(
                 "stdpython = {{ path = \"{}\", default-features = false, features = [\"alloc\"] }}",
@@ -3319,11 +3384,7 @@ fn write_cargo_toml(
                 version,
             ),
             (StdpythonSource::Registry(version), false) => {
-                if feature_list.is_empty() {
-                    format!("stdpython = \"{}\"", version)
-                } else {
-                    format!("stdpython = {{ version = \"{}\"{} }}", version, feature_list)
-                }
+                format!("stdpython = {{ version = \"{}\"{} }}", version, feature_list)
             }
         }
     };

@@ -5889,7 +5889,7 @@ pub use stdlib::datetime::{PyReplace, ReplaceArgs};
 pub use stdlib::asyncio;
 #[cfg(feature = "std")]
 pub use stdlib::time;
-#[cfg(feature = "std")]
+#[cfg(feature = "re-regex")]
 pub use stdlib::re;
 // io is in-memory buffers (StringIO/BytesIO) — pure alloc, every tier;
 // the disk-backed PyFile constructors and open() stay std-only.
@@ -5910,7 +5910,7 @@ pub use stdlib::ssl;
 pub use stdlib::urllib;
 // The Match-method trait must be in scope for m.group()/m.span() to
 // resolve through the Option layer in generated code.
-#[cfg(feature = "std")]
+#[cfg(feature = "re-regex")]
 pub use stdlib::re::PyMatchOps;
 pub use stdlib::string;
 pub use stdlib::json;
