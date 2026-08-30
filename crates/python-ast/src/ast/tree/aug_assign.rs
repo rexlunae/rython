@@ -226,7 +226,7 @@ impl CodeGen for AugAssign {
                 // read-modify-write through the runtime py_sub (the
                 // boxed int arithmetic).
                 match &target_field_rust_ty {
-                    Some(t) if t.starts_with("Option <") => {
+                    Some(crate::TypeInfo::Option(_)) => {
                         // The RHS may itself be Option-typed
                         // (`self.chunk_left -= amt` where amt is
                         // `int | None` — urllib3's _fp_read): unwrap both.
@@ -256,7 +256,7 @@ impl CodeGen for AugAssign {
                             }
                         })
                     }
-                    Some(t) if t == "stdpython :: PyValue" => {
+                    Some(crate::TypeInfo::PyValue) => {
                         Ok(quote!(#target = (#target_load).py_sub(&(#value))))
                     }
                     _ => Ok(quote!(#target -= #value)),
@@ -283,7 +283,7 @@ impl CodeGen for AugAssign {
                 // value; a None is CPython's TypeError (loud §12.2 panic
                 // — the guard in real code prevents it).
                 match &target_field_rust_ty {
-                    Some(t) if t.starts_with("Option <") => Ok(quote! {
+                    Some(crate::TypeInfo::Option(_)) => Ok(quote! {
                         #target = match (#target_load).clone() {
                             Some(__rython_v) => Some(__rython_v | (#value)),
                             None => panic!(
@@ -361,13 +361,15 @@ mod tests {
     create_parse_test!(test_rshift_assign, "x >>= 3", "test.py");
 }
 
-/// The Rust type of a `self.<field>` through the class table.
+/// The RUST type of a `self.<field>` through the class table — a TypeInfo
+/// (issue #137's review: field types are structural, so consumers match
+/// `TypeInfo::Option(_)` instead of sniffing rendered tokens).
 pub(crate) fn self_field_rust_ty(
     field: &str,
     ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
-) -> Option<String> {
+) -> Option<crate::TypeInfo> {
     let class_name = ctx.enclosing_class_name()?;
     let crate::SymbolTableNode::ClassDef(class) = symbols.get(class_name)? else {
         return None;
@@ -376,7 +378,7 @@ pub(crate) fn self_field_rust_ty(
     fields
         .iter()
         .find(|(n, _)| *n == field)
-        .map(|(_, t)| t.to_string())
+        .map(|(_, t)| t.clone())
 }
 
 /// The RUST type of an aug-assign target, when it is known: a
@@ -390,7 +392,7 @@ fn target_field_ty(
     ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
-) -> Option<String> {
+) -> Option<crate::TypeInfo> {
     match target {
         ExprType::Attribute(attr)
             if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
@@ -399,7 +401,7 @@ fn target_field_ty(
         }
         ExprType::Name(n) => {
             if let Some(t) = options.name_types.get(&n.id) {
-                return Some(t.to_rust_type().to_string());
+                return Some(t.clone());
             }
             // A local assigned from a self-field (`total = self.total` —
             // urllib3's Retry): the field's type.

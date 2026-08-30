@@ -2538,6 +2538,7 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::PyValueMember(_) => "any".to_string(),
         TypeInfo::Class(c) => c.clone(),
         TypeInfo::Borrowed(_) => "borrowed".to_string(),
+        TypeInfo::Custom(_) => "custom".to_string(),
         TypeInfo::Threading(_) => "threading object".to_string(),
         TypeInfo::Socket => "socket".to_string(),
         TypeInfo::ClassValue => "type".to_string(),

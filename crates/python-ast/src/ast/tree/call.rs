@@ -6977,8 +6977,10 @@ impl<'a> CodeGen for Call {
                             .iter()
                             .find(|(n, _)| *n == attr.attr)
                             .is_some_and(|(_, t)| {
-                                let s = t.to_string();
-                                s == "stdpython :: PyValue" || s == "PyObject"
+                                matches!(
+                                    t,
+                                    crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+                                )
                             })
                     },
                 ))
@@ -8093,7 +8095,7 @@ pub(crate) fn receiver_is_pyvalue_self_field(
             fields
                 .iter()
                 .find(|(name, _)| name == &attr.attr)
-                .map(|(_, ty)| ty.to_string() == quote!(stdpython::PyValue).to_string())
+                .map(|(_, ty)| matches!(ty, crate::TypeInfo::PyValue))
         })
         .unwrap_or(false)
 }

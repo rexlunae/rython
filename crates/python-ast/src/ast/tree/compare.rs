@@ -461,7 +461,7 @@ impl CodeGen for Compare {
                                     &options,
                                     &symbols,
                                 )
-                                .is_some_and(|t| t.starts_with("Option <"))
+                                .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
                     )
                     {
                         let cmp_ty = type_name(&inner_ty);

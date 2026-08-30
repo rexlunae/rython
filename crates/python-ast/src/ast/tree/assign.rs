@@ -433,7 +433,7 @@ impl<'a> CodeGen for Assign {
                     fields
                         .iter()
                         .find(|(name, _)| name == &attr.attr)
-                        .map(|(_, ty)| ty.to_string() == quote!(stdpython::PyValue).to_string())
+                        .map(|(_, ty)| matches!(ty, crate::TypeInfo::PyValue))
                 })
                 .unwrap_or(false)
         };
@@ -461,7 +461,7 @@ impl<'a> CodeGen for Assign {
                     fields
                         .iter()
                         .find(|(name, _)| name == &attr.attr)
-                        .map(|(_, ty)| ty.to_string().starts_with("Option <"))
+                        .map(|(_, ty)| matches!(ty, crate::TypeInfo::Option(_)))
                 })
                 .unwrap_or(false)
         };
@@ -488,15 +488,18 @@ impl<'a> CodeGen for Assign {
                     fields
                         .iter()
                         .find(|(name, _)| name == &attr.attr)
-                        .and_then(|(_, ty)| {
-                            let ty = ty.to_string();
-                            if ty == quote!(Vec<String>).to_string() {
+                        .and_then(|(_, ty)| match ty {
+                            crate::TypeInfo::Vec(inner)
+                                if matches!(**inner, crate::TypeInfo::String) =>
+                            {
                                 Some(false)
-                            } else if ty == quote!(std::collections::HashSet<String>).to_string() {
-                                Some(true)
-                            } else {
-                                None
                             }
+                            crate::TypeInfo::HashSet(inner)
+                                if matches!(**inner, crate::TypeInfo::String) =>
+                            {
+                                Some(true)
+                            }
+                            _ => None,
                         })
                 })
         };
@@ -1034,7 +1037,13 @@ impl<'a> CodeGen for Assign {
                                     &options,
                                     &symbols,
                                 )
-                                .is_some_and(|t| t.starts_with("PyDict < String"))
+                                .is_some_and(|t| {
+                                    matches!(
+                                        t,
+                                        crate::TypeInfo::Dict(k, _)
+                                            if matches!(k.as_ref(), crate::TypeInfo::String)
+                                    )
+                                })
                     );
                     let index = if string_keyed {
                         crate::render_typed(
@@ -1071,14 +1080,15 @@ impl<'a> CodeGen for Assign {
                                     &options,
                                     &symbols,
                                 )
-                                // The class table renders the field type
-                                // through a TokenStream; `PyDict<String,
-                                // PyValue>` (or the stdpython-qualified
-                                // form) is the boxed-value dict. The loose
-                                // prefix mirrors string_keyed above.
+                                // The class table carries the boxed-value
+                                // dict (`PyDict<String, PyValue>`).
                                 .is_some_and(|t| {
-                                    t.starts_with("PyDict < String")
-                                        && t.contains("PyValue")
+                                    matches!(
+                                        t,
+                                        crate::TypeInfo::Dict(k, v)
+                                            if matches!(k.as_ref(), crate::TypeInfo::String)
+                                                && matches!(v.as_ref(), crate::TypeInfo::PyValue)
+                                    )
                                 })
                     );
                     let value = if pyvalue_valued
@@ -1336,11 +1346,10 @@ fn self_field_read_clone(
     let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
     let fields = class.infer_fields(&class_symbols, options).ok()?;
     let (_, ty) = fields.iter().find(|(name, _)| *name == attr.attr)?;
-    let ty = ty.to_string();
-    let immutable = ty.contains("String")
-        || ty.contains("str")
-        || ty.contains("Vec < u8 >")
-        || ty.contains("Vec<u8>");
+    // An owned heap value anywhere inside — Option<String>,
+    // Vec<u8>, PyValue, String — clones out of the shared receiver
+    // (the structural twin of the old substring sniffing).
+    let immutable = crate::ast::tree::type_ctx::type_mentions_heap(ty);
     if !immutable {
         return None;
     }

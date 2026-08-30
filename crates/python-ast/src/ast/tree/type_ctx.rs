@@ -31,8 +31,10 @@ use crate::{
 };
 
 /// The Rust types codegen produces for Python expressions, at the
-/// granularity needed to insert coercions.
-#[derive(Clone, Debug, PartialEq)]
+/// granularity needed to insert coercions. `PartialEq` is manual:
+/// `proc_macro2::TokenStream` (the [`TypeInfo::Custom`] payload) has no
+/// structural equality, so that variant compares by its rendered spelling.
+#[derive(Clone, Debug)]
 pub enum TypeInfo {
     /// `i64`
     Int,
@@ -93,7 +95,70 @@ pub enum TypeInfo {
     /// as values (the callables-as-data divergence): the tolerated opaque
     /// type is `Option<()>`.
     ClassValue,
+    /// A runtime type with no structural meaning to the coercion
+    /// machinery — the exact Rust type, rendered verbatim
+    /// (`datetime::timedelta` — the datetime.timedelta struct). The
+    /// field/coercion layers treat it like any other TypeInfo; equality
+    /// is structural on the tokens (identical spellings compare equal).
+    Custom(TokenStream),
     PyObject,
+}
+
+impl PartialEq for TypeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TypeInfo::Custom(a), TypeInfo::Custom(b)) => {
+                a.to_string() == b.to_string()
+            }
+            _ => {
+                // Structural comparison of the remaining variants via
+                // Debug (every variant except Custom is structurally
+                // comparable; Debug renders them faithfully).
+                format!("{:?}", self) == format!("{:?}", other)
+            }
+        }
+    }
+}
+
+/// Whether a type mentions an OWNED heap value anywhere inside — PyValue,
+/// String/&str, or bytes — the structural twin of the old
+/// `tokens.contains("PyValue" | "String" | "Vec < u8 >")` sniffing used by
+/// the clone-safe field-read rule: such a field clones out of `&self`.
+pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
+    match t {
+        TypeInfo::PyValue
+        | TypeInfo::PyValueMember(_)
+        | TypeInfo::String
+        | TypeInfo::StrRef
+        | TypeInfo::Bytes
+        | TypeInfo::Custom(_) => true,
+        TypeInfo::Vec(inner)
+        | TypeInfo::Option(inner)
+        | TypeInfo::HashSet(inner)
+        | TypeInfo::Borrowed(inner) => type_mentions_heap(inner),
+        TypeInfo::Dict(k, v) => type_mentions_heap(k) || type_mentions_heap(v),
+        TypeInfo::Tuple(ts) => ts.iter().any(type_mentions_heap),
+        _ => false,
+    }
+}
+
+/// Whether a type mentions the boxed heterogeneous value ANYWHERE inside
+/// (`Vec<PyValue>`, `PyDict<String, PyValue>`, `Option<PyValue>`, ...).
+/// The structural twin of the old `tokens.to_string().contains("PyValue")`
+/// sniffing — a boxed-containing field types the whole value as dynamic
+/// (the boxed-receiver drop, the poisoned-BinOp rule, the clone-safe
+/// field rule).
+pub(crate) fn type_contains_pyvalue(t: &TypeInfo) -> bool {
+    match t {
+        TypeInfo::PyValue | TypeInfo::PyValueMember(_) => true,
+        TypeInfo::Vec(inner)
+        | TypeInfo::Option(inner)
+        | TypeInfo::HashSet(inner)
+        | TypeInfo::Borrowed(inner) => type_contains_pyvalue(inner),
+        TypeInfo::Dict(k, v) => type_contains_pyvalue(k) || type_contains_pyvalue(v),
+        TypeInfo::Tuple(ts) => ts.iter().any(type_contains_pyvalue),
+        _ => false,
+    }
 }
 
 impl TypeInfo {
@@ -162,6 +227,7 @@ impl TypeInfo {
             TypeInfo::Threading(t) => t.rust_path(),
             TypeInfo::Socket => quote!(socket::Socket),
             TypeInfo::ClassValue => quote!(Option<()>),
+            TypeInfo::Custom(t) => t.clone(),
             TypeInfo::PyObject => quote!(_),
         }
     }
@@ -189,6 +255,7 @@ impl TypeInfo {
             TypeInfo::Threading(t) => t.name().into(),
             TypeInfo::Socket => "socket".into(),
             TypeInfo::ClassValue => "type".into(),
+            TypeInfo::Custom(_) => "custom".into(),
             TypeInfo::PyObject => "unknown".into(),
         }
     }
@@ -827,12 +894,8 @@ pub(crate) fn self_field_move_clone(
     let ty = fields
         .iter()
         .find(|(name, _)| *name == attr.attr)
-        .map(|(_, ty)| ty.to_string())?;
-    let clone_safe = ty.contains("PyValue")
-        || ty.contains("String")
-        || ty.contains("Vec < u8 >")
-        || ty.contains("Vec<u8>")
-        || ty.contains("&'static str");
+        .map(|(_, ty)| ty.clone())?;
+    let clone_safe = crate::ast::tree::type_ctx::type_mentions_heap(&ty);
     if !clone_safe {
         return None;
     }
@@ -1346,7 +1409,7 @@ pub fn analyze_function_types_with_class(
                         continue;
                     }
                     if let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr) {
-                        if ty.to_string().starts_with("Option <") {
+                        if matches!(ty, crate::TypeInfo::Option(_)) {
                             // name_types only — the local IS the Option (its
                             // stores are already Option and must not Some-wrap
                             // again), and reads unwrap through the Option
