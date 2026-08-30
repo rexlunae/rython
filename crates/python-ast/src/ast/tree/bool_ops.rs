@@ -324,12 +324,12 @@ fn fold(
                 if op == BoolOps::And {
                     quote!({
                         let __rython_and = #first;
-                        if (__rython_and).is_truthy() { PyValue::from(#rest) } else { PyValue::from(#first) }
+                        if (__rython_and).is_truthy() { PyValue::from(#rest) } else { PyValue::from((__rython_and).clone()) }
                     })
                 } else {
                     quote!({
                         let __rython_or = #first;
-                        if (__rython_or).is_truthy() { PyValue::from(#first) } else { PyValue::from(#rest) }
+                        if (__rython_or).is_truthy() { PyValue::from((__rython_or).clone()) } else { PyValue::from(#rest) }
                     })
                 }
             }

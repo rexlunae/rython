@@ -3575,6 +3575,26 @@ fn boxed_index_by_int_projects_unpack_elements() {
     let b: PyValue = b"VMDI".to_vec().into();
     assert_eq!(b.py_index(0i64).unwrap(), PyValue::from(86));
     assert_eq!(b.py_index(3i64).unwrap(), PyValue::from(73));
-    // Out of range is an IndexError.
-    assert!(b.py_index(4i64).is_err(), "out of range is an IndexError");
+    // Negative indexes normalize to the last element (CPython
+    // `b"VMDI"[-1]` == 73), and out-of-range reads raise the exact
+    // per-type messages (Devin review on #263):
+    //   b"ab"[5] -> IndexError('index out of range')
+    //   (1, 2)[5] -> IndexError('tuple index out of range')
+    //   "ab"[5] -> IndexError('string index out of range')
+    assert_eq!(b.py_index(-1i64).unwrap(), PyValue::from(73));
+    let err = b.py_index(4i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "index out of range"));
+    let t: PyValue = (1, 2).into();
+    assert_eq!(t.py_index(-1i64).unwrap(), PyValue::from(2));
+    let err = t.py_index(5i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "tuple index out of range"));
+    let st: PyValue = "ab".into();
+    assert_eq!(st.py_index(-1i64).unwrap(), PyValue::from("b"));
+    let err = st.py_index(5i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "string index out of range"));
+    // Not-subscriptable values raise CPython's per-type TypeError text.
+    let err = PyValue::from(5i64).py_index(0i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'int' object is not subscriptable"));
+    let err = stdpython::PyValue::None_.py_index(0i64).unwrap_err();
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'NoneType' object is not subscriptable"));
 }

@@ -14225,24 +14225,24 @@ fn boxed_bool_fold_returns_the_python_operand_in_both_orders() {
     // `y and x`: truthy y -> the bool (x); `y or x`: truthy y -> the
     // value (y).
     assert!(
-        flat.contains("let__rython_and=y;if(__rython_and).is_truthy(){PyValue::from(x)}else{PyValue::from(y)}"),
-        "value-first AND must return the bool on a truthy value: {}",
+        flat.contains("let__rython_and=y;if(__rython_and).is_truthy(){PyValue::from(x)}else{PyValue::from((__rython_and).clone())}"),
+        "value-first AND must return the bool on a truthy value (via the bound temp, evaluated once): {}",
         out
     );
     assert!(
-        flat.contains("let__rython_or=y;if(__rython_or).is_truthy(){PyValue::from(y)}else{PyValue::from(x)}"),
-        "value-first OR must return the value on a truthy value: {}",
+        flat.contains("let__rython_or=y;if(__rython_or).is_truthy(){PyValue::from((__rython_or).clone())}else{PyValue::from(x)}"),
+        "value-first OR must return the value on a truthy value (via the bound temp, evaluated once): {}",
         out
     );
     // `x and y` (bool first): truthy x -> the value (y); `x or y`:
-    // truthy x -> the bool (x).
+    // truthy x -> the bool (x) — both via the bound temp.
     assert!(
-        flat.contains("let__rython_and=x;if(__rython_and).is_truthy(){PyValue::from(y)}else{PyValue::from(x)}"),
+        flat.contains("let__rython_and=x;if(__rython_and).is_truthy(){PyValue::from(y)}else{PyValue::from((__rython_and).clone())}"),
         "bool-first AND must return the value on a truthy bool: {}",
         out
     );
     assert!(
-        flat.contains("let__rython_or=x;if(__rython_or).is_truthy(){PyValue::from(x)}else{PyValue::from(y)}"),
+        flat.contains("let__rython_or=x;if(__rython_or).is_truthy(){PyValue::from((__rython_or).clone())}else{PyValue::from(y)}"),
         "bool-first OR must return the bool on a truthy bool: {}",
         out
     );

@@ -4540,23 +4540,42 @@ impl PyIndex<i64> for PyValue {
     type Output = PyValue;
     fn py_index(&self, key: i64) -> Result<PyValue, PyException> {
         match self {
-            PyValue::Bytes(b) => b
-                .get(key as usize)
-                .map(|&o| PyValue::Int(o as i64))
-                .ok_or_else(|| PyException::new("IndexError", "index out of range")),
-            PyValue::Tuple(members) => members
-                .get(key as usize)
-                .cloned()
-                .ok_or_else(|| PyException::new("IndexError", "index out of range")),
-            PyValue::Str(s) => {
-                if key < 0 {
-                    return Err(PyException::new("IndexError", "index out of range"));
-                }
-                s.chars()
-                    .nth(key as usize)
-                    .map(|c| PyValue::Str(c.to_string()))
-                    .ok_or_else(|| PyException::new("IndexError", "index out of range"))
+            PyValue::Bytes(b) => {
+                let i = normalize_index(key, b.len())
+                    .ok_or_else(|| PyException::new("IndexError", "index out of range"))?;
+                Ok(PyValue::Int(b[i] as i64))
             }
+            PyValue::Tuple(members) => {
+                let i = normalize_index(key, members.len())
+                    .ok_or_else(|| PyException::new("IndexError", "tuple index out of range"))?;
+                Ok(members[i].clone())
+            }
+            PyValue::Str(s) => {
+                let n = s.chars().count();
+                let i = normalize_index(key, n)
+                    .ok_or_else(|| PyException::new("IndexError", "string index out of range"))?;
+                Ok(PyValue::Str(s.chars().nth(i).unwrap().to_string()))
+            }
+            // CPython's per-type not-subscriptable TypeError texts (the
+            // round-57 projection never reaches these — the unpack RHS
+            // boxes as Bytes/Tuple — but a user's `boxed[i]` must not
+            // silently diverge).
+            PyValue::Int(_) => Err(PyException::new(
+                "TypeError",
+                "'int' object is not subscriptable",
+            )),
+            PyValue::Float(_) => Err(PyException::new(
+                "TypeError",
+                "'float' object is not subscriptable",
+            )),
+            PyValue::Bool(_) => Err(PyException::new(
+                "TypeError",
+                "'bool' object is not subscriptable",
+            )),
+            PyValue::None_ => Err(PyException::new(
+                "TypeError",
+                "'NoneType' object is not subscriptable",
+            )),
             _ => Err(PyException::new(
                 "TypeError",
                 "indices must be integers or slices",
