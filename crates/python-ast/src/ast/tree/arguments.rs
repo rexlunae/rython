@@ -148,7 +148,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
 pub(crate) fn is_optional_annotation(ann: &ExprType) -> bool {
     match ann {
         ExprType::Subscript(sub) => {
+            // `Optional[...]` and `typing.Optional[...]` (the latter from
+            // NamedTuple call-form fields — urllib3's Url).
             matches!(sub.value.as_ref(), ExprType::Name(n) if n.id == "Optional")
+                || matches!(sub.value.as_ref(), ExprType::Attribute(a)
+                    if a.attr == "Optional"
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing"))
         }
         ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
             crate::is_none_expr(&op.left) || crate::is_none_expr(&op.right)

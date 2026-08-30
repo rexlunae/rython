@@ -1402,7 +1402,7 @@ fn analyze_statement_types(
                         info.empty_pinned.insert(name.id.clone(), t);
                     }
                 }
-            } else if let [ExprType::Tuple(targets)] = assign.targets.as_slice()
+            } else if let [ExprType::Tuple(targets)] = assign.targets.as_slice() {
                 // A TUPLE-target destructure whose RHS is a call returning a
                 // typed tuple (`(body, content_type) = encode_multipart_
                 // formdata(...)` — `-> tuple[bytes, str]`, urllib3's
@@ -1410,17 +1410,34 @@ fn analyze_statement_types(
                 // locals so a later literal store into the String slot owns
                 // its &str literal (round 46). Only seeds names the plain
                 // analysis left untyped.
-                && let ExprType::Call(call) = &assign.value
-                && let Some(crate::TypeInfo::Tuple(infos)) =
-                    crate::call_return_typeinfo(call, symbols, options)
-                && targets.elts.len() == infos.len()
-            {
-                for (t, slot) in targets.elts.iter().zip(infos.iter()) {
-                    if let ExprType::Name(n) = t
-                        && !info.name_types.contains_key(&n.id)
-                        && !matches!(slot, TypeInfo::PyObject)
-                    {
-                        info.name_types.insert(n.id.clone(), slot.clone());
+                if let ExprType::Call(call) = &assign.value
+                    && let Some(crate::TypeInfo::Tuple(infos)) =
+                        crate::call_return_typeinfo(call, symbols, options)
+                    && targets.elts.len() == infos.len()
+                {
+                    for (t, slot) in targets.elts.iter().zip(infos.iter()) {
+                        if let ExprType::Name(n) = t
+                            && !info.name_types.contains_key(&n.id)
+                            && !matches!(slot, TypeInfo::PyObject)
+                        {
+                            info.name_types.insert(n.id.clone(), slot.clone());
+                        }
+                    }
+                }
+                // A tuple-target store of ALL-None literals (`auth, host,
+                // port = None, None, None` — urllib3's parse_url): each
+                // element name becomes an Option binding, mirroring the
+                // single-name None store above. Without this the names stay
+                // PyObject and a later `host = _normalize_host(...)` value
+                // double-wraps when passed to an Option slot (round 47).
+                if let ExprType::Tuple(vt) = &assign.value
+                    && vt.elts.len() == targets.elts.len()
+                    && vt.elts.iter().all(crate::is_none_expr)
+                {
+                    for t in &targets.elts {
+                        if let ExprType::Name(n) = t {
+                            info.optional_names.insert(n.id.clone());
+                        }
                     }
                 }
             }
@@ -1890,6 +1907,21 @@ pub fn resolve_alias_typeinfo(
     return result;
 }
 
+/// The bare container name of a Subscript's value (`Optional` for both
+/// `Optional[...]` and `typing.Optional[...]`, `dict` for `Dict[...]` /
+/// `typing.Dict[...]`). None for non-container values.
+fn subscript_container_name(sub: &crate::Subscript) -> Option<String> {
+    match sub.value.as_ref() {
+        ExprType::Name(n) => Some(n.id.clone()),
+        ExprType::Attribute(a)
+            if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+        {
+            Some(a.attr.clone())
+        }
+        _ => None,
+    }
+}
+
 fn resolve_alias_typeinfo_inner(
     ann: &ExprType,
     symbols: &SymbolTableScopes,
@@ -2200,6 +2232,28 @@ fn resolve_alias_typeinfo_inner(
         // A container generic whose ELEMENT may be an alias: rebuild with
         // the resolved element type.
         ExprType::Subscript(sub) => {
+            // `Optional[T]` / `typing.Optional[T]` — an OPTION of the
+            // inner type, NOT a boxed value: a NamedTuple field annotated
+            // `typing.Optional[str]` (`Url` — urllib3) is an
+            // `Option<String>` field; boxing it made every `self.scheme =
+            // scheme` store in the synthesized __init__ a
+            // `PyValue`-vs-`Option<String>` mismatch (round 46). The
+            // inner resolves through the same alias-aware path; an
+            // unresolvable inner stays the pre-existing loud fallback
+            // (rustc fails the field type).
+            if let (Some(c), crate::SubscriptKind::Index(inner)) =
+                (subscript_container_name(sub), &sub.kind)
+                && matches!(c.as_str(), "Optional")
+            {
+                return resolve_alias_typeinfo(inner, symbols, options).map(|t| {
+                    if matches!(t, TypeInfo::PyValue) {
+                        // A boxed inner already contains None.
+                        t
+                    } else {
+                        TypeInfo::Option(Box::new(t))
+                    }
+                });
+            }
             let container = match sub.value.as_ref() {
                 // Bare `Iterable[...]` / `IO[Any]` / `Sequence[...]` etc. —
                 // typing generics tolerated inside a boxed PyValue union.
