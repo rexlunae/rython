@@ -19,9 +19,15 @@
 //! and the runtime `matches` walk (in `PyException`), which is
 //! hand-written but reads interpreter-derived data.
 
+// The generated enum and its `from_name` are read only by the PyO3
+// surfacing below, so with `std` but no `pyo3-interop` they are unused.
+// The allow sits here rather than in the generated file, which is rendered
+// from the interpreter dump and must not be hand-edited.
+#![cfg_attr(not(feature = "pyo3-interop"), allow(dead_code))]
+
 include!("builtin_exceptions_gen.rs");
 
-#[cfg(feature = "std")]
+#[cfg(feature = "pyo3-interop")]
 impl BuiltinException {
     /// The real Python exception this type surfaces as through PyO3, so
     /// `raise ValueError(...)` reaches Python callers as an actual
@@ -30,7 +36,6 @@ impl BuiltinException {
     /// IndentationError/TabError/_IncompleteInputError (SyntaxErrors in
     /// CPython's tree) and none of the stdlib-module exceptions
     /// (OSErrors); each surfaces through that ancestor.
-    #[cfg(feature = "std")]
     pub(crate) fn pyo3_err(self, msg: String) -> pyo3::PyErr {
         use pyo3::exceptions::*;
         use BuiltinException::*;

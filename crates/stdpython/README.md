@@ -143,14 +143,18 @@ opt-in cargo **feature** instead of growing a mandatory dependency.
   crate (with rustls, so `https://` works) behind the **`http-ureq`**
   feature — `import urllib.request` in a converted package puts
   `features = ["http-ureq"]` on the generated stdpython dependency.
-- TLS and regular expressions follow: `ssl` sits behind **`ssl-rustls`**
-  and `re` behind **`re-regex`**. Both stay in this crate's own
-  `default` (so building or testing stdpython itself is unchanged), but
-  generated crates request the tier and its surfaces explicitly —
-  `default-features = false, features = ["std", …]` — so a converted
-  package that imports neither compiles neither rustls nor the regex
-  engine. That is 54 dependency crates down to 35, and roughly 40% less
-  CPU in the dependency build.
+- TLS, regular expressions and PyO3 interop follow: `ssl` sits behind
+  **`ssl-rustls`**, `re` behind **`re-regex`**, and the
+  `From<PyException> for pyo3::PyErr` surfacing plus the
+  `PyAny`/`PyObject` aliases behind **`pyo3-interop`** (enabled by
+  rypip's `--pyo3` mode, the one caller that needs them). All three stay
+  in this crate's own `default`, so building or testing stdpython itself
+  is unchanged — but generated crates request the tier and its surfaces
+  explicitly (`default-features = false, features = ["std", …]`), so a
+  converted package that needs none of them compiles neither rustls, nor
+  the regex engine, nor pyo3's proc-macro chain. That is **54 dependency
+  crates down to 23** and about two thirds less CPU in the dependency
+  build, leaving the std tier three crates above the alloc tier.
 
 ## Usage
 

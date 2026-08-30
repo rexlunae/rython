@@ -3398,6 +3398,13 @@ fn write_cargo_toml(
         if needs_async_stdpython {
             features.push("async-tokio");
         }
+        // `--pyo3` bindings call `.map_err(pyo3::PyErr::from)` on the
+        // generated wrappers, which needs stdpython's `From<PyException>
+        // for pyo3::PyErr`. Nothing else does, and pyo3 (with
+        // auto-initialize) is the std tier's most expensive dependency.
+        if opts.pyo3 {
+            features.push("pyo3-interop");
+        }
         features.extend(
             package_surface_features(package, python_deps, reachable)
                 .into_iter()
