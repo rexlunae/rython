@@ -606,6 +606,20 @@ fn py_type(py: &str) -> TypeInfo {
         // this a `a: np.ndarray` local inferred PyObject and the numpy
         // attribute/method lowerings never recognized it (issue #197).
         "ndarray" | "np.ndarray" | "numpy.ndarray" => TypeInfo::NdArray,
+        // A `T | None` annotation stored in local_types (`release_conn:
+        // bool | None` — urllib3): the name holds an Option — the inner
+        // type resolves through the same mapping (round 45).
+        _ if py.ends_with(" | None") => {
+            let inner = py.trim_end_matches(" | None").trim();
+            match inner {
+                "int" => TypeInfo::Option(Box::new(TypeInfo::Int)),
+                "float" => TypeInfo::Option(Box::new(TypeInfo::Float)),
+                "bool" => TypeInfo::Option(Box::new(TypeInfo::Bool)),
+                "str" => TypeInfo::Option(Box::new(TypeInfo::String)),
+                "bytes" => TypeInfo::Option(Box::new(TypeInfo::Bytes)),
+                _ => TypeInfo::PyObject,
+            }
+        }
         _ => TypeInfo::PyObject,
     }
 }
@@ -1310,6 +1324,19 @@ fn analyze_statement_types(
                             }
                             _ => syntactic_type(&assign.value),
                         },
+                        // A NAME value (`release_this_conn =
+                        // release_conn` where the param is `bool | None`
+                        // — urllib3's urlopen): the context-aware
+                        // inferrer resolves the Option through the
+                        // param's annotation, so the local is tracked as
+                        // an Option binding and later plain stores
+                        // Some-wrap (round 45).
+                        ExprType::Name(_) => match (options, symbols) {
+                            (Some(options), Some(symbols)) => {
+                                infer_type(&assign.value, options, symbols)
+                            }
+                            _ => syntactic_type(&assign.value),
+                        },
                         _ => syntactic_type(&assign.value),
                     },
                 };
@@ -1332,6 +1359,14 @@ fn analyze_statement_types(
                     && (annotated || !info.annotated_names.contains(&name.id))
                 {
                     info.name_types.insert(name.id.clone(), t.clone());
+                    // A local assigned from an OPTION-typed value
+                    // (`release_this_conn = release_conn` where the param
+                    // is `bool | None` — urllib3's urlopen) is itself an
+                    // Option binding: later plain stores must Some-wrap
+                    // through the Option-slot path (round 45).
+                    if matches!(t, TypeInfo::Option(_)) {
+                        info.optional_names.insert(name.id.clone());
+                    }
                     // Empty container: remember it to pin from later use.
                     if is_empty_container(&assign.value) {
                         info.empty_pinned.insert(name.id.clone(), t);
