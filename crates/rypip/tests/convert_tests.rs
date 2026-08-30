@@ -7577,6 +7577,69 @@ fn typing_optional_namedtuple_fields_match_cpython() {
 }
 
 #[test]
+fn option_field_or_fold_and_narrowed_call_match_cpython() {
+    // Round 48: `self.path or "/"` on a `str | None` field (urllib3's
+    // Url) unwraps to the plain string (Python's result is never None),
+    // and `ca_certs and os.path.expanduser(ca_certs)` passes the
+    // UNWRAPPED inner to the call. Output verified against CPython 3.11
+    // (`None`/`/tmp/x` for the and-fold; `/`, `/x` for the or-fold).
+    let scratch = Scratch::new("fieldor");
+    let pkg = scratch.path().join("probe");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("__init__.py"),
+        concat!(
+            "import os\n",
+            "from typing import NamedTuple\n",
+            "\n",
+            "class Url(NamedTuple):\n",
+            "    path: str | None\n",
+            "    query: str | None\n",
+            "\n",
+            "    def request_uri(self) -> str:\n",
+            "        return self.path or \"/\"\n",
+            "\n",
+            "def run(u: Url) -> str:\n",
+            "    return u.request_uri()\n",
+            "\n",
+            "def pick(ca: str | None) -> str | None:\n",
+            "    return ca and os.path.expanduser(ca)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(run(Url(None, None)))\n",
+            "    print(run(Url(\"/x\", \"q\")))\n",
+            "    print(pick(None))\n",
+            "    print(pick(\"/tmp/x\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/probe"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["/", "/x", "None", "/tmp/x"],
+        "stdout: {}",
+        stdout
+    );
+}
+
+#[test]
 fn dict_returning_self_method_and_string_slots_match_cpython() {
     // Round 46: a local assigned from a DICT-returning self-method call
     // (`ctx = self._merge(None)` where _merge is `-> dict[str, object]`)

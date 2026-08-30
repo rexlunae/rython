@@ -272,7 +272,15 @@ The `Option` arm also fires when the other operand's type is UNKNOWN (a
 call whose return is unresolved but renders the inner type) or a string
 LITERAL (which is owned at the wrap — `Some(("http").to_string())` for
 `scheme or "http"`), and a BoolOp with an Option operand yields an
-Option for store purposes (round 43). An ununifiable mix (`bool and
+Option for store purposes (round 43). The truthy arm of an `Option and
+call(option)` fold passes the UNWRAPPED inner to the call
+(`ca_certs and os.path.expanduser(ca_certs)` — round 48): Python's
+`expanduser` receives the string, never `None`. A SELF-FIELD `Option<T>
+or <concrete T>` fold (`self.path or "/"` — urllib3's Url, whose
+`-> str` property needs the plain value) UNWRAPS to the inner `T` and
+defaults to the concrete operand — Python's result is never `None`
+(round 48); a NAME-typed Option operand (`scheme or "http"`) keeps the
+Option-producing fold. An ununifiable mix (`bool and
 str`, two different types) falls back to Rust's `&&`/`||`, which fails
 loudly in rustc (§12.1) rather than silently returning a bool where
 Python returns a value. `a or None` gets Option semantics via the same
