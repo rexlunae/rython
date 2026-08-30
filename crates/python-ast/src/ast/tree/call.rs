@@ -6635,14 +6635,24 @@ impl<'a> CodeGen for Call {
             // when that type is outside the tested set).
             if sites.iter().any(|s| s.boxed || s.py_ty.is_none()) {
                 let Some(router) = &spec.router else {
-                    return Err(format!(
-                        "cannot dispatch `{}` on a boxed or statically-unknown \
-                         value: its dynamic router is unavailable (a parameter \
-                         without a concrete annotation, or an underivable morph \
-                         return type); annotate the value with a concrete type",
+                    // Round 54: a boxed/unknown axis argument with no
+                    // dynamic router (an unannotated non-axis parameter
+                    // blocked planning) — the isinstance dispatch cannot
+                    // run, so the call DROPS loudly (the dynamic-dispatch
+                    // divergence) instead of failing the whole module:
+                    // requests' `_validate_header_part(header, name, 0)`
+                    // where `name` comes from an untyped tuple
+                    // destructure. The warning names the rewrite.
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "`{}(...)` is dropped: its isinstance-dispatch axis argument \
+                         is a boxed or statically-unknown value and no dynamic router \
+                         could be planned (an unannotated non-axis parameter or an \
+                         underivable morph return type); annotate the argument or \
+                         the callee's non-axis parameters to keep the dispatch \
+                         (the dynamic-dispatch divergence)",
                         callee_name.id
-                    )
-                    .into());
+                    ));
+                    return Ok(quote!(stdpython::PyValue::None_));
                 };
                 // Route the whole call through the router: each axis
                 // parameter is `impl Into<Enum>`, so a boxed argument

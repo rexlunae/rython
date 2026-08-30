@@ -20,6 +20,11 @@
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
       "note": "Unblocked in round 53 (reassigned-param boxing): converts and builds (~318 rustc errors, measurable). Previously failed to convert entirely."
+    },
+    {
+      "name": "requests",
+      "requirement": "requests==2.32.3",
+      "note": "Unblocked in round 54 (boxed isinstance-dispatch without a router drops loudly): converts and builds (~121 rustc errors, measurable). Previously failed to convert entirely."
     }
   ]
 }
