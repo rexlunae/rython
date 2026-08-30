@@ -5526,14 +5526,43 @@ impl PyContains<String> for String {
 pub struct PyException {
     pub message: String,
     pub exception_type: String,
+    /// The raised type's BUILTIN discriminant, computed once at
+    /// construction (round 52): `except ValueError:` from generated code
+    /// lowers to `matches_builtin(BuiltinException::ValueError)` — an
+    /// integer comparison against this and the variant's ancestor slice —
+    /// instead of a string walk plus MRO table search per clause. User
+    /// classes (an open set) have `None` and keep the string `matches`.
+    pub discriminant: Option<crate::builtin_exceptions::BuiltinException>,
 }
 
 impl PyException {
     pub fn new<T: AsRef<str>, M: AsRef<str>>(exception_type: T, message: M) -> Self {
+        let exception_type = exception_type.as_ref();
         Self {
             message: message.as_ref().to_string(),
-            exception_type: exception_type.as_ref().to_string(),
+            exception_type: exception_type.to_string(),
+            discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
         }
+    }
+
+    /// Whether this exception is caught by a BUILTIN exception clause
+    /// (`except ValueError:`) — the round-52 fast path: the raised
+    /// type's discriminant compared against the target and the target's
+    /// ancestor slice (both integers, no string walk). An exception
+    /// raised OUTSIDE the builtin tree (a user class) has no
+    /// discriminant and is caught only by `Exception`/`BaseException`,
+    /// exactly like [`PyException::matches`].
+    pub fn matches_builtin(&self, target: crate::builtin_exceptions::BuiltinException) -> bool {
+        use crate::builtin_exceptions::BuiltinException;
+        let Some(raised) = self.discriminant else {
+            // A raised user class: the broad posture, same as matches().
+            return target == BuiltinException::Exception
+                || target == BuiltinException::BaseException;
+        };
+        if raised == target {
+            return true;
+        }
+        raised.ancestors().contains(&target)
     }
 
     /// Whether this exception is caught by an `except <name>:` clause.
@@ -5848,6 +5877,10 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 // ============================================================================
 
 mod builtin_exceptions;
+/// The built-in exception discriminant, re-exported so generated code's
+/// `use stdpython::*;` names it in `matches_builtin(BuiltinException::X)`
+/// (round 52).
+pub use builtin_exceptions::BuiltinException;
 mod percent_format;
 
 /// Python Standard Library modules

@@ -1086,6 +1086,49 @@ fn exception_matching_walks_the_cpython_hierarchy() {
 }
 
 #[test]
+fn builtin_discriminant_matching_walks_the_same_cpython_hierarchy() {
+    // Round 52: `matches_builtin` is the discriminant fast path generated
+    // code emits for literal `except <builtin>:` clauses. It must agree
+    // with the string `matches` walk exactly — same interpreter-derived
+    // MRO, integer comparison instead of string search. Every assertion
+    // here mirrors one in
+    // `exception_matching_walks_the_cpython_hierarchy` (same CPython
+    // 3.14 verification).
+    use stdpython::{BuiltinException as B, PyException};
+    let file_nf = PyException::new("FileNotFoundError", "gone");
+    assert!(file_nf.matches_builtin(B::FileNotFoundError));
+    assert!(file_nf.matches_builtin(B::OSError));
+    assert!(file_nf.matches_builtin(B::Exception));
+    assert!(file_nf.matches_builtin(B::BaseException));
+    assert!(!file_nf.matches_builtin(B::KeyError), "siblings do not catch");
+
+    let key_err = PyException::new("KeyError", "k");
+    assert!(key_err.matches_builtin(B::LookupError));
+    assert!(!PyException::new("IndexError", "i").matches_builtin(B::KeyError));
+
+    assert!(
+        PyException::new("UnicodeDecodeError", "bad").matches_builtin(B::ValueError),
+        "two-hop ancestry through UnicodeError"
+    );
+    assert!(PyException::new("TabError", "tabs").matches_builtin(B::SyntaxError));
+
+    for base_only in ["SystemExit", "KeyboardInterrupt", "GeneratorExit"] {
+        assert!(
+            !PyException::new(base_only, "").matches_builtin(B::Exception),
+            "{base_only} must not be caught by except Exception:"
+        );
+        assert!(PyException::new(base_only, "").matches_builtin(B::BaseException));
+    }
+
+    // A raised USER class has no discriminant: only the broad posture
+    // (same as matches()).
+    let user = PyException::new("MyError", "u");
+    assert!(user.matches_builtin(B::Exception));
+    assert!(user.matches_builtin(B::BaseException));
+    assert!(!user.matches_builtin(B::ValueError));
+}
+
+#[test]
 fn exception_leaf_constructors_carry_their_type_names() {
     use stdpython::*;
     assert_eq!(import_error("no module").exception_type, "ImportError");

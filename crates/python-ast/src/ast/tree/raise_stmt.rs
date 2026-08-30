@@ -267,6 +267,28 @@ pub const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "ZeroDivisionError",
 ];
 
+/// The BUILTIN exception ALIASES — names bound to another class object,
+/// so their `BuiltinException` variant is the CANONICAL name's
+/// (`EnvironmentError`/`IOError` ARE `OSError`; the runtime's
+/// `from_name` maps them). The round-52 fast path must not emit
+/// `BuiltinException::EnvironmentError` — no such variant exists.
+fn is_builtin_alias_name(name: &str) -> bool {
+    matches!(name, "EnvironmentError" | "IOError")
+}
+
+/// The `BuiltinException` variant ident for a NON-ALIAS builtin name
+/// (`ValueError` → `ValueError`): the round-52 fast path for a literal
+/// `except ValueError:` clause — the runtime compares the raised
+/// exception's discriminant against the variant and its ancestor slice
+/// (no string walk). None for aliases (their variant is the canonical
+/// name's) and for non-builtins (user classes stay on the string path).
+pub(crate) fn builtin_exception_variant(name: &str) -> Option<String> {
+    if !is_builtin_exception_name(name) || is_builtin_alias_name(name) {
+        return None;
+    }
+    Some(crate::exception_tree::variant_ident(name))
+}
+
 /// Whether a name is a BUILTIN exception class — the fixed set only, no
 /// naming heuristic (annotation typing and boxability must not absorb
 /// user classes that merely end in "Error").

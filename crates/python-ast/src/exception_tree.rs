@@ -46,8 +46,9 @@ pub fn dump_builtin_exception_tree() -> Result<(String, String, Vec<(String, Vec
 /// A Python exception name, as a Rust enum variant ident
 /// (`"gaierror"` → `Gaierror`, `"_IncompleteInputError"` →
 /// `IncompleteInputError`). Exception names are Python identifiers, so
-/// only case and leading underscores need handling.
-fn variant_ident(canonical: &str) -> String {
+/// only case and leading underscores need handling. `pub(crate)` so the
+/// except-clause lowering can emit `BuiltinException::<ident>` (round 52).
+pub(crate) fn variant_ident(canonical: &str) -> String {
     let trimmed = canonical.trim_start_matches('_');
     let mut chars = trimmed.chars();
     let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
@@ -86,6 +87,8 @@ pub fn render_builtin_exceptions_gen(
         }
     }
     variants.sort();
+    let canon_to_ident: std::collections::HashMap<&str, &str> =
+        variants.iter().map(|(c, i)| (*c, i.as_str())).collect();
 
     let mut out = String::new();
     writeln!(
@@ -148,25 +151,25 @@ pub fn render_builtin_exceptions_gen(
     ).expect("fmt into String");
     writeln!(
         out,
-        "/// std-only: only the PyO3 surfacing (`pyo3_err`) and its tests use the \
-         enum; the core/alloc tiers match through the MRO table alone."
+        "/// Available in every tier: `PyException` carries a discriminant in \
+         core/alloc too (the enum is pure data — unit variants and string \
+         matches — with no std dependency); only the PyO3 surfacing \
+         (`pyo3_err`) is std-gated."
     ).expect("fmt into String");
-    writeln!(out, "#[cfg(feature = \"std\")]").expect("fmt into String");
     writeln!(out, "#[derive(Clone, Copy, PartialEq, Eq, Debug)]").expect("fmt into String");
-    writeln!(out, "pub(crate) enum BuiltinException {{").expect("fmt into String");
+    writeln!(out, "pub enum BuiltinException {{").expect("fmt into String");
     for (_, ident) in &variants {
         writeln!(out, "    {ident},").expect("fmt into String");
     }
     writeln!(out, "}}").expect("fmt into String");
     writeln!(out).expect("fmt into String");
-    writeln!(out, "#[cfg(feature = \"std\")]").expect("fmt into String");
     writeln!(out, "impl BuiltinException {{").expect("fmt into String");
     writeln!(
         out,
         "    /// The ONE string→enum boundary — generated from the same dump as the \
          variant list, so aliases and variants cannot drift."
     ).expect("fmt into String");
-    writeln!(out, "    pub(crate) fn from_name(name: &str) -> Option<Self> {{").expect("fmt into String");
+    writeln!(out, "    pub fn from_name(name: &str) -> Option<Self> {{").expect("fmt into String");
     writeln!(out, "        match name {{").expect("fmt into String");
     for (name, mro) in tree {
         let canonical = mro.first().expect("non-empty mro");
@@ -194,6 +197,29 @@ pub fn render_builtin_exceptions_gen(
         writeln!(out, "        Self::{ident},").expect("fmt into String");
     }
     writeln!(out, "    ];").expect("fmt into String");
+    writeln!(out).expect("fmt into String");
+    writeln!(
+        out,
+        "    /// The variant's ancestors (its `__mro__[1..]` as variants) — \
+         generated from the same dump, so the discriminant match needs no \
+         string walk: `except ValueError:` compares integers (round 52)."
+    ).expect("fmt into String");
+    writeln!(out, "    pub fn ancestors(self) -> &'static [Self] {{").expect("fmt into String");
+    writeln!(out, "        match self {{").expect("fmt into String");
+    for (canonical, ident) in &variants {
+        let row = tree.iter().find(|(n, _)| n == canonical).expect("canonical row exists");
+        let anc: Vec<&str> = row.1.iter().skip(1).filter_map(|a| {
+            canon_to_ident.get(a.as_str()).copied()
+        }).collect();
+        if anc.is_empty() {
+            writeln!(out, "            Self::{ident} => &[],").expect("fmt into String");
+        } else {
+            let qualified: Vec<String> = anc.iter().map(|a| format!("Self::{a}")).collect();
+            writeln!(out, "            Self::{ident} => &[{}],", qualified.join(", ")).expect("fmt into String");
+        }
+    }
+    writeln!(out, "        }}").expect("fmt into String");
+    writeln!(out, "    }}").expect("fmt into String");
     writeln!(out, "}}").expect("fmt into String");
     Ok(out)
 }
@@ -272,6 +298,18 @@ mod tests {
         let (version, platform, tree) = dump_builtin_exception_tree().expect("interpreter dump");
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../stdpython/src/builtin_exceptions_gen.rs");
+        // RYTHON_REGEN unconditionally rewrites the file (not just on
+        // divergence): the generator's OWN output shape changes (new
+        // derived tables) must be foldable in too.
+        if std::env::var_os("RYTHON_REGEN").is_some() {
+            let expected = render_builtin_exceptions_gen(&version, &platform, &tree)
+                .expect("render the generated file");
+            std::fs::write(&path, &expected).expect("write the regenerated file");
+            panic!(
+                "exception tree regenerated from CPython {version} ({platform}); \
+                 the test now passes on the next run"
+            );
+        }
         let current = std::fs::read_to_string(&path)
             .expect("stdpython/src/builtin_exceptions_gen.rs must exist");
         let checked_in = parse_checked_in_table(&current);
@@ -295,15 +333,6 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            if std::env::var_os("RYTHON_REGEN").is_some() {
-                let expected = render_builtin_exceptions_gen(&version, &platform, &tree)
-                    .expect("render the generated file");
-                std::fs::write(&path, &expected).expect("write the regenerated file");
-                panic!(
-                    "exception tree regenerated from CPython {version} ({platform}); \
-                     the test now passes on the next run"
-                );
-            }
             panic!(
                 "the checked-in exception tree (stdpython/src/builtin_exceptions_gen.rs) \
                  diverged from CPython {version} ({platform}): {detail}; regenerate with \

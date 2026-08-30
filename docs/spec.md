@@ -475,6 +475,18 @@ Consequences, all enforced loudly:
   the same static decision: the runtime item when it exists
   (promoted to a `pub use` alias at module level), else the default.
 
+An `except <builtin>:` clause whose class name is a source literal
+(`except ValueError:`, `except socket.timeout:` — the dotted spelling
+canonicalizes) lowers to a DISCRIMINANT comparison: `PyException`
+carries the raised type's `BuiltinException` variant computed once at
+construction, and the handler tests it against the clause's variant and
+its precomputed ancestor slice — no string walk per clause (round 52).
+Builtin ALIASES (`except EnvironmentError:` — a variant of OSError) and
+user-defined classes keep the string `matches` walk (the alias has no
+variant of its own; user classes are an open set). The semantics are
+byte-identical to the string walk — the interpreter-derived MRO table
+drives both, and a runtime pin verifies the two agree.
+
 ---
 
 ## 6. Functions
