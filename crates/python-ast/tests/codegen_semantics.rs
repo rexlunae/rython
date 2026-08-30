@@ -3617,6 +3617,76 @@ fn tuple_destructure_string_literal_owns_into_string_slot() {
 }
 
 #[test]
+fn version_gate_bare_form_splices_module_defs() {
+    // Round 51: `if sys.version_info >= (3, 11):` at MODULE level — the
+    // bare (non-subscripted) form — was never statically evaluated (the
+    // gate arm passed the receiver Name to is_sys_version_info), so the
+    // guarded `def` stayed nested inside __module_init__ (invalid Rust).
+    // The bare form now evaluates against rython's target (3.11.0) and
+    // the taken branch's statements splice into the module body BEFORE
+    // every pass — a version-gated def is a module item (certifi's
+    // core.py: 12 errors -> 0).
+    let out = compile(
+        concat!(
+            "import sys\n",
+            "if sys.version_info >= (3, 11):\n",
+            "    def where() -> str:\n",
+            "        return \"x\"\n",
+            "else:\n",
+            "    def where() -> str:\n",
+            "        return \"old\"\n",
+        ),
+        "vergate.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("(sys::version_info)"),
+        "the version gate must be decided at conversion time, not emitted: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfnr#where()->Result<String,PyException>"),
+        "the taken branch's def must be a module item: {}",
+        out
+    );
+    assert!(
+        !flat.contains("\"old\""),
+        "the dead branch must be dropped: {}",
+        out
+    );
+}
+
+// The external-chain typed-return panic is pinned in the MULTI-module
+// e2e suite (crates/rypip/tests/convert_tests.rs): a single-module
+// conversion treats every import as a potential sibling, so the
+// external-module drop only fires under rypip's crate-wide resolution
+// (certifi's contents() — the round-51 milestone).
+
+#[test]
+fn boxed_global_read_in_typed_return_panics_loudly() {
+    // Round 51: reading a BOXED mutable global (the None-initialized
+    // `_CACERT_PATH` — certifi's where()) from a `-> str` function: the
+    // global's value is the boxed PyValue, which the typed return cannot
+    // express — the exact point of divergence is a loud panic.
+    let out = compile(
+        concat!(
+            "_CACERT_PATH = None\n",
+            "def where() -> str:\n",
+            "    global _CACERT_PATH\n",
+            "    _CACERT_PATH = \"x\"\n",
+            "    return _CACERT_PATH\n",
+        ),
+        "boxedglobal.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("panic!") && flat.contains("boxed-global"),
+        "the typed return of a boxed global read must panic loudly: {}",
+        out
+    );
+}
+
+#[test]
 fn one_type_authority_annotation_rendering_pins() {
     // Round 49 (issue #137's systemic review of rounds 38–47): the three
     // annotation resolvers collapsed into one TypeInfo authority, with the

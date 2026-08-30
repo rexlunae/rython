@@ -1265,6 +1265,20 @@ catchable `PyException`:
   arrays of different shapes). The function spelling `np.add(a, b)`
   raises a catchable `ValueError`; the operator traits have no fallible
   form yet, so that spelling panics with the same message.
+- Returning an EXTERNAL-MODULE value from a typed (non-`PyValue`)
+  function — `return files("certifi").joinpath("cacert.pem").
+  read_text("ascii")` (certifi's `contents()`, an importlib.resources
+  chain) or `return _CACERT_PATH` where the global is a boxed `None`-
+  initialized mutable static (certifi's `where()`): the value genuinely
+  cannot exist in the generated crate (the call chain was dropped at
+  conversion time with a `-W` warning), so the return is a panic at the
+  exact point of divergence, never a plausible-looking placeholder
+  (round 51; certifi 2025.1.31 measures **0** rustc errors).
+- Module-level `if sys.version_info >= (3, N):` gates are decided at
+  conversion time (rython targets 3.11.0) and the taken branch's
+  statements are spliced into the module body — a version-gated `def`
+  is a module item, and the dead branches are dropped with a `-W`
+  warning (round 51; certifi's core.py).
 
 The intended model is the one `ZeroDivisionError` already follows —
 fallible operations return `Result<T, PyException>` and propagate with

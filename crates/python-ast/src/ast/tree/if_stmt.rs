@@ -210,8 +210,10 @@ fn const_bool_tokens(test: &TokenStream) -> Option<bool> {
 /// targets Python 3, so the gate's truth value is known at conversion
 /// time. Returns `Some(taken)` when the test is a recognized version
 /// gate (whether the guarded branch is the one that runs), `None` when
-/// the test is not one.
-fn version_gate_taken(test: &ExprType) -> Option<bool> {
+/// the test is not one. `pub(crate)` so the module walker can splice the
+/// taken branch at MODULE level (a version-gated `def` must be a module
+/// item, not a nested function — certifi's core.py).
+pub(crate) fn version_gate_taken(test: &ExprType) -> Option<bool> {
     // The simulated version rython reports (Python 3.11.0).
     const VERSION: [i64; 3] = [3, 11, 0];
 
@@ -223,10 +225,11 @@ fn version_gate_taken(test: &ExprType) -> Option<bool> {
     }
     // Left side: `sys.version_info` (optionally subscripted, e.g. `[0]`).
     let (left_is_sys_version, left_index): (bool, Option<i64>) = match &*c.left {
-        ExprType::Attribute(a) => {
-            let root = is_sys_version_info(&a.value);
-            (root, None)
-        }
+        // The bare form (`sys.version_info >= (3, 11)` — certifi's
+        // core.py): the ATTRIBUTE itself is the version tuple; passing
+        // the receiver Name made every bare gate fall through (only the
+        // subscripted `[0]` form ever fired).
+        ExprType::Attribute(_) => (is_sys_version_info(&*c.left), None),
         ExprType::Subscript(s) => {
             if !is_sys_version_info(&s.value) {
                 return None;
