@@ -3243,7 +3243,23 @@ impl<'a> Collector<'a> {
                                 // parameter becomes a boxed PyValue.
                                 self.value_pinned.insert(target.id.clone());
                             } else {
-                                self.reassigned.insert(target.id.clone());
+                                // Any OTHER reassignment (`hooks = hooks
+                                // or {}` — the None-default idiom — or
+                                // `hook_data = _hook_data`, a local from a
+                                // dropped call — requests' dispatch_hook,
+                                // the ~20-round unblock): the parameter's
+                                // type genuinely changes at runtime, so
+                                // the honest model is the boxed PyValue
+                                // (the same fallback as a call-result
+                                // reassignment), with a definition warning
+                                // naming the rewrite. Downstream uses of
+                                // the boxed value stay loud (boxed-
+                                // receiver drops, E0599).
+                                self.value_pinned.insert(target.id.clone());
+                                self.options.definition_warnings.borrow_mut().push(format!(
+                                    "parameter `{}` is reassigned inside the function, so                                      it lowers as the boxed PyValue (the inferred generic                                      cannot change); annotate the parameter to keep a                                      concrete type",
+                                    target.id
+                                ));
                             }
                         } else if let Some(ty) = literal_concrete_type(&a.value) {
                             // A LITERAL store to a plain local: remember the

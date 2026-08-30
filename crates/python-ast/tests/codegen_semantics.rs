@@ -3651,6 +3651,33 @@ fn literal_builtin_except_clauses_lower_to_discriminant_matches() {
 }
 
 #[test]
+fn reassigned_unannotated_param_boxes_with_warning() {
+    // Round 53: `hooks = hooks or {}` / `hook_data = _hook_data` —
+    // requests' dispatch_hook (the ~20-round unblock): an unannotated
+    // parameter reassigned inside the function cannot keep one inferred
+    // generic type, so it lowers as the boxed PyValue (the honest
+    // dynamic-shape fallback) with a definition warning, instead of
+    // failing the whole module. charset_normalizer converts again;
+    // requests progresses past hooks.py.
+    let (out, warnings) = compile_with_warnings(
+        "def dispatch_hook(key, hooks, hook_data):\n    hooks = hooks or {}\n    hooks = hooks.get(key)\n    return hook_data\n",
+        "reassigned.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("hooks:stdpython::PyValue")
+            || flat.contains("hooks:PyValue"),
+        "the reassigned param must box to PyValue: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("reassigned") && w.contains("boxed PyValue")),
+        "the boxing must carry a definition warning: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn version_gate_bare_form_splices_module_defs() {
     // Round 51: `if sys.version_info >= (3, 11):` at MODULE level — the
     // bare (non-subscripted) form — was never statically evaluated (the

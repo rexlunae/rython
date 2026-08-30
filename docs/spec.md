@@ -475,6 +475,15 @@ Consequences, all enforced loudly:
   the same static decision: the runtime item when it exists
   (promoted to a `pub use` alias at module level), else the default.
 
+An UNANNOTATED parameter that is REASSIGNED inside the function
+(`hooks = hooks or {}`, `hook_data = _hook_data` — requests'
+`dispatch_hook`) cannot keep one inferred generic type: it lowers as
+the boxed PyValue with a definition warning naming the rewrite
+(`annotate the parameter to keep a concrete type`) instead of failing
+the module (round 53 — unblocks charset_normalizer and lets requests
+progress past hooks.py). Downstream uses of the boxed value stay loud
+(boxed-receiver drops, E0599).
+
 An `except <builtin>:` clause whose class name is a source literal
 (`except ValueError:`, `except socket.timeout:` — the dotted spelling
 canonicalizes) lowers to a DISCRIMINANT comparison: `PyException`

@@ -1,8 +1,25 @@
 {
   "_comment": "The issue #137 sweep corpus, pinned. run_sweep.py converts each package with rypip (which resolves the pinned version from PyPI into its cache), builds the generated crate, and records the rustc error histogram. Keep this list small and meaningful: each package adds a full convert+build to every sweep.",
   "packages": [
-    {"name": "urllib3", "requirement": "urllib3==2.0.7", "note": "The historical #137 corpus. Every round's delta is measured against this."},
-    {"name": "certifi", "requirement": "certifi==2025.1.31", "note": "Close to a fully-clean package (was ~8 errors); a clean package is a far better regression canary than a 1600-error crate."},
-    {"name": "idna", "requirement": "idna==3.10", "note": "Comparable in size to urllib3, never tracked round to round."}
+    {
+      "name": "urllib3",
+      "requirement": "urllib3==2.0.7",
+      "note": "The historical #137 corpus. Every round's delta is measured against this."
+    },
+    {
+      "name": "certifi",
+      "requirement": "certifi==2025.1.31",
+      "note": "Close to a fully-clean package (was ~8 errors); a clean package is a far better regression canary than a 1600-error crate."
+    },
+    {
+      "name": "idna",
+      "requirement": "idna==3.10",
+      "note": "Comparable in size to urllib3, never tracked round to round."
+    },
+    {
+      "name": "charset_normalizer",
+      "requirement": "charset-normalizer==3.4.1",
+      "note": "Unblocked in round 53 (reassigned-param boxing): converts and builds (~318 rustc errors, measurable). Previously failed to convert entirely."
+    }
   ]
 }
