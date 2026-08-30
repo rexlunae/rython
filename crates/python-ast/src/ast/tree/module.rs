@@ -2030,7 +2030,10 @@ pub fn module_imports_root(body: &[crate::Statement], root: &str) -> bool {
                     || any(&t.finalbody)
             }
             crate::StatementType::With(w) => any(&w.body),
+            crate::StatementType::AsyncWith(w) => any(&w.body),
+            crate::StatementType::AsyncFor(f) => any(&f.body) || any(&f.orelse),
             crate::StatementType::FunctionDef(f) => any(&f.body),
+            crate::StatementType::AsyncFunctionDef(f) => any(&f.body),
             _ => false,
         }
     }

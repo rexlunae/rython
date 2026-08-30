@@ -1905,7 +1905,17 @@ pub fn convert(
         }
         let has_binary = false;
         let warnings = Vec::new();
-        write_cargo_toml(package, out_dir, opts, has_binary, &manifest, kernel.uses_shim)?;
+        // Kernel modules take the alloc-tier branch below, which carries no
+        // surface features, so there are no vendored deps to consider.
+        write_cargo_toml(
+            package,
+            &[],
+            out_dir,
+            opts,
+            has_binary,
+            &manifest,
+            kernel.uses_shim,
+        )?;
         if !opts.rust_for_linux {
             // rust-for-linux modules are registered in the kernel tree's
             // Kbuild Makefile (rust-obj-m += <name>.o), not a standalone one.
@@ -2175,6 +2185,7 @@ pub fn convert(
 
     write_cargo_toml(
         package,
+        &python_deps,
         out_dir,
         opts,
         has_binary,
@@ -2479,7 +2490,7 @@ fn convert_driver(
         .replace("@@IOC_STATS@@", &format!("{:x}", manifest.ioc_stats));
     fs::write(src_dir.join("main.rs"), format_rust(&main))?;
 
-    write_cargo_toml(package, out_dir, opts, true, &manifest, false)?;
+    write_cargo_toml(package, &python_deps, out_dir, opts, true, &manifest, false)?;
 
     Ok(ConvertedCrate {
         root: out_dir.to_path_buf(),
@@ -3001,9 +3012,21 @@ impl SurfaceFeature {
 
 /// The surfaces the package's imports ask for. Parses each module once and
 /// tests every root against it, rather than re-parsing per feature.
-fn package_surface_features(package: &PyPackage) -> Vec<SurfaceFeature> {
+///
+/// Discovery has to span everything the conversion transpiles into the
+/// crate, not just the root package: vendored `[python-modules]` deps are
+/// written as sibling modules, so an `import re` in one of them needs the
+/// surface just as much as one in the entry module.
+fn package_surface_features(
+    package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
+) -> Vec<SurfaceFeature> {
     let mut needed: Vec<SurfaceFeature> = Vec::new();
-    for module in &package.modules {
+    let modules = package
+        .modules
+        .iter()
+        .chain(python_deps.iter().flat_map(|(_, dep)| dep.modules.iter()));
+    for module in modules {
         let Ok(ast) = parse_enhanced(&module.source, parse_filename(module)) else {
             continue;
         };
@@ -3277,6 +3300,7 @@ fn cargo_version(v: &str) -> String {
 
 fn write_cargo_toml(
     package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
     out_dir: &Path,
     opts: &ConvertOptions,
     has_binary: bool,
@@ -3357,7 +3381,7 @@ fn write_cargo_toml(
             features.push("async-tokio");
         }
         features.extend(
-            package_surface_features(package)
+            package_surface_features(package, python_deps)
                 .into_iter()
                 .map(SurfaceFeature::cargo_feature),
         );
