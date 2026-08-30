@@ -4,4 +4,5 @@
 //! OSError, HTTPError IS-A URLError), so no runtime module is needed for
 //! them.
 
+pub mod parse;
 pub mod request;

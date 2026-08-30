@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Every round's delta is measured against this."
+      "note": "The historical #137 corpus. Round 55: the bool-and-boxed-value fold fix and the urllib.parse calls (~1086 rustc errors, measurable; every round's delta is measured against this)."
     },
     {
       "name": "certifi",
@@ -19,12 +19,12 @@
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Unblocked in round 53 (reassigned-param boxing): converts and builds (~318 rustc errors, measurable). Previously failed to convert entirely."
+      "note": "Unblocked in round 53 (reassigned-param boxing): converts and builds (~314 rustc errors after round 55's re-alias dispatch + warn signature + json dumps arm, measurable)."
     },
     {
       "name": "requests",
       "requirement": "requests==2.32.3",
-      "note": "Unblocked in round 54 (boxed isinstance-dispatch without a router drops loudly): converts and builds (~121 rustc errors, measurable). Previously failed to convert entirely."
+      "note": "Round 54 (boxed isinstance-dispatch drops loudly) unblocked conversion; round 55 added the urllib.parse runtime surface (urlparse/urlsplit/urljoin/urlunparse/urlencode/quote/unquote/urldefrag) and the class-vs-function import registry (~69 rustc errors, measurable)."
     }
   ]
 }

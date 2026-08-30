@@ -505,6 +505,43 @@ variant of its own; user classes are an open set). The semantics are
 byte-identical to the string walk — the interpreter-derived MRO table
 drives both, and a runtime pin verifies the two agree.
 
+A from-imported STDPYTHON item is a plain call or a class construction
+per the runtime's class registry: `OrderedDict(...)` lowers to
+`OrderedDict::new(...)`, while FUNCTION items — `urlparse(url)`,
+`quote(s)`, `re.compile(...)`, `warnings.warn(...)`, `json.dumps(...)` —
+lower as direct runtime calls with `?` (round 55). Previously every
+stdpython from-import was treated as a class, producing
+`urlparse::new(...)` (E0433: a function used as a module path) at every
+requests/urllib3 call site. The same registry applies through a
+RE-EXPORT chain (requests' compat re-exports urllib.parse's functions).
+An ALIASED import (`from re import compile as re_compile`) dispatches on
+the canonical name but renders the BOUND name — only the alias is in
+scope. `from json import dumps` routes through `dumps_pyvalue` (the
+runtime converts the boxed value to the JSON model); `warnings.warn`
+resolves through the signed runtime signature for both the qualified and
+the from-imported spelling.
+
+A `bool and <boxed value>` fold (`redirect and
+response.get_redirect_location()` — urllib3's poolmanager, where the
+call returns a boxed PyValue) keeps the VALUE operand when the bool is
+truthy and boxes the bool otherwise — Python returns the second operand,
+not a boolean (round 55). The previous `&&` fallback typed the result as
+bool, which then poisoned every downstream use (`urljoin(url,
+redirect_location)` failed on a `&bool` arg once urljoin became a real
+runtime call). Only a DEFINITELY boxed operand takes this path; an
+unknown operand (`bom_or_sig_available and should_strip_sig_or_bom(...)`
+— charset_normalizer, both bool) stays `&&`.
+
+The urllib.parse runtime surface (round 55) — `urlparse`/`urlsplit`
+(returning a `ParseResult` with the six components plus
+hostname/port/username/password/geturl), `urlunparse` (six string-like
+components), `urljoin`, `urlencode(query, doseq=)`, `quote`/`quote_plus`,
+`unquote`/`unquote_plus`, `urldefrag` — is pinned against CPython in the
+runtime semantics tests. `urlencode`'s iterable-of-pairs form accepts a
+boxed tuple/list; the boxed-model list-as-tuple divergence applies
+(§12.3). Non-serializable values passed to `json.dumps` convert to JSON
+Null rather than raising TypeError (the §12 loud-fallback divergence).
+
 ---
 
 ## 6. Functions

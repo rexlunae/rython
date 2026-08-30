@@ -297,6 +297,43 @@ fn fold(
                     })
                 }
             }
+            // a: bool, b: boxed — `redirect and
+            // response.get_redirect_location()` (urllib3's poolmanager,
+            // where the call returns a boxed PyValue): Python returns the
+            // SECOND operand when the first is truthy, else the first.
+            // The `&&` fallback would type the result as bool — poisoning
+            // every downstream use (`urljoin(url, redirect_location)` —
+            // round 55: the boxed value must survive, or the real
+            // urljoin call fails on a `&bool` arg). Only a DEFINITELY
+            // boxed operand qualifies: an UNKNOWN (PyObject) operand may
+            // be a bool-returning call (`bom_or_sig_available and
+            // should_strip_sig_or_bom(...)` — charset_normalizer), which
+            // must stay `&&` (the local is `bool`; boxing would break
+            // every `== &false` use).
+            (T::Bool, T::PyValue) | (T::PyValue, T::Bool) => {
+                let bool_is_first = matches!(a, T::Bool);
+                if op == BoolOps::And {
+                    let (value_arm, bool_arm) = if bool_is_first {
+                        (rest.clone(), first.clone())
+                    } else {
+                        (first.clone(), rest.clone())
+                    };
+                    quote!({
+                        let __rython_and = #first;
+                        if (__rython_and).is_truthy() { PyValue::from(#value_arm) } else { PyValue::from(#bool_arm) }
+                    })
+                } else {
+                    let (value_arm, bool_arm) = if bool_is_first {
+                        (rest.clone(), first.clone())
+                    } else {
+                        (first.clone(), rest.clone())
+                    };
+                    quote!({
+                        let __rython_or = #first;
+                        if (__rython_or).is_truthy() { PyValue::from(#bool_arm) } else { PyValue::from(#value_arm) }
+                    })
+                }
+            }
             _ => {
                 if op == BoolOps::And {
                     quote!((#first) && (#rest))

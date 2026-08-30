@@ -3751,6 +3751,197 @@ fn version_gate_bare_form_splices_module_defs() {
     );
 }
 
+#[test]
+fn urllib_parse_functions_lower_as_plain_calls() {
+    // Round 55: `from urllib.parse import urlparse` — the item is a
+    // FUNCTION in the runtime, so the call must lower as
+    // `stdpython::urllib::parse::urlparse(&(...))?`, NOT a class
+    // construction (`urlparse::new(...)` — E0433: a function used as a
+    // module path). The stdpython_class registry separates class items
+    // (OrderedDict, ...) from function items.
+    let out = compile(
+        concat!(
+            "from urllib.parse import urlparse, urljoin, quote, unquote, urldefrag\n",
+            "def f(url: str, base: str) -> str:\n",
+            "    p = urlparse(url)\n",
+            "    j = urljoin(base, url)\n",
+            "    q = quote(url)\n",
+            "    u = unquote(url)\n",
+            "    d = urldefrag(url)\n",
+            "    return p.scheme + j + q + u + d[0]\n",
+        ),
+        "urlparse.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("urlparse::new") && !flat.contains("urljoin::new"),
+        "the parse functions must NOT lower as class constructions: {}",
+        out
+    );
+    for needle in [
+        "stdpython::urllib::parse::urlparse(&(url))?",
+        "stdpython::urllib::parse::urljoin(&(base),&(url))?",
+        "stdpython::urllib::parse::quote(&(url),None)?",
+        "stdpython::urllib::parse::unquote(&(url))?",
+        "stdpython::urllib::parse::urldefrag(&(url))?",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "missing direct-call lowering `{}` in: {}",
+            needle,
+            out
+        );
+    }
+    assert!(
+        flat.contains("p.scheme"),
+        "the ParseResult field read must survive: {}",
+        out
+    );
+}
+
+#[test]
+fn urllib_urlencode_lowers_with_doseq_and_unquote_plus_exists() {
+    // Round 55: urlencode takes the query (a dict-like PyValue) plus the
+    // doseq keyword; quote_plus/unquote_plus are the +-flavored pair. The
+    // calls render with `?` like every other fallible runtime function.
+    let out = compile(
+        concat!(
+            "from urllib.parse import urlencode, quote_plus, unquote_plus\n",
+            "def f(q) -> str:\n",
+            "    a = urlencode(q)\n",
+            "    b = urlencode(q, doseq=True)\n",
+            "    c = quote_plus(\"a b\")\n",
+            "    d = unquote_plus(\"a+b\")\n",
+            "    return a + b + c + d\n",
+        ),
+        "urlencode.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("stdpython::urllib::parse::urlencode(&(q),false)?"),
+        "urlencode without doseq must pass false: {}",
+        out
+    );
+    assert!(
+        flat.contains("stdpython::urllib::parse::urlencode(&(q),true)?"),
+        "urlencode(doseq=True) must pass true: {}",
+        out
+    );
+    assert!(
+        flat.contains("stdpython::urllib::parse::quote_plus(&(")
+            && flat.contains("))?"),
+        "quote_plus must lower as a plain call with `?`: {}",
+        out
+    );
+    assert!(
+        flat.contains("stdpython::urllib::parse::unquote_plus(&(")
+            && flat.contains("))?"),
+        "unquote_plus must lower as a plain call with `?`: {}",
+        out
+    );}
+
+#[test]
+fn urllib_urlunparse_lowers_the_six_part_sequence() {
+    // Round 55: `urlunparse([scheme, netloc, path, None, query,
+    // fragment])` — requests' prepare_url — takes a 6-element sequence
+    // with str-or-None members; the literal sequence renders as a boxed
+    // tuple the runtime extracts. A None member boxes to PyValue::None_.
+    let out = compile(
+        concat!(
+            "from urllib.parse import urlunparse\n",
+            "def f(scheme: str, netloc: str, path: str, query: str, fragment: str) -> str:\n",
+            "    return urlunparse([scheme, netloc, path, None, query, fragment])\n",
+        ),
+        "urlunparse.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("stdpython::urllib::parse::urlunparse(&(PyValue::from(vec![")
+            && flat.contains("stdpython::PyValue::None_"),
+        "the 6-part literal sequence must render as a boxed tuple with None: {}",
+        out
+    );
+    assert!(
+        !flat.contains("urlunparse::new"),
+        "urlunparse must not lower as a class construction: {}",
+        out
+    );
+}
+
+#[test]
+fn stdpython_class_registry_keeps_classes_as_constructions() {
+    // Round 55: the class-aware stdpython_class must NOT regress real
+    // classes — `from collections import OrderedDict; OrderedDict()`
+    // still lowers to `OrderedDict::new(...)`.
+    let out = compile(
+        "from collections import OrderedDict\n\ndef f():\n    return OrderedDict()\n",
+        "ordered.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("OrderedDict::new()"),
+        "OrderedDict must still lower as a class construction: {}",
+        out
+    );
+}
+
+#[test]
+fn re_alias_dispatch_uses_the_bound_name() {
+    // Round 55: `from re import compile as re_compile; re_compile(pat,
+    // flags)` — the dispatch arms match the CANONICAL name ("compile"),
+    // but the generated call must use the BOUND name (only `re_compile`
+    // is in scope via the alias re-export; rendering `compile` would be
+    // E0425). charset_normalizer's constant.py.
+    let out = compile(
+        concat!(
+            "from re import compile as re_compile\n",
+            "from re import IGNORECASE\n",
+            "def f():\n",
+            "    return re_compile(\"a\", IGNORECASE)\n",
+        ),
+        "realiased.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("re_compile(&(\"a\"),\"i\")?")
+            || flat.contains("re_compile(&(\"a\"),\"i\")"),
+        "the aliased re call must render through the BOUND name with flags: {}",
+        out
+    );
+    assert!(
+        !flat.contains("stdpython::re::compile(&"),
+        "the canonical runtime path is not what the call must render (the alias is in scope): {}",
+        out
+    );
+}
+
+#[test]
+fn json_dumps_from_import_converts_the_boxed_value() {
+    // Round 55: `from json import dumps; dumps(self.__dict__, ...)` —
+    // charset_normalizer's models.py. The runtime's `dumps` takes
+    // `&JSONValue`; the from-import call passes a PyValue/PyDict, so the
+    // call routes through `dumps_pyvalue` (pyvalue_to_json conversion).
+    let out = compile(
+        concat!(
+            "from json import dumps\n",
+            "def f(data) -> str:\n",
+            "    return dumps(data, ensure_ascii=True, indent=4)\n",
+        ),
+        "dumps.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("stdpython::json::dumps_pyvalue(data,Some(4))?"),
+        "the from-import dumps must route through dumps_pyvalue: {}",
+        out
+    );
+    assert!(
+        !flat.contains("dumps::new"),
+        "dumps must not lower as a class construction: {}",
+        out
+    );
+}
+
 // The external-chain typed-return panic is pinned in the MULTI-module
 // e2e suite (crates/rypip/tests/convert_tests.rs): a single-module
 // conversion treats every import as a potential sibling, so the
@@ -10527,10 +10718,11 @@ fn stdlib_exception_aliases_canonicalize_on_raise_and_except() {
 
 #[test]
 fn urllib_calls_without_runtime_items_drop_boxed() {
-    // urllib3's `urlencode(fields)` under `from urllib.parse import
-    // urlencode`: no runtime item exists — the call drops to the boxed
-    // None with the divergence warning instead of rendering a
-    // `urlencode::new(...)` class construction.
+    // Round 55: `from urllib.parse import urlencode` now resolves to a
+    // REAL runtime item, so `urlencode(fields)` lowers as a plain call
+    // with `?` — never a `urlencode::new(...)` class construction (that
+    // misfire was the round-55 regression; the stdpython_class registry
+    // separates class items from function items).
     let out = compile(
         concat!(
             "from urllib.parse import urlencode\n",
@@ -10541,13 +10733,13 @@ fn urllib_calls_without_runtime_items_drop_boxed() {
         "urlenc.py",
     );
     assert!(
-        out.contains("PyValue :: None_"),
-        "the call must drop boxed: {}",
+        out.contains("stdpython :: urllib :: parse :: urlencode"),
+        "the call must resolve to the runtime function: {}",
         out
     );
     assert!(
         !out.contains("urlencode :: new"),
-        "no class construction for a dropped import: {}",
+        "no class construction for a runtime function: {}",
         out
     );
 }
