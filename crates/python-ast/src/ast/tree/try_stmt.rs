@@ -696,6 +696,14 @@ fn exception_match_guard(
             )
             .map(str::to_string)
             .unwrap_or_else(|| name.id.clone());
+            // Round 52: a literal BUILTIN clause (`except ValueError:`)
+            // lowers to the discriminant comparison — the class name is
+            // a source literal and the runtime knows its variant and
+            // ancestor slice statically. No string walk per clause.
+            if let Some(ident) = crate::ast::tree::raise_stmt::builtin_exception_variant(&n) {
+                let ident = crate::safe_ident(&ident);
+                return Ok(Some(quote!(__rython_exc.matches_builtin(BuiltinException::#ident))));
+            }
             Ok(Some(quote!(__rython_exc.matches(#n))))
         }
         ExprType::Attribute(attr) => {
@@ -711,6 +719,10 @@ fn exception_match_guard(
                 }
                 _ => attr.attr.clone(),
             };
+            if let Some(ident) = crate::ast::tree::raise_stmt::builtin_exception_variant(&n) {
+                let ident = crate::safe_ident(&ident);
+                return Ok(Some(quote!(__rython_exc.matches_builtin(BuiltinException::#ident))));
+            }
             Ok(Some(quote!(__rython_exc.matches(#n))))
         }
         ExprType::Tuple(tuple) => {

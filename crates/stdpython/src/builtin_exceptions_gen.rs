@@ -193,10 +193,9 @@ pub(crate) fn canonical_name(name: &str) -> Option<&'static str> {
 }
 
 /// One variant per canonical builtin exception class — the names `__mro__[0]` across the dump, generated from the interpreter.
-/// std-only: only the PyO3 surfacing (`pyo3_err`) and its tests use the enum; the core/alloc tiers match through the MRO table alone.
-#[cfg(feature = "std")]
+/// Available in every tier: `PyException` carries a discriminant in core/alloc too (the enum is pure data — unit variants and string matches — with no std dependency); only the PyO3 surfacing (`pyo3_err`) is std-gated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum BuiltinException {
+pub enum BuiltinException {
     ArithmeticError,
     AssertionError,
     AttributeError,
@@ -281,10 +280,9 @@ pub(crate) enum BuiltinException {
     Herror,
 }
 
-#[cfg(feature = "std")]
 impl BuiltinException {
     /// The ONE string→enum boundary — generated from the same dump as the variant list, so aliases and variants cannot drift.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "ArithmeticError" => Some(Self::ArithmeticError),
             "AssertionError" => Some(Self::AssertionError),
@@ -553,4 +551,92 @@ impl BuiltinException {
         Self::Gaierror,
         Self::Herror,
     ];
+
+    /// The variant's ancestors (its `__mro__[1..]` as variants) — generated from the same dump, so the discriminant match needs no string walk: `except ValueError:` compares integers (round 52).
+    pub fn ancestors(self) -> &'static [Self] {
+        match self {
+            Self::ArithmeticError => &[Self::Exception, Self::BaseException],
+            Self::AssertionError => &[Self::Exception, Self::BaseException],
+            Self::AttributeError => &[Self::Exception, Self::BaseException],
+            Self::BaseException => &[],
+            Self::BaseExceptionGroup => &[Self::BaseException],
+            Self::BlockingIOError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::BrokenPipeError => &[Self::ConnectionError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::BufferError => &[Self::Exception, Self::BaseException],
+            Self::BytesWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::ChildProcessError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::ConnectionAbortedError => &[Self::ConnectionError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::ConnectionError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::ConnectionRefusedError => &[Self::ConnectionError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::ConnectionResetError => &[Self::ConnectionError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::ContentTooShortError => &[Self::URLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::DeprecationWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::EOFError => &[Self::Exception, Self::BaseException],
+            Self::EncodingWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::Exception => &[Self::BaseException],
+            Self::ExceptionGroup => &[Self::BaseExceptionGroup, Self::Exception, Self::BaseException],
+            Self::FileExistsError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::FileNotFoundError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::FloatingPointError => &[Self::ArithmeticError, Self::Exception, Self::BaseException],
+            Self::FutureWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::GeneratorExit => &[Self::BaseException],
+            Self::HTTPError => &[Self::URLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::ImportError => &[Self::Exception, Self::BaseException],
+            Self::ImportWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::IndentationError => &[Self::SyntaxError, Self::Exception, Self::BaseException],
+            Self::IndexError => &[Self::LookupError, Self::Exception, Self::BaseException],
+            Self::InterruptedError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::IsADirectoryError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::KeyError => &[Self::LookupError, Self::Exception, Self::BaseException],
+            Self::KeyboardInterrupt => &[Self::BaseException],
+            Self::LookupError => &[Self::Exception, Self::BaseException],
+            Self::MemoryError => &[Self::Exception, Self::BaseException],
+            Self::ModuleNotFoundError => &[Self::ImportError, Self::Exception, Self::BaseException],
+            Self::NameError => &[Self::Exception, Self::BaseException],
+            Self::NotADirectoryError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::NotImplementedError => &[Self::RuntimeError, Self::Exception, Self::BaseException],
+            Self::OSError => &[Self::Exception, Self::BaseException],
+            Self::OverflowError => &[Self::ArithmeticError, Self::Exception, Self::BaseException],
+            Self::PendingDeprecationWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::PermissionError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::ProcessLookupError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::PythonFinalizationError => &[Self::RuntimeError, Self::Exception, Self::BaseException],
+            Self::RecursionError => &[Self::RuntimeError, Self::Exception, Self::BaseException],
+            Self::ReferenceError => &[Self::Exception, Self::BaseException],
+            Self::ResourceWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::RuntimeError => &[Self::Exception, Self::BaseException],
+            Self::RuntimeWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::SSLCertVerificationError => &[Self::SSLError, Self::OSError, Self::ValueError, Self::Exception, Self::BaseException],
+            Self::SSLEOFError => &[Self::SSLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::SSLError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::SSLSyscallError => &[Self::SSLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::SSLWantReadError => &[Self::SSLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::SSLWantWriteError => &[Self::SSLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::SSLZeroReturnError => &[Self::SSLError, Self::OSError, Self::Exception, Self::BaseException],
+            Self::StopAsyncIteration => &[Self::Exception, Self::BaseException],
+            Self::StopIteration => &[Self::Exception, Self::BaseException],
+            Self::SyntaxError => &[Self::Exception, Self::BaseException],
+            Self::SyntaxWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::SystemError => &[Self::Exception, Self::BaseException],
+            Self::SystemExit => &[Self::BaseException],
+            Self::TabError => &[Self::IndentationError, Self::SyntaxError, Self::Exception, Self::BaseException],
+            Self::TimeoutError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::TypeError => &[Self::Exception, Self::BaseException],
+            Self::URLError => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::UnboundLocalError => &[Self::NameError, Self::Exception, Self::BaseException],
+            Self::UnicodeDecodeError => &[Self::UnicodeError, Self::ValueError, Self::Exception, Self::BaseException],
+            Self::UnicodeEncodeError => &[Self::UnicodeError, Self::ValueError, Self::Exception, Self::BaseException],
+            Self::UnicodeError => &[Self::ValueError, Self::Exception, Self::BaseException],
+            Self::UnicodeTranslateError => &[Self::UnicodeError, Self::ValueError, Self::Exception, Self::BaseException],
+            Self::UnicodeWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::UserWarning => &[Self::Warning, Self::Exception, Self::BaseException],
+            Self::ValueError => &[Self::Exception, Self::BaseException],
+            Self::Warning => &[Self::Exception, Self::BaseException],
+            Self::ZeroDivisionError => &[Self::ArithmeticError, Self::Exception, Self::BaseException],
+            Self::GiveupOnSendfile => &[Self::Exception, Self::BaseException],
+            Self::IncompleteInputError => &[Self::SyntaxError, Self::Exception, Self::BaseException],
+            Self::Gaierror => &[Self::OSError, Self::Exception, Self::BaseException],
+            Self::Herror => &[Self::OSError, Self::Exception, Self::BaseException],
+        }
+    }
 }

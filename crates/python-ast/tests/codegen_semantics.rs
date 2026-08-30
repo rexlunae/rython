@@ -1965,12 +1965,14 @@ fn try_except_lowers_to_result_handling() {
     );
     // Handlers are guard-matched arms, in order; the tuple form ORs.
     assert!(
-        out.contains("if __rython_exc . matches (\"ValueError\")"),
+        out.contains("__rython_exc . matches_builtin (BuiltinException :: ValueError)")
+            || out.contains("__rython_exc . matches (\"ValueError\")"),
         "generated: {}",
         out
     );
     assert!(
-        out.contains("matches (\"TypeError\") || __rython_exc . matches (\"KeyError\")"),
+        out.contains("matches_builtin (BuiltinException :: TypeError) || __rython_exc . matches_builtin (BuiltinException :: KeyError)")
+            || out.contains("matches (\"TypeError\") || __rython_exc . matches (\"KeyError\")"),
         "generated: {}",
         out
     );
@@ -2070,7 +2072,8 @@ fn zero_division_raises_catchable_zero_division_error() {
             out
         );
         assert!(
-            out.contains("__rython_exc . matches (\"ZeroDivisionError\")"),
+            out.contains("__rython_exc . matches_builtin (BuiltinException :: ZeroDivisionError)")
+                || out.contains("__rython_exc . matches (\"ZeroDivisionError\")"),
             "the handler must match ZeroDivisionError: {}",
             out
         );
@@ -3612,6 +3615,37 @@ fn tuple_destructure_string_literal_owns_into_string_slot() {
         out.contains("(\"application/x-www-form-urlencoded\") . to_string ()")
             || out.contains("(\"application/x-www-form-urlencoded\").to_string()"),
         "a str literal into a String-typed tuple slot must own: {}",
+        out
+    );
+}
+
+#[test]
+fn literal_builtin_except_clauses_lower_to_discriminant_matches() {
+    // Round 52: `except ValueError:` — the class name is a source
+    // literal and the runtime knows its variant and ancestor slice
+    // statically, so the handler lowers to a discriminant comparison
+    // (no string walk per clause). User classes and builtin ALIASES
+    // (EnvironmentError — a variant of OSError) keep the string path.
+    let out = compile(
+        concat!(
+            "def f(x: int) -> int:\n",
+            "    try:\n",
+            "        return 10 // x\n",
+            "    except ValueError:\n",
+            "        return -1\n",
+            "    except EnvironmentError:\n",
+            "        return -2\n",
+        ),
+        "exceptfast.py",
+    );
+    assert!(
+        out.contains("matches_builtin (BuiltinException :: ValueError)"),
+        "a literal builtin clause must lower to the discriminant match: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_exc . matches (\"EnvironmentError\")"),
+        "a builtin ALIAS must keep the string path (no EnvironmentError variant): {}",
         out
     );
 }
@@ -10423,7 +10457,8 @@ fn stdlib_exception_aliases_canonicalize_on_raise_and_except() {
         out
     );
     assert!(
-        out.contains("matches (\"TimeoutError\")"),
+        out.contains("matches_builtin (BuiltinException :: TimeoutError)")
+            || out.contains("matches (\"TimeoutError\")"),
         "the handler must match the canonical builtin: {}",
         out
     );
