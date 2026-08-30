@@ -756,6 +756,21 @@ impl<'a> CodeGen for Assign {
                         // rebound by a String (`out += "x"`) must be owned
                         // from the start.
                         quote!(#target_code = (#value).to_string();)
+                    } else if value_is_str_literal
+                        && options
+                            .name_types
+                            .get(&name.id)
+                            .is_some_and(|t| matches!(t, crate::TypeInfo::String))
+                    {
+                        // A str literal stored into a STRING-typed NAME
+                        // (`method = "GET"` where the parameter is `str`
+                        // and the prologue bound `let mut method: String =
+                        // method.into()` — urllib3's urlopen): the literal
+                        // is a &'static str and the binding is owned, so
+                        // the store owns it. A name whose type is
+                        // StrRef (`&'static str` — a literal-only local)
+                        // keeps the bare store.
+                        quote!(#target_code = (#value).to_string();)
                     } else if let Some(clone) = self_field_read_clone(&value_expr, &ctx, &options, &symbols) {
                         // Issue #222's local half: `box = self.scheme` —
                         // a non-Copy field read moved into a LOCAL leaves
@@ -771,7 +786,64 @@ impl<'a> CodeGen for Assign {
                 }
                 // Destructuring assignment to the hoisted names. `target_code`
                 // is already the parenthesized element list.
-                ExprType::Tuple(_) => quote!(#target_code = #value;),
+                ExprType::Tuple(tuple_target) => {
+                    // A tuple TARGET with a tuple-literal VALUE of the same
+                    // arity (`(body, content_type) = (urlencode(fields),
+                    // "application/x-www-form-urlencoded")` — urllib3's
+                    // request): each value element lands in the slot of the
+                    // corresponding target NAME, so a str literal into a
+                    // String-typed slot owns itself (`content_type` is
+                    // String from the `(Vec<u8>, String)` return of
+                    // encode_multipart_formdata). Only fires when a slot
+                    // pairing actually needs typing; otherwise the plain
+                    // whole-tuple store below keeps its exact shape.
+                    let needs_slot_typing = matches!(&value_expr, ExprType::Tuple(vt)
+                        if vt.elts.len() == tuple_target.elts.len()
+                            && tuple_target.elts.iter().zip(vt.elts.iter()).any(
+                                |(t, v)| matches!(t, ExprType::Name(n)
+                                    if matches!(options.name_types.get(&n.id),
+                                        Some(crate::TypeInfo::String))
+                                        && matches!(v, ExprType::Constant(c)
+                                            if matches!(&c.0, Some(litrs::Literal::String(_))))
+                                )
+                            ));
+                    if needs_slot_typing {
+                        let ExprType::Tuple(vt) = &value_expr else {
+                            unreachable!("just checked");
+                        };
+                        let mut rendered = Vec::with_capacity(vt.elts.len());
+                        for (t, v) in tuple_target.elts.iter().zip(vt.elts.iter()) {
+                            // Only the STR-LITERAL-INTO-STRING-SLOT pairings
+                            // re-render typed; every other element keeps the
+                            // plain render so unrelated slots (a dropped
+                            // call landing as PyValue::None_ into a
+                            // StrOrBytes-typed body slot) stay exactly as
+                            // before.
+                            let is_owned_pair = matches!(t, ExprType::Name(n)
+                                if matches!(options.name_types.get(&n.id),
+                                    Some(crate::TypeInfo::String))
+                                    && matches!(v, ExprType::Constant(c)
+                                        if matches!(&c.0, Some(litrs::Literal::String(_)))));
+                            if is_owned_pair {
+                                rendered.push(crate::render_typed(
+                                    v,
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::String),
+                                )?);
+                            } else {
+                                rendered.push(
+                                    v.clone()
+                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                                );
+                            }
+                        }
+                        quote!(#target_code = (#(#rendered),*);)
+                    } else {
+                        quote!(#target_code = #value;)
+                    }
+                }
                 // A None store into a PyValue-typed field (`self.current_buffer
                 // = None`) wraps in PyValue::None_ (the boxed value absorbs
                 // None); Option-typed fields keep the plain None store.
@@ -906,7 +978,7 @@ impl<'a> CodeGen for Assign {
                 )
                 && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
             {
-                quote!(PyValue::from(#value))
+                boxed_dict_value_wrap(&value, &value_expr, &options, &symbols)
             } else {
                 value.clone()
             };
@@ -939,7 +1011,11 @@ impl<'a> CodeGen for Assign {
                     }
                     // String-keyed dicts store `&str` indexes through
                     // py_set_index(String, V), so a &str literal index is
-                    // owned at the store site.
+                    // owned at the store site. The receiver's Dict type can
+                    // come from a NAME (name_types) or a `self.<field>`
+                    // whose field the class table types PyDict<String, V>
+                    // (urllib3's `self.conn_kw["proxy"] = self.proxy` —
+                    // round 46).
                     let string_keyed = matches!(
                         sub.value.as_ref(),
                         ExprType::Name(n)
@@ -948,6 +1024,17 @@ impl<'a> CodeGen for Assign {
                                 Some(crate::TypeInfo::Dict(k, _))
                                     if matches!(**k, crate::TypeInfo::String)
                             )
+                    ) || matches!(
+                        sub.value.as_ref(),
+                        ExprType::Attribute(attr)
+                            if matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+                                && crate::ast::tree::aug_assign::self_field_rust_ty(
+                                    &attr.attr,
+                                    &ctx,
+                                    &options,
+                                    &symbols,
+                                )
+                                .is_some_and(|t| t.starts_with("PyDict < String"))
                     );
                     let index = if string_keyed {
                         crate::render_typed(
@@ -965,6 +1052,43 @@ impl<'a> CodeGen for Assign {
                     if is_os_environ {
                         return Ok(quote!(os::setenv(#index, #value);));
                     }
+                    // A store into a `PyDict<String, PyValue>` whose value
+                    // is NOT already a boxed PyValue (`self.conn_kw["proxy"]
+                    // = self.proxy` where proxy is `Option<Url>` — urllib3):
+                    // the dict's value type is the boxed value, so the
+                    // stored member boxes (round 46). The value-type
+                    // signal comes from the same receiver lookup as
+                    // string_keyed above. A NAME receiver's wrap already
+                    // happened above (issue #121); only the self-field
+                    // receiver needs it here.
+                    let pyvalue_valued = matches!(
+                        sub.value.as_ref(),
+                        ExprType::Attribute(attr)
+                            if matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+                                && crate::ast::tree::aug_assign::self_field_rust_ty(
+                                    &attr.attr,
+                                    &ctx,
+                                    &options,
+                                    &symbols,
+                                )
+                                // The class table renders the field type
+                                // through a TokenStream; `PyDict<String,
+                                // PyValue>` (or the stdpython-qualified
+                                // form) is the boxed-value dict. The loose
+                                // prefix mirrors string_keyed above.
+                                .is_some_and(|t| {
+                                    t.starts_with("PyDict < String")
+                                        && t.contains("PyValue")
+                                })
+                    );
+                    let value = if pyvalue_valued
+                        && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
+                        && !value_is_none_early
+                    {
+                        boxed_dict_value_wrap(&value, &value_expr, &options, &symbols)
+                    } else {
+                        value
+                    };
                     Ok(quote!({
                         let __rython_val = #value;
                         (#receiver).py_set_index(#index, __rython_val)?;
@@ -1225,4 +1349,30 @@ fn self_field_read_clone(
         .to_rust(ctx.clone(), options.clone(), symbols.clone())
         .ok()?;
     Some(quote!((#tokens).clone()))
+}
+
+/// Wrap a value destined for a boxed `PyDict<K, PyValue>` slot. A plain
+/// value boxes (`PyValue::from(v)`); an OPTION value (`scheme or "http"`
+/// where scheme is `str | None` — urllib3's PoolManager) absorbs into
+/// the box — Some boxes the inner value, None is the boxed None (the
+/// dict stores None exactly like CPython's `dict[str, Any]`). The
+/// explicit match avoids a `From<Option<T>> for PyValue` blanket, whose
+/// multiple candidates would make an UNTYPED value (`PyValue::from(
+/// resolve(None)?)`) ambiguous at build time (E0283).
+fn boxed_dict_value_wrap(
+    value: &TokenStream,
+    value_expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> TokenStream {
+    if crate::expr_yields_option(value_expr, options, symbols) {
+        quote!({
+            match #value {
+                Some(__rython_member) => PyValue::from(__rython_member),
+                None => stdpython::PyValue::None_,
+            }
+        })
+    } else {
+        quote!(PyValue::from(#value))
+    }
 }

@@ -3447,6 +3447,124 @@ fn membership_uses_py_contains() {
 }
 
 #[test]
+fn local_from_dict_returning_self_method_owns_string_keys() {
+    // Round 46: `request_context = self._merge_pool_kwargs(pool_kwargs)`
+    // (urllib3's PoolManager) — the local's type comes from the callee's
+    // `-> dict[str, typing.Any]` return annotation (the class-aware
+    // seeding only types DICT-returning self-method calls; the broad
+    // round-44 version cascaded on conn-style locals). A Dict-typed
+    // local makes the subscript STORES own their string keys and box
+    // their Option values (py_set_index takes String / the value type
+    // is PyValue).
+    let out = compile(
+        "class P:\n\
+         \x20   def _merge(self, override: dict[str, object] | None) -> dict[str, object]:\n\
+         \x20       return {}\n\
+         \x20   def go(self, scheme: str | None) -> None:\n\
+         \x20       ctx = self._merge(None)\n\
+         \x20       ctx[\"scheme\"] = scheme or \"http\"\n\
+         \x20       ctx[\"port\"] = None\n",
+        "selfdict.py",
+    );
+    assert!(
+        out.contains("(ctx) . py_set_index ((\"scheme\") . to_string ()")
+            || out.contains("(ctx).py_set_index((\"scheme\").to_string()"),
+        "a Dict-typed local must own its string keys at the store: {}",
+        out
+    );
+    assert!(
+        out.contains("ctx = { (self) . _merge (None) ? }")
+            || out.contains("ctx = { (self)._merge(None)? }")
+            || out.contains("ctx = (self . _merge (None)) ?"),
+        "the local must be assigned from the self-method call: {}",
+        out
+    );
+}
+
+#[test]
+fn string_literal_store_into_string_typed_name_owns_itself() {
+    // Round 46: `method = "GET"` where the parameter is `str` and the
+    // prologue bound `let mut method: String = method.into()` (urllib3's
+    // urlopen): the literal is a &'static str and the binding is owned,
+    // so the store owns it. A literal-only local (StrRef — `&'static
+    // str`) keeps the bare store.
+    let out = compile(
+        "def f(method: str, flag: bool) -> str:\n\
+         \x20   method = method.upper()\n\
+         \x20   if flag:\n\
+         \x20       method = \"GET\"\n\
+         \x20   return method\n\
+         \ndef g() -> str:\n\
+         \x20   label = \"fine\"\n\
+         \x20   return label\n",
+        "strname.py",
+    );
+    assert!(
+        out.contains("method = (\"GET\") . to_string ()")
+            || out.contains("method = (\"GET\").to_string()"),
+        "a str literal into a String-typed name must own: {}",
+        out
+    );
+}
+
+#[test]
+fn str_literal_append_insert_into_string_vec_owns_itself() {
+    // Round 46: `lines.append("\r\n")` and `output.insert(0, "")` on
+    // Vec<String> locals (urllib3's render_headers and
+    // _remove_path_dot_segments): the &'static str literal owns at the
+    // push/insert site, mirroring the String-name store rule.
+    let out = compile(
+        "def f(seed: str) -> list[str]:\n\
+         \x20   lines = []\n\
+         \x20   lines.append(seed)\n\
+         \x20   lines.append(\"\\r\\n\")\n\
+         \x20   return lines\n\
+         \ndef g(seed2: str) -> list[str]:\n\
+         \x20   out = []\n\
+         \x20   out.append(seed2)\n\
+         \x20   out.insert(0, \"\")\n\
+         \x20   return out\n",
+        "strvec.py",
+    );
+    assert!(
+        out.contains("push ((\"\\r\\n\") . to_string ())")
+            || out.contains("push((\"\\r\\n\").to_string())"),
+        "a str literal appended to a Vec<String> must own: {}",
+        out
+    );
+    assert!(
+        out.contains("py_insert (0 , (\"\") . to_string ())")
+            || out.contains("py_insert(0, (\"\").to_string())"),
+        "a str literal inserted into a Vec<String> must own: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_destructure_string_literal_owns_into_string_slot() {
+    // Round 46: `(body, content_type) = (urlencode(fields),
+    // "application/x-www-form-urlencoded")` — urllib3's request() — the
+    // content_type slot is String-typed (from the `(Vec<u8>, String)`
+    // return of encode_multipart_formdata), so the literal owns at the
+    // destructure.
+    let out = compile(
+        "def enc() -> tuple[bytes, str]:\n\
+         \x20   return b\"\", \"x\"\n\
+         \ndef f() -> str:\n\
+         \x20   body, content_type = enc()\n\
+         \x20   body, content_type = (None, \"application/x-www-form-urlencoded\")\n\
+         \x20   return content_type\n",
+        "tupslot.py",
+    );
+    assert!(
+        out.contains("(\"application/x-www-form-urlencoded\") . to_string ()")
+            || out.contains("(\"application/x-www-form-urlencoded\").to_string()"),
+        "a str literal into a String-typed tuple slot must own: {}",
+        out
+    );
+}
+
+#[test]
 fn multiple_lossy_conversions_fold_into_one_attribute() {
     // Rust allows only one #[deprecated] per item, so a function with both a
     // dropped default and an ignored return annotation must fold both notes

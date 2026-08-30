@@ -162,7 +162,16 @@ context-aware layer — lossless, with one documented exception (the
   `range()` positions via `try_into().unwrap()` (overflow panics loudly
   rather than wrapping).
 - String literals gain `.to_string()` where an owned `String` is
-  expected; `String`s gain `.as_str()` where a `&str` is expected.
+  expected; `String`s gain `.as_str()` where a `&str` is expected. The
+  ownership is applied at the STORE/PUSH site when the slot's type is
+  known: a literal stored into a `str`-annotated NAME (`method = "GET"`
+  where the parameter is `str` — urllib3's urlopen), appended or
+  inserted into a `list[str]` (`lines.append("\r\n")`), destructured
+  into a String-typed tuple slot (`(body, content_type) = (None,
+  "application/x-www-form-urlencoded")` where `content_type` is String
+  from a `tuple[bytes, str]` return), or used as a String-keyed dict
+  index (`d["b"] = v`) all own the literal at that site (round 46). A
+  literal-only local (typed `&'static str`) keeps the bare store.
 - `int` unifies to `f64` in mixed numeric literal contexts. This is
   lossy above 2⁵³ and accepted anyway, as the only way to compile a
   mixed numeric list at all.
@@ -259,6 +268,22 @@ str`, two different types) falls back to Rust's `&&`/`||`, which fails
 loudly in rustc (§12.1) rather than silently returning a bool where
 Python returns a value. `a or None` gets Option semantics via the same
 unification.
+
+A subscript STORE into a boxed dict (`dict[str, Any]` →
+`PyDict<String, PyValue>`) absorbs an `Option` value the way the box
+absorbs `None`: `ctx["scheme"] = scheme or "http"` where `scheme` is
+`str | None` lowers to an explicit `match` — `Some(v) => PyValue::from(
+v)`, `None => PyValue::None_` — matching CPython's `dict[str, Any]`
+storing the string or `None` (round 46; an explicit match rather than a
+`From<Option<T>>` blanket, whose multiple candidates would make an
+UNTYPED value like `PyValue::from(resolve(None)?)` ambiguous at build
+time). A LOCAL assigned from a DICT-RETURNING self-method call
+(`request_context = self._merge_pool_kwargs(pool_kwargs)` — urllib3's
+PoolManager) types from the callee's `-> dict[str, typing.Any]` return
+annotation, so those stores own their string keys and box their values
+(round 46; the class-aware seeding types ONLY dict-returning
+self-method calls — the broad round-44 version cascaded on
+conn-style locals).
 
 ### 4.3 f-strings and `str.format`
 

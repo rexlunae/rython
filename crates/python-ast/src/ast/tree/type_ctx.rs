@@ -1203,23 +1203,53 @@ pub fn analyze_function_types_with_class(
             if info.name_types.contains_key(&n.id) || info.optional_names.contains(&n.id) {
                 continue;
             }
-            let crate::ExprType::Attribute(attr) = &a.value else {
-                continue;
-            };
-            if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
-                continue;
-            }
-            if let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr) {
-                if ty.to_string().starts_with("Option <") {
-                    // name_types only — the local IS the Option (its
-                    // stores are already Option and must not Some-wrap
-                    // again), and reads unwrap through the Option
-                    // receiver lowering.
-                    info.name_types.insert(
-                        n.id.clone(),
-                        crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
-                    );
+            match &a.value {
+                // `request_context = self._merge_pool_kwargs(pool_kwargs)`
+                // — a local assigned from a SELF-METHOD CALL whose callee
+                // returns a dict (`-> dict[str, typing.Any]` — urllib3's
+                // PoolManager): the local is the callee's return type.
+                // NARROW: only Dict-returning callees seed the local —
+                // typing every self-method return was a wash in round 44
+                // (conn locals exposed close-on-Option and
+                // From<Option<String>> cascades), but a Dict-typed local
+                // is exactly what the subscript-store lowering needs
+                // (string_keyed/pyvalue_valued ownership, round 46) and
+                // only the py_set_index/key handling changes for it.
+                crate::ExprType::Call(call) => {
+                    let crate::ExprType::Attribute(attr) = call.func.as_ref() else {
+                        continue;
+                    };
+                    if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self")
+                    {
+                        continue;
+                    }
+                    if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                        && let Some(ann) = method.returns.as_deref()
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                        && matches!(t, crate::TypeInfo::Dict(_, _))
+                    {
+                        info.name_types.insert(n.id.clone(), t);
+                    }
                 }
+                crate::ExprType::Attribute(attr) => {
+                    if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self")
+                    {
+                        continue;
+                    }
+                    if let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr) {
+                        if ty.to_string().starts_with("Option <") {
+                            // name_types only — the local IS the Option (its
+                            // stores are already Option and must not Some-wrap
+                            // again), and reads unwrap through the Option
+                            // receiver lowering.
+                            info.name_types.insert(
+                                n.id.clone(),
+                                crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                            );
+                        }
+                    }
+                }
+                _ => continue,
             }
         }
     }
@@ -1370,6 +1400,27 @@ fn analyze_statement_types(
                     // Empty container: remember it to pin from later use.
                     if is_empty_container(&assign.value) {
                         info.empty_pinned.insert(name.id.clone(), t);
+                    }
+                }
+            } else if let [ExprType::Tuple(targets)] = assign.targets.as_slice()
+                // A TUPLE-target destructure whose RHS is a call returning a
+                // typed tuple (`(body, content_type) = encode_multipart_
+                // formdata(...)` — `-> tuple[bytes, str]`, urllib3's
+                // RequestMethods.request): the per-element types seed the
+                // locals so a later literal store into the String slot owns
+                // its &str literal (round 46). Only seeds names the plain
+                // analysis left untyped.
+                && let ExprType::Call(call) = &assign.value
+                && let Some(crate::TypeInfo::Tuple(infos)) =
+                    crate::call_return_typeinfo(call, symbols, options)
+                && targets.elts.len() == infos.len()
+            {
+                for (t, slot) in targets.elts.iter().zip(infos.iter()) {
+                    if let ExprType::Name(n) = t
+                        && !info.name_types.contains_key(&n.id)
+                        && !matches!(slot, TypeInfo::PyObject)
+                    {
+                        info.name_types.insert(n.id.clone(), slot.clone());
                     }
                 }
             }
