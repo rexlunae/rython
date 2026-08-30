@@ -101,3 +101,25 @@ message text, ordering, and float formatting.
   workflow
 - [`docs/context-awareness.md`](docs/context-awareness.md) — type
   inference/coercion internals
+
+### The corpus sweep (issue #137)
+
+- The frontier metric is the **rustc error count on pinned real packages**,
+  measured with `eval/sweep/` (modeled on `eval/numpy/`): `run_sweep.py`
+  converts the pinned corpus (`eval/sweep/packages.json` — urllib3 2.0.7
+  by default, plus certifi and idna), builds each generated crate, and
+  writes a JSON error histogram. `summarize.py` diffs two runs into the
+  per-code and per-`expected X, found Y` delta. The corpus is **absent
+  from CI** — a round must run the sweep itself and report the delta.
+- **Traps** (each cost a round before being recorded):
+  - Rebuild the binaries first (`cargo build -p python-ast -p rypip`) and
+    use `target/debug/rypip` — a stale `rypip` on PATH silently measures
+    old codegen.
+  - Capture build logs as `> log 2>&1` (stderr first); the reverse order
+    sends stderr to the terminal and leaves an empty file.
+  - Count `^error[E` lines; the `could not compile ... due to N previous
+    errors` line is a summary, not a site.
+  - A green single-module codegen suite proves nothing about
+    multi-module conversion; the sweep is the ground truth.
+  - Parallel rounds sharing one base produce deltas that do not compose —
+    rebase-and-remeasure before claiming a delta.

@@ -1008,7 +1008,7 @@ fn field_chain_ends_in_pyvalue(
     fields
         .iter()
         .find(|(name, _)| name == &a.attr)
-        .is_some_and(|(_, ty)| ty.to_string().contains("PyValue"))
+        .is_some_and(|(_, ty)| crate::ast::tree::type_ctx::type_contains_pyvalue(ty))
 }
 
 /// Whether an expression is a BOXED PyValue at runtime: a name with an
@@ -1218,10 +1218,7 @@ pub(crate) fn receiver_option_inner(
                         if let Some((_, ty)) =
                             fields.iter().find(|(name, _)| *name == attr.attr)
                         {
-                            let ty = ty.to_string();
-                            is_option = ty
-                                .strip_prefix("Option <")
-                                .is_some_and(|s| s.strip_suffix('>').is_some());
+                            is_option = matches!(ty, crate::TypeInfo::Option(_));
                             break;
                         }
                     }

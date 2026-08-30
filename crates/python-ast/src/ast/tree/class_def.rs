@@ -1087,14 +1087,14 @@ impl ClassDef {
         &self,
         symbols: &SymbolTableScopes,
         options: &PythonOptions,
-    ) -> Result<Vec<(String, TokenStream)>, Box<dyn std::error::Error>> {
-        let mut fields: Vec<(String, TokenStream)> = Vec::new();
+    ) -> Result<Vec<(String, crate::TypeInfo)>, Box<dyn std::error::Error>> {
+        let mut fields: Vec<(String, crate::TypeInfo)> = Vec::new();
         let Some(init) = self.init_method() else {
             return Ok(fields);
         };
         // Types known for names in the __init__ body: annotated
         // parameters first, then simply-typed locals.
-        let mut name_types: std::collections::HashMap<String, TokenStream> =
+        let mut name_types: std::collections::HashMap<String, crate::TypeInfo> =
             std::collections::HashMap::new();
         crate::collect_local_types(&init.body, &mut name_types);
         // Locals assigned from a CALL (`proxy = parse_url(...)` — urllib3's
@@ -1109,7 +1109,7 @@ impl ClassDef {
                 && let Some(t) =
                     crate::call_return_typeinfo(call, Some(&symbols), Some(&options))
             {
-                name_types.insert(n.id.clone(), t.to_rust_type());
+                name_types.insert(n.id.clone(), t);
             }
             // A local assigned a CONDITIONAL (`hashes_from_link = {} if
             // link_hash is None else link_hash.as_dict()` — pip's Link):
@@ -1142,7 +1142,7 @@ impl ClassDef {
                 // annotated with a known class types the field as that
                 // class's struct (composition).
                 let ty = if matches!(ann, ExprType::Name(n) if n.id == "str") {
-                    Some(quote!(String))
+                    Some(crate::TypeInfo::String)
                 } else if !matches!(ann, ExprType::Name(_)) {
                     if p.arg == "dist" {
                     }
@@ -1150,8 +1150,7 @@ impl ClassDef {
                     // (`None | connection._TYPE_SOCKET_OPTIONS`,
                     // `tuple[str, int] | None`): resolve alias-aware.
                     let r = crate::resolve_alias_typeinfo(ann, symbols, options)
-                        .map(|t| t.to_rust_type())
-                        .or_else(|| crate::python_annotation_to_rust_type(ann))
+                        .or_else(|| crate::annotation_type_info(ann))
                         .or_else(|| {
                             if p.arg == "dist" {
                             }
@@ -1170,10 +1169,11 @@ impl ClassDef {
                                 };
                                 match inner {
                                     ExprType::Name(n) => match symbols.get(&n.id) {
-                                        Some(SymbolTableNode::ClassDef(_)) => {
-                                            let ident = crate::safe_ident(&n.id);
-                                            Some(quote!(Option<#ident>))
-                                        }
+                                        Some(SymbolTableNode::ClassDef(_)) => Some(
+                                            crate::TypeInfo::Option(Box::new(
+                                                crate::TypeInfo::Class(n.id.clone()),
+                                            )),
+                                        ),
                                         Some(SymbolTableNode::ImportFrom(i)) => {
                                             let path = i.resolved_module_path(options);
                                             if crate::module_class_def(options, &path, &n.id)
@@ -1183,8 +1183,9 @@ impl ClassDef {
                                                 )
                                                 .is_some()
                                             {
-                                                let ident = crate::safe_ident(&n.id);
-                                                Some(quote!(Option<#ident>))
+                                                Some(crate::TypeInfo::Option(Box::new(
+                                                    crate::TypeInfo::Class(n.id.clone()),
+                                                )))
                                             } else {
                                                 None
                                             }
@@ -1201,7 +1202,9 @@ impl ClassDef {
                                                 ExprType::Name(fnm) if fnm.id == "NewType"
                                             ) =>
                                         {
-                                            Some(quote!(Option<String>))
+                                            Some(crate::TypeInfo::Option(Box::new(
+                                                crate::TypeInfo::String,
+                                            )))
                                         }
                                         _ => None,
                                     },
@@ -1217,8 +1220,7 @@ impl ClassDef {
                     }
                     match symbols.get(&n.id) {
                         Some(SymbolTableNode::ClassDef(_)) => {
-                            let ident = crate::safe_ident(&n.id);
-                            Some(quote!(#ident))
+                            Some(crate::TypeInfo::Class(n.id.clone()))
                         }
                         // An IMPORTED class (`from .models import
                         // PreparedRequest` — requests/cookies.py): resolve
@@ -1231,7 +1233,7 @@ impl ClassDef {
                             ..
                         }) if matches!(c.func.as_ref(), ExprType::Name(fnm) if fnm.id == "NewType") =>
                         {
-                            Some(quote!(String))
+                            Some(crate::TypeInfo::String)
                         }
                         Some(SymbolTableNode::ImportFrom(_)) => {
                             // An IMPORTED CLASS annotation that cannot be
@@ -1239,8 +1241,7 @@ impl ClassDef {
                             // AlreadyInstalledCandidate) boxes as PyValue
                             // (the boxed-union divergence).
                             crate::resolve_alias_typeinfo(ann, symbols, options)
-                                .map(|t| t.to_rust_type())
-                                .or_else(|| Some(quote!(stdpython::PyValue)))
+                                .or_else(|| Some(crate::TypeInfo::PyValue))
                         }
                         Some(SymbolTableNode::Alias(_))
                         // A TYPE-ALIAS name (`data: _TYPE_FIELD_VALUE` —
@@ -1248,9 +1249,8 @@ impl ClassDef {
                         // bytes]`): resolve the alias value.
                         | Some(SymbolTableNode::Assign { .. }) => {
                             crate::resolve_alias_typeinfo(ann, symbols, options)
-                                .map(|t| t.to_rust_type())
                         }
-                        _ => crate::python_annotation_to_rust_type(ann).or_else(|| {
+                        _ => crate::annotation_type_info(ann).or_else(|| {
                             // A bare container annotation (`properties: dict`
                             // — a NamedTuple field, botocore's
                             // RuleSetEndpoint): the parameter itself lowers
@@ -1268,14 +1268,14 @@ impl ClassDef {
                                             | "Mapping"
                                     ) =>
                                 {
-                                    Some(quote!(stdpython::PyValue))
+                                    Some(crate::TypeInfo::PyValue)
                                 }
                                 _ => None,
                             }
                         }),
                     }
                 } else {
-                    crate::python_annotation_to_rust_type(ann)
+                    crate::annotation_type_info(ann)
                 };
                 if let Some(ty) = ty {
                     name_types.insert(p.arg.clone(), ty);
@@ -1286,7 +1286,7 @@ impl ClassDef {
             // ClientArgsCreator): the field type is a boxed PyValue (the
             // parameter's value is unknown).
             else {
-                name_types.insert(p.arg.clone(), quote!(stdpython::PyValue));
+                name_types.insert(p.arg.clone(), crate::TypeInfo::PyValue);
             }
         }
         // Issue #120: the `**kwargs` parameter is a boxed heterogeneous
@@ -1294,19 +1294,28 @@ impl ClassDef {
         // (`self.conn_kw = conn_kw` — urllib3's ConnectionPool) takes the
         // same type.
         if let Some(kwarg) = &init.args.kwarg {
-            name_types.insert(kwarg.arg.clone(), quote!(PyDict<String, PyValue>));
+            name_types.insert(
+                kwarg.arg.clone(),
+                crate::TypeInfo::Dict(
+                    Box::new(crate::TypeInfo::String),
+                    Box::new(crate::TypeInfo::PyValue),
+                ),
+            );
         }
         // The `*args` parameter collects extra positionals as a boxed
         // heterogeneous Vec (`self._args = args` — s3transfer's
         // FunctionContainer).
         if let Some(vararg) = &init.args.vararg {
-            name_types.insert(vararg.arg.clone(), quote!(Vec<stdpython::PyValue>));
+            name_types.insert(
+                vararg.arg.clone(),
+                crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+            );
         }
 
         // Class-level annotated declarations (`config: dict[str, Any]`)
         // pin field types for stores whose value cannot be inferred
         // (`self.config = {}`).
-        let mut class_annotations: std::collections::HashMap<String, TokenStream> =
+        let mut class_annotations: std::collections::HashMap<String, crate::TypeInfo> =
             std::collections::HashMap::new();
         for stmt in &self.body {
             let annotated = match &stmt.statement {
@@ -1329,14 +1338,8 @@ impl ClassDef {
                 _ => None,
             };
             if let Some((name, annotation)) = annotated {
-                let ty = crate::python_annotation_to_rust_type(annotation)
-                    .or_else(|| {
-                        crate::annotation_type_info(annotation).map(|t| t.to_rust_type())
-                    })
-                    .or_else(|| {
-                        crate::resolve_alias_typeinfo(annotation, symbols, options)
-                            .map(|t| t.to_rust_type())
-                    })
+                let ty = crate::annotation_type_info(annotation)
+                    .or_else(|| crate::resolve_alias_typeinfo(annotation, symbols, options))
                     .or_else(|| {
                         // A dict-generic annotation with an unresolvable
                         // element (`dict[Kind, list[tuple[str,
@@ -1351,7 +1354,10 @@ impl ClassDef {
                                         if matches!(n.id.as_str(), "dict" | "Dict")
                                 ) =>
                             {
-                                Some(quote!(PyDict<String, PyValue>))
+                                Some(crate::TypeInfo::Dict(
+                                    Box::new(crate::TypeInfo::String),
+                                    Box::new(crate::TypeInfo::PyValue),
+                                ))
                             }
                             _ => None,
                         }
@@ -1390,18 +1396,16 @@ impl ClassDef {
                 // CoherenceMatches = languages`) resolves through symbols;
                 // a class name maps to the struct ident; `T | None` wraps
                 // in Option.
-                let alias_ty = crate::resolve_alias_typeinfo(a, symbols, options)
-                    .map(|t| t.to_rust_type());
-                let ty_tokens = |t: &ExprType| -> Option<TokenStream> {
-                    crate::python_annotation_to_rust_type(t).or_else(|| match t {
+                let alias_ty = crate::resolve_alias_typeinfo(a, symbols, options);
+                let ty_info = |t: &ExprType| -> Option<crate::TypeInfo> {
+                    crate::annotation_type_info(t).or_else(|| match t {
                         ExprType::Name(n)
                             if matches!(
                                 symbols.get(&n.id),
                                 Some(SymbolTableNode::ClassDef(_))
                             ) =>
                         {
-                            let ident = crate::safe_ident(&n.id);
-                            Some(quote!(#ident))
+                            Some(crate::TypeInfo::Class(n.id.clone()))
                         }
                         _ => None,
                     })
@@ -1416,10 +1420,10 @@ impl ClassDef {
                         ExprType::BinOp(op) if crate::is_none_expr(&op.right) => op.left.as_ref(),
                         _ => return None,
                     };
-                    let inner = ty_tokens(inner)?;
-                    Some(quote!(Option<#inner>))
+                    let inner = ty_info(inner)?;
+                    Some(crate::TypeInfo::Option(Box::new(inner)))
                 } else {
-                    ty_tokens(a)
+                    ty_info(a)
                         .or_else(|| {
                             // A dict-generic annotation with an unresolvable
                             // element (`dict[Kind, list[tuple[str,
@@ -1433,7 +1437,10 @@ impl ClassDef {
                                             if matches!(n.id.as_str(), "dict" | "Dict")
                                     ) =>
                                 {
-                                    Some(quote!(PyDict<String, PyValue>))
+                                    Some(crate::TypeInfo::Dict(
+                                        Box::new(crate::TypeInfo::String),
+                                        Box::new(crate::TypeInfo::PyValue),
+                                    ))
                                 }
                                 _ => None,
                             }
@@ -1454,7 +1461,7 @@ impl ClassDef {
                                             ))
                                     })
                                 {
-                                    Some(quote!(stdpython::PyValue))
+                                    Some(crate::TypeInfo::PyValue)
                                 } else {
                                     None
                                 }
@@ -1472,7 +1479,7 @@ impl ClassDef {
                 Some(ty) => {
                     match fields.iter().find(|(name, _)| *name == store.attr) {
                         None => fields.push((store.attr.clone(), ty)),
-                        Some((_, prev)) if prev.to_string() == ty.to_string() => {}
+                        Some((_, prev)) if prev == &ty => {}
                         Some((_, prev))
                             if annotated_fields.contains(&store.attr) => {
                             // The attribute has an ANNOTATED store: the
@@ -1491,16 +1498,16 @@ impl ClassDef {
                         // UserAgentString(...)` then `= ua_creator` —
                         // botocore's ClientArgsCreator).
                         Some((_, prev))
-                            if (prev.to_string() == "stdpython :: PyValue"
-                                && ty.to_string() != "stdpython :: PyValue")
-                                || (ty.to_string() == "stdpython :: PyValue"
-                                    && prev.to_string() != "stdpython :: PyValue") =>
+                            if (matches!(prev, crate::TypeInfo::PyValue)
+                                && !matches!(ty, crate::TypeInfo::PyValue))
+                                || (matches!(ty, crate::TypeInfo::PyValue)
+                                    && !matches!(prev, crate::TypeInfo::PyValue)) =>
                         {
                             let idx = fields
                                 .iter()
                                 .position(|(name, _)| name == &store.attr)
                                 .unwrap();
-                            let winner = if prev.to_string() == "stdpython :: PyValue" {
+                            let winner = if matches!(prev, crate::TypeInfo::PyValue) {
                                 ty.clone()
                             } else {
                                 prev.clone()
@@ -1513,24 +1520,21 @@ impl ClassDef {
                             // ResourceHandler(...)` vs `RawHandler(...)` —
                             // boto3's ServiceAction): the field is a boxed
                             // PyValue (the callable is duck-dispatched).
-                            if prev.to_string() != "stdpython :: PyValue"
-                                && ty.to_string() != "stdpython :: PyValue"
-                                && prev.to_string() != ty.to_string()
+                            if !matches!(prev, crate::TypeInfo::PyValue)
+                                && !matches!(ty, crate::TypeInfo::PyValue)
+                                && prev != &ty
                             {
                                 let idx = fields
                                     .iter()
                                     .position(|(name, _)| name == &store.attr)
                                     .unwrap();
-                                fields[idx] = (
-                                    store.attr.clone(),
-                                    quote!(stdpython::PyValue),
-                                );
+                                fields[idx] = (store.attr.clone(), crate::TypeInfo::PyValue);
                             } else {
                                 return Err(format!(
                                     "attribute `self.{}` of class `{}` is assigned \
                                      conflicting types ({} and {}); a struct field needs \
                                      one type",
-                                    store.attr, self.name, prev, ty
+                                    store.attr, self.name, prev.display(), ty.display()
                                 )
                                 .into());
                             }
@@ -1578,7 +1582,7 @@ impl ClassDef {
             if method.name == "__init__" {
                 continue;
             }
-            let mut method_types: std::collections::HashMap<String, TokenStream> =
+            let mut method_types: std::collections::HashMap<String, crate::TypeInfo> =
                 std::collections::HashMap::new();
             crate::collect_local_types(&method.body, &mut method_types);
             let mut method_stores = Vec::new();
@@ -1613,7 +1617,7 @@ impl ClassDef {
                     // ubiquitous declare-then-fill idiom, not a type.
                     ObservedStore::NoneLiteral
                 } else if let Some(t) = from_sibling_field {
-                    ObservedStore::Typed(t.to_string())
+                    ObservedStore::Typed(t)
                 } else {
                     match infer_field_type(
                         store.value,
@@ -1622,7 +1626,7 @@ impl ClassDef {
                         options,
                         &self.name,
                     ) {
-                        Some(t) => ObservedStore::Typed(t.to_string()),
+                        Some(t) => ObservedStore::Typed(t),
                         None => ObservedStore::Unknown,
                     }
                 };
@@ -1652,15 +1656,19 @@ impl ClassDef {
             let any_unknown = observed
                 .iter()
                 .any(|o| matches!(o, ObservedStore::Unknown));
-            let mut concrete: Vec<&String> = observed
+            let concrete: Vec<crate::TypeInfo> = observed
                 .iter()
                 .filter_map(|o| match o {
-                    ObservedStore::Typed(t) => Some(t),
+                    ObservedStore::Typed(t) => Some(t.clone()),
                     _ => None,
                 })
                 .collect();
-            concrete.sort();
-            concrete.dedup();
+            let mut deduped: Vec<crate::TypeInfo> = Vec::new();
+            for t in concrete {
+                if !deduped.contains(&t) {
+                    deduped.push(t);
+                }
+            }
             // A confident join — every store agreed on one concrete
             // type — WINS over a declared annotation: the annotation is a
             // first preference, and what the class actually stores is the
@@ -1668,23 +1676,20 @@ impl ClassDef {
             // (no concrete store, disagreeing stores, or a value rython
             // cannot read) falls back to the annotation, then to the
             // boxed value.
-            let joined = match (any_unknown, concrete.as_slice()) {
+            let joined = match (any_unknown, deduped.as_slice()) {
                 (false, [only]) => {
-                    let parsed: TokenStream = only
-                        .parse()
-                        .unwrap_or_else(|_| quote!(stdpython::PyValue));
                     // An already-optional type absorbs the None store.
-                    Some(if !has_none || only.starts_with("Option <") {
-                        parsed
+                    Some(if !has_none || matches!(only, crate::TypeInfo::Option(_)) {
+                        only.clone()
                     } else {
-                        quote!(Option<#parsed>)
+                        crate::TypeInfo::Option(Box::new(only.clone()))
                     })
                 }
                 _ => None,
             };
             let ty = joined
                 .or_else(|| class_annotations.get(&attr).cloned())
-                .unwrap_or_else(|| quote!(stdpython::PyValue));
+                .unwrap_or_else(|| crate::TypeInfo::PyValue);
             fields.push((attr, ty));
         }
 
@@ -1741,7 +1746,7 @@ impl ClassDef {
                     warnings.push(message);
                 }
                 drop(warnings);
-                fields.push((name, quote!(stdpython::PyValue)));
+                fields.push((name, crate::TypeInfo::PyValue));
             }
         }
         Ok(fields)
@@ -1759,7 +1764,7 @@ impl ClassDef {
         &self,
         symbols: &SymbolTableScopes,
         options: &PythonOptions,
-    ) -> Result<Vec<(String, TokenStream)>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<(String, crate::TypeInfo)>, Box<dyn std::error::Error>> {
         let own_stores = self.infer_fields(symbols, options)?;
         let base_owned: std::collections::HashSet<String> = self
             .base_class(symbols)
@@ -2805,8 +2810,9 @@ impl CodeGen for ClassDef {
 
         let mut field_defs: Vec<TokenStream> = fields
             .iter()
-            .map(|(name, ty)| {
+            .map(|(name, ti)| {
                 let ident = crate::safe_ident(name);
+                let ty = ti.to_rust_type();
                 quote!(pub #ident: #ty)
             })
             .collect();
@@ -3205,14 +3211,15 @@ impl ClassDef {
     /// full machinery instead). The declarations mirror the subclass-side
     /// ancestor impls, which iterate the same `own_fields` in this
     /// module's scope — the two sides cannot drift.
-    fn emit_accessor_trait(&self, fields: &[(String, TokenStream)]) -> TokenStream {
+    fn emit_accessor_trait(&self, fields: &[(String, crate::TypeInfo)]) -> TokenStream {
         let class_name = crate::safe_ident(&self.name);
         let trait_name = format_ident!("{}Trait", self.name);
         let mut decls = TokenStream::new();
         let mut impls = TokenStream::new();
-        for (fname, fty) in fields {
+        for (fname, fti) in fields {
             let f = crate::safe_ident(fname);
             let f_mut = format_ident!("{}_mut", fname);
+            let fty = fti.to_rust_type();
             decls.extend(quote! {
                 fn #f(&self) -> #fty;
                 fn #f_mut(&mut self) -> &mut #fty;
@@ -3239,7 +3246,7 @@ impl ClassDef {
     fn emit_trait(
         &self,
         base: &Option<ClassDef>,
-        fields: &[(String, TokenStream)],
+        fields: &[(String, crate::TypeInfo)],
         methods: &[FunctionDef],
         options: &PythonOptions,
         symbols: &SymbolTableScopes,
@@ -3294,6 +3301,7 @@ impl ClassDef {
             }
             let f = crate::safe_ident(fname);
             let f_mut = format_ident!("{}_mut", fname);
+            let fty = fty.to_rust_type();
             own_accessor_decls.extend(quote! {
                 fn #f(&self) -> #fty;
                 fn #f_mut(&mut self) -> &mut #fty;
@@ -3408,6 +3416,7 @@ impl ClassDef {
             }
             let f = crate::safe_ident(fname);
             let f_mut = format_ident!("{}_mut", fname);
+            let fty = fty.to_rust_type();
             own_impl_body.extend(quote! {
                 fn #f(&self) -> #fty {
                     self.#f.clone()
@@ -3491,9 +3500,10 @@ impl ClassDef {
                     }
                 });
             }
-            for (fname, fty) in &a_fields {
+            for (fname, fti) in &a_fields {
                 let f = crate::safe_ident(fname);
                 let f_mut = format_ident!("{}_mut", fname);
+                let fty = fti.to_rust_type();
                 // `self.__rython_base[.__rython_base]*` reaches the
                 // ancestor's struct from the derived struct.
                 let mut accessor_self = quote!(self);
@@ -3678,22 +3688,27 @@ pub(crate) fn is_class_value_expr(value: &ExprType, symbols: &SymbolTableScopes)
 }
 
 /// Infer the struct field type for a value stored into `self.attr`.
+/// Returns a TypeInfo — the single type authority (issue #137's review of
+/// rounds 38–47): field types are structural, so the coercion layers can
+/// match on them instead of re-parsing rendered tokens.
 fn infer_field_type(
     value: &ExprType,
-    name_types: &std::collections::HashMap<String, TokenStream>,
+    name_types: &std::collections::HashMap<String, crate::TypeInfo>,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
     class_name: &str,
-) -> Option<TokenStream> {
+) -> Option<crate::TypeInfo> {
     match value {
         ExprType::Name(n) => name_types.get(&n.id).cloned().or_else(|| {
             // A module-level constant (`self.flags = _LATIN`, where
             // `_LATIN: int = 1` may live in another module): follow
             // Assign/ImportFrom chains to the constant's value.
             let const_type = |value: &ExprType| {
-                crate::simple_expr_type(value).map(|t| {
-                    if t.to_string() == "& 'static str" {
-                        quote!(String)
+                crate::simple_expr_typeinfo(value).map(|t| {
+                    // String literals are owned in FIELDS (the store side
+                    // converts; the literal itself is a &'static str).
+                    if matches!(t, crate::TypeInfo::StrRef) {
+                        crate::TypeInfo::String
                     } else {
                         t
                     }
@@ -3716,9 +3731,15 @@ fn infer_field_type(
                             .iter()
                             .any(|v| matches!(v, ExprType::Call(_) | ExprType::Lambda(_)));
                         if all_classes {
-                            Some(quote!(PyDict<String, String>))
+                            Some(crate::TypeInfo::Dict(
+                                Box::new(crate::TypeInfo::String),
+                                Box::new(crate::TypeInfo::String),
+                            ))
                         } else if has_callable {
-                            Some(quote!(PyDict<String, PyValue>))
+                            Some(crate::TypeInfo::Dict(
+                                Box::new(crate::TypeInfo::String),
+                                Box::new(crate::TypeInfo::PyValue),
+                            ))
                         } else {
                             None
                         }
@@ -3733,7 +3754,7 @@ fn infer_field_type(
                         ExprType::Call(c)
                             if matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "object") =>
                         {
-                            Some(quote!(stdpython::PyValue))
+                            Some(crate::TypeInfo::PyValue)
                         }
                         _ => None,
                     }
@@ -3761,7 +3782,7 @@ fn infer_field_type(
                         // LegacyWindowsTerm, where GetStdHandle is a
                         // Windows-API wrapper): a foreign object — a boxed
                         // PyValue (the external-object divergence).
-                        ExprType::Call(_) => Some(quote!(stdpython::PyValue)),
+                        ExprType::Call(_) => Some(crate::TypeInfo::PyValue),
                         _ => None,
                     }
                 }),
@@ -3770,14 +3791,14 @@ fn infer_field_type(
                 // a function reference held as data has no rython value
                 // equivalent — a boxed PyValue (documented divergence).
                 Some(SymbolTableNode::FunctionDef(_)) => {
-                    Some(quote!(stdpython::PyValue))
+                    Some(crate::TypeInfo::PyValue)
                 }
                 // A MODULE held as a value (`import keyring` inside
                 // __init__, then `self.keyring = keyring` — pip's
                 // KeyRingPythonProvider): an external module object — a
                 // boxed PyValue (external-object divergence).
                 Some(SymbolTableNode::Import(_)) => {
-                    Some(quote!(stdpython::PyValue))
+                    Some(crate::TypeInfo::PyValue)
                 }
                 Some(SymbolTableNode::ImportFrom(i)) => {
                     let path = i.resolved_module_path(options);
@@ -3792,9 +3813,10 @@ fn infer_field_type(
                                 // — botocore's hooks): a boxed
                                 // PyDict<String, PyValue>.
                                 match value {
-                                    ExprType::Dict(_) => {
-                                        Some(quote!(PyDict<String, PyValue>))
-                                    }
+                                    ExprType::Dict(_) => Some(crate::TypeInfo::Dict(
+                                        Box::new(crate::TypeInfo::String),
+                                        Box::new(crate::TypeInfo::PyValue),
+                                    )),
                                     _ => None,
                                 }
                             },
@@ -3806,23 +3828,23 @@ fn infer_field_type(
                 // `t = tcls(...)` and `tcls` is itself a local bound to a
                 // class — distlib's ServerProxy): a boxed PyValue (the
                 // unknown-local / class-as-value divergence).
-                _ => Some(quote!(stdpython::PyValue)),
+                _ => Some(crate::TypeInfo::PyValue),
             }
         }),
         // A constructed instance of a known class types the field as that
         // class's struct.
         ExprType::Call(call) => match call.func.as_ref() {
-            ExprType::Name(n) if n.id == "bool" => Some(quote!(bool)),
+            ExprType::Name(n) if n.id == "bool" => Some(crate::TypeInfo::Bool),
             // A `cast(T, ...)` typing no-op (`self.frames = cast(List[str],
             // spinner["frames"])[:]` — rich's Spinner): the cast's FIRST
             // argument is the annotation — `List[str]` → `Vec<String>`.
             ExprType::Name(n) if n.id == "cast" => {
                 call.args.first().and_then(|ann| match ann {
                     ExprType::Name(sn) => match sn.id.as_str() {
-                        "float" => Some(quote!(f64)),
-                        "int" => Some(quote!(i64)),
-                        "str" => Some(quote!(String)),
-                        "bool" => Some(quote!(bool)),
+                        "float" => Some(crate::TypeInfo::Float),
+                        "int" => Some(crate::TypeInfo::Int),
+                        "str" => Some(crate::TypeInfo::String),
+                        "bool" => Some(crate::TypeInfo::Bool),
                         _ => None,
                     },
                     ExprType::Subscript(sub)
@@ -3833,7 +3855,7 @@ fn infer_field_type(
                             crate::SubscriptKind::Index(elt) => {
                                 let t = crate::annotation_type_info(elt)?;
                                 if matches!(t, crate::TypeInfo::String) {
-                                    Some(quote!(Vec<String>))
+                                    Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String)))
                                 } else {
                                     None
                                 }
@@ -3851,9 +3873,9 @@ fn infer_field_type(
                 if matches!(n.id.as_str(), "int" | "float" | "str") =>
             {
                 Some(match n.id.as_str() {
-                    "int" => quote!(i64),
-                    "float" => quote!(f64),
-                    _ => quote!(String),
+                    "int" => crate::TypeInfo::Int,
+                    "float" => crate::TypeInfo::Float,
+                    _ => crate::TypeInfo::String,
                 })
             }
             // `set(...)` / `frozenset(...)` of a generator of str
@@ -3872,9 +3894,9 @@ fn infer_field_type(
                             if matches!(c.func.as_ref(), ExprType::Attribute(at) if at.attr == "lower")))
                 });
                 if has_str_generator {
-                    Some(quote!(std::collections::HashSet<String>))
+                    Some(crate::TypeInfo::HashSet(Box::new(crate::TypeInfo::String)))
                 } else {
-                    Some(quote!(stdpython::PyValue))
+                    Some(crate::TypeInfo::PyValue)
                 }
             }
             // `OrderedDict()` / `defaultdict()` / `dict()` — a map field
@@ -3883,7 +3905,10 @@ fn infer_field_type(
             ExprType::Name(n)
                 if matches!(n.id.as_str(), "dict" | "OrderedDict" | "defaultdict") =>
             {
-                Some(quote!(PyDict<String, PyValue>))
+                Some(crate::TypeInfo::Dict(
+                    Box::new(crate::TypeInfo::String),
+                    Box::new(crate::TypeInfo::PyValue),
+                ))
             }
             // A threading lock (`RLock()`, `Lock()`, `threading.RLock()`) —
             // a stdlib object with no rython equivalent; `with self.lock:`
@@ -3892,20 +3917,20 @@ fn infer_field_type(
             ExprType::Name(n)
                 if matches!(n.id.as_str(), "RLock" | "Lock" | "Semaphore") =>
             {
-                Some(quote!(()))
+                Some(crate::TypeInfo::Tuple(vec![]))
             }
             ExprType::Attribute(a)
                 if matches!(a.attr.as_str(), "RLock" | "Lock" | "Semaphore")
                     && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "threading") =>
             {
-                Some(quote!(()))
+                Some(crate::TypeInfo::Tuple(vec![]))
             }
             // `datetime.timedelta(...)` — the stdpython timedelta struct.
             ExprType::Attribute(a)
                 if a.attr == "timedelta"
                     && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "datetime") =>
             {
-                Some(quote!(datetime::timedelta))
+                Some(crate::TypeInfo::Custom(quote!(datetime::timedelta)))
             }
             // `self.sock = self._new_conn()` — a call to THIS class's own
             // method (urllib3's connect()): the method's return
@@ -3924,15 +3949,11 @@ fn infer_field_type(
                 if crate::is_none_expr(ann) {
                     return None;
                 }
-                crate::python_annotation_to_rust_type(ann).or_else(|| {
-                    crate::resolve_alias_typeinfo(ann, symbols, options)
-                        .map(|t| t.to_rust_type())
-                })
+                crate::resolve_alias_typeinfo(ann, symbols, options)
             }
             ExprType::Name(n) => match symbols.get(&n.id) {
                 Some(SymbolTableNode::ClassDef(_)) => {
-                    let ident = crate::safe_ident(&n.id);
-                    Some(quote!(#ident))
+                    Some(crate::TypeInfo::Class(n.id.clone()))
                 }
                 // An imported class (`from urllib3.util.retry import
                 // Retry` → `self.max_retries = Retry(0, ...)`) resolves
@@ -3944,8 +3965,7 @@ fn infer_field_type(
                     if crate::module_class_def(options, &path, &n.id).is_some()
                         || crate::resolve_imported_class(options, &path, &n.id, 0).is_some()
                     {
-                        let ident = crate::safe_ident(&n.id);
-                        Some(quote!(#ident))
+                        Some(crate::TypeInfo::Class(n.id.clone()))
                     } else {
                         // A call to an IMPORTED function whose return type
                         // cannot be resolved — either no return annotation,
@@ -3955,8 +3975,7 @@ fn infer_field_type(
                         // PyValue (cross-module return-typing divergence,
                         // #123).
                         crate::call_return_typeinfo(call, Some(symbols), Some(options))
-                            .map(|t| t.to_rust_type())
-                            .or_else(|| Some(quote!(stdpython::PyValue)))
+                            .or_else(|| Some(crate::TypeInfo::PyValue))
                     }
                 }
                 // A module-level function: its return annotation types the
@@ -3964,13 +3983,12 @@ fn infer_field_type(
                 // unannotated same-module function also boxes the field
                 // (PyValue) rather than failing the module.
                 _ => crate::call_return_typeinfo(call, Some(symbols), Some(options))
-                    .map(|t| t.to_rust_type())
-                    .or_else(|| Some(quote!(stdpython::PyValue))),
+                    .or_else(|| Some(crate::TypeInfo::PyValue)),
             },
             // A boolean predicate call (`character.isprintable()`,
             // `s.isascii()`) types the field bool.
             ExprType::Attribute(a)
-                if a.attr.starts_with("is") && a.attr.len() > 2 => Some(quote!(bool)),
+                if a.attr.starts_with("is") && a.attr.len() > 2 => Some(crate::TypeInfo::Bool),
             // A `.copy()` of a module-level dict (`self.key_fn_by_scheme =
             // key_fn_by_scheme.copy()` — urllib3's PoolManager): the field
             // takes the copied dict's type (a boxed PyDict for the
@@ -3997,7 +4015,10 @@ fn infer_field_type(
                             || matches!(v, ExprType::Lambda(_))
                     })
                 {
-                    Some(quote!(PyDict<String, PyValue>))
+                    Some(crate::TypeInfo::Dict(
+                        Box::new(crate::TypeInfo::String),
+                        Box::new(crate::TypeInfo::PyValue),
+                    ))
                 } else {
                     infer_field_type(&a.value, name_types, symbols, options, class_name)
                 }
@@ -4029,7 +4050,7 @@ fn infer_field_type(
                         | "capitalize" | "swapcase"
                 ) =>
             {
-                Some(quote!(String))
+                Some(crate::TypeInfo::String)
             }
             // An ASSOCIATED call (`Retry.from_int(max_retries)`) types the
             // field as the class (same-module or imported).
@@ -4040,7 +4061,7 @@ fn infer_field_type(
                 if crate::root_name(&a.value)
                     .is_some_and(|r| r == "js")
                 {
-                    return Some(quote!(stdpython::PyValue));
+                    return Some(crate::TypeInfo::PyValue);
                 }
                 // A method call on a CALL RESULT rooted in an external
                 // module (`zstd.ZstdDecompressor().decompressobj()` —
@@ -4091,7 +4112,7 @@ fn infer_field_type(
                         _ => false,
                     };
                     if external {
-                        return Some(quote!(stdpython::PyValue));
+                        return Some(crate::TypeInfo::PyValue);
                     }
                 }
                 // A stdlib MODULE call (`zlib.decompressobj()`,
@@ -4206,7 +4227,7 @@ fn infer_field_type(
                         _ => false,
                     };
                     if external {
-                        return Some(quote!(stdpython::PyValue));
+                        return Some(crate::TypeInfo::PyValue);
                     }
                     // An IN-CRATE module receiver: a module-function call
                     // (`botocore.session.get_session()` — boto3's Session,
@@ -4234,11 +4255,11 @@ fn infer_field_type(
                             crate::module_function_def(options, &path, &a.attr)
                     {
                         if let Some(ann) = f.returns.as_deref()
-                            && let Some(t) = crate::python_annotation_to_rust_type(ann)
+                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
                         {
                             return Some(t);
                         }
-                        return Some(quote!(stdpython::PyValue));
+                        return Some(crate::TypeInfo::PyValue);
                     }
                     // An IN-CRATE module CLASS construction
                     // (`botocore.httpsession.URLLib3Session(timeout=...)` —
@@ -4250,8 +4271,7 @@ fn infer_field_type(
                             || crate::resolve_imported_class(options, &path, &a.attr, 0)
                                 .is_some())
                     {
-                        let ident = crate::safe_ident(&a.attr);
-                        return Some(quote!(#ident));
+                        return Some(crate::TypeInfo::Class(a.attr.clone()));
                     }
                 }
                 // An EXTERNAL-module-rooted receiver whose dotted chain is
@@ -4290,7 +4310,7 @@ fn infer_field_type(
                         _ => false,
                     };
                     if external {
-                        return Some(quote!(stdpython::PyValue));
+                        return Some(crate::TypeInfo::PyValue);
                     }
                 }
                 // A method call on a PyValue-typed RECEIVER (`ssl_context.
@@ -4303,9 +4323,9 @@ fn infer_field_type(
                 if let ExprType::Name(recv) = a.value.as_ref()
                     && name_types
                         .get(&recv.id)
-                        .is_some_and(|t| t.to_string().contains("PyValue"))
+                        .is_some_and(|t| crate::ast::tree::type_ctx::type_contains_pyvalue(t))
                 {
-                    return Some(quote!(stdpython::PyValue));
+                    return Some(crate::TypeInfo::PyValue);
                 }
                 // A SELF-method call (`self._init_length(...)` — urllib3's
                 // emscripten response): the method's return annotation types
@@ -4318,8 +4338,7 @@ fn infer_field_type(
                         return None;
                     };
                     let ann = m.returns.as_deref()?;
-                    return crate::resolve_alias_typeinfo(ann, symbols, options)
-                        .map(|t| t.to_rust_type());
+                    return crate::resolve_alias_typeinfo(ann, symbols, options);
                 }
                 // A method call on a SELF-FIELD (`self._boto3_session.client(
                 // ...)` — boto3's ServiceDocumenter): the field is a boxed
@@ -4327,7 +4346,7 @@ fn infer_field_type(
                 if let ExprType::Attribute(inner) = a.value.as_ref()
                     && matches!(inner.value.as_ref(), ExprType::Name(n) if n.id == "self")
                 {
-                    return Some(quote!(stdpython::PyValue));
+                    return Some(crate::TypeInfo::PyValue);
                 }
                 // A method call on a chain ROOTED in an associated call or
                 // a construction of a known class (`UserAgentString.
@@ -4359,7 +4378,7 @@ fn infer_field_type(
                             _ => false,
                         };
                         if external {
-                            return Some(quote!(stdpython::PyValue));
+                            return Some(crate::TypeInfo::PyValue);
                         }
                     }
                     let class_ref = match inner.func.as_ref() {
@@ -4375,8 +4394,7 @@ fn infer_field_type(
                     if let Some(cn) = class_ref
                         && let Some(class_ty) = match symbols.get(&cn.id) {
                             Some(SymbolTableNode::ClassDef(_)) => {
-                                let ident = crate::safe_ident(&cn.id);
-                                Some(quote!(#ident))
+                                Some(crate::TypeInfo::Class(cn.id.clone()))
                             }
                             Some(SymbolTableNode::ImportFrom(i)) => {
                                 let path = i.resolved_module_path(options);
@@ -4384,8 +4402,7 @@ fn infer_field_type(
                                     || crate::resolve_imported_class(options, &path, &cn.id, 0)
                                         .is_some()
                                 {
-                                    let ident = crate::safe_ident(&cn.id);
-                                    Some(quote!(#ident))
+                                    Some(crate::TypeInfo::Class(cn.id.clone()))
                                 } else {
                                     None
                                 }
@@ -4414,7 +4431,7 @@ fn infer_field_type(
                                     crate::StatementType::AnnotatedName {
                                         name, annotation, ..
                                     } if name == &a.attr => {
-                                        crate::python_annotation_to_rust_type(annotation)
+                                        crate::annotation_type_info(annotation)
                                     }
                                     // A @property accessor read on the
                                     // construction (`TempDirectory(...).path
@@ -4433,7 +4450,7 @@ fn infer_field_type(
                                     {
                                         f.returns
                                             .as_deref()
-                                            .and_then(crate::python_annotation_to_rust_type)
+                                            .and_then(crate::annotation_type_info)
                                     }
                                     _ => None,
                                 }
@@ -4449,8 +4466,7 @@ fn infer_field_type(
                 };
                 match symbols.get(&class.id) {
                     Some(SymbolTableNode::ClassDef(_)) => {
-                        let ident = crate::safe_ident(&a.attr);
-                        Some(quote!(#ident))
+                        Some(crate::TypeInfo::Class(a.attr.clone()))
                     }
                     Some(SymbolTableNode::ImportFrom(i)) => {
                         let path = i.resolved_module_path(options);
@@ -4461,16 +4477,14 @@ fn infer_field_type(
                         // attribute (`functions.Functions()` — jmespath's
                         // TreeInterpreter, class = `a.attr` in path+sub).
                         if crate::module_class_def(options, &path, &class.id).is_some() {
-                            let ident = crate::safe_ident(&class.id);
-                            Some(quote!(#ident))
+                            Some(crate::TypeInfo::Class(class.id.clone()))
                         } else {
                             let mut p2 = path.clone();
                             p2.push(class.id.clone());
                             if crate::module_class_def(options, &path, &a.attr).is_some()
                                 || crate::module_class_def(options, &p2, &a.attr).is_some()
                             {
-                                let ident = crate::safe_ident(&a.attr);
-                                Some(quote!(#ident))
+                                Some(crate::TypeInfo::Class(a.attr.clone()))
                             } else {
                                 None
                             }
@@ -4492,18 +4506,18 @@ fn infer_field_type(
         // A documented divergence: a plain None-only attribute is a boxed
         // value instead of a typed Option. None arrives as NoneType,
         // Constant(None), or the bare Name "None".
-        other if crate::is_none_expr(other) => Some(quote!(stdpython::PyValue)),
+        other if crate::is_none_expr(other) => Some(crate::TypeInfo::PyValue),
         // An ATTRIBUTE READ off a call result (`self.type =
         // urlparse(self._r.url).scheme` — requests' cookies.MockRequest,
         // issue #137): a dynamic member of a foreign object — a boxed
         // PyValue (the external-object divergence).
         ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Call(_)) => {
-            Some(quote!(stdpython::PyValue))
+            Some(crate::TypeInfo::PyValue)
         }
         // A list comprehension of foreign objects (`self._decoders =
         // [_get_decoder(e) for e in ...]` — urllib3's MultiDecoder): the
         // element type is a boxed PyValue.
-        ExprType::ListComp(_) => Some(quote!(Vec<stdpython::PyValue>)),
+        ExprType::ListComp(_) => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
         // Logical combinations (`self.common_cjk = self.is_cjk and
         // character in COMMON_CJK_CHARACTERS`, `not x`) are bool — UNLESS
         // a branch is a boxed value (`excluded_params or frozenset()` —
@@ -4512,17 +4526,17 @@ fn infer_field_type(
         ExprType::BoolOp(b) => {
             if b.values.iter().any(|v| {
                 infer_field_type(v, name_types, symbols, options, class_name)
-                    .is_some_and(|t| t.to_string().contains("PyValue"))
+                    .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
             }) {
-                Some(quote!(stdpython::PyValue))
+                Some(crate::TypeInfo::PyValue)
             } else {
-                Some(quote!(bool))
+                Some(crate::TypeInfo::Bool)
             }
         }
-        ExprType::UnaryOp(_) => Some(quote!(bool)),
+        ExprType::UnaryOp(_) => Some(crate::TypeInfo::Bool),
         // A comparison (`x in ys`, `a == b`) is a bool field
         // (`self.safe = character in COMMON_SAFE_ASCII_CHARACTERS`).
-        ExprType::Compare(_) => Some(quote!(bool)),
+        ExprType::Compare(_) => Some(crate::TypeInfo::Bool),
         // A BinOp with a STRING-literal operand (`get_indentation() * " "`
         // — pip's spinner): a string repetition — String.
         ExprType::BinOp(b) => {
@@ -4531,7 +4545,7 @@ fn infer_field_type(
                     if matches!(&c.0, Some(litrs::Literal::String(_))))
             };
             if is_str_lit(&b.left) || is_str_lit(&b.right) {
-                Some(quote!(String))
+                Some(crate::TypeInfo::String)
             } else {
                 // A SHIFT/BITWISE BinOp (`1 << bit_no` — rich's _Bit
                 // descriptor): integer-only — i64.
@@ -4543,7 +4557,7 @@ fn infer_field_type(
                         | crate::BinOps::BitXor
                         | crate::BinOps::BitAnd
                 ) {
-                    Some(quote!(i64))
+                    Some(crate::TypeInfo::Int)
                 } else {
                     // A BinOp over a boxed/foreign operand (`1 + len(archive)`
                     // where `archive = self.loader.archive` is a PyValue —
@@ -4551,10 +4565,10 @@ fn infer_field_type(
                     // PyValue (a PyValue operand poisons the whole BinOp).
                     let poisoned = [&b.left, &b.right].iter().any(|e| {
                         infer_field_type(e, name_types, symbols, options, class_name)
-                            .is_some_and(|t| t.to_string().contains("PyValue"))
+                            .is_some_and(|t| crate::ast::tree::type_ctx::type_contains_pyvalue(&t))
                     });
                     if poisoned {
-                        Some(quote!(stdpython::PyValue))
+                        Some(crate::TypeInfo::PyValue)
                     } else {
                         None
                     }
@@ -4573,7 +4587,7 @@ fn infer_field_type(
             if let ExprType::Call(c) = a.value.as_ref()
                 && matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "getattr")
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A chain rooted in an external-module CALL
             // (`urllib.parse.urlsplit(url).netloc` — pip's PackageIndex):
@@ -4604,7 +4618,7 @@ fn infer_field_type(
                     }
                 })
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A field read on a CLASS CONSTRUCTION (`TempDirectory(...)
             // .path` — pip's VenvBuildEnvironment): the class's annotated
@@ -4632,7 +4646,7 @@ fn infer_field_type(
                     crate::StatementType::AnnotatedName {
                         name, annotation, ..
                     } if name == &a.attr => {
-                        crate::python_annotation_to_rust_type(annotation)
+                        crate::annotation_type_info(annotation)
                     }
                     crate::StatementType::FunctionDef(f)
                         if f.name == a.attr
@@ -4646,14 +4660,13 @@ fn infer_field_type(
                     {
                         f.returns
                             .as_deref()
-                            .and_then(crate::python_annotation_to_rust_type)
+                            .and_then(crate::annotation_type_info)
                     }
                     _ => None,
                 }) {
                     return Some(field_ty);
                 }
-                let ident = crate::safe_ident(&cn.id);
-                return Some(quote!(#ident));
+                return Some(crate::TypeInfo::Class(cn.id.clone()));
             }
             // A dotted chain rooted in an EXTERNAL module read as a VALUE
             // (`self._mfa_prompter = getpass.getpass` — botocore's
@@ -4669,7 +4682,7 @@ fn infer_field_type(
                     )
                 )
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // An attribute read on an UNKNOWN local (`context.bin_path`
             // where `context = env.ensure_directories(...)` — pip's venv):
@@ -4678,7 +4691,7 @@ fn infer_field_type(
                 && !name_types.contains_key(&n.id)
                 && symbols.get(&n.id).is_none()
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A BOUND-METHOD read on a self-field SUBSCRIPT
             // (`self.get = self._entries[-1].get` — rich's ThemeStack): a
@@ -4688,7 +4701,7 @@ fn infer_field_type(
                 && matches!(s.value.as_ref(), ExprType::Attribute(t)
                     if matches!(t.value.as_ref(), ExprType::Name(n) if n.id == "self"))
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A FIELD read on a local typed as a CLASS (`scheme.scripts`
             // where `scheme = get_scheme(...)` returns the Scheme class —
@@ -4697,14 +4710,13 @@ fn infer_field_type(
             // of the crate (the local's type came from a cross-module
             // return annotation) — search the module defs.
             if let ExprType::Name(recv) = a.value.as_ref()
-                && let Some(ty) = name_types.get(&recv.id)
-                && let Some(class_name2) = ty.to_string().trim().split_whitespace().next()
+                && let Some(crate::TypeInfo::Class(class_name2)) = name_types.get(&recv.id)
                 && let Some(c) = (match symbols.get(class_name2) {
                     Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
                     _ => options.module_defs.values().find_map(|m| {
                         let m: &crate::Module = m;
                         m.raw.body.iter().find_map(|s| match &s.statement {
-                            crate::StatementType::ClassDef(c) if c.name == class_name2 => {
+                            crate::StatementType::ClassDef(c) if &c.name == class_name2 => {
                                 Some(c.clone())
                             }
                             _ => None,
@@ -4714,11 +4726,9 @@ fn infer_field_type(
             {
                 let field_ty = c.body.iter().find_map(|s| match &s.statement {
                     crate::StatementType::AnnotatedName { name, annotation } if name == &a.attr => {
-                        crate::python_annotation_to_rust_type(annotation)
-                            .or_else(|| {
-                                crate::resolve_alias_typeinfo(annotation, symbols, options)
-                                    .map(|t| t.to_rust_type())
-                            })
+                        crate::annotation_type_info(annotation).or_else(|| {
+                            crate::resolve_alias_typeinfo(annotation, symbols, options)
+                        })
                     }
                     crate::StatementType::FunctionDef(f)
                         if f.name == a.attr
@@ -4732,7 +4742,7 @@ fn infer_field_type(
                     {
                         f.returns
                             .as_deref()
-                            .and_then(crate::python_annotation_to_rust_type)
+                            .and_then(crate::annotation_type_info)
                     }
                     _ => None,
                 });
@@ -4743,7 +4753,7 @@ fn infer_field_type(
                 // field (`session.resume_retries` where PipSession's
                 // attribute is dynamic — pip's Downloader): a boxed
                 // PyValue (external-member divergence).
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A SELF-FIELD chain (`self._options.custom_functions` —
             // jmespath's TreeInterpreter): the member of a class-typed
@@ -4752,7 +4762,7 @@ fn infer_field_type(
             if let ExprType::Attribute(inner) = a.value.as_ref()
                 && matches!(inner.value.as_ref(), ExprType::Name(n) if n.id == "self")
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // An attribute chain rooted in a PyValue-typed local
             // (`self._resource.meta.client` where `resource` is an
@@ -4761,9 +4771,9 @@ fn infer_field_type(
             if let Some(recv) = crate::root_name(&a.value)
                 && name_types
                     .get(recv)
-                    .is_some_and(|t| t.to_string() == "stdpython :: PyValue")
+                    .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             if let ExprType::Name(class) = a.value.as_ref()
                 && let Some(SymbolTableNode::ClassDef(c)) = symbols.get(&class.id)
@@ -4776,7 +4786,7 @@ fn infer_field_type(
                     )
                 })
             {
-                Some(quote!(i64))
+                Some(crate::TypeInfo::Int)
             } else {
                 None
             }
@@ -4799,7 +4809,7 @@ fn infer_field_type(
                         if matches!(&c.0, Some(litrs::Literal::Integer(_))))
                 });
                 if all_int {
-                    return Some(quote!(i64));
+                    return Some(crate::TypeInfo::Int);
                 }
             }
             // An annotated module dict lookup with unresolvable elements
@@ -4812,7 +4822,7 @@ fn infer_field_type(
                     Some(crate::SymbolTableNode::Assign { .. })
                 )
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A subscript READ on a PyValue-typed local or parameter
             // (`self._base_default_config = default_config_data['base']` —
@@ -4822,9 +4832,9 @@ fn infer_field_type(
             if let ExprType::Name(dict) = s.value.as_ref()
                 && name_types
                     .get(&dict.id)
-                    .is_some_and(|t| t.to_string().contains("PyValue"))
+                    .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A subscript READ on a Vec-typed local (`self.capacity =
             // ident[4]` where `ident = self._read("16B")` is a bytes
@@ -4842,7 +4852,7 @@ fn infer_field_type(
             if let ExprType::Attribute(attr) = s.value.as_ref()
                 && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
             {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A subscript READ on any other local (`self.capacity =
             // ident[4]` where `ident = self._read("16B")` — pip's
@@ -4850,7 +4860,7 @@ fn infer_field_type(
             // reach the try-block assignment): the member of an unknown
             // local — a boxed PyValue (unknown-local divergence).
             if let ExprType::Name(_) = s.value.as_ref() {
-                return Some(quote!(stdpython::PyValue));
+                return Some(crate::TypeInfo::PyValue);
             }
             // A subscript SLICE of a `cast(T, ...)` call (`self.frames =
             // cast(List[str], spinner["frames"])[:]` — rich's Spinner):
@@ -4865,7 +4875,7 @@ fn infer_field_type(
             {
                 let t = crate::annotation_type_info(elt);
                 if matches!(t, Some(crate::TypeInfo::String)) {
-                    return Some(quote!(Vec<String>));
+                    return Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String)));
                 }
             }
             None
@@ -4879,25 +4889,25 @@ fn infer_field_type(
                 matches!(e, ExprType::Constant(c)
                     if matches!(&c.0, Some(litrs::Literal::String(_))))
             }) {
-                Some(quote!(std::collections::HashSet<String>))
+                Some(crate::TypeInfo::HashSet(Box::new(crate::TypeInfo::String)))
             } else {
-                Some(quote!(stdpython::PyValue))
+                Some(crate::TypeInfo::PyValue)
             }
         }
         // An EMPTY dict/list store (`self._method_cache = {}` — jmespath's
         // Visitor, later `.get`/`[k] = v`): a boxed PyDict<String, PyValue>
         // / Vec<PyValue> (the element types are unknowable at the store).
         ExprType::Dict(d) if d.keys.is_empty() => {
-            Some(quote!(PyDict<String, stdpython::PyValue>))
+            Some(crate::TypeInfo::Dict(Box::new(crate::TypeInfo::String), Box::new(crate::TypeInfo::PyValue)))
         }
         // A NON-EMPTY dict literal (`self._context = {'special_shape_types':
         // {}}` — botocore's ShapeDocumenter): a boxed PyDict<String,
         // PyValue> (the element types are not resolved at field-inference
         // depth; the boxed-dict divergence).
-        ExprType::Dict(_) => Some(quote!(PyDict<String, stdpython::PyValue>)),
+        ExprType::Dict(_) => Some(crate::TypeInfo::Dict(Box::new(crate::TypeInfo::String), Box::new(crate::TypeInfo::PyValue))),
         // A dict COMPREHENSION (`{tag: idx for idx, tag in ...}` — pip's
         // CandidateEvaluator): a boxed PyDict<String, PyValue>.
-        ExprType::DictComp(_) => Some(quote!(PyDict<String, stdpython::PyValue>)),
+        ExprType::DictComp(_) => Some(crate::TypeInfo::Dict(Box::new(crate::TypeInfo::String), Box::new(crate::TypeInfo::PyValue))),
         // A tuple of string literals (`self._previous_requirement_header =
         // ("", "")` — pip's RequirementPreparer): a Vec<String> (the
         // all-str-tuple rule). A heterogeneous tuple boxes as PyValue.
@@ -4906,12 +4916,12 @@ fn infer_field_type(
                 matches!(e, ExprType::Constant(c)
                     if matches!(&c.0, Some(litrs::Literal::String(_))))
             }) {
-                Some(quote!(Vec<String>))
+                Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String)))
             } else {
-                Some(quote!(stdpython::PyValue))
+                Some(crate::TypeInfo::PyValue)
             }
         }
-        ExprType::List(l) if l.is_empty() => Some(quote!(Vec<stdpython::PyValue>)),
+        ExprType::List(l) if l.is_empty() => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
         // A list of string literals (`self.sections = ['title', 'client',
         // ...]` — boto3's ServiceDocumenter): Vec<String>.
         ExprType::List(l)
@@ -4921,7 +4931,7 @@ fn infer_field_type(
                         if matches!(&c.0, Some(litrs::Literal::String(_))))
                 }) =>
         {
-            Some(quote!(Vec<String>))
+            Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String)))
         }
         // A NON-EMPTY list whose elements all infer to one concrete type
         // (`self._visited_profiles = [self._profile_name]` — botocore's
@@ -4929,7 +4939,7 @@ fn infer_field_type(
         // (a PyValue-typed self-field read) boxes the Vec as PyValue
         // elements (the empty-list divergence).
         ExprType::List(l) if !l.is_empty() => {
-            let mut elt_ty: Option<proc_macro2::TokenStream> = None;
+            let mut elt_ty: Option<crate::TypeInfo> = None;
             let mut unknown = false;
             for e in l {
                 let t = crate::infer_type(e, options, symbols);
@@ -4937,10 +4947,9 @@ fn infer_field_type(
                     unknown = true;
                     break;
                 }
-                let r = t.to_rust_type();
                 match &elt_ty {
-                    None => elt_ty = Some(r),
-                    Some(prev) if prev.to_string() == r.to_string() => {}
+                    None => elt_ty = Some(t),
+                    Some(prev) if prev == &t => {}
                     _ => {
                         unknown = true;
                         break;
@@ -4948,17 +4957,20 @@ fn infer_field_type(
                 }
             }
             if unknown {
-                Some(quote!(Vec<stdpython::PyValue>))
+                Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)))
             } else {
-                elt_ty.map(|t| quote!(Vec<#t>))
+                elt_ty.map(|t| crate::TypeInfo::Vec(Box::new(t)))
             }
         }
-        other => match crate::simple_expr_type(other) {
-            // String literals are owned in fields; the store side converts
-            // (see Assign).
-            Some(ty) if ty.to_string() == "& 'static str" => Some(quote!(String)),
-            other => other,
-        },
+        other => crate::simple_expr_typeinfo(other).map(|t| {
+            // Fields own their strings: a `self._value = "5"` store makes
+            // a String field, not a &'static str (the store side converts).
+            if matches!(t, crate::TypeInfo::StrRef) {
+                crate::TypeInfo::String
+            } else {
+                t
+            }
+        }),
     }
 }
 
@@ -5031,12 +5043,12 @@ fn expr_is_literal(e: &crate::ExprType) -> bool {
 /// Whether a type-token string is a `Vec<T>` and, if so, the inner type
 /// as a token stream (`Vec<u8>` → `u8`, `Vec<stdpython::PyValue>` →
 /// `stdpython::PyValue`).
-fn vec_element_type(t: &TokenStream) -> Option<TokenStream> {
-    let s = t.to_string();
-    let inner = s.strip_prefix("Vec <")?.strip_suffix('>')?;
-    // `u8`, `String`, `stdpython :: PyValue` — re-quote via the token
-    // parser (the TokenStream Display inserts spaces around punctuation).
-    inner.replace(" :: ", "::").parse::<TokenStream>().ok()
+fn vec_element_type(t: &crate::TypeInfo) -> Option<crate::TypeInfo> {
+    // Structural, not string-parsed (issue #137's review).
+    match t {
+        crate::TypeInfo::Vec(inner) => Some((**inner).clone()),
+        _ => None,
+    }
 }
 
 /// Whether a base expression is a `typing.*` construct (Generic[T],
@@ -5175,7 +5187,7 @@ impl ClassDef {
 #[derive(Debug)]
 enum ObservedStore {
     NoneLiteral,
-    Typed(String),
+    Typed(crate::TypeInfo),
     Unknown,
 }
 

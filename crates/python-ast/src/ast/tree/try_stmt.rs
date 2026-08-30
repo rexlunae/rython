@@ -660,10 +660,8 @@ fn dynamic_exception_value(
         && let Ok(fields) = class.infer_fields(symbols, options)
         && let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr)
     {
-        let ty_str = ty.to_string();
-        let boxed = ty_str.contains("PyValue")
-            || ty_str == "PyObject"
-            || ty_str.starts_with("Option <");
+        let boxed = crate::ast::tree::type_ctx::type_contains_pyvalue(ty)
+            || matches!(ty, crate::TypeInfo::PyObject | crate::TypeInfo::Option(_));
         if boxed {
             return exception_type
                 .clone()

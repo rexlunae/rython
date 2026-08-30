@@ -351,7 +351,7 @@ fn is_option_expr(
             options,
             symbols,
         ) {
-            return t.starts_with("Option <");
+            return matches!(t, crate::TypeInfo::Option(_));
         }
     }
     false
@@ -391,10 +391,10 @@ fn py_operand_name(
             symbols,
         )
     {
-        if t.contains("f64") {
+        if matches!(t, crate::TypeInfo::Float) {
             return "float";
         }
-        if t.contains("i64") {
+        if matches!(t, crate::TypeInfo::Int) {
             return "int";
         }
     }

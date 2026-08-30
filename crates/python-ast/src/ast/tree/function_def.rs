@@ -1410,7 +1410,7 @@ impl FunctionDef {
                 options.str_literal_locals = std::rc::Rc::new(
                     locals
                         .into_iter()
-                        .filter(|(_, ty)| ty.to_string() == quote!(&'static str).to_string())
+                        .filter(|(_, ty)| matches!(ty, crate::TypeInfo::StrRef))
                         .map(|(name, _)| name)
                         .collect(),
                 );
@@ -1514,7 +1514,7 @@ impl FunctionDef {
             let mut literal_types = std::collections::HashMap::new();
             collect_local_types(&self.body, &mut literal_types);
             for (name, ty) in literal_types {
-                let Some(py) = rust_type_to_py_name(&ty) else {
+                let Some(py) = typeinfo_to_py_name(&ty) else {
                     continue;
                 };
                 // A literal assignment overrides nothing: annotations win.
@@ -1923,9 +1923,7 @@ impl FunctionDef {
             options.str_literal_locals = std::rc::Rc::new(
                 locals
                     .into_iter()
-                    .filter(|(_, ty)| {
-                        ty.to_string() == quote!(&'static str).to_string()
-                    })
+                    .filter(|(_, ty)| matches!(ty, crate::TypeInfo::StrRef))
                     .map(|(name, _)| name)
                     .collect(),
             );
@@ -2660,6 +2658,43 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
     }
 }
 
+/// The TypeInfo twin of [`simple_expr_type`] — the field-inference layer
+/// (issue #137's review: `infer_fields` carries TypeInfo, not tokens, so
+/// field types are structural and the coercion layers can match on them).
+pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
+    match expr {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(_)) => Some(crate::TypeInfo::Int),
+            Some(litrs::Literal::Float(_)) => Some(crate::TypeInfo::Float),
+            Some(litrs::Literal::Bool(_)) => Some(crate::TypeInfo::Bool),
+            // A string constant lowers to a &'static str literal (the
+            // field layer converts to owned String where fields need it).
+            Some(litrs::Literal::String(_)) => Some(crate::TypeInfo::StrRef),
+            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                Some(crate::TypeInfo::Bytes)
+            }
+            _ => None,
+        },
+        ExprType::JoinedStr(_) => Some(crate::TypeInfo::String),
+        // `"sep".join(iterable)` — yields an owned String.
+        ExprType::Call(call) => {
+            if let ExprType::Attribute(a) = call.func.as_ref()
+                && a.attr == "join"
+                && matches!(
+                    a.value.as_ref(),
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                )
+            {
+                Some(crate::TypeInfo::String)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
@@ -3004,6 +3039,20 @@ fn global_write_error(body: &[Statement]) -> Option<String> {
 /// consumer (call.rs's isinstance comparison against local_types) MUST
 /// yield the same name for the same type — they previously kept separate
 /// copies whose fallbacks disagreed.
+/// The TypeInfo twin of [`rust_type_to_py_name`] — the local-types layer
+/// carries TypeInfo (issue #137's review), so the python-name mapping
+/// matches structurally instead of re-parsing rendered tokens.
+pub(crate) fn typeinfo_to_py_name(ty: &crate::TypeInfo) -> Option<&'static str> {
+    Some(match ty {
+        crate::TypeInfo::Int => "int",
+        crate::TypeInfo::Float => "float",
+        crate::TypeInfo::Bool => "bool",
+        crate::TypeInfo::Bytes => "bytes",
+        crate::TypeInfo::StrRef | crate::TypeInfo::String => "str",
+        _ => return None,
+    })
+}
+
 pub(crate) fn rust_type_to_py_name(ty: &proc_macro2::TokenStream) -> Option<&'static str> {
     let s = ty.to_string();
     Some(match s.as_str() {
@@ -3018,7 +3067,7 @@ pub(crate) fn rust_type_to_py_name(ty: &proc_macro2::TokenStream) -> Option<&'st
 
 pub(crate) fn collect_local_types(
     body: &[Statement],
-    out: &mut std::collections::HashMap<String, TokenStream>,
+    out: &mut std::collections::HashMap<String, crate::TypeInfo>,
 ) {
     for stmt in body {
         match &stmt.statement {
@@ -3029,8 +3078,8 @@ pub(crate) fn collect_local_types(
                     if let Some(ann) = assign.annotation.as_ref()
                         && let Some(t) = crate::annotation_type_info(ann)
                     {
-                        out.insert(name.id.clone(), t.to_rust_type());
-                    } else if let Some(ty) = simple_expr_type(&assign.value) {
+                        out.insert(name.id.clone(), t);
+                    } else if let Some(ty) = simple_expr_typeinfo(&assign.value) {
                         out.insert(name.id.clone(), ty);
                     } else {
                         // A CONTAINER literal local types like the literal
@@ -3050,16 +3099,19 @@ pub(crate) fn collect_local_types(
                                         *k,
                                         crate::TypeInfo::StrRef | crate::TypeInfo::PyObject
                                     ) {
-                                        quote!(String)
+                                        crate::TypeInfo::String
                                     } else {
-                                        k.to_rust_type()
+                                        *k
                                     };
                                     let v = if matches!(*v, crate::TypeInfo::PyObject) {
-                                        quote!(stdpython::PyValue)
+                                        crate::TypeInfo::PyValue
                                     } else {
-                                        v.to_rust_type()
+                                        *v
                                     };
-                                    out.insert(name.id.clone(), quote!(PyDict<#k, #v>));
+                                    out.insert(
+                                        name.id.clone(),
+                                        crate::TypeInfo::Dict(Box::new(k), Box::new(v)),
+                                    );
                                 }
                             }
                             ExprType::List(l) if !l.is_empty() => {
@@ -3067,8 +3119,7 @@ pub(crate) fn collect_local_types(
                                     crate::syntactic_type(&assign.value)
                                 {
                                     if !matches!(*elt, crate::TypeInfo::PyObject) {
-                                        let t = elt.to_rust_type();
-                                        out.insert(name.id.clone(), quote!(Vec<#t>));
+                                        out.insert(name.id.clone(), crate::TypeInfo::Vec(elt));
                                     }
                                 }
                             }
@@ -3079,13 +3130,16 @@ pub(crate) fn collect_local_types(
                             ExprType::Dict(d) if d.keys.is_empty() => {
                                 out.insert(
                                     name.id.clone(),
-                                    quote!(PyDict<String, stdpython::PyValue>),
+                                    crate::TypeInfo::Dict(
+                                        Box::new(crate::TypeInfo::String),
+                                        Box::new(crate::TypeInfo::PyValue),
+                                    ),
                                 );
                             }
                             ExprType::List(l) if l.is_empty() => {
                                 out.insert(
                                     name.id.clone(),
-                                    quote!(Vec<stdpython::PyValue>),
+                                    crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
                                 );
                             }
                             _ => {}
@@ -3098,7 +3152,7 @@ pub(crate) fn collect_local_types(
             // module object — a boxed value.
             StatementType::Import(im) => {
                 for a in &im.names {
-                    out.insert(a.name.clone(), quote!(stdpython::PyValue));
+                    out.insert(a.name.clone(), crate::TypeInfo::PyValue);
                 }
             }
             // A bare annotated local (`key: str` / `value: str` — urllib3's
@@ -3106,7 +3160,7 @@ pub(crate) fn collect_local_types(
             // (dnsnames.append(value) pins Vec<String>).
             StatementType::AnnotatedName { name, annotation } => {
                 if let Some(t) = crate::annotation_type_info(annotation) {
-                    out.insert(name.clone(), t.to_rust_type());
+                    out.insert(name.clone(), t);
                 }
             }
             StatementType::Try(s) => {
@@ -3655,7 +3709,10 @@ impl FunctionDef {
             .or_else(|| self.unified_return_type(symbols, options))
             .or_else(|| self.module_path_call_return_type(symbols, options))
             .or_else(|| self.self_method_call_return_type(self_class, symbols, options))
-            .or_else(|| self.self_field_return_type(self_class, symbols, options))
+            .or_else(|| {
+                self.self_field_return_type(self_class, symbols, options)
+                    .map(|t| t.to_rust_type())
+            })
     }
 
     /// An unannotated METHOD whose returns are all reads of fields of its
@@ -3671,7 +3728,7 @@ impl FunctionDef {
         self_class: Option<&str>,
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
-    ) -> Option<TokenStream> {
+    ) -> Option<crate::TypeInfo> {
         if !guarantees_return(&self.body) {
             return None;
         }
@@ -3689,8 +3746,8 @@ impl FunctionDef {
         // issue #222's local half): resolve the local's single assignment
         // in the method body and type through it. Deeper chains stay out
         // of scope (the local-type collector's own bucket).
-        let assigned_self_field = |name: &str| -> Option<TokenStream> {
-            let mut found: Option<TokenStream> = None;
+        let assigned_self_field = |name: &str| -> Option<crate::TypeInfo> {
+            let mut found: Option<crate::TypeInfo> = None;
             for s in &self.body {
                 let crate::StatementType::Assign(a) = &s.statement else {
                     continue;
@@ -3714,7 +3771,7 @@ impl FunctionDef {
             }
             found
         };
-        let mut unified: Option<TokenStream> = None;
+        let mut unified: Option<crate::TypeInfo> = None;
         for r in &returns {
             let ty = match r {
                 ExprType::Attribute(attr) => {
@@ -3734,7 +3791,7 @@ impl FunctionDef {
             };
             match &unified {
                 None => unified = Some(ty),
-                Some(prev) if prev.to_string() == ty.to_string() => {}
+                Some(prev) if prev == &ty => {}
                 _ => return None,
             }
         }
@@ -4078,7 +4135,7 @@ impl FunctionDef {
     /// the body prologue, so what a `return` sees is the owned `String`.
     /// An unannotated parameter is left alone: its type may be an inferred
     /// generic, and that path is owned by `inferred_signature`.
-    fn annotated_param_type(&self, name: &str) -> Option<TokenStream> {
+    fn annotated_param_type(&self, name: &str) -> Option<crate::TypeInfo> {
         let param = self
             .args
             .posonlyargs
@@ -4088,9 +4145,9 @@ impl FunctionDef {
             .find(|p| p.arg == name)?;
         let ann = param.annotation.as_deref()?;
         if matches!(ann, ExprType::Name(n) if n.id == "str") {
-            return Some(quote!(String));
+            return Some(crate::TypeInfo::String);
         }
-        crate::python_annotation_to_rust_type(ann)
+        crate::annotation_type_info(ann)
     }
 
     pub fn inferred_return_type(&self, options: &crate::PythonOptions) -> Option<TokenStream> {
@@ -4113,17 +4170,17 @@ impl FunctionDef {
         let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
         scan_str_rebindings(&self.body, &mut literal_bindings, &mut rebound);
 
-        let mut inferred: Option<TokenStream> = None;
+        let mut inferred: Option<crate::TypeInfo> = None;
         for ret in &returns {
             let value = (*ret)?; // a bare `return` means the type is unit
             let ty = match value {
                 ExprType::Name(name) => match locals.get(&name.id) {
                     Some(t) => {
                         let t = t.clone();
-                        if t.to_string() == quote!(&'static str).to_string()
+                        if matches!(t, crate::TypeInfo::StrRef)
                             && rebound.contains(&name.id)
                         {
-                            quote!(String)
+                            crate::TypeInfo::String
                         } else {
                             t
                         }
@@ -4134,8 +4191,7 @@ impl FunctionDef {
                     // the function as the class.
                     None => match options.mutable_statics.get(&name.id) {
                         Some(crate::MutableGlobalKind::Class { class }) => {
-                            let ident = crate::safe_ident(class);
-                            quote!(#ident)
+                            crate::TypeInfo::Class(class.clone())
                         }
                         // Issue #222: a returned PARAMETER is not a local,
                         // so it used to fall straight through to `None` and
@@ -4148,15 +4204,15 @@ impl FunctionDef {
                         },
                     },
                 },
-                other => simple_expr_type(other)?,
+                other => crate::simple_expr_typeinfo(other)?,
             };
             match &inferred {
                 None => inferred = Some(ty),
-                Some(prev) if prev.to_string() == ty.to_string() => {}
+                Some(prev) if prev == &ty => {}
                 _ => return None,
             }
         }
-        inferred
+        inferred.map(|t| t.to_rust_type())
     }
 }
 

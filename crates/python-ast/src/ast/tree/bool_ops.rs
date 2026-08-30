@@ -348,17 +348,17 @@ fn fold_operand_type(
         return inferred;
     }
     let field_ty = crate::ast::tree::aug_assign::self_field_rust_ty(&attr.attr, ctx, options, symbols);
-    if field_ty.as_deref().is_some_and(|t| t.starts_with("Option <")) {
-        // The inner type from the field's Rust type, so the fold's
+    if field_ty.as_ref().is_some_and(|t| matches!(t, crate::TypeInfo::Option(_))) {
+        // The inner type from the field's TypeInfo, so the fold's
         // inner_matches can unify with the other operand (`self.path or
         // "/"` — Option<String> and a &str literal).
-        let inner = if field_ty.as_deref().is_some_and(|t| t.contains("String")) {
+        let inner = if field_ty.as_ref().is_some_and(|t| matches!(t, crate::TypeInfo::Option(inner) if matches!(**inner, crate::TypeInfo::String))) {
             crate::TypeInfo::String
-        } else if field_ty.as_deref().is_some_and(|t| t.contains("i64")) {
+        } else if field_ty.as_ref().is_some_and(|t| matches!(t, crate::TypeInfo::Option(inner) if matches!(**inner, crate::TypeInfo::Int))) {
             crate::TypeInfo::Int
-        } else if field_ty.as_deref().is_some_and(|t| t.contains("f64")) {
+        } else if field_ty.as_ref().is_some_and(|t| matches!(t, crate::TypeInfo::Option(inner) if matches!(**inner, crate::TypeInfo::Float))) {
             crate::TypeInfo::Float
-        } else if field_ty.as_deref().is_some_and(|t| t.contains("bool")) {
+        } else if field_ty.as_ref().is_some_and(|t| matches!(t, crate::TypeInfo::Option(inner) if matches!(**inner, crate::TypeInfo::Bool))) {
             crate::TypeInfo::Bool
         } else {
             crate::TypeInfo::PyObject
