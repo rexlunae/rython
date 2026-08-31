@@ -873,6 +873,21 @@ fixed; the lru_cache hit/miss paths now type-check for Option keys.
 Sweep −47 (charset_normalizer 285→238, everything else flat). Pinned in
 codegen (imported-Option store, lru_cache Option key).
 
+Round 76 (the str.is* family): charset_normalizer's biggest residual
+was 48 E0599s — str.isupper/isalpha/isdigit/isspace/islower/
+isprintable (plus isdecimal/isalnum/istitle) had NO runtime
+counterpart. The PyStrOps trait gains the family with Python's exact
+semantics (verified against python3: isupper = at least one cased
+character and no lowercase, isalpha = non-empty all alphabetic,
+isspace = non-empty all White_Space, isprintable = no Other-category
+characters with the empty string printable, istitle = cased runs form
+titlecase words). Two documented §12 approximations: isdigit/isdecimal
+are ASCII-exact (Rust's std exposes no Unicode digit property, so the
+'²'-class superscripts Python accepts are False here), and isprintable
+treats format characters (Cf) as printable. Sweep −48
+(charset_normalizer 238→190, everything else flat). Pinned in the
+runtime against the CPython truth table.
+
 ## 6. Functions
 
 ### 6.1 Signatures

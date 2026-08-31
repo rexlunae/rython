@@ -4118,6 +4118,35 @@ pub trait PyStrOps {
     fn title(&self) -> String;
     /// str.zfill(width): zero-pad to width CHARACTERS, after any sign.
     fn zfill(&self, width: i64) -> String;
+    /// Python str.isupper(): at least one cased character and no
+    /// lowercase characters (verified against python3).
+    fn isupper(&self) -> bool;
+    /// Python str.islower(): at least one cased character and no
+    /// uppercase characters.
+    fn islower(&self) -> bool;
+    /// Python str.isalpha(): non-empty and every character alphabetic.
+    fn isalpha(&self) -> bool;
+    /// Python str.isdigit(): non-empty and every character a decimal
+    /// digit. ASCII-exact (Python also classifies the Unicode digit
+    /// property — superscripts like '²' — which Rust's std does not
+    /// expose; documented divergence in §12).
+    fn isdigit(&self) -> bool;
+    /// Python str.isdecimal(): non-empty and every character a decimal
+    /// digit (ASCII-exact, same §12 note as isdigit).
+    fn isdecimal(&self) -> bool;
+    /// Python str.isalnum(): non-empty and every character
+    /// alphanumeric.
+    fn isalnum(&self) -> bool;
+    /// Python str.isspace(): non-empty and every character whitespace.
+    fn isspace(&self) -> bool;
+    /// Python str.isprintable(): every character printable (the empty
+    /// string is printable). Approximate for format characters (Cf —
+    /// Rust's std does not expose the category; documented in §12).
+    fn isprintable(&self) -> bool;
+    /// Python str.istitle(): cased characters form titlecase words
+    /// (the first cased character after uncased is uppercase, the rest
+    /// lowercase) and at least one is cased.
+    fn istitle(&self) -> bool;
     /// str.ljust / str.rjust with a fill character, width in CHARACTERS.
     /// The fill must be exactly one character; Python raises TypeError
     /// otherwise (silently using a prefix would diverge).
@@ -4336,6 +4365,77 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         } else {
             format!("{}{}", zeros, self.as_ref())
         }
+    }
+    fn isupper(&self) -> bool {
+        let mut has_cased = false;
+        for c in self.as_ref().chars() {
+            if c.is_lowercase() {
+                return false;
+            }
+            has_cased |= c.is_uppercase();
+        }
+        has_cased
+    }
+    fn islower(&self) -> bool {
+        let mut has_cased = false;
+        for c in self.as_ref().chars() {
+            if c.is_uppercase() {
+                return false;
+            }
+            has_cased |= c.is_lowercase();
+        }
+        has_cased
+    }
+    fn isalpha(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_alphabetic())
+    }
+    fn isdigit(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+    }
+    fn isdecimal(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+    }
+    fn isalnum(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_alphabetic() || c.is_numeric())
+    }
+    fn isspace(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_whitespace())
+    }
+    fn isprintable(&self) -> bool {
+        self.as_ref().chars().all(|c| {
+            let cp = c as u32;
+            !c.is_control()
+                // Private-use planes (Co) and surrogates (Cs) — Rust's
+                // std exposes no helpers for these.
+                && !(0xE000..=0xF8FF).contains(&cp)
+                && !(0xF0000..=0xFFFFD).contains(&cp)
+                && !(0x100000..=0x10FFFD).contains(&cp)
+                && !(0xD800..=0xDFFF).contains(&cp)
+        })
+    }
+    fn istitle(&self) -> bool {
+        let mut prev_cased = false;
+        let mut has_cased = false;
+        for c in self.as_ref().chars() {
+            let cased = c.is_uppercase() || c.is_lowercase();
+            if cased {
+                has_cased = true;
+                if !prev_cased {
+                    if !c.is_uppercase() {
+                        return false;
+                    }
+                } else if c.is_uppercase() {
+                    return false;
+                }
+            }
+            prev_cased = cased;
+        }
+        has_cased
     }
     fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
