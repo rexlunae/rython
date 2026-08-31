@@ -898,6 +898,22 @@ default); the alloc tier keeps the approximation. Sweep −48
 (charset_normalizer 238→190, everything else flat). Pinned in the
 runtime against the CPython truth table.
 
+Round 77 (is-None early-exit narrowing): charset_normalizer's
+`String: From<Option<String>>` family (11 sites) — an imported
+`str | None`-returning callee's local (`character_range =
+unicode_range(chunk)`) stayed untyped in the hoisting analysis, so it
+never entered optional_names and the is-not-None narrowing never fired.
+Two fixes: (1) `call_return_typeinfo` resolves imported callees through
+`module_defs_key` (the same root-relative normalization the import
+lowering uses), so the local is typed Option<String> from the start;
+(2) an `if X is None:` guard whose body ALWAYS exits
+(continue/break/return/raise) narrows the FOLLOWING statements — they
+are reachable only when X is not None (`if character_range is None:
+continue` in encoding_unicode_range) — with the membership-comparison
+unwrapping guarded against already-narrowed receivers. Sweep −3
+(charset_normalizer 190→187, everything else flat). Pinned in codegen
+(the is-None early-exit guard narrows the following reads).
+
 ## 6. Functions
 
 ### 6.1 Signatures
