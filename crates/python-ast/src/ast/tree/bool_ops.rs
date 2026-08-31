@@ -193,6 +193,18 @@ fn fold(
                 || matches!(other, T::PyObject)
                 || (matches!(inner, T::String) && matches!(other, T::StrRef))
                 || (matches!(inner, T::Bytes) && matches!(other, T::StrRef))
+                // CONTAINER-typed pairs that unify (`headers or {}` where
+                // headers is `Mapping[str, str] | None` and the empty-dict
+                // literal infers Dict(PyObject, PyObject) — urllib3's
+                // RequestMethods): the literal's element types are
+                // unknown, but the Option's inner anchors them. Round 62:
+                // unify() is the same compatibility relation the rest of
+                // the codebase uses; a boxed-PyValue result is excluded
+                // (a PyValue operand does not Some-wrap into Option<T>).
+                || !matches!(
+                    crate::ast::tree::type_ctx::unify(inner.clone(), other.clone()),
+                    T::PyObject | T::PyValue
+                )
         }
         match (&a, &b) {
             // a: Option<T>, b: T — the falsy arm holds the Option, the
@@ -360,14 +372,17 @@ fn some_arm(expr: &crate::ExprType, tokens: TokenStream) -> TokenStream {
     }
 }
 
-/// The fold's operand type: [`infer_type`] plus the SELF-FIELD case it
-/// cannot see (`self.path` — the field's class-table type; urllib3's Url
-/// stores `Option<String>` fields, and `self.path or "/"` must fold with
-/// the Option arm, not fall to `||`). A `self.<field>` read whose field
-/// the class table types `Option < ... >` is `Option(PyObject)` for the
-/// fold's purposes — the inner type's exact identity only matters for
-/// the Some-wrap, which the fold's own inner_matches lets rustc judge.
-fn fold_operand_type(
+/// The fold's operand type: [`infer_type`] plus the cases it cannot see —
+/// a SELF-FIELD read (`self.path` — the field's class-table type; urllib3's
+/// Url stores `Option<String>` fields, and `self.path or "/"` must fold
+/// with the Option arm, not fall to `||`) and a NAME whose Option-ness
+/// lives only in `optional_names` (`conn = None` then `conn = ...` —
+/// urllib3's _get_conn: the recorded None assignment infers PyObject, but
+/// the scope analysis tracks the binding as Option, so `conn or
+/// self._new_conn()` must fold with the Option arm — round 62). The inner
+/// type resolves from the recorded name type when it is an Option; an
+/// unknown inner (PyObject) still folds — the Some-wrap lets rustc judge.
+pub(crate) fn fold_operand_type(
     expr: &crate::ExprType,
     ctx: &crate::CodeGenContext,
     options: &crate::PythonOptions,
@@ -376,6 +391,15 @@ fn fold_operand_type(
     let inferred = crate::infer_type(expr, options, symbols);
     if !matches!(inferred, crate::TypeInfo::PyObject) {
         return inferred;
+    }
+    if let crate::ExprType::Name(n) = expr
+        && options.optional_names.contains(&n.id)
+    {
+        let inner = match options.name_types.get(&n.id) {
+            Some(crate::TypeInfo::Option(inner)) => (**inner).clone(),
+            _ => crate::TypeInfo::PyObject,
+        };
+        return crate::TypeInfo::Option(Box::new(inner));
     }
     let crate::ExprType::Attribute(attr) = expr else {
         return inferred;

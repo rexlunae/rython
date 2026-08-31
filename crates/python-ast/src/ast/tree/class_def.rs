@@ -4539,13 +4539,75 @@ fn infer_field_type(
         // character in COMMON_CJK_CHARACTERS`, `not x`) are bool — UNLESS
         // a branch is a boxed value (`excluded_params or frozenset()` —
         // botocore's EndpointProvider, where the param is PyValue): the
-        // combination takes the boxed value.
+        // combination takes the boxed value. Round 62 extends the operand
+        // view: `x or y` returns an OPERAND (never a bool), so an
+        // Option-typed operand keeps the Option (`self.headers = headers
+        // or {}` where headers is `Mapping[str, str] | None` — urllib3's
+        // RequestMethods: the fold's Option arm Some-wraps the default,
+        // so the field is Option<PyDict>, matching the store). The
+        // operands are typed through the SAME fold_operand_type the fold
+        // uses, so the field always matches the fold's output; unknown
+        // operands keep the Bool fallback (`flag and check()` — both
+        // bool, exactly the round-55 shape).
         ExprType::BoolOp(b) => {
-            if b.values.iter().any(|v| {
-                infer_field_type(v, name_types, symbols, options, class_name)
-                    .is_some_and(|t| matches!(t, crate::TypeInfo::PyValue))
-            }) {
-                Some(crate::TypeInfo::PyValue)
+            let field_ctx = crate::CodeGenContext::Class(class_name.to_string());
+            // Operand typing must be CONTEXT-INDEPENDENT: infer_fields is
+            // consulted from many codegen phases (trait generation, the
+            // struct, method bodies) whose function-scoped options differ.
+            // A NAME operand resolves through the caller's explicit
+            // name_types map (the __init__ parameter/local types) before
+            // any options-based inference — fold_operand_type alone would
+            // type `headers` (a `Mapping[str, str] | None` __init__
+            // parameter) as PyObject under module-level options but
+            // Option<PyDict> under the method's, making the field type
+            // depend on who asked.
+            let operand_ty = |v: &crate::ExprType| -> crate::TypeInfo {
+                if let crate::ExprType::Name(n) = v {
+                    if let Some(t) = name_types.get(&n.id) {
+                        return t.clone();
+                    }
+                }
+                crate::ast::tree::bool_ops::fold_operand_type(
+                    v, &field_ctx, options, symbols,
+                )
+            };
+            let tys: Vec<crate::TypeInfo> = b.values.iter().map(operand_ty).collect();
+            if tys
+                .iter()
+                .any(|t| matches!(t, crate::TypeInfo::PyValue))
+            {
+                return Some(crate::TypeInfo::PyValue);
+            }
+            let mut has_option = false;
+            let mut plain: Vec<crate::TypeInfo> = Vec::new();
+            for t in tys {
+                match t {
+                    crate::TypeInfo::Option(inner) => {
+                        has_option = true;
+                        plain.push((*inner).clone());
+                    }
+                    other => plain.push(other),
+                }
+            }
+            let Some(mut u) = plain.pop() else {
+                return Some(crate::TypeInfo::Bool);
+            };
+            for t in plain {
+                u = crate::ast::tree::type_ctx::unify(u, t);
+            }
+            // A unified result containing an UNKNOWN element (`Dict(
+            // PyObject, PyObject)` — the empty-dict literal typed against
+            // an unknown Option inner) renders `PyDict<_, _>`, which is
+            // E0121 in a field signature: fall back to Bool (the fold's
+            // Option arm still Some-wraps; the mismatch stays loud where
+            // it cannot type). Only fully-known types become fields.
+            if crate::ast::tree::type_ctx::type_mentions_pyobject(&u) {
+                return Some(crate::TypeInfo::Bool);
+            }
+            if has_option && !matches!(u, crate::TypeInfo::PyObject) {
+                Some(crate::TypeInfo::Option(Box::new(u)))
+            } else if !matches!(u, crate::TypeInfo::PyObject) {
+                Some(u)
             } else {
                 Some(crate::TypeInfo::Bool)
             }

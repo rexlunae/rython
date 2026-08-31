@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 61: field_class construction stores, Mapping.get with None defaults, literal-list membership spellings (1050)."
+      "note": "The historical #137 corpus. Round 62: bool-fold Option operands (None-seeded locals, Option-dict or {}), Option-aware BoolOp field types (1033)."
     },
     {
       "name": "certifi",
