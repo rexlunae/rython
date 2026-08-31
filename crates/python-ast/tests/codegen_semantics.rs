@@ -15181,8 +15181,8 @@ fn compiled_regex_groups_destructure_span_and_option_arg() {
         out
     );
     assert!(
-        out.contains("unwrap_or_else") && out.contains("has no attribute"),
-        "a truthiness-narrowed Option<String> argument must unwrap before the match: {}",
+        out.contains("unwrap_or_else") && out.contains("TypeError"),
+        "a truthiness-narrowed Option<String> argument must unwrap before the match with Python's TypeError: {}",
         out
     );
 }

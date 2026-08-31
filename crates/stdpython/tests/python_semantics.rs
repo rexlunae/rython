@@ -3700,4 +3700,10 @@ fn compiled_regex_matches_with_python_anchoring() {
     let m = grp.py_fullmatch("ab").unwrap();
     assert_eq!(m.group(0), "ab");
     assert_eq!(m.group(2), "ab");
+    // python3: re.match("a(b)?", "a").span(1) is (-1, -1) — a
+    // non-participating group's span is the sentinel pair, not an error.
+    let opt = Regex::new("a(b)?").unwrap();
+    let om = opt.py_match("a").unwrap();
+    assert_eq!(om.span_group(1), (-1, -1), "span of an absent group is (-1, -1)");
+    assert_eq!(om.span_group(0), (0, 1));
 }

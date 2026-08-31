@@ -849,8 +849,13 @@ values (a `T | None` property read, a `.get(key, None)` call, a local
 assigned an Option-returning call — all recognized by the extended
 `expr_yields_option_ctx`) through unwrapped; (5) an `if v is not None:`-
 narrowed Option-typed name READS by unwrapping — the PyValue `as_str()`
-path is for isinstance-narrowed boxed values only. Sweep −16 (urllib3
-978→962). Pinned in codegen and end-to-end (CPython-verified).
+path is for isinstance-narrowed boxed values only. Devin review on #279
+tightened two of the edges: `m.span(i)` returns Python's exact `(-1, -1)`
+for a non-participating group (not a panic), and the Option-arg unwrap
+before a compiled pattern's match raises Python's exact `TypeError`
+("expected string or bytes-like object, got 'NoneType'"), not the
+AttributeError spelling. Sweep −16 (urllib3 978→962). Pinned in codegen
+and end-to-end (CPython-verified).
 
 ## 6. Functions
 
@@ -1606,6 +1611,15 @@ in generated code rather than a conversion-time message:
   likewise surfaces only when rustc sees a use.
 - Most aliasing shapes (`b = a` then mutate) fail in rustc's move
   checker (issue #79 proposes conversion-time detection).
+
+- `m.groups()` returns `Vec<String>` and FAILS LOUDLY (a ValueError-
+  typed panic) when a capture group did not participate: Python yields
+  `None` for that member (a tuple), which a typed `Vec<String>` cannot
+  hold — the same divergence `m.group(i)` documents. The tuple-
+  DESTRUCTURE form (`path, query = m.groups()`) hits the same wall: the
+  None-able members need an Option-typed lowering, which is not wired
+  yet (round 74 defers it to the Option-slot widening work). `m.span(i)`
+  is exact: an absent group's span is Python's `(-1, -1)`, not an error.
 
 ### 12.2 Loud, by panic instead of exception
 

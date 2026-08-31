@@ -7047,11 +7047,13 @@ impl<'a> CodeGen for Call {
                                 &options,
                                 &symbols,
                             ) {
-                                let mname = attr.attr.clone();
+                                // CPython raises TypeError for a None text
+                                // argument: re.compile("a").match(None) ->
+                                // "expected string or bytes-like object,
+                                // got 'NoneType'".
                                 quote!(&((#text).clone().unwrap_or_else(|| {
                                     panic!(
-                                        "AttributeError: 'NoneType' object has no attribute '{}'",
-                                        #mname
+                                        "TypeError: expected string or bytes-like object, got 'NoneType'"
                                     )
                                 })))
                             } else {
