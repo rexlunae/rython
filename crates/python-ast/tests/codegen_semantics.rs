@@ -15363,6 +15363,23 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "the guard compiles: {}",
         out
     );
+    // Devin review on #283: a harmless `else: pass` keeps the narrowing —
+    // the else writes nothing, so the following read of an Option-typed
+    // x still unwraps.
+    let out2 = compile(
+        "def h(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       pass\n\
+         \x20   return x\n",
+        "none_pass.py",
+    );
+    assert!(
+        out2.contains("clone () . unwrap ()") || out2.contains("clone().unwrap()"),
+        "an `else: pass` must keep the is-None narrowing: {}",
+        out2
+    );
     assert!(
         out.contains("x = None") || out.contains("x = None ;"),
         "the else branch re-assignment stays: {}",
