@@ -206,6 +206,7 @@ impl PyMatch {
             .collect()
     }
 
+
     /// m.start(), in character offsets.
     pub fn start(&self) -> i64 {
         self.group_entry(0).1
@@ -222,6 +223,22 @@ impl PyMatch {
         (e.1, e.2)
     }
 
+    /// m.span(i) — the group-index form of span (Python's optional
+    /// argument; the typed surface can't overload, so the indexed
+    /// spelling routes here). A group that did not participate is
+    /// (-1, -1), Python's exact answer for span() (unlike group(),
+    /// which yields None — the typed group() fails loudly there).
+    /// Verified against python3: re.match("a(b)?", "a").span(1) is
+    /// (-1, -1).
+    pub fn span_group(&self, i: i64) -> (i64, i64) {
+        if i < 0 || i as usize >= self.groups.len() {
+            panic!("{}", PyException::new("IndexError", "no such group"));
+        }
+        match &self.groups[i as usize] {
+            Some(entry) => (entry.1, entry.2),
+            None => (-1, -1),
+        }
+    }
 }
 
 /// A Match object is always truthy in Python (`if m:` tests presence
@@ -243,6 +260,7 @@ pub trait PyMatchOps {
     fn start(&self) -> i64;
     fn end(&self) -> i64;
     fn span(&self) -> (i64, i64);
+    fn span_group(&self, i: i64) -> (i64, i64);
 }
 
 fn none_match_panic(method: &str) -> ! {
@@ -295,6 +313,12 @@ impl PyMatchOps for Option<PyMatch> {
     fn span(&self) -> (i64, i64) {
         match self {
             Some(m) => m.span(),
+            None => none_match_panic("span"),
+        }
+    }
+    fn span_group(&self, i: i64) -> (i64, i64) {
+        match self {
+            Some(m) => m.span_group(i),
             None => none_match_panic("span"),
         }
     }

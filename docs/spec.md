@@ -834,6 +834,29 @@ their own `AnnotationModule` enum + `is_typing()` predicate. Submodule
 path segments (`numpy.linalg`, `collections.abc`) remain path structure,
 not module-name-set membership. Sweep-neutral (978/63/0/285/25).
 
+Round 74 (the Option-narrowing cluster, unmasked by round 73): the
+compiled-regex fixes of round 73 let urllib3's url.py compile one step
+further, exposing the Option-value-in-string-position family. Five
+pieces close it: (1) a truthiness-narrowed `Option<String>` ARGUMENT to
+a compiled pattern's match/search/fullmatch unwraps with the loud
+NoneType panic (urllib3's `_normalize_host`); (2) `m.span(i)` — the
+group-indexed span, Python's optional argument — routes to a new
+`span_group`; (3) an Option-typed SLICE receiver (`host[start:end]`
+after `if host:`) unwraps with the loud "not subscriptable" TypeError
+panic; (4) a `-> T | None` function wraps its PLAIN returns in `Some`
+and lowers `return None` to the None member, passing already-Option
+values (a `T | None` property read, a `.get(key, None)` call, a local
+assigned an Option-returning call — all recognized by the extended
+`expr_yields_option_ctx`) through unwrapped; (5) an `if v is not None:`-
+narrowed Option-typed name READS by unwrapping — the PyValue `as_str()`
+path is for isinstance-narrowed boxed values only. Devin review on #279
+tightened two of the edges: `m.span(i)` returns Python's exact `(-1, -1)`
+for a non-participating group (not a panic), and the Option-arg unwrap
+before a compiled pattern's match raises Python's exact `TypeError`
+("expected string or bytes-like object, got 'NoneType'"), not the
+AttributeError spelling. Sweep −16 (urllib3 978→962). Pinned in codegen
+and end-to-end (CPython-verified).
+
 ## 6. Functions
 
 ### 6.1 Signatures
@@ -1588,6 +1611,15 @@ in generated code rather than a conversion-time message:
   likewise surfaces only when rustc sees a use.
 - Most aliasing shapes (`b = a` then mutate) fail in rustc's move
   checker (issue #79 proposes conversion-time detection).
+
+- `m.groups()` returns `Vec<String>` and FAILS LOUDLY (a ValueError-
+  typed panic) when a capture group did not participate: Python yields
+  `None` for that member (a tuple), which a typed `Vec<String>` cannot
+  hold — the same divergence `m.group(i)` documents. The tuple-
+  DESTRUCTURE form (`path, query = m.groups()`) hits the same wall: the
+  None-able members need an Option-typed lowering, which is not wired
+  yet (round 74 defers it to the Option-slot widening work). `m.span(i)`
+  is exact: an absent group's span is Python's `(-1, -1)`, not an error.
 
 ### 12.2 Loud, by panic instead of exception
 

@@ -2148,6 +2148,22 @@ impl FunctionDef {
                 && self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()).is_none()
                 && literal_returns_need_boxing(&self.body));
 
+        // A `-> T | None` function's resolved return type is an Option:
+        // plain (non-Option) returns wrap in Some at the return site
+        // (statement.rs) — Python returns the bare value where None is
+        // only one of the possible results (urllib3's `_normalize_host`
+        // returns both `host.lower()` and `host`, a `str | None` path).
+        options.fn_return_is_option = self
+            .returns
+            .as_deref()
+            .and_then(crate::annotation_type_info)
+            .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
+            || (self.returns.is_none()
+                && inferred_signature
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|t| t.to_string().starts_with("Option")));
+
         // A `-> List[Union[...]]` return whose element resolves to the
         // boxed PyValue (`_seg_N` in idna's uts46data: `List[Union[
         // Tuple[int, str], Tuple[int, str, str]]]`): a RETURNING list
@@ -3282,9 +3298,48 @@ pub(crate) fn expr_yields_option_ctx(
     {
         return true;
     }
+    // A `.get(key, default)` call whose default is None (or an Option) is
+    // itself an Option — the mapping protocol's get returns None when the
+    // key is absent (`headers.get(name, default=None)` — urllib3's
+    // getheader). The get lowering's OWN Some-wrap makes the value the
+    // union member, so a return/store of it must pass the Option through,
+    // never Some-wrap again.
+    if let ExprType::Call(call) = expr
+        && let ExprType::Attribute(attr) = call.func.as_ref()
+        && attr.attr == "get"
+        && call.args.len() == 2
+        && (crate::is_none_expr(&call.args[1])
+            || crate::expr_yields_option_ctx(&call.args[1], ctx, options, symbols))
+    {
+        return true;
+    }
     let ExprType::Attribute(attr) = expr else {
         return false;
     };
+    // A PROPERTY read whose getter's return annotation is `T | None`
+    // (`self.url` where `@property def url(self) -> str | None` —
+    // urllib3's HTTPResponse.url) yields the Option: the property's VALUE
+    // is the union member, never a plain member.
+    if let Some((class, class_symbols)) = crate::receiver_class(&attr.value, ctx, symbols, options)
+        && class
+            .base_chain_with_options(&class_symbols, options)
+            .iter()
+            .any(|c| {
+                c.methods().any(|m| {
+                    m.name == attr.attr
+                        && m.decorator_list.iter().any(|d| match d {
+                            ExprType::Name(n) => n.id == "property",
+                            ExprType::Attribute(a) => a.attr == "property",
+                            _ => false,
+                        })
+                        && m.returns
+                            .as_deref()
+                            .is_some_and(crate::is_optional_annotation)
+                })
+            })
+    {
+        return true;
+    }
     let Some((class, class_symbols)) =
         crate::receiver_class(&attr.value, ctx, symbols, options)
         .or_else(|| {
@@ -3331,8 +3386,17 @@ pub(crate) fn expr_yields_option(
 ) -> bool {
     match expr {
         // A name that itself holds an Option (assigned None on some path,
-        // or an Optional-annotated parameter).
-        ExprType::Name(name) => options.optional_names.contains(&name.id),
+        // an Optional-annotated parameter, or a local whose INFERRED type
+        // is an Option — `netloc = self.netloc()?` in a Url method, where
+        // netloc() returns `Result<Option<String>, _>`; the `?` strips the
+        // Result layer, leaving an Option).
+        ExprType::Name(name) => {
+            options.optional_names.contains(&name.id)
+                || matches!(
+                    options.name_types.get(&name.id),
+                    Some(crate::TypeInfo::Option(_))
+                )
+        }
         ExprType::Call(call) => match call.func.as_ref() {
             // dict.get(k) lowers to py_get, which returns Option<V>; the
             // TWO-argument form with a None default (`headers.get(name,
@@ -3351,6 +3415,19 @@ pub(crate) fn expr_yields_option(
                     .returns
                     .as_deref()
                     .is_some_and(crate::is_optional_annotation),
+                // socket.getdefaulttimeout/setdefaulttimeout return the
+                // default as `float | None` (Option<f64>) — the runtime
+                // free functions' shape (urllib3's Timeout module).
+                Some(SymbolTableNode::ImportFrom(ifm))
+                    if crate::StdModule::from_name(&ifm.module)
+                        == Some(crate::StdModule::Socket)
+                        && matches!(
+                            name.id.as_str(),
+                            "getdefaulttimeout" | "setdefaulttimeout"
+                        ) =>
+                {
+                    true
+                }
                 _ => false,
             },
             _ => false,

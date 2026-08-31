@@ -146,10 +146,27 @@ impl CodeGen for Name {
                 return Ok(match target {
                     crate::TypeInfo::StrOrBytes => quote!((#name)),
                     crate::TypeInfo::String | crate::TypeInfo::StrRef => {
-                        quote!((#name).as_str().unwrap().to_string())
+                        // Issue #125 vs #121: an `if x is not None:`-narrowed
+                        // OPTION-typed name (a `str | None` param or a
+                        // local assigned an Option-typed call result — both
+                        // recorded in optional_names) still holds the
+                        // Option at runtime and must UNWRAP — the PyValue
+                        // as_str() path below is for isinstance-narrowed
+                        // BOXED values only (`str | bytes` unions). The
+                        // unwrap fires only when the flow contradicts the
+                        // guard.
+                        if options.optional_names.contains(&self.id) {
+                            quote!((#name).clone().unwrap())
+                        } else {
+                            quote!((#name).as_str().unwrap().to_string())
+                        }
                     }
                     crate::TypeInfo::Bytes => {
-                        quote!((#name).as_bytes().unwrap().to_vec())
+                        if options.optional_names.contains(&self.id) {
+                            quote!((#name).clone().unwrap())
+                        } else {
+                            quote!((#name).as_bytes().unwrap().to_vec())
+                        }
                     }
                     // Issue #121: a boxed PyValue narrowed by isinstance
                     // reads the concrete member via the PyValue accessors
