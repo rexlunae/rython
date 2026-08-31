@@ -1133,27 +1133,64 @@ pub fn isinstance_narrowing(
 /// assign None to a narrowed name drops it from the set (a store of a
 /// possibly-None value — conservative: an `x = ...` whose value is not
 /// statically non-None removes x).
-/// Whether a statement writes (assigns to) `name` anywhere — an else
-/// branch that writes the narrowed name invalidates the is-None
+/// Whether a statement WRITES (rebinds) `name` anywhere — an else
+/// branch that rebinds the narrowed name invalidates the is-None
 /// early-exit narrowing (the following statements can then see a fresh
-/// value); `else: pass` and unrelated statements do not.
+/// value); `else: pass` and unrelated statements do not. Covers every
+/// binding form: assign/aug-assign/annotated-assign targets, del,
+/// for/with/async targets, global/nonlocal declarations, and WALRUS
+/// targets anywhere inside an expression (`y = (x := 1)` rebinds x).
+/// Attribute and subscript stores do NOT rebind the name — they mutate
+/// the object (Devin review on #283/#284).
 fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
     match &stmt.statement {
         crate::StatementType::Assign(a) => {
             a.targets.iter().any(|t| expr_writes_name(t, name))
+                || expr_walrus_binds(&a.value, name)
         }
         crate::StatementType::AugAssign(a) => expr_writes_name(&a.target, name),
+        crate::StatementType::AnnotatedName { .. } => false,
+        crate::StatementType::Delete(targets) => {
+            targets.iter().any(|t| expr_writes_name(t, name))
+        }
+        crate::StatementType::Expr(e) => expr_walrus_binds(&e.value, name),
+        crate::StatementType::Global(names) | crate::StatementType::Nonlocal(names) => {
+            names.iter().any(|n| n == name)
+        }
+        crate::StatementType::For(f) => {
+            expr_writes_name(&f.target, name)
+                || f.body.iter().chain(f.orelse.iter()).any(|b| stmt_writes_name(b, name))
+        }
+        crate::StatementType::AsyncFor(f) => {
+            expr_writes_name(&f.target, name)
+                || f.body.iter().chain(f.orelse.iter()).any(|b| stmt_writes_name(b, name))
+        }
+        crate::StatementType::While(w) => w
+            .body
+            .iter()
+            .chain(w.orelse.iter())
+            .any(|b| stmt_writes_name(b, name)),
         crate::StatementType::If(i) => i
             .body
             .iter()
             .chain(i.orelse.iter())
             .any(|b| stmt_writes_name(b, name)),
-        crate::StatementType::For(f) => {
-            expr_writes_name(&f.target, name)
-                || f.body.iter().any(|b| stmt_writes_name(b, name))
+        crate::StatementType::With(w) => {
+            w.items.iter().any(|item| {
+                item.optional_vars
+                    .as_ref()
+                    .is_some_and(|v| expr_writes_name(v, name))
+                    || expr_walrus_binds(&item.context_expr, name)
+            }) || w.body.iter().any(|b| stmt_writes_name(b, name))
         }
-        crate::StatementType::While(w) => w.body.iter().any(|b| stmt_writes_name(b, name)),
-        crate::StatementType::With(w) => w.body.iter().any(|b| stmt_writes_name(b, name)),
+        crate::StatementType::AsyncWith(w) => {
+            w.items.iter().any(|item| {
+                item.optional_vars
+                    .as_ref()
+                    .is_some_and(|v| expr_writes_name(v, name))
+                    || expr_walrus_binds(&item.context_expr, name)
+            }) || w.body.iter().any(|b| stmt_writes_name(b, name))
+        }
         crate::StatementType::Try(t) => t
             .body
             .iter()
@@ -1165,11 +1202,115 @@ fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
     }
 }
 
+/// Whether `e` is (or contains, as a binding target) a write of `name`.
 fn expr_writes_name(e: &crate::ExprType, name: &str) -> bool {
     match e {
         crate::ExprType::Name(n) => n.id == name,
         crate::ExprType::Tuple(t) => t.elts.iter().any(|x| expr_writes_name(x, name)),
-        crate::ExprType::Attribute(a) => expr_writes_name(&a.value, name),
+        crate::ExprType::List(items) => items.iter().any(|x| expr_writes_name(x, name)),
+        crate::ExprType::Starred(s) => expr_writes_name(&s.value, name),
+        crate::ExprType::NamedExpr(ne) => {
+            // A walrus binds its TARGET; the value is a read (checked
+            // separately for nested walruses by expr_walrus_binds).
+            expr_writes_name(&ne.left, name)
+        }
+        // Attribute/subscript stores mutate the object — the name binding
+        // is untouched (Devin review on #284).
+        crate::ExprType::Attribute(_) | crate::ExprType::Subscript(_) => false,
+        _ => false,
+    }
+}
+
+/// Whether a WALRUS anywhere in the expression tree binds `name`
+/// (`y = (x := 1)`, `f((x := 2))`, ...).
+fn expr_walrus_binds(e: &crate::ExprType, name: &str) -> bool {
+    match e {
+        crate::ExprType::NamedExpr(ne) => {
+            expr_writes_name(&ne.left, name) || expr_walrus_binds(&ne.right, name)
+        }
+        crate::ExprType::Call(c) => {
+            expr_walrus_binds(&c.func, name)
+                || c.args.iter().any(|a| expr_walrus_binds(a, name))
+                || c.keywords.iter().any(|k| expr_walrus_binds(&k.value, name))
+        }
+        crate::ExprType::BoolOp(b) => b.values.iter().any(|v| expr_walrus_binds(v, name)),
+        crate::ExprType::BinOp(b) => {
+            expr_walrus_binds(&b.left, name) || expr_walrus_binds(&b.right, name)
+        }
+        crate::ExprType::UnaryOp(u) => expr_walrus_binds(&u.operand, name),
+        crate::ExprType::IfExp(i) => {
+            expr_walrus_binds(&i.test, name)
+                || expr_walrus_binds(&i.body, name)
+                || expr_walrus_binds(&i.orelse, name)
+        }
+        crate::ExprType::Dict(d) => {
+            d.keys.iter().flatten().any(|k| expr_walrus_binds(k, name))
+                || d.values.iter().any(|v| expr_walrus_binds(v, name))
+        }
+        crate::ExprType::Set(s) => s.elts.iter().any(|x| expr_walrus_binds(x, name)),
+        crate::ExprType::List(items) => items.iter().any(|x| expr_walrus_binds(x, name)),
+        crate::ExprType::Tuple(t) => t.elts.iter().any(|x| expr_walrus_binds(x, name)),
+        crate::ExprType::Subscript(s) => {
+            expr_walrus_binds(&s.value, name)
+                || match &s.kind {
+                    crate::SubscriptKind::Index(i) => expr_walrus_binds(i, name),
+                    crate::SubscriptKind::Slice { lower, upper, step } => {
+                        lower.as_deref().is_some_and(|b| expr_walrus_binds(b, name))
+                            || upper.as_deref().is_some_and(|b| expr_walrus_binds(b, name))
+                            || step.as_deref().is_some_and(|b| expr_walrus_binds(b, name))
+                    }
+                }
+        }
+        crate::ExprType::Attribute(a) => expr_walrus_binds(&a.value, name),
+        crate::ExprType::Compare(c) => {
+            expr_walrus_binds(&c.left, name)
+                || c.comparators.iter().any(|x| expr_walrus_binds(x, name))
+        }
+        crate::ExprType::Starred(s) => expr_walrus_binds(&s.value, name),
+        crate::ExprType::JoinedStr(j) => {
+            j.values.iter().any(|v| expr_walrus_binds(v, name))
+        }
+        crate::ExprType::FormattedValue(f) => expr_walrus_binds(&f.value, name),
+        crate::ExprType::Await(a) => expr_walrus_binds(&a.value, name),
+        crate::ExprType::Yield(y) => y
+            .value
+            .as_deref()
+            .is_some_and(|v| expr_walrus_binds(v, name)),
+        crate::ExprType::YieldFrom(y) => expr_walrus_binds(&y.value, name),
+        crate::ExprType::Lambda(l) => expr_walrus_binds(&l.body, name),
+        crate::ExprType::ListComp(lc) => {
+            expr_walrus_binds(&lc.elt, name)
+                || lc.generators.iter().any(|g| {
+                    expr_writes_name(&g.target, name)
+                        || expr_walrus_binds(&g.iter, name)
+                        || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
+                })
+        }
+        crate::ExprType::SetComp(sc) => {
+            expr_walrus_binds(&sc.elt, name)
+                || sc.generators.iter().any(|g| {
+                    expr_writes_name(&g.target, name)
+                        || expr_walrus_binds(&g.iter, name)
+                        || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
+                })
+        }
+        crate::ExprType::DictComp(dc) => {
+            expr_walrus_binds(&dc.value, name)
+                || expr_walrus_binds(&dc.key, name)
+                || dc.generators.iter().any(|g| {
+                    expr_writes_name(&g.target, name)
+                        || expr_walrus_binds(&g.iter, name)
+                        || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
+                })
+        }
+        crate::ExprType::GeneratorExp(g) => {
+            expr_walrus_binds(&g.elt, name)
+                || g.generators.iter().any(|comp| {
+                    expr_writes_name(&comp.target, name)
+                        || expr_walrus_binds(&comp.iter, name)
+                        || comp.ifs.iter().any(|i| expr_walrus_binds(i, name))
+                })
+        }
         _ => false,
     }
 }

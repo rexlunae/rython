@@ -15385,4 +15385,36 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "the else branch re-assignment stays: {}",
         out
     );
+    // Devin review on #284: a walrus in the else REBINDS the name
+    // (`else: (x := None)`), so the narrowing must be discarded; an
+    // attribute store (`else: x.attr = 1`) only mutates the object and
+    // must KEEP it.
+    let out3 = compile(
+        "def w(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       y = (x := None)\n\
+         \x20   return \"b\"\n",
+        "none_walrus.py",
+    );
+    assert!(
+        !out3.contains("clone () . unwrap ()") && !out3.contains("clone().unwrap()"),
+        "a walrus rebinding in the else must discard the narrowing: {}",
+        out3
+    );
+    let out4 = compile(
+        "def s(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       x.attr = 1\n\
+         \x20   return x\n",
+        "none_attr.py",
+    );
+    assert!(
+        out4.contains("clone () . unwrap ()") || out4.contains("clone().unwrap()"),
+        "an attribute store in the else must keep the narrowing: {}",
+        out4
+    );
 }
