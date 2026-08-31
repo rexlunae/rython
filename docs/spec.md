@@ -609,6 +609,14 @@ now resolving IMPORTED factories too), and method-call receivers
 passes the Option through unwrapped. Pinned in both the argument and
 store positions.
 
+Round 59 (R2 continued): the Option-field STORE with a reused name no
+longer bypasses the Some-wrap. `self._last_printable_char = character`
+(field `str | None`, character read again later — charset_normalizer's
+_count_suspicious) rendered `(character).clone()` — a bare String into
+the Option field (E0308) — because the reused-name clone arm preceded
+the Option-wrap arm. The Option arm now runs first and clones INTO the
+Some (`Some((character).clone())`). Pinned.
+
 ## 6. Functions
 
 ### 6.1 Signatures
