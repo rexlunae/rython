@@ -206,6 +206,20 @@ impl PyMatch {
             .collect()
     }
 
+    /// m.group(i) as an OPTION: the group's text when it participated,
+    /// None when it did not — Python's exact semantics (group() returns
+    /// None for a non-participating group). The typed group() above
+    /// cannot hold None and fails loudly instead; the tuple-destructure
+    /// lowering of m.groups() uses group_opt so `path, query =
+    /// m.groups()` keeps the None-able members Python yields (urllib3's
+    /// request-target parsing, round 74).
+    pub fn group_opt(&self, i: i64) -> Option<String> {
+        if i < 0 || i as usize >= self.groups.len() {
+            panic!("{}", PyException::new("IndexError", "no such group"));
+        }
+        self.groups[i as usize].as_ref().map(|entry| entry.0.clone())
+    }
+
     /// m.start(), in character offsets.
     pub fn start(&self) -> i64 {
         self.group_entry(0).1
@@ -222,6 +236,14 @@ impl PyMatch {
         (e.1, e.2)
     }
 
+    /// m.span(i) — the group-index form of span (Python's optional
+    /// argument; the typed surface can't overload, so the indexed
+    /// spelling routes here). A group that did not participate is None in
+    /// Python — loud, like group().
+    pub fn span_group(&self, i: i64) -> (i64, i64) {
+        let e = self.group_entry(i);
+        (e.1, e.2)
+    }
 }
 
 /// A Match object is always truthy in Python (`if m:` tests presence
@@ -237,12 +259,14 @@ impl crate::Truthy for PyMatch {
 /// method on a missed match fails with Python's exact AttributeError.
 pub trait PyMatchOps {
     fn group(&self, i: i64) -> String;
+    fn group_opt(&self, i: i64) -> Option<String>;
     fn group_name(&self, name: &str) -> String;
     fn groupdict(&self) -> crate::PyDict<String, String>;
     fn groups(&self) -> Vec<String>;
     fn start(&self) -> i64;
     fn end(&self) -> i64;
     fn span(&self) -> (i64, i64);
+    fn span_group(&self, i: i64) -> (i64, i64);
 }
 
 fn none_match_panic(method: &str) -> ! {
@@ -259,6 +283,12 @@ impl PyMatchOps for Option<PyMatch> {
     fn group(&self, i: i64) -> String {
         match self {
             Some(m) => m.group(i),
+            None => none_match_panic("group"),
+        }
+    }
+    fn group_opt(&self, i: i64) -> Option<String> {
+        match self {
+            Some(m) => m.group_opt(i),
             None => none_match_panic("group"),
         }
     }
@@ -295,6 +325,12 @@ impl PyMatchOps for Option<PyMatch> {
     fn span(&self) -> (i64, i64) {
         match self {
             Some(m) => m.span(),
+            None => none_match_panic("span"),
+        }
+    }
+    fn span_group(&self, i: i64) -> (i64, i64) {
+        match self {
+            Some(m) => m.span_group(i),
             None => none_match_panic("span"),
         }
     }

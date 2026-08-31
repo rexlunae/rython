@@ -170,7 +170,23 @@ impl CodeGen for Subscript {
                         .filter(|m| crate::ast::tree::call::dunder_method_well_typed(m))
                         .map(|method| (class, class_symbols, method))
                 });
+        // An OPTION-typed receiver (`host[start:end]` where `host` is a
+        // truthiness-narrowed `str | None` — urllib3's _normalize_host)
+        // unwraps before the subscript: Python raises TypeError on an
+        // actual None (`'NoneType' object is not subscriptable`), and the
+        // unwrap fires only when the flow contradicts the guard. The same
+        // loud-panic spelling the Option-receiver method path uses.
+        // Computed BEFORE self.value is moved by the to_rust below.
+        let value_yields_option =
+            crate::expr_yields_option_ctx(&self.value, &ctx, &options, &symbols);
         let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value = if value_yields_option {
+            quote!((#value).clone().unwrap_or_else(|| {
+                panic!("TypeError: 'NoneType' object is not subscriptable")
+            }))
+        } else {
+            value
+        };
         match self.kind {
             // Python index rules via PyIndex: negatives from the end, a
             // catchable IndexError/KeyError instead of a Rust panic.

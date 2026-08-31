@@ -607,24 +607,37 @@ impl CodeGen for StatementType {
             // running the finally body, as Python requires.
             StatementType::Return(None) => {
                 // A bare `return` in a PyValue-returning function returns
-                // the boxed None (Python's implicit None); otherwise unit.
+                // the boxed None (Python's implicit None); in an
+                // Option-returning function it is the None member of the
+                // union; otherwise unit.
                 if options.fn_return_is_pyvalue {
                     Ok(return_tokens(&ctx, quote!(PyValue::None_)))
+                } else if options.fn_return_is_option {
+                    Ok(return_tokens(&ctx, quote!(None)))
                 } else {
                     Ok(return_tokens(&ctx, quote!(())))
                 }
             }
             StatementType::Return(Some(e)) => {
+                // Whether the returned value is already an Option — computed
+                // BEFORE the tokens below move `symbols`, the final Some()
+                // wrap (a `-> T | None` function returning a plain member)
+                // consults it.
+                let value_yields_option =
+                    crate::expr_yields_option_ctx(&e.value, &ctx, &options, &symbols);
                 // A `return None` in a PyValue-returning function is the
                 // boxed None (the None-mixing unification), whichever AST
                 // shape the parser surfaced None as (issue #133: the
                 // annotated-path repro surfaces it as the NAME `None`, not
                 // the NoneType variant); a plain-None function returns the
-                // unit value.
+                // unit value; an Option-returning function returns the
+                // None member.
                 let value = if options.fn_return_is_pyvalue
                     && crate::is_none_expr(&e.value)
                 {
                     quote!(PyValue::None_)
+                } else if options.fn_return_is_option && crate::is_none_expr(&e.value) {
+                    quote!(None)
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
                 } else if options.fn_return_is_pyvalue {
@@ -753,6 +766,34 @@ impl CodeGen for StatementType {
                     } else {
                         tokens
                     }
+                };
+                // A `-> T | None` function wraps a PLAIN (non-Option)
+                // return in Some: the value is a concrete member of the
+                // union (Python's bare return). The wrap is CONSERVATIVE:
+                // only when the value's inferred type is a definite plain
+                // member (String, Int, ...) — an already-Option value (a
+                // `.get(key, default=None)` call, a property accessor
+                // whose annotation is `T | None`) or an unknown type
+                // passes through unchanged, and the PyValue/None branches
+                // above are already in their final shape. Inside a try
+                // block the try lowering threads the return through
+                // PyFlow itself (its carrier match handles the wrap).
+                let value = if options.fn_return_is_option
+                    && !ctx.in_try_block()
+                    && !crate::is_none_expr(&e.value)
+                {
+                    // Wrap unless the value is itself the Option (an
+                    // Option-typed name, a `.get(key, None)` call, a
+                    // `T | None` property read — expr_yields_option_ctx
+                    // recognizes all three). `return None` was already
+                    // lowered to the None member above.
+                    if value_yields_option {
+                        value
+                    } else {
+                        quote!(Some(#value))
+                    }
+                } else {
+                    value
                 };
                 Ok(return_tokens(&ctx, value))
             }

@@ -3100,6 +3100,77 @@ fn re_module_matches_python_at_runtime() {
 }
 
 #[test]
+fn option_returning_functions_wrap_plain_members() {
+    // Round 74: a `-> T | None` function returns plain members (a str
+    // concatenation, a method call result) and None on other paths —
+    // the return site wraps the plain member in Some, lowers `return
+    // None` to the None member, and passes an already-Option value
+    // through (`return host` after the None guards). Also: an
+    // Option-typed receiver slices (`host[start:end]` after `if host:`)
+    // unwraps with a loud TypeError panic, and m.span(1) is the
+    // group-indexed span. Verified against python3.
+    let scratch = Scratch::new("regex_opt");
+    let file = scratch.path().join("re_opt.py");
+    fs::write(
+        &file,
+        concat!(
+            "import re\n",
+            "\n",
+            "_ZONE = re.compile(r\"\\[(.*?)\\]\")\n",
+            "\n",
+            "def normalize(host: str | None, scheme: str | None) -> str | None:\n",
+            "    if host:\n",
+            "        m = _ZONE.search(host)\n",
+            "        if m is not None:\n",
+            "            start, end = m.span(1)\n",
+            "            return \"z:\" + host[start:end]\n",
+            "        return host.lower()\n",
+            "    return None\n",
+            "\n",
+            "def main() -> int:\n",
+            "    v = normalize(\"A[Bcd]E\", \"http\")\n",
+            "    if v is not None:\n",
+            "        print(f\"v={v}\")\n",
+            "    else:\n",
+            "        print(\"none\")\n",
+            "    v = normalize(\"ABC\", \"http\")\n",
+            "    if v is not None:\n",
+            "        print(f\"v={v}\")\n",
+            "    else:\n",
+            "        print(\"none\")\n",
+            "    v = normalize(None, \"http\")\n",
+            "    if v is not None:\n",
+            "        print(f\"v={v}\")\n",
+            "    else:\n",
+            "        print(\"none\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/re_opt"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["v=z:Bcd", "v=abc", "none"],
+        "Option-returning function semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn regex_brace_patterns_and_slice_shapes_match_python_at_runtime() {
     // Issue #134: a Python pattern's unescaped `{` that does not form a
     // quantifier is literal — the converter escapes it for Rust's regex

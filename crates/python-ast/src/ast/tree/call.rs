@@ -6496,6 +6496,13 @@ impl<'a> CodeGen for Call {
                     ("group", [g]) if g.to_string().starts_with('"') => {
                         return Ok(quote!((#receiver).group_name(#g)));
                     }
+                    // m.span(i) — the group-index form (Python's optional
+                    // argument): Rust can't overload on arity, so the
+                    // indexed spelling routes to span_group; m.span() falls
+                    // through to the plain (0-arg) span().
+                    ("span", [g]) => {
+                        return Ok(quote!((#receiver).span_group(#g)));
+                    }
                     // str.encode() / encode("utf-8"): UTF-8 bytes, which is
                     // exactly what Rust strings hold. ascii and punycode
                     // (RFC 3492) go through the stdpython codec layer.
@@ -7027,7 +7034,30 @@ impl<'a> CodeGen for Call {
                                 "fullmatch" => quote!(py_fullmatch),
                                 _ => quote!(py_match),
                             };
-                            return Ok(quote!((#receiver).#m(&(#text))));
+                            // An Option-typed TEXT argument (`host: str |
+                            // None` whose None-ness was already tested —
+                            // urllib3's _normalize_host) unwraps with the
+                            // same loud NoneType panic the Option-receiver
+                            // path uses; CPython would raise TypeError on
+                            // an actual None here, and the unwrap fires
+                            // only when the flow contradicts the guard.
+                            let text_arg = if crate::expr_yields_option_ctx(
+                                &self.args[0],
+                                &ctx,
+                                &options,
+                                &symbols,
+                            ) {
+                                let mname = attr.attr.clone();
+                                quote!(&((#text).clone().unwrap_or_else(|| {
+                                    panic!(
+                                        "AttributeError: 'NoneType' object has no attribute '{}'",
+                                        #mname
+                                    )
+                                })))
+                            } else {
+                                quote!(&(#text))
+                            };
+                            return Ok(quote!((#receiver).#m(#text_arg)));
                         }
                     }
                     _ => {}

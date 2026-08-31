@@ -834,6 +834,24 @@ their own `AnnotationModule` enum + `is_typing()` predicate. Submodule
 path segments (`numpy.linalg`, `collections.abc`) remain path structure,
 not module-name-set membership. Sweep-neutral (978/63/0/285/25).
 
+Round 74 (the Option-narrowing cluster, unmasked by round 73): the
+compiled-regex fixes of round 73 let urllib3's url.py compile one step
+further, exposing the Option-value-in-string-position family. Five
+pieces close it: (1) a truthiness-narrowed `Option<String>` ARGUMENT to
+a compiled pattern's match/search/fullmatch unwraps with the loud
+NoneType panic (urllib3's `_normalize_host`); (2) `m.span(i)` — the
+group-indexed span, Python's optional argument — routes to a new
+`span_group`; (3) an Option-typed SLICE receiver (`host[start:end]`
+after `if host:`) unwraps with the loud "not subscriptable" TypeError
+panic; (4) a `-> T | None` function wraps its PLAIN returns in `Some`
+and lowers `return None` to the None member, passing already-Option
+values (a `T | None` property read, a `.get(key, None)` call, a local
+assigned an Option-returning call — all recognized by the extended
+`expr_yields_option_ctx`) through unwrapped; (5) an `if v is not None:`-
+narrowed Option-typed name READS by unwrapping — the PyValue `as_str()`
+path is for isinstance-narrowed boxed values only. Sweep −16 (urllib3
+978→962). Pinned in codegen and end-to-end (CPython-verified).
+
 ## 6. Functions
 
 ### 6.1 Signatures

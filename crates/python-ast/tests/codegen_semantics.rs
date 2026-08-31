@@ -15154,3 +15154,84 @@ fn mapping_get_binds_the_default_before_the_match() {
         out
     );
 }
+
+#[test]
+fn compiled_regex_groups_destructure_span_and_option_arg() {
+    // Round 74: the compiled-regex match surface completes against real
+    // urllib3 usage — m.span(i) routes to the group-indexed span, and a
+    // truthiness-narrowed Option<String> argument unwraps before the
+    // anchored match (CPython would raise TypeError on an actual None).
+    let out = compile(
+        "import re\n\
+         _TARGET_RE = re.compile(r\"^([^?#]*)(?:\\?([^#]*))?.*$\")\n\
+         def f(url: str) -> str:\n\
+         \x20   m = _TARGET_RE.match(url)\n\
+         \x20   path, query = m.groups()\n\
+         \x20   return path + \"?\" + query\n\
+         def g(host: str | None) -> str:\n\
+         \x20   if host:\n\
+         \x20       m = _TARGET_RE.match(host)\n\
+         \x20       start, end = m.span(1)\n\
+         \x20   return \"x\"\n",
+        "regex2.py",
+    );
+    assert!(
+        out.contains("span_group (1)"),
+        "m.span(i) must route to the group-indexed span: {}",
+        out
+    );
+    assert!(
+        out.contains("unwrap_or_else") && out.contains("has no attribute"),
+        "a truthiness-narrowed Option<String> argument must unwrap before the match: {}",
+        out
+    );
+}
+
+#[test]
+fn option_returning_functions_wrap_plain_members_and_narrowed_reads_unwrap() {
+    // Round 74: a `-> T | None` function wraps its PLAIN returns in Some
+    // (`return host.lower()` after the None guards), lowers `return None`
+    // to the None member, and passes an already-Option value through
+    // (`return host`); an Option-typed receiver SLICES through a loud
+    // TypeError unwrap (`host[start:end]` after `if host:`); and an
+    // `if v is not None:`-narrowed Option-typed name READS by unwrapping
+    // (the PyValue as_str() path is for isinstance-narrowed boxed values
+    // only).
+    let out = compile(
+        "import re\n\
+         _ZONE = re.compile(r\"\\[(.*?)\\]\")\n\
+         def normalize(host: str | None, scheme: str | None) -> str | None:\n\
+         \x20   if host:\n\
+         \x20       m = _ZONE.search(host)\n\
+         \x20       if m is not None:\n\
+         \x20           start, end = m.span(1)\n\
+         \x20           return \"z:\" + host[start:end]\n\
+         \x20       return host.lower()\n\
+         \x20   return None\n\
+         def show(v: str | None) -> str:\n\
+         \x20   if v is not None:\n\
+         \x20       return v\n\
+         \x20   return \"none\"\n",
+        "regex_opt.py",
+    );
+    assert!(
+        out.contains("return Ok (Some (") || out.contains("return Ok(Some("),
+        "plain members of an Option-returning function must wrap in Some: {}",
+        out
+    );
+    assert!(
+        out.contains("return Ok (None)") || out.contains("return Ok(None)"),
+        "return None in an Option-returning function lowers to the None member: {}",
+        out
+    );
+    assert!(
+        out.contains("is not subscriptable"),
+        "an Option-typed slice receiver unwraps with the TypeError panic: {}",
+        out
+    );
+    assert!(
+        out.contains("(v) . clone () . unwrap ()") || out.contains("(v).clone().unwrap()"),
+        "an is-not-None-narrowed Option name reads by unwrapping: {}",
+        out
+    );
+}

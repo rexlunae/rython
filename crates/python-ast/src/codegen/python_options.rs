@@ -343,6 +343,13 @@ pub struct PythonOptions {
     /// `PyValue::from` (the None-mixing unification).
     pub fn_return_is_pyvalue: bool,
 
+    /// The CURRENT function's resolved return type is an Option
+    /// (`-> str | None`): a plain (non-Option) return value wraps in
+    /// `Some` — Python returns the bare value where None is only one of
+    /// the possible results (urllib3's `_normalize_host` returns both
+    /// `host.lower()` (str) and `host` (str | None) paths).
+    pub fn_return_is_option: bool,
+
     /// The CURRENT free function's parameters whose inferred type is the
     /// boxed PyValue (a value-pinned parameter — reassigned from a call
     /// result, issue #161's `path = os.path.expandvars(path)`): they
@@ -603,6 +610,7 @@ impl Default for PythonOptions {
             clone_str_attribute_returns: false,
             clone_field_returns: false,
             fn_return_is_pyvalue: false,
+            fn_return_is_option: false,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_none_names: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_false_names: std::rc::Rc::new(std::collections::HashSet::new()),
