@@ -636,6 +636,30 @@ reads the same way. Literal lists and sets (`Vec<&str>`,
 `HashSet<&str>`) gain the str/String/PyValue membership spellings.
 Pinned in each position.
 
+Round 62 (the boolean-fold Option family): the `and`/`or` operand fold
+now takes the Option arm where the operands' types unify through
+containers and where a NAME's Option-ness is invisible to `infer_type`.
+`conn or self._new_conn()` (urllib3's _get_conn — a local seeded
+`conn = None` whose recorded None assignment infers PyObject) fell to
+the `||` approximation (E0308 ×9); `fold_operand_type` now consults
+`optional_names` for Name operands. `headers or {}` / `proxy_headers or
+{}` (a `Mapping[str, str] | None` parameter OR'd with an empty-dict
+literal, whose element types infer unknown) fell to `||` because
+`inner_matches` only unified scalars — it now applies the same `unify()`
+relation the rest of the codebase uses, and `infer_field_type`'s BoolOp
+arm types the STORED FIELD from the fold's own operand analysis (an
+Option operand keeps the Option; a PyObject-containing result falls back
+to Bool — `PyDict<_, _>` is E0121 in a field signature). The field
+inference resolves Name operands through the caller's explicit
+`name_types` map so the field type is context-independent (the __init__
+parameter types are invisible to module-level `options`). Sweep −20
+(urllib3 1053→1033; the `bool | Option<_>` pair 7→1). Pinned in each
+shape. `assert_hostname or server_hostname` (a boxed `bool | str | None`
+OR'd with `str | None` into `impl Into<String>`) stays on the loud `||`
+approximation — the truthy arm is a boxed value that cannot convert to
+String without a silent guess, and CPython itself raises AttributeError
+on the falsy-None path (`None.strip("[]")`).
+
 ## 6. Functions
 
 ### 6.1 Signatures

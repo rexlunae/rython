@@ -13199,6 +13199,56 @@ fn option_and_call_narrows_the_inner_argument() {
 }
 
 #[test]
+fn none_seeded_local_or_call_folds_the_option_arm() {
+    // Round 62: `conn or self._new_conn()` (urllib3's _get_conn) — a
+    // local seeded `conn = None` (its Option-ness lives only in
+    // optional_names; infer_type resolves the recorded None assignment to
+    // PyObject) OR'd with an untyped call. The fold must take the Option
+    // arm — Some-wrapping the call — never the loud `||` fallback (which
+    // rustc rejects: Option has no bool operator).
+    let out = compile(
+        "def g():\n    return None\n\n\
+         def f(cond) -> object:\n    conn = None\n    if cond:\n        conn = g()\n    return conn or g()\n",
+        "connor.py",
+    );
+    assert!(
+        out.contains("is_truthy () { __rython_or } else { Some (g () ?) }")
+            || out.contains("is_truthy() { __rython_or } else { Some(g()?) }"),
+        "the None-seeded local must fold through the Option arm: {}",
+        out
+    );
+    assert!(
+        !out.contains("(conn) || ("),
+        "must not fall back to the || approximation: {}",
+        out
+    );
+}
+
+#[test]
+fn option_dict_or_empty_dict_folds_the_option_arm() {
+    // Round 62: `headers or {}` (urllib3's RequestMethods.__init__) — an
+    // Option-typed dict parameter OR'd with an empty-dict literal (which
+    // infers Dict(PyObject, PyObject)); the container types unify through
+    // the same relation the rest of the codebase uses, so the fold Some-
+    // wraps the literal instead of falling to `||`.
+    let out = compile(
+        "def f(headers: dict | None) -> None:\n    x = headers or {}\n    return None\n",
+        "hdrs.py",
+    );
+    assert!(
+        out.contains("is_truthy () { __rython_or } else { Some (PyDict :: from ([])) }")
+            || out.contains("is_truthy() { __rython_or } else { Some(PyDict::from([])) }"),
+        "the Option-dict or-fold must Some-wrap the empty dict: {}",
+        out
+    );
+    assert!(
+        !out.contains("(headers) || ("),
+        "must not fall back to the || approximation: {}",
+        out
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the

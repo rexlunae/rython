@@ -142,6 +142,24 @@ pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
     }
 }
 
+/// Whether a type mentions an UNKNOWN (`PyObject`) element anywhere inside
+/// (`Dict(PyObject, PyObject)` — an empty-container literal typed without
+/// an anchor). Such a type renders `PyDict<_, _>` / `Vec<_>`, which is
+/// E0121 in an item signature — field inference must fall back rather
+/// than emit it (round 62).
+pub(crate) fn type_mentions_pyobject(t: &TypeInfo) -> bool {
+    match t {
+        TypeInfo::PyObject => true,
+        TypeInfo::Vec(inner)
+        | TypeInfo::Option(inner)
+        | TypeInfo::HashSet(inner)
+        | TypeInfo::Borrowed(inner) => type_mentions_pyobject(inner),
+        TypeInfo::Dict(k, v) => type_mentions_pyobject(k) || type_mentions_pyobject(v),
+        TypeInfo::Tuple(ts) => ts.iter().any(type_mentions_pyobject),
+        _ => false,
+    }
+}
+
 /// Whether a type mentions the boxed heterogeneous value ANYWHERE inside
 /// (`Vec<PyValue>`, `PyDict<String, PyValue>`, `Option<PyValue>`, ...).
 /// The structural twin of the old `tokens.to_string().contains("PyValue")`
