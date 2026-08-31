@@ -782,6 +782,19 @@ annotation in local_types would otherwise shadow the widened type and
 re-wrap). Sweep −8 (urllib3 997→989; the round-69 exposure −6, plus
 double-wrap fixes −2). Pinned.
 
+Round 71 (the base-chain walk across modules): the class base chain used
+a symbol-table-only walk that could not follow IMPORTED bases, so a
+chain crossing a module boundary (`PoolManager(RequestMethods)` with
+the field stored in the imported base) stopped at the derived class —
+the field-walk, the property check, and the Option-ness resolution all
+missed the ancestor's fields, and a generic-trait read emitted the bare
+name (E0615 method-not-a-field / E0609). A new options-aware
+`base_chain_with_options` resolves imported bases through the module
+definitions (sharing one walk with the plain chain so the shapes cannot
+drift), and the read path uses it. Sweep −1 (urllib3 989→988: E0615
+2→0, E0609 −2; the corrected reads exposed honest arg-adaptation gaps
++3). Pinned cross-module.
+
 ## 6. Functions
 
 ### 6.1 Signatures

@@ -13652,6 +13652,54 @@ fn annotated_local_widened_by_a_later_option_store() {
 }
 
 #[test]
+fn field_walk_follows_imported_bases() {
+    // Round 71: `self.headers` where `headers` is a field stored in an
+    // IMPORTED base class (`PoolManager(RequestMethods)` — the struct
+    // embeds the base): the base chain used a symbol-table-only walk that
+    // could not follow imported bases, so the chain stopped at the
+    // derived class and the field-walk missed the ancestor's field —
+    // the generic-trait read emitted the bare name (E0615
+    // method-not-a-field). The walk now resolves imported bases through
+    // the module definitions.
+    let base = parse(
+        "class Base:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self.headers: dict[str, str] | None = None\n",
+        "base.py",
+    )
+    .unwrap();
+    let main = parse(
+        "from .base import Base\n\
+         class Derived(Base):\n\
+         \x20   def f(self) -> dict[str, str] | None:\n\
+         \x20       return self.headers\n",
+        "main.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["base".to_string()], std::rc::Rc::new(base));
+    defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let symbols = main.clone().find_symbols(SymbolTableScopes::new());
+    let out = main
+        .to_rust(
+            CodeGenContext::Module("main".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains("__rython_base . headers") || out.contains("__rython_base.headers"),
+        "the imported-base field read must chain through the embedded base: {}",
+        out
+    );
+}
+
+#[test]
 fn local_from_another_objects_option_field_is_option() {
     // Round 68: `destination_scheme = parsed_url.scheme` (a `str | None`
     // field of a factory-local object), then passed to a `str | None`

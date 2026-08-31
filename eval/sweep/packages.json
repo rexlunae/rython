@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 70: annotated locals widen to Option when later Option-valued stores land; Option-slot args pass through (997 -> 989)."
+      "note": "The historical #137 corpus. Round 71: the base-chain walk follows imported bases (fields/properties/Option-ness through cross-module inheritance) (989 -> 988)."
     },
     {
       "name": "certifi",
