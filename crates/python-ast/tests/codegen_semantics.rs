@@ -13346,6 +13346,42 @@ fn boxed_subscript_str_method_dispatches_on_the_member() {
 }
 
 #[test]
+fn unbound_builtin_str_method_applies_to_its_argument() {
+    // Round 65: `str.title(header)` (urllib3's SKIPPABLE_HEADERS
+    // titlecasing) — Python's `str.m(s)` is `s.m()`; the class-as-value
+    // model has no `str.title` attribute (E0609/E0599 on the runtime
+    // str() fn item), so the call lowers to the bound method on the
+    // argument.
+    let out = compile(
+        "def f(headers: list[str]) -> list[str]:\n    return [str.title(header) for header in headers]\n",
+        "strtitle.py",
+    );
+    assert!(
+        out.contains("(header) . title ()") || out.contains("(header).title()"),
+        "str.title(x) must lower to x.title(): {}",
+        out
+    );
+    assert!(
+        !out.contains("str . title") && !out.contains("str.title"),
+        "must not emit the fn-item attribute: {}",
+        out
+    );
+
+    // `map(str.lower, xs)` — the unbound method as a function argument
+    // (urllib3's request): a closure applying the bound method.
+    let out2 = compile(
+        "def g(headers: dict[str, str]) -> bool:\n    return \"content-type\" in map(str.lower, headers.keys())\n",
+        "strlowermap.py",
+    );
+    assert!(
+        out2.contains("| __rython_x | (__rython_x) . lower ()")
+            || out2.contains("|__rython_x| (__rython_x).lower()"),
+        "map(str.lower, xs) must lower to a closure: {}",
+        out2
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the

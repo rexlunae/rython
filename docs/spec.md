@@ -696,6 +696,17 @@ dispatch keys off; the round-63 store fix composes (the lowered value
 boxes back into the `PyDict<String, PyValue>` member). Sweep −6
 (urllib3 1029→1023). Pinned in codegen and runtime.
 
+Round 65 (the unbound builtin-str method): `str.title(header)` —
+urllib3's SKIPPABLE_HEADERS titlecasing — and `map(str.lower,
+headers.keys())` — its request() content-type check — treated the
+builtin `str` class as a value and read the method off the runtime
+str() fn item (E0609/E0599). Python's `str.m(s)` is `s.m()`, so the
+direct call lowers to the bound method on the argument (only the
+zero-arg-beyond-receiver str methods qualify; `str.join(sep, xs)` is
+the two-argument bound form), and `map(str.m, xs)` lowers the function
+argument to a closure applying the bound method. Sweep −4 (urllib3
+1023→1019). Pinned in both shapes.
+
 ## 6. Functions
 
 ### 6.1 Signatures
