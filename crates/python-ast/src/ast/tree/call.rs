@@ -6710,12 +6710,22 @@ impl<'a> CodeGen for Call {
                             } else {
                                 quote!(Ok(__rython_v) => __rython_v)
                             };
+                            // Python evaluates the DEFAULT before entering
+                            // get — even when the key exists — so a
+                            // side-effecting default must run exactly once,
+                            // not only in the KeyError arm (Devin review on
+                            // #267). Bind it before the match; the Ok arm
+                            // keeps the __getitem__ value.
                             return Ok(quote! {
-                                match #call {
-                                    #ok_arm,
-                                    Err(__rython_e)
-                                        if __rython_e.matches("KeyError") => #default,
-                                    Err(__rython_e) => return Err(__rython_e),
+                                {
+                                    let __rython_default = #default;
+                                    match #call {
+                                        #ok_arm,
+                                        Err(__rython_e)
+                                            if __rython_e.matches("KeyError") =>
+                                                __rython_default,
+                                        Err(__rython_e) => return Err(__rython_e),
+                                    }
                                 }
                             });
                         }
