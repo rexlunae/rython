@@ -14472,3 +14472,35 @@ fn imported_factory_option_field_crosses_modules_unwrapped() {
         out
     );
 }
+
+#[test]
+fn option_field_store_of_a_reused_name_wraps_and_clones() {
+    // Round 59: `self._last_printable_char = character` where the field
+    // is `str | None` and character is read again later (charset_normalizer's
+    // _count_suspicious): the reused-name CLONE arm preceded the Option-wrap
+    // arm, so the store rendered `(character).clone()` — a bare String into
+    // the Option field (E0308). The Option arm now runs first and clones
+    // INTO the Some (`Some((character).clone())`).
+    let out = compile(
+        concat!(
+            "class Mess:\n",
+            "    def __init__(self):\n",
+            "        self._last_printable_char: str | None = None\n",
+            "    def count(self, character: str) -> str:\n",
+            "        self._last_printable_char = character\n",
+            "        return character\n",
+        ),
+        "optstore2.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("_last_printable_char=Some((character).clone())"),
+        "a reused name stored into an Option field must clone into Some: {}",
+        out
+    );
+    assert!(
+        !flat.contains("_last_printable_char=(character).clone()"),
+        "the bare clone must not bypass the Option wrap: {}",
+        out
+    );
+}

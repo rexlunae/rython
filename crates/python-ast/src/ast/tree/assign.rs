@@ -923,13 +923,12 @@ impl<'a> CodeGen for Assign {
                 {
                     quote!(#target_code = #owned;)
                 }
-                ExprType::Attribute(_) if stored_name_needs_clone => {
-                    quote!(#target_code = (#value).clone();)
-                }
                 // A non-None, non-Option value stored into an OPTION-typed
                 // FIELD wraps in Some (Python's `int | None` slot absorbs a
                 // plain int — urllib3's `self.chunk_left = self.chunk_left
-                // - amt` and `self._start_connect = time.monotonic()`).
+                // - amt` and `self._start_connect = time.monotonic()`;
+                // charset_normalizer's `self._last_printable_char =
+                // character` — the clone arm BELOW must not preempt it).
                 // None stores keep plain None; an already-Option value
                 // (another optional field, dict.get) stores through
                 // unchanged — wrapping again would nest. Only fields whose
@@ -943,7 +942,24 @@ impl<'a> CodeGen for Assign {
                         && attr_field_is_option(target)
                         && !value_yields_option =>
                 {
-                    quote!(#target_code = Some(#value);)
+                    // A reused name clones INTO the Some (the field owns
+                    // the value and the name is read again later —
+                    // charset_normalizer's `_last_printable_char =
+                    // character`).
+                    if stored_name_needs_clone {
+                        quote!(#target_code = Some((#value).clone());)
+                    } else {
+                        quote!(#target_code = Some(#value);)
+                    }
+                }
+                // A reused name stored into a FIELD clones (the field owns
+                // the value; the name is read again later). Ordered AFTER
+                // the Option-wrap arm: a String into an Option<String>
+                // field with a later reuse must still wrap (`Some(
+                // (character).clone())` — charset_normalizer's
+                // _count_suspicious).
+                ExprType::Attribute(_) if stored_name_needs_clone => {
+                    quote!(#target_code = (#value).clone();)
                 }
                 _ => quote!(#target_code = #value;),
             })
