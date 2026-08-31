@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 67: factory-local receivers resolve their class (self/super/imported, direct calls); embedded-base field reads chain (1011 -> 1002)."
+      "note": "The historical #137 corpus. Round 68: other-object Option-field locals seed; direct factory/construction calls resolve for property reads (1002 -> 997)."
     },
     {
       "name": "certifi",

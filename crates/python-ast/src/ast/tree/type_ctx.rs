@@ -1542,21 +1542,54 @@ pub fn analyze_function_types_with_class(
                     }
                 }
                 crate::ExprType::Attribute(attr) => {
-                    if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self")
+                    // A SELF-field read (`resp_options = self._response_options`
+                    // — the enclosing class's own field table).
+                    let self_read = matches!(
+                        attr.value.as_ref(),
+                        crate::ExprType::Name(r) if r.id == "self"
+                    );
+                    let field_ty = if self_read {
+                        fields
+                            .iter()
+                            .find(|(name, _)| *name == attr.attr)
+                            .map(|(_, ty)| ty.clone())
+                    } else if let Some((owner, owner_symbols)) =
+                        crate::receiver_class_for_read(
+                            &attr.value,
+                            &crate::CodeGenContext::Module(String::new()),
+                            symbols,
+                            options,
+                        )
                     {
-                        continue;
-                    }
-                    if let Some((_, ty)) = fields.iter().find(|(name, _)| *name == attr.attr) {
-                        if matches!(ty, crate::TypeInfo::Option(_)) {
-                            // name_types only — the local IS the Option (its
-                            // stores are already Option and must not Some-wrap
-                            // again), and reads unwrap through the Option
-                            // receiver lowering.
-                            info.name_types.insert(
-                                n.id.clone(),
-                                crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
-                            );
-                        }
+                        eprintln!("SEED-DEBUG: {} <- {}.{} owner={}", n.id, format!("{:?}", attr.value), attr.attr, owner.name);
+                        // A field of ANOTHER object whose class resolves
+                        // (`destination_scheme = parsed_url.scheme` where
+                        // parsed_url is a factory local of Url — the same
+                        // Option seeding as the self-field arm; without it
+                        // the local stays untyped and an Option-slot
+                        // argument double-wraps `Some(destination_scheme)`).
+                        owner
+                            .infer_fields(&owner_symbols, options)
+                            .ok()
+                            .and_then(|fs| {
+                                fs.iter()
+                                    .find(|(name, _)| *name == attr.attr)
+                                    .map(|(_, ty)| ty.clone())
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some(ty) = field_ty
+                        && matches!(ty, crate::TypeInfo::Option(_))
+                    {
+                        // name_types only — the local IS the Option (its
+                        // stores are already Option and must not Some-wrap
+                        // again), and reads unwrap through the Option
+                        // receiver lowering.
+                        info.name_types.insert(
+                            n.id.clone(),
+                            crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                        );
                     }
                 }
                 _ => continue,

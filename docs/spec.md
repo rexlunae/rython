@@ -742,6 +742,20 @@ unmasked −6); the direct-call property routing traded the remaining
 E0615s for the honest `Option<String>`-value store gaps (+3). Pinned
 cross-module in both shapes.
 
+Round 68 (the other-object Option-field local): `destination_scheme =
+parsed_url.scheme` — a `str | None` field of a factory-local object —
+then passed to a `str | None` parameter: the class-aware local seeding
+typed only `self.<field>` reads, so the local stayed untyped and the
+Option-slot ARGUMENT adaptation wrapped the already-Option local in
+`Some(...)` (Option<Option<String>>, E0308). The seeding now also types
+a local from an Option-typed field of ANY object whose class resolves
+(through the same factory-local receiver resolution the read side
+uses), so the argument passes through unwrapped. Sweep −3 (urllib3
+1002→999). Pinned cross-module. The DIRECT-call receiver resolution also
+grew to cover CLASS CONSTRUCTIONS — local or imported (`Url(...).url` —
+a property of the constructed class read in place), routing the property
+read to the getter. Sweep −2 more (urllib3 999→997; E0615 10→8).
+
 ## 6. Functions
 
 ### 6.1 Signatures
