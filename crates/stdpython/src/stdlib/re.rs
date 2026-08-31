@@ -7,6 +7,85 @@
 
 use crate::PyException;
 
+/// The compiled pattern type (`re.compile(...)` module statics hold one —
+/// round 72). Wraps the regex crate's engine together with a second,
+/// whole-text-anchored engine (`\A(?:pattern)\z`) compiled at
+/// construction.
+///
+/// Python's `re.fullmatch` must match the ENTIRE text, and that has to
+/// CONSTRAIN the engine while matching: anchoring the pattern makes the
+/// alternation and lazy quantifiers resolve to the whole-string branch
+/// (`re.fullmatch("a|ab", "ab")` matches "ab" even though the unanchored
+/// leftmost-first engine finds "a" first; `re.fullmatch("a*?", "aaa")`
+/// consumes all of "aaa"). A post-hoc filter of the first unanchored
+/// match would reject both.
+///
+/// Clone is implemented on the WRAPPER (not borrowed through `Deref`):
+/// generated code clones a compiled static's value
+/// (`(*_TARGET_RE).clone()`) to own it, and the clone must stay a
+/// `Regex` — autoderef would otherwise hand back the engine's clone,
+/// losing the anchored whole-text engine (E0599 on `py_fullmatch`).
+#[derive(Clone)]
+pub struct Regex {
+    /// The pattern as compiled (the inline `(?flags)` prefix applied),
+    /// used for match/search and as the free functions' engine.
+    re: regex::Regex,
+    /// The whole-text engine: `\A(?:pattern)\z`.
+    full: regex::Regex,
+}
+
+impl Regex {
+    /// Compile with no flags — the spelling the `Regex::new` test surface
+    /// uses; `re.compile(...)` routes through [`compile`] so flags are
+    /// inlined the same way.
+    pub fn new(pattern: &str) -> Result<Regex, PyException> {
+        compile(pattern, "")
+    }
+}
+
+impl core::ops::Deref for Regex {
+    type Target = regex::Regex;
+    fn deref(&self) -> &regex::Regex {
+        &self.re
+    }
+}
+
+/// The match surface on a COMPILED pattern (`_TARGET_RE.match(target)` —
+/// the module static holds the compiled Regex; the runtime free
+/// functions re-compile from the pattern string, while a compiled
+/// pattern matches directly). Python's `re.match` anchors at the START
+/// of the text, `re.search` finds the first match anywhere, and
+/// `re.fullmatch` requires the WHOLE text — the first two use the
+/// engine's `captures_at`/`captures` (a `match` must START at 0), while
+/// `py_fullmatch` matches against the pre-anchored whole-text engine.
+pub trait PyRegexOps {
+    fn py_match(&self, text: &str) -> Option<PyMatch>;
+    fn py_search(&self, text: &str) -> Option<PyMatch>;
+    fn py_fullmatch(&self, text: &str) -> Option<PyMatch>;
+}
+
+impl PyRegexOps for Regex {
+    fn py_match(&self, text: &str) -> Option<PyMatch> {
+        let caps = self
+            .re
+            .captures_at(text, 0)
+            .filter(|c| c.get(0).is_some_and(|m| m.start() == 0))?;
+        Some(make_match(&self.re, text, &caps))
+    }
+    fn py_search(&self, text: &str) -> Option<PyMatch> {
+        let caps = self.re.captures(text)?;
+        Some(make_match(&self.re, text, &caps))
+    }
+    fn py_fullmatch(&self, text: &str) -> Option<PyMatch> {
+        // The whole-text engine is anchored at construction, so a match
+        // here IS the whole string — the alternation/lazy branches that
+        // only cover part of the text cannot satisfy the anchors
+        // (CPython-verified: `a|ab` on "ab", `a*?` on "aaa").
+        let caps = self.full.captures(text)?;
+        Some(make_match(&self.re, text, &caps))
+    }
+}
+
 /// re.IGNORECASE — the case-insensitive flag, passed as the flags string
 /// (`re.compile("x", re.IGNORECASE)` — requests' auth; `re.I` is the same
 /// constant).
@@ -142,6 +221,7 @@ impl PyMatch {
         let e = self.group_entry(0);
         (e.1, e.2)
     }
+
 }
 
 /// A Match object is always truthy in Python (`if m:` tests presence
@@ -262,15 +342,18 @@ pub fn escape<S: AsRef<str> + ?Sized>(pattern: &S) -> String {
 }
 
 /// Compile with Python flag letters ("i", "m", "s") applied as an
-/// inline group, which the regex crate shares with Python's syntax.
-pub fn compile(pattern: &str, flags: &str) -> Result<regex::Regex, PyException> {
+/// inline group, which the regex crate shares with Python's syntax. The
+/// whole-text engine (`\A(?:pattern)\z`) is compiled alongside, at the
+/// same cost as the pattern itself — a compiled pattern's `fullmatch`
+/// anchors through it (see [`PyRegexOps::py_fullmatch`]).
+pub fn compile(pattern: &str, flags: &str) -> Result<Regex, PyException> {
     let pattern = if flags.is_empty() {
         alloc::borrow::Cow::Borrowed(pattern)
     } else {
         alloc::borrow::Cow::Owned(format!("(?{}){}", flags, pattern))
     };
     let pattern: &str = &pattern;
-    regex::Regex::new(pattern).map_err(|e| {
+    let re = regex::Regex::new(pattern).map_err(|e| {
         PyException::new(
             "re.error",
             format!(
@@ -279,7 +362,21 @@ pub fn compile(pattern: &str, flags: &str) -> Result<regex::Regex, PyException> 
                 pattern, e
             ),
         )
-    })
+    })?;
+    // A valid pattern stays valid wrapped in `\A(?:...)\z` (the wrapper
+    // adds no syntax of its own); fail loudly rather than unwrap if the
+    // engine disagrees.
+    let full_source = alloc::format!(r"\A(?:{})\z", pattern);
+    let full = regex::Regex::new(&full_source).map_err(|e| {
+        PyException::new(
+            "re.error",
+            format!(
+                "cannot compile whole-text pattern {:?}: {}",
+                full_source, e
+            ),
+        )
+    })?;
+    Ok(Regex { re, full })
 }
 
 /// re.search(pattern, string): the first match anywhere, or None.

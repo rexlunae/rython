@@ -6135,6 +6135,11 @@ pub use stdlib::urllib;
 // resolve through the Option layer in generated code.
 #[cfg(feature = "re-regex")]
 pub use stdlib::re::PyMatchOps;
+// The compiled-pattern matching trait must be in scope for
+// `_TARGET_RE.match(x)`-style calls on a compiled-regex static in
+// generated code.
+#[cfg(feature = "re-regex")]
+pub use stdlib::re::PyRegexOps;
 pub use stdlib::string;
 pub use stdlib::json;
 pub use stdlib::collections;

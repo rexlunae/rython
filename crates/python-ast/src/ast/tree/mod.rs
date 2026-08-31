@@ -55,7 +55,11 @@ pub use parameters::*;
 pub mod name;
 pub use name::*;
 
+pub mod annotation_module;
+pub mod datetime_types;
 pub mod threading_types;
+pub(crate) use annotation_module::{AnnotationModule, is_typing};
+pub(crate) use datetime_types::DatetimeType;
 pub(crate) use threading_types::ThreadingType;
 
 pub mod std_module;

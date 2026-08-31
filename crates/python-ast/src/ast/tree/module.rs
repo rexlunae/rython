@@ -941,7 +941,13 @@ impl CodeGen for Module {
                         let renderable = match &body_stmt.statement {
                             crate::StatementType::ImportFrom(i) => {
                                 let root = i.module.split('.').next().unwrap_or("");
-                                if matches!(root, "typing" | "typing_extensions") {
+                                if matches!(
+                                    crate::AnnotationModule::from_name(root),
+                                    Some(
+                                        crate::AnnotationModule::Typing
+                                            | crate::AnnotationModule::TypingExtensions
+                                    )
+                                ) {
                                     None
                                 } else if crate::ast::tree::import::is_stdpython_module(root) {
                                     // A stdpython-module import whose ITEM
@@ -3822,7 +3828,7 @@ pub(crate) fn module_def_has_runtime_item(
                                 if a.attr == "TYPE_CHECKING"
                                     && matches!(
                                         a.value.as_ref(),
-                                        crate::ExprType::Name(m) if m.id == "typing"
+                                        crate::ExprType::Name(m) if crate::is_typing(&m.id)
                                     )
                         );
                     if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
@@ -4280,7 +4286,7 @@ fn scan_module_body_for_item(
                                 if a.attr == "TYPE_CHECKING"
                                     && matches!(
                                         a.value.as_ref(),
-                                        crate::ExprType::Name(m) if m.id == "typing"
+                                        crate::ExprType::Name(m) if crate::is_typing(&m.id)
                                     )
                         );
                     if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
@@ -4319,12 +4325,12 @@ fn is_type_alias_value(value: &crate::ExprType) -> bool {
                     | "IO" | "ClassVar"
             ),
             crate::ExprType::Attribute(a) => {
-                matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "typing")
+                matches!(a.value.as_ref(), crate::ExprType::Name(n) if crate::is_typing(&n.id))
             }
             _ => false,
         },
         crate::ExprType::Attribute(a) => {
-            matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "typing")
+            matches!(a.value.as_ref(), crate::ExprType::Name(n) if crate::is_typing(&n.id))
         }
         _ => false,
     }
@@ -4402,11 +4408,31 @@ fn module_init_static_ty(
     if let crate::ExprType::Call(c) = value
         && let crate::ExprType::Attribute(a) = c.func.as_ref()
         && let crate::ExprType::Name(n) = a.value.as_ref()
+        && let Some(mod_) = crate::StdModule::from_name(&n.id)
     {
-        match (n.id.as_str(), a.attr.as_str()) {
-            ("datetime", "date") => return Some(quote!(stdpython::datetime::date)),
-            ("datetime", "datetime") => return Some(quote!(stdpython::datetime::datetime)),
-            ("datetime", "timedelta") => return Some(quote!(stdpython::datetime::timedelta)),
+        // The MODULE resolves through the StdModule registry (the one
+        // place module names exist); only the callee's function name
+        // remains a string, matched at this single boundary. These
+        // constructors give the static a typed Rust shape instead of the
+        // boxed PyValue fallback.
+        match (mod_, crate::DatetimeType::from_name(&a.attr)) {
+            (crate::StdModule::Datetime, Some(crate::DatetimeType::Date)) => {
+                return Some(quote!(stdpython::datetime::date));
+            }
+            (crate::StdModule::Datetime, Some(crate::DatetimeType::DateTime)) => {
+                return Some(quote!(stdpython::datetime::datetime));
+            }
+            (crate::StdModule::Datetime, Some(crate::DatetimeType::Timedelta)) => {
+                return Some(quote!(stdpython::datetime::timedelta));
+            }
+            // `re.compile(...)` — a compiled pattern (`_TARGET_RE =
+            // re.compile(...)`): the static holds the raw Regex, so
+            // `.match()`/`.search()`/`.fullmatch()` on it dispatch
+            // through the runtime's PyRegexOps instead of boxing the
+            // pattern in a PyValue that has no such methods (round 72).
+            (crate::StdModule::Re, _) if a.attr == "compile" => {
+                return Some(quote!(stdpython::stdlib::re::Regex));
+            }
             _ => {}
         }
     }
@@ -4541,7 +4567,7 @@ impl Module {
         match test {
             crate::ExprType::Name(n) => n.id == "TYPE_CHECKING",
             crate::ExprType::Attribute(a) => {
-                matches!(a.value.as_ref(), crate::ExprType::Name(m) if m.id == "typing")
+                matches!(a.value.as_ref(), crate::ExprType::Name(m) if crate::is_typing(&m.id))
                     && a.attr == "TYPE_CHECKING"
             }
             _ => false,

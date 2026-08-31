@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 71: the base-chain walk follows imported bases (fields/properties/Option-ness through cross-module inheritance) (989 -> 988)."
+      "note": "The historical #137 corpus. Round 72: compiled-regex statics type as the runtime Regex; .match/.search/.fullmatch dispatch through PyRegexOps (988 -> 978)."
     },
     {
       "name": "certifi",

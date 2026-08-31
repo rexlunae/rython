@@ -125,10 +125,8 @@ pub fn parse_decorator(
             ExprType::Name(n) => Some(n.id.clone()),
             ExprType::Attribute(a) => match a.value.as_ref() {
                 ExprType::Name(m)
-                    if matches!(
-                        m.id.as_str(),
-                        "functools" | "typing" | "contextlib" | "abc" | "dataclasses"
-                    ) =>
+                    if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Functools)
+                        || crate::AnnotationModule::from_name(&m.id).is_some() =>
                 {
                     Some(a.attr.clone())
                 }

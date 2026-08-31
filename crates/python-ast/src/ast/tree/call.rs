@@ -323,7 +323,7 @@ fn urllib_parse_fn(
                     .find(|a| a.asname.as_deref() == Some(&current))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| current.clone());
-                if root == "urllib" {
+                if crate::StdModule::from_name(&root) == Some(crate::StdModule::Urllib) {
                     if let Some(f) = PARSE_FNS.iter().copied().find(|f| *f == canonical.as_str()) {
                         return Some(f);
                     }
@@ -368,12 +368,20 @@ fn render_datetime_ctor(
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
-    if !matches!(name, "date" | "datetime" | "timedelta") {
+    let Some(dt) = crate::DatetimeType::from_name(name) else {
+        return Ok(None);
+    };
+    // time/timezone construct through stdpython_class (`time::new(...)`),
+    // not through the field-decomposed constructor below.
+    if matches!(
+        dt,
+        crate::DatetimeType::Time | crate::DatetimeType::Timezone
+    ) {
         return Ok(None);
     }
-    let (params, required): (&[&str], usize) = match name {
-        "date" => (&["year", "month", "day"], 3),
-        "datetime" => (
+    let (params, required): (&[&str], usize) = match dt {
+        crate::DatetimeType::Date => (&["year", "month", "day"], 3),
+        crate::DatetimeType::DateTime => (
             &[
                 "year",
                 "month",
@@ -385,7 +393,7 @@ fn render_datetime_ctor(
             ],
             3,
         ),
-        _ => (
+        crate::DatetimeType::Timedelta => (
             &[
                 "days",
                 "seconds",
@@ -397,6 +405,8 @@ fn render_datetime_ctor(
             ],
             0,
         ),
+        // Filtered out above (they construct through stdpython_class).
+        crate::DatetimeType::Time | crate::DatetimeType::Timezone => unreachable!(),
     };
     if args.len() > params.len() {
         return Err(format!(
@@ -428,12 +438,13 @@ fn render_datetime_ctor(
              element types are dynamic, issue #130)",
             name
         ));
-        return Ok(Some(match name {
-            "datetime" => quote!(stdpython::datetime::datetime::now()),
-            "date" => quote!(stdpython::datetime::date::today()),
-            _ => quote!(stdpython::datetime::timedelta::new(
+        return Ok(Some(match dt {
+            crate::DatetimeType::DateTime => quote!(stdpython::datetime::datetime::now()),
+            crate::DatetimeType::Date => quote!(stdpython::datetime::date::today()),
+            crate::DatetimeType::Timedelta => quote!(stdpython::datetime::timedelta::new(
                 None, None, None, None, None, None, None
             )),
+            crate::DatetimeType::Time | crate::DatetimeType::Timezone => unreachable!(),
         }));
     }
     for kw in keywords {
@@ -686,12 +697,16 @@ fn is_partial_target(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
             n.id == "partial"
                 && matches!(
                     symbols.get(&n.id),
-                    Some(SymbolTableNode::ImportFrom(i)) if i.module == "functools"
+                    Some(SymbolTableNode::ImportFrom(i))
+                        if crate::StdModule::from_name(&i.module)
+                            == Some(crate::StdModule::Functools)
                 )
         }
         ExprType::Attribute(attr) => {
             attr.attr == "partial"
-                && matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "functools")
+                && matches!(attr.value.as_ref(), ExprType::Name(m)
+                    if crate::StdModule::from_name(&m.id)
+                        == Some(crate::StdModule::Functools))
         }
         _ => false,
     }
@@ -724,7 +739,9 @@ fn numpy_target(func: &ExprType, symbols: &SymbolTableScopes) -> Option<String> 
         },
         ExprType::Name(n) => match symbols.get(&n.id) {
             Some(SymbolTableNode::ImportFrom(import))
-                if import.module == "numpy" || import.module == "numpy.linalg" =>
+                if crate::StdModule::from_name(
+                    import.module.split('.').next().unwrap_or("")
+                ) == Some(crate::StdModule::Numpy) =>
             {
                 let name = n.id.clone();
                 Some(if import.module == "numpy.linalg" {
@@ -1658,7 +1675,9 @@ impl<'a> CodeGen for Call {
         // prep._cookies)` into `cookie_jar = ;` (requests' auth).
         if let ExprType::Name(n) = self.func.as_ref() {
             if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id) {
-                if i.module.split('.').next() == Some("typing") {
+                if crate::AnnotationModule::from_name(i.module.split('.').next().unwrap_or(""))
+                    == Some(crate::AnnotationModule::Typing)
+                {
                     if n.id == "cast" && self.args.len() == 2 {
                         return self.args[1].clone().to_rust(ctx, options, symbols);
                     }
@@ -1690,8 +1709,9 @@ impl<'a> CodeGen for Call {
         // the runtime constructor takes the value explicitly.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && crate::ThreadingType::from_name(&attr.attr) == Some(crate::ThreadingType::Semaphore)
-            && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
-            && !module_name_shadowed("threading", &symbols)
+            && matches!(attr.value.as_ref(), ExprType::Name(n)
+                if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Threading))
+            && !module_name_shadowed(crate::StdModule::Threading.name(), &symbols)
             && self.args.is_empty()
             && self.keywords.is_empty()
         {
@@ -3533,7 +3553,8 @@ impl<'a> CodeGen for Call {
                 let from_datetime = matches!(
                     symbols.get(&n.id),
                     Some(SymbolTableNode::ImportFrom(import))
-                        if import.module == "datetime"
+                        if crate::StdModule::from_name(&import.module)
+                            == Some(crate::StdModule::Datetime)
                 );
                 if from_datetime {
                     Some(n.id.as_str())
@@ -3544,9 +3565,11 @@ impl<'a> CodeGen for Call {
             ExprType::Attribute(a) => {
                 // `datetime.date(...)`: the receiver is the stdlib module,
                 // not shadowed by a user binding.
-                let is_datetime_module =
-                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "datetime")
-                        && !crate::module_name_shadowed("datetime", &symbols);
+                let is_datetime_module = matches!(
+                    a.value.as_ref(),
+                    ExprType::Name(n)
+                        if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Datetime)
+                ) && !crate::module_name_shadowed(crate::StdModule::Datetime.name(), &symbols);
                 if is_datetime_module {
                     Some(a.attr.as_str())
                 } else {
@@ -3576,7 +3599,8 @@ impl<'a> CodeGen for Call {
             let from_itertools = matches!(
                 symbols.get(&n.id),
                 Some(SymbolTableNode::ImportFrom(import))
-                    if import.module == "itertools"
+                    if crate::StdModule::from_name(&import.module)
+                        == Some(crate::StdModule::Itertools)
             );
             let handled = matches!(
                 n.id.as_str(),
@@ -3945,11 +3969,14 @@ impl<'a> CodeGen for Call {
         // converts the boxed value (pyvalue_to_json) — round 55.
         if let ExprType::Name(n) = self.func.as_ref() {
             let from_json = match symbols.get(&n.id) {
-                Some(SymbolTableNode::ImportFrom(i)) => i.module == "json",
+                Some(SymbolTableNode::ImportFrom(i)) =>
+                    crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Json),
                 Some(SymbolTableNode::Alias(canonical)) => {
                     matches!(
                         symbols.get(canonical),
-                        Some(SymbolTableNode::ImportFrom(i)) if i.module == "json"
+                        Some(SymbolTableNode::ImportFrom(i))
+                            if crate::StdModule::from_name(&i.module)
+                                == Some(crate::StdModule::Json)
                     )
                 }
                 _ => false,
@@ -4394,7 +4421,8 @@ impl<'a> CodeGen for Call {
                     match e {
                         ExprType::Attribute(a)
                             if matches!(a.value.as_ref(), ExprType::Name(m)
-                                if m.id == "re" && !module_name_shadowed("re", symbols)) =>
+                                if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Re)
+                                    && !module_name_shadowed(crate::StdModule::Re.name(), symbols)) =>
                         {
                             name_of(&a.attr)
                         }
@@ -5073,7 +5101,8 @@ impl<'a> CodeGen for Call {
             // items are functions except the constants.
             let stdpython_fn = matches!(symbols.get(&n.id),
                 Some(crate::SymbolTableNode::ImportFrom(ifm))
-                    if ifm.module == "socket"
+                    if crate::StdModule::from_name(&ifm.module)
+                        == Some(crate::StdModule::Socket)
                         && matches!(
                             n.id.as_str(),
                             "getdefaulttimeout" | "setdefaulttimeout" | "gethostname"
@@ -6970,6 +6999,37 @@ impl<'a> CodeGen for Call {
                     ("find", [needle]) => {
                         return Ok(quote!((#receiver).py_find(&(#needle))));
                     }
+                    // A COMPILED-REGEX static receiver (`_TARGET_RE.match(
+                    // target)` — the module static holds `re.compile(...)`,
+                    // typed as the runtime Regex): the anchored matching
+                    // dispatches through the runtime's PyRegexOps (py_match
+                    // anchors at the start, py_search anywhere, py_fullmatch
+                    // requires the whole text). Without the arm the call
+                    // emitted `.r#match()` on the static's value — E0599
+                    // (no such method on a boxed PyValue). The MODULE name
+                    // resolves through the StdModule registry.
+                    ("match" | "search" | "fullmatch", [text]) => {
+                        if crate::ast::tree::call::root_name(&attr.value).is_some_and(|root| {
+                            matches!(
+                                symbols.get(&root),
+                                Some(crate::SymbolTableNode::Assign {
+                                    value: crate::ExprType::Call(c),
+                                    ..
+                                }) if matches!(c.func.as_ref(), crate::ExprType::Attribute(a)
+                                    if a.attr == "compile"
+                                        && matches!(a.value.as_ref(), crate::ExprType::Name(n)
+                                            if crate::StdModule::from_name(&n.id)
+                                                == Some(crate::StdModule::Re)))
+                            )
+                        }) {
+                            let m = match attr.attr.as_str() {
+                                "search" => quote!(py_search),
+                                "fullmatch" => quote!(py_fullmatch),
+                                _ => quote!(py_match),
+                            };
+                            return Ok(quote!((#receiver).#m(&(#text))));
+                        }
+                    }
                     _ => {}
                 }
                 // Issue #121: bytes methods on a name narrowed to Vec<u8>
@@ -7599,7 +7659,7 @@ impl<'a> CodeGen for Call {
         // the from-import spelling does.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && let ExprType::Name(m) = attr.value.as_ref()
-            && m.id == "collections"
+            && crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Collections)
             && matches!(attr.attr.as_str(), "deque" | "OrderedDict" | "defaultdict")
         {
             let module = crate::safe_ident(&m.id);
@@ -8944,14 +9004,18 @@ fn lower_threading_thread(
     let is_thread = match call.func.as_ref() {
         ExprType::Attribute(attr) => {
             is_thread_name(&attr.attr)
-                && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
-                && !module_name_shadowed("threading", symbols)
+                && matches!(attr.value.as_ref(), ExprType::Name(n)
+                    if crate::StdModule::from_name(&n.id)
+                        == Some(crate::StdModule::Threading))
+                && !module_name_shadowed(crate::StdModule::Threading.name(), symbols)
         }
         ExprType::Name(n) => {
             is_thread_name(&n.id)
                 && matches!(
                     symbols.get("Thread"),
-                    Some(SymbolTableNode::ImportFrom(i)) if i.module == "threading"
+                    Some(SymbolTableNode::ImportFrom(i))
+                        if crate::StdModule::from_name(&i.module)
+                            == Some(crate::StdModule::Threading)
                 )
         }
         _ => false,

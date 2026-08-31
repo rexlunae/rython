@@ -1808,7 +1808,7 @@ fn return_type_of(
                     // `from re import escape` (pygments' regexopt): the
                     // known re-function returns an owned String.
                     if let Some(crate::SymbolTableNode::ImportFrom(i)) = sym
-                        && i.module == "re"
+                        && crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Re)
                         && matches!(f.id.as_str(), "escape" | "sub" | "findall")
                     {
                         return Ok(quote!(String));
