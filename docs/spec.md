@@ -681,6 +681,21 @@ the never-type had masked. The copy arm returns when that boxed family
 lands; the E0599s stay loud (§12.1). Sweep −4 (urllib3 1033→1029).
 Pinned in both the plain and boxed-valued shapes.
 
+Round 64 (the boxed-str-method family's first piece): `context["scheme"]
+.lower()` where context is `dict[str, Any]` (urllib3's poolmanager — 8
+sites) emits `(#recv).lower()` through the blanket `PyStrOps for T:
+AsRef<str>`, which PyValue does not satisfy (E0599 "trait bounds not
+satisfied"). A new `PyBoxedStrOps` trait dispatches on the runtime
+member — Str → the operation; anything else → CPython's AttributeError
+panic (§12.2) — and the attr-call path routes lower/upper/strip there
+when the receiver POSITIVELY infers PyValue (PyObject stays on the
+plain method, loud in rustc if the member is boxed). `infer_type` of a
+SUBSCRIPT now reads the element type through an Option-wrapped base
+(`request_context["scheme"]` on `dict[str, Any] | None`), which the
+dispatch keys off; the round-63 store fix composes (the lowered value
+boxes back into the `PyDict<String, PyValue>` member). Sweep −6
+(urllib3 1029→1023). Pinned in codegen and runtime.
+
 ## 6. Functions
 
 ### 6.1 Signatures

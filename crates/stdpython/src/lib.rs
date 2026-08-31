@@ -4027,6 +4027,53 @@ fn single_fill_char(fill: &str) -> Result<char, PyException> {
     }
 }
 
+/// String operations on the BOXED heterogeneous value (`context["scheme"]
+/// .lower()` where context is `dict[str, Any]` — urllib3's poolmanager:
+/// the subscript read yields PyValue, and the runtime member is a str in
+/// practice). CPython dispatches on the runtime type; a non-str member
+/// raises AttributeError, which the loud §12.2 panic mirrors with
+/// CPython's message. A separate trait: the blanket `PyStrOps for T:
+/// AsRef<str>` cannot be narrowed to PyValue without a coherence
+/// conflict, and PyValue does not satisfy AsRef<str>.
+pub trait PyBoxedStrOps {
+    /// str.lower() on the runtime member.
+    fn py_boxed_lower(&self) -> String;
+    /// str.upper() on the runtime member.
+    fn py_boxed_upper(&self) -> String;
+    /// str.strip() (whitespace) on the runtime member.
+    fn py_boxed_strip(&self) -> String;
+}
+
+impl PyBoxedStrOps for PyValue {
+    fn py_boxed_lower(&self) -> String {
+        match self {
+            PyValue::Str(s) => s.to_lowercase(),
+            other => panic!(
+                "AttributeError: '{}' object has no attribute 'lower'",
+                other.py_type_name()
+            ),
+        }
+    }
+    fn py_boxed_upper(&self) -> String {
+        match self {
+            PyValue::Str(s) => s.to_uppercase(),
+            other => panic!(
+                "AttributeError: '{}' object has no attribute 'upper'",
+                other.py_type_name()
+            ),
+        }
+    }
+    fn py_boxed_strip(&self) -> String {
+        match self {
+            PyValue::Str(s) => s.trim_matches(py_is_whitespace).to_string(),
+            other => panic!(
+                "AttributeError: '{}' object has no attribute 'strip'",
+                other.py_type_name()
+            ),
+        }
+    }
+}
+
 pub trait PyStrOps {
     fn upper(&self) -> String;
     fn lower(&self) -> String;

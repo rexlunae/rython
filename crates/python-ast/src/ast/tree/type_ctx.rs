@@ -599,6 +599,15 @@ fn infer_type_inner(
         ExprType::Subscript(sub) => match infer_type(&sub.value, options, symbols) {
             TypeInfo::Vec(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
+            // An OPTION-wrapped base (`request_context["scheme"]` where
+            // request_context is `dict[str, Any] | None` — urllib3's
+            // poolmanager): the read unwraps the Option, so the element
+            // type is the dict's value (round 64 — the boxed-str-method
+            // dispatch keys off this).
+            TypeInfo::Option(inner) => match *inner {
+                TypeInfo::Dict(_, v) => *v,
+                _ => TypeInfo::PyObject,
+            },
             TypeInfo::Borrowed(inner) => match *inner {
                 TypeInfo::Vec(e) => *e,
                 TypeInfo::String => TypeInfo::StrRef,
