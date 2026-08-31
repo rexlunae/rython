@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 64: boxed-PyValue str-method dispatch (lower/upper/strip) + Option-through subscript typing (1029 -> 1023)."
+      "note": "The historical #137 corpus. Round 65: unbound builtin-str methods (str.title(x) -> x.title(), map(str.lower, xs) closure) (1023 -> 1019)."
     },
     {
       "name": "certifi",

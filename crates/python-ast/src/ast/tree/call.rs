@@ -3292,11 +3292,41 @@ impl<'a> CodeGen for Call {
                             });
                         }
                         return match rendered.as_slice() {
-                            [f, xs] => Ok(if fallible {
-                                quote!(map_fallible(#f, #xs)?)
-                            } else {
-                                quote!(map(#f, #xs))
-                            }),
+                            [f, xs] => {
+                                // `map(str.lower, xs)` — an UNBOUND
+                                // builtin-str method as the function
+                                // argument (urllib3's request():
+                                // `"content-type" in map(str.lower,
+                                // headers.keys())`): the class-as-value
+                                // model has no `str.lower` value (E0609)
+                                // — the function lowers to a closure
+                                // applying the bound method.
+                                let unbound = match self.args.first() {
+                                    Some(ExprType::Attribute(ub))
+                                        if matches!(
+                                            ub.value.as_ref(),
+                                            ExprType::Name(n) if n.id == "str"
+                                        ) && matches!(
+                                            ub.attr.as_str(),
+                                            "lower" | "upper" | "title" | "strip"
+                                                | "lstrip" | "rstrip" | "capitalize"
+                                                | "casefold" | "swapcase"
+                                        ) =>
+                                    {
+                                        Some(crate::safe_ident(&ub.attr))
+                                    }
+                                    _ => None,
+                                };
+                                let f = match unbound {
+                                    Some(m) => quote!(|__rython_x| (__rython_x).#m()),
+                                    None => f.clone(),
+                                };
+                                Ok(if fallible {
+                                    quote!(map_fallible(#f, #xs)?)
+                                } else {
+                                    quote!(map(#f, #xs))
+                                })
+                            }
                             [f, a, b] => {
                                 if fallible {
                                     return Err("map() over two iterables with a user-defined \
@@ -5747,6 +5777,33 @@ impl<'a> CodeGen for Call {
                     _ => quote!(py_boxed_strip),
                 };
                 return Ok(quote!((#receiver).#m()));
+            }
+
+            // An UNBOUND builtin-str method applied to its receiver
+            // (`str.title(header)` — urllib3's SKIPPABLE_HEADERS
+            // titlecasing): Python's `str.m(s)` is `s.m()`. The
+            // class-as-value model has no `str.title` attribute — the
+            // builtin `str` lowers to the runtime str() fn item, and the
+            // method call on it fails its PyStrOps bound (E0599) or the
+            // attribute read fails (E0609) — so the call lowers to the
+            // bound method on the argument. Only the zero-arg-beyond-
+            // receiver str methods qualify (`str.join(sep, xs)` is the
+            // two-argument bound form).
+            if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "str")
+                && self.args.len() == 1
+                && matches!(
+                    attr.attr.as_str(),
+                    "lower" | "upper" | "title" | "strip" | "lstrip" | "rstrip"
+                        | "capitalize" | "casefold" | "swapcase" | "splitlines"
+                )
+            {
+                let m = crate::safe_ident(&attr.attr);
+                let arg = self.args[0].clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                return Ok(quote!((#arg).#m()));
             }
 
             // String-keyed dicts (from a literal or a `dict[str, V]`
