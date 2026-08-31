@@ -1240,12 +1240,14 @@ impl FunctionDef {
                             }
                             // Optional keys: `x: str | None` caches on the
                             // Option (charset_normalizer's lg_inclusion).
+                            // python_annotation_to_rust_type ALREADY returns
+                            // the full Option<T> — wrapping it again nested
+                            // Option<Option<T>> (round 75).
                             Some(ann)
                                 if crate::is_optional_annotation(ann) =>
                             {
-                                let inner = crate::python_annotation_to_rust_type(ann)
-                                    .unwrap_or_else(|| quote!(String));
-                                quote!(Option<#inner>)
+                                crate::python_annotation_to_rust_type(ann)
+                                    .unwrap_or_else(|| quote!(Option<String>))
                             }
                             _ => {
                                 // A cache key of an unsupported type
@@ -3409,12 +3411,35 @@ pub(crate) fn expr_yields_option(
             }
             // A user function annotated `-> Optional[T]` generates
             // `Result<Option<T>, PyException>`; the call site's `?` strips
-            // only the Result layer, leaving an Option.
+            // only the Result layer, leaving an Option. An IMPORTED
+            // function (`from .utils import unicode_range` —
+            // charset_normalizer's cd.py, whose callee returns `str |
+            // None`) resolves the defining FunctionDef through the module
+            // defs and checks the same annotation — without it a store
+            // Some-wraps the already-Option result (Option<Option<T>>,
+            // round 75).
             ExprType::Name(name) => match symbols.get(&name.id) {
                 Some(SymbolTableNode::FunctionDef(f)) => f
                     .returns
                     .as_deref()
                     .is_some_and(crate::is_optional_annotation),
+                Some(SymbolTableNode::ImportFrom(ifm))
+                    if !crate::ast::tree::import::is_stdpython_module(&ifm.module) =>
+                {
+                    let path = ifm.resolved_module_path(options);
+                    let Some(key) = crate::module_defs_key(options, &path) else {
+                        return false;
+                    };
+                    options.module_defs.get(key).is_some_and(|m| {
+                        m.raw.body.iter().any(|s| {
+                            matches!(&s.statement, crate::StatementType::FunctionDef(f)
+                                if f.name == name.id
+                                    && f.returns
+                                        .as_deref()
+                                        .is_some_and(crate::is_optional_annotation))
+                        })
+                    })
+                }
                 // socket.getdefaulttimeout/setdefaulttimeout return the
                 // default as `float | None` (Option<f64>) — the runtime
                 // free functions' shape (urllib3's Timeout module).
