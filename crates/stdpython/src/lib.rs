@@ -4453,7 +4453,12 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
             // printable).
             static NONPRINTABLE: std::sync::LazyLock<regex::Regex> =
                 std::sync::LazyLock::new(|| {
-                    regex::Regex::new(r"[\p{Cf}\p{Cn}\p{Zl}\p{Zp}\p{Zs}--[ ]]").unwrap()
+                    // \p{C} is ALL of Other (Cc Cf Cs Co Cn) — controls,
+                    // format, surrogates, private use, unassigned —
+                    // exactly Python's exclusion; Zl/Zp/Zs add the
+                    // separators Python also excludes (minus the ASCII
+                    // space, which IS printable).
+                    regex::Regex::new(r"[\p{C}\p{Zl}\p{Zp}\p{Zs}--[ ]]").unwrap()
                 });
             return !NONPRINTABLE.is_match(self.as_ref());
         }

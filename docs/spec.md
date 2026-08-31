@@ -1622,6 +1622,14 @@ this section's kernel restrictions apply to it.
 
 ---
 
+
+- Without the `re-regex` feature (the light no-re build), the str.is*
+  Unicode classification methods fall back to Rust std's char
+  properties: isalpha/isalnum use the Alphabetic property (which
+  includes combining marks like U+0345 that CPython's Letter-category
+  rule rejects), and isprintable misses format/unassigned categories.
+  The DEFAULT build (re-regex on) is exact through the regex engine's
+  Unicode tables; the light build's approximation is documented here.
 ## 12. Deviations from CPython
 
 This section is the honest ledger §1.2 requires. Three categories.

@@ -3751,7 +3751,11 @@ fn string_is_family_matches_python() {
         let c = char::from_u32(cp).unwrap();
         assert!(!c.to_string().isprintable(), "U+{cp:04X} isprintable");
     }
-    assert!(" ".isprintable() && "\t".isprintable());
+    assert!(" ".isprintable(), "ASCII space is printable");
+    // python3: control characters (tab, newline, NUL) are NOT printable.
+    assert!(!'\t'.to_string().isprintable());
+    assert!(!'\n'.to_string().isprintable());
+    assert!(!'\u{0}'.to_string().isprintable());
     // python3: U+0345 (a combining mark with the Alphabetic property) is
     // not a letter — isalpha/isalnum are False; A-grave is a letter.
     assert!(!'\u{0345}'.to_string().isalpha());
