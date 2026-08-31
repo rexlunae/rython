@@ -707,6 +707,20 @@ the two-argument bound form), and `map(str.m, xs)` lowers the function
 argument to a closure applying the bound method. Sweep −4 (urllib3
 1023→1019). Pinned in both shapes.
 
+Round 66 (the Option-dict method-call family): three members.
+`for key in ("headers", "_proxy_headers", "_socks_options")` (urllib3's
+poolmanager — 4 sites) iterated a Rust tuple, which is not
+IntoIterator (E0277): an all-constant tuple iterates as an array, with
+string literals OWING themselves so the loop target feeds String-keyed
+dict calls (`request_context.pop(key, None)`). The call path's
+`string_keyed_dict` flag and the `in`/`not in` membership arms read the
+receiver's dict type THROUGH an Option (`request_context.pop("scheme")`,
+`key in request_context` on `dict[str, Any] | None`), and the
+membership test unwraps an Option comparator with a loud §12.2 panic
+(CPython's `TypeError: argument of type 'NoneType' is not iterable`) —
+the call path's Option receiver for the in-test. Sweep −12 (urllib3
+1019→1011, charset_normalizer 289→285). Pinned in each shape.
+
 ## 6. Functions
 
 ### 6.1 Signatures

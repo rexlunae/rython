@@ -5810,14 +5810,27 @@ impl<'a> CodeGen for Call {
             // annotation) take String keys in py_setdefault/py_pop and
             // &String in py_get/py_get_default/py_contains; literal `"a"`
             // keys are owned at the call site so the generic impls apply.
+            // An OPTION-wrapped receiver (`request_context.pop("scheme")`
+            // where request_context is `dict[str, Any] | None` — urllib3's
+            // poolmanager: the call path unwraps the Option first, round
+            // 63) is the same dict once unwrapped — the key owning sees
+            // through the Option (round 66).
             let string_keyed_dict = matches!(
                 attr.value.as_ref(),
                 ExprType::Name(n)
-                    if matches!(
+                    if (matches!(
                         options.name_types.get(&n.id),
                         Some(crate::TypeInfo::Dict(k, _))
                             if matches!(**k, crate::TypeInfo::String)
-                    )
+                    ) || matches!(
+                        options.name_types.get(&n.id),
+                        Some(crate::TypeInfo::Option(inner))
+                            if matches!(
+                                &**inner,
+                                crate::TypeInfo::Dict(k, _)
+                                    if matches!(**k, crate::TypeInfo::String)
+                            )
+                    ))
             );
 
             // list.sort(): in-place, stable, with Python's keyword-only

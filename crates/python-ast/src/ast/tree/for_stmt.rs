@@ -211,12 +211,47 @@ impl CodeGen for For {
         // not consume its iterable (issue #109, M2: iteration over
         // inferred parameters). The reuse-clone rule's `T: Clone` bound
         // makes this compile for generic parameters.
-        let iter = crate::render_reused(
+        let mut iter = crate::render_reused(
             &self.iter,
             ctx.clone(),
             options.clone(),
             symbols.clone(),
         )?;
+        // A TUPLE-LITERAL iterable (`for key in ("headers",
+        // "_proxy_headers", "_socks_options")` — urllib3's poolmanager):
+        // Python iterates the tuple; rython's tuple value is a Rust tuple,
+        // which is not IntoIterator (E0277 x4). An all-constant tuple
+        // iterates as an array of the same element tokens — STRING
+        // literals own themselves (the loop target feeds String-keyed
+        // dict calls: `request_context.pop(key, None)`,
+        // `key in request_context`).
+        if let ExprType::Tuple(t) = &self.iter
+            && t.elts.iter().all(|e| {
+                matches!(
+                    e,
+                    ExprType::Constant(_) | ExprType::UnaryOp(_)
+                )
+            })
+        {
+            let mut elts = Vec::with_capacity(t.elts.len());
+            for elt in &t.elts {
+                let tok = elt.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                if matches!(
+                    elt,
+                    ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                ) {
+                    elts.push(quote!((#tok).to_string()));
+                } else {
+                    elts.push(tok);
+                }
+            }
+            iter = quote!([#(#elts),*]);
+        }
 
         if !has_else {
             Ok(quote! {

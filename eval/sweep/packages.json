@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 65: unbound builtin-str methods (str.title(x) -> x.title(), map(str.lower, xs) closure) (1023 -> 1019)."
+      "note": "The historical #137 corpus. Round 66: tuple-literal for-iteration, Option-dict key owning through the Option (pop/get/contains/in) (1019 -> 1011)."
     },
     {
       "name": "certifi",
@@ -19,7 +19,7 @@
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Round 59: the Option-field store with a reused name wraps Some (312 -> 299)."
+      "note": "Round 66: tuple-literal for-iteration (289 -> 285)."
     },
     {
       "name": "requests",
