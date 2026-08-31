@@ -1163,6 +1163,12 @@ pub fn update_narrowed_after_statement(
             // `if character_range is None: continue`).
             if let ExprType::Compare(cmp) = &i.test
                 && let ExprType::Name(n) = cmp.left.as_ref()
+                // A SINGLE `x is None` arm: a chained `x is None is y`
+                // parses as one Compare with TWO ops, whose truth depends
+                // on y too — narrowing x on it would be wrong (Devin
+                // review on #282).
+                && cmp.ops.len() == 1
+                && cmp.comparators.len() == 1
                 && cmp.comparators.first().is_some_and(crate::is_none_expr)
                 && matches!(
                     cmp.ops.first(),
@@ -1178,6 +1184,21 @@ pub fn update_narrowed_after_statement(
                             | crate::StatementType::Raise(_)
                     )
                 })
+                // The ELSE branch must not fall through with the name
+                // re-assigned (an `else: x = None` would reach the
+                // following statements with x possibly None — narrowing
+                // would be wrong): only an empty else (or one that also
+                // exits) keeps the invariant.
+                && (i.orelse.is_empty()
+                    || i.orelse.iter().all(|b| {
+                        matches!(
+                            &b.statement,
+                            crate::StatementType::Break
+                                | crate::StatementType::Continue
+                                | crate::StatementType::Return(_)
+                                | crate::StatementType::Raise(_)
+                        )
+                    }))
             {
                 // Only a name whose recorded type is a genuine Option
                 // narrows (its inner type comes from the Option); a
