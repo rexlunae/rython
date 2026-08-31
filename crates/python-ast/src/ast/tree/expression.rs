@@ -1133,6 +1133,47 @@ pub fn isinstance_narrowing(
 /// assign None to a narrowed name drops it from the set (a store of a
 /// possibly-None value — conservative: an `x = ...` whose value is not
 /// statically non-None removes x).
+/// Whether a statement writes (assigns to) `name` anywhere — an else
+/// branch that writes the narrowed name invalidates the is-None
+/// early-exit narrowing (the following statements can then see a fresh
+/// value); `else: pass` and unrelated statements do not.
+fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
+    match &stmt.statement {
+        crate::StatementType::Assign(a) => {
+            a.targets.iter().any(|t| expr_writes_name(t, name))
+        }
+        crate::StatementType::AugAssign(a) => expr_writes_name(&a.target, name),
+        crate::StatementType::If(i) => i
+            .body
+            .iter()
+            .chain(i.orelse.iter())
+            .any(|b| stmt_writes_name(b, name)),
+        crate::StatementType::For(f) => {
+            expr_writes_name(&f.target, name)
+                || f.body.iter().any(|b| stmt_writes_name(b, name))
+        }
+        crate::StatementType::While(w) => w.body.iter().any(|b| stmt_writes_name(b, name)),
+        crate::StatementType::With(w) => w.body.iter().any(|b| stmt_writes_name(b, name)),
+        crate::StatementType::Try(t) => t
+            .body
+            .iter()
+            .chain(t.orelse.iter())
+            .chain(t.finalbody.iter())
+            .chain(t.handlers.iter().flat_map(|h| h.body.iter()))
+            .any(|b| stmt_writes_name(b, name)),
+        _ => false,
+    }
+}
+
+fn expr_writes_name(e: &crate::ExprType, name: &str) -> bool {
+    match e {
+        crate::ExprType::Name(n) => n.id == name,
+        crate::ExprType::Tuple(t) => t.elts.iter().any(|x| expr_writes_name(x, name)),
+        crate::ExprType::Attribute(a) => expr_writes_name(&a.value, name),
+        _ => false,
+    }
+}
+
 pub fn update_narrowed_after_statement(
     stmt: &crate::Statement,
     narrowed: &mut std::collections::HashMap<String, crate::TypeInfo>,
@@ -1187,18 +1228,11 @@ pub fn update_narrowed_after_statement(
                 // The ELSE branch must not fall through with the name
                 // re-assigned (an `else: x = None` would reach the
                 // following statements with x possibly None — narrowing
-                // would be wrong): only an empty else (or one that also
-                // exits) keeps the invariant.
-                && (i.orelse.is_empty()
-                    || i.orelse.iter().all(|b| {
-                        matches!(
-                            &b.statement,
-                            crate::StatementType::Break
-                                | crate::StatementType::Continue
-                                | crate::StatementType::Return(_)
-                                | crate::StatementType::Raise(_)
-                        )
-                    }))
+                // would be wrong). Any else that does NOT write the name
+                // keeps the invariant — an empty else, `else: pass`, or
+                // unrelated statements (Devin review on #283: a harmless
+                // `else: pass` must not discard the proven non-None type).
+                && i.orelse.iter().all(|b| !stmt_writes_name(b, &n.id))
             {
                 // Only a name whose recorded type is a genuine Option
                 // narrows (its inner type comes from the Option); a
