@@ -14346,3 +14346,129 @@ fn module_tuple_unpack_emits_shared_rhs_static_and_typed_projections() {
         out
     );
 }
+
+#[test]
+fn option_typed_field_read_into_option_slot_does_not_double_wrap() {
+    // The retrospective's R2 double-wrap family: a field whose type is
+    // Option (`ca_cert_dir: str | None`) read into an Option-typed
+    // parameter (`ca_cert_dir=self.ca_cert_dir` — urllib3's
+    // _ssl_wrap_socket call sites) used to render `Some(self.ca_cert_dir
+    // ())` — Option<Option<String>>. The field read already IS the
+    // Option (the accessor returns it); the wrap must pass it through.
+    let out = compile(
+        concat!(
+            "class C:\n",
+            "    def __init__(self):\n",
+            "        self.ca_cert_dir: str | None = None\n",
+            "    def use(self):\n",
+            "        return take(self.ca_cert_dir)\n",
+            "def take(ca_cert_dir: str | None) -> str | None:\n",
+            "    return ca_cert_dir\n",
+        ),
+        "optfield.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("take(self.ca_cert_dir)") || flat.contains("take((self.ca_cert_dir).clone())"),
+        "an Option-typed field read must pass through an Option parameter unwrapped: {}",
+        out
+    );
+    assert!(
+        !flat.contains("Some(self.ca_cert_dir())"),
+        "the Option field must not be double-wrapped: {}",
+        out
+    );
+}
+
+#[test]
+fn option_typed_field_read_stored_into_option_local_does_not_double_wrap() {
+    // The store twin of the double-wrap family: `destination_scheme =
+    // parsed_url.scheme` where parsed_url is a Url instance and scheme
+    // is an Option<String> field — the store into the Option local
+    // (`destination_scheme` assigned None on another path) used to wrap
+    // `Some(parsed_url.scheme)` — Option<Option<String>>.
+    let out = compile(
+        concat!(
+            "class Url:\n",
+            "    def __init__(self):\n",
+            "        self.scheme: str | None = None\n",
+            "def f(parsed_url: Url) -> str | None:\n",
+            "    destination_scheme = parsed_url.scheme\n",
+            "    return destination_scheme\n",
+        ),
+        "optstore.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("destination_scheme=Some("),
+        "an Option-typed field store must not be double-wrapped: {}",
+        out
+    );
+}
+
+#[test]
+fn imported_factory_option_field_crosses_modules_unwrapped() {
+    // Devin review on #264: when only an IMPORTED factory exposes its
+    // result class, the defining module's symbol table must survive the
+    // resolution — `make() -> Result` in module A, `u = make()` in
+    // module B, `u.field` (Option-typed in A) into an Option slot must
+    // pass through without the double-wrap. The first version discarded
+    // the defining symbols, so A's Result never resolved in B.
+    let defs_mod = parse(
+        concat!(
+            "class Result:\n",
+            "    def __init__(self):\n",
+            "        self.field: str | None = None\n",
+            "def make() -> Result:\n",
+            "    return Result()\n",
+        ),
+        "resultmod.py",
+    )
+    .unwrap();
+    let caller = parse(
+        concat!(
+            "from resultmod import make\n",
+            "def take(field: str | None) -> str | None:\n",
+            "    return field\n",
+            "def f() -> str | None:\n",
+            "    u = make()\n",
+            "    return take(u.field)\n",
+        ),
+        "caller2.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["resultmod".to_string()],
+        std::rc::Rc::new(defs_mod),
+    );
+    defs.insert(
+        vec!["caller2".to_string()],
+        std::rc::Rc::new(caller.clone()),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
+    let out = caller
+        .to_rust(
+            CodeGenContext::Module("caller2".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("take(u.field)") || flat.contains("take((u.field).clone())"),
+        "an imported factory's Option field must pass through an Option slot unwrapped: {}",
+        out
+    );
+    assert!(
+        !flat.contains("take(Some(u.field)"),
+        "the imported factory's Option field must not double-wrap: {}",
+        out
+    );
+}

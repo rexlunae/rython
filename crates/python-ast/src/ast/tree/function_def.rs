@@ -3225,6 +3225,43 @@ pub(crate) fn is_none_expr(ann: &ExprType) -> bool {
 /// into an optional-tracked name (or an Optional parameter slot) must NOT
 /// wrap it in `Some` — double-wrapping turns an absent value into
 /// `Some(None)`, and a later `is None` check silently answers wrongly.
+/// Whether `expr`'s VALUE is already an Option — `expr_yields_option`
+/// plus a FIELD READ whose field is Option-typed (`destination_scheme =
+/// parsed_url.scheme`, `ca_cert_dir=self.ca_cert_dir` — urllib3): the
+/// field lowers to its accessor, which returns the Option, so a store or
+/// argument wrap would nest (`Some(parsed_url.scheme)` ->
+/// Option<Option<String>>, the retrospective's R2 double-wrap family —
+/// ~70 rustc errors at the round-57 sweep). Resolves the receiver's
+/// class (self fields, typed params, and factory-assigned locals like
+/// `u = parse_url(url)` all route through receiver_class) and consults
+/// the field type. The ctx is used only for `self` receivers.
+pub(crate) fn expr_yields_option_ctx(
+    expr: &ExprType,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    if expr_yields_option(expr, options, symbols) {
+        return true;
+    }
+    let ExprType::Attribute(attr) = expr else {
+        return false;
+    };
+    let Some((class, class_symbols)) =
+        crate::receiver_class(&attr.value, ctx, symbols, options)
+    else {
+        return false;
+    };
+    class
+        .infer_fields(&class_symbols, options)
+        .ok()
+        .is_some_and(|fields| {
+            fields.iter().any(|(n, t)| {
+                *n == attr.attr && matches!(t, crate::TypeInfo::Option(_))
+            })
+        })
+}
+
 pub(crate) fn expr_yields_option(
     expr: &ExprType,
     options: &PythonOptions,
@@ -3486,6 +3523,16 @@ pub(crate) fn lower_optional_value(
             crate::TypeInfo::Option(_)
         )
     {
+        return expr.clone().to_rust(ctx, options, symbols);
+    }
+    // A FIELD read whose field is Option-typed (`ca_cert_dir=
+    // self.ca_cert_dir` — urllib3's _ssl_wrap_socket call sites): the
+    // field lowers to its accessor call, which already RETURNS the
+    // Option — wrapping it in Some would nest (`Some(self.ca_cert_dir())`
+    // -> Option<Option<String>>, the retrospective's R2 double-wrap
+    // family). The ctx-aware predicate resolves the receiver's class
+    // (self fields, typed params, factory-assigned locals).
+    if crate::expr_yields_option_ctx(expr, &ctx, &options, &symbols) {
         return expr.clone().to_rust(ctx, options, symbols);
     }
     let tokens = expr.clone().to_rust(ctx, options, symbols)?;

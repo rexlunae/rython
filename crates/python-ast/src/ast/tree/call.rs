@@ -8346,14 +8346,38 @@ pub(crate) fn receiver_class(
                 ..
             }) => match call.func.as_ref() {
                 ExprType::Name(cn) => {
-                    if let Some(SymbolTableNode::FunctionDef(f)) = symbols.get(&cn.id) {
-                        // A local factory call: `c = make()` where `def
-                        // make() -> Counter` (or the unannotated
-                        // lazy-singleton getter, issue #189) — the
-                        // receiver's class comes from the function's
-                        // return.
+                    // A local factory call: `c = make()` where `def
+                    // make() -> Counter` (or the unannotated
+                    // lazy-singleton getter, issue #189) — the receiver's
+                    // class comes from the function's return. An
+                    // IMPORTED factory (`u = parse_url(url)` — urllib3,
+                    // where parse_url comes from .util) resolves through
+                    // the defining module the same way (round 58: the
+                    // double-wrap family — `Some(u.host)` nested because
+                    // the local's class was never resolved).
+                    let fdef = match symbols.get(&cn.id) {
+                        Some(SymbolTableNode::FunctionDef(f)) => {
+                            Some((f.clone(), symbols.clone()))
+                        }
+                        Some(SymbolTableNode::ImportFrom(ifm)) => {
+                            let path = ifm.resolved_module_path(options);
+                            if options.module_defs.contains_key(&path) {
+                                // KEEP the defining module's symbol
+                                // table: an imported factory's return
+                                // annotation names classes in THAT module
+                                // (Devin review on #264 — dropping them
+                                // left the field unidentified and the
+                                // double-wrap in place).
+                                crate::module_function_def(options, &path, &cn.id)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((f, f_symbols)) = fdef {
                         match f.return_class_name(options) {
-                            Some(class) => (class, symbols.clone()),
+                            Some(class) => (class, f_symbols),
                             None => return None,
                         }
                     } else {
@@ -8382,6 +8406,30 @@ pub(crate) fn receiver_class(
             let field = owner.field_class(&attr.attr, &owner_symbols, options)?;
             (field, owner_symbols)
         }
+        // A METHOD CALL as the receiver (`self.proxy().host` — urllib3's
+        // connection_from_url, where proxy() returns a ProxyConfig whose
+        // host field is Option-typed): the double-wrap family's remaining
+        // shape — resolve the method's return class through the
+        // receiver's class (round 58).
+        ExprType::Call(call) => match call.func.as_ref() {
+            ExprType::Attribute(attr) => {
+                let (owner, owner_symbols) =
+                    receiver_class(&attr.value, ctx, symbols, options)?;
+                // The callee may be a real METHOD returning a class
+                // instance, or a FIELD ACCESSOR (`self.proxy()` where
+                // proxy is a ProxyConfig-typed field — urllib3): the
+                // accessor returns the field's class.
+                let class = match owner
+                    .method_on_mro_with_options(&attr.attr, &owner_symbols, options)
+                    .and_then(|m| m.return_class_name(options))
+                {
+                    Some(class) => class,
+                    None => owner.field_class(&attr.attr, &owner_symbols, options)?,
+                };
+                (class, owner_symbols)
+            }
+            _ => return None,
+        },
         _ => return None,
     };
     receiver_class_tail(&class_name, class_symbols, options)
