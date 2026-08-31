@@ -617,6 +617,12 @@ the Option field (E0308) — because the reused-name clone arm preceded
 the Option-wrap arm. The Option arm now runs first and clones INTO the
 Some (`Some((character).clone())`). Pinned.
 
+Round 60: a literal SET (`{"utf_16", "utf_32"}`) builds as
+`HashSet<&str>`; membership against an owned String operand
+(`encoding_iana in {...}` — charset_normalizer) now resolves through a
+`PyContains<String> for HashSet<&str>` impl (the generic `PyContains<T>
+for HashSet<T>` already covered the &str spellings). Pinned.
+
 ## 6. Functions
 
 ### 6.1 Signatures
