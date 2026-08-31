@@ -6667,8 +6667,7 @@ impl<'a> CodeGen for Call {
                     ("get", [key, default]) => {
                         if let Some((class, class_symbols)) =
                             crate::receiver_class(&attr.value, &ctx, &symbols, &options)
-                            && let Some(method) =
-                                class.method_on_mro("__getitem__", &class_symbols)
+                            && class.method_on_mro("__getitem__", &class_symbols).is_some()
                             && crate::ast::tree::class_def::class_has_mapping_abc_base(
                                 &class,
                                 &class_symbols,
@@ -6683,15 +6682,6 @@ impl<'a> CodeGen for Call {
                                 options.clone(),
                                 symbols.clone(),
                                 Some(crate::TypeInfo::String),
-                            )?;
-                            let call = crate::dunder_method_call(
-                                &method,
-                                &receiver,
-                                std::slice::from_ref(&self.args[0]),
-                                false,
-                                &ctx,
-                                &options,
-                                &symbols,
                             )?;
                             // A None (or Option-typed) DEFAULT (`headers.get(
                             // name, default=None)` — urllib3's getheader)
@@ -6710,16 +6700,27 @@ impl<'a> CodeGen for Call {
                             } else {
                                 quote!(Ok(__rython_v) => __rython_v)
                             };
-                            // Python evaluates the DEFAULT before entering
-                            // get — even when the key exists — so a
-                            // side-effecting default must run exactly once,
-                            // not only in the KeyError arm (Devin review on
-                            // #267). Bind it before the match; the Ok arm
-                            // keeps the __getitem__ value.
+                            // Python evaluates RECEIVER, KEY, then DEFAULT
+                            // — each exactly once, and a failure in an
+                            // earlier expression prevents the later ones
+                            // (Devin review on #267: binding the default
+                            // first reordered the side effects, and the
+                            // bare call repeated nothing but evaluated
+                            // receiver+key after the default). Bind all
+                            // three up front, then invoke __getitem__.
+                            let key_arg = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?;
                             return Ok(quote! {
                                 {
+                                    let __rython_recv = (#receiver).clone();
+                                    let __rython_key = #key_arg;
                                     let __rython_default = #default;
-                                    match #call {
+                                    match __rython_recv.__getitem__(__rython_key) {
                                         #ok_arm,
                                         Err(__rython_e)
                                             if __rython_e.matches("KeyError") =>

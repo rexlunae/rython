@@ -14537,9 +14537,25 @@ fn mapping_get_binds_the_default_before_the_match() {
         out
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    // Python's evaluation order: RECEIVER, KEY, DEFAULT — each bound
+    // once before the __getitem__ invocation (Devin review on #267, the
+    // reorder pass: the first fix bound the default first).
+    let recv = flat.find("let__rython_recv=").unwrap_or(usize::MAX);
+    let key = flat.find("let__rython_key=").unwrap_or(usize::MAX);
+    let dflt = flat.find("let__rython_default=").unwrap_or(usize::MAX);
+    assert!(
+        recv < key && key < dflt,
+        "receiver, key, default must bind in Python's order: {}",
+        out
+    );
     assert!(
         flat.contains("Err(__rython_e)if__rython_e.matches(\"KeyError\")=>__rython_default"),
         "the KeyError arm must use the pre-bound default: {}",
+        out
+    );
+    assert!(
+        flat.contains("__rython_recv.__getitem__(__rython_key)"),
+        "the __getitem__ call must use the bound receiver and key: {}",
         out
     );
 }
