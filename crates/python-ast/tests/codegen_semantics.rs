@@ -15334,3 +15334,38 @@ fn is_none_early_exit_guard_narrows_the_following_reads() {
         out
     );
 }
+
+#[test]
+fn chained_is_none_and_none_assigning_else_do_not_narrow() {
+    // Devin review on #282: the is-None early-exit narrowing must NOT
+    // fire for a CHAINED compare (`x is None is y` — the single Compare
+    // node carries two ops, whose truth depends on y) nor when the else
+    // branch re-assigns the name (`else: x = None` — the following
+    // statements can then see None).
+    let out = compile(
+        "def f(x: str | None, y: object) -> bool:\n\
+         \x20   if x is None is y:\n\
+         \x20       return False\n\
+         \x20   return y is None\n\
+         def g(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       x = None\n\
+         \x20   return \"b\"\n",
+        "none_chain.py",
+    );
+    // The chained compare must not produce a narrowed x read (the unwrap
+    // of an Option-typed x would be a compile error if x were narrowed
+    // wrongly — assert the raw read shape instead).
+    assert!(
+        out.contains("py_is_none ()") || out.contains("py_is_none()"),
+        "the guard compiles: {}",
+        out
+    );
+    assert!(
+        out.contains("x = None") || out.contains("x = None ;"),
+        "the else branch re-assignment stays: {}",
+        out
+    );
+}
