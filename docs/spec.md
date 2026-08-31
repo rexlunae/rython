@@ -884,7 +884,17 @@ characters with the empty string printable, istitle = cased runs form
 titlecase words). Two documented §12 approximations: isdigit/isdecimal
 are ASCII-exact (Rust's std exposes no Unicode digit property, so the
 '²'-class superscripts Python accepts are False here), and isprintable
-treats format characters (Cf) as printable. Sweep −48
+treats format characters (Cf) as printable. Devin review on #281
+tightened the Unicode edges: isspace now includes the four separator
+controls U+001C..U+001F (CPython's White_Space includes them; Rust's
+is_whitespace excludes Cc), isprintable is exact through the regex
+engine's Unicode tables (`[\p{Cf}\p{Cn}\p{Zl}\p{Zp}\p{Zs}--[ ]]` —
+non-ASCII spaces, line separators, format characters, and unassigned
+code points are all False, ASCII space/tab True), and isalpha/isalnum
+use the LETTER/NUMBER categories (`^\p{L}+$` / `^[\p{L}\p{N}]+$`) —
+U+0345 (a combining mark with the Alphabetic property) is False like
+CPython. The regex-backed implementations are gated on re-regex (the
+default); the alloc tier keeps the approximation. Sweep −48
 (charset_normalizer 238→190, everything else flat). Pinned in the
 runtime against the CPython truth table.
 

@@ -4388,7 +4388,23 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
     }
     fn isalpha(&self) -> bool {
         let s = self.as_ref();
-        !s.is_empty() && s.chars().all(|c| c.is_alphabetic())
+        if s.is_empty() {
+            return false;
+        }
+        #[cfg(feature = "re-regex")]
+        {
+            // Python's isalpha is the LETTER categories (Lu Ll Lt Lm Lo),
+            // NOT the Alphabetic property: U+0345 (a combining mark with
+            // the Alphabetic property) is False in CPython. The regex
+            // engine's Unicode tables classify exactly the Letter set.
+            static LETTER: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"^\p{L}+$").unwrap());
+            return LETTER.is_match(s) && LETTER.find(s).unwrap().end() == s.len();
+        }
+        #[cfg(not(feature = "re-regex"))]
+        {
+            s.chars().all(|c| c.is_alphabetic())
+        }
     }
     fn isdigit(&self) -> bool {
         let s = self.as_ref();
@@ -4400,23 +4416,62 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
     }
     fn isalnum(&self) -> bool {
         let s = self.as_ref();
-        !s.is_empty() && s.chars().all(|c| c.is_alphabetic() || c.is_numeric())
+        if s.is_empty() {
+            return false;
+        }
+        #[cfg(feature = "re-regex")]
+        {
+            static ALNUM: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"^[\p{L}\p{N}]+$").unwrap());
+            return ALNUM.is_match(s) && ALNUM.find(s).unwrap().end() == s.len();
+        }
+        #[cfg(not(feature = "re-regex"))]
+        {
+            s.chars().all(|c| c.is_alphabetic() || c.is_numeric())
+        }
     }
     fn isspace(&self) -> bool {
         let s = self.as_ref();
-        !s.is_empty() && s.chars().all(|c| c.is_whitespace())
+        !s.is_empty()
+            && s.chars().all(|c| {
+                // Python's White_Space includes the four separator
+                // controls U+001C..U+001F (file/group/record/unit
+                // separator) — Rust's is_whitespace excludes Cc controls
+                // (verified against python3: "\u001C".isspace() is True).
+                c.is_whitespace() || matches!(c, '\u{1C}'..='\u{1F}')
+            })
     }
     fn isprintable(&self) -> bool {
-        self.as_ref().chars().all(|c| {
-            let cp = c as u32;
-            !c.is_control()
-                // Private-use planes (Co) and surrogates (Cs) — Rust's
-                // std exposes no helpers for these.
-                && !(0xE000..=0xF8FF).contains(&cp)
-                && !(0xF0000..=0xFFFFD).contains(&cp)
-                && !(0x100000..=0x10FFFD).contains(&cp)
-                && !(0xD800..=0xDFFF).contains(&cp)
-        })
+        #[cfg(feature = "re-regex")]
+        {
+            // Python's isprintable excludes every Other-category
+            // character (Cc Cf Cs Co Cn) plus the line/paragraph
+            // separators and NON-ASCII spaces (Zs): U+00A0, U+200B,
+            // U+2028, U+00AD, U+FEFF, U+2060 are all False in CPython
+            // (verified). The regex engine's tables classify them
+            // exactly (the class subtracts the ASCII space, which IS
+            // printable).
+            static NONPRINTABLE: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| {
+                    regex::Regex::new(r"[\p{Cf}\p{Cn}\p{Zl}\p{Zp}\p{Zs}--[ ]]").unwrap()
+                });
+            return !NONPRINTABLE.is_match(self.as_ref());
+        }
+        #[cfg(not(feature = "re-regex"))]
+        {
+            self.as_ref().chars().all(|c| {
+                let cp = c as u32;
+                !c.is_control()
+                    // Non-ASCII whitespace (Zs beyond the ASCII space,
+                    // Zl, Zp) is not printable in Python.
+                    && !(c.is_whitespace() && !c.is_ascii())
+                    // Private-use planes (Co) and surrogates (Cs).
+                    && !(0xE000..=0xF8FF).contains(&cp)
+                    && !(0xF0000..=0xFFFFD).contains(&cp)
+                    && !(0x100000..=0x10FFFD).contains(&cp)
+                    && !(0xD800..=0xDFFF).contains(&cp)
+            })
+        }
     }
     fn istitle(&self) -> bool {
         let mut prev_cased = false;
