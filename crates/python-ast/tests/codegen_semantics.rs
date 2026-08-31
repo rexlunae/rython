@@ -13662,7 +13662,9 @@ fn compiled_regex_statics_type_and_dispatch() {
         "import re\n\
          _TARGET_RE = re.compile(\"a+\")\n\
          def f(target: str) -> bool:\n\
-         \x20   return _TARGET_RE.match(target) is not None\n",
+         \x20   return _TARGET_RE.match(target) is not None\n\
+         def g(target: str) -> bool:\n\
+         \x20   return _TARGET_RE.fullmatch(target) is not None\n",
         "regex.py",
     );
     assert!(
@@ -13674,6 +13676,11 @@ fn compiled_regex_statics_type_and_dispatch() {
     assert!(
         out.contains("py_match") && !out.contains("r#match ("),
         "the .match() call must dispatch through py_match: {}",
+        out
+    );
+    assert!(
+        out.contains("py_fullmatch"),
+        "the .fullmatch() call must dispatch through py_fullmatch: {}",
         out
     );
 }

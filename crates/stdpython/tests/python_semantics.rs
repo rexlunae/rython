@@ -3669,4 +3669,35 @@ fn compiled_regex_matches_with_python_anchoring() {
     let re2 = Regex::new("^([^?#]*)(?:\\?([^#]*))?.*$").unwrap();
     let m = re2.py_match("path?query").unwrap();
     assert_eq!(m.groups(), vec!["path", "query"]);
+    // python3: re.fullmatch("a|ab", "ab") is a match ("ab") — the
+    // engine is CONSTRAINED to the whole string, so the alternation
+    // resolves to "ab" even though the unanchored leftmost-first match
+    // is "a". A post-hoc filter of the unanchored match would return
+    // None here.
+    let alt = Regex::new("a|ab").unwrap();
+    assert_eq!(
+        alt.py_fullmatch("ab").unwrap().groups(),
+        Vec::<String>::new(),
+        "fullmatch must let the alternation resolve to the whole-string branch"
+    );
+    assert!(alt.py_fullmatch("a").is_some(), "whole text 'a' matches");
+    assert!(alt.py_fullmatch("b").is_none(), "'b' does not match");
+    // python3: re.fullmatch("a*?", "aaa") matches "aaa" — the lazy
+    // quantifier must expand until the whole text is covered.
+    let lazy = Regex::new("a*?").unwrap();
+    assert!(
+        lazy.py_fullmatch("aaa").is_some(),
+        "a lazy quantifier must expand to cover the whole text"
+    );
+    // python3: re.fullmatch("a|ab", "AB", re.IGNORECASE) matches "AB".
+    let ci = stdpython::stdlib::re::compile("a|ab", "i").unwrap();
+    assert!(ci.py_fullmatch("AB").is_some(), "flags carry into fullmatch");
+    // Groups are preserved through the anchored engine: python3
+    // re.fullmatch("(a)|(ab)", "ab") gives group(0)="ab", group(1)=None
+    // (a non-participating group — a loud ValueError in rython's typed
+    // lowering), group(2)="ab".
+    let grp = Regex::new("(a)|(ab)").unwrap();
+    let m = grp.py_fullmatch("ab").unwrap();
+    assert_eq!(m.group(0), "ab");
+    assert_eq!(m.group(2), "ab");
 }

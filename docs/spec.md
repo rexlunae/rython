@@ -800,14 +800,39 @@ module statics lowered as boxed PyValue — `PyValue::from(regex::Regex)`
 (E0277, since the boxed union has no regex member) — and `.match(x)` /
 `.search(x)` / `.fullmatch(x)` on them emitted `.r#match(x)` on the
 boxed value (E0599). A `re.compile` static now types as the runtime's
-compiled `Regex` (`LazyLock<...::re::Regex>`, the re-exported regex
-crate type), and the method calls dispatch through a new `PyRegexOps`
-trait — `py_match` anchors at the START of the text (the regex crate's
-`captures_at(text, 0)` filtered to a match starting at 0), `py_search`
-finds the first match anywhere, `py_fullmatch` requires the whole text —
-with the existing `PyMatchOps for Option<PyMatch>` providing the
-`.groups()` surface. Sweep −11 (urllib3 988→978, idna 64→63).
-Pinned in codegen and runtime.
+compiled `Regex` — a `LazyLock<...::re::Regex>` whose type is a runtime
+WRAPPER around the regex crate's engine (the wrapper retains a second,
+whole-text-anchored engine, `\A(?:pattern)\z`, compiled at construction;
+it is `Clone` so generated `(*_TARGET_RE).clone()` keeps the wrapper,
+and `Deref` to the engine so the free functions keep working) — and the
+method calls dispatch through a new `PyRegexOps` trait (root-exported so
+generated crates can see it): `py_match` anchors at the START of the
+text (the engine's `captures_at(text, 0)` filtered to a match starting
+at 0), `py_search` finds the first match anywhere, and `py_fullmatch`
+matches against the pre-anchored whole-text engine — CONSTRAINING the
+engine rather than filtering its first unanchored result, so
+`re.fullmatch("a|ab", "ab")` matches "ab" and `re.fullmatch("a*?", "aaa")`
+consumes the whole text (a post-hoc filter wrongly rejected both; the
+free `re.fullmatch` already anchored, the compiled-pattern path did
+not — Devin review on #278). The `PyMatchOps for Option<PyMatch>`
+surface provides `.groups()`. Sweep −11 (urllib3 988→978, idna 64→63).
+Pinned in codegen and runtime (CPython-verified: alternation, lazy
+quantifier, IGNORECASE, and capture-group preservation through the
+anchored engine).
+
+Round 73 (module and item names through typed enums): module names were
+compared as raw string literals at ~50 sites across a dozen files, and
+the datetime item set was duplicated in three places. All StdModule-
+backed module checks now go through `StdModule::from_name` (including
+the `module_name_shadowed` literals, which take `StdModule::X.name()`);
+the datetime item set lives in a new `DatetimeType` enum consumed by the
+import registries, the constructor lowering, and the static typing; the
+annotation modules (`typing`, `typing_extensions`, `contextlib`, `abc`,
+`dataclasses`) have no runtime backing and stay OUT of `StdModule` (its
+`from_name` gates import lowering under the runtime crate), so they get
+their own `AnnotationModule` enum + `is_typing()` predicate. Submodule
+path segments (`numpy.linalg`, `collections.abc`) remain path structure,
+not module-name-set membership. Sweep-neutral (978/63/0/285/25).
 
 ## 6. Functions
 
