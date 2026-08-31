@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 69: property reads resolve through the base chain (997; the E0615s traded for honest mixed-Option-local stores)."
+      "note": "The historical #137 corpus. Round 70: annotated locals widen to Option when later Option-valued stores land; Option-slot args pass through (997 -> 989)."
     },
     {
       "name": "certifi",

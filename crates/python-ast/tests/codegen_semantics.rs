@@ -13608,6 +13608,50 @@ fn inherited_property_read_routes_to_the_getter() {
 }
 
 #[test]
+fn annotated_local_widened_by_a_later_option_store() {
+    // Round 70: `server_hostname: str = self.host()` then `server_hostname
+    // = self._tunnel_host` (a `str | None` field of a base class, stored
+    // inside an if): the Python local becomes None-able — the annotation
+    // was a hint, not a constraint. The class-aware seeding now recurses
+    // into nested bodies and walks the base chain for the field, so the
+    // local widens to Option; the plain String store wraps in Some, and an
+    // Option-slot ARGUMENT passes the local through unwrapped (never
+    // Some-wrapped again).
+    let out = compile(
+        "class Base:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self._tunnel_host: str | None = None\n\
+         \x20   def host(self) -> str:\n\
+         \x20       return \"h\"\n\
+         class Derived(Base):\n\
+         \x20   def consume(self, h: str | None) -> None:\n\
+         \x20       pass\n\
+         \x20   def f(self) -> None:\n\
+         \x20       server_hostname: str = self.host()\n\
+         \x20       if self._tunnel_host is not None:\n\
+         \x20           server_hostname = self._tunnel_host\n\
+         \x20       self.consume(server_hostname)\n\
+         \x20       return None\n",
+        "widened.py",
+    );
+    assert!(
+        out.contains("Some ({ (self) . host () ? })") || out.contains("Some({(self).host()?})"),
+        "the plain String store must wrap into the widened local: {}",
+        out
+    );
+    assert!(
+        out.contains("consume (server_hostname)") || out.contains("consume(server_hostname)"),
+        "the widened local must pass an Option slot unwrapped: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some (server_hostname)") && !out.contains("Some(server_hostname)"),
+        "the argument must not double-wrap: {}",
+        out
+    );
+}
+
+#[test]
 fn local_from_another_objects_option_field_is_option() {
     // Round 68: `destination_scheme = parsed_url.scheme` (a `str | None`
     // field of a factory-local object), then passed to a `str | None`

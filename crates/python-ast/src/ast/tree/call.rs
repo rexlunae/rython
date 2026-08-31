@@ -8559,7 +8559,7 @@ pub(crate) fn receiver_class(
 
 /// Resolve a class NAME to its ClassDef (and the defining module's symbol
 /// table): same-module, or an imported class through its defining module.
-fn receiver_class_tail(
+pub(crate) fn receiver_class_tail(
     class_name: &str,
     class_symbols: SymbolTableScopes,
     options: &PythonOptions,
