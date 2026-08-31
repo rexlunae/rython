@@ -394,7 +394,9 @@ impl<'a> CodeGen for Attribute {
         // unwraps (`self.url()?`). Computed before the moves below.
         let property_getter =
             crate::receiver_class_for_read(&self.value, &ctx, &symbols, &options)
-                .is_some_and(|(class, _)| class.has_property_getter(&self.attr));
+                .is_some_and(|(class, class_symbols)| {
+                    class.has_property_getter(&self.attr, &class_symbols)
+                });
         let warnings = options.definition_warnings.clone();
         // Issue #137's Option-aware access: a READ through an
         // Option-typed receiver (`self.timeout.connect_timeout` where the

@@ -756,6 +756,16 @@ grew to cover CLASS CONSTRUCTIONS — local or imported (`Url(...).url` —
 a property of the constructed class read in place), routing the property
 read to the getter. Sweep −2 more (urllib3 999→997; E0615 10→8).
 
+Round 69: a PROPERTY read whose property is defined on a BASE class
+(`self.host` from a derived method, where the base declares the
+@property) emitted the bare name — the property check looked at the
+derived class's own methods only, so the getter METHOD was an E0615
+method-not-a-field. `has_property_getter` now walks the base chain, and
+the read routes to the getter call. Sweep flat: the E0615s traded for
+the honest mixed-Option-local gaps (+6 E0308 — a local annotated `str`
+that later receives `str | None` stores; the store-type analysis does
+not yet widen annotated names). Pinned.
+
 ## 6. Functions
 
 ### 6.1 Signatures
