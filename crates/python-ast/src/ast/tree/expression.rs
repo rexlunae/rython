@@ -1165,16 +1165,20 @@ fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
             expr_writes_name(&f.target, name)
                 || f.body.iter().chain(f.orelse.iter()).any(|b| stmt_writes_name(b, name))
         }
-        crate::StatementType::While(w) => w
-            .body
-            .iter()
-            .chain(w.orelse.iter())
-            .any(|b| stmt_writes_name(b, name)),
-        crate::StatementType::If(i) => i
-            .body
-            .iter()
-            .chain(i.orelse.iter())
-            .any(|b| stmt_writes_name(b, name)),
+        crate::StatementType::While(w) => {
+            expr_walrus_binds(&w.test, name)
+                || w.body
+                    .iter()
+                    .chain(w.orelse.iter())
+                    .any(|b| stmt_writes_name(b, name))
+        }
+        crate::StatementType::If(i) => {
+            expr_walrus_binds(&i.test, name)
+                || i.body
+                    .iter()
+                    .chain(i.orelse.iter())
+                    .any(|b| stmt_writes_name(b, name))
+        }
         crate::StatementType::With(w) => {
             w.items.iter().any(|item| {
                 item.optional_vars
@@ -1191,13 +1195,52 @@ fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
                     || expr_walrus_binds(&item.context_expr, name)
             }) || w.body.iter().any(|b| stmt_writes_name(b, name))
         }
-        crate::StatementType::Try(t) => t
-            .body
-            .iter()
-            .chain(t.orelse.iter())
-            .chain(t.finalbody.iter())
-            .chain(t.handlers.iter().flat_map(|h| h.body.iter()))
-            .any(|b| stmt_writes_name(b, name)),
+        crate::StatementType::Try(t) => {
+            let handler_binds = t.handlers.iter().any(|h| {
+                h.name.as_deref() == Some(name)
+                    || h.exception_type
+                        .as_ref()
+                        .is_some_and(|e| expr_walrus_binds(e, name))
+                    || h.body.iter().any(|b| stmt_writes_name(b, name))
+            });
+            handler_binds
+                || t.body
+                    .iter()
+                    .chain(t.orelse.iter())
+                    .chain(t.finalbody.iter())
+                    .any(|b| stmt_writes_name(b, name))
+        }
+        crate::StatementType::Import(im) => im.names.iter().any(|a| {
+            a.asname.as_deref() == Some(name) || a.name == name
+        }),
+        crate::StatementType::ImportFrom(im) => im.names.iter().any(|a| {
+            a.asname.as_deref() == Some(name) || a.name == name
+        }),
+        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+            f.name == name
+                || f.decorator_list
+                    .iter()
+                    .any(|d| expr_walrus_binds(d, name))
+        }
+        crate::StatementType::ClassDef(c) => {
+            c.name == name
+                || c.decorator_list
+                    .iter()
+                    .any(|d| expr_walrus_binds(d, name))
+        }
+        crate::StatementType::Assert { test, msg } => {
+            expr_walrus_binds(test, name)
+                || msg.as_deref().is_some_and(|m| expr_walrus_binds(m, name))
+        }
+        crate::StatementType::Return(r) => r
+            .as_ref()
+            .is_some_and(|e| expr_walrus_binds(&e.value, name)),
+        crate::StatementType::Raise(r) => {
+            r.exc.as_ref().is_some_and(|e| expr_walrus_binds(e, name))
+                || r.cause
+                    .as_ref()
+                    .is_some_and(|e| expr_walrus_binds(e, name))
+        }
         _ => false,
     }
 }
@@ -1281,16 +1324,17 @@ fn expr_walrus_binds(e: &crate::ExprType, name: &str) -> bool {
         crate::ExprType::ListComp(lc) => {
             expr_walrus_binds(&lc.elt, name)
                 || lc.generators.iter().any(|g| {
-                    expr_writes_name(&g.target, name)
-                        || expr_walrus_binds(&g.iter, name)
+                    // The comp's loop TARGET is scoped to the
+                    // comprehension in Python — it does NOT rebind the
+                    // enclosing function's name (Devin review on #285).
+                    expr_walrus_binds(&g.iter, name)
                         || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
                 })
         }
         crate::ExprType::SetComp(sc) => {
             expr_walrus_binds(&sc.elt, name)
                 || sc.generators.iter().any(|g| {
-                    expr_writes_name(&g.target, name)
-                        || expr_walrus_binds(&g.iter, name)
+                    expr_walrus_binds(&g.iter, name)
                         || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
                 })
         }
@@ -1298,16 +1342,14 @@ fn expr_walrus_binds(e: &crate::ExprType, name: &str) -> bool {
             expr_walrus_binds(&dc.value, name)
                 || expr_walrus_binds(&dc.key, name)
                 || dc.generators.iter().any(|g| {
-                    expr_writes_name(&g.target, name)
-                        || expr_walrus_binds(&g.iter, name)
+                    expr_walrus_binds(&g.iter, name)
                         || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
                 })
         }
         crate::ExprType::GeneratorExp(g) => {
             expr_walrus_binds(&g.elt, name)
                 || g.generators.iter().any(|comp| {
-                    expr_writes_name(&comp.target, name)
-                        || expr_walrus_binds(&comp.iter, name)
+                    expr_walrus_binds(&comp.iter, name)
                         || comp.ifs.iter().any(|i| expr_walrus_binds(i, name))
                 })
         }

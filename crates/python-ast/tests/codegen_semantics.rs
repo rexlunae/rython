@@ -15417,4 +15417,35 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "an attribute store in the else must keep the narrowing: {}",
         out4
     );
+    // Devin review on #285: a walrus in an if/while TEST of the else
+    // rebinds; a comprehension TARGET does not rebind the outer scope.
+    let out5 = compile(
+        "def t(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       if (x := None):\n\
+         \x20           pass\n\
+         \x20   return \"b\"\n",
+        "none_ifwalrus.py",
+    );
+    assert!(
+        !out5.contains("clone () . unwrap ()") && !out5.contains("clone().unwrap()"),
+        "a walrus in the else's if-test must discard the narrowing: {}",
+        out5
+    );
+    let out6 = compile(
+        "def c(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       y = [z for z in (x, \"b\")]\n\
+         \x20   return x\n",
+        "none_comp.py",
+    );
+    assert!(
+        out6.contains("clone () . unwrap ()") || out6.contains("clone().unwrap()"),
+        "a comprehension target must keep the outer narrowing: {}",
+        out6
+    );
 }
