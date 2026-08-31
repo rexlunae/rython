@@ -773,9 +773,25 @@ impl<'a> CodeGen for Assign {
                         }
                     } else if !value_is_none
                         && !value_yields_option
-                        && options.optional_names.contains(&name.id)
+                        && (options.optional_names.contains(&name.id)
+                            || options
+                                .name_types
+                                .get(&name.id)
+                                .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_))))
                     {
-                        quote!(#target_code = Some(#value);)
+                        // A plain value into an OPTION-typed local
+                        // (optional_names, or name_types widened by an
+                        // Option-valued store — `server_hostname: str =
+                        // self.host` then `server_hostname =
+                        // self._tunnel_host`: the Python local became
+                        // None-able) wraps in Some. A str LITERAL owns
+                        // itself at the wrap (`Some("lit".to_string())` —
+                        // the Option<String> slot, never Option<&str>).
+                        if value_is_str_literal {
+                            quote!(#target_code = Some((#value).to_string());)
+                        } else {
+                            quote!(#target_code = Some(#value);)
+                        }
                     } else if value_is_str_literal
                         && options.owned_str_literals.contains(&name.id)
                     {

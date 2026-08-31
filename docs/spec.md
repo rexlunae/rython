@@ -766,6 +766,22 @@ the honest mixed-Option-local gaps (+6 E0308 — a local annotated `str`
 that later receives `str | None` stores; the store-type analysis does
 not yet widen annotated names). Pinned.
 
+Round 70 (the widened-local family that round 69 exposed): a local
+annotated `str` that later receives `str | None` stores (`server_hostname:
+str = self.host` then `server_hostname = self._tunnel_host` — the Python
+value becomes None-able; the annotation was a hint, not a constraint).
+The class-aware seeding now RECURSES into nested bodies (the Option
+stores sit inside `if` blocks), walks the base chain for the field (the
+store may be a base's field), and WIDENS a plain-typed name when an
+Option-valued field store lands. The store path wraps a plain value into
+the widened local (`Some(self.host()?)`, a str literal owning itself),
+`expr_yields_option_ctx` recognizes a self-field ACCESSOR CALL (the
+getter of an Option field) and reads through the base chain, and the
+Option-slot ARGUMENT adaptation consults name_types directly (an
+annotation in local_types would otherwise shadow the widened type and
+re-wrap). Sweep −8 (urllib3 997→989; the round-69 exposure −6, plus
+double-wrap fixes −2). Pinned.
+
 ## 6. Functions
 
 ### 6.1 Signatures

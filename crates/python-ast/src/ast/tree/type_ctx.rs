@@ -1501,100 +1501,154 @@ pub fn analyze_function_types_with_class(
     if let Some(class_name) = self_class
         && let (Some(options), Some(symbols)) = (options, symbols)
         && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
-        && let Ok(fields) = class.infer_fields(symbols, options)
+        && let Ok(_) = class.infer_fields(symbols, options)
     {
-        for stmt in body {
-            let crate::StatementType::Assign(a) = &stmt.statement else {
-                continue;
-            };
-            let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
-                continue;
-            };
-            if info.name_types.contains_key(&n.id) || info.optional_names.contains(&n.id) {
-                continue;
-            }
-            match &a.value {
-                // `request_context = self._merge_pool_kwargs(pool_kwargs)`
-                // — a local assigned from a SELF-METHOD CALL whose callee
-                // returns a dict (`-> dict[str, typing.Any]` — urllib3's
-                // PoolManager): the local is the callee's return type.
-                // NARROW: only Dict-returning callees seed the local —
-                // typing every self-method return was a wash in round 44
-                // (conn locals exposed close-on-Option and
-                // From<Option<String>> cascades), but a Dict-typed local
-                // is exactly what the subscript-store lowering needs
-                // (string_keyed/pyvalue_valued ownership, round 46) and
-                // only the py_set_index/key handling changes for it.
-                crate::ExprType::Call(call) => {
-                    let crate::ExprType::Attribute(attr) = call.func.as_ref() else {
-                        continue;
-                    };
-                    if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self")
-                    {
-                        continue;
-                    }
-                    if let Some(method) = class.method_on_mro(&attr.attr, symbols)
-                        && let Some(ann) = method.returns.as_deref()
-                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
-                        && matches!(t, crate::TypeInfo::Dict(_, _))
-                    {
-                        info.name_types.insert(n.id.clone(), t);
-                    }
+        // Recurse into nested bodies: the Option-widening stores sit
+        // inside `if`/`with` blocks (`server_hostname = self._tunnel_host`
+        // inside `if self._tunnel_host is not None:`).
+        fn walk_stmts(
+            stmts: &[crate::Statement],
+            class: &crate::ClassDef,
+            info: &mut FunctionTypeInfo,
+            options: &PythonOptions,
+            symbols: &SymbolTableScopes,
+        ) {
+            for stmt in stmts {
+                let inner: Option<&[crate::Statement]> = match &stmt.statement {
+                    crate::StatementType::If(s) => Some(s.body.as_slice()),
+                    crate::StatementType::While(s) => Some(s.body.as_slice()),
+                    crate::StatementType::For(s) => Some(s.body.as_slice()),
+                    crate::StatementType::With(s) => Some(s.body.as_slice()),
+                    crate::StatementType::Try(s) => Some(s.body.as_slice()),
+                    _ => None,
+                };
+                if let Some(inner) = inner {
+                    walk_stmts(inner, class, info, options, symbols);
                 }
-                crate::ExprType::Attribute(attr) => {
-                    // A SELF-field read (`resp_options = self._response_options`
-                    // — the enclosing class's own field table).
-                    let self_read = matches!(
-                        attr.value.as_ref(),
-                        crate::ExprType::Name(r) if r.id == "self"
-                    );
-                    let field_ty = if self_read {
-                        fields
-                            .iter()
-                            .find(|(name, _)| *name == attr.attr)
-                            .map(|(_, ty)| ty.clone())
-                    } else if let Some((owner, owner_symbols)) =
-                        crate::receiver_class_for_read(
-                            &attr.value,
-                            &crate::CodeGenContext::Module(String::new()),
-                            symbols,
-                            options,
-                        )
-                    {
-                        eprintln!("SEED-DEBUG: {} <- {}.{} owner={}", n.id, format!("{:?}", attr.value), attr.attr, owner.name);
-                        // A field of ANOTHER object whose class resolves
-                        // (`destination_scheme = parsed_url.scheme` where
-                        // parsed_url is a factory local of Url — the same
-                        // Option seeding as the self-field arm; without it
-                        // the local stays untyped and an Option-slot
-                        // argument double-wraps `Some(destination_scheme)`).
-                        owner
-                            .infer_fields(&owner_symbols, options)
-                            .ok()
-                            .and_then(|fs| {
-                                fs.iter()
-                                    .find(|(name, _)| *name == attr.attr)
-                                    .map(|(_, ty)| ty.clone())
-                            })
-                    } else {
-                        None
-                    };
-                    if let Some(ty) = field_ty
-                        && matches!(ty, crate::TypeInfo::Option(_))
-                    {
-                        // name_types only — the local IS the Option (its
-                        // stores are already Option and must not Some-wrap
-                        // again), and reads unwrap through the Option
-                        // receiver lowering.
-                        info.name_types.insert(
-                            n.id.clone(),
-                            crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                let crate::StatementType::Assign(a) = &stmt.statement else {
+                    continue;
+                };
+                let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+                    continue;
+                };
+                if info.optional_names.contains(&n.id) {
+                    continue;
+                }
+                // A name the plain analysis already typed as OPTION stays
+                // as it is; a PLAIN-typed name may still be WIDENED by an
+                // Option-typed field store below (`server_hostname: str =
+                // self.host` then `server_hostname = self._tunnel_host` —
+                // the Python value becomes None-able; the annotation was a
+                // hint, not a constraint).
+                let already_option = matches!(
+                    info.name_types.get(&n.id),
+                    Some(crate::TypeInfo::Option(_))
+                );
+                match &a.value {
+                    // `request_context = self._merge_pool_kwargs(
+                    // pool_kwargs)` — a local assigned from a SELF-METHOD
+                    // CALL whose callee returns a dict (`-> dict[str,
+                    // typing.Any]` — the poolmanager): the local is the
+                    // callee's return type. NARROW: only Dict-returning
+                    // callees seed the local — typing every self-method
+                    // return was a wash in round 44 (conn locals exposed
+                    // close-on-Option and From<Option<String>> cascades),
+                    // but a Dict-typed local is exactly what the
+                    // subscript-store lowering needs (string_keyed/
+                    // pyvalue_valued ownership, round 46) and only the
+                    // py_set_index/key handling changes for it.
+                    crate::ExprType::Call(call) => {
+                        if info.name_types.contains_key(&n.id) {
+                            continue;
+                        }
+                        let crate::ExprType::Attribute(attr) = call.func.as_ref() else {
+                            continue;
+                        };
+                        if !matches!(
+                            attr.value.as_ref(),
+                            crate::ExprType::Name(r) if r.id == "self"
+                        ) {
+                            continue;
+                        }
+                        if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                            && let Some(ann) = method.returns.as_deref()
+                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                            && matches!(t, crate::TypeInfo::Dict(_, _))
+                        {
+                            info.name_types.insert(n.id.clone(), t);
+                        }
+                    }
+                    crate::ExprType::Attribute(attr) => {
+                        // A SELF-field read (`resp_options =
+                        // self._response_options` — the enclosing class's
+                        // own field table). The field may live on a BASE
+                        // whose struct is embedded (`self._tunnel_host` in
+                        // a derived method): walk the chain.
+                        let self_read = matches!(
+                            attr.value.as_ref(),
+                            crate::ExprType::Name(r) if r.id == "self"
                         );
+                        let field_ty = if self_read {
+                            class
+                                .base_chain(symbols)
+                                .iter()
+                                .find_map(|c| {
+                                    c.infer_fields(symbols, options).ok().and_then(|fs| {
+                                        fs.iter()
+                                            .find(|(name, _)| *name == attr.attr)
+                                            .map(|(_, ty)| ty.clone())
+                                    })
+                                })
+                        } else if let Some((owner, owner_symbols)) =
+                            crate::receiver_class_for_read(
+                                &attr.value,
+                                &crate::CodeGenContext::Module(String::new()),
+                                symbols,
+                                options,
+                            )
+                        {
+                            // A field of ANOTHER object whose class
+                            // resolves (`destination_scheme =
+                            // parsed_url.scheme` where parsed_url is a
+                            // factory local — the same Option seeding as
+                            // the self-field arm; without it the local
+                            // stays untyped and an Option-slot argument
+                            // double-wraps `Some(destination_scheme)`).
+                            owner
+                                .infer_fields(&owner_symbols, options)
+                                .ok()
+                                .and_then(|fs| {
+                                    fs.iter()
+                                        .find(|(name, _)| *name == attr.attr)
+                                        .map(|(_, ty)| ty.clone())
+                                })
+                        } else {
+                            None
+                        };
+                        // An OPTION field widens the local — including a
+                        // name the plain analysis typed PLAIN
+                        // (`server_hostname: str = self.host` then
+                        // `server_hostname = self._tunnel_host`: the Python
+                        // value becomes None-able — the annotation was a
+                        // hint). name_types only — the local IS the Option
+                        // (its stores are already Option and must not
+                        // Some-wrap again), and reads unwrap through the
+                        // Option receiver lowering.
+                        if let Some(ty) = field_ty
+                            && matches!(ty, crate::TypeInfo::Option(_))
+                            && !already_option
+                        {
+                            info.name_types.insert(
+                                n.id.clone(),
+                                crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                            );
+                        }
                     }
+                    _ => {}
                 }
-                _ => continue,
             }
         }
+        walk_stmts(body, class, &mut info, options, symbols);
     }
     info
 }

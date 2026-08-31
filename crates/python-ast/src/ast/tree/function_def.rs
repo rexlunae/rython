@@ -3244,22 +3244,76 @@ pub(crate) fn expr_yields_option_ctx(
     if expr_yields_option(expr, options, symbols) {
         return true;
     }
+    // Whether a class (or its BASE chain) has an Option-typed field
+    // `name` — a `self.<field>` read or accessor call of an inherited
+    // field (`self._tunnel_host` in a derived method whose struct embeds
+    // the defining base) yields the Option either way.
+    let class_field_is_option =
+        |name: &str, class: &crate::ClassDef, class_symbols: &SymbolTableScopes| -> bool {
+            class.base_chain(class_symbols).iter().any(|c| {
+                c.infer_fields(class_symbols, options)
+                    .ok()
+                    .is_some_and(|fields| {
+                        fields.iter().any(|(n, t)| {
+                            *n == name && matches!(t, crate::TypeInfo::Option(_))
+                        })
+                    })
+            })
+        };
+    // A SELF-FIELD ACCESSOR CALL (`self._tunnel_host()` — the field's
+    // generated getter): an Option-typed field's accessor returns the
+    // Option, so the call yields one — a store into an Option local must
+    // pass it through, never Some-wrap (`server_hostname =
+    // self._tunnel_host` where the local was widened to Option — round
+    // 70). The accessor's name is the field's.
+    if let ExprType::Call(call) = expr
+        && let ExprType::Attribute(attr) = call.func.as_ref()
+        && let Some((class, class_symbols)) =
+            crate::receiver_class(&attr.value, ctx, symbols, options)
+        && class_field_is_option(&attr.attr, &class, &class_symbols)
+    {
+        return true;
+    }
     let ExprType::Attribute(attr) = expr else {
         return false;
     };
     let Some((class, class_symbols)) =
         crate::receiver_class(&attr.value, ctx, symbols, options)
+        .or_else(|| {
+            // `self.proxy().host` — the receiver is a METHOD CALL whose
+            // return annotation is `T | None` (an Option-typed property
+            // accessor, `@property def proxy(self) -> Proxy | None`): the
+            // receiver is the Option of T, and the field read is T's
+            // field. Resolve the inner class through the method's
+            // annotation.
+            if let ExprType::Call(call) = attr.value.as_ref()
+                && let ExprType::Attribute(fn_attr) = call.func.as_ref()
+                && matches!(fn_attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+                && let Some(class_name) = ctx.enclosing_class_name()
+                && let Some(crate::SymbolTableNode::ClassDef(owner)) = symbols.get(class_name)
+                && let Some(method) = owner.method_on_mro(&fn_attr.attr, symbols)
+                && let Some(ann) = method.returns.as_deref()
+                && crate::is_optional_annotation(ann)
+                && let Some(inner) = match ann {
+                    ExprType::BinOp(op) if crate::is_none_expr(&op.right) => {
+                        Some(op.left.as_ref())
+                    }
+                    ExprType::BinOp(op) if crate::is_none_expr(&op.left) => {
+                        Some(op.right.as_ref())
+                    }
+                    _ => None,
+                }
+                && let ExprType::Name(inner_name) = inner
+            {
+                crate::receiver_class_tail(&inner_name.id, symbols.clone(), options)
+            } else {
+                None
+            }
+        })
     else {
         return false;
     };
-    class
-        .infer_fields(&class_symbols, options)
-        .ok()
-        .is_some_and(|fields| {
-            fields.iter().any(|(n, t)| {
-                *n == attr.attr && matches!(t, crate::TypeInfo::Option(_))
-            })
-        })
+    class_field_is_option(&attr.attr, &class, &class_symbols)
 }
 
 pub(crate) fn expr_yields_option(
@@ -3524,10 +3578,17 @@ pub(crate) fn lower_optional_value(
     // tracks None-assigned names and Optional params in optional_names,
     // but a local assigned from an Option-returning CALL only lands in
     // name_types (round 47) — wrapping it in Some would nest.
-    if let ExprType::Name(_) = expr
+    // A NAME whose recorded type is itself an Option (`host =
+    // _normalize_host(...)` where the callee returns `str | None` —
+    // parse_url; `server_hostname: str = self.host` widened by a later
+    // Option-valued store) passes through an Option slot unwrapped: the
+    // value already IS the Option. Consult name_types DIRECTLY — a name
+    // with an annotation in local_types would otherwise report its
+    // annotated (plain) type and wrap again.
+    if let ExprType::Name(n) = expr
         && matches!(
-            crate::infer_type(expr, &options, &symbols),
-            crate::TypeInfo::Option(_)
+            options.name_types.get(&n.id),
+            Some(crate::TypeInfo::Option(_))
         )
     {
         return expr.clone().to_rust(ctx, options, symbols);
