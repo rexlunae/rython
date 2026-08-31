@@ -3636,3 +3636,19 @@ fn literal_list_py_contains_boxed_str() {
     assert!(!l.py_contains(&PyValue::from("L")), "an absent Str does not");
     assert!(!l.py_contains(&PyValue::from(5)), "a non-Str boxed value never matches");
 }
+
+#[test]
+fn py_boxed_str_ops_dispatch_on_the_runtime_member() {
+    // python3: d = {"scheme": "HTTPS"}; d["scheme"].lower() == "https" —
+    // the boxed member's str method dispatches on the runtime type.
+    let boxed = PyValue::Str("HTTPS".to_string());
+    assert_eq!(boxed.py_boxed_lower(), "https");
+    assert_eq!(boxed.py_boxed_upper(), "HTTPS");
+    assert_eq!(PyValue::Str("  x  ".to_string()).py_boxed_strip(), "x");
+    // python3: d = {"k": 1}; d["k"].lower() raises AttributeError:
+    // 'int' object has no attribute 'lower' — the loud §12.2 panic.
+    let caught = std::panic::catch_unwind(|| {
+        let _ = PyValue::Int(5).py_boxed_lower();
+    });
+    assert!(caught.is_err(), "non-str members must panic loudly");
+}

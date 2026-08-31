@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 63: Option-receiver subscript stores unwrap + own (1033 -> 1029)."
+      "note": "The historical #137 corpus. Round 64: boxed-PyValue str-method dispatch (lower/upper/strip) + Option-through subscript typing (1029 -> 1023)."
     },
     {
       "name": "certifi",

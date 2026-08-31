@@ -5725,6 +5725,30 @@ impl<'a> CodeGen for Call {
                 receiver
             };
 
+            // A str method on a receiver that POSITIVELY infers the boxed
+            // PyValue (`context["scheme"].lower()` where context is
+            // `dict[str, Any]` — urllib3's poolmanager: the subscript read
+            // yields PyValue): dispatch on the runtime member — Str ->
+            // the operation; anything else -> CPython's AttributeError
+            // panic (§12.2). The blanket PyStrOps needs AsRef<str>, which
+            // PyValue does not satisfy (E0599 "trait bounds not
+            // satisfied"). Only a POSITIVE PyValue inference qualifies —
+            // PyObject (unknown) keeps the plain method, loud in rustc if
+            // the member is boxed.
+            if matches!(attr.attr.as_str(), "lower" | "upper" | "strip")
+                && matches!(
+                    crate::infer_type(&attr.value, &options, &symbols),
+                    crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
+                )
+            {
+                let m = match attr.attr.as_str() {
+                    "lower" => quote!(py_boxed_lower),
+                    "upper" => quote!(py_boxed_upper),
+                    _ => quote!(py_boxed_strip),
+                };
+                return Ok(quote!((#receiver).#m()));
+            }
+
             // String-keyed dicts (from a literal or a `dict[str, V]`
             // annotation) take String keys in py_setdefault/py_pop and
             // &String in py_get/py_get_default/py_contains; literal `"a"`

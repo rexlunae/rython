@@ -12928,10 +12928,17 @@ fn a_concrete_class_global_read_is_never_dropped() {
 fn a_protocol_method_on_a_boxed_name_is_not_dropped() {
     // `v.lower()` on a boxed value is real code the runtime forwards —
     // dropping its callee would emit `PyValue::None_(...)` (E0618).
+    // Round 64: the boxed str method now dispatches on the runtime
+    // member (py_boxed_lower) instead of the plain PyStrOps form.
     let out = compile(ROUND26, "r26c.py");
     assert!(
-        out.contains("v . lower ()"),
-        "a protocol method must survive: {}",
+        out.contains("py_boxed_lower"),
+        "a protocol method must survive as the boxed dispatch: {}",
+        out
+    );
+    assert!(
+        !out.contains("PyValue :: None_ (") && !out.contains("PyValue::None_("),
+        "the callee must not be dropped: {}",
         out
     );
 }
@@ -13298,6 +13305,42 @@ fn option_receiver_subscript_store_unwraps_and_owns() {
         out2.contains("(\"blocksize\") . to_string ()")
             || out2.contains("(\"blocksize\").to_string()"),
         "the boxed-valued dict's index must be owned: {}",
+        out2
+    );
+}
+
+#[test]
+fn boxed_subscript_str_method_dispatches_on_the_member() {
+    // Round 64: `context["scheme"].lower()` where context is `dict[str,
+    // Any]` (urllib3's poolmanager) — the subscript read yields the
+    // boxed PyValue, whose str method dispatches on the runtime member
+    // (Str -> lowercase; anything else -> CPython's AttributeError
+    // panic). The blanket PyStrOps needs AsRef<str>, which PyValue does
+    // not satisfy (E0599). The dispatch also fires through an
+    // OPTION-wrapped receiver (`dict[str, Any] | None` — the subscript's
+    // infer_type sees the value type through the Option).
+    let out = compile(
+        "def f(ctx: dict[str, object]) -> str:\n    return ctx[\"scheme\"].lower()\n",
+        "boxedlower.py",
+    );
+    assert!(
+        out.contains("py_boxed_lower"),
+        "the boxed receiver's lower must dispatch at runtime: {}",
+        out
+    );
+    assert!(
+        !out.contains("py_index (\"scheme\") ? . lower ()"),
+        "must not emit the plain PyStrOps lower: {}",
+        out
+    );
+
+    let out2 = compile(
+        "def g(ctx: dict[str, object] | None) -> str:\n    return ctx[\"scheme\"].lower()\n",
+        "boxedlower2.py",
+    );
+    assert!(
+        out2.contains("py_boxed_lower"),
+        "the Option-wrapped boxed receiver must dispatch too: {}",
         out2
     );
 }
