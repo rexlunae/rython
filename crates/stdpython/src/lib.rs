@@ -4118,6 +4118,35 @@ pub trait PyStrOps {
     fn title(&self) -> String;
     /// str.zfill(width): zero-pad to width CHARACTERS, after any sign.
     fn zfill(&self, width: i64) -> String;
+    /// Python str.isupper(): at least one cased character and no
+    /// lowercase characters (verified against python3).
+    fn isupper(&self) -> bool;
+    /// Python str.islower(): at least one cased character and no
+    /// uppercase characters.
+    fn islower(&self) -> bool;
+    /// Python str.isalpha(): non-empty and every character alphabetic.
+    fn isalpha(&self) -> bool;
+    /// Python str.isdigit(): non-empty and every character a decimal
+    /// digit. ASCII-exact (Python also classifies the Unicode digit
+    /// property — superscripts like '²' — which Rust's std does not
+    /// expose; documented divergence in §12).
+    fn isdigit(&self) -> bool;
+    /// Python str.isdecimal(): non-empty and every character a decimal
+    /// digit (ASCII-exact, same §12 note as isdigit).
+    fn isdecimal(&self) -> bool;
+    /// Python str.isalnum(): non-empty and every character
+    /// alphanumeric.
+    fn isalnum(&self) -> bool;
+    /// Python str.isspace(): non-empty and every character whitespace.
+    fn isspace(&self) -> bool;
+    /// Python str.isprintable(): every character printable (the empty
+    /// string is printable). Approximate for format characters (Cf —
+    /// Rust's std does not expose the category; documented in §12).
+    fn isprintable(&self) -> bool;
+    /// Python str.istitle(): cased characters form titlecase words
+    /// (the first cased character after uncased is uppercase, the rest
+    /// lowercase) and at least one is cased.
+    fn istitle(&self) -> bool;
     /// str.ljust / str.rjust with a fill character, width in CHARACTERS.
     /// The fill must be exactly one character; Python raises TypeError
     /// otherwise (silently using a prefix would diverge).
@@ -4336,6 +4365,137 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         } else {
             format!("{}{}", zeros, self.as_ref())
         }
+    }
+    fn isupper(&self) -> bool {
+        let mut has_cased = false;
+        for c in self.as_ref().chars() {
+            if c.is_lowercase() {
+                return false;
+            }
+            has_cased |= c.is_uppercase();
+        }
+        has_cased
+    }
+    fn islower(&self) -> bool {
+        let mut has_cased = false;
+        for c in self.as_ref().chars() {
+            if c.is_uppercase() {
+                return false;
+            }
+            has_cased |= c.is_lowercase();
+        }
+        has_cased
+    }
+    fn isalpha(&self) -> bool {
+        let s = self.as_ref();
+        if s.is_empty() {
+            return false;
+        }
+        #[cfg(feature = "re-regex")]
+        {
+            // Python's isalpha is the LETTER categories (Lu Ll Lt Lm Lo),
+            // NOT the Alphabetic property: U+0345 (a combining mark with
+            // the Alphabetic property) is False in CPython. The regex
+            // engine's Unicode tables classify exactly the Letter set.
+            static LETTER: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"^\p{L}+$").unwrap());
+            return LETTER.is_match(s) && LETTER.find(s).unwrap().end() == s.len();
+        }
+        #[cfg(not(feature = "re-regex"))]
+        {
+            s.chars().all(|c| c.is_alphabetic())
+        }
+    }
+    fn isdigit(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+    }
+    fn isdecimal(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+    }
+    fn isalnum(&self) -> bool {
+        let s = self.as_ref();
+        if s.is_empty() {
+            return false;
+        }
+        #[cfg(feature = "re-regex")]
+        {
+            static ALNUM: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"^[\p{L}\p{N}]+$").unwrap());
+            return ALNUM.is_match(s) && ALNUM.find(s).unwrap().end() == s.len();
+        }
+        #[cfg(not(feature = "re-regex"))]
+        {
+            s.chars().all(|c| c.is_alphabetic() || c.is_numeric())
+        }
+    }
+    fn isspace(&self) -> bool {
+        let s = self.as_ref();
+        !s.is_empty()
+            && s.chars().all(|c| {
+                // Python's White_Space includes the four separator
+                // controls U+001C..U+001F (file/group/record/unit
+                // separator) — Rust's is_whitespace excludes Cc controls
+                // (verified against python3: "\u001C".isspace() is True).
+                c.is_whitespace() || matches!(c, '\u{1C}'..='\u{1F}')
+            })
+    }
+    fn isprintable(&self) -> bool {
+        #[cfg(feature = "re-regex")]
+        {
+            // Python's isprintable excludes every Other-category
+            // character (Cc Cf Cs Co Cn) plus the line/paragraph
+            // separators and NON-ASCII spaces (Zs): U+00A0, U+200B,
+            // U+2028, U+00AD, U+FEFF, U+2060 are all False in CPython
+            // (verified). The regex engine's tables classify them
+            // exactly (the class subtracts the ASCII space, which IS
+            // printable).
+            static NONPRINTABLE: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| {
+                    // \p{C} is ALL of Other (Cc Cf Cs Co Cn) — controls,
+                    // format, surrogates, private use, unassigned —
+                    // exactly Python's exclusion; Zl/Zp/Zs add the
+                    // separators Python also excludes (minus the ASCII
+                    // space, which IS printable).
+                    regex::Regex::new(r"[\p{C}\p{Zl}\p{Zp}\p{Zs}--[ ]]").unwrap()
+                });
+            return !NONPRINTABLE.is_match(self.as_ref());
+        }
+        #[cfg(not(feature = "re-regex"))]
+        {
+            self.as_ref().chars().all(|c| {
+                let cp = c as u32;
+                !c.is_control()
+                    // Non-ASCII whitespace (Zs beyond the ASCII space,
+                    // Zl, Zp) is not printable in Python.
+                    && !(c.is_whitespace() && !c.is_ascii())
+                    // Private-use planes (Co) and surrogates (Cs).
+                    && !(0xE000..=0xF8FF).contains(&cp)
+                    && !(0xF0000..=0xFFFFD).contains(&cp)
+                    && !(0x100000..=0x10FFFD).contains(&cp)
+                    && !(0xD800..=0xDFFF).contains(&cp)
+            })
+        }
+    }
+    fn istitle(&self) -> bool {
+        let mut prev_cased = false;
+        let mut has_cased = false;
+        for c in self.as_ref().chars() {
+            let cased = c.is_uppercase() || c.is_lowercase();
+            if cased {
+                has_cased = true;
+                if !prev_cased {
+                    if !c.is_uppercase() {
+                        return false;
+                    }
+                } else if c.is_uppercase() {
+                    return false;
+                }
+            }
+            prev_cased = cased;
+        }
+        has_cased
     }
     fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;

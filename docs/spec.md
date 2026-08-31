@@ -873,6 +873,31 @@ fixed; the lru_cache hit/miss paths now type-check for Option keys.
 Sweep −47 (charset_normalizer 285→238, everything else flat). Pinned in
 codegen (imported-Option store, lru_cache Option key).
 
+Round 76 (the str.is* family): charset_normalizer's biggest residual
+was 48 E0599s — str.isupper/isalpha/isdigit/isspace/islower/
+isprintable (plus isdecimal/isalnum/istitle) had NO runtime
+counterpart. The PyStrOps trait gains the family with Python's exact
+semantics (verified against python3: isupper = at least one cased
+character and no lowercase, isalpha = non-empty all alphabetic,
+isspace = non-empty all White_Space, isprintable = no Other-category
+characters with the empty string printable, istitle = cased runs form
+titlecase words). Two documented §12 approximations: isdigit/isdecimal
+are ASCII-exact (Rust's std exposes no Unicode digit property, so the
+'²'-class superscripts Python accepts are False here), and isprintable
+treats format characters (Cf) as printable. Devin review on #281
+tightened the Unicode edges: isspace now includes the four separator
+controls U+001C..U+001F (CPython's White_Space includes them; Rust's
+is_whitespace excludes Cc), isprintable is exact through the regex
+engine's Unicode tables (`[\p{Cf}\p{Cn}\p{Zl}\p{Zp}\p{Zs}--[ ]]` —
+non-ASCII spaces, line separators, format characters, and unassigned
+code points are all False, ASCII space/tab True), and isalpha/isalnum
+use the LETTER/NUMBER categories (`^\p{L}+$` / `^[\p{L}\p{N}]+$`) —
+U+0345 (a combining mark with the Alphabetic property) is False like
+CPython. The regex-backed implementations are gated on re-regex (the
+default); the alloc tier keeps the approximation. Sweep −48
+(charset_normalizer 238→190, everything else flat). Pinned in the
+runtime against the CPython truth table.
+
 ## 6. Functions
 
 ### 6.1 Signatures
@@ -1597,6 +1622,14 @@ this section's kernel restrictions apply to it.
 
 ---
 
+
+- Without the `re-regex` feature (the light no-re build), the str.is*
+  Unicode classification methods fall back to Rust std's char
+  properties: isalpha/isalnum use the Alphabetic property (which
+  includes combining marks like U+0345 that CPython's Letter-category
+  rule rejects), and isprintable misses format/unassigned categories.
+  The DEFAULT build (re-regex on) is exact through the regex engine's
+  Unicode tables; the light build's approximation is documented here.
 ## 12. Deviations from CPython
 
 This section is the honest ledger §1.2 requires. Three categories.

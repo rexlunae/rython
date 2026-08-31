@@ -3707,3 +3707,58 @@ fn compiled_regex_matches_with_python_anchoring() {
     assert_eq!(om.span_group(1), (-1, -1), "span of an absent group is (-1, -1)");
     assert_eq!(om.span_group(0), (0, 1));
 }
+
+#[test]
+fn string_is_family_matches_python() {
+    // python3 ground truth (ASCII): "ABC" isupper=True islower=False
+    // isalpha=True isdigit=False isdecimal=False isalnum=True
+    // isspace=False isprintable=True istitle=False; "A1" istitle=True;
+    // "" isprintable=True but everything else False; "  " isspace=True;
+    // "Hello World" istitle=True; "HELLO" istitle=False.
+    use stdpython::PyStrOps;
+    let cases: [(&str, bool, bool, bool, bool, bool, bool, bool, bool, bool); 11] = [
+        ("ABC", true, false, true, false, false, true, false, true, false),
+        ("abc", false, true, true, false, false, true, false, true, false),
+        ("A1", true, false, false, false, false, true, false, true, true),
+        ("123", false, false, false, true, true, true, false, true, false),
+        ("", false, false, false, false, false, false, false, true, false),
+        ("  ", false, false, false, false, false, false, true, true, false),
+        ("Hello World", false, false, false, false, false, false, false, true, true),
+        ("HELLO", true, false, true, false, false, true, false, true, false),
+        ("abc123", false, true, false, false, false, true, false, true, false),
+        ("a b", false, true, false, false, false, false, false, true, false),
+        ("3rd", false, true, false, false, false, true, false, true, false),
+    ];
+    for (s, up, lo, al, di, de, an, sp, pr, ti) in cases {
+        assert_eq!(s.isupper(), up, "isupper({s:?})");
+        assert_eq!(s.islower(), lo, "islower({s:?})");
+        assert_eq!(s.isalpha(), al, "isalpha({s:?})");
+        assert_eq!(s.isdigit(), di, "isdigit({s:?})");
+        assert_eq!(s.isdecimal(), de, "isdecimal({s:?})");
+        assert_eq!(s.isalnum(), an, "isalnum({s:?})");
+        assert_eq!(s.isspace(), sp, "isspace({s:?})");
+        assert_eq!(s.isprintable(), pr, "isprintable({s:?})");
+        assert_eq!(s.istitle(), ti, "istitle({s:?})");
+    }
+    // python3: the four separator controls are whitespace.
+    for cp in 0x1C..=0x1Fu32 {
+        let c = char::from_u32(cp).unwrap();
+        assert!(c.to_string().isspace(), "U+{cp:04X} isspace");
+    }
+    // python3: non-ASCII spaces, line separators, format characters, and
+    // unassigned code points are NOT printable; ASCII space and tab are.
+    for cp in [0xA0u32, 0x200B, 0x2028, 0x2029, 0xAD, 0xFEFF, 0x2060, 0x378] {
+        let c = char::from_u32(cp).unwrap();
+        assert!(!c.to_string().isprintable(), "U+{cp:04X} isprintable");
+    }
+    assert!(" ".isprintable(), "ASCII space is printable");
+    // python3: control characters (tab, newline, NUL) are NOT printable.
+    assert!(!'\t'.to_string().isprintable());
+    assert!(!'\n'.to_string().isprintable());
+    assert!(!'\u{0}'.to_string().isprintable());
+    // python3: U+0345 (a combining mark with the Alphabetic property) is
+    // not a letter — isalpha/isalnum are False; A-grave is a letter.
+    assert!(!'\u{0345}'.to_string().isalpha());
+    assert!(!'\u{0345}'.to_string().isalnum());
+    assert!('\u{00C0}'.to_string().isalpha(), "\u{00C0} isalpha");
+}
