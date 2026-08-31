@@ -623,6 +623,19 @@ Round 60: a literal SET (`{"utf_16", "utf_32"}`) builds as
 `PyContains<String> for HashSet<&str>` impl (the generic `PyContains<T>
 for HashSet<T>` already covered the &str spellings). Pinned.
 
+Round 61: a field assigned from a CLASS CONSTRUCTION in one branch
+(`self.headers = HTTPHeaderDict(headers)` — urllib3's HTTPResponse)
+resolves through the constructed class even when another branch assigns
+an unresolvable external param — `field_class` prefers the constructed
+store. That unblocks the Mapping `.get(k, default)` path for such
+receivers: the __getitem__+KeyError lowering, whose Ok arm wraps in Some
+when the default is None (`headers.get(name, default=None)`), the
+Option-typed returns box through the Some/None match (never
+`PyValue::from(Option)`), and the boxed-dict store boxes Option field
+reads the same way. Literal lists and sets (`Vec<&str>`,
+`HashSet<&str>`) gain the str/String/PyValue membership spellings.
+Pinned in each position.
+
 ## 6. Functions
 
 ### 6.1 Signatures

@@ -1021,7 +1021,7 @@ impl<'a> CodeGen for Assign {
                 )
                 && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
             {
-                boxed_dict_value_wrap(&value, &value_expr, &options, &symbols)
+                boxed_dict_value_wrap(&value, &value_expr, &ctx, &options, &symbols)
             } else {
                 value.clone()
             };
@@ -1135,7 +1135,7 @@ impl<'a> CodeGen for Assign {
                         && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
                         && !value_is_none_early
                     {
-                        boxed_dict_value_wrap(&value, &value_expr, &options, &symbols)
+                        boxed_dict_value_wrap(&value, &value_expr, &ctx, &options, &symbols)
                     } else {
                         value
                     };
@@ -1411,10 +1411,11 @@ fn self_field_read_clone(
 fn boxed_dict_value_wrap(
     value: &TokenStream,
     value_expr: &ExprType,
+    ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> TokenStream {
-    if crate::expr_yields_option(value_expr, options, symbols) {
+    if crate::expr_yields_option_ctx(value_expr, ctx, options, symbols) {
         quote!({
             match #value {
                 Some(__rython_member) => PyValue::from(__rython_member),

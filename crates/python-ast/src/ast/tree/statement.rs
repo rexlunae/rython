@@ -644,7 +644,28 @@ impl CodeGen for StatementType {
                         &symbols,
                     ) {
                         Some(clone) => quote!(#clone),
-                        None => quote!(PyValue::from(#tokens)),
+                        None => {
+                            // An OPTION-typed value (`headers.get("location")`
+                            // with a None default — urllib3's
+                            // get_redirect_location) boxes through the
+                            // Some/None match, never `PyValue::from(Option)`
+                            // (no such From — round 61b).
+                            if crate::expr_yields_option_ctx(
+                                &e.value,
+                                &ctx,
+                                &options,
+                                &symbols,
+                            ) {
+                                quote!({
+                                    match #tokens {
+                                        Some(__rython_v) => PyValue::from(__rython_v),
+                                        None => stdpython::PyValue::None_,
+                                    }
+                                })
+                            } else {
+                                quote!(PyValue::from(#tokens))
+                            }
+                        }
                     }
                 } else {
                     // A non-PyValue function RETURNING a value that drops

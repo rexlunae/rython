@@ -6667,8 +6667,7 @@ impl<'a> CodeGen for Call {
                     ("get", [key, default]) => {
                         if let Some((class, class_symbols)) =
                             crate::receiver_class(&attr.value, &ctx, &symbols, &options)
-                            && let Some(method) =
-                                class.method_on_mro("__getitem__", &class_symbols)
+                            && class.method_on_mro("__getitem__", &class_symbols).is_some()
                             && crate::ast::tree::class_def::class_has_mapping_abc_base(
                                 &class,
                                 &class_symbols,
@@ -6684,21 +6683,50 @@ impl<'a> CodeGen for Call {
                                 symbols.clone(),
                                 Some(crate::TypeInfo::String),
                             )?;
-                            let call = crate::dunder_method_call(
-                                &method,
-                                &receiver,
-                                std::slice::from_ref(&self.args[0]),
-                                false,
-                                &ctx,
-                                &options,
-                                &symbols,
+                            // A None (or Option-typed) DEFAULT (`headers.get(
+                            // name, default=None)` — urllib3's getheader)
+                            // makes the result an OPTION: the Ok arm must
+                            // wrap (`Ok(v) => Some(v)`), or the arms mix
+                            // String and Option (round 61b).
+                            let default_is_none = crate::is_none_expr(&self.args[1])
+                                || crate::expr_yields_option_ctx(
+                                    &self.args[1],
+                                    &ctx,
+                                    &options,
+                                    &symbols,
+                                );
+                            let ok_arm = if default_is_none {
+                                quote!(Ok(__rython_v) => Some(__rython_v))
+                            } else {
+                                quote!(Ok(__rython_v) => __rython_v)
+                            };
+                            // Python evaluates RECEIVER, KEY, then DEFAULT
+                            // — each exactly once, and a failure in an
+                            // earlier expression prevents the later ones
+                            // (Devin review on #267: binding the default
+                            // first reordered the side effects, and the
+                            // bare call repeated nothing but evaluated
+                            // receiver+key after the default). Bind all
+                            // three up front, then invoke __getitem__.
+                            let key_arg = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
                             )?;
                             return Ok(quote! {
-                                match #call {
-                                    Ok(__rython_v) => __rython_v,
-                                    Err(__rython_e)
-                                        if __rython_e.matches("KeyError") => #default,
-                                    Err(__rython_e) => return Err(__rython_e),
+                                {
+                                    let __rython_recv = (#receiver).clone();
+                                    let __rython_key = #key_arg;
+                                    let __rython_default = #default;
+                                    match __rython_recv.__getitem__(__rython_key) {
+                                        #ok_arm,
+                                        Err(__rython_e)
+                                            if __rython_e.matches("KeyError") =>
+                                                __rython_default,
+                                        Err(__rython_e) => return Err(__rython_e),
+                                    }
                                 }
                             });
                         }

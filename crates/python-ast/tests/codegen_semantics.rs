@@ -14504,3 +14504,58 @@ fn option_field_store_of_a_reused_name_wraps_and_clones() {
         out
     );
 }
+
+#[test]
+fn mapping_get_binds_the_default_before_the_match() {
+    // Devin review on #267: the Mapping-get synthesis placed the
+    // default ONLY in the KeyError arm — a present key skipped the
+    // default's side effects, unlike Python (which evaluates receiver,
+    // key, and default eagerly, exactly once, before entering get).
+    // Verified against python3: `d.get('k', side_effect())` runs
+    // side_effect even when 'k' is present. The generated code must bind
+    // `__rython_default` before the match.
+    let out = compile(
+        concat!(
+            "from typing import MutableMapping\n",
+            "class M(MutableMapping[str, str]):\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        return \"v\"\n",
+            "    def __len__(self) -> int:\n",
+            "        return 0\n",
+            "    def __iter__(self):\n",
+            "        return iter([])\n",
+            "def side_effect() -> str:\n",
+            "    return \"d\"\n",
+            "def f(m: M) -> str:\n",
+            "    return m.get(\"k\", side_effect())\n",
+        ),
+        "mapget.py",
+    );
+    assert!(
+        out.contains("__rython_default"),
+        "the default must be bound before the match (eager, exactly once): {}",
+        out
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    // Python's evaluation order: RECEIVER, KEY, DEFAULT — each bound
+    // once before the __getitem__ invocation (Devin review on #267, the
+    // reorder pass: the first fix bound the default first).
+    let recv = flat.find("let__rython_recv=").unwrap_or(usize::MAX);
+    let key = flat.find("let__rython_key=").unwrap_or(usize::MAX);
+    let dflt = flat.find("let__rython_default=").unwrap_or(usize::MAX);
+    assert!(
+        recv < key && key < dflt,
+        "receiver, key, default must bind in Python's order: {}",
+        out
+    );
+    assert!(
+        flat.contains("Err(__rython_e)if__rython_e.matches(\"KeyError\")=>__rython_default"),
+        "the KeyError arm must use the pre-bound default: {}",
+        out
+    );
+    assert!(
+        flat.contains("__rython_recv.__getitem__(__rython_key)"),
+        "the __getitem__ call must use the bound receiver and key: {}",
+        out
+    );
+}

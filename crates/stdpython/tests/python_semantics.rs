@@ -3613,3 +3613,26 @@ fn literal_set_py_contains_owned_string() {
     assert!(!s.py_contains(&"latin1".to_string()), "an absent String does not");
     assert!(s.py_contains(&"utf_32"), "the &str spelling still matches");
 }
+
+// A literal list builds as Vec<&str>; membership against an owned String
+// operand (urllib3's CONTENT_DECODERS constants, round 61b) resolves
+// through the str/String spellings, comparing by value.
+#[test]
+fn literal_list_py_contains_owned_string() {
+    use stdpython::*;
+    let l: Vec<&str> = vec!["gzip", "deflate"];
+    assert!(l.py_contains(&"gzip".to_string()), "a member String matches");
+    assert!(!l.py_contains(&"br".to_string()), "an absent String does not");
+    assert!(l.py_contains(&"deflate"), "the &str spelling still matches");
+}
+
+// A literal list's membership against a BOXED Str operand (`direction in
+// ("R", "AL")` where direction is boxed — idna's _is_bidi, round 61b).
+#[test]
+fn literal_list_py_contains_boxed_str() {
+    use stdpython::*;
+    let l: Vec<&str> = vec!["R", "AL", "AN"];
+    assert!(l.py_contains(&PyValue::from("R")), "a Str member matches");
+    assert!(!l.py_contains(&PyValue::from("L")), "an absent Str does not");
+    assert!(!l.py_contains(&PyValue::from(5)), "a non-Str boxed value never matches");
+}

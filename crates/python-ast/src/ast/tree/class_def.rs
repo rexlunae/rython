@@ -896,7 +896,24 @@ impl ClassDef {
         let init = owner.init_method()?;
         let mut stores = Vec::new();
         collect_field_stores(&init.body, &mut stores);
-        let store = stores.iter().find(|s| s.attr == attr)?;
+        // Prefer a store whose value is a CLASS CONSTRUCTION
+        // (`self.headers = HTTPHeaderDict(headers)` — urllib3's
+        // HTTPResponse.__init__, where the OTHER store assigns the
+        // external `_TYPE_HEADERS` param): the constructed class is the
+        // field's real type, where the param annotation may name an
+        // alias that resolves to nothing (round 61b — the Mapping.get
+        // fallback and the boxed-field families).
+        let store = stores
+            .iter()
+            .filter(|s| s.attr == attr)
+            .find(|s| {
+                matches!(
+                    &s.value,
+                    ExprType::Call(c)
+                        if matches!(c.func.as_ref(), ExprType::Name(_))
+                )
+            })
+            .or_else(|| stores.iter().find(|s| s.attr == attr))?;
         let class_name = match store.value {
             ExprType::Call(call) => match call.func.as_ref() {
                 ExprType::Name(n) => n.id.clone(),
