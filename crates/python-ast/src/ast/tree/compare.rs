@@ -309,10 +309,17 @@ impl CodeGen for Compare {
             // (CPython's TypeError on a None comparator), mirroring the
             // call path's receiver_option_inner.
             let membership_receiver = || {
-                if crate::ast::tree::attribute::receiver_option_inner(
-                    comparator_ast, &ctx, &symbols, &options,
-                )
-                .is_some()
+                // A NARROWED comparator (`if character_range is None:
+                // continue` then `keyword in character_range` — charset's
+                // utils) already reads the inner value; unwrapping it
+                // again breaks on the String (round 77).
+                let narrowed = matches!(comparator_ast, ExprType::Name(n)
+                    if options.narrowed_names.contains_key(&n.id));
+                if !narrowed
+                    && crate::ast::tree::attribute::receiver_option_inner(
+                        comparator_ast, &ctx, &symbols, &options,
+                    )
+                    .is_some()
                 {
                     quote!((#comparator).clone().unwrap_or_else(|| {
                         panic!("TypeError: argument of type 'NoneType' is not iterable")

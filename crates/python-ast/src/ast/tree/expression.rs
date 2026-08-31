@@ -1155,6 +1155,41 @@ pub fn update_narrowed_after_statement(
             // A name narrowed by an INNER statement only narrows within that
             // branch, not after the if (a branch may not run). Nothing to
             // propagate.
+            // `if X is None: <early exit>` — a guard whose body ALWAYS
+            // exits (continue/break/return/raise): the statements that
+            // FOLLOW the if are reachable only when X is not None, so X
+            // narrows to its inner type there (round 77 —
+            // charset_normalizer's encoding_unicode_range:
+            // `if character_range is None: continue`).
+            if let ExprType::Compare(cmp) = &i.test
+                && let ExprType::Name(n) = cmp.left.as_ref()
+                && cmp.comparators.first().is_some_and(crate::is_none_expr)
+                && matches!(
+                    cmp.ops.first(),
+                    Some(crate::Compares::Is) | Some(crate::Compares::Eq)
+                )
+                && options.optional_names.contains(&n.id)
+                && i.body.iter().all(|b| {
+                    matches!(
+                        &b.statement,
+                        crate::StatementType::Break
+                            | crate::StatementType::Continue
+                            | crate::StatementType::Return(_)
+                            | crate::StatementType::Raise(_)
+                    )
+                })
+            {
+                // Only a name whose recorded type is a genuine Option
+                // narrows (its inner type comes from the Option); a
+                // String-typed name must not get an unwrap the read cannot
+                // satisfy.
+                if let Some(inner) = options.name_types.get(&n.id).and_then(|t| match t {
+                    crate::TypeInfo::Option(inner) => Some((**inner).clone()),
+                    _ => None,
+                }) {
+                    narrowed.insert(n.id.clone(), inner);
+                }
+            }
         }
         // `x = None` (or any store that may produce None) invalidates the
         // narrowing; an assignment of a statically non-None value keeps it.

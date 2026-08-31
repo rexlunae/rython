@@ -15304,3 +15304,33 @@ fn lru_cache_optional_keys_stay_single_option() {
         out
     );
 }
+
+#[test]
+fn is_none_early_exit_guard_narrows_the_following_reads() {
+    // Round 77: `if character_range is None: continue` (an is-None guard
+    // whose body ALWAYS exits) narrows the FOLLOWING statements — they
+    // are reachable only when the name is not None, so the reads unwrap
+    // (`(character_range).clone().unwrap()`) instead of passing the
+    // Option to a plain String parameter (charset_normalizer's
+    // encoding_unicode_range: String: From<Option<String>>).
+    let out = compile(
+        "def opt() -> str | None:\n\
+         \x20   return \"x\"\n\
+         def f(chunk: str) -> bool:\n\
+         \x20   character_range = opt()\n\
+         \x20   if character_range is None:\n\
+         \x20       return False\n\
+         \x20   return \"a\" in character_range\n",
+        "none_guard.py",
+    );
+    assert!(
+        out.contains("clone () . unwrap ()") || out.contains("clone().unwrap()"),
+        "an is-None early-exit guard must narrow the following reads: {}",
+        out
+    );
+    assert!(
+        !out.contains("From < Option"),
+        "the narrowed read must not pass the raw Option to a plain parameter: {}",
+        out
+    );
+}

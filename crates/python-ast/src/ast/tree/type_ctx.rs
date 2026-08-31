@@ -2868,7 +2868,15 @@ pub fn call_return_typeinfo(
         }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
-            let (f, _) = crate::module_function_def(options, &path, &callee.id)?;
+            // module_defs is keyed RELATIVE to the package root for
+            // src-layout packages, while the resolved path may carry the
+            // root-qualified prefix — the same normalization the import
+            // lowering uses (round 77: charset_normalizer's
+            // encoding_unicode_range — an imported `str | None`-returning
+            // callee stayed untyped, so the local never entered
+            // optional_names and the is-not-None narrowing never fired).
+            let path = crate::module_defs_key(options, &path)?;
+            let (f, _) = crate::module_function_def(options, path, &callee.id)?;
             let ann = f.returns.as_deref()?;
             return resolve_alias_typeinfo(ann, &module_symbols(options, &path), options);
         }
