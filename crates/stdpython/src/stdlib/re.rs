@@ -7,6 +7,45 @@
 
 use crate::PyException;
 
+/// The compiled pattern type (`re.compile(...)` module statics hold one —
+/// a COMPILED-REGEX static is `LazyLock<Regex>`, and the anchored
+/// match/search methods dispatch on it — round 72).
+pub use regex::Regex;
+
+/// The match surface on a COMPILED pattern (`_TARGET_RE.match(target)` —
+/// the module static holds the compiled Regex; the runtime free
+/// functions re-compile from the pattern string, while a compiled
+/// pattern matches directly). Python's `re.match` anchors at the START
+/// of the text, `re.search` finds the first match anywhere, and
+/// `re.fullmatch` requires the WHOLE text — the regex crate's
+/// `captures_at`/`captures` implement those exactly (an unanchored
+/// `captures` is `search`; `match` requires the match to START at 0;
+/// `fullmatch` requires it to cover the whole text).
+pub trait PyRegexOps {
+    fn py_match(&self, text: &str) -> Option<PyMatch>;
+    fn py_search(&self, text: &str) -> Option<PyMatch>;
+    fn py_fullmatch(&self, text: &str) -> Option<PyMatch>;
+}
+
+impl PyRegexOps for Regex {
+    fn py_match(&self, text: &str) -> Option<PyMatch> {
+        let caps = self
+            .captures_at(text, 0)
+            .filter(|c| c.get(0).is_some_and(|m| m.start() == 0))?;
+        Some(make_match(self, text, &caps))
+    }
+    fn py_search(&self, text: &str) -> Option<PyMatch> {
+        let caps = self.captures(text)?;
+        Some(make_match(self, text, &caps))
+    }
+    fn py_fullmatch(&self, text: &str) -> Option<PyMatch> {
+        let caps = self.captures(text).filter(|c| {
+            c.get(0).is_some_and(|m| m.start() == 0 && m.end() == text.len())
+        })?;
+        Some(make_match(self, text, &caps))
+    }
+}
+
 /// re.IGNORECASE — the case-insensitive flag, passed as the flags string
 /// (`re.compile("x", re.IGNORECASE)` — requests' auth; `re.I` is the same
 /// constant).

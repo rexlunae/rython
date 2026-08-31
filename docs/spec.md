@@ -795,6 +795,20 @@ drift), and the read path uses it. Sweep −1 (urllib3 989→988: E0615
 2→0, E0609 −2; the corrected reads exposed honest arg-adaptation gaps
 +3). Pinned cross-module.
 
+Round 72 (the compiled-regex family): `_TARGET_RE = re.compile(...)`
+module statics lowered as boxed PyValue — `PyValue::from(regex::Regex)`
+(E0277, since the boxed union has no regex member) — and `.match(x)` /
+`.search(x)` / `.fullmatch(x)` on them emitted `.r#match(x)` on the
+boxed value (E0599). A `re.compile` static now types as the runtime's
+compiled `Regex` (`LazyLock<...::re::Regex>`, the re-exported regex
+crate type), and the method calls dispatch through a new `PyRegexOps`
+trait — `py_match` anchors at the START of the text (the regex crate's
+`captures_at(text, 0)` filtered to a match starting at 0), `py_search`
+finds the first match anywhere, `py_fullmatch` requires the whole text —
+with the existing `PyMatchOps for Option<PyMatch>` providing the
+`.groups()` surface. Sweep −11 (urllib3 988→978, idna 64→63).
+Pinned in codegen and runtime.
+
 ## 6. Functions
 
 ### 6.1 Signatures

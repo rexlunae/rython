@@ -6970,6 +6970,35 @@ impl<'a> CodeGen for Call {
                     ("find", [needle]) => {
                         return Ok(quote!((#receiver).py_find(&(#needle))));
                     }
+                    // A COMPILED-REGEX static receiver (`_TARGET_RE.match(
+                    // target)` — the module static holds `re.compile(...)`,
+                    // typed as the runtime Regex): the anchored matching
+                    // dispatches through the runtime's PyRegexOps (py_match
+                    // anchors at the start, py_search anywhere, py_fullmatch
+                    // requires the whole text). Without the arm the call
+                    // emitted `.r#match()` on the static's value — E0599
+                    // (no such method on a boxed PyValue).
+                    ("match" | "search" | "fullmatch", [text]) => {
+                        if crate::ast::tree::call::root_name(&attr.value).is_some_and(|root| {
+                            matches!(
+                                symbols.get(&root),
+                                Some(crate::SymbolTableNode::Assign {
+                                    value: crate::ExprType::Call(c),
+                                    ..
+                                }) if matches!(c.func.as_ref(), crate::ExprType::Attribute(a)
+                                    if a.attr == "compile"
+                                        && matches!(a.value.as_ref(), crate::ExprType::Name(n)
+                                            if n.id == "re"))
+                            )
+                        }) {
+                            let m = match attr.attr.as_str() {
+                                "search" => quote!(py_search),
+                                "fullmatch" => quote!(py_fullmatch),
+                                _ => quote!(py_match),
+                            };
+                            return Ok(quote!((#receiver).#m(&(#text))));
+                        }
+                    }
                     _ => {}
                 }
                 // Issue #121: bytes methods on a name narrowed to Vec<u8>

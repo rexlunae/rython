@@ -3652,3 +3652,21 @@ fn py_boxed_str_ops_dispatch_on_the_runtime_member() {
     });
     assert!(caught.is_err(), "non-str members must panic loudly");
 }
+
+#[test]
+fn compiled_regex_matches_with_python_anchoring() {
+    // python3: re.compile(r"a+").match("ba") is None (anchored at the
+    // start); .search("ba") matches "a"; .fullmatch("aa") matches,
+    // .fullmatch("ba") is None (whole text required).
+    use stdpython::stdlib::re::{PyRegexOps, Regex};
+    let re = Regex::new("a+").unwrap();
+    assert!(re.py_match("ba").is_none(), "match anchors at the start");
+    assert_eq!(re.py_match("aaa").unwrap().groups(), Vec::<String>::new());
+    assert_eq!(re.py_search("ba").unwrap().groups(), Vec::<String>::new());
+    assert!(re.py_fullmatch("ba").is_none(), "fullmatch requires the whole text");
+    assert!(re.py_fullmatch("aaa").is_some());
+    // A capturing pattern's groups() carries the groups.
+    let re2 = Regex::new("^([^?#]*)(?:\\?([^#]*))?.*$").unwrap();
+    let m = re2.py_match("path?query").unwrap();
+    assert_eq!(m.groups(), vec!["path", "query"]);
+}

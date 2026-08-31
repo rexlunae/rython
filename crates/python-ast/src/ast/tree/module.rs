@@ -4407,6 +4407,14 @@ fn module_init_static_ty(
             ("datetime", "date") => return Some(quote!(stdpython::datetime::date)),
             ("datetime", "datetime") => return Some(quote!(stdpython::datetime::datetime)),
             ("datetime", "timedelta") => return Some(quote!(stdpython::datetime::timedelta)),
+            // `re.compile(...)` — a compiled pattern (`_TARGET_RE =
+            // re.compile(...)`): the static holds the raw Regex, so
+            // `.match()`/`.search()`/`.fullmatch()` on it dispatch
+            // through the runtime's PyRegexOps instead of boxing the
+            // pattern in a PyValue that has no such methods (round 72).
+            ("re", "compile") => {
+                return Some(quote!(stdpython::stdlib::re::Regex));
+            }
             _ => {}
         }
     }

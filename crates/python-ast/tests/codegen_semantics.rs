@@ -13652,6 +13652,33 @@ fn annotated_local_widened_by_a_later_option_store() {
 }
 
 #[test]
+fn compiled_regex_statics_type_and_dispatch() {
+    // Round 72: `_TARGET_RE = re.compile(...)` module statics are typed
+    // as the runtime's compiled Regex (not boxed in a PyValue that has no
+    // regex methods), and `_RE.match(x)` / `_RE.search(x)` /
+    // `_RE.fullmatch(x)` dispatch through the runtime's PyRegexOps
+    // (anchored-at-start / anywhere / whole-text).
+    let out = compile(
+        "import re\n\
+         _TARGET_RE = re.compile(\"a+\")\n\
+         def f(target: str) -> bool:\n\
+         \x20   return _TARGET_RE.match(target) is not None\n",
+        "regex.py",
+    );
+    assert!(
+        out.contains("LazyLock < stdpython :: stdlib :: re :: Regex >")
+            || out.contains("LazyLock<stdpython::stdlib::re::Regex>"),
+        "the re.compile static must be typed as the runtime Regex: {}",
+        out
+    );
+    assert!(
+        out.contains("py_match") && !out.contains("r#match ("),
+        "the .match() call must dispatch through py_match: {}",
+        out
+    );
+}
+
+#[test]
 fn field_walk_follows_imported_bases() {
     // Round 71: `self.headers` where `headers` is a field stored in an
     // IMPORTED base class (`PoolManager(RequestMethods)` — the struct
