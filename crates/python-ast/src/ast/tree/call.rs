@@ -8356,21 +8356,28 @@ pub(crate) fn receiver_class(
                     // double-wrap family — `Some(u.host)` nested because
                     // the local's class was never resolved).
                     let fdef = match symbols.get(&cn.id) {
-                        Some(SymbolTableNode::FunctionDef(f)) => Some(f.clone()),
+                        Some(SymbolTableNode::FunctionDef(f)) => {
+                            Some((f.clone(), symbols.clone()))
+                        }
                         Some(SymbolTableNode::ImportFrom(ifm)) => {
                             let path = ifm.resolved_module_path(options);
                             if options.module_defs.contains_key(&path) {
+                                // KEEP the defining module's symbol
+                                // table: an imported factory's return
+                                // annotation names classes in THAT module
+                                // (Devin review on #264 — dropping them
+                                // left the field unidentified and the
+                                // double-wrap in place).
                                 crate::module_function_def(options, &path, &cn.id)
-                                    .map(|(f, _)| f)
                             } else {
                                 None
                             }
                         }
                         _ => None,
                     };
-                    if let Some(f) = fdef {
+                    if let Some((f, f_symbols)) = fdef {
                         match f.return_class_name(options) {
-                            Some(class) => (class, symbols.clone()),
+                            Some(class) => (class, f_symbols),
                             None => return None,
                         }
                     } else {

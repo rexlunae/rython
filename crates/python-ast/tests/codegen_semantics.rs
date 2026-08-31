@@ -14405,3 +14405,70 @@ fn option_typed_field_read_stored_into_option_local_does_not_double_wrap() {
         out
     );
 }
+
+#[test]
+fn imported_factory_option_field_crosses_modules_unwrapped() {
+    // Devin review on #264: when only an IMPORTED factory exposes its
+    // result class, the defining module's symbol table must survive the
+    // resolution — `make() -> Result` in module A, `u = make()` in
+    // module B, `u.field` (Option-typed in A) into an Option slot must
+    // pass through without the double-wrap. The first version discarded
+    // the defining symbols, so A's Result never resolved in B.
+    let defs_mod = parse(
+        concat!(
+            "class Result:\n",
+            "    def __init__(self):\n",
+            "        self.field: str | None = None\n",
+            "def make() -> Result:\n",
+            "    return Result()\n",
+        ),
+        "resultmod.py",
+    )
+    .unwrap();
+    let caller = parse(
+        concat!(
+            "from resultmod import make\n",
+            "def take(field: str | None) -> str | None:\n",
+            "    return field\n",
+            "def f() -> str | None:\n",
+            "    u = make()\n",
+            "    return take(u.field)\n",
+        ),
+        "caller2.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["resultmod".to_string()],
+        std::rc::Rc::new(defs_mod),
+    );
+    defs.insert(
+        vec!["caller2".to_string()],
+        std::rc::Rc::new(caller.clone()),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
+    let out = caller
+        .to_rust(
+            CodeGenContext::Module("caller2".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("take(u.field)") || flat.contains("take((u.field).clone())"),
+        "an imported factory's Option field must pass through an Option slot unwrapped: {}",
+        out
+    );
+    assert!(
+        !flat.contains("take(Some(u.field)"),
+        "the imported factory's Option field must not double-wrap: {}",
+        out
+    );
+}
