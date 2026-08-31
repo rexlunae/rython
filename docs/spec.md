@@ -751,7 +751,10 @@ Option-slot ARGUMENT adaptation wrapped the already-Option local in
 a local from an Option-typed field of ANY object whose class resolves
 (through the same factory-local receiver resolution the read side
 uses), so the argument passes through unwrapped. Sweep −3 (urllib3
-1002→999). Pinned cross-module.
+1002→999). Pinned cross-module. The DIRECT-call receiver resolution also
+grew to cover CLASS CONSTRUCTIONS — local or imported (`Url(...).url` —
+a property of the constructed class read in place), routing the property
+read to the getter. Sweep −2 more (urllib3 999→997; E0615 10→8).
 
 ## 6. Functions
 

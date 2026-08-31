@@ -13535,6 +13535,53 @@ fn direct_imported_factory_call_property_read_resolves() {
 }
 
 #[test]
+fn construction_call_property_read_resolves_imported_classes_too() {
+    // Round 68: `Url(scheme=..., path=...).url` — a PROPERTY of a class
+    // CONSTRUCTION read in place. The direct-call receiver resolution
+    // covered imported-factory calls; a construction's func is the class
+    // NAME, local or imported — both now resolve, so the property read
+    // routes to the getter instead of E0615 method-not-a-field.
+    let url = parse(
+        "class Url:\n\
+         \x20   def __init__(self, scheme: str | None) -> None:\n\
+         \x20       self._scheme = scheme\n\
+         \x20   @property\n\
+         \x20   def url(self) -> str:\n\
+         \x20       return self._scheme or \"\"\n",
+        "url.py",
+    )
+    .unwrap();
+    let main = parse(
+        "from .url import Url\n\
+         def f(scheme: str | None) -> str:\n\
+         \x20   return Url(scheme).url\n",
+        "main.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["url".to_string()], std::rc::Rc::new(url));
+    defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let symbols = main.clone().find_symbols(SymbolTableScopes::new());
+    let out = main
+        .to_rust(
+            CodeGenContext::Module("main".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". url () ?") || out.contains(".url()?"),
+        "the construction property read must route to the getter: {}",
+        out
+    );
+}
+
+#[test]
 fn local_from_another_objects_option_field_is_option() {
     // Round 68: `destination_scheme = parsed_url.scheme` (a `str | None`
     // field of a factory-local object), then passed to a `str | None`

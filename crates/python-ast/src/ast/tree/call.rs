@@ -8601,19 +8601,33 @@ pub(crate) fn receiver_class_for_read(
     if let Some(r) = receiver_class(recv, ctx, symbols, options) {
         return Some(r);
     }
-    // A DIRECT imported-factory CALL as the receiver
-    // (`parse_url(url).netloc` — a property of the return class): the
-    // same resolution as the NAME-assign factory, for the call in place
-    // instead of a local. The conservative receiver_class keeps
-    // method-call receivers only; the property surface needs this shape.
+    // A DIRECT factory CALL as the receiver (`parse_url(url).netloc` —
+    // a property of the return class, or `Url(...).url` — a property of
+    // the CONSTRUCTED class): the same resolution as the NAME-assign
+    // factory, for the call in place instead of a local. The
+    // conservative receiver_class keeps method-call receivers only; the
+    // property surface needs this shape.
     if let ExprType::Call(call) = recv
         && let ExprType::Name(cn) = call.func.as_ref()
-        && let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id)
     {
-        let path = i.resolved_module_path(options);
-        let (f, f_symbols) = crate::module_function_def(options, &path, &cn.id)?;
-        let class_name = f.return_class_name(options)?;
-        return receiver_class_tail(&class_name, f_symbols, options);
+        // A CLASS CONSTRUCTION — the class itself (local, or imported:
+        // `Url(...).url` where Url comes from another module).
+        if matches!(symbols.get(&cn.id), Some(SymbolTableNode::ClassDef(_))) {
+            return receiver_class_tail(&cn.id, symbols.clone(), options);
+        }
+        if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id) {
+            let path = i.resolved_module_path(options);
+            // An IMPORTED CLASS construction.
+            if options.module_defs.contains_key(&path)
+                && crate::module_class_def(options, &path, &cn.id).is_some()
+            {
+                return receiver_class_tail(&cn.id, symbols.clone(), options);
+            }
+            // An IMPORTED factory (`parse_url(url)`).
+            let (f, f_symbols) = crate::module_function_def(options, &path, &cn.id)?;
+            let class_name = f.return_class_name(options)?;
+            return receiver_class_tail(&class_name, f_symbols, options);
+        }
     }
     let ExprType::Name(n) = recv else {
         return None;

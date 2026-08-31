@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 68: locals from another object's Option field seed as Option; Option-slot args pass through (1002 -> 999)."
+      "note": "The historical #137 corpus. Round 68: other-object Option-field locals seed; direct factory/construction calls resolve for property reads (1002 -> 997)."
     },
     {
       "name": "certifi",
