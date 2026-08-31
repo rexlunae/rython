@@ -721,6 +721,27 @@ membership test unwraps an Option comparator with a loud §12.2 panic
 the call path's Option receiver for the in-test. Sweep −12 (urllib3
 1019→1011, charset_normalizer 289→285). Pinned in each shape.
 
+Round 67 (super() factory locals): `r = super().make()` — an override
+that assigns the BASE's method result and later reads a member of it —
+left `r`'s class unresolved: the factory-local receiver resolution
+(`x = self.make()` and imported factories) recognized only a bare
+`self` callee, so a field read on the super-factory local emitted the
+bare name. When the result class's member lives on the result class's
+OWN embedded base (a base class's field read through a derived
+instance), the bare read is an E0615 method-not-a-field. The
+super-callee now resolves the method through the ENCLOSING class's base
+chain (the override's own class does not define it) and takes its
+return class, so the embedded-base chain rewrite fires. A DIRECT
+imported-factory CALL as the receiver (`parse_url(url).netloc` — a
+property of the return class, read in place) resolves the same way, and
+the return class's name resolves against the DEFINING module's symbol
+table (the annotation names classes in that module — the rule the
+conservative receiver path already followed). Sweep −9 (urllib3
+1011→1002: E0615 22→10, plus the boxed-union pair shifts the retyping
+unmasked −6); the direct-call property routing traded the remaining
+E0615s for the honest `Option<String>`-value store gaps (+3). Pinned
+cross-module in both shapes.
+
 ## 6. Functions
 
 ### 6.1 Signatures

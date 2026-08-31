@@ -8601,6 +8601,20 @@ pub(crate) fn receiver_class_for_read(
     if let Some(r) = receiver_class(recv, ctx, symbols, options) {
         return Some(r);
     }
+    // A DIRECT imported-factory CALL as the receiver
+    // (`parse_url(url).netloc` — a property of the return class): the
+    // same resolution as the NAME-assign factory, for the call in place
+    // instead of a local. The conservative receiver_class keeps
+    // method-call receivers only; the property surface needs this shape.
+    if let ExprType::Call(call) = recv
+        && let ExprType::Name(cn) = call.func.as_ref()
+        && let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id)
+    {
+        let path = i.resolved_module_path(options);
+        let (f, f_symbols) = crate::module_function_def(options, &path, &cn.id)?;
+        let class_name = f.return_class_name(options)?;
+        return receiver_class_tail(&class_name, f_symbols, options);
+    }
     let ExprType::Name(n) = recv else {
         return None;
     };
@@ -8626,18 +8640,44 @@ pub(crate) fn receiver_class_for_read(
             let method = owner.methods().find(|m| m.name == attr.attr)?;
             method.return_class_name(options)?
         }
+        // A SUPER-method factory: `r = super().make()` — an override that
+        // assigns the base's result (a method reads its own override's
+        // base-chain members afterwards). The base's method (not the
+        // enclosing class's own, which does not define it) provides the
+        // return class.
+        ExprType::Attribute(attr)
+            if matches!(
+                attr.value.as_ref(),
+                ExprType::Call(c)
+                    if matches!(c.func.as_ref(), ExprType::Name(s) if s.id == "super")
+            ) =>
+        {
+            let class_name = ctx.enclosing_class_name()?;
+            let crate::SymbolTableNode::ClassDef(cls) = symbols.get(class_name)? else {
+                return None;
+            };
+            let base = cls.base_chain(symbols).into_iter().find(|c| {
+                c.methods().any(|m| m.name == attr.attr)
+            })?;
+            let method = base.methods().find(|m| m.name == attr.attr)?;
+            method.return_class_name(options)?
+        }
         // An IMPORTED factory (`parsed_url = parse_url(url)` — urllib3,
         // whose parse_url is imported from util.url): resolve the function
-        // through its defining module and take its return class.
+        // through its defining module and take its return class. The
+        // return annotation names classes in the DEFINING module, so the
+        // tail resolves against its symbol table (the same rule the
+        // conservative receiver_class follows for imported factories).
         ExprType::Name(cn) => {
             let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id) else {
                 return None;
             };
             let path = i.resolved_module_path(options);
-            let (f, _) = crate::module_function_def(options, &path, &cn.id)?;
-            f.return_class_name(options)?
+            let (f, f_symbols) = crate::module_function_def(options, &path, &cn.id)?;
+            let class_name = f.return_class_name(options)?;
+            return receiver_class_tail(&class_name, f_symbols, options);
         }
-        _ => return None,
+        _ => return None
     };
     receiver_class_tail(&class_name, symbols.clone(), options)
 }
