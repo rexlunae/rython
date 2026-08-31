@@ -998,6 +998,28 @@ impl<'a> CodeGen for Assign {
                 options.clone(),
                 symbols.clone(),
             )?;
+            // An OPTION-typed receiver (`request_context["blocksize"] =
+            // _DEFAULT_BLOCKSIZE` where request_context is `dict | None` —
+            // urllib3's poolmanager, guaranteed non-None after the `if x
+            // is None:` fill above): CPython raises TypeError on a None
+            // receiver, which the loud §12.2 panic mirrors. Mirrors the
+            // read side's receiver_option_inner, but a STORE needs `&mut`
+            // of the inner, so the unwrap is as_mut — the same shape the
+            // call path uses for `x.pop(k)` on an Option binding.
+            let receiver = if crate::ast::tree::attribute::receiver_option_inner(
+                &sub.value,
+                &ctx,
+                &symbols,
+                &options,
+            )
+            .is_some()
+            {
+                quote!((#receiver).as_mut().unwrap_or_else(|| {
+                    panic!("TypeError: 'NoneType' object does not support item assignment")
+                }))
+            } else {
+                receiver
+            };
             // `os.environ[k] = v` routes through `os::setenv`: os.environ
             // is an IMMUTABLE module static (a live view of the process
             // environment) and cannot be borrowed mutably for py_set_index.
@@ -1014,11 +1036,23 @@ impl<'a> CodeGen for Assign {
             );
             // Issue #121: a store into a PyDict<K, PyValue> (`dict[str,
             // Any]`) wraps the value (`PyValue::from(v)`, None via `()`).
+            // An OPTION-wrapped receiver (`request_context["blocksize"] =
+            // _DEFAULT_BLOCKSIZE` where request_context is `dict[str,
+            // Any] | None` — urllib3's poolmanager) is the same dict once
+            // the store unwraps it (round 63).
             let value = if let ExprType::Name(n) = sub.value.as_ref()
-                && matches!(
+                && (matches!(
                     options.name_types.get(&n.id),
                     Some(crate::TypeInfo::Dict(_, v)) if matches!(**v, crate::TypeInfo::PyValue)
-                )
+                ) || matches!(
+                    options.name_types.get(&n.id),
+                    Some(crate::TypeInfo::Option(inner))
+                        if matches!(
+                            &**inner,
+                            crate::TypeInfo::Dict(_, v)
+                                if matches!(**v, crate::TypeInfo::PyValue)
+                        )
+                ))
                 && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
             {
                 boxed_dict_value_wrap(&value, &value_expr, &ctx, &options, &symbols)
@@ -1058,33 +1092,51 @@ impl<'a> CodeGen for Assign {
                     // come from a NAME (name_types) or a `self.<field>`
                     // whose field the class table types PyDict<String, V>
                     // (urllib3's `self.conn_kw["proxy"] = self.proxy` —
-                    // round 46).
-                    let string_keyed = matches!(
-                        sub.value.as_ref(),
-                        ExprType::Name(n)
-                            if matches!(
-                                options.name_types.get(&n.id),
-                                Some(crate::TypeInfo::Dict(k, _))
-                                    if matches!(**k, crate::TypeInfo::String)
-                            )
-                    ) || matches!(
-                        sub.value.as_ref(),
-                        ExprType::Attribute(attr)
-                            if matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
-                                && crate::ast::tree::aug_assign::self_field_rust_ty(
+                    // round 46). An OPTION-wrapped receiver (`headers["k"]
+                    // = v` where headers is `Mapping[str, str] | None` —
+                    // urllib3's RequestMethods; `request_context["k"] = v`
+                    // where request_context is `dict[str, Any] | None` —
+                    // poolmanager) is the same dict once the store unwraps
+                    // it, so the dict type is read through the Option
+                    // (round 63).
+                    let receiver_dict = || -> Option<(crate::TypeInfo, crate::TypeInfo)> {
+                        let through_option = |t: &crate::TypeInfo| match t {
+                            crate::TypeInfo::Dict(k, v) => {
+                                Some(((**k).clone(), (**v).clone()))
+                            }
+                            crate::TypeInfo::Option(inner) => match inner.as_ref() {
+                                crate::TypeInfo::Dict(k, v) => {
+                                    Some(((**k).clone(), (**v).clone()))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match sub.value.as_ref() {
+                            ExprType::Name(n) => options
+                                .name_types
+                                .get(&n.id)
+                                .and_then(through_option),
+                            ExprType::Attribute(attr)
+                                if matches!(
+                                    attr.value.as_ref(),
+                                    ExprType::Name(r) if r.id == "self"
+                                ) =>
+                            {
+                                crate::ast::tree::aug_assign::self_field_rust_ty(
                                     &attr.attr,
                                     &ctx,
                                     &options,
                                     &symbols,
                                 )
-                                .is_some_and(|t| {
-                                    matches!(
-                                        t,
-                                        crate::TypeInfo::Dict(k, _)
-                                            if matches!(k.as_ref(), crate::TypeInfo::String)
-                                    )
-                                })
-                    );
+                                .as_ref()
+                                .and_then(through_option)
+                            }
+                            _ => None,
+                        }
+                    };
+                    let string_keyed = receiver_dict()
+                        .is_some_and(|(k, _)| matches!(k, crate::TypeInfo::String));
                     let index = if string_keyed {
                         crate::render_typed(
                             index,
@@ -1109,33 +1161,43 @@ impl<'a> CodeGen for Assign {
                     // signal comes from the same receiver lookup as
                     // string_keyed above. A NAME receiver's wrap already
                     // happened above (issue #121); only the self-field
-                    // receiver needs it here.
+                    // receiver needs it here. The self-field dict type is
+                    // read through an Option (a `str | None`-style field
+                    // holds the dict after the store's unwrap).
                     let pyvalue_valued = matches!(
                         sub.value.as_ref(),
                         ExprType::Attribute(attr)
                             if matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
-                                && crate::ast::tree::aug_assign::self_field_rust_ty(
-                                    &attr.attr,
-                                    &ctx,
-                                    &options,
-                                    &symbols,
-                                )
-                                // The class table carries the boxed-value
-                                // dict (`PyDict<String, PyValue>`).
-                                .is_some_and(|t| {
-                                    matches!(
-                                        t,
-                                        crate::TypeInfo::Dict(k, v)
-                                            if matches!(k.as_ref(), crate::TypeInfo::String)
-                                                && matches!(v.as_ref(), crate::TypeInfo::PyValue)
-                                    )
-                                })
-                    );
+                    ) && receiver_dict().is_some_and(|(k, v)| {
+                        matches!(k, crate::TypeInfo::String)
+                            && matches!(v, crate::TypeInfo::PyValue)
+                    });
                     let value = if pyvalue_valued
                         && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
                         && !value_is_none_early
                     {
                         boxed_dict_value_wrap(&value, &value_expr, &ctx, &options, &symbols)
+                    } else {
+                        value
+                    };
+                    // A STRING-valued dict stores a str LITERAL by owning it
+                    // (`headers["Content-Type"] = "application/json"` —
+                    // urllib3's RequestMethods: the dict is PyDict<String,
+                    // String>, and the literal is a &'static str). The
+                    // index-side owning above covers the key; the value
+                    // needs the same treatment. Only the literal shape
+                    // (render_typed passes anything else through).
+                    let value = if receiver_dict().is_some_and(|(k, v)| {
+                        matches!(k, crate::TypeInfo::String)
+                            && matches!(v, crate::TypeInfo::String)
+                    }) {
+                        crate::render_typed(
+                            &value_expr,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::String),
+                        )?
                     } else {
                         value
                     };
