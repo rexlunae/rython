@@ -3250,15 +3250,18 @@ pub(crate) fn expr_yields_option_ctx(
     // the defining base) yields the Option either way.
     let class_field_is_option =
         |name: &str, class: &crate::ClassDef, class_symbols: &SymbolTableScopes| -> bool {
-            class.base_chain(class_symbols).iter().any(|c| {
-                c.infer_fields(class_symbols, options)
-                    .ok()
-                    .is_some_and(|fields| {
-                        fields.iter().any(|(n, t)| {
-                            *n == name && matches!(t, crate::TypeInfo::Option(_))
+            class
+                .base_chain_with_options(class_symbols, options)
+                .iter()
+                .any(|c| {
+                    c.infer_fields(class_symbols, options)
+                        .ok()
+                        .is_some_and(|fields| {
+                            fields.iter().any(|(n, t)| {
+                                *n == name && matches!(t, crate::TypeInfo::Option(_))
+                            })
                         })
-                    })
-            })
+                })
         };
     // A SELF-FIELD ACCESSOR CALL (`self._tunnel_host()` — the field's
     // generated getter): an Option-typed field's accessor returns the

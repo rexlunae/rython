@@ -527,12 +527,17 @@ impl ClassDef {
     /// Whether the class defines a property getter named `name` (a
     /// `@property def name` or the getter half of a pair) — used to route
     /// attribute READS to the getter method call.
-    pub fn has_property_getter(&self, name: &str, symbols: &SymbolTableScopes) -> bool {
+    pub fn has_property_getter(
+        &self,
+        name: &str,
+        symbols: &SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> bool {
         // A property defined on a BASE class is a property of the derived
         // class too (`self.host` on HTTPSConnection, whose `host`
         // property HTTPConnection defines): the read routes to the getter
-        // call either way.
-        self.base_chain(symbols).iter().any(|c| {
+        // call either way. The chain follows imported bases.
+        self.base_chain_with_options(symbols, options).iter().any(|c| {
             c.methods().any(|m| {
                 m.name == name
                     && m.decorator_list.iter().any(|d| match d {
@@ -744,10 +749,33 @@ impl ClassDef {
     }
 
     pub(crate) fn base_chain(&self, symbols: &SymbolTableScopes) -> Vec<ClassDef> {
+        self.base_chain_impl(symbols, |c, s| c.base_class(s))
+    }
+
+    /// An options-aware base chain: the plain chain cannot follow IMPORTED
+    /// bases (no options to resolve the module), so a chain that crosses a
+    /// module boundary (`PoolManager(RequestMethods)` with the field
+    /// stored in the imported base — the field-walk, the property check,
+    /// and the Option-ness resolution need it) stops at the boundary and
+    /// misses the ancestor's fields (E0615/E0609 in generic trait
+    /// defaults). The two share one walk so their shapes cannot drift.
+    pub(crate) fn base_chain_with_options(
+        &self,
+        symbols: &SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Vec<ClassDef> {
+        self.base_chain_impl(symbols, |c, s| c.base_class_with_options(s, options))
+    }
+
+    fn base_chain_impl(
+        &self,
+        symbols: &SymbolTableScopes,
+        next: impl Fn(&ClassDef, &SymbolTableScopes) -> Option<ClassDef>,
+    ) -> Vec<ClassDef> {
         let mut chain = vec![self.clone()];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         seen.insert(self.name.clone());
-        while let Some(base) = chain.last().and_then(|c| c.base_class(symbols)) {
+        while let Some(base) = chain.last().and_then(|c| next(c, symbols)) {
             // A cyclic base (`class A(A)` after the name was rebound, so
             // the class resolves to itself) must terminate: Python looks
             // the base up in the OUTER scope and errors when it finds the
@@ -881,9 +909,11 @@ impl ClassDef {
         // urllib3's HTTPSConnection reads `self.host`, which HTTPConnection
         // synthesized from its own unmodeled stdlib base — so it is part of
         // the chain walk, not a check on the receiver's class alone.
-        self.base_chain(symbols).iter().rposition(|c| {
-            c.owns_field(attr) || c.has_inferred_field(attr, symbols, options)
-        })
+        self.base_chain_with_options(symbols, options)
+            .iter()
+            .rposition(|c| {
+                c.owns_field(attr) || c.has_inferred_field(attr, symbols, options)
+            })
     }
 
     /// The class of the value stored in field `attr`, when the field holds
