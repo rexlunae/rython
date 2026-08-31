@@ -13484,6 +13484,57 @@ fn super_method_factory_local_resolves_its_class() {
 }
 
 #[test]
+fn direct_imported_factory_call_property_read_resolves() {
+    // Round 67: `parse_url(url).netloc` — a PROPERTY of the return class
+    // of an IMPORTED factory, read directly on the call (not through a
+    // local): the factory-call receiver's class was unresolved, the read
+    // emitted the bare name, and the property was E0615
+    // method-not-a-field. The factory resolution now also covers the call
+    // in place; the property read routes to the getter call.
+    let url = parse(
+        "class Url:\n\
+         \x20   def __init__(self, netloc: str | None) -> None:\n\
+         \x20       self._netloc = netloc\n\
+         \x20   @property\n\
+         \x20   def netloc(self) -> str | None:\n\
+         \x20       return self._netloc\n\
+         def parse_url(url: str) -> Url:\n\
+         \x20   return Url(url)\n",
+        "url.py",
+    )
+    .unwrap();
+    let main = parse(
+        "from .url import parse_url\n\
+         def f(url: str) -> str | None:\n\
+         \x20   return parse_url(url).netloc\n",
+        "main.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["url".to_string()], std::rc::Rc::new(url));
+    defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let symbols = main.clone().find_symbols(SymbolTableScopes::new());
+    let out = main
+        .to_rust(
+            CodeGenContext::Module("main".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains("parse_url (url) ? . netloc () ?")
+            || out.contains("parse_url(url)?.netloc()?"),
+        "the factory-call property read must route to the getter: {}",
+        out
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the

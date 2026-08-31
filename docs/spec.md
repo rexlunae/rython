@@ -731,9 +731,16 @@ OWN embedded base (a base class's field read through a derived
 instance), the bare read is an E0615 method-not-a-field. The
 super-callee now resolves the method through the ENCLOSING class's base
 chain (the override's own class does not define it) and takes its
-return class, so the embedded-base chain rewrite fires. Sweep −9
-(urllib3 1011→1002: E0615 22→13, plus the boxed-union pair shifts it
-unmasked −6). Pinned cross-module.
+return class, so the embedded-base chain rewrite fires. A DIRECT
+imported-factory CALL as the receiver (`parse_url(url).netloc` — a
+property of the return class, read in place) resolves the same way, and
+the return class's name resolves against the DEFINING module's symbol
+table (the annotation names classes in that module — the rule the
+conservative receiver path already followed). Sweep −9 (urllib3
+1011→1002: E0615 22→10, plus the boxed-union pair shifts the retyping
+unmasked −6); the direct-call property routing traded the remaining
+E0615s for the honest `Option<String>`-value store gaps (+3). Pinned
+cross-module in both shapes.
 
 ## 6. Functions
 

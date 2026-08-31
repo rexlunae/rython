@@ -1,17 +1,17 @@
 {
-  "rypip_commit": "55db9fa",
+  "rypip_commit": "489a37d",
   "rypip_path": "/Users/tserica/rython/target/debug/rypip",
-  "elapsed_seconds": 377.7,
+  "elapsed_seconds": 368.0,
   "packages": {
     "urllib3": {
       "total": 1002,
       "histogram": {
-        "E0308": 456,
+        "E0308": 459,
         "E0599": 211,
         "E0277": 151,
         "E0609": 93,
         "E0061": 33,
-        "E0615": 13,
+        "E0615": 10,
         "E0605": 8,
         "E0618": 7,
         "E0624": 6,
@@ -81,6 +81,7 @@
         "bool | String": 3,
         "HTTPConnectionPool | PyValue": 3,
         "Option<PyValue> | HTTPConnectionPool": 3,
+        "&str | Option<String>": 3,
         "IndexMap<String, &str> | Option<IndexMap<String, String>>": 3,
         "Vec<u8> | Result<Vec<u8>, PyException>": 3,
         "&Option<i64> | &i64": 3,
