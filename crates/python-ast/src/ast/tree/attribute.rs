@@ -499,7 +499,9 @@ impl<'a> CodeGen for Attribute {
             // packages.py aliasing): rython's crate is static, so the
             // registry is always empty — the read lowers to an empty dict
             // (list(sys.modules) iterates nothing, indexing misses).
-            if value_str == "sys" && self.attr == "modules" {
+            if crate::StdModule::from_name(&value_str) == Some(crate::StdModule::Sys)
+                && self.attr == "modules"
+            {
                 return Ok(quote!(PyDict::<String, stdpython::PyValue>::from([])));
             }
 

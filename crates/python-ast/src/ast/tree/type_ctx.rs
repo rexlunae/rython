@@ -1343,7 +1343,7 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             },
             // `typing.Mapping[K, V]` lowers like the bare name.
             ExprType::Attribute(a)
-                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                if matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
                     && a.attr == "Mapping" =>
             {
                 if let crate::SubscriptKind::Index(kv) = &sub.kind
@@ -1366,7 +1366,7 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             // fields `typing.Optional[str]`). One definition, so the
             // tokens resolver and the TypeInfo resolver cannot drift.
             ExprType::Attribute(a)
-                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                if matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
                     && matches!(
                         a.attr.as_str(),
                         "List" | "Dict" | "Set" | "FrozenSet" | "Tuple" | "Optional"
@@ -1405,13 +1405,15 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
         // so the tokens resolver and the TypeInfo resolver cannot drift.
         ExprType::Attribute(attr) => {
             if let ExprType::Name(n) = attr.value.as_ref() {
-                if n.id == "threading" {
+                if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Threading) {
                     return crate::ThreadingType::from_name(&attr.attr).map(TypeInfo::Threading);
                 }
-                if n.id == "socket" && attr.attr == "socket" {
+                if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Socket)
+                    && attr.attr == "socket"
+                {
                     return Some(TypeInfo::Socket);
                 }
-                if n.id == "typing" && attr.attr == "Any" {
+                if crate::is_typing(&n.id) && attr.attr == "Any" {
                     return Some(TypeInfo::PyValue);
                 }
                 if crate::is_numpy_alias(&n.id) {
@@ -2311,7 +2313,7 @@ fn subscript_container_name(sub: &crate::Subscript) -> Option<String> {
     match sub.value.as_ref() {
         ExprType::Name(n) => Some(n.id.clone()),
         ExprType::Attribute(a)
-            if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+            if matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id)) =>
         {
             Some(a.attr.clone())
         }
@@ -2375,7 +2377,7 @@ fn resolve_alias_typeinfo_inner(
             // `typing.Any` — the typing module is never in module_defs;
             // Any is the boxed value directly.
             if attr.attr == "Any"
-                && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                && matches!(attr.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
             {
                 return Some(TypeInfo::PyValue);
             }
@@ -2385,12 +2387,14 @@ fn resolve_alias_typeinfo_inner(
             // them; the tokens resolver always mapped them, so the
             // authority must too).
             if let ExprType::Name(n) = attr.value.as_ref() {
-                if n.id == "threading" {
+                if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Threading) {
                     if let Some(t) = crate::ThreadingType::from_name(&attr.attr) {
                         return Some(TypeInfo::Threading(t));
                     }
                 }
-                if n.id == "socket" && attr.attr == "socket" {
+                if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Socket)
+                    && attr.attr == "socket"
+                {
                     return Some(TypeInfo::Socket);
                 }
             }
@@ -2399,7 +2403,7 @@ fn resolve_alias_typeinfo_inner(
                 // pyOpenSSL class annotation, urllib3's WrappedSocket): the
                 // root is an external import — a boxed value.
                 if crate::root_name(&attr.value)
-                    .is_some_and(|r| r != "typing")
+                    .is_some_and(|r| !crate::is_typing(&r))
                 {
                     return Some(TypeInfo::PyValue);
                 }
@@ -2576,7 +2580,13 @@ fn resolve_alias_typeinfo_inner(
             // (`from typing_extensions import Buffer` — requests/_types.py)
             // is a boxed value.
             Some(SymbolTableNode::ImportFrom(i))
-                if matches!(i.module.as_str(), "typing" | "typing_extensions") =>
+                if matches!(
+                    crate::AnnotationModule::from_name(&i.module),
+                    Some(
+                        crate::AnnotationModule::Typing
+                            | crate::AnnotationModule::TypingExtensions
+                    )
+                ) =>
             {
                 Some(TypeInfo::PyValue)
             }
@@ -2704,7 +2714,7 @@ fn resolve_alias_typeinfo_inner(
                 }
                 ExprType::Name(n) => n.id.as_str(),
                 ExprType::Attribute(a)
-                    if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing") =>
+                    if matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id)) =>
                 {
                     match a.attr.as_str() {
                         "List" => "list",

@@ -998,7 +998,8 @@ impl<'a> CodeGen for Assign {
                 }
                 ExprType::Attribute(a) => {
                     a.attr == "modules"
-                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "sys")
+                        && matches!(a.value.as_ref(), ExprType::Name(n)
+                            if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Sys))
                 }
                 _ => false,
             };
@@ -1046,7 +1047,8 @@ impl<'a> CodeGen for Assign {
                 sub.value.as_ref(),
                 ExprType::Attribute(a)
                     if a.attr == "environ"
-                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "os")
+                        && matches!(a.value.as_ref(), ExprType::Name(n)
+                            if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Os))
                         && !crate::ast::tree::call::root_name(&a.value)
                             .is_some_and(|root| crate::module_name_shadowed(root, &symbols))
             );

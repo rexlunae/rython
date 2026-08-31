@@ -100,7 +100,8 @@ pub(crate) fn scan_argparse(
             continue;
         };
         let is_ctor = attr.attr == "ArgumentParser"
-            && matches!(attr.value.as_ref(), ExprType::Name(m) if m.id == "argparse");
+            && matches!(attr.value.as_ref(), ExprType::Name(m)
+                if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Argparse));
         if !is_ctor {
             continue;
         }
@@ -1457,7 +1458,9 @@ impl FunctionDef {
                     if let Some(t) = crate::ThreadingType::from_name(&ann.id)
                         && matches!(
                             symbols.get(&ann.id),
-                            Some(crate::SymbolTableNode::ImportFrom(i)) if i.module == "threading"
+                            Some(crate::SymbolTableNode::ImportFrom(i))
+                                if crate::StdModule::from_name(&i.module)
+                                    == Some(crate::StdModule::Threading)
                         )
                     {
                         known.insert(param.arg.clone(), format!("threading.{}", t.name()));
@@ -1487,7 +1490,9 @@ impl FunctionDef {
                 // A dotted threading annotation (`lock: threading.Lock`):
                 // same recording as above.
                 if let Some(ExprType::Attribute(ann)) = param.annotation.as_deref()
-                    && matches!(ann.value.as_ref(), ExprType::Name(m) if m.id == "threading")
+                    && matches!(ann.value.as_ref(), ExprType::Name(m)
+                        if crate::StdModule::from_name(&m.id)
+                            == Some(crate::StdModule::Threading))
                     && let Some(t) = crate::ThreadingType::from_name(&ann.attr)
                 {
                     known.insert(param.arg.clone(), format!("threading.{}", t.name()));
@@ -2044,7 +2049,7 @@ impl FunctionDef {
             Some(ExprType::Subscript(sub)) if match sub.value.as_ref() {
                 ExprType::Name(n) => matches!(n.id.as_str(), "Generator" | "Iterator"),
                 ExprType::Attribute(a) => {
-                    matches!(a.value.as_ref(), ExprType::Name(m) if m.id == "typing")
+                    matches!(a.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id))
                         && matches!(a.attr.as_str(), "Generator" | "Iterator")
                 }
                 _ => false,
@@ -3450,7 +3455,7 @@ pub(crate) fn generator_element_type(
         && match sub.value.as_ref() {
             ExprType::Name(n) => matches!(n.id.as_str(), "Generator" | "Iterator"),
             ExprType::Attribute(a) => {
-                matches!(a.value.as_ref(), ExprType::Name(m) if m.id == "typing")
+                matches!(a.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id))
                     && matches!(a.attr.as_str(), "Generator" | "Iterator")
             }
             _ => false,

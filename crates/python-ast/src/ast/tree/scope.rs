@@ -641,7 +641,8 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         // receiver: `heapq.heappush(h, x)` needs `h` mutable, mirroring
         // the bare-function branch below.
         if let ExprType::Name(m) = attr.value.as_ref() {
-            if matches!(m.id.as_str(), "heapq" | "csv")
+            if crate::StdModule::from_name(&m.id)
+                .is_some_and(|s| matches!(s, crate::StdModule::Heapq | crate::StdModule::Csv))
                 && mutates_first_arg(&attr.attr)
             {
                 if let Some(first) = call.args.first() {

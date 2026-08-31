@@ -27,14 +27,18 @@ fn is_threading_sync_call(
         ExprType::Call(call) => match call.func.as_ref() {
             ExprType::Attribute(attr) => {
                 is_sync_name(&attr.attr)
-                    && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "threading")
-                    && !crate::module_name_shadowed("threading", symbols)
+                    && matches!(attr.value.as_ref(), ExprType::Name(n)
+                        if crate::StdModule::from_name(&n.id)
+                            == Some(crate::StdModule::Threading))
+                    && !crate::module_name_shadowed(crate::StdModule::Threading.name(), symbols)
             }
             ExprType::Name(n) => {
                 is_sync_name(&n.id)
                     && matches!(
                         symbols.get(&n.id),
-                        Some(SymbolTableNode::ImportFrom(i)) if i.module == "threading"
+                        Some(SymbolTableNode::ImportFrom(i))
+                            if crate::StdModule::from_name(&i.module)
+                                == Some(crate::StdModule::Threading)
                     )
             }
             _ => false,

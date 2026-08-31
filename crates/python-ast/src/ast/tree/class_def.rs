@@ -203,7 +203,7 @@ impl ClassDef {
     pub fn is_namedtuple(&self) -> bool {        self.bases.iter().any(|b| match b {
             ExprType::Attribute(a) => {
                 a.attr == "NamedTuple"
-                    && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                    && matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
             }
             ExprType::Name(n) => n.id == "NamedTuple",
             // The CALL form (`typing.NamedTuple("Url", [...])`): the field
@@ -211,7 +211,7 @@ impl ClassDef {
             ExprType::Call(c) => match c.func.as_ref() {
                 ExprType::Attribute(a) => {
                     a.attr == "NamedTuple"
-                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
                 }
                 ExprType::Name(n) => n.id == "NamedTuple",
                 _ => false,
@@ -2284,7 +2284,9 @@ impl CodeGen for ClassDef {
                 && (matches!(
                     &kw.value,
                     ExprType::Attribute(a)
-                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "abc")
+                        if matches!(a.value.as_ref(), ExprType::Name(n)
+                            if crate::AnnotationModule::from_name(&n.id)
+                                == Some(crate::AnnotationModule::Abc))
                             && a.attr == "ABCMeta"
                 ) || matches!(&kw.value, ExprType::Name(_)));
             // TypedDict's `total=` keyword (`class _VersionReplace(
@@ -2572,7 +2574,8 @@ impl CodeGen for ClassDef {
                 }) if matches!(call.func.as_ref(), ExprType::Name(n) if n.id == "namedtuple")
                     || matches!(call.func.as_ref(), ExprType::Attribute(a)
                         if a.attr == "NamedTuple"
-                            && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")) =>
+                            && matches!(a.value.as_ref(), ExprType::Name(n)
+                                if crate::is_typing(&n.id))) =>
                 {
                     None
                 }
@@ -3974,14 +3977,19 @@ fn infer_field_type(
             }
             ExprType::Attribute(a)
                 if matches!(a.attr.as_str(), "RLock" | "Lock" | "Semaphore")
-                    && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "threading") =>
+                    && matches!(a.value.as_ref(), ExprType::Name(n)
+                        if crate::StdModule::from_name(&n.id)
+                            == Some(crate::StdModule::Threading)) =>
             {
                 Some(crate::TypeInfo::Tuple(vec![]))
             }
             // `datetime.timedelta(...)` — the stdpython timedelta struct.
             ExprType::Attribute(a)
-                if a.attr == "timedelta"
-                    && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "datetime") =>
+                if crate::DatetimeType::from_name(&a.attr)
+                    == Some(crate::DatetimeType::Timedelta)
+                    && matches!(a.value.as_ref(), ExprType::Name(n)
+                        if crate::StdModule::from_name(&n.id)
+                            == Some(crate::StdModule::Datetime)) =>
             {
                 Some(crate::TypeInfo::Custom(quote!(datetime::timedelta)))
             }
@@ -4081,7 +4089,9 @@ fn infer_field_type(
             // session_vars)` — botocore's SessionVarDict).
             ExprType::Attribute(a)
                 if matches!(a.attr.as_str(), "copy" | "deepcopy")
-                    && crate::root_name(&a.value).is_some_and(|r| r == "copy")
+                    && crate::root_name(&a.value).is_some_and(|r| {
+                        crate::StdModule::from_name(&r) == Some(crate::StdModule::Copy)
+                    })
                     && call.args.len() == 1 =>
             {
                 infer_field_type(
@@ -5180,14 +5190,14 @@ fn is_typing_base(b: &ExprType) -> bool {
         // ProxyConfig); other `typing.*` names are Generic/Protocol/
         // MutableMapping metadata.
         ExprType::Attribute(a) => {
-            matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+            matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
         }
         // The CALL form of a NamedTuple base (`typing.NamedTuple("Url",
         // [("scheme", T), ...])` — urllib3's Url) is also field metadata.
         ExprType::Call(c) => match c.func.as_ref() {
             ExprType::Attribute(a) => {
                 a.attr == "NamedTuple"
-                    && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                    && matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
             }
             ExprType::Name(n) => n.id == "NamedTuple",
             _ => false,
@@ -5230,7 +5240,10 @@ pub(crate) fn class_has_mapping_abc_base(
             ExprType::Attribute(a) => {
                 matches!(a.attr.as_str(), "MutableMapping" | "Mapping")
                     && matches!(a.value.as_ref(), ExprType::Name(n)
-                        if matches!(n.id.as_str(), "typing" | "collections" | "collections.abc"))
+                        if crate::is_typing(&n.id)
+                            || crate::StdModule::from_name(&n.id)
+                                == Some(crate::StdModule::Collections)
+                            || n.id == "collections.abc")
             }
             ExprType::Name(n) => matches!(n.id.as_str(), "MutableMapping" | "Mapping"),
             _ => false,

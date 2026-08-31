@@ -43,12 +43,10 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         StdModule::Functools => false,
         StdModule::Hashlib => false,
         StdModule::Json => false,
-        // datetime's date/datetime/timedelta are handled by
-        // render_datetime_ctor; time/timezone construct through
-        // stdpython_class (`time::new(...)` — the runtime structs).
-        StdModule::Datetime => {
-            matches!(name, "datetime" | "date" | "time" | "timedelta" | "timezone")
-        }
+        // The datetime module's classes — one typed set
+        // (DatetimeType::from_name), shared by the registry and the
+        // constructor lowering.
+        StdModule::Datetime => crate::DatetimeType::from_name(name).is_some(),
         StdModule::Os => false,
         StdModule::Pathlib => matches!(name, "PurePath" | "Path"),
         StdModule::Tempfile => {
@@ -204,10 +202,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
             matches!(name, "md5" | "sha1" | "sha256" | "sha512" | "new")
         }
         StdModule::Json => matches!(name, "dumps" | "loads" | "load" | "dump"),
-        StdModule::Datetime => matches!(
-            name,
-            "datetime" | "date" | "time" | "timedelta" | "timezone"
-        ),
+        StdModule::Datetime => crate::DatetimeType::from_name(name).is_some(),
         // os: enumerated — the runtime module has these (and only these);
         // anything else (`from os import PathLike` — annotation-only)
         // drops loudly and maps to the boxed PyValue.
@@ -299,7 +294,7 @@ pub(crate) fn import_dropped_stdpython_item(
         return false;
     };
     let first = ifm.module.split('.').next().unwrap_or("");
-    if first != "urllib" {
+    if crate::StdModule::from_name(first) != Some(crate::StdModule::Urllib) {
         return false;
     }
     let canonical = ifm
@@ -571,7 +566,9 @@ impl CodeGen for Import {
                     let runtime = crate::safe_ident(&options.stdpython);
                     match &alias.asname {
                         None => {
-                            if alias.name == "numpy" {
+                            if crate::StdModule::from_name(&alias.name)
+                                == Some(crate::StdModule::Numpy)
+                            {
                                 // `import numpy` — the name comes from the
                                 // `use stdpython::*` glob re-export.
                                 quote! {}
@@ -817,7 +814,9 @@ impl CodeGen for ImportFrom {
         debug!("ctx: {:?}", ctx);
         // annotations map to Rust types directly, so the import itself
         // lowers to nothing.
-        if self.module.split('.').next() == Some("typing") {
+        if crate::AnnotationModule::from_name(self.module.split('.').next().unwrap_or(""))
+            == Some(crate::AnnotationModule::Typing)
+        {
             return Ok(TokenStream::new());
         }
 
@@ -840,7 +839,9 @@ impl CodeGen for ImportFrom {
         // crate::dataclasses::...` would be an unresolved import. Other
         // dataclasses names are the same: nothing from the module exists
         // at runtime in the generated crate.
-        if self.module == "dataclasses" {
+        if crate::AnnotationModule::from_name(&self.module)
+            == Some(crate::AnnotationModule::Dataclasses)
+        {
             return Ok(TokenStream::new());
         }
 
@@ -1091,7 +1092,7 @@ impl CodeGen for ImportFrom {
             // the function definitions themselves, so the imports emit
             // nothing (an uncalled bare reference is then a loud
             // unresolved-name error).
-            if self.module == "functools"
+            if crate::StdModule::from_name(&self.module) == Some(crate::StdModule::Functools)
                 && matches!(
                     alias.name.as_str(),
                     "partial" | "lru_cache" | "cache" | "singledispatch"

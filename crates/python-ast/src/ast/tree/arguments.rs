@@ -153,7 +153,7 @@ pub(crate) fn is_optional_annotation(ann: &ExprType) -> bool {
             matches!(sub.value.as_ref(), ExprType::Name(n) if n.id == "Optional")
                 || matches!(sub.value.as_ref(), ExprType::Attribute(a)
                     if a.attr == "Optional"
-                        && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing"))
+                        && matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id)))
         }
         ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
             crate::is_none_expr(&op.left) || crate::is_none_expr(&op.right)
@@ -247,7 +247,7 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
                 // typing-module spelling of the same generics (urllib3's
                 // `dict[str, T] | typing.Sequence[tuple[str, T]]`).
                 ExprType::Attribute(a) => {
-                    matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "typing")
+                    matches!(a.value.as_ref(), ExprType::Name(n) if crate::is_typing(&n.id))
                         && matches!(
                             a.attr.as_str(),
                             "Tuple" | "List" | "Dict" | "Set" | "Sequence" | "Iterable"

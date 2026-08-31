@@ -319,7 +319,8 @@ fn is_sys_version_info(expr: &ExprType) -> bool {
         expr,
         ExprType::Attribute(a)
             if a.attr == "version_info"
-                && matches!(&*a.value, ExprType::Name(n) if n.id == "sys")
+                && matches!(&*a.value, ExprType::Name(n)
+                    if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Sys))
     )
 }
 

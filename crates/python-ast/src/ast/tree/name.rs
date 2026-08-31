@@ -232,7 +232,7 @@ impl CodeGen for Name {
                 // as the plain &str / i64 / tuple value, not the static.
                 // Both ssl backends expose the same LazyLock shape.
                 if path.len() == 1
-                    && path[0] == "ssl"
+                    && crate::StdModule::from_name(&path[0]) == Some(crate::StdModule::Ssl)
                     && matches!(
                         ifm.names
                             .iter()
