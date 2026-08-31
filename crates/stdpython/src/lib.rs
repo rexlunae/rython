@@ -4680,6 +4680,34 @@ impl PyContains<str> for Vec<String> {
     }
 }
 
+// A literal set/list builds as Vec<&str> (`CONTENT_DECODERS =
+// {"gzip", ...}` — urllib3's response constants); membership against an
+// owned String operand (`encoding in CONTENT_DECODERS()`) needs the
+// str/String spellings, comparing by value (round 61b).
+impl PyContains<str> for Vec<&str> {
+    fn py_contains(&self, item: &str) -> bool {
+        self.iter().any(|s| *s == item)
+    }
+}
+
+impl PyContains<String> for Vec<&str> {
+    fn py_contains(&self, item: &String) -> bool {
+        self.iter().any(|s| *s == item.as_str())
+    }
+}
+
+// A BOXED operand (`direction in ("R", "AL")` where direction is a
+// boxed Str — idna's _is_bidi): compare the &str members against the
+// Str member by value.
+impl PyContains<PyValue> for Vec<&str> {
+    fn py_contains(&self, item: &PyValue) -> bool {
+        match item {
+            PyValue::Str(s) => self.iter().any(|m| *m == s),
+            _ => false,
+        }
+    }
+}
+
 // A BOXED list's membership test against a string (`encoding_iana in
 // [specified_encoding, "ascii", "utf_8"]` where specified_encoding is
 // `str | None`, so the list boxes to Vec<PyValue> — charset_normalizer's

@@ -6693,9 +6693,26 @@ impl<'a> CodeGen for Call {
                                 &options,
                                 &symbols,
                             )?;
+                            // A None (or Option-typed) DEFAULT (`headers.get(
+                            // name, default=None)` — urllib3's getheader)
+                            // makes the result an OPTION: the Ok arm must
+                            // wrap (`Ok(v) => Some(v)`), or the arms mix
+                            // String and Option (round 61b).
+                            let default_is_none = crate::is_none_expr(&self.args[1])
+                                || crate::expr_yields_option_ctx(
+                                    &self.args[1],
+                                    &ctx,
+                                    &options,
+                                    &symbols,
+                                );
+                            let ok_arm = if default_is_none {
+                                quote!(Ok(__rython_v) => Some(__rython_v))
+                            } else {
+                                quote!(Ok(__rython_v) => __rython_v)
+                            };
                             return Ok(quote! {
                                 match #call {
-                                    Ok(__rython_v) => __rython_v,
+                                    #ok_arm,
                                     Err(__rython_e)
                                         if __rython_e.matches("KeyError") => #default,
                                     Err(__rython_e) => return Err(__rython_e),

@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 57: flat (1085). Round 58: the Option-double-wrap family (fields read into Option slots no longer nest) \u2014 1076 -> 1060."
+      "note": "The historical #137 corpus. Round 61: field_class construction stores, Mapping.get with None defaults, literal-list membership spellings (1050)."
     },
     {
       "name": "certifi",
@@ -14,7 +14,7 @@
     {
       "name": "idna",
       "requirement": "idna==3.10",
-      "note": "Round 57: mixed-arity tuple lists box as PyValue, the Union[A, B] subscript annotation resolves, and module-level tuple-unpacks promote (73)."
+      "note": "Round 61: boxed-operand membership on literal lists (64)."
     },
     {
       "name": "charset_normalizer",

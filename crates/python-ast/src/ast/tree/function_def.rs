@@ -3272,8 +3272,15 @@ pub(crate) fn expr_yields_option(
         // or an Optional-annotated parameter).
         ExprType::Name(name) => options.optional_names.contains(&name.id),
         ExprType::Call(call) => match call.func.as_ref() {
-            // dict.get(k) lowers to py_get, which returns Option<V>.
-            ExprType::Attribute(attr) => attr.attr == "get" && call.args.len() == 1,
+            // dict.get(k) lowers to py_get, which returns Option<V>; the
+            // TWO-argument form with a None default (`headers.get(name,
+            // default=None)` — urllib3's getheader/get_redirect_location)
+            // is Option too (round 61b).
+            ExprType::Attribute(attr) => {
+                attr.attr == "get"
+                    && (call.args.len() == 1
+                        || (call.args.len() == 2 && crate::is_none_expr(&call.args[1])))
+            }
             // A user function annotated `-> Optional[T]` generates
             // `Result<Option<T>, PyException>`; the call site's `?` strips
             // only the Result layer, leaving an Option.
