@@ -4725,6 +4725,17 @@ impl PyContains<&str> for HashSet<String> {
     }
 }
 
+// A literal set builds as HashSet<&str> (`{"utf_16", "utf_32"}` — the
+// set literal's elements are &'static str); the generic
+// `PyContains<T> for HashSet<T>` covers the &str operand spellings, and
+// an owned String operand (`encoding_iana in {...}` — charset_normalizer)
+// needs this String spelling, comparing by value (round 60).
+impl PyContains<String> for HashSet<&str> {
+    fn py_contains(&self, item: &String) -> bool {
+        self.iter().any(|s| *s == item.as_str())
+    }
+}
+
 impl<V> PyContains<str> for PyDict<String, V> {
     fn py_contains(&self, item: &str) -> bool {
         self.keys().any(|k| k == item)

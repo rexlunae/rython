@@ -3598,3 +3598,18 @@ fn boxed_index_by_int_projects_unpack_elements() {
     let err = stdpython::PyValue::None_.py_index(0i64).unwrap_err();
     assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'NoneType' object is not subscriptable"));
 }
+
+// A literal set's membership against an owned String operand (round 60):
+// `{"utf_16", "utf_32"}` builds as HashSet<&str> and `encoding_iana in
+// {...}` (charset_normalizer) passes an owned String — the generic
+// PyContains<T> for HashSet<T> covers the &str spellings, and the String
+// impl compares by value. Verified against python3: "utf_16" in {"utf_16"}.
+#[test]
+fn literal_set_py_contains_owned_string() {
+    use stdpython::*;
+    let s: std::collections::HashSet<&str> =
+        std::collections::HashSet::from(["utf_16", "utf_32"]);
+    assert!(s.py_contains(&"utf_16".to_string()), "a member String matches");
+    assert!(!s.py_contains(&"latin1".to_string()), "an absent String does not");
+    assert!(s.py_contains(&"utf_32"), "the &str spelling still matches");
+}
