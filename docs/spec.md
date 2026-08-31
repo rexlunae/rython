@@ -857,6 +857,22 @@ before a compiled pattern's match raises Python's exact `TypeError`
 AttributeError spelling. Sweep −16 (urllib3 978→962). Pinned in codegen
 and end-to-end (CPython-verified).
 
+Round 75 (the double-Option family): charset_normalizer's 285-error
+residual was dominated by Option<Option<T>> nests. Two roots: (1) a
+store from an IMPORTED function whose return annotation is `T | None`
+(`character_range = unicode_range(chunk)` — cd.py, where utils'
+callee returns `str | None`) Some-wrapped the already-Option result —
+`expr_yields_option` now resolves imported callees through the module
+defs and checks the defining FunctionDef's return annotation (the
+store's pass-through guard sees the Option and stops wrapping); (2) an
+@lru_cache function with an Optional key parameter
+(`lg_inclusion: Optional[str] = None`) typed the cache key as
+Option<Option<T>> — the key typing called python_annotation_to_rust_type
+(which already returns the full Option) and wrapped it again. Both
+fixed; the lru_cache hit/miss paths now type-check for Option keys.
+Sweep −47 (charset_normalizer 285→238, everything else flat). Pinned in
+codegen (imported-Option store, lru_cache Option key).
+
 ## 6. Functions
 
 ### 6.1 Signatures

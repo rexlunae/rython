@@ -15235,3 +15235,72 @@ fn option_returning_functions_wrap_plain_members_and_narrowed_reads_unwrap() {
         out
     );
 }
+
+#[test]
+fn imported_option_returning_callee_store_does_not_double_wrap() {
+    // Round 75: a local assigned from an IMPORTED function whose return
+    // annotation is `T | None` (`character_range = unicode_range(chunk)`
+    // — charset_normalizer's cd.py, where utils.unicode_range returns
+    // `str | None`) is itself the Option — the store must pass the
+    // callee's result through, never Some-wrap it again
+    // (Option<Option<String>>, the 19-error double-Option family).
+    let utils = parse(
+        "def unicode_range(character: str) -> str | None:\n\
+         \x20   return character\n",
+        "utils.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["utils".to_string()], std::rc::Rc::new(utils));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let out = compile_with_options(
+        "from .utils import unicode_range\n\
+         def f(chunk: str) -> str | None:\n\
+         \x20   character_range = unicode_range(chunk)\n\
+         \x20   if character_range is not None:\n\
+         \x20       return character_range\n\
+         \x20   return None\n",
+        "cd.py",
+        options,
+    )
+    .expect("converts");
+    assert!(
+        !out.contains("Some (unicode_range") && !out.contains("Some(unicode_range"),
+        "a store from an imported Option-returning callee must not Some-wrap: {}",
+        out
+    );
+    assert!(
+        out.contains("= unicode_range") && out.contains("return Ok (None)"),
+        "the store passes the Option through and None lowers to the member: {}",
+        out
+    );
+}
+
+#[test]
+fn lru_cache_optional_keys_stay_single_option() {
+    // Round 75: an @lru_cache function with an Optional key parameter
+    // (`lg_inclusion: Optional[str] = None` — charset_normalizer's
+    // is_unicode_range_secondary) caches on the Option: the key type was
+    // wrapped twice (Option<Option<String>>), breaking every cache hit
+    // and miss path (the 34-error charset cluster).
+    let out = compile(
+        "from functools import lru_cache\n\
+         @lru_cache(maxsize=2048)\n\
+         def f(decoded: str, lg_inclusion: str | None = None) -> str | None:\n\
+         \x20   return lg_inclusion\n",
+        "lru_opt.py",
+    );
+    assert!(
+        !out.contains("Option < Option < String > >") && !out.contains("Option<Option<String>>"),
+        "an Optional cache key must stay a single Option: {}",
+        out
+    );
+    assert!(
+        out.contains("lg_inclusion : Option < String >") || out.contains("lg_inclusion: Option<String>"),
+        "the key param is the single Option: {}",
+        out
+    );
+}
