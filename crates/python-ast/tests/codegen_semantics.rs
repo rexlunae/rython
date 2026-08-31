@@ -13428,6 +13428,62 @@ fn option_receiver_membership_unwraps_and_owns_the_key() {
 }
 
 #[test]
+fn super_method_factory_local_resolves_its_class() {
+    // Round 67: `r = super().make()` — an override assigning the BASE's
+    // result, then reading a field of it that lives on the result class's
+    // OWN base (`r.status` where the result class embeds its base — the
+    // field needs the embedded-base chain rewrite). The factory-local
+    // receiver resolution used to recognize only a bare `self` callee
+    // (`r = self.make()`); the super-callee left the local untyped, the
+    // field read emitted the bare name, and the embedded-base field was
+    // an E0615 method-not-a-field.
+    let resp = parse(
+        "class RBase:\n\
+         \x20   def __init__(self, status: int) -> None:\n\
+         \x20       self.status = status\n\
+         class Resp(RBase):\n\
+         \x20   pass\n",
+        "resp.py",
+    )
+    .unwrap();
+    let base = parse(
+        "from .resp import Resp\n\
+         class Base:\n\
+         \x20   def make(self) -> Resp:\n\
+         \x20       return Resp(200)\n\
+         class Sub(Base):\n\
+         \x20   def make(self) -> Resp:\n\
+         \x20       return super().make()\n\
+         \x20   def read(self) -> int:\n\
+         \x20       r = super().make()\n\
+         \x20       return r.status\n",
+        "base.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["resp".to_string()], std::rc::Rc::new(resp));
+    defs.insert(vec!["base".to_string()], std::rc::Rc::new(base.clone()));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    let symbols = base.clone().find_symbols(SymbolTableScopes::new());
+    let out = base
+        .to_rust(
+            CodeGenContext::Module("base".to_string()),
+            options,
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains("r . __rython_base . status") || out.contains("r.__rython_base.status"),
+        "the super-factory local's embedded-base field read must chain: {}",
+        out
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the
