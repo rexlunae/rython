@@ -14346,3 +14346,62 @@ fn module_tuple_unpack_emits_shared_rhs_static_and_typed_projections() {
         out
     );
 }
+
+#[test]
+fn option_typed_field_read_into_option_slot_does_not_double_wrap() {
+    // The retrospective's R2 double-wrap family: a field whose type is
+    // Option (`ca_cert_dir: str | None`) read into an Option-typed
+    // parameter (`ca_cert_dir=self.ca_cert_dir` — urllib3's
+    // _ssl_wrap_socket call sites) used to render `Some(self.ca_cert_dir
+    // ())` — Option<Option<String>>. The field read already IS the
+    // Option (the accessor returns it); the wrap must pass it through.
+    let out = compile(
+        concat!(
+            "class C:\n",
+            "    def __init__(self):\n",
+            "        self.ca_cert_dir: str | None = None\n",
+            "    def use(self):\n",
+            "        return take(self.ca_cert_dir)\n",
+            "def take(ca_cert_dir: str | None) -> str | None:\n",
+            "    return ca_cert_dir\n",
+        ),
+        "optfield.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("take(self.ca_cert_dir)") || flat.contains("take((self.ca_cert_dir).clone())"),
+        "an Option-typed field read must pass through an Option parameter unwrapped: {}",
+        out
+    );
+    assert!(
+        !flat.contains("Some(self.ca_cert_dir())"),
+        "the Option field must not be double-wrapped: {}",
+        out
+    );
+}
+
+#[test]
+fn option_typed_field_read_stored_into_option_local_does_not_double_wrap() {
+    // The store twin of the double-wrap family: `destination_scheme =
+    // parsed_url.scheme` where parsed_url is a Url instance and scheme
+    // is an Option<String> field — the store into the Option local
+    // (`destination_scheme` assigned None on another path) used to wrap
+    // `Some(parsed_url.scheme)` — Option<Option<String>>.
+    let out = compile(
+        concat!(
+            "class Url:\n",
+            "    def __init__(self):\n",
+            "        self.scheme: str | None = None\n",
+            "def f(parsed_url: Url) -> str | None:\n",
+            "    destination_scheme = parsed_url.scheme\n",
+            "    return destination_scheme\n",
+        ),
+        "optstore.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("destination_scheme=Some("),
+        "an Option-typed field store must not be double-wrapped: {}",
+        out
+    );
+}

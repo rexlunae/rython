@@ -595,6 +595,20 @@ reverted).
 
 ---
 
+Round 58 (the retrospective's R2 start — the Option-adaptation
+family): an OPTION-typed FIELD READ flowing into an Option slot no
+longer double-wraps. `ca_cert_dir=self.ca_cert_dir` (the field is
+`str | None`, so the accessor already returns the Option) rendered
+`Some(self.ca_cert_dir())` — `Option<Option<String>>`; the store twin
+(`destination_scheme = parsed_url.scheme` with parsed_url a Url whose
+scheme field is Option) did the same. The ctx-aware
+`expr_yields_option_ctx` predicate resolves the receiver's class — self
+fields, typed params, factory-assigned locals (`u = parse_url(url)` —
+now resolving IMPORTED factories too), and method-call receivers
+(`self.proxy().host`, resolving the accessor's field class) — and
+passes the Option through unwrapped. Pinned in both the argument and
+store positions.
+
 ## 6. Functions
 
 ### 6.1 Signatures

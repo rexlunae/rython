@@ -279,7 +279,8 @@ impl<'a> CodeGen for Assign {
         }
 
         let value_is_none_early = crate::is_none_expr(&self.value);
-        let value_yields_option = crate::expr_yields_option(&self.value, &options, &symbols);
+        let value_yields_option =
+            crate::expr_yields_option_ctx(&self.value, &ctx, &options, &symbols);
         let value_expr = self.value.clone();
         // Issue #121: a dict literal stored into a `dict[str, Any]` name
         // (whose value type is the boxed PyValue) forces the literal's

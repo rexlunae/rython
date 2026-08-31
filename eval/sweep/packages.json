@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 55: the bool-and-boxed-value fold fix and the urllib.parse calls (~1086 rustc errors). Round 56: flat (1085)."
+      "note": "The historical #137 corpus. Round 57: flat (1085). Round 58: the Option-double-wrap family (fields read into Option slots no longer nest) \u2014 1076 -> 1060."
     },
     {
       "name": "certifi",
