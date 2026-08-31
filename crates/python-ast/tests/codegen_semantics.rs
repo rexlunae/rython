@@ -13382,6 +13382,52 @@ fn unbound_builtin_str_method_applies_to_its_argument() {
 }
 
 #[test]
+fn tuple_literal_iterates_as_an_array_of_owned_strings() {
+    // Round 66: `for key in ("headers", "_proxy_headers")` (urllib3's
+    // poolmanager) — Python iterates the tuple; rython's tuple value is
+    // a Rust tuple, which is not IntoIterator (E0277). An all-constant
+    // tuple iterates as an array; STRING literals own themselves so the
+    // loop target feeds String-keyed dict calls
+    // (`request_context.pop(key, None)`).
+    let out = compile(
+        "def f(ctx: dict[str, object] | None) -> None:\n\
+         \x20   for key in (\"scheme\", \"host\"):\n\
+         \x20       ctx.pop(key, None)\n\
+         \x20   return None\n",
+        "tupleiter.py",
+    );
+    assert!(
+        out.contains("for key in [(\"scheme\") . to_string () , (\"host\") . to_string ()]")
+            || out.contains("for key in [(\"scheme\").to_string(), (\"host\").to_string()]"),
+        "the tuple iterable must become an array of owned strings: {}",
+        out
+    );
+}
+
+#[test]
+fn option_receiver_membership_unwraps_and_owns_the_key() {
+    // Round 66: `key in request_context` where request_context is
+    // `dict[str, Any] | None` (urllib3's poolmanager) — the membership
+    // READ unwraps the Option receiver with a loud §12.2 panic (CPython's
+    // TypeError on a None comparator), and a String-keyed dict owns the
+    // &str member key (the dict type is read THROUGH the Option).
+    let out = compile(
+        "def f(ctx: dict[str, object] | None, key: str) -> bool:\n    return key in ctx\n",
+        "optcontains.py",
+    );
+    assert!(
+        out.contains("not iterable"),
+        "the Option comparator must unwrap with CPython's TypeError: {}",
+        out
+    );
+    assert!(
+        out.contains("py_contains") && !out.contains("(ctx) . py_contains"),
+        "the unwrapped comparator must run the membership test: {}",
+        out
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the

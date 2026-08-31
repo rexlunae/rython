@@ -303,6 +303,24 @@ impl CodeGen for Compare {
             // behaviour (bool result) through blanket impls, while NdArray
             // overrides them to broadcast elementwise and return an array —
             // the same pattern `+` uses with PyAdd.
+            // An OPTION-typed comparator (`key in context` where context is
+            // `dict[str, Any] | None` — urllib3's poolmanager): the
+            // membership READ unwraps the Option with a loud §12.2 panic
+            // (CPython's TypeError on a None comparator), mirroring the
+            // call path's receiver_option_inner.
+            let membership_receiver = || {
+                if crate::ast::tree::attribute::receiver_option_inner(
+                    comparator_ast, &ctx, &symbols, &options,
+                )
+                .is_some()
+                {
+                    quote!((#comparator).clone().unwrap_or_else(|| {
+                        panic!("TypeError: argument of type 'NoneType' is not iterable")
+                    }))
+                } else {
+                    comparator.clone()
+                }
+            };
             let tokens = match op {
                 Compares::Eq => quote!((#left).py_eq(&(#comparator))),
                 Compares::NotEq => quote!((#left).py_ne(&(#comparator))),
@@ -343,11 +361,19 @@ impl CodeGen for Compare {
                     } else if matches!(
                         comparator_ast,
                         ExprType::Name(n)
-                            if matches!(
+                            if (matches!(
                                 options.name_types.get(&n.id),
                                 Some(crate::TypeInfo::Dict(k, _))
                                     if matches!(**k, crate::TypeInfo::String)
-                            )
+                            ) || matches!(
+                                options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Option(inner))
+                                    if matches!(
+                                        &**inner,
+                                        crate::TypeInfo::Dict(k, _)
+                                            if matches!(**k, crate::TypeInfo::String)
+                                    )
+                            ))
                     ) {
                         let left = crate::render_typed(
                             left_ast,
@@ -356,9 +382,11 @@ impl CodeGen for Compare {
                             symbols.clone(),
                             Some(crate::TypeInfo::String),
                         )?;
-                        quote!((#comparator).py_contains(&(#left)))
+                        let recv = membership_receiver();
+                        quote!((#recv).py_contains(&(#left)))
                     } else {
-                        quote!((#comparator).py_contains(&(#left)))
+                        let recv = membership_receiver();
+                        quote!((#recv).py_contains(&(#left)))
                     }
                 }
                 Compares::NotIn => {
@@ -383,11 +411,19 @@ impl CodeGen for Compare {
                     } else if matches!(
                         comparator_ast,
                         ExprType::Name(n)
-                            if matches!(
+                            if (matches!(
                                 options.name_types.get(&n.id),
                                 Some(crate::TypeInfo::Dict(k, _))
                                     if matches!(**k, crate::TypeInfo::String)
-                            )
+                            ) || matches!(
+                                options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Option(inner))
+                                    if matches!(
+                                        &**inner,
+                                        crate::TypeInfo::Dict(k, _)
+                                            if matches!(**k, crate::TypeInfo::String)
+                                    )
+                            ))
                     ) {
                         let left = crate::render_typed(
                             left_ast,
@@ -396,9 +432,11 @@ impl CodeGen for Compare {
                             symbols.clone(),
                             Some(crate::TypeInfo::String),
                         )?;
-                        quote!(!(#comparator).py_contains(&(#left)))
+                        let recv = membership_receiver();
+                        quote!(!(#recv).py_contains(&(#left)))
                     } else {
-                        quote!(!(#comparator).py_contains(&(#left)))
+                        let recv = membership_receiver();
+                        quote!(!(#recv).py_contains(&(#left)))
                     }
                 }
 
