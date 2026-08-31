@@ -4,7 +4,7 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 62: bool-fold Option operands (None-seeded locals, Option-dict or {}), Option-aware BoolOp field types (1033)."
+      "note": "The historical #137 corpus. Round 63: Option-receiver subscript stores unwrap + own (1033 -> 1029)."
     },
     {
       "name": "certifi",

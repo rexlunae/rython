@@ -13249,6 +13249,60 @@ fn option_dict_or_empty_dict_folds_the_option_arm() {
 }
 
 #[test]
+fn option_receiver_subscript_store_unwraps_and_owns() {
+    // Round 63: `headers["k"] = "v"` where headers is `Mapping[str, str]
+    // | None` (urllib3's RequestMethods — guaranteed non-None after the
+    // `if headers is None:` fill): the subscript STORE unwraps the Option
+    // receiver with a loud §12.2 panic (CPython's TypeError on a None
+    // receiver), and the String-keyed dict owns both the index literal and
+    // the str-literal value (the receiver dict type is read THROUGH the
+    // Option). The boxed-value twin (`dict[str, Any] | None` —
+    // poolmanager's request_context) wraps the stored member in
+    // PyValue::from.
+    let out = compile(
+        "def f(headers: dict[str, str] | None) -> None:\n    headers[\"k\"] = \"v\"\n    return None\n",
+        "optstore.py",
+    );
+    assert!(
+        out.contains("as_mut () . unwrap_or_else")
+            || out.contains("as_mut().unwrap_or_else"),
+        "the Option receiver must unwrap with the loud panic: {}",
+        out
+    );
+    assert!(
+        out.contains("does not support item assignment"),
+        "the panic must carry CPython's TypeError message: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"k\") . to_string ()") || out.contains("(\"k\").to_string()"),
+        "the index literal must be owned: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"v\") . to_string ()") || out.contains("(\"v\").to_string()"),
+        "the str-literal value must be owned: {}",
+        out
+    );
+
+    let out2 = compile(
+        "def g(ctx: dict[str, object] | None) -> None:\n    ctx[\"blocksize\"] = 10\n    return None\n",
+        "optstore2.py",
+    );
+    assert!(
+        out2.contains("PyValue :: from (10)") || out2.contains("PyValue::from(10)"),
+        "the member of a boxed-valued dict must wrap: {}",
+        out2
+    );
+    assert!(
+        out2.contains("(\"blocksize\") . to_string ()")
+            || out2.contains("(\"blocksize\").to_string()"),
+        "the boxed-valued dict's index must be owned: {}",
+        out2
+    );
+}
+
+#[test]
 fn option_lhs_compare_unwraps_with_equality_semantics() {
     // Round 43: `amt != 0` where amt is `int | None` (urllib3's
     // _read_next_chunk) — the Option LHS unwraps the inner for the

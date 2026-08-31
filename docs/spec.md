@@ -660,6 +660,27 @@ approximation — the truthy arm is a boxed value that cannot convert to
 String without a silent guess, and CPython itself raises AttributeError
 on the falsy-None path (`None.strip("[]")`).
 
+Round 63: a SUBSCRIPT STORE through an Option-typed receiver
+(`headers["k"] = v` where headers is `Mapping[str, str] | None` —
+urllib3's RequestMethods; `request_context["blocksize"] =
+_DEFAULT_BLOCKSIZE` where request_context is `dict[str, Any] | None` —
+poolmanager) emitted `(#receiver).py_set_index(...)` on the raw Option
+(E0599 ×4). The store now unwraps the Option receiver the same way the
+read/call paths do (`as_mut().unwrap_or_else(panic)`, with CPython's
+`TypeError: 'NoneType' object does not support item assignment` — the
+receiver is guaranteed non-None after the `if x is None:` fill), and the
+receiver's DICT TYPE is read THROUGH the Option so the String-keyed
+index owning fires, the stored member of a `PyDict<String, PyValue>`
+boxes in PyValue::from, and a str literal into a `PyDict<String,
+String>` owns itself. The copy() family was attempted in the same
+window but REVERTED: `x.copy()` on dict receivers (7 sites, −4 E0599)
+unmasked a +12 cascade in poolmanager's _default_key_normalizer — the
+copy's success types the `context` local, surfacing the boxed-PyValue
+method gaps (py_index → PyValue → .lower(), PyValue::from(Option)) that
+the never-type had masked. The copy arm returns when that boxed family
+lands; the E0599s stay loud (§12.1). Sweep −4 (urllib3 1033→1029).
+Pinned in both the plain and boxed-valued shapes.
+
 ## 6. Functions
 
 ### 6.1 Signatures
