@@ -1,18 +1,17 @@
 {
-  "rypip_commit": "a4d1bd9",
+  "rypip_commit": "664b8b4",
   "rypip_path": "/Users/tserica/rython/target/debug/rypip",
-  "elapsed_seconds": 369.3,
+  "elapsed_seconds": 1173.5,
   "packages": {
     "urllib3": {
       "total": 997,
       "histogram": {
-        "E0308": 456,
+        "E0308": 462,
         "E0599": 211,
         "E0277": 151,
         "E0609": 93,
         "E0061": 33,
         "E0605": 8,
-        "E0615": 8,
         "E0618": 7,
         "E0624": 6,
         "E0282": 5,
@@ -20,6 +19,7 @@
         "E0369": 4,
         "E0067": 3,
         "E0223": 3,
+        "E0615": 2,
         "E0382": 2,
         "E0425": 1,
         "E0433": 1,
@@ -37,6 +37,7 @@
         "i64 | Option<i64>": 10,
         "Option<Socket> | PyValue": 9,
         "PyValue | PyException": 9,
+        "String | Option<String>": 7,
         "Option<String> | String": 7,
         "&Option<i64> | &{integer}": 7,
         "PyException | PyValue": 6,
@@ -177,7 +178,6 @@
         "&Url | (_, _, _, _, _, _, _)": 1,
         "&[u8] | &PyValue": 1,
         "&str | (&str, &str)": 1,
-        "String | Option<String>": 1,
         "bool | Result<bool, PyException>": 1
       },
       "package": "urllib3",

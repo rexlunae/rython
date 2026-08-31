@@ -1,18 +1,18 @@
 {
-  "rypip_commit": "1e2e8f0",
+  "rypip_commit": "a4d1bd9",
   "rypip_path": "/Users/tserica/rython/target/debug/rypip",
-  "elapsed_seconds": 372.6,
+  "elapsed_seconds": 369.3,
   "packages": {
     "urllib3": {
-      "total": 999,
+      "total": 997,
       "histogram": {
         "E0308": 456,
         "E0599": 211,
         "E0277": 151,
         "E0609": 93,
         "E0061": 33,
-        "E0615": 10,
         "E0605": 8,
+        "E0615": 8,
         "E0618": 7,
         "E0624": 6,
         "E0282": 5,

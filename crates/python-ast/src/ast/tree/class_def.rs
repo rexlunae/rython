@@ -527,14 +527,20 @@ impl ClassDef {
     /// Whether the class defines a property getter named `name` (a
     /// `@property def name` or the getter half of a pair) — used to route
     /// attribute READS to the getter method call.
-    pub fn has_property_getter(&self, name: &str) -> bool {
-        self.methods().any(|m| {
-            m.name == name
-                && m.decorator_list.iter().any(|d| match d {
-                    ExprType::Name(n) => n.id == "property",
-                    ExprType::Attribute(a) => a.attr == "property",
-                    _ => false,
-                })
+    pub fn has_property_getter(&self, name: &str, symbols: &SymbolTableScopes) -> bool {
+        // A property defined on a BASE class is a property of the derived
+        // class too (`self.host` on HTTPSConnection, whose `host`
+        // property HTTPConnection defines): the read routes to the getter
+        // call either way.
+        self.base_chain(symbols).iter().any(|c| {
+            c.methods().any(|m| {
+                m.name == name
+                    && m.decorator_list.iter().any(|d| match d {
+                        ExprType::Name(n) => n.id == "property",
+                        ExprType::Attribute(a) => a.attr == "property",
+                        _ => false,
+                    })
+            })
         })
     }
 

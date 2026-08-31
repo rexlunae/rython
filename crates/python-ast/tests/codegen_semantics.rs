@@ -13582,6 +13582,32 @@ fn construction_call_property_read_resolves_imported_classes_too() {
 }
 
 #[test]
+fn inherited_property_read_routes_to_the_getter() {
+    // Round 69: `self.host` where `host` is a @property of a BASE class
+    // (read from a derived method — the property check used to look at
+    // the derived class's own methods only, so the read emitted the bare
+    // name and the getter METHOD was an E0615 method-not-a-field). The
+    // property check now walks the base chain.
+    let out = compile(
+        "class Base:\n\
+         \x20   def __init__(self, host: str | None) -> None:\n\
+         \x20       self._host = host\n\
+         \x20   @property\n\
+         \x20   def host(self) -> str | None:\n\
+         \x20       return self._host\n\
+         class Derived(Base):\n\
+         \x20   def f(self) -> str | None:\n\
+         \x20       return self.host\n",
+        "inhprop.py",
+    );
+    assert!(
+        out.contains("(self . host () ?)") || out.contains("(self.host()?)"),
+        "the inherited property read must route to the getter: {}",
+        out
+    );
+}
+
+#[test]
 fn local_from_another_objects_option_field_is_option() {
     // Round 68: `destination_scheme = parsed_url.scheme` (a `str | None`
     // field of a factory-local object), then passed to a `str | None`
