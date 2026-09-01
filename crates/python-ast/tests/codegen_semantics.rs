@@ -15448,4 +15448,21 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "a comprehension target must keep the outer narrowing: {}",
         out6
     );
+    // Devin review on #285 (2nd pass): a walrus in a def DEFAULT or a
+    // class BASE in the else rebinds the guarded name.
+    let out7 = compile(
+        "def d(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       def g(y=(x := None)):\n\
+         \x20           return y\n\
+         \x20   return \"b\"\n",
+        "none_defdefault.py",
+    );
+    assert!(
+        !out7.contains("clone () . unwrap ()") && !out7.contains("clone().unwrap()"),
+        "a walrus in a nested def default must discard the narrowing: {}",
+        out7
+    );
 }

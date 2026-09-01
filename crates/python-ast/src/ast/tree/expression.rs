@@ -793,6 +793,54 @@ impl Node for Expr {
 mod tests {
     use super::*;
 
+    /// The is-None narrowing's write detection (Devin review on #285):
+    /// a walrus in a nested def DEFAULT or a class KEYWORD rebinds the
+    /// guarded name; a comprehension TARGET does not.
+    #[test]
+    fn narrowing_write_detection_covers_def_and_class_headers() {
+        let stmts = |src: &str| {
+            crate::parse(src, "t.py")
+                .unwrap()
+                .raw
+                .body
+        };
+        // `def g(y=(x := None))` in the else: the default evaluates in
+        // the enclosing scope and rebinds x.
+        let def_body = stmts(
+            "def d(x: str | None) -> str:\n\
+             \x20   if x is None:\n\
+             \x20       return \"a\"\n\
+             \x20   else:\n\
+             \x20       def g(y=(x := None)):\n\
+             \x20           return y\n\
+             \x20   return \"b\"\n",
+        );
+        let outer_def = match &def_body[0].statement {
+            crate::StatementType::FunctionDef(f) => f,
+            _ => panic!("expected the outer def"),
+        };
+        let guard = match &outer_def.body[0].statement {
+            crate::StatementType::If(i) => i,
+            _ => panic!("expected the if guard"),
+        };
+        assert!(guard.orelse.iter().any(|b| super::stmt_writes_name(b, "x")),
+            "a walrus in a nested def default rebinds x");
+        // A comprehension target does NOT rebind the enclosing scope.
+        let comp = stmts("def c(x: str | None) -> str:\n\x20   y = [z for z in x]\n\x20   return \"b\"\n");
+        let c_def = match &comp[0].statement {
+            crate::StatementType::FunctionDef(f) => f,
+            _ => panic!("expected the def"),
+        };
+        let assign = match &c_def.body[0].statement {
+            crate::StatementType::Assign(a) => a,
+            _ => panic!("expected the assign"),
+        };
+        assert!(!super::expr_walrus_binds(&assign.value, "x"),
+            "a comprehension target does not rebind x");
+        assert!(!super::expr_writes_name(&assign.value, "x"),
+            "a comprehension target is not an outer write");
+    }
+
     #[test]
     fn check_call_expression() {
         let expression = crate::parse("test()", "test.py").unwrap();
@@ -1142,7 +1190,7 @@ pub fn isinstance_narrowing(
 /// targets anywhere inside an expression (`y = (x := 1)` rebinds x).
 /// Attribute and subscript stores do NOT rebind the name — they mutate
 /// the object (Devin review on #283/#284).
-fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
+pub(crate) fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
     match &stmt.statement {
         crate::StatementType::Assign(a) => {
             a.targets.iter().any(|t| expr_writes_name(t, name))
@@ -1211,22 +1259,60 @@ fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
                     .any(|b| stmt_writes_name(b, name))
         }
         crate::StatementType::Import(im) => im.names.iter().any(|a| {
-            a.asname.as_deref() == Some(name) || a.name == name
+            a.asname.as_deref() == Some(name)
+                // An unaliased `import x.y` binds the FIRST segment `x`
+                // (Devin review on #285).
+                || a.name == name
+                || a.name.split('.').next() == Some(name)
         }),
         crate::StatementType::ImportFrom(im) => im.names.iter().any(|a| {
             a.asname.as_deref() == Some(name) || a.name == name
         }),
         crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+            // Everything the ENCLOSING scope evaluates when the def runs:
+            // decorators, parameter defaults, parameter annotations, and
+            // the return annotation (the body runs in its own scope — not
+            // inspected).
+            let args = &f.args;
+            let param_parts = || {
+                args.posonlyargs
+                    .iter()
+                    .chain(args.args.iter())
+                    .chain(args.kwonlyargs.iter())
+                    .chain(args.vararg.iter())
+                    .chain(args.kwarg.iter())
+            };
             f.name == name
                 || f.decorator_list
                     .iter()
                     .any(|d| expr_walrus_binds(d, name))
+                || param_parts().any(|p| {
+                    p.annotation
+                        .as_deref()
+                        .is_some_and(|a| expr_walrus_binds(a, name))
+                })
+                || args.defaults.iter().any(|d| expr_walrus_binds(d, name))
+                || args
+                    .kw_defaults
+                    .iter()
+                    .flatten()
+                    .any(|d| expr_walrus_binds(d, name))
+                || f.returns
+                    .as_deref()
+                    .is_some_and(|r| expr_walrus_binds(r, name))
         }
         crate::StatementType::ClassDef(c) => {
+            // The class HEADER's expressions evaluate in the enclosing
+            // scope: decorators, bases, and keyword values (the body runs
+            // in its own scope — not inspected).
             c.name == name
                 || c.decorator_list
                     .iter()
                     .any(|d| expr_walrus_binds(d, name))
+                || c.bases.iter().any(|b| expr_walrus_binds(b, name))
+                || c.keywords
+                    .iter()
+                    .any(|k| expr_walrus_binds(&k.value, name))
         }
         crate::StatementType::Assert { test, msg } => {
             expr_walrus_binds(test, name)
