@@ -1055,6 +1055,37 @@ itself: the round-83 unwrap would break the Ok-arm match
 (Option-field aug-add inner; Option field value into a concrete slot;
 mapping-get Option default stays Option).
 
+Round 84 (a None-stored local into a BOXED-class parameter unwraps with
+Python's None passing through): urllib3's `urlopen` binds `conn = None`
+then `conn = self._get_conn(...)`, and passes the local to
+`self._prepare_proxy(conn)` / `self._put_conn(conn)` — methods whose
+parameter annotation is a TYPE_CHECKING-imported Protocol stub
+(`BaseHTTPConnection`, `BaseHTTPSConnection` — imported only for
+typing). The syntax-only annotation mapping cannot see a class name, so
+the argument rendered RAW: the `Option<PyValue>` binding went straight
+into the `PyValue`-typed parameter (the `PyValue | Option<PyValue>`
+family, ×18 — the frontier's top residual). The argument-side expected
+type now falls back to the symbols-aware authority
+(`resolve_alias_typeinfo` — the same resolution the parameter's Rust
+type used), so an OPTION-typed argument coerces `Option<PyValue> →
+PyValue` via `unwrap_or(PyValue::None_)` — Python's None IS the boxed
+None, no panic needed (the round-83 `Option→concrete` panic is for
+concrete members; the boxed slot absorbs the empty case). The coercion
+is gated three ways so it cannot misfire: only OPTION-typed arguments
+(a plain class-instance argument keeps its loud raw mismatch — the
+`err: _TYPE_TIMEOUT` sites would otherwise box through `PyValue::from`,
+which has no From for a class); only unannotated names (an ANNOTATED
+name's PyValue-ness is authoritative — `body: _TYPE_BODY | None` and
+`chunks: Iterable[bytes] | None` put their None INSIDE the box, so the
+fabricated Option-unwrap would be a wrong `unwrap_or` on a plain
+PyValue); and the `X | None`-form parameter branch (a union that boxes)
+takes the same unwrap for its present Option-typed arguments. Sweep −18
+(urllib3 868→853 with `PyValue | Option<PyValue>` 30→12; charset
+180→177 with `CharsetMatch | Option<CharsetMatch>` 3→0 — the same
+None-stored-local family; idna/certifi/requests flat — 1124→1106).
+Pinned in codegen (a None-stored local into a boxed-class parameter
+unwraps).
+
 ## 6. Functions
 
 ### 6.1 Signatures

@@ -1084,18 +1084,31 @@ pub fn render_typed(
     // (Python fails at use on a None value, rython at the conversion —
     // mirroring the return site). The inner conversion reuses the same
     // coercion: identity for the matching member, and a genuine inner
-    // mismatch stays a loud rustc error. Excludes Option/PyValue/
-    // StrOrBytes slots — the empty case is their legitimate value.
-    let actual = if matches!(actual, crate::TypeInfo::PyObject)
-        && !matches!(
-            expected,
-            crate::TypeInfo::Option(_)
-                | crate::TypeInfo::PyValue
-                | crate::TypeInfo::StrOrBytes
-        )
-        && crate::ast::tree::function_def::expr_yields_option_ctx(
-            expr, &ctx, &options, &symbols,
-        )
+    // mismatch stays a loud rustc error. Excludes Option/StrOrBytes
+    // slots — the empty case is their legitimate value. Round 84: a
+    // PYVALUE slot also coerce — a None-then-assigned name whose
+    // binding is `Option<PyValue>` (urllib3's `conn`) into a
+    // PyValue-annotated parameter (`_prepare_proxy(conn:
+    // BaseHTTPConnection)` — the TYPE_CHECKING stub resolves to the
+    // boxed value): `Option<PyValue> → PyValue` unwraps via
+    // `unwrap_or(PyValue::None_)` — Python's None passes through
+    // exactly, no panic needed.
+    let actual = if crate::ast::tree::function_def::expr_yields_option_ctx(
+        expr, &ctx, &options, &symbols,
+    ) && !matches!(expr, ExprType::Name(n)
+        // An ANNOTATED name's PyValue/PyObject answer is authoritative:
+        // its annotation resolved to the boxed value (`body: _TYPE_BODY |
+        // None` — urllib3's urlopen param; `chunks: Iterable[bytes] |
+        // None` — the annotated local), where the None is INSIDE the box,
+        // so the fabricated Option-unwrap must not fire on it. Only an
+        // UNANNOTATED None-stored local (`conn = None` then `conn = ...`
+        // — declare-then-fill) has the Option binding the unwrap targets.
+        if options.local_types.contains_key(&n.id)
+            || options.annotated_names.contains(&n.id))
+        && !matches!(expected, crate::TypeInfo::Option(_) | crate::TypeInfo::StrOrBytes)
+        && (matches!(actual, crate::TypeInfo::PyObject)
+            || (matches!(actual, crate::TypeInfo::PyValue)
+                && matches!(expected, crate::TypeInfo::PyValue)))
     {
         crate::TypeInfo::Option(Box::new(expected.clone()))
     } else {

@@ -278,6 +278,13 @@ pub struct PythonOptions {
     /// some path, or annotated Optional): non-None stores into them wrap
     /// in Some. Set per scope by the function/module generators.
     pub optional_names: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Names whose type came from an ANNOTATION (an annotated local
+    /// `chunks: Iterable[bytes] | None`, or an annotated parameter): their
+    /// PyValue/PyObject-ness is authoritative (a `X | None` union that
+    /// boxes has its None INSIDE the box), so the round-84 Option-unwrap
+    /// for assignment-derived Option bindings must not fire on them. Set
+    /// per scope by the function generator's analysis pass.
+    pub annotated_names: std::rc::Rc<std::collections::HashSet<String>>,
     /// Names whose Option-ness is statically narrowed away at the CURRENT
     /// point (issue #125): inside `if x is not None:`, and after an if/else
     /// where both branches leave x holding a non-None value. Reads of a
@@ -612,6 +619,7 @@ impl Default for PythonOptions {
                 std::collections::HashMap::new()
             )),
             optional_names: std::rc::Rc::new(std::collections::HashSet::new()),
+            annotated_names: std::rc::Rc::new(std::collections::HashSet::new()),
             narrowed_names: std::rc::Rc::new(std::collections::HashMap::new()),
             dict_forced_kv: std::rc::Rc::new(None),
             fn_return_list_elt: std::rc::Rc::new(None),

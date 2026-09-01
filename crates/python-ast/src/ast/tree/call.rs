@@ -9584,17 +9584,32 @@ fn map_call_arguments_inner(
                 if crate::is_none_expr(expr) {
                     return Ok(quote!(stdpython::PyValue::None_));
                 }
-                // A present argument renders RAW: a PyValue passes
-                // through (the param IS the boxed value), while a class
-                // instance stays a loud mismatch (the boxed value cannot
-                // hold one) — the coercion would only move the error
-                // kind, not fix it.
+                // A present argument: an OPTION-typed value (a None-
+                // stored local like `conn` — urllib3's urlopen, whose
+                // `_put_conn(conn: BaseHTTPConnection | None)` param
+                // boxes to PyValue) unwraps to the boxed value with
+                // Python's None passing through as PyValue::None_ — the
+                // boxed slot IS the None-able value (round 84). A plain
+                // PyValue passes through (the param IS the boxed value),
+                // while a class instance stays a loud mismatch (the boxed
+                // value cannot hold one) — the coercion would only move
+                // the error kind, not fix it.
+                let arg_is_option = matches!(expr, ExprType::Name(n)
+                    if options.optional_names.contains(&n.id))
+                    || matches!(
+                        crate::infer_type(expr, &options, &symbols),
+                        crate::TypeInfo::Option(_)
+                    );
                 return crate::render_typed_reused(
                     expr,
                     ctx.clone(),
                     options.clone(),
                     symbols.clone(),
-                    None,
+                    if arg_is_option {
+                        Some(crate::TypeInfo::PyValue)
+                    } else {
+                        None
+                    },
                 );
             }
             // Round 81 (the generics directive): an `X | None`-annotated
@@ -9720,6 +9735,50 @@ fn map_call_arguments_inner(
                 .annotation
                 .as_deref()
                 .and_then(crate::call_arg_expected_type)
+                .or_else(|| {
+                    // Round 84: a CLASS-name annotation the syntax-only
+                    // mapping cannot see (`conn: BaseHTTPConnection` — a
+                    // TYPE_CHECKING Protocol stub imported for typing, so
+                    // the codegen resolves the parameter to the boxed
+                    // PyValue): the symbols-aware authority answers the
+                    // same way the parameter's Rust type was resolved, so
+                    // an OPTION-typed argument coerces (`Option<PyValue> →
+                    // PyValue` via unwrap_or(None_) — Python's None passes
+                    // through exactly — urllib3's
+                    // `self._prepare_proxy(conn)` where `conn` is
+                    // None-then-assigned, ×7). Gated on the OPTION-typed
+                    // argument: a plain class-instance argument must keep
+                    // the pre-existing raw render (a loud rustc mismatch),
+                    // not box through `PyValue::from` (no such From for a
+                    // class — an E0277 shift at the `err: _TYPE_TIMEOUT`
+                    // sites). Skips an annotation the syntax-only mapping
+                    // ALREADY answers (`str` → call_arg_expected_type
+                    // deliberately returns None so literals pass as &str
+                    // into the `impl Into<String>` parameter).
+                    param.annotation.as_deref().and_then(|ann| {
+                        if crate::annotation_type_info(ann).is_some() {
+                            return None;
+                        }
+                        // The argument must be an OPTION-typed value: a
+                        // None-then-assigned NAME (`conn` — urllib3's
+                        // urlopen, whose infer_type answers the boxed
+                        // PyValue while the BINDING is Option<PyValue>) or
+                        // an inferred Option. A plain class-instance
+                        // argument must keep the pre-existing raw render
+                        // (a loud rustc mismatch), not box through
+                        // `PyValue::from` (no such From for a class — an
+                        // E0277 shift at the `err: _TYPE_TIMEOUT` sites).
+                        let arg_is_option = matches!(
+                            crate::infer_type(expr, &options, &symbols),
+                            crate::TypeInfo::Option(_)
+                        ) || matches!(expr, ExprType::Name(n)
+                            if options.optional_names.contains(&n.id));
+                        if !arg_is_option {
+                            return None;
+                        }
+                        crate::resolve_alias_typeinfo(ann, symbols, options)
+                    })
+                })
                 .or_else(|| {
                     // A None-defaulted unannotated parameter whose VALUE is
                     // used in the callee (`retryable_exceptions=None`
