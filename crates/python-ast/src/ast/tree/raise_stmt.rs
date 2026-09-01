@@ -440,6 +440,48 @@ fn exception_value(
                     };
                     return Ok(quote!(PyException::new(#kind, #msg)));
                 }
+                // Round 82: a raise of a name imported from an EXTERNAL
+                // module (`raise ResponseNotReady()` — http.client, which
+                // urllib3 imports; `raise RemoteDisconnected()`) that is
+                // NOT resolvable as an in-crate class: the exception model
+                // is string-tagged, so the class NAME is the exception's
+                // runtime value — construct the tagged PyException. The
+                // previous fall-through dropped the raise to the boxed
+                // None (the call into an external module), silently
+                // replacing a raised exception with a returned value
+                // (E0308 `PyException | PyValue` on every handler).
+                if crate::ast::tree::import::resolves_to_external_import(
+                    &name.id,
+                    &options,
+                    &symbols,
+                ) {
+                    let kind = &name.id;
+                    let msg = match call.args.len() {
+                        0 => quote!(String::new()),
+                        1 => {
+                            let arg = message_arg(&call.args[0], ctx, options, symbols)?;
+                            quote!(format!("{}", #arg))
+                        }
+                        _ => {
+                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = call
+                                .args
+                                .iter()
+                                .map(|a| {
+                                    message_arg(
+                                        a,
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )
+                                })
+                                .collect();
+                            let args = args?;
+                            let fmt = vec!["{}"; args.len()].join(", ");
+                            quote!(format!(#fmt, #(#args),*))
+                        }
+                    };
+                    return Ok(quote!(PyException::new(#kind, #msg)));
+                }
                 if is_exception_class_name(&name.id)
                     || resolved_is_exception_class(&name.id, &options, &symbols)
                 {

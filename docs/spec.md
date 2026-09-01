@@ -991,6 +991,34 @@ double-fire on the narrowed read. Sweep −25 (urllib3 931→911, idna
 (four round-81 pins: and-chain narrowing, boxed-value return, boxed
 argument into a concrete optional slot, reused boxed name store).
 
+Round 82 (external-module return annotations box; inherited-field
+stores use the base-most owner): three families in urllib3. (1) A
+function whose return annotation is an EXTERNAL-module class
+(`-> ssl.SSLSocket`, `-> logging.StreamHandler`) previously resolved to
+NOTHING — the function silently typed `()` while its body returned a
+value, so every caller of the return mismatched (the `() | PyValue`
+family, 11 sites). The return-annotation path now falls back to the
+symbols-aware authority (`resolve_alias_typeinfo`), which resolves the
+external import to the boxed PyValue (the external-object divergence);
+the body's value converts back via the round-81 `.into()`. (2) A raise
+of a name imported from an EXTERNAL module (`raise ResponseNotReady()`
+— http.client) dropped to the boxed None (the external-module call
+divergence), silently replacing a raised exception with a returned
+value (`PyException | PyValue` on every handler); the string-tagged
+exception model now constructs the tagged PyException from the class
+name. (3) Field STORES on an INHERITED field (`self.is_verified =
+sock_and_verified.is_verified` in HTTPSConnection, where the field
+lives on base HTTPConnection) consulted the DERIVED class's own
+`infer_fields` — which joined the boxed member read to PyValue — and
+wrapped in `PyValue::from` against the struct's real `bool` field
+(`bool | PyValue`). The store-side field-type helpers
+(`attr_field_is_pyvalue`/`_is_option`/`_concrete_type`) now resolve the
+BASE-MOST class in the chain that assigns the field (its struct is the
+ground truth) and convert boxed values into concrete inherited fields
+via `.into()`. Sweep −25 (urllib3 911→887, charset 181→180, requests/idna/
+certifi flat). Pinned in codegen (external-module return annotation
+boxes; boxed value into a concrete inherited field converts).
+
 ## 6. Functions
 
 ### 6.1 Signatures

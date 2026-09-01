@@ -450,8 +450,32 @@ impl<'a> CodeGen for Assign {
             else {
                 return false;
             };
-            class
-                .infer_fields(&class_symbols, &options)
+            // The OWNER class's field type (the struct's ground truth):
+            // HTTPSConnection's `is_verified` is owned by base
+            // HTTPConnection (bool), and the derived class's own
+            // infer_fields must not report it as a boxed PyValue (its
+            // methods store the boxed member read into the inherited
+            // field). The BASE-MOST class in the chain that assigns the
+            // field is where the struct declares it.
+            let chain = class.base_chain_with_options(&class_symbols, &options);
+            let owner = chain
+                .iter()
+                .rev()
+                .find(|c| c.owns_field(&attr.attr))
+                .cloned()
+                .unwrap_or_else(|| class.clone());
+            let owner_symbols = if owner.name == class.name {
+                class_symbols
+            } else {
+                // The owner's defining module's symbols, when it is a
+                // same-crate class (the base chain resolves it).
+                match symbols.get(&owner.name) {
+                    Some(crate::SymbolTableNode::ClassDef(_)) => symbols.clone(),
+                    _ => class_symbols,
+                }
+            };
+            owner
+                .infer_fields(&owner_symbols, &options)
                 .ok()
                 .and_then(|fields| {
                     fields
@@ -478,8 +502,24 @@ impl<'a> CodeGen for Assign {
             else {
                 return false;
             };
-            class
-                .infer_fields(&class_symbols, &options)
+            // The BASE-MOST owner's field type (the struct's ground
+            // truth), like the concrete-type helper: a derived class's own
+            // infer_fields may report a boxed PyValue where the inherited
+            // field is `Option<T>`.
+            let chain = class.base_chain_with_options(&class_symbols, &options);
+            let owner = chain
+                .iter()
+                .rev()
+                .find(|c| c.owns_field(&attr.attr))
+                .cloned()
+                .unwrap_or_else(|| class.clone());
+            let owner_symbols = if owner.name == class.name {
+                class_symbols
+            } else {
+                symbols.clone()
+            };
+            owner
+                .infer_fields(&owner_symbols, &options)
                 .ok()
                 .and_then(|fields| {
                     fields
@@ -488,6 +528,67 @@ impl<'a> CodeGen for Assign {
                         .map(|(_, ty)| matches!(ty, crate::TypeInfo::Option(_)))
                 })
                 .unwrap_or(false)
+        };
+        // Round 81 (the generics directive): the CONCRETE member type of a
+        // field, when the field's class-table type is a boxable concrete
+        // member (Int/Float/Bool/String/Bytes) rather than the boxed
+        // PyValue or an Option. A store of a boxed value into such a field
+        // converts via `.into()`; anything else (unknown field type,
+        // unboxable container) returns None so the plain store keeps its
+        // loud rustc error.
+        //
+        // The type comes from the class that OWNS the field (`field_class`
+        // walks the base chain): HTTPSConnection's `is_verified` is owned
+        // by base HTTPConnection (bool), while the DERIVED class's own
+        // `infer_fields` may report PyValue (a boxed member stored into
+        // it in a derived method). The owner's type is the struct's
+        // ground truth.
+        let attr_field_concrete_type = |target: &ExprType| -> Option<crate::TypeInfo> {
+            let ExprType::Attribute(attr) = target else {
+                return None;
+            };
+            let Some((class, class_symbols)) =
+                crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+            else {
+                return None;
+            };
+            // The OWNER class: the BASE-MOST class in the chain that
+            // assigns the field (its struct declares it) — HTTPSConnection
+            // inherits `is_verified` from HTTPConnection, and the derived
+            // class's own infer_fields may report a boxed PyValue where
+            // the struct says bool. Fall back to the receiver class when
+            // the field is not inherited.
+            let chain = class.base_chain_with_options(&class_symbols, &options);
+            let owner_class = chain
+                .iter()
+                .rev()
+                .find(|c| c.owns_field(&attr.attr))
+                .cloned()
+                .unwrap_or_else(|| class.clone());
+            let owner_symbols = if owner_class.name == class.name {
+                class_symbols
+            } else {
+                symbols.clone()
+            };
+            owner_class
+                .infer_fields(&owner_symbols, &options)
+                .ok()
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == &attr.attr)
+                        .map(|(_, ty)| ty.clone())
+                })
+                .filter(|t| {
+                    matches!(
+                        t,
+                        crate::TypeInfo::Int
+                            | crate::TypeInfo::Float
+                            | crate::TypeInfo::Bool
+                            | crate::TypeInfo::String
+                            | crate::TypeInfo::Bytes
+                    )
+                })
         };
         // A container of string literals stored into a field whose inferred
         // type is an OWNED String container (issue #229: `self.items =
@@ -1005,6 +1106,24 @@ impl<'a> CodeGen for Assign {
                 // _count_suspicious).
                 ExprType::Attribute(_) if stored_name_needs_clone => {
                     quote!(#target_code = (#value).clone();)
+                }
+                // Round 81 (the generics directive): a BOXED value stored
+                // into a CONCRETE-typed FIELD (`self.is_verified =
+                // sock_and_verified.is_verified` — a bool field receiving
+                // the boxed namedtuple member) converts via the reverse
+                // From<PyValue> impls — `(#value).into()` recovers the
+                // member, and a wrong member is a LOUD TypeError panic
+                // (Python fails at use, rython at the conversion).
+                ExprType::Attribute(_)
+                    if attr_field_concrete_type(target).is_some()
+                        && matches!(
+                            crate::ast::tree::type_ctx::infer_type(
+                                &value_expr, &options, &symbols,
+                            ),
+                            crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
+                        ) =>
+                {
+                    quote!(#target_code = (#value).into();)
                 }
                 _ => quote!(#target_code = #value;),
             })
