@@ -1,7 +1,7 @@
 {
-  "rypip_commit": "2f93bf7",
+  "rypip_commit": "2be3488",
   "rypip_path": "/Users/tserica/rython/target/debug/rypip",
-  "elapsed_seconds": 372.7,
+  "elapsed_seconds": 305.0,
   "packages": {
     "urllib3": {
       "total": 962,

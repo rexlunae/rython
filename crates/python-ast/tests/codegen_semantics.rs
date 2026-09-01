@@ -15385,4 +15385,84 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "the else branch re-assignment stays: {}",
         out
     );
+    // Devin review on #284: a walrus in the else REBINDS the name
+    // (`else: (x := None)`), so the narrowing must be discarded; an
+    // attribute store (`else: x.attr = 1`) only mutates the object and
+    // must KEEP it.
+    let out3 = compile(
+        "def w(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       y = (x := None)\n\
+         \x20   return \"b\"\n",
+        "none_walrus.py",
+    );
+    assert!(
+        !out3.contains("clone () . unwrap ()") && !out3.contains("clone().unwrap()"),
+        "a walrus rebinding in the else must discard the narrowing: {}",
+        out3
+    );
+    let out4 = compile(
+        "def s(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       x.attr = 1\n\
+         \x20   return x\n",
+        "none_attr.py",
+    );
+    assert!(
+        out4.contains("clone () . unwrap ()") || out4.contains("clone().unwrap()"),
+        "an attribute store in the else must keep the narrowing: {}",
+        out4
+    );
+    // Devin review on #285: a walrus in an if/while TEST of the else
+    // rebinds; a comprehension TARGET does not rebind the outer scope.
+    let out5 = compile(
+        "def t(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       if (x := None):\n\
+         \x20           pass\n\
+         \x20   return \"b\"\n",
+        "none_ifwalrus.py",
+    );
+    assert!(
+        !out5.contains("clone () . unwrap ()") && !out5.contains("clone().unwrap()"),
+        "a walrus in the else's if-test must discard the narrowing: {}",
+        out5
+    );
+    let out6 = compile(
+        "def c(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       y = [z for z in (x, \"b\")]\n\
+         \x20   return x\n",
+        "none_comp.py",
+    );
+    assert!(
+        out6.contains("clone () . unwrap ()") || out6.contains("clone().unwrap()"),
+        "a comprehension target must keep the outer narrowing: {}",
+        out6
+    );
+    // Devin review on #285 (2nd pass): a walrus in a def DEFAULT or a
+    // class BASE in the else rebinds the guarded name.
+    let out7 = compile(
+        "def d(x: str | None) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"a\"\n\
+         \x20   else:\n\
+         \x20       def g(y=(x := None)):\n\
+         \x20           return y\n\
+         \x20   return \"b\"\n",
+        "none_defdefault.py",
+    );
+    assert!(
+        !out7.contains("clone () . unwrap ()") && !out7.contains("clone().unwrap()"),
+        "a walrus in a nested def default must discard the narrowing: {}",
+        out7
+    );
 }
