@@ -5602,8 +5602,17 @@ impl<'a> CodeGen for Call {
                         ));
                         return Ok(quote!(stdpython::PyValue::None_));
                     }
+                    // The stub call can only be DROPPED when the missing
+                    // arguments are NOT defaultable — a stub whose missing
+                    // params all have defaults (or Option annotations) can
+                    // be mapped to the full-arity call, which dispatches
+                    // VIRTUALLY to the most-derived override
+                    // (`self.read(len(b))` in BaseHTTPResponse.readinto
+                    // where HTTPResponse overrides read — urllib3, round
+                    // 79: dropping it boxed the bytes result as None).
                     if supplied < stub_params
                         && crate::ast::tree::call::is_notimpl_stub(&sig)
+                        && !stub_missing_args_defaultable(&sig, supplied)
                     {
                         options.definition_warnings.borrow_mut().push(format!(
                             "call to the abstract stub `{}.{}` with {} argument(s) is \
@@ -8501,6 +8510,36 @@ fn escape_regex_braces(pattern: &str) -> String {
 
 /// Whether a function is a raise-only NotImplementedError stub — an
 /// abstract method (`_do_modeled_error_parse` — botocore's parsers).
+/// Whether a stub call's MISSING positional arguments can all be filled
+/// by the argument-mapping (each has a Python default or is
+/// Option-annotated): such a call lowers to the full-arity invocation
+/// (virtual dispatch), so it must NOT be dropped. Only a stub whose
+/// missing params are REQUIRED (unmappable — botocore's extra `parsed`)
+/// is dropped.
+fn stub_missing_args_defaultable(sig: &crate::FunctionDef, supplied: usize) -> bool {
+    let posonly = sig.args.posonlyargs.len();
+    let pos = posonly + sig.args.args.len();
+    if supplied >= pos {
+        return true;
+    }
+    let pos_defaulted = sig.args.defaults.len().min(pos);
+    let first_defaulted = pos - pos_defaulted;
+    (supplied..pos).all(|i| {
+        if i >= first_defaulted {
+            return true;
+        }
+        let p = if i < posonly {
+            &sig.args.posonlyargs[i]
+        } else {
+            &sig.args.args[i - posonly]
+        };
+        p.annotation
+            .as_deref()
+            .is_some_and(crate::is_optional_annotation)
+    })
+}
+
+
 fn is_notimpl_stub(f: &crate::FunctionDef) -> bool {
     f.body.len() == 1
         && matches!(
