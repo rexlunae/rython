@@ -1121,6 +1121,29 @@ codegen (loop-element fall-through returns Option; a partial literal
 return becomes an Option; a caller of an inferred Option function
 narrows and unwraps).
 
+Round 86 (the argument-side expected-type fallback reaches the GENERAL
+call path): the round-84 fallback (`resolve_alias_typeinfo` for an
+annotation the syntax-only mapping cannot see, so an OPTION-typed
+argument coerces into the boxed slot) lived only in the mapped-call fill
+(`map_call_arguments_inner`) — a plain call whose arguments matched the
+signature with no keywords/defaults rendered through the general
+argument loop and never coerced (`g(resolve_default_timeout(timeout))`
+where `_TYPE_TIMEOUT = Union[float, str, None]` lowers to the boxed
+PyValue: the callee's `-> float | None` result went in raw). The
+fallback is now a shared helper covering BOTH paths, with three gates:
+a NARROWED name's read already unwraps (the `if conn and
+is_connection_dropped(conn)` chain — wrapping the member again would
+match on a non-Option); an `Option<Class>` inner cannot box into a
+PyValue slot (no `From<Class>` — the raw mismatch stays loud instead of
+shifting to an E0277 — but a CONCRETE slot coerces any inner via the
+round-83 match-unwrap, charset's `fallback_specified: CharsetMatch`);
+and the argument can be a CALL whose callee returns an Option — a
+classmethod (`Timeout::resolve_default_timeout`) or a `self` property
+accessor (`self.proxy()`), resolved through the class's method table.
+Sweep −1 (urllib3 856→855, everything else flat — 1113→1112). Pinned in
+codegen (an Option-typed callee result into a boxed-union parameter
+coerces via the Some/None match).
+
 ## 6. Functions
 
 ### 6.1 Signatures

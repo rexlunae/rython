@@ -13951,6 +13951,52 @@ fn a_caller_of_an_inferred_option_fn_narrows_and_unwraps() {
     );
 }
 
+#[test]
+fn an_option_callee_result_into_a_boxed_union_param_coerces() {
+    // Round 86: `resolve_default_timeout(timeout)` returns `float | None`
+    // and the result feeds a `_TYPE_TIMEOUT` parameter — a module-level
+    // alias (`Union[float, str, None]`) that lowers to the boxed PyValue.
+    // The syntax-only annotation mapping cannot see the alias, so the
+    // GENERAL call-argument path (a plain `g(...)` call, not the
+    // mapped-fill) must fall back to the symbols-aware authority — an
+    // OPTION-typed argument coerces `Option<f64> → PyValue` via the
+    // Some/None match, Python's None passing through as the boxed None.
+    let out = compile(
+        concat!(
+            "from typing import Union\n",
+            "\n",
+            "_TYPE_TIMEOUT = Union[float, str, None]\n",
+            "\n",
+            "def resolve_default_timeout(timeout: _TYPE_TIMEOUT) -> float | None:\n",
+            "    return None\n",
+            "\n",
+            "def g(timeout: _TYPE_TIMEOUT) -> None:\n",
+            "    pass\n",
+            "\n",
+            "def f(timeout: _TYPE_TIMEOUT) -> None:\n",
+            "    g(resolve_default_timeout(timeout))\n",
+        ),
+        "optunionarg.py",
+    );
+    assert!(
+        out.contains("match (resolve_default_timeout (timeout) ?) {")
+            || out.contains("match(resolve_default_timeout(timeout)?){"),
+        "the Option-typed callee result must coerce into the boxed param: {}",
+        out
+    );
+    assert!(
+        out.contains("Some (__rython_v) => PyValue :: from ((__rython_v))")
+            || out.contains("Some(__rython_v)=>PyValue::from((__rython_v))"),
+        "the Some arm must box the inner: {}",
+        out
+    );
+    assert!(
+        out.contains("None => stdpython :: PyValue :: None_"),
+        "the None arm must be the boxed None: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // §7's mapping-protocol slice: a user class's own `__getitem__`/
 // `__setitem__`/`__contains__` dunders receive the subscript store,

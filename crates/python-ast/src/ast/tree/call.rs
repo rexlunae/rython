@@ -7812,7 +7812,21 @@ impl<'a> CodeGen for Call {
                     let expected = param
                         .annotation
                         .as_deref()
-                        .and_then(crate::call_arg_expected_type);
+                        .and_then(crate::call_arg_expected_type)
+                        // Round 86: the same symbols-aware fallback the
+                        // mapped-call fill uses — an annotation the
+                        // syntax-only mapping cannot see (a module-level
+                        // alias resolving to the boxed PyValue:
+                        // `_TYPE_TIMEOUT = Union[float, str, None]` —
+                        // urllib3's `resolve_default_timeout(timeout)`
+                        // into a `_TYPE_TIMEOUT` param) resolves through
+                        // `resolve_alias_typeinfo`, so an OPTION-typed
+                        // argument coerces (`Option<f64> → PyValue` via
+                        // the Some/None match — Python's None passes
+                        // through as the boxed None).
+                        .or_else(|| {
+                            arg_expected_fallback(param, &arg, &ctx, &symbols, &options)
+                        });
                     let rendered = crate::render_typed_reused(
                         &arg,
                         ctx.clone(),
@@ -9357,6 +9371,144 @@ pub(crate) fn dotted_module_path(expr: &ExprType) -> Option<Vec<String>> {
     Some(parts)
 }
 
+/// Round 84/86 (the generics directive): the argument-side expected-type
+/// fallback for an annotation the syntax-only mapping cannot see. A CLASS
+/// name (`conn: BaseHTTPConnection` — a TYPE_CHECKING Protocol stub,
+/// round 84) or a module-level ALIAS resolving to the boxed PyValue
+/// (`_TYPE_TIMEOUT = Union[float, str, None]` — urllib3's
+/// `resolve_default_timeout(timeout)` into a `_TYPE_TIMEOUT` param,
+/// round 86) resolves through the symbols-aware authority — the same
+/// resolution the parameter's Rust type used — so an OPTION-typed
+/// argument coerces (`Option<f64> → PyValue` via the Some/None match,
+/// Python's None passing through as the boxed None). Gated on the
+/// OPTION-typed argument: a plain class-instance argument must keep the
+/// pre-existing raw render (a loud rustc mismatch), not box through
+/// `PyValue::from` (no such From for a class — an E0277 shift at the
+/// `err: _TYPE_TIMEOUT` sites). Skips an annotation the syntax-only
+/// mapping ALREADY answers (`str` → call_arg_expected_type deliberately
+/// returns None so literals pass as &str into the `impl Into<String>`
+/// parameter).
+fn arg_expected_fallback(
+    param: &crate::Parameter,
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<crate::TypeInfo> {
+    let ann = param.annotation.as_deref()?;
+    if crate::annotation_type_info(ann).is_some() {
+        return None;
+    }
+    // A NARROWED name's read already unwraps to the inner value
+    // (`(conn).clone().unwrap()` — the `if conn and
+    // is_connection_dropped(conn)` chain, round 81): the tokens are the
+    // member, not the Option — wrapping them in the Option→PyValue match
+    // would match on a non-Option (E0308). Same principle as the
+    // render_typed narrowed-names handling.
+    if matches!(expr, ExprType::Name(n)
+        if options.narrowed_names.contains_key(&n.id))
+    {
+        return None;
+    }
+    // The argument must be an OPTION-typed value: an inferred Option, a
+    // None-then-assigned NAME (`conn` — urllib3's urlopen, whose
+    // infer_type answers the boxed PyValue while the BINDING is
+    // Option<PyValue>), or a CALL whose callee returns an Option
+    // (`Timeout.resolve_default_timeout(timeout)` — a classmethod whose
+    // `-> float | None` return infer_type cannot see; `self.proxy()` — a
+    // `Proxy | None` property accessor — round 86).
+    let arg_is_option = matches!(
+        crate::infer_type(expr, options, symbols),
+        crate::TypeInfo::Option(_)
+    ) || matches!(expr, ExprType::Name(n)
+        if options.optional_names.contains(&n.id))
+        || matches!(expr, ExprType::Call(c)
+            if call_returns_option(c, ctx, symbols, options));
+    if !arg_is_option {
+        return None;
+    }
+    let resolved = crate::resolve_alias_typeinfo(ann, symbols, options)?;
+    // For a BOXED-PyValue slot, the Option's INNER must be boxable
+    // (`PyValue::from(inner)` must exist — int/str/bytes/tuple/Vec/
+    // PyValue ...): an `Option<Class>` argument (`Option<Retry>` —
+    // urllib3's `retries` union) cannot box (no `From<Class>`), so the
+    // fallback must not fire — the raw mismatch stays loud instead of
+    // shifting to an E0277. A CONCRETE slot (a class-annotated parameter
+    // — charset's `fallback_specified: CharsetMatch`) coerces any inner
+    // via the Option→concrete match-unwrap (the round-83 loud
+    // unhandled-None panic).
+    if matches!(resolved, crate::TypeInfo::PyValue) {
+        let inner_boxable = match crate::infer_type(expr, options, symbols) {
+            crate::TypeInfo::Option(inner) => {
+                crate::ast::tree::type_ctx::is_boxable_value_type(&inner)
+            }
+            _ => true,
+        };
+        if !inner_boxable {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+/// Whether a CALL's callee resolves to an Option-returning function:
+/// a NAME callee (call_return_typeinfo), or a CLASS-QUALIFIED callee
+/// (`Timeout.resolve_default_timeout(...)` — a classmethod/staticmethod
+/// on a same-module class whose `-> T | None` return annotation
+/// infer_type cannot see — round 86).
+fn call_returns_option(
+    call: &crate::Call,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> bool {
+    let return_is_option = |m: crate::FunctionDef| -> bool {
+        m.returns.as_deref().is_some_and(|r| {
+            matches!(
+                crate::resolve_alias_typeinfo(r, symbols, options),
+                Some(crate::TypeInfo::Option(_))
+            )
+        })
+    };
+    match call.func.as_ref() {
+        ExprType::Name(_) => matches!(
+            crate::call_return_typeinfo(call, Some(symbols), Some(options)),
+            Some(crate::TypeInfo::Option(_))
+        ),
+        ExprType::Attribute(attr) => {
+            let ExprType::Name(recv) = attr.value.as_ref() else {
+                return false;
+            };
+            // `self.proxy()` — a `Proxy | None` property accessor on the
+            // ENCLOSING class (urllib3's
+            // `connection_requires_http_tunnel(self.proxy(), ...)`).
+            if recv.id == "self"
+                && let Some((class, class_symbols)) =
+                    receiver_class(&attr.value, ctx, symbols, options)
+            {
+                return class
+                    .method_on_mro_with_options(&attr.attr, &class_symbols, options)
+                    .is_some_and(return_is_option);
+            }
+            // Same-module class, or an IMPORTED one (`Timeout` from
+            // .util.timeout — urllib3's `Timeout::resolve_default_timeout`
+            // classmethod) resolved through its defining module.
+            let class = match symbols.get(&recv.id) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                _ => crate::resolve_construction_class(&recv.id, symbols, options)
+                    .map(|(c, _)| c),
+            };
+            let Some(class) = class else {
+                return false;
+            };
+            class
+                .method_on_mro_with_options(&attr.attr, symbols, options)
+                .is_some_and(return_is_option)
+        }
+        _ => false,
+    }
+}
+
 fn map_call_arguments(
     func: &crate::FunctionDef,
     args: &[ExprType],
@@ -9735,50 +9887,7 @@ fn map_call_arguments_inner(
                 .annotation
                 .as_deref()
                 .and_then(crate::call_arg_expected_type)
-                .or_else(|| {
-                    // Round 84: a CLASS-name annotation the syntax-only
-                    // mapping cannot see (`conn: BaseHTTPConnection` — a
-                    // TYPE_CHECKING Protocol stub imported for typing, so
-                    // the codegen resolves the parameter to the boxed
-                    // PyValue): the symbols-aware authority answers the
-                    // same way the parameter's Rust type was resolved, so
-                    // an OPTION-typed argument coerces (`Option<PyValue> →
-                    // PyValue` via unwrap_or(None_) — Python's None passes
-                    // through exactly — urllib3's
-                    // `self._prepare_proxy(conn)` where `conn` is
-                    // None-then-assigned, ×7). Gated on the OPTION-typed
-                    // argument: a plain class-instance argument must keep
-                    // the pre-existing raw render (a loud rustc mismatch),
-                    // not box through `PyValue::from` (no such From for a
-                    // class — an E0277 shift at the `err: _TYPE_TIMEOUT`
-                    // sites). Skips an annotation the syntax-only mapping
-                    // ALREADY answers (`str` → call_arg_expected_type
-                    // deliberately returns None so literals pass as &str
-                    // into the `impl Into<String>` parameter).
-                    param.annotation.as_deref().and_then(|ann| {
-                        if crate::annotation_type_info(ann).is_some() {
-                            return None;
-                        }
-                        // The argument must be an OPTION-typed value: a
-                        // None-then-assigned NAME (`conn` — urllib3's
-                        // urlopen, whose infer_type answers the boxed
-                        // PyValue while the BINDING is Option<PyValue>) or
-                        // an inferred Option. A plain class-instance
-                        // argument must keep the pre-existing raw render
-                        // (a loud rustc mismatch), not box through
-                        // `PyValue::from` (no such From for a class — an
-                        // E0277 shift at the `err: _TYPE_TIMEOUT` sites).
-                        let arg_is_option = matches!(
-                            crate::infer_type(expr, &options, &symbols),
-                            crate::TypeInfo::Option(_)
-                        ) || matches!(expr, ExprType::Name(n)
-                            if options.optional_names.contains(&n.id));
-                        if !arg_is_option {
-                            return None;
-                        }
-                        crate::resolve_alias_typeinfo(ann, symbols, options)
-                    })
-                })
+                .or_else(|| arg_expected_fallback(param, expr, &ctx, symbols, &options))
                 .or_else(|| {
                     // A None-defaulted unannotated parameter whose VALUE is
                     // used in the callee (`retryable_exceptions=None`
