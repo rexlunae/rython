@@ -15491,3 +15491,55 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         out7
     );
 }
+
+#[test]
+fn abstract_stub_call_with_defaultable_missing_args_dispatches_virtually() {
+    // Round 79: `self.read(len(b))` inside a base's readinto where the
+    // base read is a `raise NotImplementedError()` stub — the call was
+    // DROPPED (boxed None) because the stub's arity exceeded the call's.
+    // The stub's missing params all have defaults, so the call maps to
+    // the full-arity invocation, which dispatches virtually to the
+    // derived override (urllib3's BaseHTTPResponse.readinto →
+    // HTTPResponse.read).
+    let out = compile(
+        "class Base:\n\
+         \x20   def read(self, amt: int | None = None, decode_content: bool | None = None) -> bytes:\n\
+         \x20       raise NotImplementedError()\n\
+         \x20   def readinto(self, b: bytearray) -> int:\n\
+         \x20       temp = self.read(len(b))\n\
+         \x20       if len(temp) == 0:\n\
+         \x20           return 0\n\
+         \x20       b[: len(temp)] = temp\n\
+         \x20       return len(temp)\n",
+        "mro_stub.py",
+    );
+    assert!(
+        !out.contains("PyValue :: None_") && !out.contains("PyValue::None_"),
+        "the stub call must not drop to a boxed None: {}",
+        out
+    );
+    assert!(
+        out.contains("(self) . read (Some (len (& (b)) as i64) , None) ")
+            || out.contains("(self).read(Some(len(&(b)) as i64), None)"),
+        "the stub call must map to the full-arity virtual invocation: {}",
+        out
+    );
+}
+
+#[test]
+fn reused_name_slice_assign_clones_the_value() {
+    // Round 79: `b[:len(temp)] = temp; return len(temp)` — the
+    // slice-assign MOVED temp into the receiver; the later read was a
+    // use-after-move (E0382). A reused Name value now clones.
+    let out = compile(
+        "def f(b: bytearray, temp: bytes) -> int:\n\
+         \x20   b[: len(temp)] = temp\n\
+         \x20   return len(temp)\n",
+        "slice_reuse.py",
+    );
+    assert!(
+        out.contains("clone ()") || out.contains("clone()"),
+        "a reused slice-assign value must clone: {}",
+        out
+    );
+}

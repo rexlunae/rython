@@ -1257,6 +1257,19 @@ impl<'a> CodeGen for Assign {
                     // selected slot count and raises ValueError otherwise
                     // (exactly like CPython's list_ass_subscript).
                     if step_is_one {
+                        // A REUSED Name value (`b[:len(temp)] = temp;
+                        // return len(temp)` — urllib3's readinto): the
+                        // slice-assign MOVES the value into the receiver,
+                        // and a later read would use-after-move — clone it
+                        // (the same stored_name_needs_clone rule the plain
+                        // stores apply, round 79).
+                        let value = if matches!(&value_expr, ExprType::Name(n)
+                            if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1)
+                        {
+                            quote!((#value).clone())
+                        } else {
+                            value.clone()
+                        };
                         Ok(quote!({
                             (#receiver).py_slice_assign(#lo_tok, #up_tok, #value);
                         }))

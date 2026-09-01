@@ -926,6 +926,22 @@ promoted-static emission re-renders a list-literal init with the String
 element type when the static's type is `Vec<String>`. Sweep −3
 (charset_normalizer 187→182, everything else flat). Pinned in codegen.
 
+Round 79 (virtual dispatch through abstract stubs): a call to a
+`raise NotImplementedError()` stub method whose MISSING arguments all
+have defaults (`self.read(len(b))` in BaseHTTPResponse.readinto, where
+HTTPResponse overrides read) was DROPPED to a boxed None — the stub
+arity exceeded the call's, so the abstract-protocol guard fired even
+though the call is mappable to the full-arity invocation, which
+dispatches VIRTUALLY to the derived override. The guard now drops only
+stubs whose missing params are truly REQUIRED (unmappable —
+botocore's extra `parsed`); a defaultable stub call lowers to
+`(self).read(Some(len(b)), None, false)` and the derived override runs.
+Also: a REUSED Name value in a slice-assign (`b[:len(temp)] = temp;
+return len(temp)`) now clones — the assign MOVED the value and the
+later read was an E0382 use-after-move. Sweep −3 (urllib3 962→961,
+everything else flat). Pinned in codegen (the virtual stub dispatch and
+the slice-assign clone).
+
 ## 6. Functions
 
 ### 6.1 Signatures
