@@ -1653,6 +1653,66 @@ fn resolve_construction_class_depth(
     }
 }
 
+/// Whether a method call on this ATTRIBUTE receiver is DROPPED by the
+/// boxed-receiver rule (the dynamic-method divergence) — the exact
+/// condition the call lowering uses, shared with the RETURN lowering (a
+/// dropped call in return position must not emit `Ok(PyValue::None_)`
+/// in a typed fn — round 80). Protocol methods survive (the runtime
+/// forwards them); module members and resolvable receivers do not drop.
+/// Whether a NAME is bound to a call into an EXTERNAL module, which
+/// lowered to the boxed None (`conn = h2.connection.H2Connection(...)`).
+/// A merely-unknown PyValue-typed name keeps its calls.
+pub(crate) fn name_is_dropped_external_value(
+    e: &crate::ExprType,
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> bool {
+    let crate::ExprType::Name(n) = e else {
+        return false;
+    };
+    let Some(SymbolTableNode::Assign {
+        value: ExprType::Call(c),
+        ..
+    }) = symbols.get(&n.id)
+    else {
+        return false;
+    };
+    match c.func.as_ref() {
+        crate::ExprType::Attribute(a) => crate::ast::tree::attribute::external_module_root(
+            &a.value, symbols, options,
+        )
+        .is_some(),
+        crate::ExprType::Name(f) => {
+            crate::ast::tree::import::resolves_to_external_import(&f.id, options, symbols)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn boxed_receiver_method_dropped(
+    attr: &crate::Attribute,
+    ctx: &crate::CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> bool {
+    if !crate::ast::tree::attribute::receiver_is_pyvalue(&attr.value, ctx, symbols, options) {
+        return false;
+    }
+    matches!(attr.value.as_ref(), ExprType::Attribute(_))
+        || crate::ast::tree::attribute::receiver_call_is_external_drop(
+            &attr.value,
+            symbols,
+            options,
+        )
+        || (!crate::ast::tree::attribute::pyvalue_protocol_method(&attr.attr)
+            && (name_is_dropped_external_value(&attr.value, symbols, options)
+                || crate::ast::tree::attribute::receiver_is_boxed_positively(
+                    &attr.value,
+                    symbols,
+                    options,
+                )))
+}
+
 impl<'a> CodeGen for Call {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -1895,62 +1955,15 @@ impl<'a> CodeGen for Call {
         // is_*/as_*/py_* and the rewrite-table names the later pipeline
         // lowers (decode, encode, split, strip, ...) resolve normally.
         // One definition, shared with the read-side drop in attribute.rs.
-        let pyvalue_protocol_method =
-            crate::ast::tree::attribute::pyvalue_protocol_method;
         // A NAME receiver drops only on the PRECISE pattern: the name is
         // bound to a call into an EXTERNAL module, which lowered to the
         // boxed None (`conn = h2.connection.H2Connection(...)`, `log =
         // logging.getLogger(...)`). A merely-unknown PyValue-typed name
         // (a socket, a generic parameter, a class) keeps its calls — the
         // TypeInfo::PyValue signal alone means "unknown", not "boxed".
-        let name_is_dropped_external_value = |e: &ExprType| -> bool {
-            let ExprType::Name(n) = e else { return false };
-            let Some(SymbolTableNode::Assign {
-                value: ExprType::Call(c),
-                ..
-            }) = symbols.get(&n.id)
-            else {
-                return false;
-            };
-            match c.func.as_ref() {
-                ExprType::Attribute(a) => crate::ast::tree::attribute::external_module_root(
-                    &a.value, &symbols, &options,
-                )
-                .is_some(),
-                ExprType::Name(f) => crate::ast::tree::import::resolves_to_external_import(
-                    &f.id, &options, &symbols,
-                ),
-                _ => false,
-            }
-        };
+
         if let ExprType::Attribute(attr) = self.func.as_ref()
-            && (matches!(attr.value.as_ref(), ExprType::Attribute(_))
-                || crate::ast::tree::attribute::receiver_call_is_external_drop(
-                    attr.value.as_ref(),
-                    &symbols,
-                    &options,
-                )
-                || (!pyvalue_protocol_method(&attr.attr)
-                    && (name_is_dropped_external_value(attr.value.as_ref())
-                        // Issue #137 round 26: a POSITIVELY boxed name drops
-                        // the whole call here. It has to: the read-side drop
-                        // in attribute.rs now fires for such a receiver, so
-                        // leaving the call to render its callee through that
-                        // path would emit `PyValue::None_(...)` — a value
-                        // called as a function (E0618). The two sides share
-                        // one signal so they cannot disagree about what is
-                        // boxed.
-                        || crate::ast::tree::attribute::receiver_is_boxed_positively(
-                            attr.value.as_ref(),
-                            &symbols,
-                            &options,
-                        ))))
-            && crate::ast::tree::attribute::receiver_is_pyvalue(
-                &attr.value,
-                &ctx,
-                &symbols,
-                &options,
-            )
+            && crate::boxed_receiver_method_dropped(attr, &ctx, &symbols, &options)
         {
             options.definition_warnings.borrow_mut().push(format!(
                 "`{}.{}(...)` is dropped: the receiver is a boxed PyValue \

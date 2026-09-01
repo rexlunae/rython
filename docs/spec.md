@@ -942,6 +942,24 @@ later read was an E0382 use-after-move. Sweep −3 (urllib3 962→961,
 everything else flat). Pinned in codegen (the virtual stub dispatch and
 the slice-assign clone).
 
+Round 80 (loud dropped-call returns; generic From<PyValue> recovery):
+two families in urllib3/idna. (1) A call on a BOXED receiver in return
+position — `self._obj.method(...)` where `_obj` is a `PyValue` — was
+lowered to `Ok(PyValue::None_)` in a TYPED function, silently returning
+None for the call's real value. The return lowering now panics loudly
+(`rython: the value ... cannot be returned as the function's typed
+result (external-module / boxed-global divergence)`) at the exact point
+of divergence, sharing the call-side drop predicate
+(`boxed_receiver_method_dropped`: protocol methods, module receivers
+like `copy`, and positively-boxed receivers all keep their prior
+behavior). (2) The reverse generic impls (`From<PyValue> for
+String/Vec<u8>/i64/f64/bool`) let a boxed value flow back into a typed
+slot or `impl Into<T>` parameter via the accessors; a wrong member is a
+loud `TypeError`-style panic (`value_member_panic`), matching Python's
+fail-at-use. Sweep −38 (urllib3 961→931, idna 63→55, everything else
+flat). Pinned in the runtime (boxed values convert back to typed
+members) and in codegen (the loud dropped-call return).
+
 ## 6. Functions
 
 ### 6.1 Signatures
