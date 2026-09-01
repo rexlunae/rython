@@ -1086,6 +1086,41 @@ None-stored-local family; idna/certifi/requests flat — 1124→1106).
 Pinned in codegen (a None-stored local into a boxed-class parameter
 unwraps).
 
+Round 85 (the return-type directive: a function that can return exactly
+`T | None` returns `Option<T>` — the caller decides what to do with the
+None, and a caller that does not handle it in a concrete context gets a
+LOUD error, never a mangled behavior): an unannotated function whose
+returns unify to ONE concrete type T plus a None path (a `return None`,
+a bare `return`, or a fall-through — the type-ignore "bug" pattern)
+infers `Option<T>` instead of the boxed PyValue. Both inference paths
+change: the generic collector's None-mixing arm (`return None` +
+`return x` — `for x in p: return x` falls through to Option<B>, the
+loop element; `if c: return 1` falls through to Option<i64>) and the
+signature chain's `unified_return_type` (the annotated-parameter shape —
+`return "yes"` / `return None` under `flag: bool` is Option<String>).
+The return site follows the signature: `fn_return_is_option` now derives
+from the same symbols-aware authority the signature uses (the syntax-
+only `annotation_type_info` cannot see a quoted class name —
+`Optional["CharsetMatch"]` — so the flag and the signature agree), plain
+returns Some-wrap (a string literal owns itself), `return None` lowers
+to the None member, and a fall-through tail is `Ok(None)` — an
+Option-returning function's fall-through is Python's None. The caller
+side propagates: `call_return_typeinfo` and `expr_yields_option` consult
+the inferred return for an unannotated callee, so a store
+(`v = pick(flag)`) types the local as an Option and `if v is None:`
+narrows it — while a caller that passes the Option into a concrete slot
+unhandled keeps the loud rustc mismatch (the directive's "throw an
+error rather than mangle" — Python's likely-bug pattern). A plain
+`return None` in a unit-returning function lowers to the unit value (the
+NAME-None shape no longer falls through to a raw `None` token that
+types as an Option against `Result<(), _>`). Sweep +7 (urllib3 853→856,
+charset 177→181, idna/certifi/requests flat — 1106→1113): the
+directive's honest cost — the newly-Option returns surface loud errors
+where callers have not yet been taught to handle the None. Pinned in
+codegen (loop-element fall-through returns Option; a partial literal
+return becomes an Option; a caller of an inferred Option function
+narrows and unwraps).
+
 ## 6. Functions
 
 ### 6.1 Signatures

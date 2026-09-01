@@ -3067,8 +3067,18 @@ pub fn call_return_typeinfo(
     };
     match symbols.get(&fn_name) {
         Some(SymbolTableNode::FunctionDef(f)) => {
-            let ann = f.returns.as_deref()?;
-            resolve_alias_typeinfo(ann, symbols, options)
+            // Round 85 (the return-type directive): an UNANNOTATED callee
+            // whose body can return exactly `T | None` infers an
+            // `Option<T>` return — the caller must learn it so the
+            // Option-aware machinery applies (the caller decides what to
+            // do with the None; a concrete use without handling it is the
+            // loud Option→concrete panic). The annotation is authoritative
+            // when present.
+            if let Some(ann) = f.returns.as_deref() {
+                resolve_alias_typeinfo(ann, symbols, options)
+            } else {
+                f.inferred_return_typeinfo(symbols, options)
+            }
         }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);

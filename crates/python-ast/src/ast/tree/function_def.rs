@@ -2138,43 +2138,61 @@ impl FunctionDef {
         // (previously only the former was consulted, so a generic
         // `Result<PyValue, _>` signature carried unwrapped `Ok(val)`
         // bodies — E0308 on the issue's flagify shape).
-        options.fn_return_is_pyvalue = matches!(
-            self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()),
-            Some(ref ty) if ty.to_string() == "stdpython :: PyValue"
-        ) || (self.returns.is_none()
-            // A unified return exists whenever the collector ran — for a
-            // generic signature AND for one whose parameters pinned
-            // concrete (a value-pinned PyValue, issue #161); a method's
-            // synthesized signature never carries one, so methods keep
-            // their own path.
-            && matches!(
-                &inferred_signature.return_type,
-                Some(ty) if ty.to_string() == "stdpython :: PyValue"
-            ))
-            // The NON-generic disconnect (annotated params, mixed
-            // `return 1`/`return None` literal bodies — the issue's pick
-            // shape): the generic collector never ran (no unannotated
-            // params), resolved_return_type has no answer — box.
+        // Round 85 (the return-type directive): when the function's
+        // return IS an Option (annotated `-> T | None`, or the inferred
+        // `T | None` unification below), the return site must NOT box —
+        // plain returns Some-wrap, None stays the empty member, and the
+        // fall-through tail is Ok(None).
+        let resolved = self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name());
+        let return_is_option = self
+            .returns
+            .as_deref()
+            // The symbols-aware authority (round 85): the syntax-only
+            // annotation_type_info cannot see a quoted class name
+            // (`Optional["CharsetMatch"]` — charset_normalizer's best,
+            // where the signature resolves via resolve_alias_typeinfo) —
+            // the flag must agree with the signature.
+            .and_then(|ann| crate::resolve_alias_typeinfo(ann, &symbols, &options))
+            .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
             || (self.returns.is_none()
-                && !inferred_signature.is_generic()
-                && self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()).is_none()
-                && literal_returns_need_boxing(&self.body));
+                && (inferred_signature
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|t| t.to_string().starts_with("Option"))
+                    || matches!(
+                        &resolved,
+                        Some(ty) if ty.to_string().starts_with("Option")
+                    )));
+        options.fn_return_is_pyvalue = !return_is_option
+            && (matches!(
+                &resolved,
+                Some(ty) if ty.to_string() == "stdpython :: PyValue"
+            ) || (self.returns.is_none()
+                // A unified return exists whenever the collector ran — for a
+                // generic signature AND for one whose parameters pinned
+                // concrete (a value-pinned PyValue, issue #161); a method's
+                // synthesized signature never carries one, so methods keep
+                // their own path.
+                && matches!(
+                    &inferred_signature.return_type,
+                    Some(ty) if ty.to_string() == "stdpython :: PyValue"
+                ))
+                // The NON-generic disconnect (annotated params, mixed
+                // `return 1`/`return None` literal bodies — the issue's pick
+                // shape): the generic collector never ran (no unannotated
+                // params), resolved_return_type has no answer — box.
+                || (self.returns.is_none()
+                    && !inferred_signature.is_generic()
+                    && resolved.is_none()
+                    && literal_returns_need_boxing(&self.body)));
 
         // A `-> T | None` function's resolved return type is an Option:
         // plain (non-Option) returns wrap in Some at the return site
         // (statement.rs) — Python returns the bare value where None is
         // only one of the possible results (urllib3's `_normalize_host`
         // returns both `host.lower()` and `host`, a `str | None` path).
-        options.fn_return_is_option = self
-            .returns
-            .as_deref()
-            .and_then(crate::annotation_type_info)
-            .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
-            || (self.returns.is_none()
-                && inferred_signature
-                    .return_type
-                    .as_ref()
-                    .is_some_and(|t| t.to_string().starts_with("Option")));
+        // Round 85 extends this to the INFERRED `T | None` returns.
+        options.fn_return_is_option = return_is_option;
 
         // Round 81 (the generics directive): a CONCRETE typed return
         // (`-> Vec<u8>`, `-> i64` ...) whose value arrives as a boxed
@@ -2339,16 +2357,23 @@ impl FunctionDef {
                 // fall-through path (Python returns None there) — loud,
                 // never a rustc mismatch at build time. A CONCRETE partial
                 // return (e.g. `if c: return 1`) keeps the old Result<()>
-                // shape.
+                // shape. Round 85 (the return-type directive): an
+                // OPTION return is EXEMPT — the fall-through None is the
+                // Option's empty member (`for x in p: return x` returns
+                // `B | None` = Option<B>), exactly the model the directive
+                // prescribes; the signature below carries the Option.
                 let s = ty.to_string();
-                let tokens: Vec<&str> = s
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                inferred_signature.type_params.iter().any(|p| {
-                    let p = p.to_string();
-                    tokens.iter().any(|t| *t == p)
-                })
+                !s.starts_with("Option")
+                    && {
+                        let tokens: Vec<&str> = s
+                            .split(|c: char| !c.is_alphanumeric())
+                            .filter(|t| !t.is_empty())
+                            .collect();
+                        inferred_signature.type_params.iter().any(|p| {
+                            let p = p.to_string();
+                            tokens.iter().any(|t| *t == p)
+                        })
+                    }
             }) {
                 // Some path returns an inferred generic value while
                 // another can fall through (Python returns None there) —
@@ -2372,6 +2397,16 @@ impl FunctionDef {
                 // members, so the type stands and the fall-through renders
                 // PyValue::None_ (issue #122 step 3).
                 quote!(-> Result<stdpython::PyValue, PyException>)
+            } else if let Some(ty) = &inferred_signature.return_type
+                && ty.to_string().starts_with("Option")
+            {
+                // Round 85: an inferred `Option<T>` return with a
+                // fall-through path — the None IS the fall-through (the
+                // directive: a function that can return exactly `T | None`
+                // returns Option<T>, and the caller decides what to do
+                // with the None). The fall-through tail below renders the
+                // None member.
+                quote!(-> Result<#ty, PyException>)
             } else {
                 quote!(-> Result<(), PyException>)
             }
@@ -2401,6 +2436,10 @@ impl FunctionDef {
         } else if !guarantees_return(&self.body) {
             if options.fn_return_is_pyvalue {
                 streams.extend(quote!(Ok(PyValue::None_)));
+            } else if options.fn_return_is_option {
+                // Round 85: an Option-returning function's fall-through
+                // path is Python's None — the Option's empty member.
+                streams.extend(quote!(Ok(None)));
             } else {
                 streams.extend(quote!(Ok(())));
             }
@@ -3470,7 +3509,17 @@ pub(crate) fn expr_yields_option(
                 Some(SymbolTableNode::FunctionDef(f)) => f
                     .returns
                     .as_deref()
-                    .is_some_and(crate::is_optional_annotation),
+                    .is_some_and(crate::is_optional_annotation)
+                    // Round 85 (the return-type directive): an UNANNOTATED
+                    // callee whose body can return exactly `T | None`
+                    // infers an `Option<T>` return — the caller's store
+                    // analysis must see the Option so the value is an
+                    // Option binding (narrowing, Option-access unwraps,
+                    // and the Option→concrete coercions all apply).
+                    || (f.returns.is_none()
+                        && f.inferred_return_typeinfo(symbols, options).is_some_and(
+                            |t| matches!(t, crate::TypeInfo::Option(_)),
+                        )),
                 Some(SymbolTableNode::ImportFrom(ifm))
                     if !crate::ast::tree::import::is_stdpython_module(&ifm.module) =>
                 {
@@ -4386,6 +4435,48 @@ impl FunctionDef {
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<TokenStream> {
+        self.inferred_return_typeinfo(symbols, options)
+            .map(|t| t.to_rust_type())
+    }
+
+    /// The TypeInfo-level return unification (the None-mixing fold behind
+    /// [`unified_return_type`]), exposed for the CALLER side: a caller
+    /// that stores or passes an unannotated callee's result must learn
+    /// the inferred `Option<T>` so the Option-aware machinery (narrowing,
+    /// Option-access unwraps, the Option→concrete coercions) applies —
+    /// the round-85 return-type directive ("a function that can return
+    /// T | None returns Option<T>; the caller decides what to do with the
+    /// None"). Round 85: a SINGLE concrete T plus the None path — exactly
+    /// `T | None` — is `Option<T>`; a boxed or unrenderable T keeps the
+    /// boxed PyValue (the box already contains None); disagreeing types
+    /// with a None path box.
+    pub(crate) fn inferred_return_typeinfo(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<crate::TypeInfo> {
+        // Cycle guard: `infer_type` on a return may consult
+        // `call_return_typeinfo` (a recursive callee — `def f(x): return
+        // f(x-1)`) which consults this again — the same thread_local
+        // pattern the alias resolver uses.
+        thread_local! {
+            static IRT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let d = IRT_DEPTH.with(|c| c.get());
+        if d > 16 {
+            return None;
+        }
+        IRT_DEPTH.with(|c| c.set(d + 1));
+        let result = self.inferred_return_typeinfo_inner(symbols, options);
+        IRT_DEPTH.with(|c| c.set(d));
+        result
+    }
+
+    fn inferred_return_typeinfo_inner(
+        &self,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<crate::TypeInfo> {
         let mut returns = Vec::new();
         crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
         if returns.is_empty() {
@@ -4398,19 +4489,34 @@ impl FunctionDef {
         // PyValue, exactly the None-mixing unification the literal
         // partial-return rule already applies (issue #122 step 3).
         // Without a None path, disagreeing returns keep refusing.
-        let has_none = !guarantees_return(&self.body)
+        let mut has_none = !guarantees_return(&self.body)
             || self
                 .body
                 .iter()
                 .any(|s| matches!(&s.statement, crate::StatementType::Return(None)));
         let mut unified: Option<crate::TypeInfo> = None;
         for r in &returns {
-            let t = crate::infer_type(r, options, symbols);
+            // A `return None` literal is the None path (its infer_type
+            // is PyObject — "no answer" — which would otherwise look like
+            // a disagreeing type and box the fold).
+            if crate::is_none_expr(r) {
+                has_none = true;
+                continue;
+            }
+            let t = match crate::infer_type(r, options, symbols) {
+                // A string-LITERAL return infers `&'static str` (StrRef);
+                // the codegen returns an owned String — normalize so the
+                // `T | None` fold types `return "s"` + `return None` as
+                // `Option<String>`, matching the collector's literal
+                // handling (round 85).
+                crate::TypeInfo::StrRef => crate::TypeInfo::String,
+                t => t,
+            };
             match &unified {
                 None => unified = Some(t),
                 Some(prev) if *prev == t => {}
                 Some(_) if has_none => {
-                    return Some(quote!(stdpython::PyValue));
+                    return Some(crate::TypeInfo::PyValue);
                 }
                 Some(_) => return None,
             }
@@ -4419,12 +4525,22 @@ impl FunctionDef {
             // No None path: the type survives ONLY when renderable — an
             // unrenderable (PyObject "no answer") return still refuses
             // rather than guessing (the #224 discipline).
-            (Some(t), false) if renderable_return_typeinfo(&t) => Some(t.to_rust_type()),
-            // A None path makes the function heterogeneous by definition
-            // — boxed PyValue, whether the returns agree or not (an
-            // unrenderable/PyValue-containing return is exactly the
-            // dynamic case this models).
-            (Some(_), true) => Some(quote!(stdpython::PyValue)),
+            (Some(t), false) if renderable_return_typeinfo(&t) => Some(t),
+            // A None path makes the function heterogeneous by definition.
+            // Round 85 (the return-type directive): a SINGLE concrete type
+            // T plus None — exactly `T | None` — returns `Option<T>` (the
+            // caller decides what to do with the None). A boxed or
+            // unrenderable T keeps the boxed PyValue (the box already
+            // contains None).
+            (Some(t), true) => {
+                if renderable_return_typeinfo(&t)
+                    && !matches!(t, crate::TypeInfo::PyValue | crate::TypeInfo::PyObject)
+                {
+                    Some(crate::TypeInfo::Option(Box::new(t)))
+                } else {
+                    Some(crate::TypeInfo::PyValue)
+                }
+            }
             _ => None,
         }
     }

@@ -740,6 +740,17 @@ impl CodeGen for StatementType {
                     quote!(PyValue::None_)
                 } else if options.fn_return_is_option && crate::is_none_expr(&e.value) {
                     quote!(None)
+                } else if crate::is_none_expr(&e.value)
+                    && !options.fn_return_is_pyvalue
+                    && !options.fn_return_is_option
+                {
+                    // A plain `return None` in a unit-returning function
+                    // is the unit value — the NAME-None shape (issue #133)
+                    // must not fall through to the raw `None` token, which
+                    // would type as an Option against Result<(), _> (round
+                    // 85: None-only functions now resolve to honest unit
+                    // signatures).
+                    quote!(())
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
                 } else if options.fn_return_is_pyvalue {
@@ -892,7 +903,17 @@ impl CodeGen for StatementType {
                     if value_yields_option {
                         value
                     } else {
-                        quote!(Some(#value))
+                        // A string LITERAL must own itself in the wrap
+                        // (`Some("yes")` is Option<&str>; the slot is
+                        // Option<String> — the same ownership the
+                        // Option-slot store applies, round 85).
+                        if matches!(&e.value, ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_))))
+                        {
+                            quote!(Some((#value).to_string()))
+                        } else {
+                            quote!(Some(#value))
+                        }
                     }
                 } else {
                     value

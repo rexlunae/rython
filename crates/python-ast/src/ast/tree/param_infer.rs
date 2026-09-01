@@ -931,11 +931,26 @@ pub fn infer_unannotated_signature(
                 }
                 // A `return None` alongside a typed return (`return None`
                 // + `return service_name in ['s3']` — botocore's docs
-                // client): the function returns `T | None` — a boxed
-                // PyValue (the None-mixing unification; the codegen wraps
-                // the returns).
+                // client): the function returns `T | None`. Round 85 (the
+                // return-type directive): EXACTLY two types — one concrete
+                // T plus None — returns `Option<T>`; the caller decides
+                // what to do with the None (and a caller that uses it in a
+                // concrete context without handling it gets the loud
+                // Option→concrete panic — Python's likely-bug pattern). A
+                // boxed PyValue keeps itself (the box already contains
+                // None); an already-Option absorbs the None; a None-only
+                // fold stays unit.
                 Some(prev) if prev.to_string() == "()" || ty.to_string() == "()" => {
-                    inferred = Some(quote!(stdpython::PyValue));
+                    let other = if prev.to_string() == "()" { &ty } else { prev };
+                    let s = other.to_string();
+                    if s == "()"
+                        || s == "stdpython :: PyValue"
+                        || s.starts_with("Option")
+                    {
+                        inferred = Some(other.clone());
+                    } else {
+                        inferred = Some(quote!(Option<#other>));
+                    }
                 }
                 // Recursive fixpoint (M4): `<X as PyOp<X>>::Output` unifies
                 // with X — the recursive call returns the parameter's type
@@ -953,6 +968,13 @@ pub fn infer_unannotated_signature(
                     if is_bare_type_name(&prev.to_string())
                         || is_bare_type_name(&ty.to_string()) =>
                 {
+                    inferred = Some(quote!(stdpython::PyValue));
+                }
+                // A SECOND distinct type folding into an Option<T>
+                // (`return None` + `return 1` + `return "x"` — T1|T2|None):
+                // more than two types — box (the directive covers exactly
+                // T | None).
+                Some(prev) if prev.to_string().starts_with("Option") => {
                     inferred = Some(quote!(stdpython::PyValue));
                 }
                 // A TUPLE return with per-element unification
