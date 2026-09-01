@@ -839,6 +839,22 @@ mod tests {
             "a comprehension target does not rebind x");
         assert!(!super::expr_writes_name(&assign.value, "x"),
             "a comprehension target is not an outer write");
+        // An ALIASED `import pkg.mod as alias` binds only the alias.
+        let imp = stmts("import pkg.mod as alias\n");
+        match &imp[0].statement {
+            crate::StatementType::Import(im) => {
+                assert!(!super::stmt_writes_name(&imp[0], "pkg"),
+                    "an aliased import does not bind the package name");
+                assert!(super::stmt_writes_name(&imp[0], "alias"),
+                    "an aliased import binds the alias");
+                let _ = im;
+            }
+            _ => panic!("expected the import"),
+        }
+        // An unaliased `import pkg.mod` binds the first segment.
+        let imp2 = stmts("import pkg.mod\n");
+        assert!(super::stmt_writes_name(&imp2[0], "pkg"),
+            "an unaliased dotted import binds the first segment");
     }
 
     #[test]
@@ -1259,11 +1275,15 @@ pub(crate) fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
                     .any(|b| stmt_writes_name(b, name))
         }
         crate::StatementType::Import(im) => im.names.iter().any(|a| {
-            a.asname.as_deref() == Some(name)
-                // An unaliased `import x.y` binds the FIRST segment `x`
-                // (Devin review on #285).
-                || a.name == name
-                || a.name.split('.').next() == Some(name)
+            if let Some(asname) = a.asname.as_deref() {
+                // An ALIASED `import pkg.mod as alias` binds only the
+                // alias — the package name is untouched (Devin review on
+                // #285).
+                asname == name
+            } else {
+                // An unaliased `import x.y` binds the FIRST segment `x`.
+                a.name == name || a.name.split('.').next() == Some(name)
+            }
         }),
         crate::StatementType::ImportFrom(im) => im.names.iter().any(|a| {
             a.asname.as_deref() == Some(name) || a.name == name
