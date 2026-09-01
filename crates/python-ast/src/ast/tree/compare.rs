@@ -280,7 +280,7 @@ impl CodeGen for Compare {
             // int/float cross-PartialOrd, so the bounds
             // `B: PyLe<B> + PyFromInt` are satisfied by both i64 and f64
             // (Python promotes `2.5 <= 0` to a float comparison).
-            let comparator = if let ExprType::Name(n) = left_ast {
+            let mut comparator = if let ExprType::Name(n) = left_ast {
                 if let Some(tv) = options.param_type_vars.get(&n.id) {
                     if matches!(
                         comparator_ast,
@@ -297,6 +297,35 @@ impl CodeGen for Compare {
             } else {
                 comparator
             };
+            // Python promotes an INT operand to FLOAT in a numeric
+            // comparison (`read_timeout == 0` where read_timeout is
+            // `float | None` — urllib3's _make_request, whose Option-match
+            // and plain py_eq paths compare the f64 with an i64 literal):
+            // Rust std has no int/float cross-PartialEq, so the literal
+            // renders as the float — the same `as f64` the coercion
+            // machinery accepts for numeric contexts (lossy above 2^53,
+            // where Python's comparison is exact; accepted because the
+            // alternative is a rustc error, round 87). Only when the LEFT
+            // side is a Float (or an Option whose inner is Float) — an
+            // int-typed side keeps the int comparison.
+            {
+                let left_ty = crate::infer_type(left_ast, &options, &symbols);
+                let float_side = match &left_ty {
+                    crate::TypeInfo::Float => true,
+                    crate::TypeInfo::Option(inner) => {
+                        matches!(**inner, crate::TypeInfo::Float)
+                    }
+                    _ => false,
+                };
+                if float_side
+                    && matches!(
+                        crate::infer_type(comparator_ast, &options, &symbols),
+                        crate::TypeInfo::Int
+                    )
+                {
+                    comparator = quote!((#comparator) as f64);
+                }
+            }
             // Comparisons route through the stdpython PyEq/PyNe/PyLt/PyLe/
             // PyGt/PyGe traits (in scope via `use stdpython::*`): scalars
             // and containers get their existing PartialEq/PartialOrd

@@ -1751,6 +1751,24 @@ pub fn analyze_function_types_with_class(
                         {
                             info.name_types.insert(n.id.clone(), t);
                         }
+                        // Round 87: a CLASS-returning self-method call
+                        // (`timeout_obj = self._get_timeout()` — urllib3's
+                        // `-> Timeout` callee) seeds the local with the
+                        // class, so a later property read on it
+                        // (`timeout_obj.read_timeout` — an
+                        // `Option<f64>`-returning accessor) resolves its
+                        // receiver's class. The Dict arm above was the
+                        // narrow survivor of round 44's wash (typing EVERY
+                        // self-method return exposed close/From cascades);
+                        // the CLASS arm is safe — the local IS the
+                        // instance, and the property arm below consumes it.
+                        if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                            && let Some(ann) = method.returns.as_deref()
+                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                            && matches!(t, crate::TypeInfo::Class(_))
+                        {
+                            info.name_types.insert(n.id.clone(), t);
+                        }
                     }
                     crate::ExprType::Attribute(attr) => {
                         // A SELF-field read (`resp_options =
@@ -1815,6 +1833,67 @@ pub fn analyze_function_types_with_class(
                             info.name_types.insert(
                                 n.id.clone(),
                                 crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
+                            );
+                        }
+                        // Round 87: a PROPERTY read on a class-resolved
+                        // receiver (`read_timeout = timeout_obj.read_timeout`
+                        // — urllib3's `@property def read_timeout(self) ->
+                        // float | None` on the Timeout instance the
+                        // class-seeding arm typed): the getter's return
+                        // annotation types the local, so an Option getter
+                        // makes it an Option binding (the `_raise_timeout(
+                        // e, url, read_timeout)` argument then coerces
+                        // instead of going in raw). The receiver's class
+                        // comes from the WALK's own seeding
+                        // (`info.name_types` — a local the plain analysis
+                        // left PyObject) as well as the plain analysis.
+                        let info_receiver_class = match attr.value.as_ref() {
+                            crate::ExprType::Name(rn) => match info.name_types.get(&rn.id) {
+                                Some(crate::TypeInfo::Class(c)) => {
+                                    crate::receiver_class_tail(c, symbols.clone(), options)
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some((owner, owner_symbols)) = info_receiver_class
+                            .or_else(|| {
+                                crate::receiver_class_for_read(
+                                    &attr.value,
+                                    &crate::CodeGenContext::Module(String::new()),
+                                    symbols,
+                                    options,
+                                )
+                            })
+                            && !already_option
+                            && let Some(inner) =
+                                owner.method_on_mro(&attr.attr, symbols).and_then(|m| {
+                                    let is_property = m
+                                        .decorator_list
+                                        .iter()
+                                        .any(|d| match d {
+                                            crate::ExprType::Name(n) => n.id == "property",
+                                            crate::ExprType::Attribute(a) => {
+                                                a.attr == "property"
+                                            }
+                                            _ => false,
+                                        });
+                                    if !is_property {
+                                        return None;
+                                    }
+                                    m.returns.as_deref().and_then(|r| {
+                                        match crate::resolve_alias_typeinfo(
+                                            r, &owner_symbols, options,
+                                        ) {
+                                            Some(crate::TypeInfo::Option(inner)) => Some(*inner),
+                                            _ => None,
+                                        }
+                                    })
+                                })
+                        {
+                            info.name_types.insert(
+                                n.id.clone(),
+                                crate::TypeInfo::Option(Box::new(inner)),
                             );
                         }
                     }
@@ -1942,11 +2021,34 @@ fn analyze_statement_types(
                     },
                 };
                 // Dict keys normalize to String (matches literal lowering
-                // and `dict[str, V]` annotations); empty dicts and lists
+                // and `dict[str, V]` annotations); VALUES of string
+                // literals likewise normalize (`headers_ = {"Accept":
+                // "*/*"}` — a `-> Mapping[str, str]` local — so the local
+                // types Dict(String, String), agreeing with the literal
+                // lowering's owned values, round 87); empty dicts and lists
                 // are remembered for pinning from later use.
                 t = match t {
-                    TypeInfo::Dict(k, v) if matches!(*k, TypeInfo::StrRef) => {
-                        TypeInfo::Dict(Box::new(TypeInfo::String), v)
+                    TypeInfo::Dict(k, v)
+                        if matches!(*k, TypeInfo::StrRef) || matches!(*v, TypeInfo::StrRef) =>
+                    {
+                        TypeInfo::Dict(
+                            Box::new(if matches!(*k, TypeInfo::StrRef) {
+                                TypeInfo::String
+                            } else {
+                                (*k).clone()
+                            }),
+                            Box::new(if matches!(*v, TypeInfo::StrRef) {
+                                TypeInfo::String
+                            } else {
+                                (*v).clone()
+                            }),
+                        )
+                    }
+                    // A string-literal LIST element (`ks = ["Retry-After"]`
+                    // — the literal lowering owns the element, so the local
+                    // types Vec(String) in agreement, round 87).
+                    TypeInfo::Vec(inner) if matches!(*inner, TypeInfo::StrRef) => {
+                        TypeInfo::Vec(Box::new(TypeInfo::String))
                     }
                     other => other,
                 };
