@@ -350,6 +350,17 @@ pub struct PythonOptions {
     /// `host.lower()` (str) and `host` (str | None) paths).
     pub fn_return_is_option: bool,
 
+    /// The CURRENT function's resolved return type, when it is a CONCRETE
+    /// member (Int/Float/Bool/String/Bytes) rather than the boxed PyValue
+    /// or an Option (round 81's generics directive): a returned value
+    /// whose inference is a boxed PyValue (a dropped external call stored
+    /// in a local, a boxed member read) converts via the reverse
+    /// `From<PyValue>` impls — `(#value).into()` — instead of leaving a
+    /// loud E0308 at the return site. Python fails at use, rython at the
+    /// conversion; never a silent placeholder. None = not a concrete
+    /// typed return.
+    pub fn_return_typed: Option<crate::TypeInfo>,
+
     /// The CURRENT free function's parameters whose inferred type is the
     /// boxed PyValue (a value-pinned parameter — reassigned from a call
     /// result, issue #161's `path = os.path.expandvars(path)`): they
@@ -611,6 +622,7 @@ impl Default for PythonOptions {
             clone_field_returns: false,
             fn_return_is_pyvalue: false,
             fn_return_is_option: false,
+            fn_return_typed: None,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_none_names: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_false_names: std::rc::Rc::new(std::collections::HashSet::new()),

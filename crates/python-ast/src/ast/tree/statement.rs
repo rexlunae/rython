@@ -393,6 +393,46 @@ fn return_tokens(ctx: &CodeGenContext, value: TokenStream) -> TokenStream {
     }
 }
 
+/// Round 81 (the generics directive): whether a NAME's assigned value is
+/// a call the lowering DROPS to the boxed None (`decompressed =
+/// self._obj.decompress(data)` — DeflateDecoder, where the zlib call
+/// lowered to `PyValue::None_`). Such a local has no recorded type
+/// (infer_type says PyObject) but its Rust binding IS the boxed PyValue —
+/// the store was `PyValue::None_`. Returning it from a CONCRETE typed
+/// function converts via the reverse From<PyValue> impls (`.into()`),
+/// mirroring the dropped-call return panic while staying recoverable for
+/// the local case. The same drop predicates the call lowering uses
+/// (boxed-receiver method drop, external-module drop, boxed-global
+/// read), so the two sides cannot disagree about what is boxed.
+fn name_binds_dropped_call(
+    id: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    ctx: &CodeGenContext,
+) -> bool {
+    let Some(crate::SymbolTableNode::Assign { value, .. }) = symbols.get(id) else {
+        return false;
+    };
+    let crate::ExprType::Call(c) = value else {
+        return false;
+    };
+    match c.func.as_ref() {
+        crate::ExprType::Attribute(a) => {
+            crate::ast::tree::call::boxed_receiver_method_dropped(a, ctx, symbols, options)
+                || crate::ast::tree::attribute::external_module_root(
+                    &a.value,
+                    symbols,
+                    options,
+                )
+                .is_some()
+        }
+        crate::ExprType::Name(f) => {
+            crate::ast::tree::import::resolves_to_external_import(&f.id, options, symbols)
+        }
+        _ => false,
+    }
+}
+
 /// Whether a statement list contains a function-level `return` anywhere —
 /// looking through control flow (including nested trys and their handlers)
 /// but not into nested function or class definitions. The try lowering uses
@@ -625,6 +665,68 @@ impl CodeGen for StatementType {
                 // consults it.
                 let value_yields_option =
                     crate::expr_yields_option_ctx(&e.value, &ctx, &options, &symbols);
+                // Round 81 (the generics directive): whether the returned
+                // VALUE is (or wraps) a boxed PyValue inside a CONCRETE
+                // typed return — computed here, BEFORE the tokens below
+                // move `symbols` (the final `.into()` conversion consults
+                // it). Two shapes: the bare boxed PyValue
+                // (`PyValue → T` via `.into()`), and an OPTION-wrapped
+                // boxed value (`Option<PyValue> → T` — a `bytes | None`
+                // local like `returned_chunk` in a `-> bytes` fn: map the
+                // conversion, and the None case is a LOUD panic — Python
+                // would fail at use on a None chunk, §12.2).
+                let value_infers_pyvalue_in_typed_return = options
+                    .fn_return_typed
+                    .is_some()
+                    && (matches!(
+                        crate::ast::tree::type_ctx::infer_type(
+                            &e.value,
+                            &options,
+                            &symbols,
+                        ),
+                        crate::TypeInfo::PyValue
+                    )
+                    // A local whose assigned value is a DROPPED call
+                    // (`decompressed = self._obj.decompress(data)` —
+                    // DeflateDecoder, where the zlib call lowered to the
+                    // boxed None) has NO recorded type (PyObject) but its
+                    // Rust binding IS the bare boxed PyValue — the store
+                    // was `PyValue::None_` (round 81). The same drop
+                    // predicates the call lowering uses, so the two sides
+                    // cannot disagree about what is boxed. A name that is
+                    // OPTION-typed (assigned None first — `returned_chunk
+                    // = None`) holds `Option<PyValue>`, not the bare
+                    // value: it routes to the option-map arm below.
+                    || matches!(&e.value, ExprType::Name(n)
+                        if name_binds_dropped_call(&n.id, &symbols, &options, &ctx)
+                            && !options.optional_names.contains(&n.id)));
+                let value_infers_option_pyvalue_in_typed_return = options
+                    .fn_return_typed
+                    .is_some()
+                    && (matches!(
+                        crate::ast::tree::type_ctx::infer_type(
+                            &e.value,
+                            &options,
+                            &symbols,
+                        ),
+                        crate::TypeInfo::Option(inner)
+                            if matches!(inner.as_ref(), crate::TypeInfo::PyValue)
+                    )
+                    // An OPTION-typed name (`returned_chunk = None` then
+                    // `Some(boxed)` — a `bytes | None` local in a
+                    // `-> bytes` fn): the binding is Option<PyValue> even
+                    // when the stores joined to a boxed value and the
+                    // inference reports PyValue.
+                    || matches!(&e.value, ExprType::Name(n)
+                        if options.optional_names.contains(&n.id)
+                            && (matches!(
+                                crate::ast::tree::type_ctx::infer_type(
+                                    &e.value,
+                                    &options,
+                                    &symbols,
+                                ),
+                                crate::TypeInfo::PyValue
+                            ) || name_binds_dropped_call(&n.id, &symbols, &options, &ctx))));
                 // A `return None` in a PyValue-returning function is the
                 // boxed None (the None-mixing unification), whichever AST
                 // shape the parser surfaced None as (issue #133: the
@@ -792,6 +894,33 @@ impl CodeGen for StatementType {
                     } else {
                         quote!(Some(#value))
                     }
+                } else {
+                    value
+                };
+                // Round 81 (the generics directive): a CONCRETE typed
+                // return whose value is a boxed PyValue (`return
+                // decompressed` where `decompressed` was a dropped
+                // external call, or a boxed member read — urllib3's
+                // DeflateDecoder in a `-> bytes` fn) converts via the
+                // reverse From<PyValue> impls: `(#value).into()` recovers
+                // the member, and a wrong member is a LOUD TypeError
+                // panic (`value_member_panic`) — Python fails at use,
+                // rython at the conversion, never a silent placeholder
+                // (rustc's own suggestion at these sites is exactly this
+                // `.into()`). Only fires for a value that is NOT already
+                // in its final shape — the dropped-call panic above, the
+                // Some wrap, and the list-elt/ownership paths are done.
+                // An OPTION-wrapped boxed value (`return returned_chunk`
+                // where the local is `bytes | None` in a `-> bytes` fn)
+                // maps the conversion over the Option — the None case is
+                // a LOUD panic (Python would fail at use on a None chunk,
+                // §12.2).
+                let value = if value_infers_pyvalue_in_typed_return {
+                    quote!((#value).into())
+                } else if value_infers_option_pyvalue_in_typed_return {
+                    quote!((#value).map(Into::into).expect(
+                        "rython: the returned optional value was None (Python would fail at use, rython at the conversion)"
+                    ))
                 } else {
                     value
                 };

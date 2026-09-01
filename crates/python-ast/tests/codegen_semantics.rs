@@ -15543,3 +15543,111 @@ fn reused_name_slice_assign_clones_the_value() {
         out
     );
 }
+
+#[test]
+fn and_chain_truthiness_narrows_the_later_operand_reads() {
+    // Round 81 (the generics directive): `if conn and
+    // is_connection_dropped(conn):` — the first conjunct proves the
+    // Option-typed name non-None, so the SECOND conjunct's read of conn
+    // unwraps (`(conn).clone().unwrap()` — the PyValue inner), where the
+    // pre-round-81 output passed the raw Option and failed in rustc.
+    let out = compile(
+        "def drop(c) -> bool:\n\
+         \x20   return False\n\
+         def f(conn: bytes | None) -> bool:\n\
+         \x20   if conn and drop(conn):\n\
+         \x20       return True\n\
+         \x20   return False\n",
+        "and_narrow.py",
+    );
+    assert!(
+        out.contains("conn) . clone () . unwrap ()")
+            || out.contains("(conn).clone().unwrap()"),
+        "the and-chain must narrow the later operand's reads: {}",
+        out
+    );
+    assert!(
+        !out.contains("drop (conn)") && !out.contains("drop(conn)"),
+        "the later operand must NOT receive the raw Option: {}",
+        out
+    );
+}
+
+#[test]
+fn boxed_value_return_in_a_typed_fn_converts_via_into() {
+    // Round 81 (the generics directive): a `-> bytes` function returning
+    // a local that was assigned a DROPPED call (`decompressed =
+    // self._obj.decompress(data)` — the zlib receiver is boxed) has a
+    // PyValue binding; the return converts via the reverse From<PyValue>
+    // impl (`(decompressed).into()`) instead of leaving an E0308. The
+    // conversion is LOUD on a wrong member (Python fails at use, rython
+    // at the conversion).
+    let out = compile(
+        "class D:\n\
+         \x20   def __init__(self):\n\
+         \x20       self._obj = None\n\
+         \x20   def decompress(self, data: bytes) -> bytes:\n\
+         \x20       decompressed = self._obj.decompress(data)\n\
+         \x20       if decompressed:\n\
+         \x20           self._first = False\n\
+         \x20       return decompressed\n",
+        "dropped_ret.py",
+    );
+    assert!(
+        out.contains("decompressed) . into ()") || out.contains("(decompressed).into()"),
+        "the boxed-value return must convert via .into(): {}",
+        out
+    );
+}
+
+#[test]
+fn boxed_argument_into_a_concrete_optional_slot_converts_the_inner() {
+    // Round 81 (the generics directive): `create_urllib3_context(
+    // cert_reqs=resolve_cert_reqs(cert_reqs))` — the callee's boxed
+    // return feeds an `int | None` param (`Option<i64>`). The argument
+    // wraps in Some AND converts the inner (`(v).into()`) — a loud
+    // TypeError on a wrong member, never `Some(PyValue)` against
+    // `Option<i64>` (E0308).
+    let out = compile(
+        "from typing import Any\n\
+         def resolve_cert_reqs(candidate: int | None) -> Any:\n\
+         \x20   if candidate is None:\n\
+         \x20       return 2\n\
+         \x20   return candidate\n\
+         def create_urllib3_context(cert_reqs: int | None = None) -> None:\n\
+         \x20   pass\n\
+         def make_context(cert_reqs: int | None) -> None:\n\
+         \x20   create_urllib3_context(cert_reqs=resolve_cert_reqs(cert_reqs))\n",
+        "opt_inner.py",
+    );
+    assert!(
+        (out.contains("Some ({") || out.contains("Some({"))
+            && (out.contains("__rython_v) . into ()") || out.contains("(__rython_v).into()")),
+        "the boxed argument must wrap in Some and convert the inner: {}",
+        out
+    );
+}
+
+#[test]
+fn reused_boxed_name_store_clones_out_of_the_shared_value() {
+    // Round 81: `context = ssl_context` then `elif ssl_context is None:`
+    // — the boxed PyValue name is read AGAIN after the store; the store
+    // must CLONE (the Arc reference copy, Python semantics) or the move
+    // poisons the later read (E0382, newly exposed by the round-81
+    // coerce fixes).
+    let out = compile(
+        "from typing import Any\n\
+         def wrap(ssl_context: Any) -> Any:\n\
+         \x20   context = ssl_context\n\
+         \x20   if context is None:\n\
+         \x20       return ssl_context\n\
+         \x20   return context\n",
+        "reused_boxed.py",
+    );
+    assert!(
+        out.contains("context = (ssl_context) . clone ()")
+            || out.contains("context = (ssl_context).clone()"),
+        "a reused boxed name store must clone: {}",
+        out
+    );
+}

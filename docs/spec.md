@@ -960,6 +960,37 @@ fail-at-use. Sweep −38 (urllib3 961→931, idna 63→55, everything else
 flat). Pinned in the runtime (boxed values convert back to typed
 members) and in codegen (the loud dropped-call return).
 
+Round 81 (generics at the typed-slot boundaries): the round-80 reverse
+`From<PyValue>` impls were only half the story — the codegen still left
+boxed values as E0308 at every typed slot that did not route through
+`render_typed`. Four boundaries now convert, all with the loud
+wrong-member panic (Python fails at use, rython at the conversion):
+(1) `coerce_tokens` gains the reverse arms — `PyValue → i64/f64/bool/
+String/Vec<u8>` via `.into()` and `Option<PyValue> → Option<T>` via
+`.map(Into::into)` (the Option arm must precede the generic `T →
+Option` arm, whose `from_ty != PyValue` guard would otherwise eat it);
+(2) a CONCRETE typed return (`-> bytes`/`-> i64`) whose value is a boxed
+local (`return decompressed` where a dropped call stored `PyValue::None_`,
+and `return returned_chunk` where the `bytes | None` local holds
+`Option<PyValue>`) converts at the return site (`.into()` / `.map(..).
+expect(..)`); (3) call arguments into `X | None` parameters whose X is a
+concrete member (`cert_reqs: int | None` receiving
+`resolve_cert_reqs(...)` — a boxed callee return) wrap in `Some` and
+convert the inner (`Some({ let __rython_v = ...; (__rython_v).into() })`),
+recognizing boxed CALLS through the resolved return type and boxed
+ATTRIBUTE reads through the same positive-evidence predicate the read-side
+drop uses; (4) a REUSED boxed name stored into a name/field target clones
+(`context = ssl_context` then `elif ssl_context is None` — urllib3's
+_ssl_wrap_socket_and_match_hostname) — the Arc copy is Python reference
+semantics. Also: an `and`-CHAIN in condition position narrows an
+Option-typed name for the LATER operands (`if conn and
+is_connection_dropped(conn)` — the second conjunct reads the unwrapped
+value), with the compare/attribute Option-unwraps taught not to
+double-fire on the narrowed read. Sweep −25 (urllib3 931→911, idna
+55→51, charset 182→181, requests/certifi flat). Pinned in codegen
+(four round-81 pins: and-chain narrowing, boxed-value return, boxed
+argument into a concrete optional slot, reused boxed name store).
+
 ## 6. Functions
 
 ### 6.1 Signatures

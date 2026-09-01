@@ -465,17 +465,31 @@ impl CodeGen for Compare {
             let tokens = if let crate::TypeInfo::Option(inner) =
                 crate::infer_type(left_ast, &options, &symbols)
             {
-                let inner_ty = (*inner).clone();
-                let is_py_cmp = matches!(
-                    op,
-                    Compares::Eq
-                        | Compares::NotEq
-                        | Compares::Lt
-                        | Compares::LtE
-                        | Compares::Gt
-                        | Compares::GtE
-                );
-                if is_py_cmp {
+                // A NARROWED LHS (round 81's `and`-chain narrowing:
+                // `if conn and is_connection_dropped(conn)` proves conn
+                // non-None; `amt and amt > c_int_max` — urllib3's
+                // _read_next_chunk) already reads the INNER value
+                // (`(amt).clone().unwrap()` via narrowed_names); wrapping
+                // it in the Option-match again double-unwraps (E0308 on
+                // the i64 scrutinee). The read-side unwrap and the
+                // compare-side match must not both fire — the narrowed
+                // read is authoritative.
+                let lhs_narrowed = matches!(left_ast, ExprType::Name(n)
+                    if options.narrowed_names.contains_key(&n.id));
+                if lhs_narrowed {
+                    tokens
+                } else {
+                    let inner_ty = (*inner).clone();
+                    let is_py_cmp = matches!(
+                        op,
+                        Compares::Eq
+                            | Compares::NotEq
+                            | Compares::Lt
+                            | Compares::LtE
+                            | Compares::Gt
+                            | Compares::GtE
+                    );
+                    if is_py_cmp {
                     // An OPTION-typed comparator (`amt < self.chunk_left`
                     // where BOTH are `int | None` — urllib3's
                     // _handle_chunk): unwrap it the same way, with the
@@ -569,8 +583,9 @@ impl CodeGen for Compare {
                             None => #none_arm,
                         }
                     }
-                } else {
-                    tokens
+                    } else {
+                        tokens
+                    }
                 }
             } else {
                 tokens
