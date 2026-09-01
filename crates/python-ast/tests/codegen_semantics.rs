@@ -13862,6 +13862,44 @@ fn optional_str_literal_arguments_own_themselves() {
     );
 }
 
+#[test]
+fn a_none_stored_local_into_a_boxed_class_param_unwraps() {
+    // Round 84: `conn = None` then `conn = self._get_conn(...)`, passed
+    // to a method whose parameter is annotated with a TYPE_CHECKING-imported
+    // Protocol stub (`conn: BaseHTTPConnection` — urllib3's
+    // connectionpool). The stub resolves to the boxed PyValue (the same
+    // authority the parameter's Rust type used), so the Option<PyValue>
+    // binding must unwrap to the boxed value with Python's None passing
+    // through as PyValue::None_ — never a raw Option into a PyValue slot
+    // (the `PyValue | Option<PyValue>` family, ×18 fixed).
+    let out = compile(
+        concat!(
+            "from http.client import HTTPConnection as _HTTPConnection\n",
+            "\n",
+            "class Conn:\n",
+            "    def _prepare_proxy(self, conn: _HTTPConnection) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    def _make(self) -> _HTTPConnection:\n",
+            "        return self._new_conn()\n",
+            "\n",
+            "    def _new_conn(self) -> _HTTPConnection:\n",
+            "        raise NotImplementedError()\n",
+            "\n",
+            "    def f(self) -> None:\n",
+            "        conn = None\n",
+            "        conn = self._make()\n",
+            "        self._prepare_proxy(conn)\n",
+        ),
+        "boxedparam.py",
+    );
+    assert!(
+        out.contains("(conn) . unwrap_or (stdpython :: PyValue :: None_)"),
+        "the None-stored local must unwrap to the boxed value with Python's None passing through: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // §7's mapping-protocol slice: a user class's own `__getitem__`/
 // `__setitem__`/`__contains__` dunders receive the subscript store,

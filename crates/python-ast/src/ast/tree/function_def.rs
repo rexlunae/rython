@@ -1551,6 +1551,16 @@ impl FunctionDef {
                 merged.extend(info.optional_names.iter().cloned());
                 options.optional_names = std::rc::Rc::new(merged);
             }
+            // Annotated names (annotated locals) join the annotation-
+            // derived set: the round-84 Option-unwrap guard consults them
+            // (an annotated local's PyValue-ness is authoritative — a
+            // `X | None` union that boxes has its None inside the box).
+            if !info.annotated_names.is_empty() {
+                let mut merged: std::collections::HashSet<String> =
+                    (*options.annotated_names).clone();
+                merged.extend(info.annotated_names.iter().cloned());
+                options.annotated_names = std::rc::Rc::new(merged);
+            }
             for p in self
                 .args
                 .args
