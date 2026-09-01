@@ -15651,3 +15651,49 @@ fn reused_boxed_name_store_clones_out_of_the_shared_value() {
         out
     );
 }
+
+#[test]
+fn external_module_return_annotation_types_the_function_as_boxed() {
+    // Round 82: `-> ssl.SSLSocket` (an external-module class annotation)
+    // previously resolved to NOTHING — the function silently typed `()`
+    // while its body returned a value, so every caller of the return
+    // mismatched (the `() | PyValue` family). The symbols-aware authority
+    // now resolves the annotation to the boxed PyValue (the external-object
+    // divergence), so the signature carries the value.
+    let out = compile(
+        "import ssl\n\
+         def wrap_socket(sock) -> ssl.SSLSocket:\n\
+         \x20   return sock\n",
+        "ssl_ret.py",
+    );
+    assert!(
+        out.contains("-> Result < stdpython :: PyValue , PyException >")
+            || out.contains("Result<stdpython::PyValue, PyException>"),
+        "the external-module return annotation must box the return: {}",
+        out
+    );
+}
+
+#[test]
+fn boxed_value_stored_into_a_concrete_inherited_field_converts() {
+    // Round 82: `self.is_verified = sock_and_verified.is_verified` — a
+    // boxed namedtuple member stored into the bool field inherited from
+    // the BASE class (HTTPSConnection → HTTPConnection). The field type is
+    // the BASE-MOST owner's (bool, the struct ground truth), not the
+    // derived class's own boxed-join; the store converts via `.into()`.
+    let out = compile(
+        "class Base:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.is_verified = False\n\
+         class Child(Base):\n\
+         \x20   def __init__(self, info):\n\
+         \x20       super().__init__()\n\
+         \x20       self.is_verified = info.is_verified\n",
+        "inherit_field.py",
+    );
+    assert!(
+        !out.contains("PyValue :: from (info . is_verified)") && !out.contains("PyValue::from(info.is_verified)"),
+        "a boxed value into a concrete inherited field must not box-wrap: {}",
+        out
+    );
+}

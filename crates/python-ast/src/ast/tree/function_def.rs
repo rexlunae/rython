@@ -3911,6 +3911,21 @@ impl FunctionDef {
                     None
                 } else {
                     crate::python_annotation_to_rust_type(ann).or_else(|| {
+                        // Round 82 (the generics directive): an EXTERNAL-module
+                        // class annotation (`-> ssl.SSLSocket`,
+                        // `-> logging.StreamHandler` — the function returns a
+                        // real object rython cannot model) resolves to the
+                        // boxed PyValue through the symbols-aware authority —
+                        // the same external-object divergence the parameter
+                        // and field sides use. The symbols-FREE
+                        // python_annotation_to_rust_type above cannot see the
+                        // import (`ssl` → external), so it returned None and
+                        // the function silently typed `()` while its body
+                        // returned a value — every caller of the return then
+                        // mismatched (the `() | PyValue` family).
+                        crate::resolve_alias_typeinfo(ann, symbols, options)
+                            .map(|t| t.to_rust_type())
+                            .or_else(|| {
                         // A user-class annotation (`-> Scheme`): the type is
                         // the class name rendered as a Rust ident — the same
                         // path parameters use. A bare Name that is NOT a
@@ -3967,6 +3982,7 @@ impl FunctionDef {
                             }
                             _ => None,
                         }
+                        })
                     })
                 }
             })

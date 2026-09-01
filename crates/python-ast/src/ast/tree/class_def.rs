@@ -839,7 +839,7 @@ impl ClassDef {
 
     /// Whether `attr` is a field assigned somewhere in this class's own
     /// `__init__`.
-    fn owns_field(&self, attr: &str) -> bool {
+    pub(crate) fn owns_field(&self, attr: &str) -> bool {
         // EVERY method's stores, not just `__init__`'s: an attribute
         // first assigned elsewhere is still a field of this class (issue
         // #137 round 23 taught `infer_fields` the same thing), and the two
