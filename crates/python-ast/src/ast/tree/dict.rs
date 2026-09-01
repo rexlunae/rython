@@ -161,7 +161,17 @@ impl CodeGen for Dict {
         } else if matches!(v_expected, crate::TypeInfo::PyObject) {
             None
         } else {
-            Some(v_expected)
+            // Dict VALUES are owned String, not &'static str — the same
+            // rule as the keys above: literal `"b"` values must match
+            // `dict[str, str]` annotations (IndexMap<String, String>)
+            // and survive past the literal's lifetime (round 87 — a
+            // `headers_ = {"Accept": "*/*"}` local rendered
+            // IndexMap<String, &str> and could never match the
+            // `Mapping[str, str]` return).
+            Some(match v_expected {
+                crate::TypeInfo::StrRef => crate::TypeInfo::String,
+                other => other,
+            })
         };
 
         for (key, value) in self.keys.iter().zip(self.values.iter()) {

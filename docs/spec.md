@@ -1144,6 +1144,40 @@ Sweep −1 (urllib3 856→855, everything else flat — 1113→1112). Pinned in
 codegen (an Option-typed callee result into a boxed-union parameter
 coerces via the Some/None match).
 
+Round 87 (the property-read Option local): a local assigned from a
+PROPERTY read on a class-resolved receiver (`read_timeout =
+timeout_obj.read_timeout` — urllib3's `_make_request`, where
+`timeout_obj = self._get_timeout(timeout)` is a `-> Timeout` self-method
+call) is recorded as an Option binding in the class-aware walk, seeded
+from the getter's ACTUAL return annotation (`float | None` → Option<f64>,
+not the unknown marker — the argument fallback's boxable gate must pass).
+The walk's class-seeding arm types the factory local (`timeout_obj`) so
+the property arm can resolve its receiver; the property-yields-Option
+check (`expr_yields_option_ctx`) uses the READ-flavored receiver
+resolution (`receiver_class_for_read` — the conservative `receiver_class`
+hard-returns None on the attribute-callee Assign shape), so the store
+passes the Option through instead of double-wrapping
+`Some(timeout_obj.read_timeout()?)` into `Option<Option<f64>>`. The
+Option<f64> local then coerces into a `_TYPE_TIMEOUT` (boxed PyValue)
+parameter via the Some/None match. Three companion fixes fall out of the
+same family: an integer-literal comparator against a Float-typed operand
+promotes to the float (`read_timeout == 0` → `py_eq(&((0) as f64))` —
+Rust std has no int/float cross-PartialEq, and Python promotes the int);
+an ANNOTATED return wins over the body's inferred type (`-> float | None`
+with a `return 0.5` body stays `Option<f64>` — the annotation is the
+contract, and the return-site Some-wrap already agreed); and dict-literal
+string VALUES normalize to owned String exactly like keys (`headers_ =
+{"Accept": "*/*"}` in a `-> Mapping[str, str]` function renders
+`IndexMap<String, String>`, never `IndexMap<String, &str>`), with
+string-LIST elements owning the same way (`ks = ["Retry-After"]; return
+ks` in a `-> list[str]` function builds `Vec<String>`).
+Sweep −8 (urllib3 855→849, charset 181→179, idna/certifi/requests flat —
+1112→1104). Pinned in codegen (a property-read local on a factory local
+coerces into a boxed-union parameter; a float Option compares with an
+int literal as a float; a dict literal's string value is owned like its
+key; an annotated Option return keeps the Option against a plain literal
+body).
+
 ## 6. Functions
 
 ### 6.1 Signatures

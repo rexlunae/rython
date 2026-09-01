@@ -3408,8 +3408,15 @@ pub(crate) fn expr_yields_option_ctx(
     // A PROPERTY read whose getter's return annotation is `T | None`
     // (`self.url` where `@property def url(self) -> str | None` —
     // urllib3's HTTPResponse.url) yields the Option: the property's VALUE
-    // is the union member, never a plain member.
-    if let Some((class, class_symbols)) = crate::receiver_class(&attr.value, ctx, symbols, options)
+    // is the union member, never a plain member. The READ-flavored
+    // receiver resolution (not the conservative receiver_class) so a
+    // local assigned from a SELF-METHOD factory (`timeout_obj =
+    // self._get_timeout()` — round 87) resolves its class: receiver_class
+    // hard-returns None on that Assign shape (an attribute callee), and
+    // the property read would double-wrap `Some(timeout_obj.read_timeout()?)`
+    // instead of passing the Option through.
+    if let Some((class, class_symbols)) =
+        crate::receiver_class_for_read(&attr.value, ctx, symbols, options)
         && class
             .base_chain_with_options(&class_symbols, options)
             .iter()
@@ -4061,8 +4068,16 @@ impl FunctionDef {
         {
             return Some(quote!(Self));
         }
-        self.inferred_return_type(options)
-            .or(annotated)
+        // The ANNOTATION is the contract and wins over the body's inferred
+        // type: a `-> float | None` getter whose body returns a plain
+        // literal (`return 0.5` — urllib3's Timeout.read_timeout) must
+        // type as `Option<f64>` (the return-site Some-wrap and the
+        // fn_return_is_option flag already agree), NOT the body's `f64` —
+        // the inferred-first ordering let a plain return silently shrink
+        // the annotated Option and every caller of the union typed the
+        // bare member (round 87).
+        annotated
+            .or_else(|| self.inferred_return_type(options))
             .or_else(|| self.boxed_list_return_type(symbols, options))
             .or_else(|| self.unified_return_type(symbols, options))
             .or_else(|| self.module_path_call_return_type(symbols, options))

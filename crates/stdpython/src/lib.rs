@@ -4863,6 +4863,26 @@ impl PyIndex<&str> for PyValue {
     }
 }
 
+// A boxed-dict index with an OWNED String key (`script_ranges[script]`
+// where script is a `str` local and the dict boxes to PyValue — idna's
+// `_is_script`): the same Dict dispatch as the &str impl, for the owned
+// String the str-parameter prologue produces (round 87).
+impl PyIndex<String> for PyValue {
+    type Output = PyValue;
+    fn py_index(&self, key: String) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Dict(d) => d.py_index(key),
+            other => Err(PyException::new(
+                "TypeError",
+                format!(
+                    "'{}' object is not subscriptable",
+                    py_value_type_name(other)
+                ),
+            )),
+        }
+    }
+}
+
 impl PyIndexMut<&str> for PyValue {
     type Output = PyValue;
     fn py_index_mut(&mut self, key: &str) -> Result<&mut PyValue, PyException> {
@@ -4966,6 +4986,19 @@ impl PyContains<PyValue> for Vec<&str> {
     fn py_contains(&self, item: &PyValue) -> bool {
         match item {
             PyValue::Str(s) => self.iter().any(|m| *m == s),
+            _ => false,
+        }
+    }
+}
+
+// The same boxed-operand membership for an OWNED string list (a
+// string-literal list now lowers to Vec<String>, round 87 — idna's
+// `direction in ["R", "AL"]` where direction is a boxed Str param):
+// compare the String members against the Str member by value.
+impl PyContains<PyValue> for Vec<String> {
+    fn py_contains(&self, item: &PyValue) -> bool {
+        match item {
+            PyValue::Str(s) => self.iter().any(|m| m == s),
             _ => false,
         }
     }

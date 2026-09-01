@@ -13997,6 +13997,143 @@ fn an_option_callee_result_into_a_boxed_union_param_coerces() {
     );
 }
 
+#[test]
+fn a_property_read_local_on_a_factory_local_coerces_into_a_boxed_union_param() {
+    // Round 87: `timeout_obj = self._get_timeout()` (a `-> Timeout`
+    // self-method call) seeds the local with the class; the PROPERTY read
+    // `read_timeout = timeout_obj.read_timeout` (a `-> float | None`
+    // accessor) then types the local as Option<f64> — and because the
+    // read yields the Option (the read-flavored receiver resolution sees
+    // the factory local where the conservative receiver_class returned
+    // None on the attribute-callee Assign shape), the store passes it
+    // through instead of double-wrapping `Some(timeout_obj.read_timeout()?)`.
+    // The Option<f64> local into a `_TYPE_TIMEOUT` (boxed PyValue) param
+    // then coerces via the Some/None match — Python's None passes through
+    // as the boxed None.
+    let out = compile(
+        concat!(
+            "from typing import Union\n",
+            "\n",
+            "_TYPE_TIMEOUT = Union[float, str, None]\n",
+            "\n",
+            "class Timeout:\n",
+            "    @property\n",
+            "    def read_timeout(self) -> float | None:\n",
+            "        return None\n",
+            "\n",
+            "class Conn:\n",
+            "    def _get_timeout(self) -> Timeout:\n",
+            "        return Timeout()\n",
+            "    def _raise(self, e: int, timeout_value: _TYPE_TIMEOUT) -> None:\n",
+            "        pass\n",
+            "    def f(self) -> None:\n",
+            "        timeout_obj = self._get_timeout()\n",
+            "        read_timeout = timeout_obj.read_timeout\n",
+            "        self._raise(1, read_timeout)\n",
+        ),
+        "propfactory.py",
+    );
+    assert!(
+        out.contains("read_timeout = timeout_obj . read_timeout () ?")
+            || out.contains("read_timeout=timeout_obj.read_timeout()?"),
+        "the property read must pass the Option through, not double-wrap: {}",
+        out
+    );
+    assert!(
+        !out.contains("read_timeout = Some (timeout_obj")
+            && !out.contains("read_timeout=Some(timeout_obj"),
+        "the store must NOT Some-wrap an already-Option property read: {}",
+        out
+    );
+    assert!(
+        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from ((__rython_v)) , None => stdpython :: PyValue :: None_ , }")
+            || out.contains("match(read_timeout){Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
+        "the Option<f64> local must coerce into the boxed param: {}",
+        out
+    );
+}
+
+#[test]
+fn a_float_typed_option_compares_with_an_int_literal_as_a_float() {
+    // Round 87: `read_timeout == 0` where read_timeout is a `float | None`
+    // property read — the Option-match comparison lowers the inner f64
+    // against the integer literal, and Rust std has no int/float
+    // cross-PartialEq. Python promotes the int operand to float, so the
+    // literal renders `(0) as f64` (the same `as f64` the coercion
+    // machinery accepts for numeric contexts).
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    @property\n",
+            "    def read_timeout(self) -> float | None:\n",
+            "        return 0.5\n",
+            "\n",
+            "class Conn:\n",
+            "    def _get_timeout(self) -> Timeout:\n",
+            "        return Timeout()\n",
+            "    def f(self) -> None:\n",
+            "        timeout_obj = self._get_timeout()\n",
+            "        read_timeout = timeout_obj.read_timeout\n",
+            "        if read_timeout == 0:\n",
+            "            print(\"zero\")\n",
+        ),
+        "floatcmp.py",
+    );
+    assert!(
+        out.contains("py_eq (& ((0) as f64))") || out.contains("py_eq(&((0)as f64))"),
+        "the integer literal must promote to the float operand: {}",
+        out
+    );
+}
+
+#[test]
+fn a_dict_literal_string_value_is_owned_like_its_key() {
+    // Round 87: `headers_ = {"Accept": "*/*"}` in a `-> Mapping[str, str]`
+    // function — string-literal VALUES alone inferred &'static str, so the
+    // literal rendered IndexMap<String, &str> and could never match the
+    // IndexMap<String, String> return. The value normalizes to owned
+    // String exactly like the key.
+    let out = compile(
+        concat!(
+            "from typing import Mapping\n",
+            "\n",
+            "def headers() -> Mapping[str, str]:\n",
+            "    headers_ = {\"Accept\": \"*/*\"}\n",
+            "    return headers_\n",
+        ),
+        "strdict.py",
+    );
+    assert!(
+        out.contains("(\"Accept\") . to_string () , (\"*/*\") . to_string ()")
+            || out.contains("(\"Accept\").to_string(),(\"*/*\").to_string()"),
+        "the dict literal must own its string value like its key: {}",
+        out
+    );
+}
+
+#[test]
+fn an_annotated_option_return_keeps_the_option_against_a_plain_literal_body() {
+    // Round 87: `-> float | None` with a `return 0.5` body — the body's
+    // inferred `f64` must NOT shrink the annotated `Option<f64>` (the
+    // return-site Some-wrap and the fn_return_is_option flag already
+    // agree on the Option; the annotation is the contract).
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    @property\n",
+            "    def read_timeout(self) -> float | None:\n",
+            "        return 0.5\n",
+        ),
+        "annopt.py",
+    );
+    assert!(
+        out.contains("-> Result < Option < f64 > , PyException >")
+            || out.contains("->Result<Option<f64>,PyException>"),
+        "the annotated Option return must win over the body's inferred float: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // §7's mapping-protocol slice: a user class's own `__getitem__`/
 // `__setitem__`/`__contains__` dunders receive the subscript store,

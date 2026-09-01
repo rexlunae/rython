@@ -423,7 +423,16 @@ impl ExprType {
                 let expected_elt = if matches!(expected, crate::TypeInfo::PyObject) {
                     None
                 } else {
-                    Some(expected)
+                    // String-literal elements are owned String, not
+                    // &'static str — the same rule as dict VALUES (round
+                    // 87): `ks = ["Retry-After"]; return ks` in a
+                    // `-> list[str]` function must build Vec<String>, or
+                    // the literal's Vec<&str> can never match the
+                    // annotation-honest Vec<String> return.
+                    Some(match expected {
+                        crate::TypeInfo::StrRef => crate::TypeInfo::String,
+                        other => other,
+                    })
                 };
 
                 let mut elements = Vec::new();
