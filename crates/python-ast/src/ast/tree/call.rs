@@ -6825,16 +6825,6 @@ impl<'a> CodeGen for Call {
                                 &class_symbols,
                             )
                         {
-                            // The DEFAULT must unify with the __getitem__
-                            // result type: a str literal owns itself
-                            // (String, not &str).
-                            let default = crate::render_typed(
-                                &self.args[1],
-                                ctx.clone(),
-                                options.clone(),
-                                symbols.clone(),
-                                Some(crate::TypeInfo::String),
-                            )?;
                             // A None (or Option-typed) DEFAULT (`headers.get(
                             // name, default=None)` — urllib3's getheader)
                             // makes the result an OPTION: the Ok arm must
@@ -6847,6 +6837,28 @@ impl<'a> CodeGen for Call {
                                     &options,
                                     &symbols,
                                 );
+                            // Round 83: an OPTION-typed default renders as the
+                            // Option ITSELF — the Some-wrapped Ok arm matches
+                            // it, and the empty case IS the fallback (Python's
+                            // `headers.get(k, default)` returns the Option
+                            // default when the key is absent). The Option→
+                            // concrete coercion (the round-83 unwrap) must NOT
+                            // fire here — it would unwrap the fallback to the
+                            // member and break the arm match (`Option<String> |
+                            // String`, getheader ×3 in urllib3).
+                            let default = if default_is_none {
+                                self.args[1]
+                                    .clone()
+                                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                            } else {
+                                crate::render_typed(
+                                    &self.args[1],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::String),
+                                )?
+                            };
                             let ok_arm = if default_is_none {
                                 quote!(Ok(__rython_v) => Some(__rython_v))
                             } else {

@@ -14119,6 +14119,70 @@ fn an_option_value_in_condition_position_tests_none_ness() {
     );
 }
 
+#[test]
+fn an_option_field_augmented_add_operates_on_the_inner() {
+    // Round 83: `self._data += data` where the field is `bytes | None`
+    // (urllib3's DeflateDecoder — the None stores widen `_data` to
+    // Option<Vec<u8>>): the aug-add reads the INNER value, py_adds, and
+    // stores back wrapped — a None here is CPython's TypeError
+    // (`None + bytes`), a loud §12.2 panic with the message.
+    let out = compile(
+        concat!(
+            "class Decoder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._data: bytes | None = b\"\"\n",
+            "\n",
+            "    def feed(self, data: bytes) -> bytes:\n",
+            "        self._data += data\n",
+            "        return data\n",
+        ),
+        "optaugadd.py",
+    );
+    assert!(
+        out.contains("unsupported operand type(s) for +=: 'NoneType' and 'bytes'"),
+        "the Option aug-add must carry CPython's TypeError text: {}",
+        out
+    );
+    assert!(
+        out.contains("Some ((__rython_v) . py_add"),
+        "the Option aug-add must py_add the INNER value and store wrapped: {}",
+        out
+    );
+}
+
+#[test]
+fn an_option_field_value_into_a_concrete_slot_unwraps_loudly() {
+    // Round 83: `self.decompress(self._data)` where the field is
+    // `bytes | None` (urllib3's DeflateDecoder reading the now-Option
+    // `_data` into the `data: bytes` parameter): the Option unwraps with
+    // the loud conversion panic — Python fails at use on a None value,
+    // rython at the conversion (§12.2), mirroring the return site.
+    let out = compile(
+        concat!(
+            "class Decoder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._data: bytes | None = b\"\"\n",
+            "\n",
+            "    def feed(self, data: bytes) -> bytes:\n",
+            "        return self.decompress(self._data)\n",
+            "\n",
+            "    def decompress(self, data: bytes) -> bytes:\n",
+            "        return data\n",
+        ),
+        "optarg.py",
+    );
+    assert!(
+        out.contains("rython: an optional value was None where a concrete value was required"),
+        "an Option value into a concrete slot must unwrap with the loud panic: {}",
+        out
+    );
+    assert!(
+        out.contains("Some (__rython_v) => __rython_v"),
+        "the Some arm must yield the inner value: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // The bytes-display slice (issue #137): Python displays a bytes value as
 // `b'ab'`, NOT the int-list the blanket Vec<T> display renders. print of
@@ -15151,6 +15215,47 @@ fn mapping_get_binds_the_default_before_the_match() {
     assert!(
         flat.contains("__rython_recv.__getitem__(__rython_key)"),
         "the __getitem__ call must use the bound receiver and key: {}",
+        out
+    );
+}
+
+#[test]
+fn mapping_get_with_an_option_typed_default_keeps_the_option() {
+    // Round 83: `.get(k, default)` where the DEFAULT is `str | None`
+    // (urllib3's getheader — `default: str | None = None` into the
+    // mapping-get synthesis): the fallback IS the Option (the result is
+    // Option<String>, matching the Some-wrapped Ok arm) — the round-83
+    // Option→concrete unwrap must NOT fire on the default, or the arms
+    // mismatch (`Option<String> | String`, getheader ×3).
+    let out = compile(
+        concat!(
+            "from typing import MutableMapping\n",
+            "class M(MutableMapping[str, str]):\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        return \"v\"\n",
+            "    def __len__(self) -> int:\n",
+            "        return 0\n",
+            "    def __iter__(self):\n",
+            "        return iter([])\n",
+            "def f(m: M, default: str | None) -> str | None:\n",
+            "    return m.get(\"k\", default)\n",
+        ),
+        "mapgetopt.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("let__rython_default=default;"),
+        "the Option default must render as the Option itself, not the unwrap: {}",
+        out
+    );
+    assert!(
+        flat.contains("Ok(__rython_v)=>Some(__rython_v)"),
+        "the Ok arm must Some-wrap to match the Option default: {}",
+        out
+    );
+    assert!(
+        !flat.contains("rython:anoptionalvaluewasNone"),
+        "the Option default must NOT be unwrapped with the round-83 panic: {}",
         out
     );
 }

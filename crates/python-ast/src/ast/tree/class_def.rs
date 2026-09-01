@@ -1550,6 +1550,29 @@ impl ClassDef {
                         // an unannotated param (`self._session_ua_creator =
                         // UserAgentString(...)` then `= ua_creator` —
                         // botocore's ClientArgsCreator).
+                        // Round 83: a None store joins a CONCRETE field
+                        // type (`self._data = b""` in __init__, then
+                        // `self._data = None` in decompress — urllib3's
+                        // DeflateDecoder, whose `_data` is `bytes | None`):
+                        // the field widens to Option<T> — the same
+                        // declare-then-fill idiom the method-store join
+                        // uses. The None store then lowers to the None
+                        // member, and reads unwrap loudly where a concrete value is
+                        // required (the round-83 Option→concrete coercion).
+                        Some((_, prev))
+                            if crate::is_none_expr(store.value)
+                                && !matches!(prev, crate::TypeInfo::Option(_))
+                                && !matches!(prev, crate::TypeInfo::PyValue) =>
+                        {
+                            let idx = fields
+                                .iter()
+                                .position(|(name, _)| name == &store.attr)
+                                .unwrap();
+                            fields[idx] = (
+                                store.attr.clone(),
+                                crate::TypeInfo::Option(Box::new(prev.clone())),
+                            );
+                        }
                         Some((_, prev))
                             if (matches!(prev, crate::TypeInfo::PyValue)
                                 && !matches!(ty, crate::TypeInfo::PyValue))
@@ -1647,6 +1670,30 @@ impl ClassDef {
                     continue;
                 }
                 if fields.iter().any(|(name, _)| *name == store.attr) {
+                    // Round 83: a None store in a METHOD joins a
+                    // __init__-declared CONCRETE field (`self._data = b""`
+                    // in __init__, then `self._data = None` in decompress
+                    // — urllib3's DeflateDecoder, whose `_data` is
+                    // `bytes | None`): the field widens to Option<T>, the
+                    // same declare-then-fill idiom the __init__ store join
+                    // uses. The None store then lowers to the None member,
+                    // and reads unwrap loudly where a concrete value is
+                    // required (the round-83 Option→concrete coercion).
+                    if crate::is_none_expr(store.value) {
+                        let idx = fields
+                            .iter()
+                            .position(|(name, _)| name == &store.attr)
+                            .unwrap();
+                        let prev = fields[idx].1.clone();
+                        if !matches!(prev, crate::TypeInfo::Option(_))
+                            && !matches!(prev, crate::TypeInfo::PyValue)
+                        {
+                            fields[idx] = (
+                                store.attr.clone(),
+                                crate::TypeInfo::Option(Box::new(prev)),
+                            );
+                        }
+                    }
                     continue;
                 }
                 // `self.last = self.value` — a store FROM another

@@ -350,6 +350,20 @@ pub fn coerce_tokens(
                 coerce_tokens(quote!(__rython_v), &TypeInfo::PyValue, to_inner)?;
             Some(quote!((#tokens).map(|__rython_v| #coerced)))
         }
+        // Round 83 (the generics directive): an OPTION-typed value into an
+        // OPTION-typed slot of a DIFFERENT inner type (`Option<i64> →
+        // Option<f64>`, `Option<A> → Option<B>` — urllib3's urlopen
+        // headers): map the inner conversion — None passes through
+        // (Python's None IS the empty case), Some converts. Must come
+        // BEFORE the generic `T → Option` arm below, which would
+        // otherwise Some-wrap the recursion and turn the empty case into
+        // a panic instead of a pass-through None.
+        (TypeInfo::Option(from_inner), TypeInfo::Option(to_inner))
+            if !matches!(**from_inner, TypeInfo::PyValue) =>
+        {
+            let coerced = coerce_tokens(quote!(__rython_v), from_inner, to_inner)?;
+            Some(quote!((#tokens).map(|__rython_v| #coerced)))
+        }
         // T → Option<U> (issue #137 round 27): a concrete value stored
         // into an OPTIONAL slot. Round 23 gave fields an `Option<T>` type
         // when a None store joined a typed one — the declare-then-fill
@@ -389,6 +403,35 @@ pub fn coerce_tokens(
         | (TypeInfo::PyValue, TypeInfo::String)
         | (TypeInfo::PyValue, TypeInfo::Bytes) => {
             Some(quote!((#tokens).into()))
+        }
+        // Round 83 (the generics directive): an OPTION-typed value into a
+        // CONCRETE slot (`Option<Vec<u8>> → Vec<u8>` — a `bytes | None`
+        // field read passed to a `bytes`-annotated parameter — urllib3's
+        // `self.decompress(self._data)` where DeflateDecoder's `_data`
+        // widens to Option when a None store joins): the inner converts,
+        // and the None case is a LOUD panic — Python fails at use on a
+        // None value, rython at the conversion (§12.2), mirroring the
+        // return-site `Option<PyValue>` map (round 81). Excludes the
+        // PyValue targets (the Option→PyValue arms above keep the empty
+        // case as Python's None), StrOrBytes (a union slot), and Option
+        // targets (an Option→Option join passes None through, not a
+        // panic — that direction stays a rustc error until the `.map`
+        // conversion is added).
+        (TypeInfo::Option(inner), to_ty)
+            if !matches!(
+                to_ty,
+                TypeInfo::PyValue | TypeInfo::StrOrBytes | TypeInfo::Option(_)
+            ) =>
+        {
+            let coerced = coerce_tokens(quote!(__rython_v), inner, to_ty)?;
+            Some(quote!(
+                match (#tokens) {
+                    Some(__rython_v) => #coerced,
+                    None => panic!(
+                        "rython: an optional value was None where a concrete value was required (Python would fail at use, rython at the conversion)"
+                    ),
+                }
+            ))
         }
         // Anything → PyValue (issue #121): a value stored into a boxed
         // union / Any slot wraps in PyValue::from (None via From<()>).
@@ -1030,6 +1073,33 @@ pub fn render_typed(
             None => actual,
         },
         _ => actual,
+    };
+    // Round 83 (the generics directive): an OPTION-typed value into a
+    // CONCRETE slot (`self.decompress(self._data)` where the field is
+    // `bytes | None` — urllib3's DeflateDecoder, whose None stores
+    // widen the field to Option<Vec<u8>>): `infer_type` answers PyObject
+    // for attribute reads ("no answer"), but the ctx-aware predicate
+    // resolves the Option through the class table — coerce from the
+    // Option shape so the read unwraps with the loud §12.2 panic
+    // (Python fails at use on a None value, rython at the conversion —
+    // mirroring the return site). The inner conversion reuses the same
+    // coercion: identity for the matching member, and a genuine inner
+    // mismatch stays a loud rustc error. Excludes Option/PyValue/
+    // StrOrBytes slots — the empty case is their legitimate value.
+    let actual = if matches!(actual, crate::TypeInfo::PyObject)
+        && !matches!(
+            expected,
+            crate::TypeInfo::Option(_)
+                | crate::TypeInfo::PyValue
+                | crate::TypeInfo::StrOrBytes
+        )
+        && crate::ast::tree::function_def::expr_yields_option_ctx(
+            expr, &ctx, &options, &symbols,
+        )
+    {
+        crate::TypeInfo::Option(Box::new(expected.clone()))
+    } else {
+        actual
     };
     match coerce_tokens(tokens.clone(), &actual, &expected) {
         Some(coerced) => Ok(coerced),
