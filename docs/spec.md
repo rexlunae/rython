@@ -914,6 +914,18 @@ unwrapping guarded against already-narrowed receivers. Sweep −3
 (charset_normalizer 190→187, everything else flat). Pinned in codegen
 (the is-None early-exit guard narrows the following reads).
 
+Round 78 (string-literal ownership in Vec contexts): charset's
+`String | &str` family — a `-> list[str]` function returning a list
+LITERAL (`return ["Latin Based"]` — unicode_range_languages) and a
+module `Vec<String>` static with a list-literal init
+(`UNICODE_SECONDARY_RANGE_KEYWORD = ["Supplement", ...]`) emitted
+`Vec<&'static str>` elements that mismatched the `Vec<String>` type.
+The return statement's forced-list-element mechanism (round 57, the
+boxed-element case) now also fires for `Vec<String>` returns, and the
+promoted-static emission re-renders a list-literal init with the String
+element type when the static's type is `Vec<String>`. Sweep −3
+(charset_normalizer 187→182, everything else flat). Pinned in codegen.
+
 ## 6. Functions
 
 ### 6.1 Signatures

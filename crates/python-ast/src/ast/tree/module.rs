@@ -1410,7 +1410,31 @@ impl CodeGen for Module {
                     // type matches.
                     let (ty, wrapped) =
                         match module_init_static_ty(&n, &a.value, &options) {
-                            Some(ty) => (ty, value_tokens.clone()),
+                            Some(ty) => {
+                                // A `Vec<String>` static whose init is a
+                                // list LITERAL (`UNICODE_SECONDARY_RANGE_
+                                // KEYWORD = ["Supplement", ...]` —
+                                // charset_normalizer): the literal alone
+                                // infers Vec<&'static str>, mismatching
+                                // Vec<String> — force each element to own
+                                // (round 78).
+                                let wrapped = if ty.to_string().contains("Vec < String >")
+                                    && matches!(&a.value, crate::ExprType::List(_))
+                                {
+                                    let mut st_opt = options.clone();
+                                    st_opt.forced_list_elt = std::rc::Rc::new(Some(
+                                        crate::TypeInfo::String,
+                                    ));
+                                    a.value.clone().to_rust(
+                                        ctx.clone(),
+                                        st_opt,
+                                        symbols.clone(),
+                                    )?
+                                } else {
+                                    value_tokens.clone()
+                                };
+                                (ty, wrapped)
+                            }
                             None => {
                                 let boxed = match (unpack_at, &shared_ident) {
                                     (Some(i), Some(shared)) => {
