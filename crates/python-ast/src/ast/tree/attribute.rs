@@ -1323,3 +1323,27 @@ pub(crate) fn receiver_option_inner(
         _ => None,
     }
 }
+
+/// Whether a RETURN value is a method call on a boxed-PyValue receiver
+/// (`return self._obj.decompress(...)` — urllib3's DeflateDecoder, where
+/// `self._obj` is an unmodeled zlib object): call.rs DROPS such calls to
+/// the boxed None (dynamic-method divergence), so returning one from a
+/// TYPED function would emit `Ok(PyValue::None_)` in a `Vec<u8>`-typed
+/// fn — a loud runtime panic at the exact point of divergence instead
+/// (round 80), mirroring the external-module-drop return.
+pub(crate) fn dropped_boxed_receiver_call(
+    value: &crate::ExprType,
+    ctx: &crate::CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let crate::ExprType::Call(c) = value else {
+        return false;
+    };
+    let crate::ExprType::Attribute(a) = c.func.as_ref() else {
+        return false;
+    };
+    // The EXACT condition the call lowering uses to drop a boxed-receiver
+    // call (protocol methods survive; module members do not drop).
+    crate::ast::tree::call::boxed_receiver_method_dropped(a, ctx, symbols, options)
+}

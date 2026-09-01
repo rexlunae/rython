@@ -697,7 +697,7 @@ impl CodeGen for StatementType {
                     ) || crate::ast::tree::attribute::is_boxed_global_read(
                         &e.value,
                         &options,
-                    ) {
+                    ) || crate::ast::tree::attribute::dropped_boxed_receiver_call(&e.value, &ctx, &symbols, &options) {
                         let spelling = crate::ast::tree::call::expr_chain_spelling(&e.value);
                         return Ok(return_tokens(
                             &ctx,

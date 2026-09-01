@@ -2693,6 +2693,62 @@ impl From<&str> for PyValue {
     }
 }
 
+/// The REVERSE conversions: a boxed PyValue flows back into a typed
+/// slot or `impl Into<T>` parameter (`check_nfc((label).clone())` —
+/// idna's core, where the None-mixing inference boxed a str label;
+/// round 80). The value was boxed from a concrete member, so the
+/// conversion recovers it; a WRONG member panics loudly (Python fails
+/// at USE, rython fails at the conversion — the same loudness class,
+/// and never a silent placeholder).
+fn value_member_panic(expected: &str) -> ! {
+    panic!(
+        "{}",
+        PyException::new(
+            "TypeError",
+            format!(
+                "the boxed value is not a {} (Python would have failed at                  use; rython fails at the conversion)",
+                expected
+            ),
+        )
+    );
+}
+
+impl From<PyValue> for String {
+    fn from(value: PyValue) -> String {
+        value
+            .as_str()
+            .unwrap_or_else(|| value_member_panic("str"))
+            .to_string()
+    }
+}
+
+impl From<PyValue> for Vec<u8> {
+    fn from(value: PyValue) -> Vec<u8> {
+        value
+            .as_bytes()
+            .unwrap_or_else(|| value_member_panic("bytes"))
+            .to_vec()
+    }
+}
+
+impl From<PyValue> for i64 {
+    fn from(value: PyValue) -> i64 {
+        value.as_int().unwrap_or_else(|| value_member_panic("int"))
+    }
+}
+
+impl From<PyValue> for f64 {
+    fn from(value: PyValue) -> f64 {
+        value.as_float().unwrap_or_else(|| value_member_panic("float"))
+    }
+}
+
+impl From<PyValue> for bool {
+    fn from(value: PyValue) -> bool {
+        value.as_bool().unwrap_or_else(|| value_member_panic("bool"))
+    }
+}
+
 impl From<&[u8]> for PyValue {
     fn from(value: &[u8]) -> Self {
         PyValue::Bytes(value.to_vec())

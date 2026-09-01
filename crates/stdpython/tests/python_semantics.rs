@@ -3762,3 +3762,29 @@ fn string_is_family_matches_python() {
     assert!(!'\u{0345}'.to_string().isalnum());
     assert!('\u{00C0}'.to_string().isalpha(), "\u{00C0} isalpha");
 }
+
+#[test]
+fn boxed_values_convert_back_to_typed_members() {
+    // Round 80: a boxed PyValue flows back into a typed slot or
+    // `impl Into<T>` parameter via the reverse From impls — the value
+    // was boxed from a concrete member, so the conversion recovers it;
+    // a wrong member is a LOUD TypeError panic (Python fails at use,
+    // rython at the conversion).
+    use stdpython::PyValue;
+    let s: String = PyValue::from("abc").into();
+    assert_eq!(s, "abc");
+    let b: Vec<u8> = PyValue::from(b"xy".to_vec()).into();
+    assert_eq!(b, b"xy");
+    let i: i64 = PyValue::from(7).into();
+    assert_eq!(i, 7);
+    let f: f64 = PyValue::from(1.5).into();
+    assert_eq!(f, 1.5);
+    let bl: bool = PyValue::from(true).into();
+    assert!(bl);
+    // A wrong member is loud.
+    let v = PyValue::from(3);
+    let r = std::panic::catch_unwind(|| {
+        let _: String = v.into();
+    });
+    assert!(r.is_err(), "a non-str boxed value into a String slot must panic");
+}
