@@ -2176,6 +2176,17 @@ impl FunctionDef {
         options.fn_return_list_elt = std::rc::Rc::new(
             self.returns.as_deref().and_then(|ann| {
                 match crate::annotation_type_info(ann) {
+                    // A `-> list[str]` return's list LITERAL must own its
+                    // string literals (`return ["a", "b"]` — charset's
+                    // unicode_range_languages): the literal alone infers
+                    // Vec<&'static str>, mismatching Vec<String> (round
+                    // 78 — the same forced-elt mechanism round 57 added
+                    // for the boxed-element case).
+                    Some(crate::TypeInfo::Vec(inner))
+                        if matches!(*inner, crate::TypeInfo::String) =>
+                    {
+                        Some(crate::TypeInfo::String)
+                    }
                     Some(crate::TypeInfo::Vec(inner))
                         if matches!(*inner, crate::TypeInfo::PyValue) =>
                     {

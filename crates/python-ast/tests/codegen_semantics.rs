@@ -15448,6 +15448,31 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "a comprehension target must keep the outer narrowing: {}",
         out6
     );
+    // Round 78: a `-> list[str]` function's returning list LITERAL owns
+    // its string literals (`return ["a", "b"]` lowers the elements), and
+    // a module `Vec<String>` static with a list-literal init does too.
+    let out_v = compile(
+        "def langs() -> list[str]:\n\
+         \x20   return [\"Latin\", \"Cyrillic\"]\n",
+        "vecstr.py",
+    );
+    assert!(
+        out_v.contains("to_string ()") || out_v.contains("to_string()"),
+        "a returning list[str] literal must own its elements: {}",
+        out_v
+    );
+    // Devin review on #286: a SPREAD of borrowed strings into the
+    // returning list owns each spread element too.
+    let out_vs = compile(
+        "def langs(more: list[str]) -> list[str]:\n\
+         \x20   return [\"a\", *more, \"b\"]\n",
+        "vecspread.py",
+    );
+    assert!(
+        out_vs.contains("into_iter () . map") || out_vs.contains("into_iter().map"),
+        "a spread into a returning list[str] must own each element: {}",
+        out_vs
+    );
     // Devin review on #285 (2nd pass): a walrus in a def DEFAULT or a
     // class BASE in the else rebinds the guarded name.
     let out7 = compile(
