@@ -323,6 +323,15 @@ impl ExprType {
                     for li in &l {
                         if let ExprType::Starred(_) = li {
                             let s = spreads[si].clone();
+                            // A SPREAD of borrowed strings into a
+                            // Vec<String> list (`return ["a", *more]`
+                            // where more is Vec<&str>): own each spread
+                            // element (Devin review on #286).
+                            let s = if matches!(forced, crate::TypeInfo::String) {
+                                quote!(#s.into_iter().map(|__e| __e.to_string()))
+                            } else {
+                                s
+                            };
                             segments.push(quote!(__rython_list.extend(#s);));
                             si += 1;
                         } else {
