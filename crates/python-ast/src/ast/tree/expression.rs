@@ -900,14 +900,59 @@ pub fn condition_to_rust(    expr: &ExprType,
         ExprType::BoolOp(op)
             if matches!(op.op, crate::BoolOps::And | crate::BoolOps::Or) =>
         {
+            // Round 81 (the generics directive): in an `and` CHAIN in
+            // condition position, an earlier operand that is a truthiness
+            // test on an OPTION-typed NAME proves the name non-None for
+            // the LATER operands — Python evaluates them only when the
+            // earlier one was truthy (`if conn and
+            // is_connection_dropped(conn)` — urllib3's _get_conn, where
+            // conn is `BaseHTTPConnection | None` and the call needs the
+            // unwrapped value). The narrowing reuses the same
+            // Option-truthiness predicate the operand lowering uses
+            // (`!(x).py_is_none()` — receiver_option_inner), so the two
+            // sides cannot disagree about what is Option. `or` chains do
+            // NOT narrow: a truthy earlier operand short-circuits, so the
+            // later operands run only on the FALSY path.
             let mut parts = Vec::new();
+            let mut narrowed = options.narrowed_names.as_ref().clone();
+            let mut chain_options = options.clone();
             for value in &op.values {
-                parts.push(condition_to_rust(
+                let rendered = condition_to_rust(
                     value,
                     ctx.clone(),
-                    options.clone(),
+                    chain_options.clone(),
                     symbols.clone(),
-                )?);
+                )?;
+                parts.push(rendered);
+                if matches!(op.op, crate::BoolOps::And) {
+                    // A NAME whose truthiness test the operand lowering
+                    // turns into `!(x).py_is_none()` — the same predicate
+                    // (receiver_option_inner) — narrows for later
+                    // operands. The narrowed_names entry is the OPTION
+                    // itself: Name::to_rust's fallback for an Option entry
+                    // emits `(x).clone().unwrap()`, exactly the inner read
+                    // the later operand needs (mirroring bool_ops.rs's
+                    // narrow_option_operand).
+                    if let ExprType::Name(n) = value
+                        && crate::ast::tree::attribute::receiver_option_inner(
+                            value,
+                            &ctx,
+                            &symbols,
+                            &chain_options,
+                        )
+                        .is_some()
+                    {
+                        let inner = match chain_options.name_types.get(&n.id) {
+                            Some(crate::TypeInfo::Option(inner)) => (**inner).clone(),
+                            _ => crate::TypeInfo::PyObject,
+                        };
+                        narrowed.insert(
+                            n.id.clone(),
+                            crate::TypeInfo::Option(Box::new(inner)),
+                        );
+                        chain_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
+                    }
+                }
             }
             Ok(match op.op {
                 crate::BoolOps::And => quote!(#((#parts))&&*),

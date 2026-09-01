@@ -407,7 +407,20 @@ impl<'a> CodeGen for Attribute {
         // narrowed receiver never reaches here (narrowed_names unwraps
         // reads already); guarded access stays exact. Computed BEFORE
         // `self.value` is moved by the to_rust below.
-        let option_receiver = receiver_option_inner(&self.value, &ctx, &symbols, &options);
+        let option_receiver = {
+            // Round 81's `and`-chain narrowing (`if conn and
+            // conn.is_connected():` — urllib3) proves the NAME non-None:
+            // its read already emits `(conn).clone().unwrap()` (the
+            // unwrapped PyValue), so the Option-unwrap here would
+            // double-unwrap — `unwrap_or_else` on a PyValue (E0599).
+            let receiver_narrowed = matches!(self.value.as_ref(), ExprType::Name(n)
+                if options.narrowed_names.contains_key(&n.id));
+            if receiver_narrowed {
+                None
+            } else {
+                receiver_option_inner(&self.value, &ctx, &symbols, &options)
+            }
+        };
         // The generic trait-default context (`Self: {Class}Trait`), captured
         // before `ctx` is moved: the base-accessor hops generated below must
         // be qualified with the OWN trait to dodge the own-vs-ancestor

@@ -223,7 +223,9 @@ impl CodeGen for Try {
         // A return that broke out of any of the closures below runs the
         // finally body, then returns from the function — re-wrapped as
         // another Break when this try is itself inside an enclosing try's
-        // closure.
+        // closure. The carried value was already converted by the Return
+        // statement inside the closure (round 81's `.into()` fires there,
+        // where the value's inference is known).
         let break_return = if ctx.in_try_block() {
             quote!(return Ok(PyFlow::Return(__rython_ret));)
         } else {

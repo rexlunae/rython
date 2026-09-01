@@ -9585,7 +9585,120 @@ fn map_call_arguments_inner(
                     None,
                 );
             }
-            crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())
+            // Round 81 (the generics directive): an `X | None`-annotated
+            // parameter whose X is a CONCRETE member (`cert_reqs: int |
+            // None` → `Option<i64>`) receives a BOXED argument
+            // (`resolve_cert_reqs(...)` — the callee's return was boxed
+            // by the None-mixing inference). The inner converts via the
+            // reverse From<PyValue> impls: `Some((arg).into())` — loud
+            // TypeError panic on a wrong member, never a silent
+            // placeholder (rustc's own suggestion is exactly the
+            // `.into()`). The bare-PyValue case wraps here so the wrap
+            // and the conversion happen in one pass (lower_optional_value
+            // would Some-wrap the raw PyValue, leaving `Some(PyValue)`
+            // against `Option<i64>`).
+            let inner_expected = param.annotation.as_deref().and_then(|ann| {
+                match crate::call_arg_expected_type(ann) {
+                    Some(crate::TypeInfo::Option(inner))
+                        if crate::ast::tree::type_ctx::is_boxable_value_type(&inner) =>
+                    {
+                        Some(inner)
+                    }
+                    _ => None,
+                }
+            });
+            let arg_infers = crate::ast::tree::type_ctx::infer_type(expr, &options, &symbols);
+            // A BOXED argument: the inferrer's PyValue, or PyObject
+            // ("no answer") that the boxed-receiver read-side drop
+            // recognizes — an ATTRIBUTE read on a boxed receiver
+            // (`conn.host` where conn is `PyValue` — urllib3's
+            // _url_from_connection) lowers to `PyValue::None_`; its
+            // argument is boxed, so it converts the same way. A CALL into
+            // a same-module function whose RESOLVED return is the boxed
+            // PyValue (`resolve_cert_reqs(...)` — a generic callee the
+            // inferrer cannot see through) is boxed the same way.
+            let arg_is_boxed = matches!(
+                arg_infers,
+                crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
+            ) || (matches!(arg_infers, crate::TypeInfo::PyObject)
+                && (matches!(expr, ExprType::Call(c)
+                    // A call into a same-module function whose RESOLVED
+                    // return is the boxed PyValue (`resolve_cert_reqs(...)`
+                    // — a generic callee the inferrer cannot see through).
+                    // The resolved return is the authority: the codegen
+                    // renders `Result<PyValue>` from it, so the argument is
+                    // boxed and converts like one.
+                    if matches!(
+                        crate::ast::tree::type_ctx::call_return_typeinfo(
+                            c, Some(&symbols), Some(&options),
+                        ),
+                        Some(crate::TypeInfo::PyValue | crate::TypeInfo::PyObject)
+                    ) || {
+                        match c.func.as_ref() {
+                            ExprType::Name(callee) => match symbols.get(&callee.id) {
+                                Some(crate::SymbolTableNode::FunctionDef(f)) => f
+                                .resolved_return_type(&symbols, &options)
+                                .is_some_and(|t| {
+                                    let s = t.to_string();
+                                    s.contains("PyValue") || s.contains("PyObject")
+                                }),
+                                _ => false,
+                            },
+                            _ => false,
+                        }
+                    })
+                // A NAME receiver with POSITIVE boxing evidence (`conn.host`
+                // where conn is a boxed PyValue param — urllib3's
+                // _url_from_connection): the read-side drop fires, so the
+                // read lowers to `PyValue::None_` and the argument is boxed.
+                // The SAME positive-evidence predicate the read-side drop
+                // uses (`receiver_is_boxed_positively` — PyValue, never the
+                // PyObject "no answer", which is what round 24's regression
+                // keyed on) — so a FIELD-CHAIN receiver
+                // (`httplib_response.reason` — a REAL `Option<String>`
+                // field read resolving through the base) stays uncoerced:
+                // its value is the typed field, and coercing would corrupt
+                // it.
+                || matches!(expr, ExprType::Attribute(a)
+                    if matches!(a.value.as_ref(), ExprType::Name(_))
+                        && crate::ast::tree::attribute::receiver_is_boxed_positively(
+                            &a.value, &symbols, &options,
+                        ))));
+            if let (Some(inner), true) = (&inner_expected, arg_is_boxed) {
+                let tokens = expr
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let inner_ty = crate::ast::tree::type_ctx::coerce_tokens(
+                    quote!(__rython_v),
+                    &crate::TypeInfo::PyValue,
+                    inner,
+                )
+                .expect("boxable inner converts from PyValue");
+                return Ok(quote!(Some({
+                    let __rython_v = #tokens;
+                    #inner_ty
+                })));
+            }
+            // An OPTION-wrapped boxed argument (`Option<PyValue> →
+            // Option<i64>` — a `.get(key, None)` call into a concrete
+            // optional slot): map the conversion over the Option — None
+            // passes through, Some converts loudly.
+            let optional_tokens =
+                crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())?;
+            if let (Some(inner), crate::TypeInfo::Option(inner_arg)) =
+                (&inner_expected, &arg_infers)
+            {
+                if matches!(inner_arg.as_ref(), crate::TypeInfo::PyValue) {
+                    if let Some(coerced) = crate::ast::tree::type_ctx::coerce_tokens(
+                        optional_tokens.clone(),
+                        &crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyValue)),
+                        &crate::TypeInfo::Option(inner.clone()),
+                    ) {
+                        return Ok(coerced);
+                    }
+                }
+            }
+            Ok(optional_tokens)
         } else {
             // Type-aware lowering: coerce the argument to the parameter's
             // annotated type (usize → i64, i64 → f64) and clone non-Copy

@@ -326,6 +326,30 @@ pub fn coerce_tokens(
                 }
             ))
         }
+        // Round 81: an OPTION-wrapped boxed value into an Option of a
+        // CONCRETE member (`Option<PyValue> → Option<i64>` — a boxed
+        // `cert_reqs` call result stored through an optional slot): map
+        // the conversion over the Option — None passes through (Python's
+        // None IS the empty case), Some converts loudly. Must come BEFORE
+        // the generic `T → Option` arm below: a `from_ty` of
+        // `Option<PyValue>` satisfies that arm's `from_ty != PyValue`
+        // guard, and its recursion (`Option<PyValue> → i64`) finds no
+        // conversion, returning None and dropping the map.
+        (TypeInfo::Option(from_inner), TypeInfo::Option(to_inner))
+            if matches!(**from_inner, TypeInfo::PyValue)
+                && matches!(
+                    **to_inner,
+                    TypeInfo::Int
+                        | TypeInfo::Float
+                        | TypeInfo::Bool
+                        | TypeInfo::String
+                        | TypeInfo::Bytes
+                ) =>
+        {
+            let coerced =
+                coerce_tokens(quote!(__rython_v), &TypeInfo::PyValue, to_inner)?;
+            Some(quote!((#tokens).map(|__rython_v| #coerced)))
+        }
         // T → Option<U> (issue #137 round 27): a concrete value stored
         // into an OPTIONAL slot. Round 23 gave fields an `Option<T>` type
         // when a None store joined a typed one — the declare-then-fill
@@ -335,6 +359,36 @@ pub fn coerce_tokens(
         (from_ty, TypeInfo::Option(inner)) if from_ty != &TypeInfo::PyValue => {
             let coerced = coerce_tokens(tokens, from_ty, inner)?;
             Some(quote!(Some(#coerced)))
+        }
+        // Round 81 (the generics directive): a BOXED value into an
+        // OPTION-typed slot (`Some(resolve_cert_reqs(...)?)` against
+        // `Option<i64>` — urllib3's create_urllib3_context): the inner
+        // converts via the reverse From<PyValue> impls (loud TypeError
+        // panic on a wrong member — Python fails at use, rython at the
+        // conversion), and the present value wraps in Some — Python's
+        // optional slot holds the value. A `PyValue | None` union with a
+        // None default is the None_ member, never an Option, so the
+        // empty case does not arise here.
+        (TypeInfo::PyValue, TypeInfo::Option(inner)) => {
+            let coerced = coerce_tokens(tokens, &TypeInfo::PyValue, inner)?;
+            Some(quote!(Some(#coerced)))
+        }
+        // Round 81 (the generics directive): a boxed value into a CONCRETE
+        // typed slot — `PyValue → i64/f64/bool/String/Vec<u8>` through the
+        // reverse `From<PyValue>` impls (round 80). The value was boxed
+        // from a concrete member by the None-mixing inference; the
+        // conversion recovers it, and a wrong member is a LOUD TypeError
+        // panic (`value_member_panic`): Python fails at use, rython at the
+        // conversion — never a silent placeholder. rustc's own suggestions
+        // at these sites are exactly this `.into()` (urllib3's
+        // py_set_index(key, ...) String keys, `port: i64` params,
+        // `is_verified: bool` field stores).
+        (TypeInfo::PyValue, TypeInfo::Int)
+        | (TypeInfo::PyValue, TypeInfo::Float)
+        | (TypeInfo::PyValue, TypeInfo::Bool)
+        | (TypeInfo::PyValue, TypeInfo::String)
+        | (TypeInfo::PyValue, TypeInfo::Bytes) => {
+            Some(quote!((#tokens).into()))
         }
         // Anything → PyValue (issue #121): a value stored into a boxed
         // union / Any slot wraps in PyValue::from (None via From<()>).
@@ -578,6 +632,21 @@ fn infer_type_inner(
                     // each move-prone use, matching Python's aliasing).
                     Some(crate::SymbolTableNode::ClassDef(_)) => {
                         TypeInfo::Class(n.id.clone())
+                    }
+                    // A SAME-MODULE FUNCTION call resolves its return
+                    // annotation through the same authority the import
+                    // path uses (round 81: `resolve_cert_reqs(...)` — a
+                    // `-> PyValue`-resolving callee — was invisible here,
+                    // so the boxed argument never coerced into the
+                    // `Option<i64>` slot it feeds). An IMPORTED callee
+                    // stays PyObject: resolving its concrete class return
+                    // (`proxy_from_url(...)` → `ProxyManager` in
+                    // requests, which imports urllib3) would type the
+                    // local as the class and make the generated crate
+                    // reference a type it does not import.
+                    Some(crate::SymbolTableNode::FunctionDef(_)) => {
+                        call_return_typeinfo(call, Some(symbols), Some(options))
+                            .unwrap_or(TypeInfo::PyObject)
                     }
                     _ => TypeInfo::PyObject,
                 },
@@ -942,6 +1011,26 @@ pub fn render_typed(
         return Ok(quote!(stdpython::PyValue::None_));
     }
     let actual = infer_type(expr, &options, &symbols);
+    // Round 81: a NARROWED name read already converts to the member type
+    // (name.rs: `(x).as_bytes().unwrap().to_vec()` for a Bytes-narrowed
+    // boxed value, `(x).as_str().unwrap().to_string()` for String). The
+    // recorded type (PyValue) is the PRE-narrowing union; coerce_tokens
+    // against the member target would re-wrap the already-member tokens
+    // (`(Vec<u8>).into()` — a redundant E0282/identity). The narrowed
+    // target IS the actual type the tokens carry.
+    let actual = match expr {
+        ExprType::Name(n) => match options.narrowed_names.get(&n.id) {
+            Some(crate::TypeInfo::StrOrBytes) => crate::TypeInfo::StrOrBytes,
+            Some(crate::TypeInfo::String) | Some(crate::TypeInfo::StrRef) => {
+                crate::TypeInfo::String
+            }
+            Some(crate::TypeInfo::Bytes) => crate::TypeInfo::Bytes,
+            Some(crate::TypeInfo::PyValueMember(inner)) => (**inner).clone(),
+            Some(t) => t.clone(),
+            None => actual,
+        },
+        _ => actual,
+    };
     match coerce_tokens(tokens.clone(), &actual, &expected) {
         Some(coerced) => Ok(coerced),
         None => {
@@ -3606,5 +3695,17 @@ mod tests {
             "Option<()>",
             "type[X] is the tolerated opaque class marker"
         );
+    }
+}
+
+#[cfg(test)]
+mod round81_token_format_tests {
+    use super::*;
+    #[test]
+    fn token_format_strings() {
+        let q = quote!(Vec<u8>);
+        let s = q.to_string();
+        eprintln!("Vec<u8> to_string = [{s}]");
+        assert!(s.contains("u8"), "sanity");
     }
 }

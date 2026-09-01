@@ -2166,6 +2166,33 @@ impl FunctionDef {
                     .as_ref()
                     .is_some_and(|t| t.to_string().starts_with("Option")));
 
+        // Round 81 (the generics directive): a CONCRETE typed return
+        // (`-> Vec<u8>`, `-> i64` ...) whose value arrives as a boxed
+        // PyValue (a dropped external call stored in a local —
+        // DeflateDecoder's `decompressed`, a boxed member read) converts
+        // at the return site via the reverse From<PyValue> impls. The
+        // boxed-PyValue and Option returns are NOT "typed" here — they
+        // have their own return-site shapes (PyValue::from / Some wrap).
+        options.fn_return_typed = self
+            .resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name())
+            .and_then(|ts| {
+                let s = ts.to_string();
+                let t = if s == "i64" {
+                    Some(crate::TypeInfo::Int)
+                } else if s == "f64" {
+                    Some(crate::TypeInfo::Float)
+                } else if s == "bool" {
+                    Some(crate::TypeInfo::Bool)
+                } else if s == "std :: string :: String" || s == "String" {
+                    Some(crate::TypeInfo::String)
+                } else if s == "std :: vec :: Vec < u8 >" || s == "Vec < u8 >" {
+                    Some(crate::TypeInfo::Bytes)
+                } else {
+                    None
+                };
+                t.filter(|_| !options.fn_return_is_pyvalue && !options.fn_return_is_option)
+            });
+
         // A `-> List[Union[...]]` return whose element resolves to the
         // boxed PyValue (`_seg_N` in idna's uts46data: `List[Union[
         // Tuple[int, str], Tuple[int, str, str]]]`): a RETURNING list

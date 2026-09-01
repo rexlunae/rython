@@ -743,12 +743,20 @@ impl<'a> CodeGen for Assign {
             // Rust move would poison the later use (E0382). Cloning the
             // store is faithful ONLY for values Python cannot mutate
             // (str/bytes) — mutable containers keep the move, so aliasing
-            // stays loud (issue #79).
+            // stays loud (issue #79). The boxed PyValue clones too (its
+            // Arc shares dict/tuple members and value-copies the
+            // immutable scalars — Python reference semantics, round 80);
+            // without the clone a reused boxed name is moved out from
+            // under its later reads (`context = ssl_context` then
+            // `elif ssl_context is None` — urllib3's
+            // _ssl_wrap_socket_and_match_hostname).
             let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
                 if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
                     && matches!(
                         crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
-                        crate::TypeInfo::String | crate::TypeInfo::Bytes
+                        crate::TypeInfo::String
+                            | crate::TypeInfo::Bytes
+                            | crate::TypeInfo::PyValue
                     ));
             Ok(match target {
                 ExprType::Name(name) => {
@@ -767,7 +775,18 @@ impl<'a> CodeGen for Assign {
                         if value_is_none_early {
                             quote!(#target_code = PyValue::None_;)
                         } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {
-                            quote!(#target_code = #value;)
+                            // A REUSED boxed name stores a CLONE (the
+                            // Arc copy — Python reference semantics); the
+                            // bare store would move the value out from
+                            // under its later reads (`context =
+                            // ssl_context` then `elif ssl_context is
+                            // None` — urllib3's
+                            // _ssl_wrap_socket_and_match_hostname).
+                            if stored_name_needs_clone {
+                                quote!(#target_code = (#value).clone();)
+                            } else {
+                                quote!(#target_code = #value;)
+                            }
                         } else {
                             quote!(#target_code = PyValue::from(#value);)
                         }
@@ -823,6 +842,16 @@ impl<'a> CodeGen for Assign {
                         // containers keep the move so aliasing stays loud
                         // (issue #79), mirroring stored_name_needs_clone.
                         quote!(#target_code = #clone;)
+                    } else if stored_name_needs_clone {
+                        // A REUSED immutable/boxed name stored into a NAME
+                        // target (`context = ssl_context` then `elif
+                        // ssl_context is None` — urllib3's
+                        // _ssl_wrap_socket_and_match_hostname): the bare
+                        // store moves the value out from under its later
+                        // reads (E0382). The clone is the Arc/Python
+                        // reference copy — faithful for str/bytes and the
+                        // boxed PyValue (issue #123 family, round 81).
+                        quote!(#target_code = (#value).clone();)
                     } else {
                         quote!(#target_code = #value;)
                     }
