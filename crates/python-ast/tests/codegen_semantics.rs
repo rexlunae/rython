@@ -7894,34 +7894,35 @@ fn iteration_bounds_flow_through_a_callee() {
 }
 
 #[test]
-fn loop_element_return_with_fall_through_boxes_to_pyvalue() {
+fn loop_element_return_with_fall_through_returns_an_option() {
     // `for x in p: return x` can fall through (empty p → Python None).
-    // The generic element return and the None fall-through unify through
-    // the boxed PyValue (issue #122 step 3 — verified against python3:
-    // first([1,2,3]) → 1, first([]) → None), so the function converts
-    // with a boxed return instead of refusing.
+    // Round 85 (the return-type directive): a function that can return
+    // EXACTLY two types — the element B and None — returns Option<B> (the
+    // caller decides what to do with the None). Verified against python3:
+    // first([1,2,3]) → 1, first([]) → None. The old boxed-PyValue
+    // unification (issue #122 step 3) is replaced by the Option.
     let out = compile(
         "def first(p):\n    for x in p:\n        return x\n",
         "iter4.py",
     );
     assert!(
-        out.contains("-> Result < stdpython :: PyValue , PyException >"),
-        "boxed return: {}",
+        out.contains("-> Result < Option < B > , PyException >"),
+        "the element | None return must be Option<B>: {}",
         out
     );
     assert!(
-        out.contains("stdpython :: PyValue : From < B >"),
-        "the element must satisfy the boxed conversion: {}",
+        out.contains("return Ok (Some (x))"),
+        "the element return must Some-wrap, not box: {}",
         out
     );
     assert!(
-        out.contains("PyValue :: from (x)"),
-        "the element return must box: {}",
+        out.contains("Ok (None)"),
+        "the fall-through must be the Option's None member: {}",
         out
     );
     assert!(
-        out.contains("PyValue :: None_"),
-        "the fall-through must be the boxed None: {}",
+        !out.contains("stdpython :: PyValue : From < B >"),
+        "the boxed-conversion bound must be gone: {}",
         out
     );
 }
@@ -10333,11 +10334,12 @@ fn generic_mixed_returns_box_and_wrap() {
 }
 
 #[test]
-fn annotated_params_mixed_literal_returns_box() {
+fn annotated_params_mixed_literal_returns_an_option() {
     // The NON-generic path (annotated parameter, unannotated return):
-    // `return 1` / `return None` has no single concrete type — the
-    // signature boxes to PyValue and the returns wrap (previously the
-    // signature said Result<(), _> while the body returned Ok(1)/Ok(None)).
+    // `return 1` / `return None` is exactly `i64 | None` — round 85 (the
+    // return-type directive) says `Option<i64>`: the literal Some-wraps
+    // and None stays the empty member (previously the signature boxed to
+    // PyValue).
     let out = compile(
         concat!(
             "def pick(flag: bool):\n",
@@ -10348,27 +10350,29 @@ fn annotated_params_mixed_literal_returns_box() {
         "pick.py",
     );
     assert!(
-        out.contains("Result < stdpython :: PyValue , PyException >"),
-        "mixed literal/None returns must box the signature: {}",
+        out.contains("Result < Option < i64 > , PyException >"),
+        "mixed literal/None returns must be Option<i64>: {}",
         out
     );
     assert!(
-        out.contains("PyValue :: from (1)"),
-        "the literal return must wrap: {}",
+        out.contains("Some (1)"),
+        "the literal return must Some-wrap: {}",
         out
     );
     assert!(
-        out.contains("PyValue :: None_"),
-        "the None return must box: {}",
+        out.contains("return Ok (None)"),
+        "the None return must be the Option's empty member: {}",
         out
     );
 }
 
 #[test]
-fn partial_literal_return_boxes_with_none_tail() {
+fn partial_literal_return_becomes_an_option_with_none_tail() {
     // A value return on one path and a FALL-THROUGH on the other returns
-    // `1 | None` in Python: the signature boxes and the implicit tail is
-    // the boxed None.
+    // `1 | None` in Python. Round 85 (the return-type directive): exactly
+    // two types — i64 and None — returns Option<i64>; the implicit tail
+    // is the Option's None member. The old boxed-PyValue signature is
+    // replaced by the Option.
     let out = compile(
         concat!(
             "def partial(flag: bool):\n",
@@ -10378,13 +10382,18 @@ fn partial_literal_return_boxes_with_none_tail() {
         "partial.py",
     );
     assert!(
-        out.contains("Result < stdpython :: PyValue , PyException >"),
-        "a partial literal return must box the signature: {}",
+        out.contains("Result < Option < i64 > , PyException >"),
+        "a partial literal return must be Option<i64>: {}",
         out
     );
     assert!(
-        out.contains("Ok (PyValue :: None_)"),
-        "the fall-through tail must be the boxed None: {}",
+        out.contains("return Ok (Some (1))"),
+        "the literal return must Some-wrap: {}",
+        out
+    );
+    assert!(
+        out.contains("Ok (None)"),
+        "the fall-through tail must be the Option's None member: {}",
         out
     );
 }
@@ -13896,6 +13905,48 @@ fn a_none_stored_local_into_a_boxed_class_param_unwraps() {
     assert!(
         out.contains("(conn) . unwrap_or (stdpython :: PyValue :: None_)"),
         "the None-stored local must unwrap to the boxed value with Python's None passing through: {}",
+        out
+    );
+}
+
+#[test]
+fn a_caller_of_an_inferred_option_fn_narrows_and_unwraps() {
+    // Round 85 (the return-type directive): `pick(flag: bool)` returning
+    // `"yes"` | None INFERS `Option<String>` (no annotation — the body's
+    // two return types are exactly T and None). The caller's store of the
+    // result must learn the Option (call_return_typeinfo consults the
+    // inferred return), so `if v is None:` narrows and the read unwraps —
+    // the caller decides what to do with the None. A caller that returns
+    // the Option into a concrete slot unhandled keeps the loud mismatch
+    // (Python's likely-bug pattern — "throw an error rather than mangle").
+    let out = compile(
+        concat!(
+            "def pick(flag: bool):\n",
+            "    if flag:\n",
+            "        return \"yes\"\n",
+            "    return None\n",
+            "\n",
+            "def use(flag: bool) -> str:\n",
+            "    v = pick(flag)\n",
+            "    if v is None:\n",
+            "        return \"none\"\n",
+            "    return v\n",
+        ),
+        "optcaller.py",
+    );
+    assert!(
+        out.contains("Result < Option < String > , PyException >"),
+        "the unannotated T | None function must return Option<String>: {}",
+        out
+    );
+    assert!(
+        out.contains("(v) . clone () . unwrap ()"),
+        "the narrowed read must unwrap the Option: {}",
+        out
+    );
+    assert!(
+        out.contains("return Ok ((v) . clone () . unwrap ())") || out.contains("return Ok ((v).clone().unwrap())"),
+        "the narrowed return must unwrap: {}",
         out
     );
 }
