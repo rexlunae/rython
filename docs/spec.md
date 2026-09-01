@@ -1019,6 +1019,42 @@ via `.into()`. Sweep −25 (urllib3 911→887, charset 181→180, requests/idna/
 certifi flat). Pinned in codegen (external-module return annotation
 boxes; boxed value into a concrete inherited field converts).
 
+Round 83 (a `bytes | None` FIELD widens honestly, and Option values
+convert into concrete slots — the generics directive): urllib3's
+DeflateDecoder stores `self._data = b""` in `__init__` and later
+`self._data = None` in the error paths (`# type: ignore[assignment]`
+in the source — the author KNOWS it is a `bytes | None`). The field
+previously stayed `Vec<u8>` with the None stores dropping to the boxed
+PyValue (`Vec<u8> | Option<_>` ×19 and `Vec<u8> | PyValue` families).
+Two changes land the honest model. (1) A None STORE joining a concrete
+field widens it to `Option<T>` — both in `__init__` (the
+declare-then-fill conflict arm) and in any method's store list — the
+same join the round-23 Option fields used, now covering the
+method-store half (`_data` becomes `Option<Vec<u8>>`, `Vec<u8> |
+Option<_>` 19→7). The reads then lower through three Option-aware
+conversions, all loud on the empty case (Python fails at use on a None
+value, rython at the conversion, §12.2): (a) a generic `Option<T> →
+concrete` arm in `coerce_tokens` unwraps with the loud panic, so
+`self.decompress(self._data)` (a `bytes` param) converts at the call
+site; (b) `render_typed` answers `Option<expected>` for a read the
+ctx-aware `expr_yields_option_ctx` proves Option-typed even when
+`infer_type` reports PyObject ("no answer" for attribute reads) — the
+coercion fires where the class table is the authority; (c) the
+augmented-assignment `+=` with an Option target operates on the INNER
+value and stores back wrapped (`self._data += data` → py_add on the
+unwrapped member, `Some` rewrap), with CPython's exact TypeError text
+(`unsupported operand type(s) for +=: 'NoneType' and 'bytes'`), the
+`-=` arm's twin. A `Option<X> → Option<Y>` (different inner) arm maps
+the inner conversion with None passing through — the `T → Option` arm's
+recursion must not turn the empty case into a panic. The `.get`-with-
+Option-default synthesis (`getheader(name, default: str | None)` —
+http.client's HTTPResponse model) renders the fallback as the Option
+itself: the round-83 unwrap would break the Ok-arm match
+(`Option<String> | String` ×3 — caught by the re-sweep). Sweep −19
+(urllib3 887→868, everything else flat — 1143→1124). Pinned in codegen
+(Option-field aug-add inner; Option field value into a concrete slot;
+mapping-get Option default stays Option).
+
 ## 6. Functions
 
 ### 6.1 Signatures

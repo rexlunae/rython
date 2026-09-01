@@ -213,8 +213,50 @@ impl CodeGen for AugAssign {
         // Generate the appropriate augmented assignment operator
         match self.op {
             // `+=` mirrors Python's `+` (string concat, list concat,
-            // numeric promotion) via PyAdd.
-            BinOps::Add => Ok(quote!(#target = (#target_load).py_add(&(#value)))),
+            // numeric promotion) via PyAdd. An OPTION-typed target
+            // (`self._data += data` where the field is `bytes | None` —
+            // urllib3's DeflateDecoder, whose `_data` widens when a None
+            // store joins) operates on the INNER value and stores back
+            // wrapped; a None here is CPython's TypeError (`None +
+            // bytes`), a loud §12.2 panic with the message (the guard in
+            // real code prevents it). A BOXED (PyValue) target does the
+            // read-modify-write through the runtime py_add (the boxed
+            // arithmetic).
+            BinOps::Add => match &target_field_rust_ty {
+                Some(crate::TypeInfo::Option(inner)) => {
+                    let type_name = option_inner_py_name(inner);
+                    // CPython's exact message text, spliced as one literal
+                    // (`None + b""` → "unsupported operand type(s) for +:
+                    // 'NoneType' and 'bytes'").
+                    let msg = format!(
+                        "unsupported operand type(s) for +=: 'NoneType' and '{}'",
+                        type_name
+                    );
+                    // The RHS may itself be Option-typed: unwrap both.
+                    let value = if value_is_option {
+                        quote! {
+                            match (#value).clone() {
+                                Some(__rython_w) => __rython_w,
+                                None => panic!(#msg),
+                            }
+                        }
+                    } else {
+                        quote!(#value)
+                    };
+                    Ok(quote! {
+                        #target = {
+                            let __rython_w = #value;
+                            match (#target_load).clone() {
+                                Some(__rython_v) => {
+                                    Some((__rython_v).py_add(&__rython_w))
+                                }
+                                None => panic!(#msg),
+                            }
+                        }
+                    })
+                }
+                _ => Ok(quote!(#target = (#target_load).py_add(&(#value)))),
+            },
             BinOps::Sub => {
                 // An OPTION-typed target (`self.length_remaining -= n`
                 // where the field is `i64 | None` — urllib3's
@@ -379,6 +421,26 @@ pub(crate) fn self_field_rust_ty(
         .iter()
         .find(|(n, _)| *n == field)
         .map(|(_, t)| t.clone())
+}
+
+/// The CPython type name of an Option's inner type, for the §12.2 panic
+/// messages mirroring CPython's `unsupported operand type(s)` text
+/// (`None + b""` names `'bytes'`, `x -= 1` on None names `'int'`). A
+/// non-primitive inner falls back to the empty string — the panic still
+/// names the operator and the None side.
+fn option_inner_py_name(inner: &crate::TypeInfo) -> String {
+    match inner {
+        crate::TypeInfo::Int => "int".to_string(),
+        crate::TypeInfo::Float => "float".to_string(),
+        crate::TypeInfo::Bool => "bool".to_string(),
+        crate::TypeInfo::String | crate::TypeInfo::StrRef | crate::TypeInfo::StrOrBytes => {
+            "str".to_string()
+        }
+        crate::TypeInfo::Bytes => "bytes".to_string(),
+        crate::TypeInfo::Vec(_) => "list".to_string(),
+        crate::TypeInfo::Dict(_, _) => "dict".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// The RUST type of an aug-assign target, when it is known: a
