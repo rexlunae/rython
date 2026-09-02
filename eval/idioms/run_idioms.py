@@ -50,13 +50,15 @@ BASELINE = HERE / "baseline.json"
 DEFAULT_WORKDIR = Path("/tmp/rython-idioms")
 
 ERROR_HEADER = re.compile(r"^error(?:\[(E\d+)\])?: (.*)$", re.M)
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # The interpreter the pins were captured under. Another minor version is
 # not refused -- the live re-derivation already catches any output drift
 # loudly -- but it is reported, so a "stale pin" verdict can be read right.
 PINNED_PYTHON = (3, 11)
 
 
-def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subprocess.CompletedProcess:
+def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run one measured command in its own session, so that on a timeout --
     or on anything else that interrupts the wait, a Ctrl-C included -- the
     whole process group dies: cargo's rustc workers, a generated program's
@@ -65,7 +67,7 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subproce
     programs measured after it. The own-session is also why the group must
     be killed on interrupt: the terminal's SIGINT no longer reaches it."""
     proc = subprocess.Popen(
-        cmd, cwd=cwd, text=True, start_new_session=True,
+        cmd, cwd=cwd, text=True, start_new_session=True, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     try:
@@ -145,8 +147,12 @@ def stale_binary(rypip: Path) -> str | None:
 
 
 def error_histogram(log: str) -> dict[str, int]:
+    """Count rustc errors by code. Escapes are stripped first: under
+    CARGO_TERM_COLOR=always (CI sets it globally) a colored `error[E0308]`
+    header does not start its line with `error`, and a failed build would
+    otherwise be recorded with zero errors."""
     hist: dict[str, int] = {}
-    for m in ERROR_HEADER.finditer(log):
+    for m in ERROR_HEADER.finditer(ANSI.sub("", log)):
         code = m.group(1) or "error"
         if m.group(2).startswith("could not compile"):
             continue
@@ -204,7 +210,10 @@ def measure(program: Path, rypip: Path, workdir: Path, keep: bool, python: str |
         return result
     result["warnings"] = sum(1 for line in convert.stderr.splitlines() if "warning" in line)
 
-    build = run(["cargo", "build", "--quiet"], cwd=crate, timeout=1800)
+    # Plain diagnostics regardless of the caller's environment: the kept
+    # build.log is for reading, and the histogram is parsed from it.
+    build_env = {**os.environ, "CARGO_TERM_COLOR": "never"}
+    build = run(["cargo", "build", "--quiet"], cwd=crate, timeout=1800, env=build_env)
     log = build.stderr
     (crate / "build.log").write_text(log)
     if build.returncode != 0:
@@ -265,15 +274,18 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="results JSON path (default results/run-<head>.json)")
     ap.add_argument("--only", nargs="+", default=None, metavar="NAME", help="program names to run")
     ap.add_argument("--keep", action="store_true", help="keep every generated crate, not just failing ones")
-    ap.add_argument("--check-baseline", action="store_true",
-                    help="exit 1 if a program listed in baseline.json no longer passes")
-    ap.add_argument("--update-baseline", action="store_true",
-                    help="rewrite baseline.json with the programs that pass now")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check-baseline", action="store_true",
+                      help="exit 1 if a program listed in baseline.json no longer passes")
+    mode.add_argument("--update-baseline", action="store_true",
+                      help="rewrite baseline.json with the programs that pass now")
     ap.add_argument("--force-baseline", action="store_true",
                     help="with --update-baseline: drop programs that regressed or were deleted (the ratchet refuses otherwise)")
     ap.add_argument("--allow-stale", action="store_true",
                     help="measure with a rypip older than the converter source (the result file will be misnamed)")
     args = ap.parse_args()
+    if args.force_baseline and not args.update_baseline:
+        ap.error("--force-baseline only applies with --update-baseline")
 
     rypip = Path(args.rypip)
     if not rypip.is_file():
@@ -286,6 +298,13 @@ def main() -> int:
     python, oracle_desc = oracle()
     if python is None and oracle_desc != "no python3 on PATH":
         print(f"oracle refused: {oracle_desc}", file=sys.stderr)
+        return 2
+    if python is None and (args.check_baseline or args.update_baseline):
+        # A pass recorded in or checked against the baseline is a claim
+        # about CPython behavior; without the oracle the pins are only
+        # trusted, not verified, and that is not enough to make the claim.
+        print("no CPython oracle on PATH: --check-baseline/--update-baseline need one "
+              "(a plain run still reports against the pinned outputs)", file=sys.stderr)
         return 2
     print(f"oracle: {oracle_desc if python else 'none (trusting pins)'}")
     workdir = Path(args.workdir)
