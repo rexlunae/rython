@@ -57,18 +57,20 @@ PINNED_PYTHON = (3, 11)
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run one measured command in its own session, so a timeout kills the
-    whole process group -- cargo's rustc workers, a generated program's
-    children -- not just the direct child. Killing only the child would
-    leave workers hogging cores and holding the target-dir lock against the
-    programs measured after it, which defeats per-program isolation."""
+    """Run one measured command in its own session, so that on a timeout --
+    or on anything else that interrupts the wait, a Ctrl-C included -- the
+    whole process group dies: cargo's rustc workers, a generated program's
+    children, not just the direct child. Killing only the child would leave
+    workers hogging cores and holding the target-dir lock against the
+    programs measured after it. The own-session is also why the group must
+    be killed on interrupt: the terminal's SIGINT no longer reaches it."""
     proc = subprocess.Popen(
         cmd, cwd=cwd, text=True, start_new_session=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     try:
         out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:  # TimeoutExpired, KeyboardInterrupt, anything
         try:
             os.killpg(proc.pid, signal.SIGKILL)  # the session leader's pgid is its pid
         except ProcessLookupError:
