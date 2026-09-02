@@ -146,6 +146,7 @@ def main() -> None:
     args.workdir.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
+    idioms_failed = None
     results = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futures = {ex.submit(sweep_one, s, args.rypip, args.workdir): s["name"] for s in specs}
@@ -173,23 +174,37 @@ def main() -> None:
         # compiles is silently wrong (it diffs against CPython's output).
         idioms_json = args.workdir / "idioms.json"
         idioms_json.unlink(missing_ok=True)  # a crashed run must not leave a stale count
-        subprocess.run(
+        idioms_run = subprocess.run(
             [sys.executable, str(ROOT / "eval" / "idioms" / "run_idioms.py"),
              "--rypip", str(args.rypip), "--workdir", str(args.workdir / "idioms"),
              "--out", str(idioms_json)],
             check=False,
         )
-        if idioms_json.is_file():
+        # A requested measurement that did not complete is a failed sweep,
+        # not a sweep with one field missing: the runner's non-zero exit
+        # (stale pins, a stale converter, a refused oracle) is recorded and
+        # propagated, and no count from it is embedded as if valid.
+        if idioms_run.returncode != 0 or not idioms_json.is_file():
+            reason = (f"run_idioms.py exited {idioms_run.returncode}"
+                      if idioms_run.returncode != 0 else "run_idioms.py wrote no results file")
+            payload["idioms"] = {"error": reason}
+            idioms_failed = reason
+        else:
             idioms = json.loads(idioms_json.read_text())
             payload["idioms"] = {k: idioms[k] for k in ("passed", "total", "passing")}
     Path(out).write_text(json.dumps(payload, indent=2) + "\n")
     if "idioms" in payload:
-        print(f"idioms       {payload['idioms']['passed']}/{payload['idioms']['total']} pass")
+        if "error" in payload["idioms"]:
+            print(f"idioms       FAILED: {payload['idioms']['error']}")
+        else:
+            print(f"idioms       {payload['idioms']['passed']}/{payload['idioms']['total']} pass")
     for name, r in results.items():
         total = r.get("total")
         print(f"{name:12} {specs and ''}{'' if total is None else total} errors"
               f"{' (convert failed)' if total is None else ''}")
     print(f"wrote {out}")
+    if idioms_failed:
+        sys.exit(f"--with-idioms was requested but the idiom measurement failed: {idioms_failed}")
 
 
 if __name__ == "__main__":

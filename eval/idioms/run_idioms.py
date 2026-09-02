@@ -48,6 +48,10 @@ BASELINE = HERE / "baseline.json"
 DEFAULT_WORKDIR = Path("/tmp/rython-idioms")
 
 ERROR_HEADER = re.compile(r"^error(?:\[(E\d+)\])?: (.*)$", re.M)
+# The interpreter the pins were captured under. Another minor version is
+# not refused -- the live re-derivation already catches any output drift
+# loudly -- but it is reported, so a "stale pin" verdict can be read right.
+PINNED_PYTHON = (3, 11)
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subprocess.CompletedProcess:
@@ -70,6 +74,27 @@ def converter_commit() -> str:
     p = run(["git", "log", "-1", "--format=%h", "--",
              "crates/python-ast", "crates/rypip", "crates/stdpython"], cwd=REPO)
     return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else "unknown"
+
+
+def oracle() -> tuple[str | None, str | None]:
+    """(path, description) of the CPython oracle, or (None, reason). The
+    corpus pins CPython's behavior; another implementation on PATH would
+    silently redefine what "correct" means, so it is refused."""
+    python = shutil.which("python3")
+    if python is None:
+        return None, "no python3 on PATH"
+    p = run([python, "-c",
+             "import platform, sys; print(platform.python_implementation(), "
+             "sys.version_info[0], sys.version_info[1], sys.version_info[2])"], timeout=30)
+    if p.returncode != 0:
+        return None, f"python3 failed to report its version: {p.stderr.strip()[-100:]}"
+    impl, major, minor, micro = p.stdout.split()
+    if impl != "CPython":
+        return None, f"python3 is {impl}, not CPython; the corpus pins CPython behavior"
+    desc = f"CPython {major}.{minor}.{micro}"
+    if (int(major), int(minor)) != PINNED_PYTHON:
+        desc += f" (pins captured under {PINNED_PYTHON[0]}.{PINNED_PYTHON[1]})"
+    return python, desc
 
 
 def converter_sources_newest() -> float:
@@ -110,13 +135,12 @@ def error_histogram(log: str) -> dict[str, int]:
     return dict(sorted(hist.items(), key=lambda kv: -kv[1]))
 
 
-def verify_expected(program: Path, expected: Path) -> tuple[str | None, str]:
-    """Re-run the program under python3 and compare with the pin. Returns
-    (error, expected_stderr): error is set if the pin is stale or python3
-    fails; expected_stderr is what the generated binary must also emit
-    (empty when no oracle is available -- a passing program is silent on
-    stderr, so a warning or panic text there is a divergence, not noise)."""
-    python = shutil.which("python3")
+def verify_expected(program: Path, expected: Path, python: str | None) -> tuple[str | None, str]:
+    """Re-run the program under the CPython oracle and compare with the
+    pin. Returns (error, expected_stderr): error is set if the pin is stale
+    or the oracle fails; expected_stderr is what the generated binary must
+    also emit (empty when no oracle is available -- a passing program is
+    silent on stderr, so a warning or panic text there is a divergence)."""
     if python is None:
         return None, ""  # no oracle available; trust the pin
     p = run([python, str(program)], timeout=60)
@@ -127,14 +151,14 @@ def verify_expected(program: Path, expected: Path) -> tuple[str | None, str]:
     return None, p.stderr
 
 
-def run_one(program: Path, rypip: Path, workdir: Path, keep: bool) -> dict:
+def run_one(program: Path, rypip: Path, workdir: Path, keep: bool, python: str | None) -> dict:
     name = program.stem
     expected = program.with_suffix(".expected")
     result: dict = {"program": name}
     if not expected.is_file():
         result["status"] = "no-expected"
         return result
-    stale, expected_err = verify_expected(program, expected)
+    stale, expected_err = verify_expected(program, expected, python)
     if stale:
         result["status"] = "expected-stale"
         result["detail"] = stale
@@ -215,6 +239,8 @@ def main() -> int:
                     help="exit 1 if a program listed in baseline.json no longer passes")
     ap.add_argument("--update-baseline", action="store_true",
                     help="rewrite baseline.json with the programs that pass now")
+    ap.add_argument("--force-baseline", action="store_true",
+                    help="with --update-baseline: drop programs that regressed or were deleted (the ratchet refuses otherwise)")
     ap.add_argument("--allow-stale", action="store_true",
                     help="measure with a rypip older than the converter source (the result file will be misnamed)")
     args = ap.parse_args()
@@ -227,6 +253,11 @@ def main() -> int:
     if stale and not args.allow_stale:
         print(f"stale converter: {stale}", file=sys.stderr)
         return 2
+    python, oracle_desc = oracle()
+    if python is None and oracle_desc != "no python3 on PATH":
+        print(f"oracle refused: {oracle_desc}", file=sys.stderr)
+        return 2
+    print(f"oracle: {oracle_desc if python else 'none (trusting pins)'}")
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -241,7 +272,7 @@ def main() -> int:
 
     results = {}
     for program in programs:
-        r = run_one(program, rypip, workdir, args.keep)
+        r = run_one(program, rypip, workdir, args.keep, python)
         results[program.stem] = r
         extra = ""
         if r["status"] == "build-failed":
@@ -259,6 +290,7 @@ def main() -> int:
         "repo_head": git_head(),
         "rypip_path": str(rypip),
         "rypip_built": datetime.fromtimestamp(rypip.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+        "oracle": oracle_desc if python else None,
         "passed": len(passing),
         "total": len(results),
         "passing": passing,
@@ -276,11 +308,19 @@ def main() -> int:
     if args.update_baseline:
         # Under --only, programs that were not run keep their entry; only
         # the selected ones are re-decided. Without --only every program
-        # ran, so the new baseline is exactly what passes.
+        # ran, so an absent entry is a deleted program.
         kept = [n for n in baseline if n not in results] if args.only else []
+        lost = [n for n in baseline if n not in kept and n not in passing]
+        if lost and not args.force_baseline:
+            # The ratchet only ever tightens on its own: a transient failure
+            # must not silently remove a guarantee. Dropping one is a
+            # deliberate act, taken with --force-baseline.
+            print(f"REFUSED: updating would drop baseline programs that no longer pass "
+                  f"or no longer exist: {lost} (pass --force-baseline to drop them)")
+            return 1
         merged = sorted(set(kept) | set(passing))
         BASELINE.write_text(json.dumps({"passing": merged}, indent=2) + "\n")
-        print(f"baseline updated: {merged}")
+        print(f"baseline updated: {merged}" + (f" (dropped {lost})" if lost else ""))
     elif args.check_baseline:
         if args.only:
             skipped = [n for n in baseline if n not in results]
