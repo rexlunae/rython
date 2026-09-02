@@ -1,0 +1,9 @@
+circle with area 3.1
+rect 2x3
+square of side 2.5
+circle with area 0.8
+total 16.177
+biggest: square(6.25)
+[circle(0.79), circle(3.14), rect(6.00), square(6.25)]
+2 ['rect', 'square']
+abstract: area

@@ -122,6 +122,15 @@ message text, ordering, and float formatting.
   writes a JSON error histogram. `summarize.py` diffs two runs into the
   per-code and per-`expected X, found Y` delta. The corpus is **absent
   from CI** — a round must run the sweep itself and report the delta.
+- The **idiom corpus** (`eval/idioms/`) is the sweep's complement: small
+  idiomatic programs (the shapes a Python programmer writes, not urllib3's)
+  that must convert, build, and print exactly what CPython prints.
+  `run_idioms.py` reports per-program status; `baseline.json` is a ratchet
+  CI enforces (`--check-baseline` fails only when a program that passed
+  stops passing). A round that claims a shape fixed adds the program that
+  exercises it **before** the fix, written so state is observable in the
+  output (a printed total after a mutation), and bumps the baseline in the
+  same PR. Report the idiom pass count next to the sweep delta.
 - **Traps** (each cost a round before being recorded):
   - Rebuild the binaries first (`cargo build -p python-ast -p rypip`) and
     use `target/debug/rypip` — a stale `rypip` on PATH silently measures

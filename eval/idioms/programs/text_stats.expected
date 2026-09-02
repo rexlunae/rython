@@ -1,0 +1,9 @@
+19 words, 11 distinct
+quick     4 ####
+the       4 ####
+dog       2 ##
+fox       2 ##
+longest: sleeps 6
+starts with q: ['quick']
+The Quick Brown Fox | tHE qUICK bROWN fOX | The_Quick_Brown_Fox
+2 4 True

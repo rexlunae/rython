@@ -1,0 +1,6 @@
+['0.9.9', '1.2.0', '1.2.3', '1.10.0']
+True True
+False True
+1.3.0 0 True
+bad patch: patch must be >= 0
+0 1.10.0 True

@@ -40,3 +40,18 @@ jobs:
         run: |
           rustup target add thumbv7m-none-eabi
           cargo check -p stdpython --no-default-features --features alloc --target thumbv7m-none-eabi
+
+  # The idiom corpus: small idiomatic programs that must convert, build, and
+  # print exactly what CPython prints. A ratchet, not a gate: it fails only
+  # when a program listed in eval/idioms/baseline.json stops passing.
+  idioms:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Build the converter
+        run: cargo build -p python-ast -p rypip
+      - name: Idiom corpus (regression ratchet)
+        run: python3 eval/idioms/run_idioms.py --check-baseline

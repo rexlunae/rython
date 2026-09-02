@@ -130,6 +130,8 @@ def main() -> None:
     ap.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     ap.add_argument("--package", action="append", default=None)
     ap.add_argument("--jobs", type=int, default=2)
+    ap.add_argument("--with-idioms", action="store_true",
+                    help="also run eval/idioms and embed its pass count in the summary")
     args = ap.parse_args()
 
     specs = json.loads((Path(__file__).resolve().parent / "packages.json").read_text())["packages"]
@@ -165,7 +167,23 @@ def main() -> None:
         "elapsed_seconds": round(time.time() - started, 1),
         "packages": results,
     }
+    if args.with_idioms:
+        # The idiom corpus measures what the error histogram cannot: whether
+        # ordinary Python translates at all, and whether a crate that
+        # compiles is silently wrong (it diffs against CPython's output).
+        idioms_json = args.workdir / "idioms.json"
+        subprocess.run(
+            [sys.executable, str(ROOT / "eval" / "idioms" / "run_idioms.py"),
+             "--rypip", str(args.rypip), "--workdir", str(args.workdir / "idioms"),
+             "--out", str(idioms_json)],
+            check=False,
+        )
+        if idioms_json.is_file():
+            idioms = json.loads(idioms_json.read_text())
+            payload["idioms"] = {k: idioms[k] for k in ("passed", "total", "passing")}
     Path(out).write_text(json.dumps(payload, indent=2) + "\n")
+    if "idioms" in payload:
+        print(f"idioms       {payload['idioms']['passed']}/{payload['idioms']['total']} pass")
     for name, r in results.items():
         total = r.get("total")
         print(f"{name:12} {specs and ''}{'' if total is None else total} errors"
