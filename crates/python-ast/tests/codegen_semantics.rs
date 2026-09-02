@@ -14320,8 +14320,34 @@ fn a_factory_local_stored_into_a_field_resolves_the_receiver_class() {
     );
 }
 
-// ---------------------------------------------------------------------
-// §7's mapping-protocol slice: a user class's own `__getitem__`/
+#[test]
+fn a_base_chain_option_field_compares_via_the_option_match() {
+    // Round 91: `self.__rython_base._tunnel_scheme == "https"` — a
+    // BASE-class `str | None` field read through the embedded base
+    // struct — the compare's Option-match trigger only handled the
+    // bare `self.<field>` shape, so the base-chain read compared the
+    // raw Option (`py_eq(&("https"))` on Option<String> — E0308). The
+    // trigger now walks a `self.<chain>.<field>` receiver chain and
+    // looks the field up in every class of the base chain.
+    let out = compile(
+        concat!(
+            "class Base:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._tunnel_scheme: str | None = None\n",
+            "\n",
+            "class Conn(Base):\n",
+            "    def f(self) -> bool:\n",
+            "        return self._tunnel_scheme == \"https\"\n",
+        ),
+        "baseoptcmp.py",
+    );
+    assert!(
+        out.contains("match (") && out.contains(") . clone () { Some (__rython_v) => (__rython_v) . py_eq (& (\"https\")) , None => false")
+            || out.contains("match(") && out.contains(").clone(){Some(__rython_v)=>(__rython_v).py_eq(&(\"https\")),None=>false"),
+        "the base-chain Option field must unwrap to the inner comparison: {}",
+        out
+    );
+}
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

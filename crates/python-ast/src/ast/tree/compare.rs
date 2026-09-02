@@ -501,18 +501,43 @@ impl CodeGen for Compare {
                 _ => None,
             };
             let opt_inner = opt_inner.or_else(|| {
-                if let ExprType::Attribute(attr) = left_ast
-                    && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
-                {
-                    match crate::ast::tree::aug_assign::self_field_rust_ty(
-                        &attr.attr,
-                        &ctx,
-                        &options,
-                        &symbols,
-                    ) {
-                        Some(crate::TypeInfo::Option(inner)) => Some(*inner),
-                        _ => None,
+                if let ExprType::Attribute(attr) = left_ast {
+                    // The field's OWNER: the enclosing class's chain for a
+                    // `self.<field>` read (round 89), or the BASE structs
+                    // for a `self.__rython_base.<field>` chain (a base-class
+                    // field read through the embedded struct — urllib3's
+                    // `self.__rython_base._tunnel_scheme == "https"`,
+                    // round 91). Walk the receiver chain to confirm it
+                    // roots at `self`, then look the field up in every
+                    // class of the chain.
+                    let mut cur = attr.value.as_ref();
+                    loop {
+                        match cur {
+                            crate::ExprType::Name(n) if n.id == "self" => break,
+                            crate::ExprType::Attribute(a) => cur = a.value.as_ref(),
+                            _ => return None,
+                        }
                     }
+                    let class_name = ctx.enclosing_class_name()?;
+                    let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
+                    else {
+                        return None;
+                    };
+                    class
+                        .base_chain_with_options(&symbols, &options)
+                        .iter()
+                        .find_map(|c| {
+                            c.infer_fields(&symbols, &options).ok().and_then(|fields| {
+                                fields
+                                    .iter()
+                                    .find(|(n, _)| *n == attr.attr)
+                                    .map(|(_, t)| t.clone())
+                            })
+                        })
+                        .and_then(|t| match t {
+                            crate::TypeInfo::Option(inner) => Some(*inner),
+                            _ => None,
+                        })
                 } else {
                     None
                 }
