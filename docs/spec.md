@@ -1170,13 +1170,41 @@ string VALUES normalize to owned String exactly like keys (`headers_ =
 {"Accept": "*/*"}` in a `-> Mapping[str, str]` function renders
 `IndexMap<String, String>`, never `IndexMap<String, &str>`), with
 string-LIST elements owning the same way (`ks = ["Retry-After"]; return
-ks` in a `-> list[str]` function builds `Vec<String>`).
-Sweep −8 (urllib3 855→849, charset 181→179, idna/certifi/requests flat —
-1112→1104). Pinned in codegen (a property-read local on a factory local
+ks` in a `-> list[str]` function builds `Vec<String>`); the runtime
+gains the owned-form boxed-operand impls the container change surfaces
+(`PyContains<PyValue> for Vec<String>`, `PyIndex<String> for PyValue`).
+Sweep −15 (urllib3 855→845, charset 181→176, idna/certifi/requests flat —
+1112→1097). Pinned in codegen (a property-read local on a factory local
 coerces into a boxed-union parameter; a float Option compares with an
 int literal as a float; a dict literal's string value is owned like its
 key; an annotated Option return keeps the Option against a plain literal
 body).
+
+Round 88 (the unmodeled-base `super().__init__` and the ownership-clone
+family): a `super().__init__(args)` call against a class with NO
+structural base (urllib3's `_HTTPConnection` inherits the external
+`http.client.HTTPConnection`) previously fell to the generic
+"base implementation unmodeled — call the class's own method" fallback,
+rendering a SELF-RECURSIVE `self.__init__(raw args)` call against the
+class's own 8-parameter signature with 5 args (E0061). A non-empty
+`super().__init__(...)` with an unresolvable base is now the same
+documented divergence as the unmodeled-method path: a definition warning
+and a no-op (the external constructor would set up the socket rython
+cannot model). Separately, a REUSED class-typed local's ownership clone
+(`timeout_obj` passed to two calls — urllib3's urlopen) previously
+rendered `(x).clone()`, which resolves to the class's OWN `clone` method
+when it defines one (urllib3's Timeout does) — a REAL semantic call where
+Python just re-reads the variable. The reuse-clone now renders
+`Clone::clone(&x)` — the trait-qualified std Clone, immune to inherent
+shadowing and never naming the concrete type (a TYPE_CHECKING-only class
+stub stays valid). And `dict.update(other)` — the stdpython PyDictOps
+method takes the other dict by value, so an OPTION-typed argument
+(`headers.update(self.proxy_headers)` — a `Mapping[str, str] | None`
+field) coerces via the round-83 Option→concrete match: Python's
+update(None) is a TypeError, and the loud panic is the honest model.
+Sweep −6 (urllib3 845→839, everything else flat — 1097→1091). Pinned in
+codegen (a reused class local clones via the qualified std Clone; a dict
+update with an Option dict argument unwraps loudly).
 
 ## 6. Functions
 

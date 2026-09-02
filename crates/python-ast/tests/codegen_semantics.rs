@@ -14134,6 +14134,78 @@ fn an_annotated_option_return_keeps_the_option_against_a_plain_literal_body() {
     );
 }
 
+#[test]
+fn a_reused_class_local_clones_via_the_qualified_std_clone() {
+    // Round 88: a REUSED class-typed local (`timeout_obj` from a
+    // `-> Timeout` factory, passed to two calls) must clone with the
+    // QUALIFIED std Clone — the bare `(x).clone()` would resolve to the
+    // class's OWN `clone` method when it defines one (urllib3's Timeout
+    // does), a REAL semantic call where Python just re-reads the
+    // variable (round 88).
+    let out = compile(
+        concat!(
+            "class Timeout:\n",
+            "    def clone(self) -> Timeout:\n",
+            "        return Timeout()\n",
+            "\n",
+            "class Conn:\n",
+            "    def _get_timeout(self) -> Timeout:\n",
+            "        return Timeout()\n",
+            "    def _consume(self, t: Timeout) -> None:\n",
+            "        pass\n",
+            "    def f(self) -> None:\n",
+            "        timeout_obj = self._get_timeout()\n",
+            "        self._consume(timeout_obj)\n",
+            "        self._consume(timeout_obj)\n",
+        ),
+        "qualclone.py",
+    );
+    assert!(
+        out.contains("Clone :: clone (& (timeout_obj))")
+            || out.contains("Clone::clone(&(timeout_obj))"),
+        "the reuse-clone must be the qualified std Clone, never the user clone method: {}",
+        out
+    );
+    assert!(
+        !out.contains("timeout_obj . clone ()")
+            && !out.contains("timeout_obj.clone()"),
+        "the user's clone method must not be called for an ownership clone: {}",
+        out
+    );
+}
+
+#[test]
+fn a_dict_update_with_an_option_dict_argument_unwraps_loudly() {
+    // Round 88: `headers.update(self.proxy_headers)` where proxy_headers
+    // is a `Mapping[str, str] | None` field — the stdpython PyDictOps
+    // update takes the other dict BY VALUE, and Python's update(None) is
+    // a TypeError, so the Option argument coerces via the round-83 match
+    // with the loud unhandled-None panic.
+    let out = compile(
+        concat!(
+            "from typing import Mapping\n",
+            "\n",
+            "class P:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.proxy_headers: Mapping[str, str] | None = {\"Accept\": \"*/*\"}\n",
+            "    def urlopen(self, headers: Mapping[str, str] | None) -> None:\n",
+            "        headers.update(self.proxy_headers)\n",
+        ),
+        "dictupdate.py",
+    );
+    assert!(
+        out.contains("match ((self . proxy_headers) . clone ()) { Some (__rython_v) => __rython_v")
+            || out.contains("match((self.proxy_headers).clone()){Some(__rython_v)=>__rython_v"),
+        "the Option dict argument must unwrap via the Some/None match: {}",
+        out
+    );
+    assert!(
+        out.contains("an optional value was None where a concrete value was required"),
+        "the None case must be the loud unhandled-Option panic: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // §7's mapping-protocol slice: a user class's own `__getitem__`/
 // `__setitem__`/`__contains__` dunders receive the subscript store,
