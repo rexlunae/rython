@@ -1,0 +1,14 @@
+moved 120 alice->bob
+audit: ['alice', 'bob']
+True
+transfer failed: need 100, have 30 (short by 70)
+audit: ['alice', 'bob']
+False
+no such account: 'carol'
+audit: ['alice', 'bob']
+False
+rejected: deposit must be positive
+alice 29 ['+50', '-120', '-1']
+bob 120 ['+120']
+True
+True True

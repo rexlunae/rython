@@ -1,3 +1,5 @@
+"""Classes with Optional fields, inheritance + super(), a dict of objects,
+exceptions, and the get-then-mutate shape (aliasing must hold)."""
 from typing import Optional
 
 
@@ -72,7 +74,7 @@ def main() -> None:
         print("no cheese")
     left = inv.take("bolt", 3)
     print(left, inv.find("bolt").label().upper())
-    print(inv.total())  # 14 — proves take() mutated the stored Item
+    print(inv.total())  # 14 - proves take() mutated the stored Item
     words = [w.strip() for w in "a, b ,c".split(",") if w.strip()]
     print("-".join(words), len(words))
 

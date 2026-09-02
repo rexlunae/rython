@@ -1,0 +1,6 @@
+9
+name:x1 op:+ num:42 op:* op:( name:y_2 op:- num:7 op:) 
+2 1 False
+[('num', '3'), ('bad', '$')]
+14 2
+HELLO world hlowrd dlrow olleh

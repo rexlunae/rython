@@ -1,0 +1,9 @@
+mon ['09:00 standup', '10:00 planning', '14:00 review']
+tue ['11:00 1:1']
+wed ['16:00 retro']
+busiest: mon
+2 1
+['mon', 'tue'] False
+[9, 10, 11] True 3
+[12]
+['1:1', 'planning', 'standup'] ['standup']

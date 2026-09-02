@@ -130,6 +130,8 @@ def main() -> None:
     ap.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     ap.add_argument("--package", action="append", default=None)
     ap.add_argument("--jobs", type=int, default=2)
+    ap.add_argument("--with-idioms", action="store_true",
+                    help="also run eval/idioms and embed its pass count in the summary")
     args = ap.parse_args()
 
     specs = json.loads((Path(__file__).resolve().parent / "packages.json").read_text())["packages"]
@@ -144,6 +146,7 @@ def main() -> None:
     args.workdir.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
+    idioms_failed = None
     results = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futures = {ex.submit(sweep_one, s, args.rypip, args.workdir): s["name"] for s in specs}
@@ -156,17 +159,6 @@ def main() -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     out = args.out or str(RESULTS / f"run-{stamp}.json")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    # The idiom corpus (issue #137, Directive 3): every program must
-    # CONVERT, COMPILE, and diff its stdout against the CPython-captured
-    # expected output — a pass count the error histogram cannot fake.
-    idioms = {}
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "idioms"))
-        import run as run_idioms  # type: ignore
-
-        idioms = run_idioms.collect()
-    except Exception as e:  # noqa: BLE001 — the sweep must not die on the corpus
-        idioms = {"total": 0, "pass": 0, "error": str(e)}
     payload = {
         "rypip_commit": subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
@@ -175,17 +167,44 @@ def main() -> None:
         "rypip_path": str(args.rypip),
         "elapsed_seconds": round(time.time() - started, 1),
         "packages": results,
-        "idioms": idioms,
     }
+    if args.with_idioms:
+        # The idiom corpus measures what the error histogram cannot: whether
+        # ordinary Python translates at all, and whether a crate that
+        # compiles is silently wrong (it diffs against CPython's output).
+        idioms_json = args.workdir / "idioms.json"
+        idioms_json.unlink(missing_ok=True)  # a crashed run must not leave a stale count
+        idioms_run = subprocess.run(
+            [sys.executable, str(ROOT / "eval" / "idioms" / "run_idioms.py"),
+             "--rypip", str(args.rypip), "--workdir", str(args.workdir / "idioms"),
+             "--out", str(idioms_json)],
+            check=False,
+        )
+        # A requested measurement that did not complete is a failed sweep,
+        # not a sweep with one field missing: the runner's non-zero exit
+        # (stale pins, a stale converter, a refused oracle) is recorded and
+        # propagated, and no count from it is embedded as if valid.
+        if idioms_run.returncode != 0 or not idioms_json.is_file():
+            reason = (f"run_idioms.py exited {idioms_run.returncode}"
+                      if idioms_run.returncode != 0 else "run_idioms.py wrote no results file")
+            payload["idioms"] = {"error": reason}
+            idioms_failed = reason
+        else:
+            idioms = json.loads(idioms_json.read_text())
+            payload["idioms"] = {k: idioms[k] for k in ("passed", "total", "passing")}
     Path(out).write_text(json.dumps(payload, indent=2) + "\n")
+    if "idioms" in payload:
+        if "error" in payload["idioms"]:
+            print(f"idioms       FAILED: {payload['idioms']['error']}")
+        else:
+            print(f"idioms       {payload['idioms']['passed']}/{payload['idioms']['total']} pass")
     for name, r in results.items():
         total = r.get("total")
         print(f"{name:12} {specs and ''}{'' if total is None else total} errors"
               f"{' (convert failed)' if total is None else ''}")
-    print(
-        f"idioms      {idioms.get('pass', 0)}/{idioms.get('total', 0)} pass"
-    )
     print(f"wrote {out}")
+    if idioms_failed:
+        sys.exit(f"--with-idioms was requested but the idiom measurement failed: {idioms_failed}")
 
 
 if __name__ == "__main__":
