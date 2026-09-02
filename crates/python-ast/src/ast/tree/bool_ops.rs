@@ -388,7 +388,7 @@ pub(crate) fn fold_operand_type(
     options: &crate::PythonOptions,
     symbols: &crate::SymbolTableScopes,
 ) -> crate::TypeInfo {
-    let inferred = crate::infer_type(expr, options, symbols);
+    let inferred = crate::infer_type(Some(&ctx), expr, options, symbols);
     if !matches!(inferred, crate::TypeInfo::PyObject) {
         return inferred;
     }

@@ -907,7 +907,7 @@ fn variant_expr_type(
     {
         return crate::TypeInfo::String;
     }
-    crate::infer_type(e, opts, symbols)
+    crate::infer_type(None, e, opts, symbols)
 }
 
 /// Every value-carrying `return` expression in the body (nested statement

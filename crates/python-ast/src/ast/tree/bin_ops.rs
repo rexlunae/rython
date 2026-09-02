@@ -339,7 +339,7 @@ fn is_option_expr(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
-    if matches!(crate::infer_type(expr, options, symbols), crate::TypeInfo::Option(_)) {
+    if matches!(crate::infer_type(Some(&ctx), expr, options, symbols), crate::TypeInfo::Option(_)) {
         return true;
     }
     if let ExprType::Attribute(attr) = expr
@@ -376,7 +376,7 @@ fn py_operand_name(
             _ => "int",
         }
     }
-    let from_infer = operand_name(&crate::infer_type(expr, options, symbols));
+    let from_infer = operand_name(&crate::infer_type(Some(&ctx), expr, options, symbols));
     if from_infer != "int" {
         return from_infer;
     }

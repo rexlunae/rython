@@ -231,7 +231,7 @@ impl CodeGen for AugAssign {
         // Whether the RHS is itself Option-typed (needed by the Option
         // target arm below) — captured before `to_rust` moves `self.value`.
         let value_is_option = matches!(
-            crate::infer_type(&self.value, &options, &symbols),
+            crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
             crate::TypeInfo::Option(_)
         );
 

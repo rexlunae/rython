@@ -309,7 +309,7 @@ impl CodeGen for Compare {
             // side is a Float (or an Option whose inner is Float) — an
             // int-typed side keeps the int comparison.
             {
-                let left_ty = crate::infer_type(left_ast, &options, &symbols);
+                let left_ty = crate::infer_type(Some(&ctx), left_ast, &options, &symbols);
                 let float_side = match &left_ty {
                     crate::TypeInfo::Float => true,
                     crate::TypeInfo::Option(inner) => {
@@ -319,7 +319,7 @@ impl CodeGen for Compare {
                 };
                 if float_side
                     && matches!(
-                        crate::infer_type(comparator_ast, &options, &symbols),
+                        crate::infer_type(Some(&ctx), comparator_ast, &options, &symbols),
                         crate::TypeInfo::Int
                     )
                 {
@@ -351,7 +351,7 @@ impl CodeGen for Compare {
                     crate::ExprType::Name(n)
                         if options.narrowed_names.contains_key(&n.id)
                 ) && (matches!(
-                    crate::infer_type(comparator_ast, &options, &symbols),
+                    crate::infer_type(Some(&ctx), comparator_ast, &options, &symbols),
                     crate::TypeInfo::Option(_)
                 ) || matches!(
                     comparator_ast,
@@ -375,7 +375,7 @@ impl CodeGen for Compare {
                     // CPython names the LHS's type (`5 < None` → "'<' not
                     // supported between instances of 'int' and
                     // 'NoneType'").
-                    let lhs_ty = match crate::infer_type(left_ast, &options, &symbols) {
+                    let lhs_ty = match crate::infer_type(Some(&ctx), left_ast, &options, &symbols) {
                         crate::TypeInfo::Int => "int",
                         crate::TypeInfo::Float => "float",
                         crate::TypeInfo::String | crate::TypeInfo::StrRef => "str",
@@ -564,7 +564,7 @@ impl CodeGen for Compare {
             // `self.chunk_left == 0` — urllib3's _handle_chunk, where the
             // fields are `int | None` and infer_type cannot see through
             // self-fields — round 89).
-            let opt_inner = match crate::infer_type(left_ast, &options, &symbols) {
+            let opt_inner = match crate::infer_type(Some(&ctx), left_ast, &options, &symbols) {
                 crate::TypeInfo::Option(inner) => Some(*inner),
                 _ => None,
             };

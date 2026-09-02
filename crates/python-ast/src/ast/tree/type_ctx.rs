@@ -459,13 +459,13 @@ pub fn is_ndarray_expr(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
-    if matches!(infer_type(expr, options, symbols), TypeInfo::NdArray) {
+    if matches!(infer_type(None, expr, options, symbols), TypeInfo::NdArray) {
         return true;
     }
     match expr {
         ExprType::Name(n) => match symbols.get(&n.id) {
             Some(SymbolTableNode::Assign { value, .. }) => {
-                matches!(infer_type(&value, options, symbols), TypeInfo::NdArray)
+                matches!(infer_type(None, &value, options, symbols), TypeInfo::NdArray)
             }
             _ => false,
         },
@@ -476,6 +476,7 @@ pub fn is_ndarray_expr(
 /// Infer the Rust type an expression will produce, bottom-up, from syntax
 /// plus the per-function annotation/assignment maps.
 pub fn infer_type(
+    ctx: Option<&CodeGenContext>,
     expr: &ExprType,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
@@ -491,12 +492,32 @@ pub fn infer_type(
         return TypeInfo::PyObject;
     }
     INFER_DEPTH.with(|c| c.set(d + 1));
-    let result = infer_type_inner(expr, options, symbols);
+    let result = infer_type_inner(ctx, expr, options, symbols);
     INFER_DEPTH.with(|c| c.set(d));
     return result;
 }
 
 fn infer_type_inner(
+    ctx: Option<&CodeGenContext>,
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> TypeInfo {
+    thread_local! { static R99_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    let d = R99_DEPTH.with(|c| c.get());
+    if d > 40 {
+        eprintln!("R99CYCLE at depth 40: {:?}", std::mem::discriminant(expr));
+        eprintln!("R99EXPR {:?}", expr);
+        return TypeInfo::PyObject;
+    }
+    R99_DEPTH.with(|c| c.set(d + 1));
+    let r = infer_type_body(ctx, expr, options, symbols);
+    R99_DEPTH.with(|c| c.set(d));
+    r
+}
+
+fn infer_type_body(
+    ctx: Option<&CodeGenContext>,
     expr: &ExprType,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
@@ -540,7 +561,7 @@ fn infer_type_inner(
             }
             // 4. The symbol table's recorded assignment.
             if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id) {
-                return infer_type(value, options, symbols);
+                return infer_type_inner(ctx, value, options, symbols);
             }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
             // `EXCEPTION_MAP['k']` — botocore's retryhandler): classes as
@@ -564,7 +585,7 @@ fn infer_type_inner(
         ExprType::List(l) => {
             let mut elt = TypeInfo::PyObject;
             for e in l {
-                let t = infer_type(e, options, symbols);
+                let t = infer_type_inner(ctx, e, options, symbols);
                 if !matches!(t, TypeInfo::PyObject) {
                     elt = unify(elt, t);
                 }
@@ -576,10 +597,10 @@ fn infer_type_inner(
             let mut v = TypeInfo::PyObject;
             for (key, value) in d.keys.iter().zip(d.values.iter()) {
                 let kt = match key {
-                    Some(key) => infer_type(key, options, symbols),
+                    Some(key) => infer_type_inner(ctx, key, options, symbols),
                     None => TypeInfo::PyObject, // `**d` unpacking
                 };
-                let vt = infer_type(value, options, symbols);
+                let vt = infer_type_inner(ctx, value, options, symbols);
                 if !matches!(kt, TypeInfo::PyObject) {
                     k = unify(k, kt);
                 }
@@ -592,14 +613,14 @@ fn infer_type_inner(
         ExprType::Tuple(t) => TypeInfo::Tuple(
             t.elts
                 .iter()
-                .map(|e| infer_type(e, options, symbols))
+                .map(|e| infer_type_inner(ctx, e, options, symbols))
                 .collect(),
         ),
         ExprType::JoinedStr(_) => TypeInfo::String,
         ExprType::FormattedValue(_) => TypeInfo::String,
         ExprType::BinOp(op) => {
-            let l = infer_type(&op.left, options, symbols);
-            let r = infer_type(&op.right, options, symbols);
+            let l = infer_type_inner(ctx, &op.left, options, symbols);
+            let r = infer_type_inner(ctx, &op.right, options, symbols);
             match op.op {
                 crate::BinOps::Add => {
                     if is_stringy(&l) && is_stringy(&r) {
@@ -637,7 +658,7 @@ fn infer_type_inner(
         ExprType::UnaryOp(u) => match u.op {
             crate::Ops::Not => TypeInfo::Bool,
             crate::Ops::USub | crate::Ops::UAdd => {
-                infer_type(&u.operand, options, symbols)
+                infer_type_inner(ctx, &u.operand, options, symbols)
             }
             _ => TypeInfo::PyObject,
         },
@@ -645,8 +666,8 @@ fn infer_type_inner(
         ExprType::Compare(_) => TypeInfo::Bool,
         ExprType::IfExp(i) => {
             // The branches must agree for a useful inference.
-            let a = infer_type(&i.body, options, symbols);
-            let b = infer_type(&i.orelse, options, symbols);
+            let a = infer_type_inner(ctx, &i.body, options, symbols);
+            let b = infer_type_inner(ctx, &i.orelse, options, symbols);
             if a == b {
                 a
             } else if is_numeric(&a) && is_numeric(&b) {
@@ -703,12 +724,34 @@ fn infer_type_inner(
                 match attr.attr.as_str() {
                     "get" | "pop" | "setdefault" => TypeInfo::PyObject,
                     _ if on_numpy => TypeInfo::NdArray,
+                    // Dict VIEW methods carry the (key, value) pair type
+                    // (`self.items.items()` → Vec<(str, Item)> — the idiom
+                    // corpus's report): the receiver's Dict type is the
+                    // authority (round 99).
+                    "items" | "keys" | "values"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::Dict(_, _)
+                        ) =>
+                    {
+                        match infer_type_inner(ctx, &attr.value, options, symbols) {
+                            TypeInfo::Dict(k, v) => match attr.attr.as_str() {
+                                "items" => TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![
+                                    (*k).clone(),
+                                    (*v).clone(),
+                                ]))),
+                                "keys" => TypeInfo::Vec(Box::new((*k).clone())),
+                                _ => TypeInfo::Vec(Box::new((*v).clone())),
+                            },
+                            _ => TypeInfo::PyObject,
+                        }
+                    }
                     _ => TypeInfo::PyObject,
                 }
             }
             _ => TypeInfo::PyObject,
         },
-        ExprType::Subscript(sub) => match infer_type(&sub.value, options, symbols) {
+        ExprType::Subscript(sub) => match infer_type_inner(ctx, &sub.value, options, symbols) {
             TypeInfo::Vec(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
             // An OPTION-wrapped base (`request_context["scheme"]` where
@@ -732,7 +775,7 @@ fn infer_type_inner(
             Box::new(TypeInfo::PyObject),
             Box::new(TypeInfo::PyObject),
         ),
-        ExprType::Starred(s) => infer_type(&s.value, options, symbols),
+        ExprType::Starred(s) => infer_type_inner(ctx, &s.value, options, symbols),
         _ => TypeInfo::PyObject,
     }
 }
@@ -804,7 +847,7 @@ fn iterator_builtin_type(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<TypeInfo> {
-    let elem_of = |e: &ExprType| iterable_element_type(&infer_type(e, options, symbols));
+    let elem_of = |e: &ExprType| iterable_element_type(&infer_type(None, e, options, symbols));
     match name {
         // sorted/filter preserve the element type; the iterable is the
         // last positional argument (`sorted(xs)`, `filter(pred, xs)`).
@@ -1065,7 +1108,7 @@ pub fn render_typed(
     if matches!(expected, TypeInfo::PyValue) && crate::is_none_expr(expr) {
         return Ok(quote!(stdpython::PyValue::None_));
     }
-    let actual = infer_type(expr, &options, &symbols);
+    let actual = infer_type(None, expr, &options, &symbols);
     // Round 81: a NARROWED name read already converts to the member type
     // (name.rs: `(x).as_bytes().unwrap().to_vec()` for a Bytes-narrowed
     // boxed value, `(x).as_str().unwrap().to_string()` for String). The
@@ -1214,7 +1257,7 @@ pub fn render_reused(
     if let Some(root) = reuse_root_name(expr) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
         if uses > 1 {
-            let t = infer_type(expr, &options, &symbols);
+            let t = infer_type(None, expr, &options, &symbols);
             // Round 92: clone whenever the name is not statically Copy —
             // INCLUDING an inferrer-unknown (PyObject) name, which the
             // old gate excluded. A local bound from a SELF-METHOD call
@@ -1279,7 +1322,7 @@ pub fn render_typed_reused(
     if let Some(root) = reuse_root_name(expr) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
         if uses > 1 && !adapted_is_into {
-            let t = infer_type(expr, &options, &symbols);
+            let t = infer_type(None, expr, &options, &symbols);
             // See render_reused: clone whenever the name is not statically
             // Copy — INCLUDING inferrer-unknown (PyObject) names, whose
             // actual binding may be any non-Copy value (`data =
@@ -2131,7 +2174,7 @@ fn analyze_statement_types(
                         // only infer_type has the operand types.
                         ExprType::BinOp(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                infer_type(&assign.value, options, symbols)
+                                infer_type(None, &assign.value, options, symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2147,7 +2190,7 @@ fn analyze_statement_types(
                         _ if crate::ast::tree::assign::is_container_literal(&assign.value) => match (options, symbols)
                         {
                             (Some(options), Some(symbols)) => {
-                                infer_type(&assign.value, options, symbols)
+                                infer_type(None, &assign.value, options, symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2160,7 +2203,7 @@ fn analyze_statement_types(
                         // Some-wrap (round 45).
                         ExprType::Name(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                infer_type(&assign.value, options, symbols)
+                                infer_type(None, &assign.value, options, symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2300,7 +2343,7 @@ fn analyze_statement_types(
             // types the nested destructure, so the loop-body method calls
             // resolve their receiver's class — round 99).
             if let (Some(options), Some(symbols)) = (options, symbols) {
-                let iter_ty = infer_type(&s.iter, options, symbols);
+                let iter_ty = infer_type(None, &s.iter, options, symbols);
                 if let Some(elem) = iterable_element_type(&iter_ty) {
                     seed_target_types(&s.target, &elem, info);
                 }
@@ -3499,6 +3542,7 @@ fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
 fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
     match target {
         ExprType::Name(n) => {
+            eprintln!("R99DBG seed target {} ty={:?}", n.id, ty);
             info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
         }
         ExprType::Tuple(t) => {

@@ -87,7 +87,7 @@ impl CodeGen for UnaryOp {
         // panic for unmodeled operands, matching the PySub contract).
         // Computed before `options`/`symbols` are moved below.
         let operand_is_boxed = matches!(
-            crate::infer_type(&self.operand, &options, &symbols),
+            crate::infer_type(Some(&ctx), &self.operand, &options, &symbols),
             crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
         );
         let operand = self.operand.clone().to_rust(ctx, options, symbols)?;

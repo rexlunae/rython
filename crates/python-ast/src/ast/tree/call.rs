@@ -3507,7 +3507,7 @@ impl<'a> CodeGen for Call {
                                 );
                                 if !generic
                                     && matches!(
-                                        crate::infer_type(
+                                        crate::infer_type(Some(&ctx), 
                                             &self.args[0],
                                             &options,
                                             &symbols
@@ -5853,7 +5853,7 @@ impl<'a> CodeGen for Call {
             // the member is boxed.
             if matches!(attr.attr.as_str(), "lower" | "upper" | "strip")
                 && matches!(
-                    crate::infer_type(&attr.value, &options, &symbols),
+                    crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
                     crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
                 )
             {
@@ -5924,7 +5924,7 @@ impl<'a> CodeGen for Call {
             // the pair comes from the dict (or Option-wrapped dict) type
             // the receiver's name holds (round 88).
             let dict_receiver_kv: Option<(crate::TypeInfo, crate::TypeInfo)> =
-                match crate::infer_type(&attr.value, &options, &symbols) {
+                match crate::infer_type(Some(&ctx), &attr.value, &options, &symbols) {
                     crate::TypeInfo::Dict(k, v) => Some(((*k).clone(), (*v).clone())),
                     crate::TypeInfo::Option(inner) => match &*inner {
                         crate::TypeInfo::Dict(k, v) => Some(((**k).clone(), (**v).clone())),
@@ -6433,7 +6433,7 @@ impl<'a> CodeGen for Call {
                         // owned Strings, so the literal owns at the push
                         // site (mirroring the String-name store rule).
                         if let crate::TypeInfo::Vec(inner) =
-                            crate::infer_type(&attr.value, &options, &symbols)
+                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols)
                             && matches!(*inner, crate::TypeInfo::String)
                             && matches!(
                                 self.args.first(),
@@ -6459,9 +6459,9 @@ impl<'a> CodeGen for Call {
                     // receiver (`exceptions.extend([ChecksumError])` —
                     // Vec<PyValue> + Vec<String>).
                     ("extend", [value]) => {
-                        let recv_ty = crate::infer_type(&attr.value, &options, &symbols);
+                        let recv_ty = crate::infer_type(Some(&ctx), &attr.value, &options, &symbols);
                         if let crate::TypeInfo::Vec(inner) = &recv_ty {
-                            let arg_ty = crate::infer_type(&self.args[0], &options, &symbols);
+                            let arg_ty = crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols);
                             let runtime = crate::safe_ident(&options.stdpython);
                             let boxed = matches!(
                                 **inner,
@@ -7064,7 +7064,7 @@ impl<'a> CodeGen for Call {
                         // Vec holds owned Strings, so the literal owns at the
                         // insert site.
                         if let crate::TypeInfo::Vec(inner) =
-                            crate::infer_type(&attr.value, &options, &symbols)
+                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols)
                             && matches!(*inner, crate::TypeInfo::String)
                             && matches!(
                                 self.args.get(1),
@@ -7731,7 +7731,7 @@ impl<'a> CodeGen for Call {
             ExprType::Call(_) => true,
             e => {
                 let mut drop = matches!(
-                    crate::infer_type(e, &options, &symbols),
+                    crate::infer_type(Some(&ctx), e, &options, &symbols),
                     crate::TypeInfo::PyValue
                         | crate::TypeInfo::String
                         | crate::TypeInfo::Option(_)
@@ -7839,7 +7839,7 @@ impl<'a> CodeGen for Call {
         // loop (os.setenv's Option-vs-plain value routing).
         let second_arg_option = self.args.get(1).map(|a| {
             matches!(
-                crate::infer_type(a, &options, &symbols),
+                crate::infer_type(Some(&ctx), a, &options, &symbols),
                 crate::TypeInfo::Option(_)
             )
         });
@@ -9491,7 +9491,7 @@ fn arg_expected_fallback(
     // `-> float | None` return infer_type cannot see; `self.proxy()` — a
     // `Proxy | None` property accessor — round 86).
     let arg_is_option = matches!(
-        crate::infer_type(expr, options, symbols),
+        crate::infer_type(Some(&ctx), expr, options, symbols),
         crate::TypeInfo::Option(_)
     ) || matches!(expr, ExprType::Name(n)
         if options.optional_names.contains(&n.id))
@@ -9511,7 +9511,7 @@ fn arg_expected_fallback(
     // via the Option→concrete match-unwrap (the round-83 loud
     // unhandled-None panic).
     if matches!(resolved, crate::TypeInfo::PyValue) {
-        let inner_boxable = match crate::infer_type(expr, options, symbols) {
+        let inner_boxable = match crate::infer_type(Some(&ctx), expr, options, symbols) {
             crate::TypeInfo::Option(inner) => {
                 crate::ast::tree::type_ctx::is_boxable_value_type(&inner)
             }
@@ -9835,7 +9835,7 @@ fn map_call_arguments_inner(
                 let arg_is_option = matches!(expr, ExprType::Name(n)
                     if options.optional_names.contains(&n.id))
                     || matches!(
-                        crate::infer_type(expr, &options, &symbols),
+                        crate::infer_type(Some(&ctx), expr, &options, &symbols),
                         crate::TypeInfo::Option(_)
                     );
                 return crate::render_typed_reused(
@@ -9872,7 +9872,7 @@ fn map_call_arguments_inner(
                     _ => None,
                 }
             });
-            let arg_infers = crate::ast::tree::type_ctx::infer_type(expr, &options, &symbols);
+            let arg_infers = crate::ast::tree::type_ctx::infer_type(None, expr, &options, &symbols);
             // A BOXED argument: the inferrer's PyValue, or PyObject
             // ("no answer") that the boxed-receiver read-side drop
             // recognizes — an ATTRIBUTE read on a boxed receiver
