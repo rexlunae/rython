@@ -1610,10 +1610,25 @@ impl FunctionDef {
                             // requests' sessions): record the class so
                             // receiver resolution (property reads/setter
                             // stores on the parameter) can route to the
-                            // class's methods.
+                            // class's methods. A module-level TYPE ALIAS
+                            // annotation (`value: _TYPE_FIELD_VALUE` where
+                            // `_TYPE_FIELD_VALUE = Union[str, bytes]` —
+                            // urllib3's fields) resolves FIRST through the
+                            // symbols-aware authority — the alias name is
+                            // not a class, and the recorded type must agree
+                            // with the parameter's actual Rust type (round
+                            // 93 — the alias-as-Class entry left the
+                            // PyValue-typed local's stores uncoerced,
+                            // `value = py_mod(...)?` raw against PyValue).
                             _ => {
                                 let cname = n.id.clone();
-                                if symbols.get(&cname).is_some() {
+                                if let Some(t) = crate::resolve_alias_typeinfo(
+                                    &ExprType::Name(n.clone()),
+                                    &symbols,
+                                    &options,
+                                ) {
+                                    info.name_types.insert(p.arg.clone(), t);
+                                } else if symbols.get(&cname).is_some() {
                                     info.name_types.insert(
                                         p.arg.clone(),
                                         crate::TypeInfo::Class(cname),

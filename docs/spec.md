@@ -1280,6 +1280,23 @@ Sweep −7 (urllib3 823→822 — E0277 −3, E0599 −1; charset 175→169 —
 E0277 −5, E0382 −1; idna/certifi/requests flat — 1074→1067). Pinned in
 codegen (a plain LHS with an Option comparator unwraps the comparator).
 
+Round 93 (type-alias parameter annotations): the parameter-typing loop
+recorded a BARE-NAME annotation that is neither a builtin scalar nor a
+container as a CLASS (`value: _TYPE_FIELD_VALUE` where
+`_TYPE_FIELD_VALUE = Union[str, bytes]` — urllib3's fields — recorded
+Class("_TYPE_FIELD_VALUE")) — disagreeing with the parameter's actual
+boxed PyValue Rust type, so a store into the local
+(`value = "%s*=%s" % (name, value)`) went in raw (E0308) and every
+method call on the local dispatched to the boxed value's unmodeled
+methods (E0599 — the `_TYPE_FIELD_VALUE` / `_TYPE_TIMEOUT` /
+`_TYPE_BODY` family in fields, response, connection, util). The bare-name
+arm now resolves the annotation through the same symbols-aware authority
+the parameter lowering uses (a module alias resolves to its value type;
+a real class still records the class).
+Sweep −13 (urllib3 822→809 — E0599 −22, E0308 +2, E0609 +6, E0382 +1;
+everything else flat — 1067→1054). Pinned in codegen (a type-alias
+annotated parameter stores into its boxed local).
+
 ## 6. Functions
 
 ### 6.1 Signatures

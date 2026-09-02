@@ -14381,6 +14381,34 @@ fn a_plain_lhs_with_an_option_comparator_unwraps_the_comparator() {
         out
     );
 }
+
+#[test]
+fn a_type_alias_annotated_param_stores_into_its_boxed_local() {
+    // Round 93: `value: _TYPE_FIELD_VALUE` where
+    // `_TYPE_FIELD_VALUE = Union[str, bytes]` — the parameter's recorded
+    // type came from the bare-name "class" fallback (Class("_TYPE_FIELD_VALUE")),
+    // disagreeing with the parameter's actual boxed PyValue Rust type, so
+    // a store into the local (`value = "%s*=%s" % (name, value)`) went in
+    // raw. The parameter annotation now resolves the alias FIRST, so the
+    // boxed local wraps its stores.
+    let out = compile(
+        concat!(
+            "from typing import Union\n",
+            "\n",
+            "_TYPE_FIELD_VALUE = Union[str, bytes]\n",
+            "\n",
+            "def format_header_param_rfc2231(name: str, value: _TYPE_FIELD_VALUE) -> str:\n",
+            "    value = \"%s*=%s\" % (name, value)\n",
+            "    return value\n",
+        ),
+        "aliasparam.py",
+    );
+    assert!(
+        out.contains("value = PyValue :: from (py_mod") || out.contains("value=PyValue::from(py_mod"),
+        "the boxed-alias local must wrap its stores: {}",
+        out
+    );
+}
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions
