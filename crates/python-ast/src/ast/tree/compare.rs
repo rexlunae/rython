@@ -491,8 +491,33 @@ impl CodeGen for Compare {
             // unreachable; the equality answers are always reachable. The
             // py_* six ops are wrapped; `is`/`is not`/`in` keep their own
             // None-aware lowerings.
-            let tokens = if let crate::TypeInfo::Option(inner) =
-                crate::infer_type(left_ast, &options, &symbols)
+            // The LHS Option-ness: infer_type for a plain name, or the
+            // FIELD TABLE for a `self.<field>` accessor (`self.length_remaining != 0`,
+            // `self.chunk_left == 0` — urllib3's _handle_chunk, where the
+            // fields are `int | None` and infer_type cannot see through
+            // self-fields — round 89).
+            let opt_inner = match crate::infer_type(left_ast, &options, &symbols) {
+                crate::TypeInfo::Option(inner) => Some(*inner),
+                _ => None,
+            };
+            let opt_inner = opt_inner.or_else(|| {
+                if let ExprType::Attribute(attr) = left_ast
+                    && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                {
+                    match crate::ast::tree::aug_assign::self_field_rust_ty(
+                        &attr.attr,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    ) {
+                        Some(crate::TypeInfo::Option(inner)) => Some(*inner),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+            let tokens = if let Some(inner) = opt_inner
             {
                 // A NARROWED LHS (round 81's `and`-chain narrowing:
                 // `if conn and is_connection_dropped(conn)` proves conn
@@ -508,7 +533,7 @@ impl CodeGen for Compare {
                 if lhs_narrowed {
                     tokens
                 } else {
-                    let inner_ty = (*inner).clone();
+                    let inner_ty = inner.clone();
                     let is_py_cmp = matches!(
                         op,
                         Compares::Eq
