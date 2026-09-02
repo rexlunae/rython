@@ -156,6 +156,17 @@ def main() -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     out = args.out or str(RESULTS / f"run-{stamp}.json")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
+    # The idiom corpus (issue #137, Directive 3): every program must
+    # CONVERT, COMPILE, and diff its stdout against the CPython-captured
+    # expected output — a pass count the error histogram cannot fake.
+    idioms = {}
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "idioms"))
+        import run as run_idioms  # type: ignore
+
+        idioms = run_idioms.collect()
+    except Exception as e:  # noqa: BLE001 — the sweep must not die on the corpus
+        idioms = {"total": 0, "pass": 0, "error": str(e)}
     payload = {
         "rypip_commit": subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
@@ -164,12 +175,16 @@ def main() -> None:
         "rypip_path": str(args.rypip),
         "elapsed_seconds": round(time.time() - started, 1),
         "packages": results,
+        "idioms": idioms,
     }
     Path(out).write_text(json.dumps(payload, indent=2) + "\n")
     for name, r in results.items():
         total = r.get("total")
         print(f"{name:12} {specs and ''}{'' if total is None else total} errors"
               f"{' (convert failed)' if total is None else ''}")
+    print(
+        f"idioms      {idioms.get('pass', 0)}/{idioms.get('total', 0)} pass"
+    )
     print(f"wrote {out}")
 
 
