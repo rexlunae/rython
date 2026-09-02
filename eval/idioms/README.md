@@ -33,12 +33,14 @@ which is what `target/debug/rypip` was built from — and the runner
 **refuses a binary older than the newest converter source file** (pass
 `--allow-stale` to override), so the name is trustworthy because the run
 could not otherwise have happened. The payload also records `repo_head`
-and the binary's build time. A branch that only edits `eval/`
+and the oracle's version; it carries no machine-local paths or timestamps,
+so a committed result file changes only when a measurement does. A branch that only edits `eval/`
 therefore measures, and is named by, the same converter as its merge-base.
 
 Per-program status is one of `convert-failed`, `build-failed` (with the
-rustc error histogram), `run-failed`, `output-mismatch` (with the first
-differing line), or `pass`. Each run writes `results/run-<commit>.json`;
+rustc error histogram), `run-failed`, `timeout` (a hang in any stage is that
+program's result, not the corpus's), `output-mismatch` (with the first
+differing line, on either stream), or `pass`. Each run writes `results/run-<commit>.json`;
 failing crates are left in the workdir (`/tmp/rython-idioms/crate-<name>`)
 with a `build.log` for diagnosis.
 

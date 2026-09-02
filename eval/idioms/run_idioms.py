@@ -152,6 +152,17 @@ def verify_expected(program: Path, expected: Path, python: str | None) -> tuple[
 
 
 def run_one(program: Path, rypip: Path, workdir: Path, keep: bool, python: str | None) -> dict:
+    """One program's measurement. A hang anywhere in its pipeline is that
+    program's `timeout` status, never an abort of the remaining corpus."""
+    try:
+        return measure(program, rypip, workdir, keep, python)
+    except subprocess.TimeoutExpired as e:
+        cmd = e.cmd[0] if isinstance(e.cmd, list) else str(e.cmd)
+        return {"program": program.stem, "status": "timeout",
+                "detail": f"{Path(cmd).name} exceeded {e.timeout:.0f}s"}
+
+
+def measure(program: Path, rypip: Path, workdir: Path, keep: bool, python: str | None) -> dict:
     name = program.stem
     expected = program.with_suffix(".expected")
     result: dict = {"program": name}
@@ -233,7 +244,7 @@ def main() -> int:
     ap.add_argument("--rypip", default=str(REPO / "target" / "debug" / "rypip"))
     ap.add_argument("--workdir", default=str(DEFAULT_WORKDIR))
     ap.add_argument("--out", default=None, help="results JSON path (default results/run-<head>.json)")
-    ap.add_argument("--only", nargs="*", default=None, help="program names to run")
+    ap.add_argument("--only", nargs="+", default=None, metavar="NAME", help="program names to run")
     ap.add_argument("--keep", action="store_true", help="keep every generated crate, not just failing ones")
     ap.add_argument("--check-baseline", action="store_true",
                     help="exit 1 if a program listed in baseline.json no longer passes")
@@ -288,8 +299,7 @@ def main() -> int:
     payload = {
         "converter_commit": converter_commit(),
         "repo_head": git_head(),
-        "rypip_path": str(rypip),
-        "rypip_built": datetime.fromtimestamp(rypip.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+        "rypip_path": str(rypip.relative_to(REPO)) if rypip.is_relative_to(REPO) else str(rypip),
         "oracle": oracle_desc if python else None,
         "passed": len(passing),
         "total": len(results),
