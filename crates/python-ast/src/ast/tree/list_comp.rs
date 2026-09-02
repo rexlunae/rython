@@ -248,9 +248,18 @@ fn build_comprehension_loops(
             .ifs
             .iter()
             .map(|if_expr| {
-                if_expr
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                // The filter lowers truthiness through the SAME authority
+                // the if-statement uses (`condition_to_rust` → the
+                // `(#tokens).is_truthy()` contract — Directive 5): the
+                // raw `!(w.strip())` applied `!` to a String (E0600 in
+                // the idiom corpus's `[w.strip() for w in ... if
+                // w.strip()]`).
+                crate::condition_to_rust(
+                    if_expr,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )
             })
             .collect();
         let conditions = conditions?;

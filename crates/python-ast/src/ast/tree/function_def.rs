@@ -3429,7 +3429,30 @@ pub(crate) fn expr_yields_option_ctx(
     {
         return true;
     }
-    // A `.get(key, default)` call whose default is None (or an Option) is
+    // A SELF-METHOD call returning an Option (`item = self.find(name)` —
+    // a `-> Optional[Item]` finder the caller narrows with an early-exit
+    // guard): the result IS the Option — a store into an Option local
+    // must pass it through, never Some-wrap (the corpus's take() would
+    // nest `Some(Option<Item>)`, round 97). The field-accessor arm above
+    // covers OPTION FIELDS; this covers METHODS whose return annotation
+    // is an Option.
+    if let ExprType::Call(call) = expr
+        && let ExprType::Attribute(attr) = call.func.as_ref()
+        && matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+        && let Some(class_name) = ctx.enclosing_class_name()
+        && let Some(crate::SymbolTableNode::ClassDef(owner)) = symbols.get(class_name)
+        && owner
+            .method_on_mro(&attr.attr, symbols)
+            .and_then(|m| m.returns.as_deref().cloned())
+            .is_some_and(|r| {
+                matches!(
+                    crate::resolve_alias_typeinfo(&r, symbols, options),
+                    Some(crate::TypeInfo::Option(_))
+                )
+            })
+    {
+        return true;
+    }
     // itself an Option — the mapping protocol's get returns None when the
     // key is absent (`headers.get(name, default=None)` — urllib3's
     // getheader). The get lowering's OWN Some-wrap makes the value the
