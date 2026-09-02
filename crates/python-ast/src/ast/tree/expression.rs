@@ -358,7 +358,7 @@ impl ExprType {
                         has_starred = true;
                         continue;
                     }
-                    let t = crate::infer_type(&li, &options, &symbols);
+                    let t = crate::infer_type(Some(&ctx), &li, &options, &symbols);
                     if !matches!(t, crate::TypeInfo::PyObject) {
                         elt_types.push(t);
                     }

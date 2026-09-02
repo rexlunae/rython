@@ -679,7 +679,7 @@ impl CodeGen for StatementType {
                     .fn_return_typed
                     .is_some()
                     && (matches!(
-                        crate::ast::tree::type_ctx::infer_type(
+                        crate::ast::tree::type_ctx::infer_type(None, 
                             &e.value,
                             &options,
                             &symbols,
@@ -704,7 +704,7 @@ impl CodeGen for StatementType {
                     .fn_return_typed
                     .is_some()
                     && (matches!(
-                        crate::ast::tree::type_ctx::infer_type(
+                        crate::ast::tree::type_ctx::infer_type(None, 
                             &e.value,
                             &options,
                             &symbols,
@@ -720,7 +720,7 @@ impl CodeGen for StatementType {
                     || matches!(&e.value, ExprType::Name(n)
                         if options.optional_names.contains(&n.id)
                             && (matches!(
-                                crate::ast::tree::type_ctx::infer_type(
+                                crate::ast::tree::type_ctx::infer_type(None, 
                                     &e.value,
                                     &options,
                                     &symbols,

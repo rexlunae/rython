@@ -3814,7 +3814,7 @@ fn first_yield_type(
                 if let ExprType::Yield(y) = &e.value
                     && let Some(v) = y.value.as_ref()
                 {
-                    let t = crate::infer_type(v, options, symbols);
+                    let t = crate::infer_type(None, v, options, symbols);
                     if !matches!(t, crate::TypeInfo::PyObject) {
                         return Some(t);
                     }
@@ -4459,7 +4459,7 @@ impl FunctionDef {
                 if !matches!(li, ExprType::Constant(_)) {
                     return None;
                 }
-                let t = crate::infer_type(li, options, symbols);
+                let t = crate::infer_type(None, li, options, symbols);
                 if matches!(t, crate::TypeInfo::PyObject) {
                     continue;
                 }
@@ -4648,7 +4648,7 @@ impl FunctionDef {
                 has_none = true;
                 continue;
             }
-            let t = match crate::infer_type(r, options, symbols) {
+            let t = match crate::infer_type(None, r, options, symbols) {
                 // A string-LITERAL return infers `&'static str` (StrRef);
                 // the codegen returns an owned String — normalize so the
                 // `T | None` fold types `return "s"` + `return None` as

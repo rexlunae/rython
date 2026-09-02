@@ -62,7 +62,7 @@ impl CodeGen for Dict {
         let forced_kv = options.dict_forced_kv.as_ref().clone();
         for (key, value) in self.keys.iter().zip(self.values.iter()) {
             if let Some(k) = key {
-                let kt = crate::infer_type(k, &options, &symbols);
+                let kt = crate::infer_type(Some(&ctx), k, &options, &symbols);
                 if !matches!(kt, crate::TypeInfo::PyObject) {
                     if !k_distinct.contains(&kt) {
                         k_distinct.push(kt.clone());
@@ -70,7 +70,7 @@ impl CodeGen for Dict {
                     k_expected = crate::unify(k_expected, kt);
                 }
             }
-            let vt = crate::infer_type(value, &options, &symbols);
+            let vt = crate::infer_type(Some(&ctx), value, &options, &symbols);
             if !matches!(vt, crate::TypeInfo::PyObject) {
                 if !v_distinct.contains(&vt) {
                     v_distinct.push(vt.clone());
@@ -236,7 +236,7 @@ impl CodeGen for Dict {
                     .find(|(k, _)| k.is_none())
                     .map(|(_, v)| v)
                     && let crate::TypeInfo::Dict(k, v) =
-                        crate::infer_type(first, &options, &symbols)
+                        crate::infer_type(Some(&ctx), first, &options, &symbols)
                 {
                     (k.to_rust_type(), v.to_rust_type())
                 } else {

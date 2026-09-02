@@ -854,7 +854,7 @@ impl<'a> CodeGen for Assign {
             let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
                 if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
                     && matches!(
-                        crate::ast::tree::type_ctx::infer_type(&value_expr, &options, &symbols),
+                        crate::ast::tree::type_ctx::infer_type(None, &value_expr, &options, &symbols),
                         crate::TypeInfo::String
                             | crate::TypeInfo::Bytes
                             | crate::TypeInfo::PyValue
@@ -1117,7 +1117,7 @@ impl<'a> CodeGen for Assign {
                 ExprType::Attribute(_)
                     if attr_field_concrete_type(target).is_some()
                         && matches!(
-                            crate::ast::tree::type_ctx::infer_type(
+                            crate::ast::tree::type_ctx::infer_type(None, 
                                 &value_expr, &options, &symbols,
                             ),
                             crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)

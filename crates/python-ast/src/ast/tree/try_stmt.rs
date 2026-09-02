@@ -671,7 +671,7 @@ fn dynamic_exception_value(
                 .map(Some);
         }
     }
-    match crate::infer_type(exception_type, options, symbols) {
+    match crate::infer_type(Some(&ctx), exception_type, options, symbols) {
         crate::TypeInfo::PyValue => exception_type
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())

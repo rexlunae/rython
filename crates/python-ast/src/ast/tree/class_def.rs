@@ -2784,7 +2784,7 @@ impl CodeGen for ClassDef {
                     } else {
                         stripped
                     };
-                    let ti = crate::infer_type(&a.value, &options, &symbols);
+                    let ti = crate::infer_type(Some(&ctx), &a.value, &options, &symbols);
                     let concrete = !matches!(ti, crate::TypeInfo::PyObject)
                         && !crate::ast::tree::module::type_contains_uninferred(&ti);
                     let (ty, init) = if concrete {
@@ -5182,7 +5182,7 @@ fn infer_field_type(
             let mut elt_ty: Option<crate::TypeInfo> = None;
             let mut unknown = false;
             for e in l {
-                let t = crate::infer_type(e, options, symbols);
+                let t = crate::infer_type(None, e, options, symbols);
                 if matches!(t, crate::TypeInfo::PyObject) {
                     unknown = true;
                     break;

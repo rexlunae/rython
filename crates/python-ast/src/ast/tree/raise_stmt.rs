@@ -14,28 +14,27 @@ pub(crate) fn message_arg(
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let rendered = expr.clone().to_rust(ctx, options.clone(), symbols.clone())?;
-    // A GENERIC parameter keeps the raw format arg (its concrete type is
-    // bound elsewhere); a concrete class instance/Option/boxed value
-    // needs py_display.
-    let generic = matches!(expr, crate::ExprType::Name(n)
-        if options.param_type_vars.contains_key(&n.id));
-    let needs_display = !generic
+    // The type check borrows ctx BEFORE the render move (infer_type now
+    // takes the CodeGenContext — Directive 2). A GENERIC parameter keeps
+    // the raw format arg (its concrete type is bound elsewhere); a
+    // concrete class instance/Option/boxed value needs py_display.
+    let needs_display = !matches!(expr, crate::ExprType::Name(n)
+        if options.param_type_vars.contains_key(&n.id))
         && matches!(
-            crate::infer_type(expr, &options, &symbols),
+            crate::infer_type(Some(&ctx), expr, &options, &symbols),
             crate::TypeInfo::Class(_)
                 | crate::TypeInfo::Option(_)
                 | crate::TypeInfo::PyValue
                 | crate::TypeInfo::PyValueMember(_)
                 | crate::TypeInfo::PyObject
         );
+    let rendered = expr.clone().to_rust(ctx, options.clone(), symbols.clone())?;
     if needs_display {
         Ok(quote!(py_display(&(#rendered))))
     } else {
         Ok(rendered)
     }
 }
-
 
 use serde::{Deserialize, Serialize};
 

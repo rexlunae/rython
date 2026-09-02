@@ -1082,7 +1082,7 @@ pub(crate) fn receiver_is_boxed_positively(
         return false;
     }
     matches!(
-        crate::infer_type(expr, options, symbols),
+        crate::infer_type(None, expr, options, symbols),
         crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
     )
 }
@@ -1099,7 +1099,7 @@ pub(crate) fn receiver_is_pyvalue(
                 return false;
             }
             matches!(
-                crate::infer_type(expr, options, symbols),
+                crate::infer_type(Some(&ctx), expr, options, symbols),
                 crate::TypeInfo::PyValue
                     | crate::TypeInfo::PyObject
                     | crate::TypeInfo::PyValueMember(_)
