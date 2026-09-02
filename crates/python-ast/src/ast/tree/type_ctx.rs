@@ -3273,7 +3273,27 @@ pub fn call_return_typeinfo(
     options: Option<&PythonOptions>,
 ) -> Option<TypeInfo> {
     let ExprType::Name(callee) = call.func.as_ref() else {
-        return None;
+        // An ATTRIBUTE callee on a CLASS-typed receiver (`inv.find(name)`
+        // where inv = Inventory() — the idiom corpus's find): resolve the
+        // method through the receiver's class MRO and take its return
+        // annotation — the call LOWERING already resolves this shape (the
+        // `?` is emitted), so the type side must agree or the Option
+        // machinery (narrowing, the receiver unwrap) never sees it
+        // (round 99).
+        let ExprType::Attribute(attr) = call.func.as_ref() else {
+            return None;
+        };
+        let (symbols, options) = (symbols?, options?);
+        let ExprType::Name(recv) = attr.value.as_ref() else {
+            return None;
+        };
+        let Some(crate::TypeInfo::Class(cname)) = options.name_types.get(&recv.id) else {
+            return None;
+        };
+        let class = crate::resolve_class_referenced(cname, symbols, options)?;
+        let method = class.method_on_mro(&attr.attr, symbols)?;
+        let ann = method.returns.as_deref()?;
+        return resolve_alias_typeinfo(ann, symbols, options);
     };
     let symbols = symbols?;
     let options = options?;
