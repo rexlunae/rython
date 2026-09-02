@@ -11201,10 +11201,11 @@ fn shadowed_external_alias_annotation_boxes() {
 
 #[test]
 fn unannotated_generator_boxes_and_returns_ok() {
-    // A generator whose yield type the inference cannot resolve boxes to
-    // PyValue — the `_` placeholder is illegal in item signatures
-    // (E0121) — and the collector returns inside the function's Result
-    // (`return __rython_gen` bare was E0308).
+    // A generator's yield element type: the For-target seeding (round 99)
+    // types the loop element from the iterable (`for i in range(n)` seeds
+    // i as int), so the collector is Vec<i64> — precise, not the boxed
+    // PyValue the unseeded analysis used to emit. The collector returns
+    // inside the function's Result (`return __rython_gen` bare was E0308).
     let out = compile(
         "def gen(n: int):\n\
          \x20   for i in range(n):\n\
@@ -11212,18 +11213,13 @@ fn unannotated_generator_boxes_and_returns_ok() {
         "boxgen.py",
     );
     assert!(
-        out.contains("Vec < stdpython :: PyValue >"),
-        "unresolved yield element must box: {}",
+        out.contains("Vec < i64 >") || out.contains("Vec<i64>"),
+        "the seeded yield element must type the collector: {}",
         out
     );
     assert!(
         out.contains("return Ok (__rython_gen)"),
         "the collector returns in the Result: {}",
-        out
-    );
-    assert!(
-        out.contains("push (stdpython :: PyValue :: from"),
-        "yields box into the collector: {}",
         out
     );
 }
