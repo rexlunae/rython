@@ -1447,6 +1447,31 @@ impl<'a> CodeGen for Assign {
         let render = |target: &ExprType,
                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // Issue #137's Directive 4: a field store through a local
+            // holding a COPY of a container-stored object (`item = self.
+            // find(name)`, then `item.qty = v`) applies to the copy and is
+            // LOST — the same silently-diverging shape the AugAssign
+            // lowering refuses (round 98).
+            if let ExprType::Attribute(attr) = target
+                && let ExprType::Name(n) = attr.value.as_ref()
+                && let Some(crate::TypeInfo::Option(inner)) =
+                    options.name_types.get(&n.id)
+                && matches!(**inner, crate::TypeInfo::Class(_))
+            {
+                return Err(format!(
+                    "storing `{}.{}` is not supported yet: `{}` holds a copy of a \
+                     container-stored object (fetched with `{} = ...`), so the store \
+                     would apply to the copy and be lost; rython refuses to silently \
+                     ignore it — mutate through the container \
+                     (`self.items[name].{} = ...`) or restructure",
+                    n.id,
+                    attr.attr,
+                    n.id,
+                    n.id,
+                    attr.attr
+                )
+                .into());
+            }
             // A store into a CLASS attribute (`HTTPSConnectionPool.
             // ConnectionCls = HTTP2Connection` — urllib3's http2
             // injection) or a MODULE attribute (`urllib3_connection.

@@ -2347,6 +2347,19 @@ fn analyze_statement_types(
                 analyze_statement_types(b, info, options, symbols);
             }
         }
+        StatementType::Raise(r) => {
+            // A raise's exception expression READS its operands
+            // (`raise KeyError(name)` after `find(name)` moved name — the
+            // idiom corpus's take): uncounted, the reuse-clone never fired
+            // on the earlier move and the raise borrowed a moved value
+            // (E0382, round 98).
+            if let Some(e) = &r.exc {
+                count_expr_reads(e, info);
+            }
+            if let Some(e) = &r.cause {
+                count_expr_reads(e, info);
+            }
+        }
         _ => {}
     }
 }
