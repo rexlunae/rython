@@ -14522,6 +14522,29 @@ fn a_boxed_static_promoted_from_a_scalar_initializer_wraps() {
     );
 }
 
+#[test]
+fn a_comprehension_filter_uses_the_if_statement_truthiness_authority() {
+    // Issue #137, Directive 5: a comprehension `if` filter lowered its
+    // condition RAW (`if !(w.strip())` — the unary `!` applied to a
+    // String, E0600 in the idiom corpus's `[w.strip() for w in ... if
+    // w.strip()]`). The filter now routes through condition_to_rust —
+    // the same truthiness authority the if-statement uses
+    // (`(#tokens).is_truthy()`).
+    let out = compile(
+        concat!(
+            "def f(s: str) -> list[str]:\n",
+            "    return [w.strip() for w in s.split(\",\") if w.strip()]\n",
+        ),
+        "compfilter.py",
+    );
+    assert!(
+        out.contains("w . strip ()) . is_truthy ()))")
+            || out.contains("w.strip()).is_truthy())"),
+        "the comprehension filter must use is_truthy, never ! on a String: {}",
+        out
+    );
+}
+
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

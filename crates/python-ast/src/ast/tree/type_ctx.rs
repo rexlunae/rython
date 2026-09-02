@@ -1834,6 +1834,29 @@ pub fn analyze_function_types_with_class(
                         {
                             info.name_types.insert(n.id.clone(), t);
                         }
+                        // An OPTION-of-CLASS-returning self-method call
+                        // (`item = self.find(name)` — a `-> Optional[Item]`
+                        // finder whose result the caller narrows with an
+                        // early-exit guard, the idiom corpus's take()):
+                        // seed the local as the Option BINDING — name_types
+                        // AND optional_names — so the `is None`-guard
+                        // narrowing fires and later field reads unwrap the
+                        // class (the corpus's four `Option<Item>` errors).
+                        // The round-44 wash came from typing EVERY
+                        // self-method return; an Option<Class> local is the
+                        // narrow shape the guard narrowing consumes.
+                        if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                            && let Some(ann) = method.returns.as_deref()
+                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                            && matches!(
+                                &t,
+                                crate::TypeInfo::Option(inner)
+                                    if matches!(**inner, crate::TypeInfo::Class(_))
+                            )
+                        {
+                            info.optional_names.insert(n.id.clone());
+                            info.name_types.insert(n.id.clone(), t);
+                        }
                     }
                     crate::ExprType::Attribute(attr) => {
                         // A SELF-field read (`resp_options =

@@ -1347,6 +1347,28 @@ Sweep −2 (urllib3 793→791 — E0308 −2; everything else flat —
 1038→1036). Pinned in codegen (a boxed static promoted from a scalar
 initializer wraps).
 
+Round 97 (the value-adaptation authority, first step — idiom corpus
+acceptance): the idiom corpus (eval/idioms/) exposed that the
+local-type analysis never typed a local assigned from an OPTION-
+returning SELF-METHOD call (`item = self.find(name)` — a `-> Optional[Item]`
+finder), so the `is None` early-exit-guard narrowing never fired and
+every later field read hit the raw `Option<Item>` (the corpus's four
+`no field qty on Option<Item>` errors). The class-aware walk now seeds
+an Option-of-CLASS self-method local as the Option binding (name_types
+AND optional_names — the narrow shape the guard narrowing consumes),
+and `expr_yields_option_ctx` treats a self-method call whose return
+annotation is an Option as yielding the Option (so the Option-slot
+store passes it through instead of nesting `Some(Option<Item>)`) — the
+raise-guard narrowing itself was already recognized; no raise-specific
+branch was added. Separately, a comprehension `if` filter lowered its
+condition RAW (`if !(w.strip())` — the unary `!` applied to a String,
+E0600); it now routes through `condition_to_rust`, the SAME truthiness
+authority the if-statement uses (Directive 5 — one path, not two).
+Sweep −4 (urllib3 793→789, charset 169→167 — E0308 −3, E0600 −1;
+everything else flat — 1036→1032). Idiom corpus: 13 → 9 errors on
+inventory. Pinned in codegen (a comprehension filter uses the if-
+statement truthiness authority).
+
 ## 6. Functions
 
 ### 6.1 Signatures
