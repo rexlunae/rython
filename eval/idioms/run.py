@@ -101,7 +101,9 @@ def collect(names: list[str] | None = None) -> dict:
     """Run every program (or the named ones) and return the per-program
     status map plus counts — the shape run_sweep.py embeds next to the
     rustc-error histogram."""
-    programs = sorted(HERE.glob("*.py"))
+    programs = sorted(
+        p for p in HERE.glob("*.py") if p.name != "run.py"
+    )
     if names:
         wanted = set(names)
         programs = [p for p in programs if p.stem in wanted]
@@ -129,7 +131,7 @@ def main() -> int:
     args = parser.parse_args()
 
     result = collect(args.names)
-    programs = sorted(p.stem for p in HERE.glob("*.py"))
+    programs = sorted(p.stem for p in HERE.glob("*.py") if p.name != "run.py")
     if args.names:
         programs = [p for p in programs if p in args.names]
     for name in programs:
