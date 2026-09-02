@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 import re
 import shutil
 import subprocess
@@ -61,6 +62,16 @@ def git_head() -> str:
     return p.stdout.strip() if p.returncode == 0 else "unknown"
 
 
+def converter_commit() -> str:
+    """The last commit that touched the converter's source -- what
+    target/debug/rypip was built from, PROVIDED it was rebuilt (the README
+    trap). This, not HEAD, names a result file: a branch that only edits
+    eval/ measures the same converter as its merge-base."""
+    p = run(["git", "log", "-1", "--format=%h", "--",
+             "crates/python-ast", "crates/rypip", "crates/stdpython"], cwd=REPO)
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else "unknown"
+
+
 def error_histogram(log: str) -> dict[str, int]:
     hist: dict[str, int] = {}
     for m in ERROR_HEADER.finditer(log):
@@ -71,18 +82,21 @@ def error_histogram(log: str) -> dict[str, int]:
     return dict(sorted(hist.items(), key=lambda kv: -kv[1]))
 
 
-def verify_expected(program: Path, expected: Path) -> str | None:
+def verify_expected(program: Path, expected: Path) -> tuple[str | None, str]:
     """Re-run the program under python3 and compare with the pin. Returns
-    an error string if the pin is stale (or python3 fails), else None."""
+    (error, expected_stderr): error is set if the pin is stale or python3
+    fails; expected_stderr is what the generated binary must also emit
+    (empty when no oracle is available -- a passing program is silent on
+    stderr, so a warning or panic text there is a divergence, not noise)."""
     python = shutil.which("python3")
     if python is None:
-        return None  # no oracle available; trust the pin
+        return None, ""  # no oracle available; trust the pin
     p = run([python, str(program)], timeout=60)
     if p.returncode != 0:
-        return f"python3 exited {p.returncode}: {p.stderr.strip()[-200:]}"
+        return f"python3 exited {p.returncode}: {p.stderr.strip()[-200:]}", ""
     if p.stdout != expected.read_text():
-        return "pinned .expected differs from a live python3 run (regenerate the pin)"
-    return None
+        return "pinned .expected differs from a live python3 run (regenerate the pin)", ""
+    return None, p.stderr
 
 
 def run_one(program: Path, rypip: Path, workdir: Path, keep: bool) -> dict:
@@ -92,7 +106,7 @@ def run_one(program: Path, rypip: Path, workdir: Path, keep: bool) -> dict:
     if not expected.is_file():
         result["status"] = "no-expected"
         return result
-    stale = verify_expected(program, expected)
+    stale, expected_err = verify_expected(program, expected)
     if stale:
         result["status"] = "expected-stale"
         result["detail"] = stale
@@ -135,6 +149,10 @@ def run_one(program: Path, rypip: Path, workdir: Path, keep: bool) -> dict:
     if ran.stdout != expected.read_text():
         result["status"] = "output-mismatch"
         result["detail"] = first_difference(expected.read_text(), ran.stdout)
+        return result
+    if ran.stderr != expected_err:
+        result["status"] = "output-mismatch"
+        result["detail"] = f"stderr differs: expected {expected_err!r}, got {ran.stderr[-200:]!r}"
         return result
     result["status"] = "pass"
     if not keep:
@@ -203,13 +221,16 @@ def main() -> int:
     print(f"\n{len(passing)}/{len(results)} pass" + (f"; STALE PINS: {stale}" if stale else ""))
 
     payload = {
-        "rypip_commit": git_head(),
+        "converter_commit": converter_commit(),
+        "repo_head": git_head(),
+        "rypip_path": str(rypip),
+        "rypip_built": datetime.fromtimestamp(rypip.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
         "passed": len(passing),
         "total": len(results),
         "passing": passing,
         "programs": results,
     }
-    out = Path(args.out) if args.out else RESULTS / f"run-{payload['rypip_commit']}.json"
+    out = Path(args.out) if args.out else RESULTS / f"run-{payload['converter_commit']}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"wrote {out}")
@@ -217,21 +238,35 @@ def main() -> int:
     rc = 0
     if stale:
         rc = 2
+    baseline = load_baseline()
     if args.update_baseline:
-        BASELINE.write_text(json.dumps({"passing": passing}, indent=2) + "\n")
-        print(f"baseline updated: {passing}")
+        # Under --only, programs that were not run keep their entry; only
+        # the selected ones are re-decided. Without --only every program
+        # ran, so the new baseline is exactly what passes.
+        kept = [n for n in baseline if n not in results] if args.only else []
+        merged = sorted(set(kept) | set(passing))
+        BASELINE.write_text(json.dumps({"passing": merged}, indent=2) + "\n")
+        print(f"baseline updated: {merged}")
     elif args.check_baseline:
-        baseline = load_baseline()
-        checked = [n for n in baseline if n in results]
-        regressed = [n for n in checked if results[n]["status"] != "pass"]
+        if args.only:
+            skipped = [n for n in baseline if n not in results]
+            if skipped:
+                print(f"not run (--only), not checked: {skipped}")
+            to_check = [n for n in baseline if n in results]
+        else:
+            to_check = baseline  # everything ran: a missing entry is a deleted program
+        regressed = [n for n in to_check
+                     if n not in results or results[n]["status"] != "pass"]
+        missing = [n for n in regressed if n not in results]
         new = [n for n in passing if n not in baseline]
         if regressed:
-            print(f"REGRESSION: baseline programs no longer pass: {regressed}")
+            print(f"REGRESSION: baseline programs no longer pass: {regressed}"
+                  + (f" (missing from programs/: {missing})" if missing else ""))
             rc = 1
         if new:
             print(f"newly passing (add to baseline.json in this PR): {new}")
         if not regressed:
-            print(f"baseline holds: {len(checked)} program(s)")
+            print(f"baseline holds: {len(to_check)} program(s)")
     return rc
 
 

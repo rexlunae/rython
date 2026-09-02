@@ -172,6 +172,7 @@ def main() -> None:
         # ordinary Python translates at all, and whether a crate that
         # compiles is silently wrong (it diffs against CPython's output).
         idioms_json = args.workdir / "idioms.json"
+        idioms_json.unlink(missing_ok=True)  # a crashed run must not leave a stale count
         subprocess.run(
             [sys.executable, str(ROOT / "eval" / "idioms" / "run_idioms.py"),
              "--rypip", str(args.rypip), "--workdir", str(args.workdir / "idioms"),
