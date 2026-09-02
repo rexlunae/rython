@@ -1315,6 +1315,38 @@ Sweep −8 (urllib3 809→801 — E0308 −8; everything else flat —
 1054→1046). Pinned in codegen (a module-qualified typing cast is a
 runtime identity).
 
+Round 95 (Option values through `typing.cast` locals): a cast-assigned
+local (`proxy_config = typing.cast(ProxyConfig, self.proxy_config)` —
+urllib3's _connect_tls_proxy, where the field is `ProxyConfig | None`)
+previously stayed unknown — the field reads on it never unwrapped the
+Option (E0609). The class-aware walk now looks through the identity
+cast and seeds the local with the field's REAL Option type (not the
+unknown placeholder, so the inner class resolves); the Option-slot
+store passes the value through (a cast yields what its value yields)
+and the self-field-read clone looks through the cast (an Option field
+— any inner — clones out of the shared receiver, the same rule the
+Option-slot pass-through already applied); and the field-read Option
+detection resolves a receiver that is an OPTION-CLASS-typed local by
+looking the inner class's field table up directly.
+Sweep −8 (urllib3 801→793 — E0609 −9, E0507 +1; everything else flat —
+1046→1038). Pinned in codegen (a cast-assigned Option field local
+unwraps and clones on read).
+
+Round 96 (boxed statics promoted from scalar initializers): a module
+binding whose static type resolves but whose initializer is a PLAIN
+value (`_FAILEDTELL: Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token` —
+an Enum sentinel member, an i64 associated const — urllib3's
+util/request and util/timeout) went through the inferred-type static
+promotion path, which emitted the initializer RAW against a
+`LazyLock<PyValue>` (E0308 — the boxed value was only wrapped on the
+unknown-type path). A static whose resolved type is EXACTLY the boxed
+PyValue now wraps its initializer in `PyValue::from` (a `PyDict<String,
+PyValue>` typed static keeps its literal unwrapped — the wrap check is
+token-exact, not a substring).
+Sweep −2 (urllib3 793→791 — E0308 −2; everything else flat —
+1038→1036). Pinned in codegen (a boxed static promoted from a scalar
+initializer wraps).
+
 ## 6. Functions
 
 ### 6.1 Signatures

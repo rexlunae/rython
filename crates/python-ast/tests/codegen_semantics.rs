@@ -14448,6 +14448,80 @@ fn a_module_qualified_typing_cast_is_a_runtime_identity() {
         out
     );
 }
+#[test]
+fn a_cast_assigned_option_field_local_unwraps_and_clones_on_read() {
+    // Round 95: `proxy_config = cast(ProxyConfig, self.proxy_config)`
+    // where the field is `ProxyConfig | None` — the cast-assigned local
+    // must seed as the field's real Option type (the walk looks through
+    // the identity cast), the Option-slot store must pass the value
+    // through (the cast yields what its value yields) and clone it out
+    // of `&self`, and field reads on the unwrapped local resolve the
+    // inner class's fields.
+    let out = compile(
+        concat!(
+            "from typing import cast\n",
+            "\n",
+            "class ProxyConfig:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.ssl_context: str | None = None\n",
+            "\n",
+            "class R:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.proxy_config: ProxyConfig | None = None\n",
+            "    def f(self, other: str | None) -> str | None:\n",
+            "        proxy_config = cast(ProxyConfig, self.proxy_config)\n",
+            "        ssl_context = proxy_config.ssl_context\n",
+            "        return other if ssl_context is None else ssl_context\n",
+        ),
+        "castoptfield.py",
+    );
+    let i = out.find("fn f").unwrap_or(0);
+    let body = &out[i..];
+    assert!(
+        body.contains("proxy_config = (self . proxy_config) . clone ()")
+            || body.contains("proxy_config=(self.proxy_config).clone()"),
+        "the cast-assigned Option field must clone out of the receiver: {}",
+        out
+    );
+    assert!(
+        body.contains("unwrap_or_else (|| { panic ! (\"AttributeError: 'NoneType' object has no attribute '{}'\"")
+            || body.contains("unwrap_or_else(||{panic!(\"AttributeError: 'NoneType' object has no attribute '{}'\""),
+        "the read of the Option local must unwrap loudly: {}",
+        out
+    );
+}
+
+#[test]
+fn a_boxed_static_promoted_from_a_scalar_initializer_wraps() {
+    // Round 96: `_FAILEDTELL: Final[_TYPE_FAILEDTELL] =
+    // _TYPE_FAILEDTELL.token` — an Enum sentinel member (an i64 const)
+    // promoted to a boxed LazyLock static — the inferred-type promotion
+    // path rendered the initializer RAW against LazyLock<PyValue>
+    // (E0308). A boxed-typed static now wraps its initializer in
+    // PyValue::from, matching the unknown-type path.
+    let out = compile(
+        concat!(
+            "from enum import Enum\n",
+            "from typing import Final\n",
+            "\n",
+            "class _TYPE_FAILEDTELL(Enum):\n",
+            "    token = 0\n",
+            "\n",
+            "def use() -> int:\n",
+            "    return 1 if _FAILEDTELL is _TYPE_FAILEDTELL.token else 0\n",
+            "\n",
+            "_FAILEDTELL: Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token\n",
+        ),
+        "enumstatic.py",
+    );
+    assert!(
+        out.contains("LazyLock < stdpython :: PyValue > = std :: sync :: LazyLock :: new (|| stdpython :: PyValue :: from")
+            || out.contains("LazyLock<stdpython::PyValue>=std::sync::LazyLock::new(||stdpython::PyValue::from"),
+        "the boxed static must wrap its scalar initializer: {}",
+        out
+    );
+}
+
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

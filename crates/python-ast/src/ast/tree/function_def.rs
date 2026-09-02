@@ -3369,6 +3369,33 @@ pub(crate) fn expr_yields_option_ctx(
     if expr_yields_option(expr, options, symbols) {
         return true;
     }
+    // A `typing.cast(T, value)` call is a runtime identity: it yields
+    // exactly what its VALUE yields (`proxy_config = cast(ProxyConfig,
+    // self.proxy_config)` — a `ProxyConfig | None` field read — must
+    // pass the Option through the Option-slot store, or the wrap nests
+    // into Option<Option<ProxyConfig>>, round 95).
+    if let ExprType::Call(call) = expr
+        && call.args.len() == 2
+        && (matches!(
+            call.func.as_ref(),
+            ExprType::Name(n)
+                if n.id == "cast"
+                    && matches!(
+                        symbols.get(&n.id),
+                        Some(crate::SymbolTableNode::ImportFrom(i))
+                            if crate::AnnotationModule::from_name(
+                                i.module.split('.').next().unwrap_or("")
+                            ) == Some(crate::AnnotationModule::Typing)
+                    )
+        ) || matches!(
+            call.func.as_ref(),
+            ExprType::Attribute(attr)
+                if attr.attr == "cast"
+                    && matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id))
+        ))
+    {
+        return expr_yields_option_ctx(&call.args[1], ctx, options, symbols);
+    }
     // Whether a class (or its BASE chain) has an Option-typed field
     // `name` — a `self.<field>` read or accessor call of an inherited
     // field (`self._tunnel_host` in a derived method whose struct embeds
@@ -3472,6 +3499,32 @@ pub(crate) fn expr_yields_option_ctx(
                     .is_some_and(|fields| {
                         fields.iter().any(|(n, t)| {
                             *n == attr.attr && matches!(t, crate::TypeInfo::Option(_))
+                        })
+                    })
+            })
+    {
+        return true;
+    }
+    // The receiver may be an OPTION-CLASS-typed LOCAL (`proxy_config`
+    // where `proxy_config = cast(ProxyConfig, self.proxy_config)` — the
+    // walk seeds it Option<ProxyConfig>, and the attr-read lowering
+    // unwraps the Option on the read, so `X.assert_fingerprint` is a
+    // field of the CLASS — round 95): receiver_class_for_read cannot
+    // resolve an Option-wrapped name, so look the inner class's field
+    // table up directly.
+    if let ExprType::Name(n) = attr.value.as_ref()
+        && let Some(crate::TypeInfo::Option(inner)) = options.name_types.get(&n.id)
+        && let crate::TypeInfo::Class(cname) = &**inner
+        && let Some(class) = crate::resolve_class_referenced(cname, symbols, options)
+        && class
+            .base_chain_with_options(symbols, options)
+            .iter()
+            .any(|c| {
+                c.infer_fields(symbols, options)
+                    .ok()
+                    .is_some_and(|fields| {
+                        fields.iter().any(|(fn_, t)| {
+                            *fn_ == attr.attr && matches!(t, crate::TypeInfo::Option(_))
                         })
                     })
             })

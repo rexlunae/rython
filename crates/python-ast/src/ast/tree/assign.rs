@@ -1618,7 +1618,39 @@ fn self_field_read_clone(
     options: &crate::PythonOptions,
     symbols: &crate::SymbolTableScopes,
 ) -> Option<proc_macro2::TokenStream> {
-    let ExprType::Attribute(attr) = value_expr else {
+    // A `typing.cast(T, value)` wrapper is a runtime identity: look
+    // through it to the field read (`proxy_config = cast(ProxyConfig,
+    // self.proxy_config)` — urllib3's _connect_tls_proxy — round 95).
+    let cast_value = match value_expr {
+        crate::ExprType::Call(call)
+            if call.args.len() == 2
+                && (matches!(
+                    call.func.as_ref(),
+                    crate::ExprType::Name(n)
+                        if n.id == "cast"
+                            && matches!(
+                                symbols.get(&n.id),
+                                Some(crate::SymbolTableNode::ImportFrom(i))
+                                    if crate::AnnotationModule::from_name(
+                                        i.module.split('.').next().unwrap_or("")
+                                    ) == Some(crate::AnnotationModule::Typing)
+                            )
+                ) || matches!(
+                    call.func.as_ref(),
+                    crate::ExprType::Attribute(attr)
+                        if attr.attr == "cast"
+                            && matches!(
+                                attr.value.as_ref(),
+                                crate::ExprType::Name(m) if crate::is_typing(&m.id)
+                            )
+                )) =>
+        {
+            Some(&call.args[1])
+        }
+        _ => None,
+    };
+    let field_expr = cast_value.unwrap_or(value_expr);
+    let ExprType::Attribute(attr) = field_expr else {
         return None;
     };
     if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
@@ -1629,8 +1661,13 @@ fn self_field_read_clone(
     let (_, ty) = fields.iter().find(|(name, _)| *name == attr.attr)?;
     // An owned heap value anywhere inside — Option<String>,
     // Vec<u8>, PyValue, String — clones out of the shared receiver
-    // (the structural twin of the old substring sniffing).
-    let immutable = crate::ast::tree::type_ctx::type_mentions_heap(ty);
+    // (the structural twin of the old substring sniffing). An OPTION-
+    // typed field clones for ANY inner (including a class —
+    // `Option<ProxyConfig>` — the Option-slot pass-through already
+    // clones attribute reads this way, round 90; the class instance
+    // cannot be moved out of `&self`, round 95).
+    let immutable = matches!(ty, crate::TypeInfo::Option(_))
+        || crate::ast::tree::type_ctx::type_mentions_heap(ty);
     if !immutable {
         return None;
     }
