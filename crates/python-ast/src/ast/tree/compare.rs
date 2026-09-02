@@ -326,6 +326,74 @@ impl CodeGen for Compare {
                     comparator = quote!((#comparator) as f64);
                 }
             }
+            // An OPTION-typed comparator unwraps to the inner value
+            // (`len(...) < amt` where amt is `int | None` — urllib3's
+            // _read; `amt < self.chunk_left` where BOTH sides are
+            // `int | None` — _handle_chunk): Python compares the inner
+            // when non-None, and an ordered compare on None is CPython's
+            // TypeError — the loud §12.2 panic. Applies to the py_* six
+            // ops whether or not the LHS is itself an Option (round 92 —
+            // the unwrap previously lived ONLY inside the LHS-Option
+            // branch, so a plain LHS with an Option comparator compared
+            // the raw Option — E0277 on the PyLt<Option<i64>> bound).
+            {
+                let is_py_cmp = matches!(
+                    op,
+                    Compares::Eq
+                        | Compares::NotEq
+                        | Compares::Lt
+                        | Compares::LtE
+                        | Compares::Gt
+                        | Compares::GtE
+                );
+                let comparator_is_option = !matches!(
+                    comparator_ast,
+                    crate::ExprType::Name(n)
+                        if options.narrowed_names.contains_key(&n.id)
+                ) && (matches!(
+                    crate::infer_type(comparator_ast, &options, &symbols),
+                    crate::TypeInfo::Option(_)
+                ) || matches!(
+                    comparator_ast,
+                    crate::ExprType::Attribute(attr)
+                        if matches!(attr.value.as_ref(), crate::ExprType::Name(n) if n.id == "self")
+                            && crate::ast::tree::aug_assign::self_field_rust_ty(
+                                &attr.attr, &ctx, &options, &symbols,
+                            )
+                            .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
+                ));
+                if is_py_cmp && comparator_is_option {
+                    let op_name = match op {
+                        Compares::Eq => "==",
+                        Compares::NotEq => "!=",
+                        Compares::Lt => "<",
+                        Compares::LtE => "<=",
+                        Compares::Gt => ">",
+                        Compares::GtE => ">=",
+                        _ => "?",
+                    };
+                    // CPython names the LHS's type (`5 < None` → "'<' not
+                    // supported between instances of 'int' and
+                    // 'NoneType'").
+                    let lhs_ty = match crate::infer_type(left_ast, &options, &symbols) {
+                        crate::TypeInfo::Int => "int",
+                        crate::TypeInfo::Float => "float",
+                        crate::TypeInfo::String | crate::TypeInfo::StrRef => "str",
+                        crate::TypeInfo::Bytes => "bytes",
+                        _ => "NoneType",
+                    };
+                    let msg = format!(
+                        "'{}' not supported between instances of '{}' and 'NoneType'",
+                        op_name, lhs_ty
+                    );
+                    comparator = quote! {
+                        match (#comparator).clone() {
+                            Some(__rython_r) => __rython_r,
+                            None => panic!(#msg),
+                        }
+                    };
+                }
+            }
             // Comparisons route through the stdpython PyEq/PyNe/PyLt/PyLe/
             // PyGt/PyGe traits (in scope via `use stdpython::*`): scalars
             // and containers get their existing PartialEq/PartialOrd
@@ -583,48 +651,6 @@ impl CodeGen for Compare {
                             _ => "NoneType",
                         }
                     }
-                    let comparator = if matches!(
-                        crate::infer_type(comparator_ast, &options, &symbols),
-                        crate::TypeInfo::Option(_)
-                    ) || matches!(
-                        comparator_ast,
-                        crate::ExprType::Attribute(attr)
-                            if matches!(
-                                attr.value.as_ref(),
-                                crate::ExprType::Name(n) if n.id == "self"
-                            )
-                                && crate::ast::tree::aug_assign::self_field_rust_ty(
-                                    &attr.attr,
-                                    &ctx,
-                                    &options,
-                                    &symbols,
-                                )
-                                .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
-                    )
-                    {
-                        let cmp_ty = type_name(&inner_ty);
-                        let op_name = match op {
-                            Compares::Eq => "==",
-                            Compares::NotEq => "!=",
-                            Compares::Lt => "<",
-                            Compares::LtE => "<=",
-                            Compares::Gt => ">",
-                            Compares::GtE => ">=",
-                            _ => "?",
-                        };
-                        let msg = format!(
-                            "'{}' not supported between instances of 'NoneType' and '{}'",
-                            op_name, cmp_ty
-                        );
-                        quote! {
-                            match (#comparator).clone() {
-                                Some(__rython_r) => __rython_r,
-                                None => panic!(#msg),
-                            }
-                        }
-                    } else {
-                        quote!(#comparator)
-                    };
                     let inner_cmp = match op {
                         Compares::Eq => quote!((__rython_v).py_eq(&(#comparator))),
                         Compares::NotEq => quote!((__rython_v).py_ne(&(#comparator))),

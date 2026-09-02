@@ -14348,6 +14348,39 @@ fn a_base_chain_option_field_compares_via_the_option_match() {
         out
     );
 }
+
+#[test]
+fn a_plain_lhs_with_an_option_comparator_unwraps_the_comparator() {
+    // Round 92: `total < amt` where total is a plain i64 and amt is
+    // `int | None` (urllib3's `len(self._decoded_buffer) < amt` in
+    // _read) — the Option-comparator unwrap lived ONLY inside the
+    // LHS-Option branch, so a plain LHS compared the raw Option
+    // (`py_lt(&(amt))` — E0277 on the PyLt<Option<i64>> bound). The
+    // unwrap now applies to the py_* six ops regardless of the LHS:
+    // the inner compares, and None is CPython's TypeError — the loud
+    // §12.2 panic naming the LHS type.
+    let out = compile(
+        concat!(
+            "class R:\n",
+            "    def read(self, amt: int | None = None) -> None:\n",
+            "        total = 10\n",
+            "        while total < amt:\n",
+            "            total += 1\n",
+        ),
+        "plainoptcmp.py",
+    );
+    assert!(
+        out.contains("py_lt (& (match (amt) . clone () { Some (__rython_r) => __rython_r , None => panic")
+            || out.contains("py_lt(&(match(amt).clone(){Some(__rython_r)=>__rython_r,None=>panic"),
+        "the Option comparator must unwrap to the inner comparison: {}",
+        out
+    );
+    assert!(
+        out.contains("not supported between instances of 'int' and 'NoneType'"),
+        "the None case must be CPython's ordered-compare TypeError text: {}",
+        out
+    );
+}
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

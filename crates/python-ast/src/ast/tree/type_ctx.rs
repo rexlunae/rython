@@ -1178,12 +1178,18 @@ pub fn render_reused(
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
-            // An inferred (unannotated) parameter is not statically Copy —
-            // the reuse-clone rule adds `T: Clone` for it, so clone it
-            // here too (a generic value would otherwise be moved into the
-            // call while still being used).
-            let inferred_param = options.param_type_vars.contains_key(&n.id);
-            if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
+            // Round 92: clone whenever the name is not statically Copy —
+            // INCLUDING an inferrer-unknown (PyObject) name, which the
+            // old gate excluded. A local bound from a SELF-METHOD call
+            // whose return the inferrer cannot see (`data =
+            // self._read(amt)` — the read family in urllib3's response)
+            // is PyObject to infer_type while its ACTUAL binding is
+            // `Vec<u8>` — skipping the clone moved the value into the
+            // first call and every later read borrowed a moved value
+            // (E0382, exposed once the compare fix let the loop
+            // type-check). `.clone()` compiles on every generated type
+            // (Copy types clone via Copy; classes derive Clone).
+            if !t.is_copy() {
                 // A CLASS-typed name (a local holding an instance —
                 // `timeout_obj` from `self._get_timeout()`): the bare
                 // `(#tokens).clone()` would resolve to the class's OWN
@@ -1220,13 +1226,13 @@ pub fn render_typed_reused(
         let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
-            // See render_reused: an inferred parameter is not statically
-            // Copy, so clone it at the call site (its `T: Clone` bound is
-            // the reuse-clone rule's). A CLASS-typed name's reuse-clone
-            // must be the qualified std Clone — never the class's own
-            // `clone` method (round 88).
-            let inferred_param = options.param_type_vars.contains_key(&n.id);
-            if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
+            // See render_reused: clone whenever the name is not statically
+            // Copy — INCLUDING inferrer-unknown (PyObject) names, whose
+            // actual binding may be any non-Copy value (`data =
+            // self._read(amt)` — the moved-value E0382s, round 92). A
+            // CLASS-typed name's reuse-clone is the qualified std Clone —
+            // never the class's own `clone` method (round 88).
+            if !t.is_copy() {
                 // See render_reused: a CLASS-typed name's reuse-clone must
                 // be the trait-qualified std Clone (`Clone::clone(&x)`),
                 // never the class's own `clone` method (round 88).
