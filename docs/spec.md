@@ -1260,6 +1260,26 @@ unwrapping to the inner comparison with Python's None-equality answers.
 Sweep −3 (urllib3 826→823, everything else flat — 1077→1074). Pinned in
 codegen (a base-chain Option field compares via the Option match).
 
+Round 92 (plain-LHS Option comparators and the inferrer-unknown
+reuse-clone): the Option-COMPARATOR unwrap (`x < y` where y is
+`T | None`) lived only inside the LHS-Option branch of the compare
+lowering, so a PLAIN LHS compared the raw Option (`len(self._decoded_buffer)
+< amt` — urllib3's _read — E0277 on the missing PyLt<Option<i64>>
+bound); the unwrap now applies to the py_* six ops regardless of the
+LHS, with CPython's ordered-compare TypeError text naming the LHS type.
+Fixing the comparisons EXPOSED six latent moved-value errors: a local
+bound from a SELF-METHOD call whose return the inferrer cannot see
+(`data = self._raw_read(amt)` — the response read family) infers as the
+unknown marker, and the reuse-clone gate deliberately skipped
+PyObject-named names — so the first `_decode(data)` moved the Vec<u8>
+and every later read borrowed a moved value (E0382, previously masked
+by the comparison E0277s). `.clone()` compiles on every generated type
+(Copy types clone via Copy; classes derive Clone), so the gate now
+clones whenever the name is not statically Copy, unknown type included.
+Sweep −7 (urllib3 823→822 — E0277 −3, E0599 −1; charset 175→169 —
+E0277 −5, E0382 −1; idna/certifi/requests flat — 1074→1067). Pinned in
+codegen (a plain LHS with an Option comparator unwraps the comparator).
+
 ## 6. Functions
 
 ### 6.1 Signatures
