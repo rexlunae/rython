@@ -1745,6 +1745,20 @@ impl<'a> CodeGen for Call {
                 }
             }
         }
+        // `typing.cast(T, value)` — the MODULE-QUALIFIED form of the
+        // runtime-identity cast (`typing.cast(ProxyConfig,
+        // self.proxy_config)` — urllib3's _connect_tls_proxy): same
+        // lowering as the imported `cast` name above — the value passes
+        // through unchanged (round 94 — without it the call fell to the
+        // external-module drop and the local became `PyValue::None_`,
+        // breaking every field read on it, E0609).
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && attr.attr == "cast"
+            && self.args.len() == 2
+            && matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id))
+        {
+            return self.args[1].clone().to_rust(ctx, options, symbols);
+        }
         // A compat builtin ALIAS used as a callee (`builtin_str = str` —
         // requests/compat, called as `builtin_str(x)` in models.py): the
         // alias resolves through its defining module to the builtin name,
@@ -9788,7 +9802,20 @@ fn map_call_arguments_inner(
                             && (crate::is_none_expr(&op.left)
                                 || crate::is_none_expr(&op.right))
                 ) && matches!(
-                    crate::resolve_alias_typeinfo(ann, symbols, &options),
+                    // The annotation's alias lives in the CALLEE's module
+                    // (`headers: ValidHTTPHeaderSource | None` where
+                    // ValidHTTPHeaderSource is defined in _collections.py —
+                    // a construction `HTTPHeaderDict(headers)` from
+                    // _request_methods.py): resolve through the
+                    // defining module's symbols (default_symbols), not the
+                    // caller's scope where the alias is absent (round 94 —
+                    // the mismatch left the OPTION-typed argument
+                    // uncoerced, raw against the boxed param).
+                    crate::resolve_alias_typeinfo(
+                        ann,
+                        default_symbols.unwrap_or(symbols),
+                        &options,
+                    ),
                     Some(crate::TypeInfo::PyValue)
                 )
             }) {

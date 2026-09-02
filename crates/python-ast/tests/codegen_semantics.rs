@@ -14409,6 +14409,45 @@ fn a_type_alias_annotated_param_stores_into_its_boxed_local() {
         out
     );
 }
+
+#[test]
+fn a_module_qualified_typing_cast_is_a_runtime_identity() {
+    // Round 94: `typing.cast(ProxyConfig, self.proxy_config)` — the
+    // MODULE-QUALIFIED cast (urllib3's _connect_tls_proxy) previously
+    // fell to the external-module drop (`proxy_config = PyValue::None_`),
+    // breaking every field read on the local (E0609). The qualified form
+    // lowers to its VALUE argument, exactly like the imported `cast` name.
+    let out = compile(
+        concat!(
+            "from typing import cast\n",
+            "\n",
+            "class ProxyConfig:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.ssl_context: str | None = None\n",
+            "\n",
+            "class R:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.proxy_config: ProxyConfig = ProxyConfig()\n",
+            "    def f(self) -> str | None:\n",
+            "        proxy_config = cast(ProxyConfig, self.proxy_config)\n",
+            "        return proxy_config.ssl_context\n",
+        ),
+        "typingcast.py",
+    );
+    let i = out.find("fn f").unwrap_or(0);
+    let body = &out[i..];
+    assert!(
+        body.contains("proxy_config = self . proxy_config") || body.contains("proxy_config=self.proxy_config"),
+        "the cast must pass the value through unchanged: {}",
+        out
+    );
+    assert!(
+        !body.contains("proxy_config = stdpython :: PyValue :: None_")
+            && !body.contains("proxy_config=stdpython::PyValue::None_"),
+        "the cast must NOT drop to the boxed None: {}",
+        out
+    );
+}
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

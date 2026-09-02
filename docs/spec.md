@@ -1297,6 +1297,24 @@ Sweep −13 (urllib3 822→809 — E0599 −22, E0308 +2, E0609 +6, E0382 +1;
 everything else flat — 1067→1054). Pinned in codegen (a type-alias
 annotated parameter stores into its boxed local).
 
+Round 94 (cross-module boxed-param resolution and the qualified
+typing.cast): the boxed-union argument fill (`headers: ValidHTTPHeaderSource
+| None` → the boxed PyValue param) resolved the annotation's alias in the
+CALLER's symbols — for a CONSTRUCTION of an imported class
+(`HTTPHeaderDict(headers)` from _request_methods.py, whose
+`ValidHTTPHeaderSource` is defined in _collections.py) the alias is
+absent there, so the branch never fired and the OPTION-typed argument
+went in raw (`PyValue | Option<IndexMap>` — E0308). The resolution now
+uses the DEFINING module's symbols (the same `default_symbols` the
+dropped-default constants already use). And `typing.cast(T, value)` — the
+MODULE-QUALIFIED form (`typing.cast(ProxyConfig, self.proxy_config)` —
+urllib3's _connect_tls_proxy) previously fell to the external-module
+drop (`PyValue::None_`); it now lowers to its VALUE argument, exactly
+like the imported `cast` name (a runtime identity).
+Sweep −8 (urllib3 809→801 — E0308 −8; everything else flat —
+1054→1046). Pinned in codegen (a module-qualified typing cast is a
+runtime identity).
+
 ## 6. Functions
 
 ### 6.1 Signatures
