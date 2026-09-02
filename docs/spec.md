@@ -1206,6 +1206,27 @@ Sweep −6 (urllib3 845→839, everything else flat — 1097→1091). Pinned in
 codegen (a reused class local clones via the qualified std Clone; a dict
 update with an Option dict argument unwraps loudly).
 
+Round 89 (Option values behind self-fields): the compare Option-match
+trigger and the Option-slot pass-through both keyed on `infer_type`,
+which cannot see through SELF-FIELD accessors. A `self.length_remaining !=
+0` comparison (the field is `int | None` — urllib3's _handle_chunk)
+rendered `py_ne(&(0))` on the raw Option (E0308 — the runtime
+PartialEq impls only compare Option with Option); the trigger now also
+consults the FIELD TABLE for a `self.<field>` LHS, unwrapping to the
+inner comparison with Python's None-equality answers (`None != 0` is
+True, ordered compares are the loud §12.2 panic). Likewise an OPTION-
+typed FIELD READ on a class-resolved receiver (`self.proxy.host` — Url's
+`host`/`port`/`scheme` fields are `T | None`, urllib3's ProxyManager
+`super().connection_from_host(self.proxy.host, ...)`) now counts as
+yielding the Option in `expr_yields_option_ctx` (the property arm only
+covered accessor METHODS; the field table covers plain fields on any
+receiver), so an Option-slot argument passes the read through instead of
+double-wrapping `Some(self.proxy().host)` into `Option<Option<String>>`.
+Sweep −10 (urllib3 839→830, charset 176→175, idna/certifi/requests flat —
+1091→1081). Pinned in codegen (a self Option field compares via the
+Option match; an Option field read passes through an Option slot without
+double-wrapping).
+
 ## 6. Functions
 
 ### 6.1 Signatures

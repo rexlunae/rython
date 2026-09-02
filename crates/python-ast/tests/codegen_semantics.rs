@@ -14206,6 +14206,73 @@ fn a_dict_update_with_an_option_dict_argument_unwraps_loudly() {
     );
 }
 
+#[test]
+fn an_option_field_read_passes_through_an_option_slot_without_double_wrapping() {
+    // Round 89: `super().from_host(self.proxy.host, ...)` where Url's
+    // `host`/`port`/`scheme` fields are `T | None` — the field READ
+    // yields the Option (the accessor returns it), so an Option-slot
+    // argument must pass it through; `Some(self.proxy().host)` would
+    // double it into `Option<Option<String>>`.
+    let out = compile(
+        concat!(
+            "class Url:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.host: str | None = None\n",
+            "        self.port: int | None = None\n",
+            "        self.scheme: str | None = None\n",
+            "\n",
+            "class Base:\n",
+            "    def from_host(self, host: str | None, port: int | None = None, scheme: str | None = None) -> None:\n",
+            "        pass\n",
+            "\n",
+            "class PM(Base):\n",
+            "    def __init__(self) -> None:\n",
+            "        self.proxy: Url = Url()\n",
+            "    def connection_from_host(self, host: str | None, port: int | None = None, scheme: str | None = None) -> None:\n",
+            "        return super().from_host(self.proxy.host, self.proxy.port, self.proxy.scheme)\n",
+        ),
+        "fieldopt.py",
+    );
+    let i = out.find("connection_from_host").unwrap_or(0);
+    let body = &out[i..];
+    assert!(
+        body.contains("self . proxy () . host") || body.contains("self.proxy().host"),
+        "the Option field read must pass through unwrapped: {}",
+        out
+    );
+    assert!(
+        !body.contains("Some (self . proxy () . host)")
+            && !body.contains("Some(self.proxy().host)"),
+        "the Option field read must NOT double-wrap: {}",
+        out
+    );
+}
+
+#[test]
+fn a_self_option_field_compares_via_the_option_match() {
+    // Round 89: `self.length_remaining != 0` where the field is
+    // `int | None` — infer_type cannot see through self-fields, so the
+    // compare's Option-match trigger consults the FIELD TABLE for a
+    // `self.<field>` accessor: the Option unwraps to the inner i64 and
+    // the equality answers Python's None semantics (`None != 0` is True).
+    let out = compile(
+        concat!(
+            "class Conn:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.length_remaining: int | None = None\n",
+            "    def f(self) -> bool:\n",
+            "        return self.length_remaining != 0\n",
+        ),
+        "selfoptcmp.py",
+    );
+    assert!(
+        out.contains("match (self . length_remaining) . clone () { Some (__rython_v) => (__rython_v) . py_ne (& (0)) , None => true")
+            || out.contains("match(self.length_remaining).clone(){Some(__rython_v)=>(__rython_v).py_ne(&(0)),None=>true"),
+        "the self-field Option must unwrap to the inner comparison: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // §7's mapping-protocol slice: a user class's own `__getitem__`/
 // `__setitem__`/`__contains__` dunders receive the subscript store,

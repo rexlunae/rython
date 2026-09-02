@@ -3436,6 +3436,33 @@ pub(crate) fn expr_yields_option_ctx(
     {
         return true;
     }
+    // An OPTION-typed FIELD read on a class-resolved receiver
+    // (`self.proxy.host` — Url's `host` field is `str | None`, the
+    // proxy field resolves through the ProxyManager class table; round
+    // 89's `super().connection_from_host(self.proxy.host, ...)`): the
+    // field read yields the Option (the accessor returns it), so an
+    // Option-slot argument must pass it through — `Some(self.proxy().host)`
+    // would double it into `Option<Option<String>>`. The property arm
+    // above covers accessor METHODS; this arm covers plain FIELDS on any
+    // receiver (the self-field accessor-call arm above covers the
+    // `self._tunnel_host()` shape).
+    if let Some((class, class_symbols)) =
+        crate::receiver_class_for_read(&attr.value, ctx, symbols, options)
+        && class
+            .base_chain_with_options(&class_symbols, options)
+            .iter()
+            .any(|c| {
+                c.infer_fields(&class_symbols, options)
+                    .ok()
+                    .is_some_and(|fields| {
+                        fields.iter().any(|(n, t)| {
+                            *n == attr.attr && matches!(t, crate::TypeInfo::Option(_))
+                        })
+                    })
+            })
+    {
+        return true;
+    }
     let Some((class, class_symbols)) =
         crate::receiver_class(&attr.value, ctx, symbols, options)
         .or_else(|| {
