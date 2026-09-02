@@ -1160,6 +1160,31 @@ pub(crate) fn self_field_move_clone(
     Some(quote!((#tokens).clone()))
 }
 
+/// The reuse-clone decision for a move-prone expression: a NAME read
+/// more than once, or an ATTRIBUTE read whose NON-SELF receiver name is
+/// read more than once (`item.name` for the key and the value — the
+/// idiom corpus's `self.items[item.name] = item`). The attribute case
+/// walks to the base name; a `self` receiver has its own clone machinery
+/// (the accessor calls and self_field_read_clone) and is skipped here.
+pub(crate) fn reuse_root_name(expr: &ExprType) -> Option<String> {
+    match expr {
+        ExprType::Name(n) => Some(n.id.clone()),
+        ExprType::Attribute(a) => {
+            let mut cur = a.value.as_ref();
+            loop {
+                match cur {
+                    ExprType::Name(n) => {
+                        break if n.id == "self" { None } else { Some(n.id.clone()) };
+                    }
+                    ExprType::Attribute(a2) => cur = a2.value.as_ref(),
+                    _ => break None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Render an expression in a move-prone position (a call argument or a
 /// container element). Names that are read more than once in the enclosing
 /// function are cloned so Rust's move semantics do not consume them —
@@ -1174,8 +1199,8 @@ pub fn render_reused(
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
-    if let ExprType::Name(n) = expr {
-        let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
+    if let Some(root) = reuse_root_name(expr) {
+        let uses = options.use_counts.get(&root).copied().unwrap_or(0);
         if uses > 1 {
             let t = infer_type(expr, &options, &symbols);
             // Round 92: clone whenever the name is not statically Copy —
@@ -1221,10 +1246,27 @@ pub fn render_typed_reused(
     symbols: SymbolTableScopes,
     expected: Option<TypeInfo>,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // The pre-coercion render: render_typed may ADAPT the tokens
+    // (`.into()` / `.to_string()` / `as f64`) — a clone wrapped around an
+    // adapted form loses the adaptation's inference anchor
+    // (`((key).into()).clone()` — E0282: the Into target is
+    // unconstrained inside the clone, round 98). A clone only applies to
+    // an UN-adapted read; an adapted expression is a fresh value whose
+    // source-consumption is the pre-existing shape.
+    let raw = expr
+        .clone()
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
     let tokens = render_typed(expr, ctx, options.clone(), symbols.clone(), expected)?;
-    if let ExprType::Name(n) = expr {
-        let uses = options.use_counts.get(&n.id).copied().unwrap_or(0);
-        if uses > 1 {
+    let adapted = raw.to_string() != tokens.to_string();
+    // The ONE adaptation a clone cannot wrap is `.into()`: the Into
+    // target is unconstrained inside the clone (`((key).into()).clone()`
+    // — E0282, round 98). Every OTHER adaptation wraps fine — the
+    // round-92 boxing (`PyValue::from((x))` → the box is a fresh value)
+    // NEEDS the clone or the move returns.
+    let adapted_is_into = adapted && tokens.to_string().contains("into");
+    if let Some(root) = reuse_root_name(expr) {
+        let uses = options.use_counts.get(&root).copied().unwrap_or(0);
+        if uses > 1 && !adapted_is_into {
             let t = infer_type(expr, &options, &symbols);
             // See render_reused: clone whenever the name is not statically
             // Copy — INCLUDING inferrer-unknown (PyObject) names, whose

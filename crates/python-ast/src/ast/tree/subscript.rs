@@ -204,8 +204,11 @@ impl CodeGen for Subscript {
                 }
                 // Context-aware: indices are i64. `len(x)` yields usize and
                 // `xs[len(xs) - 1]` yields i64, so coerce usize → i64 here
-                // rather than depend on the runtime generic.
-                let index = crate::render_typed(
+                // rather than depend on the runtime generic. The
+                // reuse-aware renderer: an index read from a REUSED
+                // receiver's field moves the value out of the field (the
+                // reuse-clone keeps the receiver intact, round 98).
+                let index = crate::render_typed_reused(
                     &index,
                     ctx,
                     options,

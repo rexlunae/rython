@@ -1369,6 +1369,29 @@ everything else flat — 1036→1032). Idiom corpus: 13 → 9 errors on
 inventory. Pinned in codegen (a comprehension filter uses the if-
 statement truthiness authority).
 
+Round 98 (the reuse-clone reaches attribute reads; sum over a
+comprehension): three corpus shapes from inventory. `sum(item.qty for
+item in self.items.values())` — the generator collector ends its Vec
+with `.into_iter()`, so sum received an IntoIter with no PySum impl
+(E0277 ×2) — the runtime implements PySum for the numeric IntoIter
+forms (alloc-tier clean). `self.items[item.name] = item` — the dict
+takes the value BY OWNED VALUE while the key reads a field of the SAME
+object: the value clones when its root name is read again (the key read
+would borrow a moved value, E0382 ×2), with CPython's value-then-key
+evaluation order preserved (verified against python3). And the
+reuse-clone generally covers ATTRIBUTE reads on a reused non-self
+receiver (render_reused/render_typed_reused walked only plain names) —
+a clone cannot wrap an `.into()` adaptation (the Into target is
+unconstrained inside the clone, E0282), so that one adaptation skips
+the clone while the round-92 boxing keeps it.
+Sweep −1 (urllib3 789→788 — E0382 −1; everything else flat —
+1032→1031). Idiom corpus: 9 → 5 errors on inventory (the remaining
+five: a method call on an un-narrowed Option result, a moved `name`
+read in a raise format, a `?` mismatch, `Result: PyDisplay` inside an
+f-string, and `sorted` over (str, Item) — Item has no Ord). Pinned in
+codegen (a dict store of a reused instance clones value and key; sum
+over a generator comprehension lowers to the runtime sum).
+
 ## 6. Functions
 
 ### 6.1 Signatures

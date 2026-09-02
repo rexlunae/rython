@@ -1287,6 +1287,23 @@ macro_rules! pysum_numeric {
 // fallback would then contradict an i64 use context.
 pysum_numeric!(i64, f64);
 
+// A COMPREHENSION argument to sum() (`sum(item.qty for item in
+// self.items.values())` — the idiom corpus's total): the generator
+// collector ends its Vec with `.into_iter()`, so sum receives the
+// iterator, not the Vec. Same sum as the Vec forms (round 98).
+impl PySum for alloc::vec::IntoIter<i64> {
+    type Output = i64;
+    fn py_sum(self) -> i64 {
+        self.sum()
+    }
+}
+impl PySum for alloc::vec::IntoIter<f64> {
+    type Output = f64;
+    fn py_sum(self) -> f64 {
+        self.sum()
+    }
+}
+
 // Python sum() of a bool list counts the Trues (bool ⊂ int).
 impl PySum for Vec<bool> {
     type Output = i64;
