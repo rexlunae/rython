@@ -1,8 +1,8 @@
 {
   "converter_commit": "0769b2d",
-  "repo_head": "2bb1b5c",
-  "rypip_path": "/home/user/rython/target/debug/rypip",
-  "rypip_built": "2026-09-02T06:24:24+00:00",
+  "repo_head": "6d9cc9e",
+  "rypip_path": "target/debug/rypip",
+  "oracle": "CPython 3.11.15",
   "passed": 0,
   "total": 10,
   "passing": [],

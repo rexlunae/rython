@@ -34,8 +34,10 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timezone
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -55,10 +57,25 @@ PINNED_PYTHON = (3, 11)
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, cwd=cwd, timeout=timeout, text=True,
+    """Run one measured command in its own session, so a timeout kills the
+    whole process group -- cargo's rustc workers, a generated program's
+    children -- not just the direct child. Killing only the child would
+    leave workers hogging cores and holding the target-dir lock against the
+    programs measured after it, which defeats per-program isolation."""
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, text=True, start_new_session=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # the session leader's pgid is its pid
+        except ProcessLookupError:
+            pass
+        proc.communicate()  # reap; discard partial output
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def git_head() -> str:
