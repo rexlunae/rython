@@ -1246,6 +1246,20 @@ Sweep −4 (urllib3 830→826 — E0308 −3, E0507 −1; everything else flat �
 1081→1077). Pinned in codegen (a factory-local field store resolves the
 receiver class; Option field reads clone out of the shared receiver).
 
+Round 91 (base-chain Option field comparisons): the compare
+Option-match trigger handled the bare `self.<field>` shape, but a BASE-
+class field read through the embedded base struct (`self.__rython_base.
+_tunnel_scheme == "https"` — urllib3's HTTPSConnection tunnel checks,
+and the trait-base accessor twin `HTTPSConnectionTrait::base(self).
+_tunnel_scheme()`) has an Attribute receiver chain, not a bare `self` —
+the raw Option compared with the `&str` literal (E0308, the runtime
+PartialEq only compares Option with Option). The trigger now walks a
+`self.<chain>.<field>` receiver chain to confirm it roots at `self`, then
+looks the field up in EVERY class of the enclosing class's base chain,
+unwrapping to the inner comparison with Python's None-equality answers.
+Sweep −3 (urllib3 826→823, everything else flat — 1077→1074). Pinned in
+codegen (a base-chain Option field compares via the Option match).
+
 ## 6. Functions
 
 ### 6.1 Signatures
