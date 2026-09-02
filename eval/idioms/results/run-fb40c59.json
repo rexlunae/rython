@@ -1,0 +1,123 @@
+{
+  "rypip_commit": "c9cc59a",
+  "passed": 0,
+  "total": 10,
+  "passing": [],
+  "programs": {
+    "bank": {
+      "program": "bank",
+      "warnings": 3,
+      "status": "build-failed",
+      "errors": 13,
+      "histogram": {
+        "E0308": 8,
+        "E0425": 2,
+        "E0599": 1,
+        "E0277": 1,
+        "E0382": 1
+      }
+    },
+    "inventory": {
+      "program": "inventory",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 13,
+      "histogram": {
+        "E0609": 4,
+        "E0277": 4,
+        "E0382": 2,
+        "E0308": 1,
+        "E0599": 1,
+        "E0600": 1
+      }
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0277": 3,
+        "E0425": 2,
+        "E0061": 1
+      }
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 12,
+      "status": "build-failed",
+      "errors": 7,
+      "histogram": {
+        "E0277": 4,
+        "E0618": 1,
+        "E0282": 1,
+        "E0308": 1
+      }
+    },
+    "records": {
+      "program": "records",
+      "warnings": 4,
+      "status": "build-failed",
+      "errors": 16,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 4,
+        "E0599": 3,
+        "E0615": 3,
+        "E0369": 1
+      }
+    },
+    "schedule": {
+      "program": "schedule",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 15,
+      "histogram": {
+        "E0277": 7,
+        "E0308": 5,
+        "E0599": 2,
+        "E0369": 1
+      }
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 3,
+      "histogram": {
+        "E0308": 2,
+        "E0277": 1
+      }
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 9,
+      "histogram": {
+        "E0599": 4,
+        "E0308": 3,
+        "E0277": 2
+      }
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0308": 5,
+        "E0599": 1
+      }
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 1,
+      "histogram": {
+        "E0072": 1
+      }
+    }
+  }
+}
