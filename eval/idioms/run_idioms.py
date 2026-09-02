@@ -72,6 +72,34 @@ def converter_commit() -> str:
     return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else "unknown"
 
 
+def converter_sources_newest() -> float:
+    """mtime of the newest tracked file under the converter crates."""
+    p = run(["git", "ls-files", "-z", "--",
+             "crates/python-ast", "crates/rypip", "crates/stdpython"], cwd=REPO)
+    newest = 0.0
+    for rel in p.stdout.split("\0"):
+        if rel:
+            try:
+                newest = max(newest, (REPO / rel).stat().st_mtime)
+            except FileNotFoundError:
+                pass
+    return newest
+
+
+def stale_binary(rypip: Path) -> str | None:
+    """A result file is named by the converter's source commit, which is
+    only true of a binary built AFTER the last source change. Refuse to
+    measure with one that was not -- the trap the sweep README records as
+    having cost rounds -- rather than infer provenance and hope."""
+    built = rypip.stat().st_mtime
+    newest = converter_sources_newest()
+    if newest > built:
+        fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")
+        return (f"{rypip} was built at {fmt(built)} but converter source changed at "
+                f"{fmt(newest)}: rebuild it (cargo build -p python-ast -p rypip) or pass --allow-stale")
+    return None
+
+
 def error_histogram(log: str) -> dict[str, int]:
     hist: dict[str, int] = {}
     for m in ERROR_HEADER.finditer(log):
@@ -187,11 +215,17 @@ def main() -> int:
                     help="exit 1 if a program listed in baseline.json no longer passes")
     ap.add_argument("--update-baseline", action="store_true",
                     help="rewrite baseline.json with the programs that pass now")
+    ap.add_argument("--allow-stale", action="store_true",
+                    help="measure with a rypip older than the converter source (the result file will be misnamed)")
     args = ap.parse_args()
 
     rypip = Path(args.rypip)
     if not rypip.is_file():
         print(f"rypip not found at {rypip}; run `cargo build -p python-ast -p rypip` first", file=sys.stderr)
+        return 2
+    stale = stale_binary(rypip)
+    if stale and not args.allow_stale:
+        print(f"stale converter: {stale}", file=sys.stderr)
         return 2
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)

@@ -29,9 +29,11 @@ python3 eval/sweep/run_sweep.py --with-idioms         # embed the pass count in 
 
 A result file is named by the **converter's source commit** (the last
 commit touching `crates/python-ast`, `crates/rypip`, or `crates/stdpython`),
-which is what `target/debug/rypip` was built from provided it was rebuilt;
-the payload also records `repo_head` and the binary's build time so a
-mismatch is visible rather than silent. A branch that only edits `eval/`
+which is what `target/debug/rypip` was built from — and the runner
+**refuses a binary older than the newest converter source file** (pass
+`--allow-stale` to override), so the name is trustworthy because the run
+could not otherwise have happened. The payload also records `repo_head`
+and the binary's build time. A branch that only edits `eval/`
 therefore measures, and is named by, the same converter as its merge-base.
 
 Per-program status is one of `convert-failed`, `build-failed` (with the
