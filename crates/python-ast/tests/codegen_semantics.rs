@@ -14491,6 +14491,37 @@ fn a_cast_assigned_option_field_local_unwraps_and_clones_on_read() {
     );
 }
 
+#[test]
+fn a_boxed_static_promoted_from_a_scalar_initializer_wraps() {
+    // Round 96: `_FAILEDTELL: Final[_TYPE_FAILEDTELL] =
+    // _TYPE_FAILEDTELL.token` — an Enum sentinel member (an i64 const)
+    // promoted to a boxed LazyLock static — the inferred-type promotion
+    // path rendered the initializer RAW against LazyLock<PyValue>
+    // (E0308). A boxed-typed static now wraps its initializer in
+    // PyValue::from, matching the unknown-type path.
+    let out = compile(
+        concat!(
+            "from enum import Enum\n",
+            "from typing import Final\n",
+            "\n",
+            "class _TYPE_FAILEDTELL(Enum):\n",
+            "    token = 0\n",
+            "\n",
+            "def use() -> int:\n",
+            "    return 1 if _FAILEDTELL is _TYPE_FAILEDTELL.token else 0\n",
+            "\n",
+            "_FAILEDTELL: Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token\n",
+        ),
+        "enumstatic.py",
+    );
+    assert!(
+        out.contains("LazyLock < stdpython :: PyValue > = std :: sync :: LazyLock :: new (|| stdpython :: PyValue :: from")
+            || out.contains("LazyLock<stdpython::PyValue>=std::sync::LazyLock::new(||stdpython::PyValue::from"),
+        "the boxed static must wrap its scalar initializer: {}",
+        out
+    );
+}
+
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

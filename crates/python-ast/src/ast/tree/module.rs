@@ -1418,7 +1418,12 @@ impl CodeGen for Module {
                                 // infers Vec<&'static str>, mismatching
                                 // Vec<String> — force each element to own
                                 // (round 78).
-                                let wrapped = if ty.to_string().contains("Vec < String >")
+                                let ty_s = ty.to_string();
+                                let ty_is_boxed = ty_s
+                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                    .filter(|t| !t.is_empty())
+                                    .eq(["stdpython", "PyValue"].iter().copied());
+                                let wrapped = if ty_s.contains("Vec < String >")
                                     && matches!(&a.value, crate::ExprType::List(_))
                                 {
                                     let mut st_opt = options.clone();
@@ -1430,6 +1435,16 @@ impl CodeGen for Module {
                                         st_opt,
                                         symbols.clone(),
                                     )?
+                                } else if ty_is_boxed {
+                                    // A BOXED static whose inferred type is
+                                    // the boxed PyValue but whose initializer
+                                    // is a PLAIN value (`_FAILEDTELL:
+                                    // Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token`
+                                    // — an Enum sentinel member, i64 —
+                                    // urllib3's util/request): wrap like the
+                                    // unknown-type path below — the closure
+                                    // must produce the PyValue (round 96).
+                                    quote!(stdpython::PyValue::from(#value_tokens))
                                 } else {
                                     value_tokens.clone()
                                 };

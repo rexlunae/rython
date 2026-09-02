@@ -1332,6 +1332,21 @@ Sweep −8 (urllib3 801→793 — E0609 −9, E0507 +1; everything else flat —
 1046→1038). Pinned in codegen (a cast-assigned Option field local
 unwraps and clones on read).
 
+Round 96 (boxed statics promoted from scalar initializers): a module
+binding whose static type resolves but whose initializer is a PLAIN
+value (`_FAILEDTELL: Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token` —
+an Enum sentinel member, an i64 associated const — urllib3's
+util/request and util/timeout) went through the inferred-type static
+promotion path, which emitted the initializer RAW against a
+`LazyLock<PyValue>` (E0308 — the boxed value was only wrapped on the
+unknown-type path). A static whose resolved type is EXACTLY the boxed
+PyValue now wraps its initializer in `PyValue::from` (a `PyDict<String,
+PyValue>` typed static keeps its literal unwrapped — the wrap check is
+token-exact, not a substring).
+Sweep −2 (urllib3 793→791 — E0308 −2; everything else flat —
+1038→1036). Pinned in codegen (a boxed static promoted from a scalar
+initializer wraps).
+
 ## 6. Functions
 
 ### 6.1 Signatures
