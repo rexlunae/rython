@@ -809,6 +809,18 @@ fn iterator_builtin_type(
         // sorted/filter preserve the element type; the iterable is the
         // last positional argument (`sorted(xs)`, `filter(pred, xs)`).
         "sorted" => Some(TypeInfo::Vec(Box::new(elem_of(call.args.first()?)?))),
+        // `enumerate(xs)` materializes (int, elem) pairs — the runtime
+        // enumerate is Vec<T> -> Vec<(i64, T)> (round 99: the idiom
+        // corpus's `for (i, (name, item)) in enumerate(...)` — the
+        // nested destructure binds the element types, so the loop-body
+        // method calls resolve their receiver's class).
+        "enumerate" => {
+            let elem = elem_of(call.args.first()?)?;
+            Some(TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![
+                TypeInfo::Int,
+                elem,
+            ]))))
+        }
         "filter" | "list" | "reversed" => {
             Some(TypeInfo::Vec(Box::new(elem_of(call.args.last()?)?)))
         }
@@ -2282,6 +2294,17 @@ fn analyze_statement_types(
         StatementType::For(s) => {
             count_expr_reads(&s.iter, info);
             count_target_reads(&s.target, info);
+            // Seed the loop-target types from the iterable's element type
+            // (`for (i, (name, item)) in enumerate(sorted(self.items.items()))`
+            // — the idiom corpus's report: the element (int, (str, Item))
+            // types the nested destructure, so the loop-body method calls
+            // resolve their receiver's class — round 99).
+            if let (Some(options), Some(symbols)) = (options, symbols) {
+                let iter_ty = infer_type(&s.iter, options, symbols);
+                if let Some(elem) = iterable_element_type(&iter_ty) {
+                    seed_target_types(&s.target, &elem, info);
+                }
+            }
             for b in &s.body {
                 analyze_statement_types(b, info, options, symbols);
             }
@@ -3466,6 +3489,26 @@ fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
         TypeInfo::Bytes
     } else {
         TypeInfo::PyObject
+    }
+}
+
+/// Seed the loop-target types from the iterable's element type: a Name
+/// target binds the element; a (nested) TUPLE target binds each element
+/// name from the matching pair (`for (i, (name, item)) in enumerate(...)`
+/// — round 99). `or_insert`: an earlier store or annotation wins.
+fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
+    match target {
+        ExprType::Name(n) => {
+            info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
+        }
+        ExprType::Tuple(t) => {
+            if let TypeInfo::Tuple(ts) = ty {
+                for (elt, ety) in t.elts.iter().zip(ts.iter()) {
+                    seed_target_types(elt, ety, info);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
