@@ -1746,7 +1746,44 @@ pub fn analyze_function_types_with_class(
                     info.name_types.get(&n.id),
                     Some(crate::TypeInfo::Option(_))
                 );
-                match &a.value {
+                // A `typing.cast(T, value)` assignment (`proxy_config =
+                // typing.cast(ProxyConfig, self.proxy_config)` — urllib3's
+                // _connect_tls_proxy): the cast is a runtime identity, so
+                // the VALUE's shape seeds the local exactly like the
+                // direct form (round 95 — without it the cast-assigned
+                // local stayed unknown and the Option-field reads on it
+                // never unwrapped, E0609).
+                let cast_value = match &a.value {
+                    crate::ExprType::Call(call)
+                        if call.args.len() == 2
+                            && (matches!(
+                                call.func.as_ref(),
+                                crate::ExprType::Name(n)
+                                    if n.id == "cast"
+                                        && matches!(
+                                            symbols.get(&n.id),
+                                            Some(crate::SymbolTableNode::ImportFrom(i))
+                                                if crate::AnnotationModule::from_name(
+                                                    i.module.split('.').next().unwrap_or("")
+                                                ) == Some(crate::AnnotationModule::Typing)
+                                        )
+                            ) || matches!(
+                                call.func.as_ref(),
+                                crate::ExprType::Attribute(attr)
+                                    if attr.attr == "cast"
+                                        && matches!(
+                                            attr.value.as_ref(),
+                                            crate::ExprType::Name(m)
+                                                if crate::is_typing(&m.id)
+                                        )
+                            )) =>
+                    {
+                        Some(&call.args[1])
+                    }
+                    _ => None,
+                };
+                let value_ref = cast_value.unwrap_or(&a.value);
+                match value_ref {
                     // `request_context = self._merge_pool_kwargs(
                     // pool_kwargs)` — a local assigned from a SELF-METHOD
                     // CALL whose callee returns a dict (`-> dict[str,
@@ -1858,10 +1895,15 @@ pub fn analyze_function_types_with_class(
                             && matches!(ty, crate::TypeInfo::Option(_))
                             && !already_option
                         {
-                            info.name_types.insert(
-                                n.id.clone(),
-                                crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)),
-                            );
+                            // The REAL field type (`Option<ProxyConfig>` —
+                            // the `proxy_config = cast(ProxyConfig,
+                            // self.proxy_config)` local, whose reads must
+                            // resolve the inner class's fields) — not the
+                            // unknown placeholder: the local IS the field's
+                            // Option, and an Option<Class> inner lets the
+                            // receiver resolution and the Option-slot
+                            // coercions see through it (round 95).
+                            info.name_types.insert(n.id.clone(), ty);
                         }
                         // Round 87: a PROPERTY read on a class-resolved
                         // receiver (`read_timeout = timeout_obj.read_timeout`
