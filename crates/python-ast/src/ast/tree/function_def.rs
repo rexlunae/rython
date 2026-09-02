@@ -3842,7 +3842,19 @@ pub(crate) fn lower_optional_value(
     // family). The ctx-aware predicate resolves the receiver's class
     // (self fields, typed params, factory-assigned locals).
     if crate::expr_yields_option_ctx(expr, &ctx, &options, &symbols) {
-        return expr.clone().to_rust(ctx, options, symbols);
+        let tokens = expr.clone().to_rust(ctx.clone(), options, symbols)?;
+        // The pass-through MOVES the Option out of the receiver: a
+        // `self.<field>` read borrows `&self` (E0507 — `headers =
+        // self.headers` where the field is Option<IndexMap>, urllib3's
+        // _request_methods), and a field read on a composed receiver
+        // (`self.proxy.host` — the ProxyManager super call, round 90)
+        // borrows the composed object the same way. Clone the value out —
+        // the Python object is shared by reference, so the clone is the
+        // faithful copy.
+        if matches!(expr, ExprType::Attribute(_)) {
+            return Ok(quote!((#tokens).clone()));
+        }
+        return Ok(tokens);
     }
     let tokens = expr.clone().to_rust(ctx, options, symbols)?;
     // A string LITERAL lowers to `&'static str`; an Option<String> slot

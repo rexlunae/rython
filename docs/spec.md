@@ -1227,6 +1227,25 @@ Sweep −10 (urllib3 839→830, charset 176→175, idna/certifi/requests flat �
 Option match; an Option field read passes through an Option slot without
 double-wrapping).
 
+Round 90 (factory-local field stores and the Option pass-through clone):
+`field_class` — the class resolver for `self.<field>` receivers — only
+named the field's class when the __init__ store came from an annotated
+PARAMETER; a LOCAL store (`proxy = parse_url(...); self.proxy = proxy` —
+urllib3's ProxyManager.__init__) returned None, so `self.proxy.host`
+never resolved its receiver's class and the round-89 Option-field reads
+still double-wrapped. The Name arm now resolves a local through its
+single factory-CALL assignment's return annotation (same-module and
+imported factories). And the Option-slot pass-through (`lower_optional_value`)
+rendered an Option-typed FIELD read bare, MOVING it out of the shared
+receiver (`headers = self.headers` where the field is Option<IndexMap> —
+urllib3's _request_methods; `self.proxy.host` in the ProxyManager super
+call) — E0507. The pass-through now CLONES attribute reads
+(`(self.headers).clone()` — the Python object is shared by reference, so
+the clone is the faithful copy).
+Sweep −4 (urllib3 830→826 — E0308 −3, E0507 −1; everything else flat —
+1081→1077). Pinned in codegen (a factory-local field store resolves the
+receiver class; Option field reads clone out of the shared receiver).
+
 ## 6. Functions
 
 ### 6.1 Signatures

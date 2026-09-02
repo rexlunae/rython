@@ -952,8 +952,8 @@ impl ClassDef {
             .or_else(|| stores.iter().find(|s| s.attr == attr))?;
         let class_name = match store.value {
             ExprType::Call(call) => match call.func.as_ref() {
-                ExprType::Name(n) => n.id.clone(),
-                _ => return None,
+                ExprType::Name(n) => Some(n.id.clone()),
+                _ => None,
             },
             ExprType::Name(n) => {
                 let param = init
@@ -962,29 +962,97 @@ impl ClassDef {
                     .iter()
                     .chain(init.args.args.iter())
                     .chain(init.args.kwonlyargs.iter())
-                    .find(|p| p.arg == n.id)?;
-                match param.annotation.as_deref() {
-                    Some(ExprType::Name(ann)) => ann.id.clone(),
-                    // An OPTIONAL class annotation (`headers:
-                    // HTTPHeaderDict | None` — HTTPResponse): the class is
-                    // the non-None side of the union.
-                    Some(ExprType::BinOp(b)) if crate::is_none_expr(&b.left) => {
-                        match b.right.as_ref() {
-                            ExprType::Name(ann) => ann.id.clone(),
+                    .find(|p| p.arg == n.id);
+                // A store from a PARAM (`self.proxy = proxy` where proxy
+                // is an annotated __init__ parameter): the annotation names
+                // the class (or the non-None side of a `T | None` union).
+                let class_name = match param {
+                    Some(param) => match param.annotation.as_deref() {
+                        Some(ExprType::Name(ann)) => Some(ann.id.clone()),
+                        // An OPTIONAL class annotation (`headers:
+                        // HTTPHeaderDict | None` — HTTPResponse): the class is
+                        // the non-None side of the union.
+                        Some(ExprType::BinOp(b)) if crate::is_none_expr(&b.left) => {
+                            match b.right.as_ref() {
+                                ExprType::Name(ann) => Some(ann.id.clone()),
+                                _ => None,
+                            }
+                        }
+                        Some(ExprType::BinOp(b)) if crate::is_none_expr(&b.right) => {
+                            match b.left.as_ref() {
+                                ExprType::Name(ann) => Some(ann.id.clone()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    },
+                    // A store from a LOCAL (`proxy = parse_url(...);
+                    // self.proxy = proxy` — urllib3's ProxyManager.__init__,
+                    // where the factory local is later field-stored): the
+                    // local's single assignment is a factory CALL whose
+                    // return annotation names the class (round 90 — without
+                    // it the `self.proxy` receiver never resolves and the
+                    // Option-field reads double-wrap).
+                    None => init.body.iter().find_map(|s| {
+                        let crate::StatementType::Assign(a) = &s.statement else {
+                            return None;
+                        };
+                        let [crate::ExprType::Name(tn)] = a.targets.as_slice() else {
+                            return None;
+                        };
+                        if tn.id != n.id {
+                            return None;
+                        }
+                        let crate::ExprType::Call(call) = &a.value else {
+                            return None;
+                        };
+                        let crate::ExprType::Name(callee) = call.func.as_ref() else {
+                            return None;
+                        };
+                        let f = match symbols.get(&callee.id) {
+                            Some(crate::SymbolTableNode::FunctionDef(f)) => f.clone(),
+                            // An IMPORTED factory (`parse_url` from
+                            // .util.url): resolve the FunctionDef through
+                            // its defining module.
+                            Some(crate::SymbolTableNode::ImportFrom(i)) => {
+                                let path = i.resolved_module_path(options);
+                                if !options.module_defs.contains_key(&path) {
+                                    return None;
+                                }
+                                crate::module_function_def(options, &path, &callee.id)
+                                    .map(|(f, _)| f)?
+                            }
                             _ => return None,
+                        };
+                        match f.returns.as_deref() {
+                            Some(ExprType::Name(ann)) => Some(ann.id.clone()),
+                            _ => None,
+                        }
+                    }),
+                };
+                let Some(class_name) = class_name else {
+                    return None;
+                };
+                match symbols.get(&class_name) {
+                    Some(SymbolTableNode::ClassDef(_)) => Some(class_name),
+                    // An IMPORTED class field (`self.headers = HTTPHeaderDict(
+                    // headers)` where HTTPHeaderDict comes from
+                    // `from ._collections import HTTPHeaderDict` — urllib3's
+                    // HTTPResponse): resolve through the defining module.
+                    Some(SymbolTableNode::ImportFrom(_)) => {
+                        if crate::resolve_class_referenced(&class_name, symbols, options).is_some()
+                        {
+                            Some(class_name)
+                        } else {
+                            None
                         }
                     }
-                    Some(ExprType::BinOp(b)) if crate::is_none_expr(&b.right) => {
-                        match b.left.as_ref() {
-                            ExprType::Name(ann) => ann.id.clone(),
-                            _ => return None,
-                        }
-                    }
-                    _ => return None,
+                    _ => None,
                 }
             }
             _ => return None,
         };
+        let class_name = class_name?;
         match symbols.get(&class_name) {
             Some(SymbolTableNode::ClassDef(_)) => Some(class_name),
             // An IMPORTED class field (`self.headers = HTTPHeaderDict(
