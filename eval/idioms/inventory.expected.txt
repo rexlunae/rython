@@ -1,8 +1,0 @@
-1. bolt: 15
-2. milk [7d]: 2
-17
-error: only 2 milk left
-no cheese
-12 BOLT
-14
-a-b-c 3
