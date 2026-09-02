@@ -5393,6 +5393,27 @@ impl<'a> CodeGen for Call {
                         {
                             return Ok(quote!(()));
                         }
+                        // Round 88: `super().__init__(args)` against an
+                        // UNMODELED base (urllib3's `_HTTPConnection`
+                        // inherits `http.client.HTTPConnection` — an
+                        // external class whose constructor would set up
+                        // the socket rython cannot model) must NOT fall to
+                        // the self-call below: that renders a
+                        // SELF-RECURSIVE `self.__init__(raw args)` call
+                        // against the class's OWN 8-parameter signature
+                        // with 5 args (E0061). The external constructor is
+                        // unmodeled — a no-op with the definition warning,
+                        // the same documented divergence as the
+                        // base-method-unmodeled path below.
+                        if attr.attr == "__init__" {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "super().__init__(...) in `{}` is dropped: the base's \
+                                 constructor is unmodeled (an external or \
+                                 non-structural base)",
+                                class.name
+                            ));
+                            return Ok(quote!(stdpython::PyValue::None_));
+                        }
                         let mut args = Vec::new();
                         for arg in &self.args {
                             args.push(arg.clone().to_rust(
@@ -5883,6 +5904,20 @@ impl<'a> CodeGen for Call {
                             )
                     ))
             );
+            // The receiver's (k, v) pair for dict methods whose ARGUMENT
+            // must match the element types (`dict.update(other)` — the
+            // stdpython PyDictOps method takes the other dict by value):
+            // the pair comes from the dict (or Option-wrapped dict) type
+            // the receiver's name holds (round 88).
+            let dict_receiver_kv: Option<(crate::TypeInfo, crate::TypeInfo)> =
+                match crate::infer_type(&attr.value, &options, &symbols) {
+                    crate::TypeInfo::Dict(k, v) => Some(((*k).clone(), (*v).clone())),
+                    crate::TypeInfo::Option(inner) => match &*inner {
+                        crate::TypeInfo::Dict(k, v) => Some(((**k).clone(), (**v).clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
 
             // list.sort(): in-place, stable, with Python's keyword-only
             // key=/reverse=. Vec's inherent sort demands a total order
@@ -6909,6 +6944,30 @@ impl<'a> CodeGen for Call {
                     // Views materialize as Vecs in insertion order.
                     ("keys", []) => {
                         return Ok(quote!((#receiver).py_keys()));
+                    }
+                    // dict.update(other) — the stdpython PyDictOps method
+                    // takes the other dict BY VALUE (`other: PyDict<K, V>`),
+                    // and an OPTION-typed argument (`headers.update(
+                    // self.proxy_headers)` — a `Mapping[str, str] | None`
+                    // field, urllib3's urlopen/_make_request) must coerce
+                    // via the round-83 Option→concrete match: Python's
+                    // update(None) is a TypeError, and the loud panic is
+                    // the honest model (round 88).
+                    ("update", [other]) => {
+                        if let Some((k, v)) = dict_receiver_kv.clone() {
+                            let arg = crate::render_typed(
+                                &self.args[0],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::Dict(
+                                    Box::new(k),
+                                    Box::new(v),
+                                )),
+                            )?;
+                            return Ok(quote!((#receiver).update(#arg)));
+                        }
+                        return Ok(quote!((#receiver).update(#other)));
                     }
                     ("values", []) => {
                         return Ok(quote!((#receiver).py_values()));

@@ -1184,6 +1184,20 @@ pub fn render_reused(
             // call while still being used).
             let inferred_param = options.param_type_vars.contains_key(&n.id);
             if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
+                // A CLASS-typed name (a local holding an instance —
+                // `timeout_obj` from `self._get_timeout()`): the bare
+                // `(#tokens).clone()` would resolve to the class's OWN
+                // `clone` method when it defines one (urllib3's Timeout
+                // does) — a REAL semantic call, where Python just re-reads
+                // the variable. The reuse-clone is rython's ownership
+                // artifact and must be Rust std Clone, invoked through the
+                // trait so the inherent method cannot shadow it —
+                // `Clone::clone(&x)` never names the concrete type, so a
+                // TYPE_CHECKING-only class stub (rendering as PyValue)
+                // stays valid (round 88).
+                if matches!(t, TypeInfo::Class(_)) {
+                    return Ok(quote!(Clone::clone(&(#tokens))));
+                }
                 return Ok(quote!((#tokens).clone()));
             }
         }
@@ -1208,9 +1222,17 @@ pub fn render_typed_reused(
             let t = infer_type(expr, &options, &symbols);
             // See render_reused: an inferred parameter is not statically
             // Copy, so clone it at the call site (its `T: Clone` bound is
-            // the reuse-clone rule's).
+            // the reuse-clone rule's). A CLASS-typed name's reuse-clone
+            // must be the qualified std Clone — never the class's own
+            // `clone` method (round 88).
             let inferred_param = options.param_type_vars.contains_key(&n.id);
             if !t.is_copy() && (!matches!(t, TypeInfo::PyObject) || inferred_param) {
+                // See render_reused: a CLASS-typed name's reuse-clone must
+                // be the trait-qualified std Clone (`Clone::clone(&x)`),
+                // never the class's own `clone` method (round 88).
+                if matches!(t, TypeInfo::Class(_)) {
+                    return Ok(quote!(Clone::clone(&(#tokens))));
+                }
                 return Ok(quote!((#tokens).clone()));
             }
         }
