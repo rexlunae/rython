@@ -14611,6 +14611,42 @@ fn sum_over_a_generator_comprehension_sums_the_collected_list() {
     );
 }
 
+#[test]
+fn mutation_through_a_fetched_copy_is_a_loud_error() {
+    // Issue #137, Directive 4 (decision: loud until borrowed accessors
+    // land): `item = self.find(name)` then `item.qty -= qty` — the local
+    // holds a COPY of the container-stored object, so the mutation would
+    // be lost (CPython's reaches the stored object through the
+    // reference). The conversion names the construct and the rewrite.
+    let err = compile_err(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def find(self, name: str) -> Item | None:\n",
+            "        return self.items.get(name)\n",
+            "    def take(self, name: str, qty: int) -> int:\n",
+            "        item = self.find(name)\n",
+            "        if item is None:\n",
+            "            raise KeyError(name)\n",
+            "        item.qty -= qty\n",
+            "        return item.qty\n",
+        ),
+        "aliasmut.py",
+    );
+    assert!(
+        err.contains("mutating `item.qty` is not supported yet")
+            && err.contains("holds a copy of a container-stored object")
+            && err.contains("mutate through the container"),
+        "the aliasing refusal must name the construct and the rewrite: {}",
+        err
+    );
+}
+
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

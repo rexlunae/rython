@@ -75,6 +75,33 @@ impl CodeGen for AugAssign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // Issue #137's Directive 4: a mutation through a local holding a
+        // COPY of a container-stored object (`item = self.find(name)`,
+        // then `item.qty -= qty`) applies to the copy and is LOST —
+        // CPython's mutation reaches the stored object through the
+        // reference. The borrowed-accessor lowering is not built yet;
+        // until it lands the shape is a loud conversion error, never
+        // silently different (the idiom corpus's take() asserts the
+        // mutation IS observable).
+        if let ExprType::Attribute(attr) = &self.target
+            && let ExprType::Name(n) = attr.value.as_ref()
+            && let Some(crate::TypeInfo::Option(inner)) = options.name_types.get(&n.id)
+            && matches!(**inner, crate::TypeInfo::Class(_))
+        {
+            return Err(format!(
+                "mutating `{}.{}` is not supported yet: `{}` holds a copy of a \
+                 container-stored object (fetched with `{} = ...`), so the mutation \
+                 would apply to the copy and be lost; rython refuses to silently \
+                 ignore it — mutate through the container \
+                 (`self.items[name].{} -= ...`) or restructure",
+                n.id,
+                attr.attr,
+                n.id,
+                n.id,
+                attr.attr
+            )
+            .into());
+        }
         // Issue #115: a compound assignment to a `global`-declared name
         // whose module binding is a MUTABLE static is a read-modify-write
         // through the static's helpers: load the global, evaluate the
