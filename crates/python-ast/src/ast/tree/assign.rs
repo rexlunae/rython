@@ -1227,6 +1227,19 @@ impl<'a> CodeGen for Assign {
             };
             match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
+                    // The dict takes the value BY OWNED VALUE; Python's dict
+                    // holds a reference. A value whose ROOT name is read
+                    // again (the key reads a field of the same object —
+                    // `self.items[item.name] = item` — the idiom corpus's
+                    // add()) must be CLONED, or the key read borrows a
+                    // moved value (E0382, round 98). The clone lands on
+                    // the RAW value, before any boxing.
+                    let value = match crate::type_ctx::reuse_root_name(&value_expr)
+                        .and_then(|r| options.use_counts.get(&r).copied())
+                    {
+                        Some(uses) if uses > 1 => quote!(Clone::clone(&(#value))),
+                        _ => value,
+                    };
                     // A user-class receiver that defines `__setitem__`
                     // routes the store to ITS method — Python's behavior
                     // (the class's own key semantics and exceptions;

@@ -14545,6 +14545,72 @@ fn a_comprehension_filter_uses_the_if_statement_truthiness_authority() {
     );
 }
 
+#[test]
+fn a_dict_store_of_a_reused_instance_clones_value_and_key() {
+    // Round 98: `self.items[item.name] = item` — the dict takes the
+    // value BY OWNED VALUE while the key reads a field of the same
+    // object: the value clones (the key read would borrow a moved
+    // value), and the key itself clones (a reused non-self receiver's
+    // field read moves the String out of the receiver). CPython
+    // evaluates the value first, then the key — the emitted order
+    // matches.
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self, name: str) -> None:\n",
+            "        self.name = name\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def add(self, item: Item) -> None:\n",
+            "        if item.name in self.items:\n",
+            "            self.items[item.name].qty += 1\n",
+            "        else:\n",
+            "            self.items[item.name] = item\n",
+        ),
+        "dictstoreitem.py",
+    );
+    assert!(
+        out.contains("let __rython_val = Clone :: clone (& (item)) ;")
+            || out.contains("let __rython_val=Clone::clone(&(item));"),
+        "the dict-store value must clone the reused instance: {}",
+        out
+    );
+    // The key reads `item.name` AFTER the value binding — which is a
+    // CLONE, so the receiver is intact and the plain read compiles.
+    assert!(
+        out.contains("py_set_index (item . name , __rython_val)")
+            || out.contains("py_set_index(item.name,__rython_val)"),
+        "the key reads the intact receiver (the value was cloned): {}",
+        out
+    );
+}
+
+#[test]
+fn sum_over_a_generator_comprehension_sums_the_collected_list() {
+    // Round 98: `sum(item.qty for item in self.items.values())` — the
+    // generator collector ends its Vec with `.into_iter()`, so sum
+    // received an IntoIter with no PySum impl (E0277 in the idiom
+    // corpus's total). The runtime implements PySum for the numeric
+    // IntoIter forms.
+    let out = compile(
+        concat!(
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, int] = {}\n",
+            "    def total(self) -> int:\n",
+            "        return sum(item for item in self.items.values())\n",
+        ),
+        "sumcomp.py",
+    );
+    assert!(
+        out.contains("sum ({") || out.contains("sum({"),
+        "the sum over a comprehension must lower to the runtime sum: {}",
+        out
+    );
+}
+
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions
