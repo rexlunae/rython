@@ -14273,6 +14273,53 @@ fn a_self_option_field_compares_via_the_option_match() {
     );
 }
 
+#[test]
+fn a_factory_local_stored_into_a_field_resolves_the_receiver_class() {
+    // Round 90: `proxy = parse_url(...); self.proxy = proxy` (urllib3's
+    // ProxyManager.__init__) — field_class's param-only Name arm could not
+    // name the field's class, so `self.proxy.host` never resolved its
+    // receiver and the Option field reads double-wrapped
+    // `Some(self.proxy().host)`. The arm now resolves a LOCAL store
+    // through the factory call's return annotation.
+    let out = compile(
+        concat!(
+            "class Url:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.host: str | None = None\n",
+            "        self.port: int | None = None\n",
+            "        self.scheme: str | None = None\n",
+            "\n",
+            "def parse_url(u: str) -> Url:\n",
+            "    return Url()\n",
+            "\n",
+            "class Base:\n",
+            "    def from_host(self, host: str | None, port: int | None = None, scheme: str | None = None) -> None:\n",
+            "        pass\n",
+            "\n",
+            "class PM(Base):\n",
+            "    def __init__(self) -> None:\n",
+            "        proxy = parse_url(\"x\")\n",
+            "        self.proxy = proxy\n",
+            "    def connection_from_host(self, host: str | None, port: int | None = None, scheme: str | None = None) -> None:\n",
+            "        return super().from_host(self.proxy.host, self.proxy.port, self.proxy.scheme)\n",
+        ),
+        "fieldloc.py",
+    );
+    let i = out.find("connection_from_host").unwrap_or(0);
+    let body = &out[i..];
+    assert!(
+        body.contains("self . proxy () . host") || body.contains("self.proxy().host"),
+        "the factory-local field read must pass through unwrapped: {}",
+        out
+    );
+    assert!(
+        !body.contains("Some (self . proxy () . host)")
+            && !body.contains("Some(self.proxy().host)"),
+        "the factory-local field read must NOT double-wrap: {}",
+        out
+    );
+}
+
 // ---------------------------------------------------------------------
 // §7's mapping-protocol slice: a user class's own `__getitem__`/
 // `__setitem__`/`__contains__` dunders receive the subscript store,
