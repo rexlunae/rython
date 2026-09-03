@@ -22,6 +22,7 @@
 //! makes). Exception classes and Protocols never take part: they lower to
 //! marker structs with no trait machinery.
 
+use crate::SymbolTableScopes;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{ClassDef, ExprType, PythonOptions};
@@ -53,6 +54,28 @@ thread_local! {
 /// Whether `name` is a polymorphic root of the conversion in progress.
 pub fn is_polymorphic_root(name: &str) -> bool {
     ROOTS.with(|r| r.borrow().contains_key(name))
+}
+
+/// A polymorphic root's class definition with its defining module's
+/// symbols, from the registry: the root's variant carries its module
+/// path (`None` = the module being converted, where `symbols` has it).
+/// The read path uses this when the receiver's class is not otherwise
+/// resolvable in the current scope (a `TYPE_CHECKING`-only import of the
+/// root — urllib3's retry.py reads `response.status` on a
+/// `BaseHTTPResponse | None`).
+pub fn root_class_def(
+    root: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(ClassDef, SymbolTableScopes)> {
+    let path = options.hierarchy_roots.get(root)?.first()?.module_path.clone();
+    match path {
+        Some(path) => crate::module_class_def(options, &path, root),
+        None => match symbols.get(root) {
+            Some(crate::SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+            _ => None,
+        },
+    }
 }
 
 /// Whether `class` is in `root`'s subtree, by the registry.
@@ -126,11 +149,15 @@ fn base_names(c: &ClassDef) -> Vec<String> {
 pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> HierarchyRoots {
     // name → (its direct bases, the module defining it)
     let mut classes: BTreeMap<String, (Vec<String>, Option<Vec<String>>)> = BTreeMap::new();
-    for c in this_classes {
-        if participates(c) {
-            classes.insert(c.name.clone(), (base_names(c), None));
-        }
-    }
+    // The index is keyed by BARE class name — the identity the type side
+    // carries (`TypeInfo::Class(name)`) — so a name two modules both
+    // define (`Timeout` in urllib3's util.timeout and in requests'
+    // exceptions) is ambiguous: it is excluded, as a class and as a base,
+    // and its classes lower as before the index existed (concrete
+    // structs) rather than joining the wrong subtree.
+    let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_module: Vec<(Option<Vec<String>>, Vec<ClassDef>)> = Vec::new();
+    per_module.push((None, this_classes.to_vec()));
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
             continue;
@@ -151,11 +178,24 @@ pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> Hier
         };
         module_opts.this_module_path = path.clone();
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
+        per_module.push((Some(path.clone()), defs));
+    }
+    for (_, defs) in &per_module {
         for c in defs {
-            if participates(&c) {
-                classes
-                    .entry(c.name.clone())
-                    .or_insert((base_names(&c), Some(path.clone())));
+            *defined_in.entry(c.name.clone()).or_insert(0) += 1;
+        }
+    }
+    let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
+    for (path, defs) in &per_module {
+        for c in defs {
+            if participates(c) && unambiguous(&c.name) {
+                classes.insert(
+                    c.name.clone(),
+                    (
+                        base_names(c).into_iter().filter(|b| unambiguous(b)).collect(),
+                        path.clone(),
+                    ),
+                );
             }
         }
     }
@@ -255,7 +295,9 @@ pub fn variant_path(v: &Variant) -> proc_macro2::TokenStream {
 /// the body: visibility, `fn name<...>(params) -> ret` and any `where`),
 /// the method name, and the parameter names to forward (the receiver
 /// excluded). `None` when the tokens are not a single fn item.
-pub fn split_fn(rendered: &proc_macro2::TokenStream) -> Option<(proc_macro2::TokenStream, proc_macro2::Ident, Vec<proc_macro2::Ident>)> {
+pub fn split_fn(
+    rendered: &proc_macro2::TokenStream,
+) -> Option<(proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::Ident, Vec<proc_macro2::Ident>)> {
     use proc_macro2::{Delimiter, TokenTree};
     let trees: Vec<TokenTree> = rendered.clone().into_iter().collect();
     let fn_pos = trees
@@ -277,7 +319,18 @@ pub fn split_fn(rendered: &proc_macro2::TokenStream) -> Option<(proc_macro2::Tok
         .skip(params_pos + 1)
         .find(|(_, t)| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace))
         .map(|(i, _)| i)?;
-    let head: proc_macro2::TokenStream = trees[..body_pos].iter().cloned().collect();
+    // Leading attributes (`#[doc = ...]`) are not part of the head: an
+    // emit site prefixes its own visibility, and `pub #[doc] fn` is not
+    // an item. They come back as the head's prefix.
+    let mut attrs_end = 0;
+    while attrs_end + 1 < trees.len()
+        && matches!(&trees[attrs_end], TokenTree::Punct(p) if p.as_char() == '#')
+        && matches!(&trees[attrs_end + 1], TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket)
+    {
+        attrs_end += 2;
+    }
+    let attrs: proc_macro2::TokenStream = trees[..attrs_end].iter().cloned().collect();
+    let head: proc_macro2::TokenStream = trees[attrs_end..body_pos].iter().cloned().collect();
     // Parameter names: at depth 0 of the parameter group, the identifier
     // immediately before each `:`, skipping the receiver (`self`, `&self`,
     // `&mut self`) and a `mut` pattern prefix.
@@ -303,5 +356,5 @@ pub fn split_fn(rendered: &proc_macro2::TokenStream) -> Option<(proc_macro2::Tok
             }
         }
     }
-    Some((head, name, names))
+    Some((attrs, head, name, names))
 }

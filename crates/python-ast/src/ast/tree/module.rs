@@ -343,7 +343,14 @@ impl CodeGen for Module {
             // The closed-world hierarchy (hierarchy.rs): the polymorphic
             // roots of the WHOLE crate and their subtrees, so a root's
             // slot type renders as its sum type in every module.
-            let roots = crate::ast::tree::hierarchy::compute_roots(&classes, &options);
+            // The sum type's variants are module ITEMS (a class under a
+            // gate the emission cannot fold is not one).
+            let mut items = Vec::new();
+            top_level_class_defs(
+                &splice_gated_branches(self.raw.body.clone(), &options),
+                &mut items,
+            );
+            let roots = crate::ast::tree::hierarchy::compute_roots(&items, &options);
             crate::ast::tree::hierarchy::install_roots(&roots);
             options.hierarchy_roots = std::rc::Rc::new(roots);
         }
@@ -5004,7 +5011,7 @@ pub(crate) fn emitted_class_defs(
     // No class under a gate: the plain walk is exact, and the per-module
     // symbol table (the gate names need it) is never built.
     if !has_gated_class(&module.raw.body) {
-        collect_class_defs(&module.raw.body, &mut out);
+        top_level_class_defs(&module.raw.body, &mut out);
         return out;
     }
     let (body, _) = fold_static_import_trys(&module.raw.body, options);
@@ -5020,8 +5027,19 @@ pub(crate) fn emitted_class_defs(
     gated.statically_false_names = std::rc::Rc::new(false_names);
     gated.statically_module_names = std::rc::Rc::new(module_names);
     let body = splice_gated_branches(body, &gated);
-    collect_class_defs(&body, &mut out);
+    top_level_class_defs(&body, &mut out);
     out
+}
+
+/// The class statements that are module ITEMS: a class under a gate the
+/// emission cannot fold lowers inside the module-init block, where no
+/// other item can name it — it is not a crate-visible class.
+fn top_level_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>) {
+    for s in stmts {
+        if let crate::StatementType::ClassDef(c) = &s.statement {
+            out.push(c.clone());
+        }
+    }
 }
 
 /// Whether any class statement sits under a module-level `if` or `try`

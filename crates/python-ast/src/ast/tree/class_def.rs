@@ -5993,9 +5993,20 @@ impl ClassDef {
                     Some(path) => qualify_cross_module_types(rendered, path, a_syms, a_opts, options),
                     None => rendered,
                 };
-                let Some((head, name, args)) = h::split_fn(&rendered) else {
+                let Some((attrs, head, name, args)) = h::split_fn(&rendered) else {
                     continue;
                 };
+                // A definer whose trait is ACCESSOR-ONLY (a class
+                // subclassed only cross-module — urllib3's RequestMethods)
+                // keeps its methods inherent, on ITS struct alone: a
+                // variant reaches them through its base chain, and its
+                // own same-named method may take other parameters
+                // (`urlopen` on PoolManager). No uniform arm exists, so
+                // the sum type carries no delegator — a call on it is
+                // loud in rustc, never a wrong dispatch.
+                if !full_trait {
+                    continue;
+                }
                 let call_args = quote!(#(#args),*);
                 let fwd_args = quote!(#(, #args)*);
                 if first_seen {
@@ -6013,7 +6024,7 @@ impl ClassDef {
                         .iter()
                         .zip(vpaths.iter())
                         .map(|(vn, vp)| {
-                            let call = if full_trait && is_definer {
+                            let call = if is_definer {
                                 quote!(<#vp as #trait_path>::#name(v #fwd_args))
                             } else {
                                 quote!(v.#name(#call_args))
@@ -6022,14 +6033,14 @@ impl ClassDef {
                         })
                         .collect();
                     inherent.extend(quote! {
-                        pub #head {
+                        #attrs pub #head {
                             match self { #(#arms),* }
                         }
                     });
                 }
-                if full_trait && is_definer {
+                if is_definer {
                     fwd.extend(quote! {
-                        #head { #any::#name(self #fwd_args) }
+                        #attrs #head { #any::#name(self #fwd_args) }
                     });
                 }
             }

@@ -872,6 +872,7 @@ pub(crate) fn class_field_access(
                 _ => return None,
             };
             crate::ast::tree::call::receiver_class_tail(&name, symbols.clone(), options)
+                .or_else(|| crate::ast::tree::hierarchy::root_class_def(&name, symbols, options))
         });
         if let Some((class, class_symbols)) = resolved
             && crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
