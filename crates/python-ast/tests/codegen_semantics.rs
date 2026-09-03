@@ -16963,3 +16963,66 @@ fn a_key_lambda_parameter_shadowing_a_narrowed_name_is_a_fresh_binding() {
         out
     );
 }
+
+/// A comprehension over a SET of a class types its target from the set's
+/// element (Devin review on #318): the body's user-method call resolves
+/// its receiver and propagates the Result.
+#[test]
+fn a_set_comprehension_target_is_the_sets_element() {
+    let out = compile(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n\ndef f(shapes: set[Shape]) -> list[float]:\n    return [s.area() for s in shapes]\n",
+        "setcomp.py",
+    );
+    assert!(out.contains(". area () ?"), "the target is the set's element: {}", out);
+}
+
+/// `map(lambda x, y: ..., xs, ys)`: one parameter per iterable, each the
+/// element of its own iterable.
+#[test]
+fn a_two_iterable_map_lambda_binds_each_parameter_to_its_iterables_element() {
+    let out = compile(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n\ndef f(xs: list[Shape], ys: list[Shape]) -> list[float]:\n    return list(map(lambda x, y: x.area() + y.area(), xs, ys))\n",
+        "map2.py",
+    );
+    assert_eq!(
+        out.matches(". area () ?").count(),
+        2,
+        "both parameters resolve their class: {}",
+        out
+    );
+}
+
+/// A root-qualified IMPORTED CLASS constructed and used directly as a
+/// receiver (`Shape().area()` with `from pkg.shapes import Shape` in a
+/// src-layout package): the constructor resolves to the class, not a
+/// factory, through the module key authority.
+#[test]
+fn a_root_qualified_imported_constructor_result_is_a_method_receiver() {
+    let shapes = parse(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n",
+        "shapes.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["shapes".to_string()], std::rc::Rc::new(shapes));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.shapes import Shape\n\ndef go() -> float:\n    return Shape().area()\n",
+        "usemod2.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("usemod2".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". area () ?"),
+        "the constructed class's method call propagates: {}",
+        out
+    );
+}

@@ -910,7 +910,11 @@ fn infer_type_inner(
 /// different type from the receiver and not what any caller here wants.
 pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
     match t {
-        TypeInfo::Vec(e) => Some((**e).clone()),
+        TypeInfo::Vec(e) | TypeInfo::HashSet(e) => Some((**e).clone()),
+        // Iterating a dict yields its keys.
+        TypeInfo::Dict(k, _) => Some((**k).clone()),
+        // Iterating a str yields one-character strings.
+        TypeInfo::String | TypeInfo::StrRef => Some(TypeInfo::String),
         TypeInfo::Range => Some(TypeInfo::Int),
         TypeInfo::Borrowed(inner) => iterable_element_type(inner),
         _ => None,
@@ -4139,12 +4143,12 @@ pub(crate) fn comprehension_prefix_scopes(
 /// parameter bound to the given type, in order.
 pub(crate) fn lambda_scope(
     lambda: &crate::Lambda,
-    param_types: &[TypeInfo],
+    param_types: &[Option<TypeInfo>],
     options: &PythonOptions,
 ) -> PythonOptions {
     let mut scope = options.clone();
     for (i, p) in lambda.args.args.iter().enumerate() {
-        bind_fresh_name(&mut scope, &p.arg, param_types.get(i));
+        bind_fresh_name(&mut scope, &p.arg, param_types.get(i).and_then(|t| t.as_ref()));
     }
     scope
 }
@@ -4792,6 +4796,24 @@ mod tests {
         let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
         assert_eq!(info.name_types.get("a"), Some(&TypeInfo::String));
         assert_eq!(info.name_types.get("b"), Some(&TypeInfo::PyValue));
+    }
+
+    /// The binder's element authority covers every iterable whose element
+    /// is statically known (Devin review on #318): a set yields its
+    /// element, a dict its keys, a str one-character strings.
+    #[test]
+    fn iterable_element_types_cover_sets_dicts_and_strings() {
+        assert_eq!(
+            iterable_element_type(&TypeInfo::HashSet(Box::new(TypeInfo::Class("Shape".into())))),
+            Some(TypeInfo::Class("Shape".into()))
+        );
+        assert_eq!(
+            iterable_element_type(&TypeInfo::Dict(Box::new(TypeInfo::String), Box::new(TypeInfo::Int))),
+            Some(TypeInfo::String)
+        );
+        assert_eq!(iterable_element_type(&TypeInfo::String), Some(TypeInfo::String));
+        assert_eq!(iterable_element_type(&TypeInfo::StrRef), Some(TypeInfo::String));
+        assert_eq!(iterable_element_type(&TypeInfo::Int), None);
     }
 
     #[test]

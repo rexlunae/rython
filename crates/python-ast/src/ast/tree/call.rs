@@ -3340,10 +3340,13 @@ impl<'a> CodeGen for Call {
                         }
                         // A lambda function argument's parameter is the
                         // iterable's element — typed like a `key=` lambda.
-                        let rendered = match (self.args.first(), self.args.get(1)) {
-                            (Some(f @ ExprType::Lambda(_)), Some(xs)) if self.args.len() == 2 => {
+                        // `map(f, a, b)`: one parameter per iterable, in
+                        // order.
+                        let rendered = match self.args.first() {
+                            Some(f @ ExprType::Lambda(_)) if self.args.len() >= 2 => {
+                                let iterables: Vec<&ExprType> = self.args[1..].iter().collect();
                                 let mut r = rendered.clone();
-                                r[0] = render_key_fn(f, xs, &ctx, &options, &symbols)?;
+                                r[0] = render_lambda_over(f, &iterables, &ctx, &options, &symbols)?;
                                 r
                             }
                             _ => rendered,
@@ -8822,8 +8825,15 @@ fn named_call_class(
             // package's own root-qualified spelling (`from pkg.session
             // import make` in a src-layout sdist, keyed ["session"]).
             let path = ifm.resolved_module_path(options);
-            crate::module_defs_key(options, &path)
-                .and_then(|key| crate::module_function_def(options, key, &cn.id))
+            let key = crate::module_defs_key(options, &path);
+            // An imported CLASS constructor: the class itself, with its
+            // defining module's symbols (the same key).
+            if let Some(key) = key
+                && let Some((class, class_symbols)) = crate::module_class_def(options, key, &cn.id)
+            {
+                return Some((class.name, class_symbols));
+            }
+            key.and_then(|key| crate::module_function_def(options, key, &cn.id))
         }
         _ => None,
     };
@@ -8847,15 +8857,36 @@ fn render_key_fn(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    if let ExprType::Lambda(lam) = key
-        && let Some(elem) = crate::ast::tree::type_ctx::iterable_element_type(
-            &crate::infer_type(Some(ctx), iterable, options, symbols),
-        )
-    {
-        let scope = crate::lambda_scope(lam, &[elem], options);
-        return key.clone().to_rust(ctx.clone(), scope, symbols.clone());
+    render_lambda_over(key, &[iterable], ctx, options, symbols)
+}
+
+/// Render a function argument whose lambda's parameters are, in order,
+/// the elements of `iterables` (`map(lambda x, y: ..., xs, ys)` binds `x`
+/// to xs's element and `y` to ys's). Each parameter is a fresh binding
+/// whether or not its element type is known.
+fn render_lambda_over(
+    f: &ExprType,
+    iterables: &[&ExprType],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let ExprType::Lambda(lam) = f {
+        let elems: Vec<Option<crate::TypeInfo>> = iterables
+            .iter()
+            .map(|it| {
+                crate::ast::tree::type_ctx::iterable_element_type(&crate::infer_type(
+                    Some(ctx),
+                    it,
+                    options,
+                    symbols,
+                ))
+            })
+            .collect();
+        let scope = crate::lambda_scope(lam, &elems, options);
+        return f.clone().to_rust(ctx.clone(), scope, symbols.clone());
     }
-    key.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+    f.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
 }
 
 /// Resolve a class NAME to its ClassDef (and the defining module's symbol
