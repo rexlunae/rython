@@ -156,7 +156,9 @@ pub fn subexprs(e: &ExprType) -> Vec<&ExprType> {
             .chain(c.args.iter())
             .chain(c.keywords.iter().map(|k| &k.value))
             .collect(),
-        ExprType::FormattedValue(f) => vec![&f.value],
+        ExprType::FormattedValue(f) => std::iter::once(f.value.as_ref())
+            .chain(f.format_spec.iter().map(|spec| spec.as_ref()))
+            .collect(),
         ExprType::JoinedStr(j) => j.values.iter().collect(),
         ExprType::Attribute(a) => vec![&a.value],
         ExprType::Subscript(s) => {
