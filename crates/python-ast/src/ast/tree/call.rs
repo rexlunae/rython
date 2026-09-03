@@ -5816,17 +5816,15 @@ impl<'a> CodeGen for Call {
                     // only callees may read through the load form.
                     let mutates_receiver =
                         class.method_needs_mut_self(&attr.attr, &class_symbols, &options);
-                    let narrowed_class_name = matches!(
-                        attr.value.as_ref(),
-                        ExprType::Name(n)
-                            if options.narrowed_class_origin.get(&n.id).is_some_and(|root| {
-                                matches!(options.narrowed_names.get(&n.id), Some(crate::TypeInfo::Class(t)) if t != root)
-                            })
-                    );
+                    // A receiver that is, or is a chain rooted at, a
+                    // narrowed root-typed name: the place from the mutable
+                    // view (`s.center.bump()` — Devin review on #319).
+                    let narrowed_class_chain =
+                        crate::ast::tree::attribute::chain_root_is_narrowed_class(&attr.value, &options);
                     let receiver =
                         if mutates_receiver
                             && (crate::ast::tree::attribute::chain_root_is_self(&attr.value)
-                                || narrowed_class_name)
+                                || narrowed_class_chain)
                         {
                             // The WHOLE chain renders as a place:
                             // `self.outer.inner.bump()` goes through
@@ -5907,9 +5905,15 @@ impl<'a> CodeGen for Call {
             // load form (`self.items()`) clones the field: the mutable
             // accessor (`self.items_mut()`) keeps the write on the real
             // field.
-            let mutating_self_field = ctx.in_generic_trait()
+            let mutating_self_field = (ctx.in_generic_trait()
                 && matches!(attr.value.as_ref(), ExprType::Attribute(_))
-                && crate::ast::tree::attribute::chain_root_is_self(&attr.value);
+                && crate::ast::tree::attribute::chain_root_is_self(&attr.value))
+                // A container field of a NARROWED root-typed name
+                // (`s.tags.append(..)` — Devin review on #319): the place
+                // from the mutable view, or the push lands on the read
+                // view's clone.
+                || (matches!(attr.value.as_ref(), ExprType::Attribute(_))
+                    && crate::ast::tree::attribute::chain_root_is_narrowed_class(&attr.value, &options));
             // Issue #137's Option-aware access, the CALL side: a method
             // call through an Option-typed receiver (`conn.close()` where
             // conn is `BaseHTTPConnection | None` — urllib3's
@@ -9548,7 +9552,13 @@ pub(crate) fn root_isinstance_test(
     arg: &TokenStream,
     symbols: &SymbolTableScopes,
 ) -> TokenStream {
+    // The root itself or an ANCESTOR: the crate-wide registry answers
+    // (an ancestor of a root is a root whose subtree holds it — an
+    // imported root, or one whose base is imported, is not in this
+    // module's symbols; Devin review on #319), with the class tree
+    // for a same-module ancestor that is no root.
     if target == root
+        || crate::ast::tree::hierarchy::in_subtree_by_name(root, target)
         || crate::ast::tree::class_def::ClassDef::class_extends(root, target, symbols)
     {
         return quote!(true);

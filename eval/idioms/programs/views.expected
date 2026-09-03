@@ -1,6 +1,6 @@
-circle:3.14     12.6|
-shape:6.00       24|
-shape:0.00        0|
+circle:3.14     12.6| -
+shape:6.00       24| 1/1
+shape:0.00        0| -
 1
 2 3
 True False False
