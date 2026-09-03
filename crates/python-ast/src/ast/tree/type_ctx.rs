@@ -739,6 +739,24 @@ fn infer_type_inner(
                     }
                     "pop" | "setdefault" => TypeInfo::PyObject,
                     _ if on_numpy => TypeInfo::NdArray,
+                    // The str/bytes codec pair, as the lowering renders them
+                    // (`decode_ascii(...)` is a String, `encode_ascii(...)`
+                    // a Vec<u8>) whatever the receiver's static shape — a
+                    // narrowed union, a boxed value, or the plain type.
+                    "decode" => TypeInfo::String,
+                    "encode" => TypeInfo::Bytes,
+                    // A str method returning str, on a str receiver: the
+                    // type side agrees with the lowering's `.upper()` etc.
+                    "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "title" | "capitalize"
+                    | "casefold" | "swapcase" | "replace" | "zfill" | "center" | "ljust"
+                    | "rjust" | "expandtabs" | "format"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::String | TypeInfo::StrRef
+                        ) =>
+                    {
+                        TypeInfo::String
+                    }
                     // Dict VIEW methods carry the (key, value) pair type
                     // (`self.items.items()` → Vec<(str, Item)> — the idiom
                     // corpus's report): the receiver's Dict type is the
@@ -2258,6 +2276,63 @@ fn narrowed_value_type(t: &TypeInfo) -> TypeInfo {
     }
 }
 
+/// Definite assignment of `name` by a statement list, on its fall-through
+/// paths: `Some(true)` when every path that reaches the end has written
+/// the name, `Some(false)` when some path may not have, `None` when no
+/// path falls through (the list terminates in return/raise/break/continue
+/// before the end). A nested `if` counts only when both arms do; a loop
+/// never does (it may run zero times); a `try` counts when its body and
+/// every handler do; a `with` counts through its body.
+fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
+    fn assign_target_writes(target: &ExprType, name: &str) -> bool {
+        match target {
+            ExprType::Name(n) => n.id == name,
+            ExprType::Tuple(t) => t.elts.iter().any(|e| assign_target_writes(e, name)),
+            ExprType::List(l) => l.iter().any(|e| assign_target_writes(e, name)),
+            ExprType::Starred(st) => assign_target_writes(&st.value, name),
+            _ => false,
+        }
+    }
+    for stmt in stmts {
+        match &stmt.statement {
+            StatementType::Return(_)
+            | StatementType::Raise(_)
+            | StatementType::Break
+            | StatementType::Continue => return None,
+            StatementType::Assign(a) if a.targets.iter().any(|t| assign_target_writes(t, name)) => {
+                return Some(true);
+            }
+            StatementType::AugAssign(a) if assign_target_writes(&a.target, name) => {
+                return Some(true);
+            }
+            StatementType::If(s) => match (definitely_writes(&s.body, name), definitely_writes(&s.orelse, name)) {
+                (Some(true), Some(true)) | (Some(true), None) | (None, Some(true)) => return Some(true),
+                (None, None) => return None,
+                _ => {}
+            },
+            StatementType::With(s) => match definitely_writes(&s.body, name) {
+                Some(true) => return Some(true),
+                None => return None,
+                _ => {}
+            },
+            StatementType::Try(t) => {
+                let body = definitely_writes(&t.body, name);
+                let handlers = t.handlers.iter().map(|h| definitely_writes(&h.body, name));
+                let all_handlers_write = handlers.clone().all(|d| d != Some(false));
+                let final_writes = definitely_writes(&t.finalbody, name);
+                if final_writes == Some(true) {
+                    return Some(true);
+                }
+                if body == Some(true) && all_handlers_write {
+                    return Some(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(false)
+}
+
 fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
     if info.name_types.is_empty() {
         return options.clone();
@@ -2559,19 +2634,33 @@ fn analyze_statement_types(
                 // not (Devin review on #318). One or no reassignment
                 // restores the pre-if entry: the name may still hold the
                 // original union.
-                let both_write = s.body.iter().any(|st| crate::ast::tree::expression::stmt_writes_name(st, n))
-                    && s.orelse.iter().any(|st| crate::ast::tree::expression::stmt_writes_name(st, n));
-                if both_write
-                    && let (Some(body_result), Some(else_result)) =
-                        (after_body.as_ref(), info.name_types.get(n))
-                {
-                    let joined = unify(body_result.clone(), else_result.clone());
-                    info.name_types.insert(n.clone(), joined);
-                } else {
-                    match saved {
-                        Some(t) => info.name_types.insert(n.clone(), t),
-                        None => info.name_types.remove(n),
-                    };
+                // DEFINITE assignment, per branch: every fall-through path
+                // writes the name (a nested `if` writing in one arm only, a
+                // loop that may run zero times, do not count), and a branch
+                // that terminates (return/raise) constrains nothing. Devin
+                // review on #318: "a write exists somewhere" is not that.
+                let body_def = definitely_writes(&s.body, n);
+                let else_def = definitely_writes(&s.orelse, n);
+                let else_result = info.name_types.get(n).cloned();
+                let joined = match (body_def, else_def) {
+                    (Some(true), Some(true)) => match (after_body.as_ref(), else_result.as_ref()) {
+                        (Some(b), Some(e)) => Some(unify(b.clone(), e.clone())),
+                        _ => None,
+                    },
+                    (Some(true), None) => after_body.clone(),
+                    (None, Some(true)) => else_result.clone(),
+                    _ => None,
+                };
+                match joined {
+                    Some(t) => {
+                        info.name_types.insert(n.clone(), t);
+                    }
+                    None => {
+                        match saved {
+                            Some(t) => info.name_types.insert(n.clone(), t),
+                            None => info.name_types.remove(n),
+                        };
+                    }
                 }
             }
         }
@@ -4382,6 +4471,61 @@ mod tests {
             .as_deref()
             .expect("annotation")
             .clone()
+    }
+
+    /// The analysis after `if isinstance(label, bytes): ... else: ...` on a
+    /// `str | bytes` parameter, with the branch bodies given.
+    fn post_if_type(body: &str, orelse: &str) -> Option<TypeInfo> {
+        let src = format!(
+            "def f(label):\n    if isinstance(label, bytes):\n{body}    else:\n{orelse}    return label\n"
+        );
+        let module = parse(&src, "narrow.py").expect("parse failed");
+        let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+            panic!("expected a function def");
+        };
+        let mut options = PythonOptions::default();
+        let mut names = HashMap::new();
+        names.insert("label".to_string(), TypeInfo::StrOrBytes);
+        options.name_types = std::rc::Rc::new(names);
+        let symbols = SymbolTableScopes::new();
+        let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
+        info.name_types.get("label").cloned()
+    }
+
+    /// Devin review on #318: a narrowed name reassigned on EVERY fall-through
+    /// path of both branches keeps the reassigned type after the if (the
+    /// join of the two branch results); a write nested under a further
+    /// condition, or a branch that may not write, restores the union.
+    #[test]
+    fn a_definite_reassignment_in_both_narrowed_branches_retypes_the_name() {
+        assert_eq!(
+            post_if_type(
+                "        label = label.decode(\"ascii\")\n",
+                "        label = label.upper()\n"
+            ),
+            Some(TypeInfo::String)
+        );
+        // A terminating branch constrains nothing: the other's type stands.
+        assert_eq!(
+            post_if_type("        raise ValueError(\"bytes\")\n", "        label = label.upper()\n"),
+            Some(TypeInfo::String)
+        );
+        // A conditional write in one branch is not definite: the union stays.
+        assert_eq!(
+            post_if_type(
+                "        if len(label) > 3:\n            label = label.decode(\"ascii\")\n",
+                "        label = label.upper()\n"
+            ),
+            None
+        );
+        // A loop may run zero times: not definite either.
+        assert_eq!(
+            post_if_type(
+                "        for _ in range(3):\n            label = label.decode(\"ascii\")\n",
+                "        label = label.upper()\n"
+            ),
+            None
+        );
     }
 
     /// The single type authority (issue #137's systemic review of rounds

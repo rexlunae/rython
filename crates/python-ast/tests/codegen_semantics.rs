@@ -16864,24 +16864,27 @@ fn a_nested_comprehension_binds_each_generator_in_its_prefix_scope() {
 }
 
 #[test]
-fn a_name_reassigned_in_both_narrowed_branches_keeps_the_reassigned_type() {
-    // Devin review on #318: the narrowing is temporary, a reassignment is
-    // not — after `label = label.decode(...)` in both arms, reads of
-    // `label` are str, not the parameter's boxed union.
+fn a_write_nested_under_a_condition_in_a_narrowed_branch_keeps_the_union() {
+    // Devin review on #318: only a DEFINITE reassignment (every fall-through
+    // path of both branches) retypes the name after the if; a write nested
+    // under a further condition leaves the union in place on the other
+    // path, so post-if reads stay boxed.
     let out = compile(
         concat!(
-            "def norm(label: str | bytes) -> str:\n",
+            "def norm(label: str | bytes, flag: bool) -> bool:\n",
             "    if isinstance(label, bytes):\n",
-            "        label = label.decode(\"ascii\")\n",
+            "        if flag:\n",
+            "            label = label.decode(\"ascii\")\n",
             "    else:\n",
             "        label = label.upper()\n",
-            "    return label.lower()\n",
+            "    return isinstance(label, bytes)\n",
         ),
-        "branch_reassign.py",
+        "branch_partial_reassign.py",
     );
+    // The post-if `isinstance` is a second runtime test on the union.
     assert!(
-        !out.contains("py_boxed_lower"),
-        "the post-if read must be the reassigned str, not the boxed union: {}",
+        out.matches("is_bytes ()").count() == 2,
+        "a conditional write must not retype the name after the if: {}",
         out
     );
 }
