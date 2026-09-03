@@ -770,7 +770,27 @@ fn infer_type_inner(
                             TypeInfo::String | TypeInfo::StrRef
                         ) =>
                     {
-                        StrMethod::from_name(name).expect("just checked").result()
+                        match StrMethod::from_name(name).expect("just checked") {
+                            // `format` renders a String only for a template
+                            // the lowering can see; a dynamic template is
+                            // dropped as the boxed None (the dynamic-format
+                            // divergence), and the type side says so.
+                            StrMethod::Format => {
+                                if crate::ast::tree::call::str_format_template(
+                                    &attr.value,
+                                    ctx,
+                                    symbols,
+                                    options,
+                                )
+                                .is_some()
+                                {
+                                    TypeInfo::String
+                                } else {
+                                    TypeInfo::PyValue
+                                }
+                            }
+                            m => m.result(),
+                        }
                     }
                     // Dict VIEW methods carry the (key, value) pair type
                     // (`self.items.items()` → Vec<(str, Item)> — the idiom
@@ -2361,6 +2381,15 @@ fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
             _ => false,
         }
     }
+    // The bound name of an import alias (`import a.b` binds `a`; `import
+    // x as y` and `from m import x as y` bind `y`).
+    fn alias_binds(a: &crate::Alias, name: &str, dotted_root: bool) -> bool {
+        match &a.asname {
+            Some(as_) => as_ == name,
+            None if dotted_root => a.name.split('.').next() == Some(name),
+            None => a.name == name,
+        }
+    }
     for stmt in stmts {
         match &stmt.statement {
             StatementType::Return(_)
@@ -2373,11 +2402,36 @@ fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
             StatementType::AugAssign(a) if assign_target_writes(&a.target, name) => {
                 return Some(true);
             }
+            // The other definite binders: a walrus in an expression
+            // statement, an import, a def/class of that name.
+            StatementType::Expr(e) if expr_walrus_writes(&e.value, name) => return Some(true),
+            StatementType::Import(i) if i.names.iter().any(|a| alias_binds(a, name, true)) => {
+                return Some(true);
+            }
+            StatementType::ImportFrom(i)
+                if i.names.iter().any(|a| alias_binds(a, name, false)) =>
+            {
+                return Some(true);
+            }
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f)
+                if f.name == name =>
+            {
+                return Some(true);
+            }
+            StatementType::ClassDef(c) if c.name == name => return Some(true),
             StatementType::If(s) => match (definitely_writes(&s.body, name), definitely_writes(&s.orelse, name)) {
                 (Some(true), Some(true)) | (Some(true), None) | (None, Some(true)) => return Some(true),
                 (None, None) => return None,
                 _ => {}
             },
+            // `with ... as name:` binds before the body runs.
+            StatementType::With(s)
+                if s.items.iter().any(|it| {
+                    it.optional_vars.as_ref().is_some_and(|v| assign_target_writes(v, name))
+                }) =>
+            {
+                return Some(true);
+            }
             StatementType::With(s) => match definitely_writes(&s.body, name) {
                 Some(true) => return Some(true),
                 None => return None,
@@ -2385,7 +2439,14 @@ fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
             },
             StatementType::Try(t) => {
                 let body = definitely_writes(&t.body, name);
-                let handlers = t.handlers.iter().map(|h| definitely_writes(&h.body, name));
+                // A handler binds its `as name` before its body runs.
+                let handlers = t.handlers.iter().map(|h| {
+                    if h.name.as_deref() == Some(name) {
+                        Some(true)
+                    } else {
+                        definitely_writes(&h.body, name)
+                    }
+                });
                 let all_handlers_write = handlers.clone().all(|d| d != Some(false));
                 let final_writes = definitely_writes(&t.finalbody, name);
                 if final_writes == Some(true) {
@@ -2399,6 +2460,41 @@ fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
         }
     }
     Some(false)
+}
+
+/// Whether evaluating `expr` binds `name` through a walrus (`(m :=
+/// f(x))`), anywhere in its operand tree (an expression is evaluated in
+/// full, so any walrus in it runs — short-circuit operands excepted).
+fn expr_walrus_writes(expr: &ExprType, name: &str) -> bool {
+    match expr {
+        ExprType::NamedExpr(ne) => {
+            matches!(ne.left.as_ref(), ExprType::Name(n) if n.id == name)
+                || expr_walrus_writes(&ne.right, name)
+        }
+        ExprType::Attribute(a) => expr_walrus_writes(&a.value, name),
+        ExprType::Call(c) => {
+            expr_walrus_writes(&c.func, name)
+                || c.args.iter().any(|a| expr_walrus_writes(a, name))
+                || c.keywords.iter().any(|k| expr_walrus_writes(&k.value, name))
+        }
+        ExprType::BinOp(b) => {
+            expr_walrus_writes(&b.left, name) || expr_walrus_writes(&b.right, name)
+        }
+        // Only the first operand of a short-circuit chain surely runs.
+        ExprType::BoolOp(b) => b.values.first().is_some_and(|v| expr_walrus_writes(v, name)),
+        ExprType::Compare(c) => {
+            expr_walrus_writes(&c.left, name)
+                || c.comparators.iter().any(|r| expr_walrus_writes(r, name))
+        }
+        ExprType::UnaryOp(u) => expr_walrus_writes(&u.operand, name),
+        ExprType::IfExp(i) => expr_walrus_writes(&i.test, name),
+        ExprType::Subscript(sub) => expr_walrus_writes(&sub.value, name),
+        ExprType::Tuple(t) => t.elts.iter().any(|e| expr_walrus_writes(e, name)),
+        ExprType::List(l) => l.iter().any(|e| expr_walrus_writes(e, name)),
+        ExprType::Set(st) => st.elts.iter().any(|e| expr_walrus_writes(e, name)),
+        ExprType::Starred(st) => expr_walrus_writes(&st.value, name),
+        _ => false,
+    }
 }
 
 fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
@@ -4030,9 +4126,8 @@ pub(crate) fn comprehension_prefix_scopes(
     for g in generators {
         let prev = scopes.last().expect("the outer scope is always present");
         let mut next = prev.clone();
-        if let Some(elem) = iterable_element_type(&infer_type(ctx, &g.iter, prev, symbols)) {
-            seed_binder_types(&g.target, &elem, std::rc::Rc::make_mut(&mut next.name_types), true);
-        }
+        let elem = iterable_element_type(&infer_type(ctx, &g.iter, prev, symbols));
+        bind_fresh(&mut next, &g.target, elem.as_ref());
         scopes.push(next);
     }
     scopes
@@ -4048,10 +4143,55 @@ pub(crate) fn lambda_scope(
     options: &PythonOptions,
 ) -> PythonOptions {
     let mut scope = options.clone();
-    for (p, ty) in lambda.args.args.iter().zip(param_types.iter()) {
-        std::rc::Rc::make_mut(&mut scope.name_types).insert(p.arg.clone(), ty.clone());
+    for (i, p) in lambda.args.args.iter().enumerate() {
+        bind_fresh_name(&mut scope, &p.arg, param_types.get(i));
     }
     scope
+}
+
+/// Bind a comprehension target (any destructuring shape) as FRESH names
+/// in `scope`: see `bind_fresh_name`. The element type seeds the names
+/// when known; an unknowable element leaves them untyped — never typed
+/// as a same-named outer binding.
+pub(crate) fn bind_fresh(scope: &mut PythonOptions, target: &ExprType, ty: Option<&TypeInfo>) {
+    let mut names = Vec::new();
+    binder_names(target, &mut names);
+    for n in &names {
+        bind_fresh_name(scope, n, None);
+    }
+    if let Some(ty) = ty {
+        seed_binder_types(target, ty, std::rc::Rc::make_mut(&mut scope.name_types), true);
+    }
+}
+
+/// Bind `name` as a FRESH binding in `scope` — a comprehension target or a
+/// lambda parameter shadows a same-named outer name (Python 3 scopes
+/// them), so nothing the outer scope knew about that name applies: not
+/// its type, not its Option-ness, not the flow narrowing an enclosing
+/// `if` installed (a narrowed Option read unwraps; the fresh binding is
+/// not an Option). Devin review on #318.
+pub(crate) fn bind_fresh_name(scope: &mut PythonOptions, name: &str, ty: Option<&TypeInfo>) {
+    std::rc::Rc::make_mut(&mut scope.narrowed_names).remove(name);
+    std::rc::Rc::make_mut(&mut scope.optional_names).remove(name);
+    let types = std::rc::Rc::make_mut(&mut scope.name_types);
+    match ty {
+        Some(t) => {
+            types.insert(name.to_string(), t.clone());
+        }
+        None => {
+            types.remove(name);
+        }
+    }
+}
+
+fn binder_names(target: &ExprType, out: &mut Vec<String>) {
+    match target {
+        ExprType::Name(n) => out.push(n.id.clone()),
+        ExprType::Tuple(t) => t.elts.iter().for_each(|e| binder_names(e, out)),
+        ExprType::List(l) => l.iter().for_each(|e| binder_names(e, out)),
+        ExprType::Starred(st) => binder_names(&st.value, out),
+        _ => {}
+    }
 }
 
 fn count_expr_reads(expr: &ExprType, info: &mut FunctionTypeInfo) {
@@ -4606,6 +4746,54 @@ mod tests {
     /// Devin review on #318: a user class's own `encode`/`decode` keeps
     /// its declared return; only a string-shaped receiver takes the codec
     /// answer.
+    /// The definite binders beyond plain assignment (Devin review on
+    /// #318): `with ... as`, `except ... as`, a walrus in an expression
+    /// statement, an import, a def. A loop target stays indefinite (zero
+    /// iterations).
+    #[test]
+    fn definite_writes_cover_the_other_binders() {
+        let body = |src: &str| {
+            let module = parse(&format!("def f(label):\n{}", src), "dw.py").expect("parse failed");
+            let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+                panic!("expected a function def");
+            };
+            f.body.clone()
+        };
+        assert_eq!(definitely_writes(&body("    with open(p) as label:\n        pass\n"), "label"), Some(true));
+        assert_eq!(
+            definitely_writes(&body("    try:\n        label = g()\n    except ValueError as label:\n        pass\n"), "label"),
+            Some(true)
+        );
+        assert_eq!(definitely_writes(&body("    print(label := g())\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    import os as label\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    from os import path as label\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    def label():\n        pass\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    for label in xs:\n        pass\n"), "label"), Some(false));
+        assert_eq!(definitely_writes(&body("    print(a and (label := g()))\n"), "label"), Some(false));
+    }
+
+    /// `str.format` types as the lowering renders it (Devin review on
+    /// #318): a literal template is a String; a dynamic one (a str
+    /// parameter as the template) is the boxed None the lowering drops
+    /// the call to, never a String.
+    #[test]
+    fn str_format_types_as_the_lowering_renders_it() {
+        let src = "def f(tpl: str, n: int):\n    a = \"{}!\".format(n)\n    b = tpl.format(n)\n    return a\n";
+        let module = parse(src, "fmt.py").expect("parse failed");
+        let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+        let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+            panic!("expected a function def");
+        };
+        let mut options = PythonOptions::default();
+        let mut names = HashMap::new();
+        names.insert("tpl".to_string(), TypeInfo::String);
+        names.insert("n".to_string(), TypeInfo::Int);
+        options.name_types = std::rc::Rc::new(names);
+        let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
+        assert_eq!(info.name_types.get("a"), Some(&TypeInfo::String));
+        assert_eq!(info.name_types.get("b"), Some(&TypeInfo::PyValue));
+    }
+
     #[test]
     fn a_user_classes_decode_keeps_its_declared_return() {
         let src = "class Codec:\n    def decode(self) -> int:\n        return 1\n\ndef f(label: str):\n    c = Codec()\n    n = c.decode()\n    s = label.encode(\"ascii\")\n    return n\n";

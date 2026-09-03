@@ -16931,3 +16931,35 @@ fn a_root_qualified_imported_factory_result_is_a_method_receiver() {
         out
     );
 }
+
+/// A comprehension target that reuses a NARROWED outer name (Devin
+/// review on #318): the target is a fresh binding (Python 3 scopes the
+/// comprehension), so the enclosing `if x is None: return` narrowing —
+/// whose reads unwrap the Option parameter — must not apply to it.
+#[test]
+fn a_comprehension_target_shadowing_a_narrowed_name_is_a_fresh_binding() {
+    let out = compile(
+        "def f(x: int | None, xs: list[int]) -> list[int]:\n    if x is None:\n        return []\n    return [x * 2 for x in xs]\n",
+        "shadow_comp.py",
+    );
+    assert!(
+        !out.contains("unwrap"),
+        "the fresh target reads plainly, never through the outer Option's unwrap: {}",
+        out
+    );
+}
+
+/// A key lambda's parameter that reuses a narrowed outer name is likewise
+/// a fresh binding.
+#[test]
+fn a_key_lambda_parameter_shadowing_a_narrowed_name_is_a_fresh_binding() {
+    let out = compile(
+        "def f(s: str | None, xs: list[str]) -> list[str]:\n    if s is None:\n        return []\n    return sorted(xs, key=lambda s: s.lower())\n",
+        "shadow_lambda.py",
+    );
+    assert!(
+        !out.contains("unwrap"),
+        "the fresh parameter reads plainly, never through the outer Option's unwrap: {}",
+        out
+    );
+}

@@ -6193,220 +6193,19 @@ impl<'a> CodeGen for Call {
             // spec Rust cannot reproduce exactly is a loud conversion
             // error, never approximated output.
             if attr.attr == "format" {
-                let template = match attr.value.as_ref() {
-                    ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
-                        match &c.0 {
-                            Some(litrs::Literal::String(s)) => s.value().to_string(),
-                            _ => unreachable!(),
-                        }
-                    }
-                    // A MODULE-level constant template
-                    // (`LARGE_SECTION_MESSAGE.format(...)` — botocore's
-                    // restdoc): the constant's literal value.
-                    ExprType::Name(n) => match symbols.get(&n.id) {
-                        Some(SymbolTableNode::Assign {
-                            value: ExprType::Constant(c),
-                            ..
-                        }) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
-                            match &c.0 {
-                                Some(litrs::Literal::String(s)) => s.value().to_string(),
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => {
-                            
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        }
-                    },
-                    // A SELF-FIELD template (`self.default_endpoint.format(
-                    // service=..., region=...)` — botocore's
-                    // Client._assume_endpoint, where the field stores
-                    // `default_endpoint or self.DEFAULT_ENDPOINT`): resolve
-                    // the field's stored value to a string template.
-                    ExprType::Attribute(a)
-                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
-                    {
-                        let Some(enclosing) = ctx.enclosing_class_name() else {
-                            
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        };
-                        let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
-                        else {
-                            
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        };
-                        // The class's class-level string constants
-                        // (`self.DEFAULT_ENDPOINT` reads).
-                        let class_const = |attr: &str| -> Option<String> {
-                            class.body.iter().find_map(|s| match &s.statement {
-                                crate::StatementType::Assign(assign)
-                                    if assign.targets.len() == 1
-                                        && matches!(
-                                            &assign.targets[0],
-                                            ExprType::Name(n) if n.id == attr
-                                        ) =>
-                                {
-                                    match &assign.value {
-                                        ExprType::Constant(c) => match &c.0 {
-                                            Some(litrs::Literal::String(s)) => {
-                                                Some(s.value().to_string())
-                                            }
-                                            _ => None,
-                                        },
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
-                            })
-                        };
-                        // The field's store value in __init__
-                        // (`self.<field> = <value>`).
-                        let store_value = class.init_method().and_then(|init| {
-                            init.body.iter().find_map(|s| match &s.statement {
-                                crate::StatementType::Assign(assign)
-                                    if assign.targets.len() == 1
-                                        && matches!(
-                                            &assign.targets[0],
-                                            ExprType::Attribute(t)
-                                                if matches!(
-                                                    t.value.as_ref(),
-                                                    ExprType::Name(n) if n.id == "self"
-                                                ) && t.attr == a.attr
-                                        ) =>
-                                {
-                                    Some(&assign.value)
-                                }
-                                _ => None,
-                            })
-                        });
-                        let Some(v) = store_value else {
-                            
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        };
-                        match template_from_expr(v, &class_const) {
-                            Some(t) => t,
-                            None => {
-                                // A self-field template whose stored value
-                                // is a PARAMETER (`self.text_format.format(
-                                // task=task)` — rich's TextColumn, where
-                                // __init__ stores the text_format
-                                // parameter): the template is dynamic at
-                                // conversion time — the format call is
-                                // dropped (the dynamic-format divergence).
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped \
-                                     (the dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                            }
-                        }
-                    }
-                    // A CLASS-CONSTANT template (`ResponseError.SPECIFIC_ERROR
-                    // .format(...)` — urllib3's exceptions): the class's
-                    // class-level string constants are metadata, but the
-                    // template is statically known.
-                    ExprType::Attribute(a) => {
-                        let ExprType::Name(class) = a.value.as_ref() else {
-                            
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        };
-                        // The class may be imported (`from .exceptions import
-                        // ResponseError` in urllib3/util/retry.py): resolve
-                        // through the defining module.
-                        let class_def = match symbols.get(&class.id) {
-                            Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
-                            Some(SymbolTableNode::ImportFrom(i)) => {
-                                let path = i.resolved_module_path(&options);
-                                crate::resolve_imported_class(&options, &path, &class.id, 0)
-                                    .map(|(c, _)| c)
-                            }
-                            _ => None,
-                        };
-                        let Some(c) = class_def else {
-                            
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        };
-                        let Some(assign) = c.body.iter().find_map(|s| match &s.statement {
-                            crate::StatementType::Assign(assign)
-                                if assign.targets.len() == 1
-                                    && matches!(&assign.targets[0], ExprType::Name(n) if n.id == a.attr) =>
-                            {
-                                Some(assign)
-                            }
-                            _ => None,
-                        }) else {
-
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                        };
-                        match &assign.value {
-                            ExprType::Constant(c)
-                                if matches!(&c.0, Some(litrs::Literal::String(_))) =>
-                            {
-                                match &c.0 {
-                                    Some(litrs::Literal::String(s)) => s.value().to_string(),
-                                    _ => unreachable!(),
-                                }
-                            }
-                            _ => {
-                                
-                                options.definition_warnings.borrow_mut().push(
-                                    "str.format on a non-literal template is dropped (the \
-                                     dynamic-format divergence)"
-                                        .to_string(),
-                                );
-                                return Ok(quote!(stdpython::PyValue::None_));
-                            }
-                        }
-                    }
-                    _ => {
-                        // A RUNTIME template (`template.format(service=...,
-                        // region=...)` — botocore's regions, where the
-                        // template is a parameter): the template cannot be
-                        // checked at conversion time — the format call is
-                        // dropped (the dynamic-format divergence).
-                        options.definition_warnings.borrow_mut().push(
-                            "str.format on a runtime (non-literal) template is dropped \
-                             (the dynamic-format divergence)"
-                                .to_string(),
-                        );
-                        return Ok(quote!(stdpython::PyValue::None_));
-                    }
+                let Some(template) =
+                    str_format_template(attr.value.as_ref(), Some(&ctx), &symbols, &options)
+                else {
+                    // The dynamic-format divergence: a template the
+                    // conversion cannot see (a parameter, a field stored
+                    // from one) — the call is dropped as the boxed None,
+                    // with the warning.
+                    options.definition_warnings.borrow_mut().push(
+                        "str.format on a non-literal template is dropped (the \
+                         dynamic-format divergence)"
+                            .to_string(),
+                    );
+                    return Ok(quote!(stdpython::PyValue::None_));
                 };
                 return lower_str_format(
                     &template,
@@ -8257,6 +8056,180 @@ fn convert_rust_bind_ret(
         Some(other) => return Err(format!("rust.bind: unsupported return type `{}`", other).into()),
     };
     Ok(converted)
+}
+
+/// The statically-known template of a `str.format` RECEIVER — the one
+/// authority for which receivers the format lowering renders: a literal,
+/// a module-level string constant, a self-field stored from a literal or
+/// a class constant, a class constant (possibly imported). `None` is the
+/// dynamic-template divergence: the lowering drops the call as the boxed
+/// None, and the type side (type_ctx.rs) types the result the same way,
+/// never as a String the lowering does not produce. Devin review on
+/// #318.
+pub(crate) fn str_format_template(
+    receiver: &ExprType,
+    ctx: Option<&CodeGenContext>,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<String> {
+    Some(match receiver {
+        ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
+            match &c.0 {
+                Some(litrs::Literal::String(s)) => s.value().to_string(),
+                _ => unreachable!(),
+            }
+        }
+        // A MODULE-level constant template
+        // (`LARGE_SECTION_MESSAGE.format(...)` — botocore's
+        // restdoc): the constant's literal value.
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::Assign {
+                value: ExprType::Constant(c),
+                ..
+            }) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
+                match &c.0 {
+                    Some(litrs::Literal::String(s)) => s.value().to_string(),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                    return None;
+            }
+        },
+        // A SELF-FIELD template (`self.default_endpoint.format(
+        // service=..., region=...)` — botocore's
+        // Client._assume_endpoint, where the field stores
+        // `default_endpoint or self.DEFAULT_ENDPOINT`): resolve
+        // the field's stored value to a string template.
+        ExprType::Attribute(a)
+            if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+        {
+            let Some(enclosing) = ctx.and_then(|c| c.enclosing_class_name()) else {
+                    return None;
+            };
+            let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
+            else {
+                    return None;
+            };
+            // The class's class-level string constants
+            // (`self.DEFAULT_ENDPOINT` reads).
+            let class_const = |attr: &str| -> Option<String> {
+                class.body.iter().find_map(|s| match &s.statement {
+                    crate::StatementType::Assign(assign)
+                        if assign.targets.len() == 1
+                            && matches!(
+                                &assign.targets[0],
+                                ExprType::Name(n) if n.id == attr
+                            ) =>
+                    {
+                        match &assign.value {
+                            ExprType::Constant(c) => match &c.0 {
+                                Some(litrs::Literal::String(s)) => {
+                                    Some(s.value().to_string())
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+            };
+            // The field's store value in __init__
+            // (`self.<field> = <value>`).
+            let store_value = class.init_method().and_then(|init| {
+                init.body.iter().find_map(|s| match &s.statement {
+                    crate::StatementType::Assign(assign)
+                        if assign.targets.len() == 1
+                            && matches!(
+                                &assign.targets[0],
+                                ExprType::Attribute(t)
+                                    if matches!(
+                                        t.value.as_ref(),
+                                        ExprType::Name(n) if n.id == "self"
+                                    ) && t.attr == a.attr
+                            ) =>
+                    {
+                        Some(&assign.value)
+                    }
+                    _ => None,
+                })
+            });
+            let Some(v) = store_value else {
+                    return None;
+            };
+            match template_from_expr(v, &class_const) {
+                Some(t) => t,
+                None => {
+                    // A self-field template whose stored value
+                    // is a PARAMETER (`self.text_format.format(
+                    // task=task)` — rich's TextColumn, where
+                    // __init__ stores the text_format
+                    // parameter): the template is dynamic at
+                    // conversion time — the format call is
+                    // dropped (the dynamic-format divergence).
+                    return None;
+                }
+            }
+        }
+        // A CLASS-CONSTANT template (`ResponseError.SPECIFIC_ERROR
+        // .format(...)` — urllib3's exceptions): the class's
+        // class-level string constants are metadata, but the
+        // template is statically known.
+        ExprType::Attribute(a) => {
+            let ExprType::Name(class) = a.value.as_ref() else {
+                    return None;
+            };
+            // The class may be imported (`from .exceptions import
+            // ResponseError` in urllib3/util/retry.py): resolve
+            // through the defining module.
+            let class_def = match symbols.get(&class.id) {
+                Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let path = i.resolved_module_path(options);
+                    crate::resolve_imported_class(options, &path, &class.id, 0)
+                        .map(|(c, _)| c)
+                }
+                _ => None,
+            };
+            let Some(c) = class_def else {
+                    return None;
+            };
+            let Some(assign) = c.body.iter().find_map(|s| match &s.statement {
+                crate::StatementType::Assign(assign)
+                    if assign.targets.len() == 1
+                        && matches!(&assign.targets[0], ExprType::Name(n) if n.id == a.attr) =>
+                {
+                    Some(assign)
+                }
+                _ => None,
+            }) else {
+
+                    return None;
+            };
+            match &assign.value {
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::String(_))) =>
+                {
+                    match &c.0 {
+                        Some(litrs::Literal::String(s)) => s.value().to_string(),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {
+                    return None;
+                }
+            }
+        }
+        _ => {
+            // A RUNTIME template (`template.format(service=...,
+            // region=...)` — botocore's regions, where the
+            // template is a parameter): the template cannot be
+            // checked at conversion time — the format call is
+            // dropped (the dynamic-format divergence).
+            return None;
+        }
+    })
 }
 
 /// Lower a literal `template.format(args...)` call to a Rust `format!`.
