@@ -784,6 +784,29 @@ pub(crate) fn to_rust_place_expr(
                 symbols.clone(),
             )
         }
+        // A NAME narrowed from a polymorphic root to a class of its subtree
+        // (hierarchy.rs): as a PLACE it is the sum type's mutable view, so
+        // a store or a mutating call through it reaches the real value
+        // (the read view is a clone). A narrowing to a nested root has no
+        // place: loud.
+        ExprType::Name(n)
+            if let Some(root) = options.narrowed_class_origin.get(&n.id)
+                && let Some(crate::TypeInfo::Class(t)) = options.narrowed_names.get(&n.id)
+                && t != root =>
+        {
+            if crate::ast::tree::hierarchy::is_polymorphic_root(t) {
+                return Err(format!(
+                    "mutating `{}` inside `isinstance({}, {})` is not supported: `{}` is \
+                     itself a base class, and its narrowed view is a copy — test for \
+                     the concrete class, or mutate through a method of `{}`",
+                    n.id, n.id, t, t, root
+                )
+                .into());
+            }
+            let name = crate::safe_ident(&n.id);
+            let as_mut = format_ident!("__rython_as_{}_mut", t);
+            Ok(quote!((#name).#as_mut().unwrap()))
+        }
         _ => expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()),
     }
 }

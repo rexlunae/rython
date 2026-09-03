@@ -769,6 +769,24 @@ impl<'a> CodeGen for Assign {
             // generic trait default, `self.f = v` must store through the
             // mutable accessor (`*self.f_mut() = v`) rather than the load
             // accessor (which clones).
+            // A store into a polymorphic ROOT's slot (hierarchy.rs) —
+            // `self.inner = Inner(0)` where Inner has subclasses — takes
+            // the sum type: a struct of the subtree converts, the rule
+            // `coerce_tokens` applies to an argument or a return.
+            let root_slot_value = if let ExprType::Attribute(_) = target
+                && let crate::TypeInfo::Class(slot) =
+                    crate::infer_type(Some(&ctx), target, &options, &symbols)
+                && crate::ast::tree::hierarchy::is_polymorphic_root(&slot)
+                && let crate::TypeInfo::Class(from) =
+                    crate::infer_type(Some(&ctx), &value_expr, &options, &symbols)
+                && (from == slot
+                    || crate::ast::tree::class_def::ClassDef::extends_by_name(&from, &slot))
+            {
+                Some(quote!((#value).into()))
+            } else {
+                None
+            };
+            let value = root_slot_value.as_ref().unwrap_or(value);
             let target_code = match target {
                 ExprType::Attribute(attr) => crate::ast::tree::attribute::to_rust_place(
                     &attr.value,

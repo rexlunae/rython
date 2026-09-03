@@ -4260,6 +4260,28 @@ fn count_expr_reads(expr: &ExprType, info: &mut FunctionTypeInfo) {
                 count_expr_reads(&g.iter, info);
             }
         }
+        // A generator expression / set / dict comprehension reads its
+        // iterables too (`sum(1 for s in shapes if ...)` after `for s in
+        // shapes` — the first loop must clone, the idiom corpus's views).
+        ExprType::GeneratorExp(g) => {
+            count_expr_reads(&g.elt, info);
+            for comp in &g.generators {
+                count_expr_reads(&comp.iter, info);
+            }
+        }
+        ExprType::SetComp(sc) => {
+            count_expr_reads(&sc.elt, info);
+            for comp in &sc.generators {
+                count_expr_reads(&comp.iter, info);
+            }
+        }
+        ExprType::DictComp(dc) => {
+            count_expr_reads(&dc.key, info);
+            count_expr_reads(&dc.value, info);
+            for comp in &dc.generators {
+                count_expr_reads(&comp.iter, info);
+            }
+        }
         ExprType::Starred(s) => count_expr_reads(&s.value, info),
         ExprType::JoinedStr(js) => {
             for v in &js.values {

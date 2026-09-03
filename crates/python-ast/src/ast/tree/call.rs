@@ -2615,20 +2615,24 @@ impl<'a> CodeGen for Call {
                             if let Some(c) = &arg_class
                                 && crate::ast::tree::hierarchy::is_polymorphic_root(c)
                             {
-                                if t.id == *c
+                                // The registry knows the class's own name:
+                                // an alias target (`C = Circle`, `import
+                                // Rect as R`) resolves to it first.
+                                let target = crate::ast::tree::hierarchy::canonical_class_name(&t.id, &symbols);
+                                if target == *c
                                     || crate::ast::tree::class_def::ClassDef::class_extends(
-                                        c, &t.id, &symbols,
+                                        c, &target, &symbols,
                                     )
                                 {
                                     return Ok(quote!(true));
                                 }
-                                if crate::ast::tree::hierarchy::in_subtree_by_name(&t.id, c) {
+                                if crate::ast::tree::hierarchy::in_subtree_by_name(&target, c) {
                                     let arg = self.args[0].clone().to_rust(
                                         ctx.clone(),
                                         options.clone(),
                                         symbols.clone(),
                                     )?;
-                                    let is_fn = format_ident!("__rython_is_{}", t.id);
+                                    let is_fn = format_ident!("__rython_is_{}", target);
                                     return Ok(quote!((#arg).#is_fn()));
                                 }
                                 return Ok(quote!(false));
@@ -5767,9 +5771,17 @@ impl<'a> CodeGen for Call {
                     // only callees may read through the load form.
                     let mutates_receiver =
                         class.method_needs_mut_self(&attr.attr, &class_symbols, &options);
+                    let narrowed_class_name = matches!(
+                        attr.value.as_ref(),
+                        ExprType::Name(n)
+                            if options.narrowed_class_origin.get(&n.id).is_some_and(|root| {
+                                matches!(options.narrowed_names.get(&n.id), Some(crate::TypeInfo::Class(t)) if t != root)
+                            })
+                    );
                     let receiver =
                         if mutates_receiver
-                            && crate::ast::tree::attribute::chain_root_is_self(&attr.value)
+                            && (crate::ast::tree::attribute::chain_root_is_self(&attr.value)
+                                || narrowed_class_name)
                         {
                             // The WHOLE chain renders as a place:
                             // `self.outer.inner.bump()` goes through
