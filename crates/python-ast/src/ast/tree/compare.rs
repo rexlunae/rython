@@ -425,6 +425,12 @@ impl CodeGen for Compare {
                     comparator.clone()
                 }
             };
+            // `is` on a SHARED class's references is identity of the one
+            // object (shared.rs), never the `==` a class may define.
+            let shared_identity = matches!(
+                crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+                crate::TypeInfo::Class(c) if crate::ast::tree::shared::is_shared(&c)
+            );
             let tokens = match op {
                 Compares::Eq => quote!((#left).py_eq(&(#comparator))),
                 Compares::NotEq => quote!((#left).py_ne(&(#comparator))),
@@ -432,6 +438,8 @@ impl CodeGen for Compare {
                 Compares::LtE => quote!((#left).py_le(&(#comparator))),
                 Compares::Gt => quote!((#left).py_gt(&(#comparator))),
                 Compares::GtE => quote!((#left).py_ge(&(#comparator))),
+                Compares::Is if shared_identity => quote!((#left).py_is(&#comparator)),
+                Compares::IsNot if shared_identity => quote!(!(#left).py_is(&#comparator)),
                 Compares::Is => quote!(&#left == &#comparator),
                 Compares::IsNot => quote!(&#left != &#comparator),
                 // Python `in` dispatches on the container: substring for

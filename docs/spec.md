@@ -381,10 +381,15 @@ through subscript/attribute stores marks the chain's base variable.
   SHARED class (below) is the exception: its references alias.
 - **Shared instances (the aliasing representation, issue #137).** A
   class whose instances are stored in a container anywhere in the crate
-  (a `list[C]`, `dict[K, C]`, `set[C]`, … annotation) AND mutated after
-  construction anywhere in the crate (a method that stores into `self`, a
-  container-mutating call on a `self` field, or a field of the class
-  stored through a non-`self` receiver) is SHARED: its values are
+  (a `list[C]`, `dict[K, C]`, `set[C]`, … slot, as the typed annotation
+  authority resolves it — an alias `Items = list[C]`, a class's inferred
+  field table, an un-annotated store the inferrer types — count; the
+  boxed generics `Sequence[C]`, `Iterable[C]` hold no struct and do not)
+  AND mutated after construction anywhere in the crate (a method, an
+  `async def` included, that stores into or `del`s a `self` field, a
+  container-mutating call on one, a field of the class stored through a
+  non-`self` receiver — or the same on any base class, since a mutator
+  is inherited) is SHARED: its values are
   `stdpython::PyRef<C>` (`Rc<RefCell<C>>`), so the container slot, a
   local fetched from it (`item = self.find(name)`), a loop variable, and
   a parameter are ONE object, as every CPython reference is. Reads go
@@ -396,7 +401,14 @@ through subscript/attribute stores marks the chain's base variable.
   immutable object, or one no container holds, is unobservable). The
   `shared.rs` analysis is the one authority; a shared class's method
   that lets `self` escape (stores or returns `self`) is loud in rustc
-  (the struct is not the reference).
+  (the struct is not the reference). On shared references `is` is
+  identity of the one object, `==` is CPython's default (identity) —
+  a shared class that defines `__eq__` (own or inherited) cannot route
+  `==` through it (the emitted `__eq__` takes the boxed value), so `==`
+  on its references panics at runtime and the conversion warns. An
+  instance's truth (`bool(x)`, also through `Option` and the sum type)
+  is `__bool__`, else `__len__() != 0`, else True, the dunder resolved
+  on the MRO.
 - Names first assigned inside a `try` body (which lowers to a closure)
   are pre-initialized with `Default::default()` to satisfy rustc's
   capture rules; behavior is unchanged on the paths Python defines.

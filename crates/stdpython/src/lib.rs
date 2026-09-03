@@ -3890,10 +3890,18 @@ impl<T: core::fmt::Debug> core::fmt::Debug for PyRef<T> {
     }
 }
 
-/// Identity, as CPython's default `__eq__` is.
-impl<T> PartialEq for PyRef<T> {
+/// A shared class's `==` (the converter implements this for every shared
+/// class): identity by default, as CPython's default `__eq__` is; a class
+/// whose `__eq__` the reference form cannot call overrides it to panic.
+pub trait PyRefEq: Sized {
+    fn ref_eq(a: &PyRef<Self>, b: &PyRef<Self>) -> bool {
+        a.py_is(b)
+    }
+}
+
+impl<T: PyRefEq> PartialEq for PyRef<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.py_is(other)
+        T::ref_eq(self, other)
     }
 }
 
@@ -3939,6 +3947,7 @@ mod pyref_tests {
     struct Counter {
         n: i64,
     }
+    impl PyRefEq for Counter {}
 
     #[test]
     fn a_clone_is_the_same_object() {
@@ -3948,6 +3957,10 @@ mod pyref_tests {
         assert_eq!(a.borrow().n, 3);
         assert!(a.py_is(&b));
         assert!(!a.py_is(&PyRef::new(Counter { n: 3 })));
+        // `==` is identity by default (CPython's default __eq__): two
+        // aliases are equal, two distinct equal-field objects are not.
+        assert!(a == b);
+        assert!(a != PyRef::new(Counter { n: 3 }));
     }
 
     /// `bool(x)` on an optional value: None is false, a present value has

@@ -3291,10 +3291,13 @@ impl CodeGen for ClassDef {
         // where `proxy: Url | None` and `PyBool for Option<T>` asks the
         // inner value): Python's `__bool__`, else `__len__() != 0`, else
         // True. A raise inside either is the loud §12.2 panic.
+        // The dunder resolves on the MRO: an inherited `__len__` is the
+        // derived instance's truth too (Devin review on #321); the call
+        // reaches it through the ancestor's trait, in scope with the class.
         let truth_impl = if options.with_std_python {
-            let body = if self.methods().any(|m| m.name == "__bool__") {
+            let body = if self.method_on_mro("__bool__", &symbols).is_some() {
                 quote!(self.__bool__().expect("__bool__ raised"))
-            } else if self.methods().any(|m| m.name == "__len__") {
+            } else if self.method_on_mro("__len__", &symbols).is_some() {
                 quote!(self.__len__().expect("__len__ raised") != 0)
             } else {
                 quote!(true)
@@ -3304,6 +3307,39 @@ impl CodeGen for ClassDef {
                     #body
                 }
             })
+        } else {
+            quote!()
+        };
+        // A SHARED class's `==` (shared.rs): Python's default is identity,
+        // which `PyRefEq`'s default gives. A class defining `__eq__` (own
+        // or inherited) cannot route `==` through it — the emitted
+        // `__eq__` takes the boxed value, which no class instance can be
+        // — so `==` on its references is a loud runtime panic and the
+        // conversion says so, never the identity default in silence
+        // (Devin review on #321).
+        let ref_eq_impl = if options.with_std_python
+            && crate::ast::tree::shared::is_shared(&self.name)
+        {
+            if self.method_on_mro("__eq__", &symbols).is_some() {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "class `{}` defines __eq__ and is shared (its instances are held \
+                     by reference, issue #137): `==` on its references cannot call \
+                     __eq__ (whose parameter is the boxed value) and panics at runtime; \
+                     `is` keeps its identity meaning",
+                    self.name
+                ));
+                let msg = format!(
+                    "TypeError: == on shared class `{}`, which defines __eq__, is not supported (issue #137)",
+                    self.name
+                );
+                quote!(impl stdpython::PyRefEq for #class_name {
+                    fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
+                        panic!(#msg)
+                    }
+                })
+            } else {
+                quote!(impl stdpython::PyRefEq for #class_name {})
+            }
         } else {
             quote!()
         };
@@ -3406,7 +3442,7 @@ impl CodeGen for ClassDef {
             // so `x is None` on an instance lowers through PyIsNone to
             // false — same contract the PyInherits tree carries for
             // ancestry bounds.
-            #is_none_impl #truth_impl
+            #is_none_impl #truth_impl #ref_eq_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
