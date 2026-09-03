@@ -4162,6 +4162,7 @@ pub(crate) fn bind_fresh(scope: &mut PythonOptions, target: &ExprType, ty: Optio
 pub(crate) fn bind_fresh_name(scope: &mut PythonOptions, name: &str, ty: Option<&TypeInfo>) {
     std::rc::Rc::make_mut(&mut scope.narrowed_names).remove(name);
     std::rc::Rc::make_mut(&mut scope.optional_names).remove(name);
+    std::rc::Rc::make_mut(&mut scope.narrowed_class_origin).remove(name);
     let types = std::rc::Rc::make_mut(&mut scope.name_types);
     match ty {
         Some(t) => {
