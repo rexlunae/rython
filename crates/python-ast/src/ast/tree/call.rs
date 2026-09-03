@@ -8818,7 +8818,14 @@ fn named_call_class(
     let ExprType::Name(cn) = call.func.as_ref() else {
         return None;
     };
-    let fdef = match symbols.get(&cn.id) {
+    // An ALIASED import (`from pkg.shapes import Shape as S`) binds the
+    // local name to the canonical one, which carries the ImportFrom: the
+    // defining module knows only the canonical name.
+    let (name, node) = match symbols.get(&cn.id) {
+        Some(SymbolTableNode::Alias(canonical)) => (canonical.clone(), symbols.get(canonical)),
+        other => (cn.id.clone(), other),
+    };
+    let fdef = match node {
         Some(SymbolTableNode::FunctionDef(f)) => Some((f.clone(), symbols.clone())),
         Some(SymbolTableNode::ImportFrom(ifm)) => {
             // The module key authority (`module_defs_key`) covers the
@@ -8829,17 +8836,17 @@ fn named_call_class(
             // An imported CLASS constructor: the class itself, with its
             // defining module's symbols (the same key).
             if let Some(key) = key
-                && let Some((class, class_symbols)) = crate::module_class_def(options, key, &cn.id)
+                && let Some((class, class_symbols)) = crate::module_class_def(options, key, &name)
             {
                 return Some((class.name, class_symbols));
             }
-            key.and_then(|key| crate::module_function_def(options, key, &cn.id))
+            key.and_then(|key| crate::module_function_def(options, key, &name))
         }
         _ => None,
     };
     match fdef {
         Some((f, f_symbols)) => f.return_class_name(options).map(|class| (class, f_symbols)),
-        None => Some((cn.id.clone(), symbols.clone())),
+        None => Some((name, symbols.clone())),
     }
 }
 

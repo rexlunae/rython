@@ -17026,3 +17026,37 @@ fn a_root_qualified_imported_constructor_result_is_a_method_receiver() {
         out
     );
 }
+
+/// An ALIASED root-qualified import (`from pkg.shapes import Shape as S`)
+/// constructed and used directly as a receiver: the alias resolves to the
+/// canonical name the defining module knows.
+#[test]
+fn an_aliased_imported_constructor_result_is_a_method_receiver() {
+    let shapes = parse(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n",
+        "shapes.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["shapes".to_string()], std::rc::Rc::new(shapes));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.shapes import Shape as S\n\ndef go() -> float:\n    return S().area()\n",
+        "usemod3.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("usemod3".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". area () ?"),
+        "the aliased class's method call propagates: {}",
+        out
+    );
+}
