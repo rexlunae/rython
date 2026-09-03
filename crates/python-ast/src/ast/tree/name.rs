@@ -192,6 +192,23 @@ impl CodeGen for Name {
                     // A PyValue narrowed to itself (e.g. the else of a
                     // compound `isinstance(x, T) and ...`) reads bare.
                     crate::TypeInfo::PyValue => quote!((#name)),
+                    // A root-typed name narrowed to a class of its subtree
+                    // (hierarchy.rs) reads as the sum type's VIEW of that
+                    // class — an owned clone, guaranteed by the guard; the
+                    // root itself (the else branch) reads bare.
+                    crate::TypeInfo::Class(t) => {
+                        match options.narrowed_class_origin.get(&self.id) {
+                            Some(root) if root != t => {
+                                let as_fn = quote::format_ident!("__rython_as_{}", t);
+                                quote!((#name).#as_fn().unwrap())
+                            }
+                            Some(_) => quote!((#name)),
+                            // Not a class narrowing: an `is not None`-narrowed
+                            // Option of a class unwraps, as every other
+                            // Option narrowing below does.
+                            None => quote!((#name).clone().unwrap()),
+                        }
+                    }
                     _ => quote!((#name).clone().unwrap()),
                 });
             }

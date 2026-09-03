@@ -234,9 +234,17 @@ impl TypeInfo {
             // A narrowed PyValue member still holds the boxed value at
             // runtime; only reads convert.
             TypeInfo::PyValueMember(_) => quote!(stdpython::PyValue),
+            // A polymorphic ROOT's slot holds any class in its subtree:
+            // the slot type is the generated sum type (hierarchy.rs). A
+            // leaf class is exactly its struct.
             TypeInfo::Class(name) => {
-                let ident = crate::safe_ident(name);
-                quote!(#ident)
+                if crate::ast::tree::hierarchy::is_polymorphic_root(name) {
+                    let any = crate::ast::tree::hierarchy::any_ident(name);
+                    quote!(#any)
+                } else {
+                    let ident = crate::safe_ident(name);
+                    quote!(#ident)
+                }
             }
             TypeInfo::Borrowed(inner) => {
                 let t = inner.to_rust_type();
@@ -287,17 +295,26 @@ pub fn coerce_tokens(
     from: &TypeInfo,
     to: &TypeInfo,
 ) -> Option<TokenStream> {
+    // A class value into a polymorphic ROOT's slot (hierarchy.rs): the
+    // slot is the sum type, and the value is a struct of the subtree or
+    // already the sum type — `.into()` covers both (the generated
+    // `From<Variant>`, or the reflexive `From<T> for T`). Decided BEFORE
+    // the equality early-out: `Shape()` into a `Shape` slot is a struct
+    // into an enum. A class outside the subtree is left as is: rustc
+    // rejects it loudly (E0308), never a silent conversion.
+    if let (TypeInfo::Class(a), TypeInfo::Class(b)) = (from, to)
+        && crate::ast::tree::hierarchy::is_polymorphic_root(b)
+    {
+        return if a == b || crate::ast::tree::class_def::ClassDef::extends_by_name(a, b) {
+            Some(quote!((#tokens).into()))
+        } else {
+            None
+        };
+    }
     if from == to {
         return Some(tokens);
     }
     match (from, to) {
-        // Derived → base (a subclass argument where an ancestor is
-        // expected): the generated `From<Derived> for Base` walks the
-        // embedded base structs (round 99 — the idiom corpus's
-        // `add(perishable)` where `add(item: Item)`). A pair with no
-        // generated From (unrelated classes) fails loudly in rustc (E0277)
-        // — never a silent conversion.
-        (TypeInfo::Class(_), TypeInfo::Class(_)) => Some(quote!((#tokens).into())),
         // &str → String: string literals in String-typed contexts.
         (TypeInfo::StrRef, TypeInfo::String) => Some(quote!((#tokens).to_string())),
         // String → &str: computed keys/args into &str-typed containers.
@@ -1103,6 +1120,13 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
             if is_numeric(&a) && is_numeric(&b) {
                 return TypeInfo::Float;
             }
+            // Two classes of one hierarchy unify to their nearest common
+            // ROOT (`[Circle(), Rect()]` is a list of Shape — hierarchy.rs).
+            if let (TypeInfo::Class(x), TypeInfo::Class(y)) = (&a, &b)
+                && let Some(root) = crate::ast::tree::hierarchy::common_root_by_name(x, y)
+            {
+                return TypeInfo::Class(root);
+            }
             if is_stringy(&a) && is_stringy(&b) {
                 return TypeInfo::String;
             }
@@ -1296,53 +1320,6 @@ pub fn render_typed(
     } else {
         actual
     };
-    // A DERIVED argument coerced to a BASE-typed slot: the generated
-    // `From<Derived> for Base` slices the embedded base — exact ONLY when
-    // the derived class overrides nothing the base declares (no dynamic
-    // dispatch is observable through the base-typed value). An OVERRIDING
-    // derived (`add(Perishable(...))` into `add(item: Item)`, where
-    // Perishable overrides `label` — the idiom corpus's report prints the
-    // override's `[7d]` through the base-typed dict) would LOSE the
-    // override: CPython dispatches dynamically. Loud conversion error,
-    // never silently different (Directive 4's interim, round 99).
-    if let (TypeInfo::Class(from_c), TypeInfo::Class(to_c)) = (&actual, &expected)
-        && from_c != to_c
-    {
-        let from_def = crate::resolve_class_referenced(from_c, &symbols, &options)
-            .or_else(|| match symbols.get(from_c) {
-                Some(crate::SymbolTableNode::ClassDef(c)) => Some(c.clone()),
-                _ => None,
-            });
-        if let Some(from_def) = from_def
-            && let Some(crate::SymbolTableNode::ClassDef(to_def)) = symbols.get(to_c)
-        {
-            // The derived's chain up to (excluding) the base: any method
-            // of the base defined in that slice is an override the slice
-            // would drop.
-            let chain = from_def.base_chain(&symbols);
-            let to_pos = chain.iter().position(|c| c.name == *to_c);
-            if let Some(to_pos) = to_pos {
-                // Every class BELOW the base in the derived's chain that
-                // defines one of the base's methods is an override the
-                // slice would drop.
-                let overridden = chain[..to_pos].iter().any(|overrider| {
-                    to_def.methods().any(|m| {
-                        overrider.methods().any(|om| om.name == m.name)
-                    })
-                });
-                if overridden {
-                    return Err(format!(
-                        "passing `{from_c}` where `{to_c}` is expected is not supported yet: \
-                         the derived class overrides a base method, and the base-typed slot \
-                         would lose the override (CPython dispatches dynamically through \
-                         the base-typed container); rython refuses to silently ignore it — \
-                         store the derived type directly or restructure"
-                    )
-                    .into());
-                }
-            }
-        }
-    }
     match coerce_tokens(tokens.clone(), &actual, &expected) {
         Some(coerced) => Ok(coerced),
         None => {
@@ -1430,7 +1407,15 @@ pub fn render_reused(
         .to_rust(ctx, options.clone(), symbols.clone())?;
     if let Some(root) = reuse_root_name(expr) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
-        if uses > 1 {
+        // A NARROWED name already reads as an owned value (the unwrap or
+        // member conversion clones — name.rs), so the reuse-clone would
+        // clone twice; only the bare narrowings (a str|bytes union read
+        // as itself, a PyValue narrowed to itself) still move.
+        let narrowed_owned = matches!(expr, ExprType::Name(_))
+            && options.narrowed_names.get(&root).is_some_and(|t| {
+                !matches!(t, TypeInfo::StrOrBytes | TypeInfo::PyValue)
+            });
+        if uses > 1 && !narrowed_owned {
             let t = infer_type(None, expr, &options, &symbols);
             // Round 92: clone whenever the name is not statically Copy —
             // INCLUDING an inferrer-unknown (PyObject) name, which the

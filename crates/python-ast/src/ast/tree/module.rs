@@ -376,6 +376,12 @@ impl CodeGen for Module {
                 }
             }
             options.hierarchy_classes = std::rc::Rc::new(hierarchy);
+            // The closed-world hierarchy (hierarchy.rs): the polymorphic
+            // roots of the WHOLE crate and their subtrees, so a root's
+            // slot type renders as its sum type in every module.
+            let roots = crate::ast::tree::hierarchy::compute_roots(&classes, &options);
+            crate::ast::tree::hierarchy::install_roots(&roots);
+            options.hierarchy_roots = std::rc::Rc::new(roots);
         }
 
         // Functions whose unannotated parameter is isinstance-dispatched

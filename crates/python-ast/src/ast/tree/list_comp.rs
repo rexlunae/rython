@@ -249,10 +249,16 @@ fn build_comprehension_loops(
             .target
             .clone()
             .to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
-        let iter_expr = generator
-            .iter
-            .clone()
-            .to_rust(ctx.clone(), iter_options.clone(), symbols.clone())?;
+        // The iterable takes the reuse-clone a for-statement's does: the
+        // loop consumes it, and a name read again later (`sum(s.area()
+        // for s in shapes)` then `max(shapes, ...)` — the idiom corpus's
+        // shapes) would otherwise be a use after move (E0382).
+        let iter_expr = crate::render_reused(
+            &generator.iter,
+            ctx.clone(),
+            iter_options.clone(),
+            symbols.clone(),
+        )?;
         let conditions: Result<Vec<_>, _> = generator
             .ifs
             .iter()

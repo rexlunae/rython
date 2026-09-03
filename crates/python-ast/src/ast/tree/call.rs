@@ -2602,6 +2602,37 @@ impl<'a> CodeGen for Call {
                                 }
                                 _ => None,
                             };
+                            // A ROOT-typed name (hierarchy.rs) holds any
+                            // class of the subtree: a target inside the
+                            // subtree is a RUNTIME variant test (the
+                            // generated predicate), an ancestor is true,
+                            // anything else is false — exact, never a fold
+                            // of the static type as if it were the runtime
+                            // one (the idiom corpus's shapes: a Square in a
+                            // `list[Shape]` answered false to `isinstance(s,
+                            // Rect)`). A leaf class IS its struct, so the
+                            // class-tree fold is exact there.
+                            if let Some(c) = &arg_class
+                                && crate::ast::tree::hierarchy::is_polymorphic_root(c)
+                            {
+                                if t.id == *c
+                                    || crate::ast::tree::class_def::ClassDef::class_extends(
+                                        c, &t.id, &symbols,
+                                    )
+                                {
+                                    return Ok(quote!(true));
+                                }
+                                if crate::ast::tree::hierarchy::in_subtree_by_name(&t.id, c) {
+                                    let arg = self.args[0].clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
+                                    let is_fn = format_ident!("__rython_is_{}", t.id);
+                                    return Ok(quote!((#arg).#is_fn()));
+                                }
+                                return Ok(quote!(false));
+                            }
                             let result = match &arg_class {
                                 Some(c) => {
                                     crate::ast::tree::class_def::ClassDef::class_extends(
@@ -8506,6 +8537,21 @@ fn lower_str_format(
                             );
                         ));
                         fmt.push_str(&format!("{{{}}}", fld));
+                    }
+                    // Python's general float format: the runtime renders
+                    // the significant digits; fill/align/width apply after.
+                    crate::pyformat::SpecLowering::GeneralFloat { precision, suffix } => {
+                        let fld = format!("__rython_fld{}", field_bindings.len());
+                        let src = crate::safe_ident(&index_name);
+                        let ident = crate::safe_ident(&fld);
+                        field_bindings.push(quote!(
+                            let #ident = py_format_g((#src) as f64, #precision);
+                        ));
+                        if suffix.is_empty() {
+                            fmt.push_str(&format!("{{{}}}", fld));
+                        } else {
+                            fmt.push_str(&format!("{{{}:{}}}", fld, suffix));
+                        }
                     }
                     // The `,` thousands separator: the runtime groups the
                     // integer's digits.

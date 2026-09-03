@@ -160,6 +160,12 @@ pub(crate) enum SpecLowering {
     /// The `,` thousands separator (`f"{size:,}"` — rich's filesize): the
     /// grouped integer renders through the stdpython runtime formatter.
     GroupedInt,
+    /// Python's general float format (`g`: `precision` significant
+    /// digits, fixed or scientific by the exponent, trailing zeros
+    /// stripped), rendered by the stdpython runtime formatter; `suffix`
+    /// is the fill/align/width part, applied by Rust to the rendered
+    /// string exactly as Python applies it.
+    GeneralFloat { precision: usize, suffix: String },
 }
 
 
@@ -284,6 +290,36 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
                 precision = "6".to_string();
             }
         }
+        // Python's general format: the runtime formatter renders the
+        // significant digits and picks fixed or scientific by the
+        // exponent (Rust has no equivalent); fill/align/width then apply
+        // to the rendered string, as Python applies them.
+        Some('g') => {
+            if grouped {
+                return Err("the ',' thousands separator is not supported with the 'g' \
+                            presentation type"
+                    .into());
+            }
+            let precision: usize = if precision.is_empty() {
+                6
+            } else {
+                precision.parse().map_err(|_| "bad precision".to_string())?
+            };
+            let mut suffix = String::new();
+            if let Some(f) = fill {
+                suffix.push(f);
+            }
+            if let Some(a) = align {
+                suffix.push(a);
+            }
+            suffix.push_str(&width);
+            if sign == Some('+') || alternate || zero {
+                return Err("sign, '#' and '0' flags are not supported yet with the 'g' \
+                            presentation type"
+                    .into());
+            }
+            return Ok(SpecLowering::GeneralFloat { precision, suffix });
+        }
         Some(radix @ ('x' | 'X' | 'o' | 'b')) => {
             if !precision.is_empty() {
                 return Err("precision not allowed in integer format specifier".into());
@@ -375,6 +411,16 @@ mod tests {
             SpecLowering::GroupedInt
         ));
         assert!(translate_format_spec("e").is_err());
+        // Python's general float format routes through the runtime
+        // formatter (py_format_g), with the width applied after.
+        assert_eq!(
+            translate_format_spec("g").unwrap(),
+            GeneralFloat { precision: 6, suffix: String::new() }
+        );
+        assert_eq!(
+            translate_format_spec(">8.3g").unwrap(),
+            GeneralFloat { precision: 3, suffix: ">8".into() }
+        );
         assert!(translate_format_spec("=10").is_err());
     }
 

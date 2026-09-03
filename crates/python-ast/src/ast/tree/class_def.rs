@@ -814,6 +814,13 @@ impl ClassDef {
         }
     }
 
+    /// `class_extends` by the hierarchy registry alone (no symbol table in
+    /// hand — the coercion authority): whether `child` is in `ancestor`'s
+    /// subtree.
+    pub(crate) fn extends_by_name(child: &str, ancestor: &str) -> bool {
+        child == ancestor || crate::ast::tree::hierarchy::in_subtree_by_name(child, ancestor)
+    }
+
     /// The class name that closes an inheritance cycle (`class A(A)`), or
     /// None for a valid chain. Walks bases like base_chain but reports the
     /// repeat instead of silently stopping.
@@ -3323,32 +3330,7 @@ impl CodeGen for ClassDef {
                 let ancestor = crate::safe_ident(&a.name);
                 quote!(impl PyInherits<#ancestor> for #class_name {})
             });
-            // The UP-CAST conversions: a derived instance into each
-            // ancestor, via the embedded base structs (the slice is exact —
-            // the ancestor's fields ARE the embedded part; CPython's shared
-            // object identity is the value-semantics divergence §12.3
-            // records for the container model). `add(perishable)` where
-            // `add(item: Item)` — the idiom corpus's add (round 99). One
-            // `From` per ancestor, walking the same base_chain the
-            // PyInherits tree uses, so the two cannot drift.
-            let chain: Vec<_> = self.base_chain(&symbols).into_iter().collect();
-            // base_chain is REFLEXIVE (chain[0] is the class itself) — the
-            // From impls start at the first real ancestor.
-            let from_impls = (1..chain.len())
-                .map(|depth| {
-                    let ancestor = crate::safe_ident(&chain[depth].name);
-                    let mut tokens = quote!(v);
-                    for _ in 0..depth {
-                        tokens = quote!(#tokens.__rython_base);
-                    }
-                    quote!(impl std::convert::From<#class_name> for #ancestor {
-                        fn from(v: #class_name) -> #ancestor {
-                            #tokens
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            quote!(#(#entries)* #(#from_impls)*)
+            quote!(#(#entries)*)
         } else {
             quote!()
         };
@@ -3442,16 +3424,40 @@ impl CodeGen for ClassDef {
                 };
                 quote!(format!("<{} object>", #class_display))
             };
+            // repr(obj) is `__repr__` alone (str falls back to it, not the
+            // other way round); a class without one reprs as the default
+            // object form. Every class carries PyRepr so a container of
+            // instances prints (`print(sorted(shapes, key=...))`) and the
+            // hierarchy sum type can delegate.
+            let repr_expr = if defines_dunder("__repr__") {
+                quote!(self.__repr__().unwrap_or_else(|e| panic!("{}", e)))
+            } else {
+                let module = options.module_path.join(".");
+                let class_display = if module.is_empty() {
+                    self.name.clone()
+                } else {
+                    format!("{module}.{}", self.name)
+                };
+                quote!(format!("<{} object>", #class_display))
+            };
             quote! {
                 impl stdpython::PyDisplay for #class_name {
                     fn py_display(&self) -> String {
                         #display_expr
                     }
                 }
+                impl stdpython::PyRepr for #class_name {
+                    fn py_repr(&self) -> String {
+                        #repr_expr
+                    }
+                }
             }
         } else {
             quote!()
         };
+
+        // A polymorphic ROOT's sum type (hierarchy.rs), after the class.
+        let any_enum = self.emit_any_enum(in_hierarchy, &symbols, &options)?;
 
         Ok(quote! {
             #docs
@@ -3480,6 +3486,7 @@ impl CodeGen for ClassDef {
                 #base_inherent_accessors
                 #methods_stream
             }
+            #any_enum
         })
     }
 }
@@ -5708,5 +5715,294 @@ fn collect_self_attr_reads(
             }
             _ => {}
         }
+    }
+}
+
+impl ClassDef {
+    /// The sum type of a polymorphic ROOT (hierarchy.rs): `enum AnyShape {
+    /// Shape(Shape), Circle(Circle), ... }` with one variant per class in
+    /// the root's subtree, plus everything a root-typed slot needs —
+    /// `From` per variant (and per nested root), the root's accessors and
+    /// every method of its MRO dispatching by `match` to the variant's own
+    /// implementation, the runtime traits (`PyDisplay`, `PyRepr`,
+    /// `PyIsNone`, `PyInherits`), a `Default` (the root variant), and the
+    /// `isinstance` predicates and narrowing views (`__rython_is_X`,
+    /// `__rython_as_X`) the lowering emits instead of the constant fold.
+    /// Empty for a class that is not a root.
+    pub(crate) fn emit_any_enum(
+        &self,
+        in_hierarchy: bool,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        use crate::ast::tree::hierarchy as h;
+        let Some(variants) = h::subtree(options, &self.name) else {
+            return Ok(quote!());
+        };
+        if !options.with_std_python {
+            return Ok(quote!());
+        }
+        let any = h::any_ident(&self.name);
+        let root_ident = crate::safe_ident(&self.name);
+        let vnames: Vec<proc_macro2::Ident> =
+            variants.iter().map(|v| crate::safe_ident(&v.name)).collect();
+        let vpaths: Vec<TokenStream> = variants.iter().map(h::variant_path).collect();
+
+        // ---- The type, its conversions, and the runtime traits ----
+        let from_impls = vnames.iter().zip(vpaths.iter()).map(|(vn, vp)| {
+            quote! {
+                impl std::convert::From<#vp> for #any {
+                    fn from(v: #vp) -> #any { #any::#vn(v) }
+                }
+            }
+        });
+        // A NESTED root in the subtree (Rect inside Shape's): its own sum
+        // type converts variant by variant.
+        let nested_from = variants.iter().skip(1).filter(|v| h::subtree(options, &v.name).is_some()).map(|v| {
+            let inner_any = h::any_ident(&v.name);
+            let inner_any_path = match &v.module_path {
+                None => quote!(#inner_any),
+                Some(path) => {
+                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    quote!(crate #(::#segs)* :: #inner_any)
+                }
+            };
+            let members: Vec<proc_macro2::Ident> = h::subtree(options, &v.name)
+                .map(|s| s.iter().map(|m| crate::safe_ident(&m.name)).collect())
+                .unwrap_or_default();
+            quote! {
+                impl std::convert::From<#inner_any_path> for #any {
+                    fn from(v: #inner_any_path) -> #any {
+                        match v { #(#inner_any_path::#members(x) => #any::#members(x)),* }
+                    }
+                }
+            }
+        });
+        let ancestors: Vec<proc_macro2::Ident> = self
+            .base_chain(symbols)
+            .iter()
+            .map(|a| crate::safe_ident(&a.name))
+            .collect();
+        let runtime_impls = quote! {
+            impl Default for #any {
+                fn default() -> Self { #any::#root_ident(#root_ident::default()) }
+            }
+            impl stdpython::PyIsNone for #any {
+                fn py_is_none(&self) -> bool { false }
+            }
+            #(impl PyInherits<#ancestors> for #any {})*
+            impl stdpython::PyDisplay for #any {
+                fn py_display(&self) -> String {
+                    match self { #(#any::#vnames(v) => v.py_display()),* }
+                }
+            }
+            impl stdpython::PyRepr for #any {
+                fn py_repr(&self) -> String {
+                    match self { #(#any::#vnames(v) => v.py_repr()),* }
+                }
+            }
+        };
+
+        // ---- isinstance predicates and narrowing views ----
+        let mut views = TokenStream::new();
+        for v in variants.iter().skip(1) {
+            let is_fn = format_ident!("__rython_is_{}", v.name);
+            let as_fn = format_ident!("__rython_as_{}", v.name);
+            let members: Vec<proc_macro2::Ident> = match h::subtree(options, &v.name) {
+                Some(s) => s.iter().map(|m| crate::safe_ident(&m.name)).collect(),
+                None => vec![crate::safe_ident(&v.name)],
+            };
+            let (view_ty, arms) = match h::subtree(options, &v.name) {
+                Some(_) => {
+                    let inner_any = h::any_ident(&v.name);
+                    let inner_any_path = match &v.module_path {
+                        None => quote!(#inner_any),
+                        Some(path) => {
+                            let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                            quote!(crate #(::#segs)* :: #inner_any)
+                        }
+                    };
+                    (
+                        inner_any_path.clone(),
+                        quote!(#(#any::#members(x) => Some(#inner_any_path::#members(x.clone()))),*),
+                    )
+                }
+                None => {
+                    let vp = h::variant_path(v);
+                    let vn = crate::safe_ident(&v.name);
+                    (vp, quote!(#any::#vn(x) => Some(x.clone())))
+                }
+            };
+            views.extend(quote! {
+                pub fn #is_fn(&self) -> bool {
+                    matches!(self, #(#any::#members(_))|*)
+                }
+                pub fn #as_fn(&self) -> Option<#view_ty> {
+                    match self { #arms, _ => None }
+                }
+            });
+        }
+
+        // ---- Accessors and method delegators, per class of the MRO ----
+        let chain = self.cross_module_chain(symbols, options);
+        let mut inherent = TokenStream::new();
+        let mut trait_impls = TokenStream::new();
+        let mut seen_methods: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // A method is a member of the trait of the class that FIRST
+        // defines it (the topmost definer in the chain): an override
+        // forwards under that ancestor's trait, never under the
+        // overrider's (E0407). The chain runs root-first, so the last
+        // index defining a name is its definer.
+        let skip_method = |m: &FunctionDef| {
+            m.name == "__init__"
+                || m.decorator_list.iter().any(|d| {
+                    matches!(d, ExprType::Name(n) if n.id == "staticmethod" || n.id == "classmethod")
+                })
+        };
+        let mut definer: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, (anc, _, _, _)) in chain.iter().enumerate() {
+            for m in anc.methods() {
+                if skip_method(m) {
+                    continue;
+                }
+                let name = if anc.is_property_setter(&m.name) {
+                    anc.emitted_method_name(m)
+                } else {
+                    m.name.clone()
+                };
+                definer.insert(name, i);
+            }
+        }
+        for (depth, (ancestor, a_syms, a_opts, a_path)) in chain.iter().enumerate() {
+            let a_trait = format_ident!("{}Trait", ancestor.name);
+            let trait_path = match a_path {
+                Some(path) => {
+                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    quote!(crate #(::#segs)* :: #a_trait)
+                }
+                None => quote!(#a_trait),
+            };
+            // Does this class's trait carry its METHODS (the full
+            // machinery) or only its accessors? Same rule the emission
+            // uses: same-module, the module's hierarchy set; cross-module,
+            // the defining module's trait registry.
+            let full_trait = if depth == 0 {
+                in_hierarchy
+            } else {
+                match a_path {
+                    None => options.hierarchy_classes.contains(&ancestor.name),
+                    Some(path) => crate::ast::tree::module::module_class_traits(a_opts, path)
+                        .contains_key(&ancestor.name),
+                }
+            };
+            let has_trait = full_trait
+                || (a_path.is_none()
+                    && crate::ast::tree::module::class_subclassed_crate_wide(&ancestor.name, options))
+                || a_path.is_some();
+            let mut fwd = TokenStream::new();
+            // base()/base_mut(): the trait's required accessors for a class
+            // with a base — trait-qualified on the variant, since the
+            // variant's INHERENT base() is its own base, not this one's.
+            if let Some(b) = ancestor.base_class_with_options(a_syms, a_opts) {
+                let b_ident = crate::safe_ident(&b.name);
+                fwd.extend(quote! {
+                    fn base(&self) -> &#b_ident {
+                        match self { #(#any::#vnames(v) => <#vpaths as #trait_path>::base(v)),* }
+                    }
+                    fn base_mut(&mut self) -> &mut #b_ident {
+                        match self { #(#any::#vnames(v) => <#vpaths as #trait_path>::base_mut(v)),* }
+                    }
+                });
+            }
+            let fields = ancestor.own_fields(a_syms, a_opts)?;
+            for (fname, fty) in &fields {
+                if ancestor.base_class_with_options(a_syms, a_opts).is_some()
+                    && matches!(fname.as_str(), "base" | "base_mut")
+                {
+                    continue;
+                }
+                if !seen_fields.insert(fname.clone()) {
+                    continue;
+                }
+                let f = crate::safe_ident(fname);
+                let f_mut = format_ident!("{}_mut", fname);
+                let ty = fty.to_rust_type();
+                inherent.extend(quote! {
+                    pub fn #f(&self) -> #ty {
+                        match self { #(#any::#vnames(v) => v.#f()),* }
+                    }
+                    pub fn #f_mut(&mut self) -> &mut #ty {
+                        match self { #(#any::#vnames(v) => v.#f_mut()),* }
+                    }
+                });
+                fwd.extend(quote! {
+                    fn #f(&self) -> #ty { #any::#f(self) }
+                    fn #f_mut(&mut self) -> &mut #ty { #any::#f_mut(self) }
+                });
+            }
+            for m in ancestor.methods() {
+                if skip_method(m) {
+                    continue;
+                }
+                let mut emitted = m.clone();
+                if ancestor.is_property_setter(&m.name) {
+                    emitted.name = ancestor.emitted_method_name(m);
+                }
+                // The inherent delegator takes the most-derived rendering
+                // (first seen); the trait forwarder goes under the
+                // definer's trait, rendered in the definer's own scope.
+                let first_seen = seen_methods.insert(emitted.name.clone());
+                let is_definer = definer.get(&emitted.name) == Some(&depth);
+                if !first_seen && !is_definer {
+                    continue;
+                }
+                let force_mut_self = options
+                    .trait_mut_self
+                    .get(&ancestor.name)
+                    .is_some_and(|s| s.contains(&m.name));
+                let trait_ctx = CodeGenContext::Trait {
+                    class: ancestor.name.clone(),
+                    generic: false,
+                    super_target: None,
+                    force_mut_self,
+                };
+                let rendered = emitted.to_rust(trait_ctx, a_opts.clone(), a_syms.clone())?;
+                let Some((head, name, args)) = h::split_fn(&rendered) else {
+                    continue;
+                };
+                let call_args = quote!(#(#args),*);
+                let fwd_args = quote!(#(, #args)*);
+                if first_seen {
+                    inherent.extend(quote! {
+                        pub #head {
+                            match self { #(#any::#vnames(v) => v.#name(#call_args)),* }
+                        }
+                    });
+                }
+                if full_trait && is_definer {
+                    fwd.extend(quote! {
+                        #head { #any::#name(self #fwd_args) }
+                    });
+                }
+            }
+            if has_trait {
+                trait_impls.extend(quote! {
+                    impl #trait_path for #any { #fwd }
+                });
+            }
+        }
+        Ok(quote! {
+            #[derive(Clone)]
+            pub enum #any { #(#vnames(#vpaths)),* }
+            #(#from_impls)*
+            #(#nested_from)*
+            #runtime_impls
+            impl #any {
+                #views
+                #inherent
+            }
+            #trait_impls
+        })
     }
 }

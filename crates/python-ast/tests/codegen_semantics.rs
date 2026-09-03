@@ -17060,3 +17060,125 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
         out
     );
 }
+    // `Inner` has a subclass here, so the `inner: Inner` field is the
+    // hierarchy sum type (§7) and its field is reached through the
+    // accessor: `self.inner_mut().nums_mut()`.
+        out.contains("(self . inner_mut () . nums_mut ()) . push"),
+        "builtin mutating method must go through self.inner_mut().nums_mut(): {}",
+fn a_derived_argument_into_a_base_slot_converts_into_the_sum_type() {
+    // The closed-world hierarchy (issue #137, drift 2): `Item` has a
+    // subclass, so an `Item` slot is the sum type `AnyItem` — one variant
+    // per class of the subtree, dispatching by match — and a `Perishable`
+    // flows into `add(item: Item)` through `From<Perishable> for AnyItem`,
+    // keeping its override and its identity. This replaces the struct
+    // slice (which dropped the override) and the loud refusal.
+    let out = compile(
+            "        self.items[item.label()] = item\n",
+        "sumtype.py",
+    let flat: String = out.split_whitespace().collect();
+        flat.contains("pubenumAnyItem{Item(Item),Perishable(Perishable)}"),
+        "the root's slot type is the sum type with one variant per class: {}",
+        out
+    );
+    assert!(
+        flat.contains("From<Perishable>forAnyItem"),
+        "a derived value converts into the sum type: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyDict<String,AnyItem>"),
+        "a container of the root holds the sum type: {}",
+        out
+    );
+    assert!(
+        flat.contains("matchself{AnyItem::Item(v)=>v.label(),AnyItem::Perishable(v)=>v.label()}"),
+        "every method of the root's MRO dispatches by match to the variant's own implementation: {}",
+        out
+    );
+    assert!(
+        !out.contains("is not supported yet"),
+        "no loud refusal remains for the polymorphic store: {}",
+        out
+
+// The closed-world hierarchy (issue #137, drift 2): a slot declared with
+// a class that other classes derive from holds the sum type; isinstance on
+// it is a runtime variant test, and the guarded branch reads the name as
+// the variant's view.
+const SHAPES_SRC: &str = concat!(
+    "class Shape:\n",
+    "    def name(self) -> str:\n",
+    "        return \"shape\"\n",
+    "\n",
+    "class Rect(Shape):\n",
+    "    def __init__(self, w: float):\n",
+    "        self.w = w\n",
+    "    def name(self) -> str:\n",
+    "        return \"rect\"\n",
+    "\n",
+    "class Square(Rect):\n",
+    "    def name(self) -> str:\n",
+    "        return \"square\"\n",
+    "\n",
+    "def describe(s: Shape) -> str:\n",
+    "    if isinstance(s, Rect):\n",
+    "        return f\"rect {s.w}\"\n",
+    "    return s.name()\n",
+    "\n",
+    "def main() -> None:\n",
+    "    shapes: list[Shape] = [Rect(2.0), Square(1.0)]\n",
+    "    for s in shapes:\n",
+    "        print(describe(s))\n",
+);
+
+#[test]
+fn isinstance_on_a_root_typed_value_is_a_runtime_variant_test() {
+    let out = compile(SHAPES_SRC, "hier_isinstance.py");
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(s).__rython_is_Rect()"),
+        "isinstance on a root-typed parameter must test the variant at runtime, never fold: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfn__rython_is_Rect(&self)->bool{matches!(self,AnyShape::Rect(_)|AnyShape::Square(_))}"),
+        "the predicate covers the target's whole subtree: {}",
+        out
+    );
+}
+
+#[test]
+fn a_root_typed_name_narrowed_by_isinstance_reads_as_the_variants_view() {
+    let out = compile(SHAPES_SRC, "hier_narrow.py");
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(s).__rython_as_Rect().unwrap().w()"),
+        "inside the guard the name reads as the narrowed class's view, and its field through the accessor: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfn__rython_as_Rect(&self)->Option<AnyRect>"),
+        "a nested root narrows to its own sum type: {}",
+        out
+    );
+}
+
+#[test]
+fn a_list_of_a_root_holds_the_sum_type_and_its_elements_convert() {
+    let out = compile(SHAPES_SRC, "hier_list.py");
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Rect::new(2.0)?}).into()") && flat.contains("Square::new(1.0)?}).into()"),
+        "every element converts into the root's sum type: {}",
+        out
+    );
+    assert!(
+        flat.contains("describe(s)?") || flat.contains("describe((s).clone())?"),
+        "a root-typed value passes into a root slot as is: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyDisplayforAnyShape") && flat.contains("implDefaultforAnyShape"),
+        "the sum type carries the runtime traits: {}",
+        out
+    );
+}

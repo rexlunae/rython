@@ -275,6 +275,17 @@ impl FormattedValue {
                 "{}".to_string(),
                 quote!(py_grouped_int(#value)),
             )),
+            // Python's general float format (`{x:g}`): the runtime
+            // formatter renders the significant digits, then the
+            // fill/align/width apply to the string.
+            SpecLowering::GeneralFloat { precision, suffix } => Ok((
+                if suffix.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{:{}}}", suffix)
+                },
+                quote!(py_format_g(((#value) as f64), #precision)),
+            )),
         }
     }
 }

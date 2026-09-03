@@ -1120,6 +1120,24 @@ pub fn isinstance_narrowing(
     let ExprType::Name(n) = &call.args[0] else {
         return None;
     };
+    // A ROOT-typed name (hierarchy.rs) narrows to a class of its subtree:
+    // the body reads the name as that class (the sum type's view), the
+    // else keeps the root. The class-narrowing keeps the SAME shape the
+    // union narrowing has, so the if-statement installs both alike.
+    if let Some(crate::TypeInfo::Class(r)) = options.name_types.get(&n.id)
+        && crate::ast::tree::hierarchy::is_polymorphic_root(r)
+        && let ExprType::Name(t) = &call.args[1]
+        && t.id != *r
+        && crate::ast::tree::hierarchy::in_subtree_by_name(&t.id, r)
+    {
+        let narrowed = crate::TypeInfo::Class(t.id.clone());
+        let original = crate::TypeInfo::Class(r.clone());
+        return Some(if negated {
+            (n.id.clone(), original, narrowed)
+        } else {
+            (n.id.clone(), narrowed, original)
+        });
+    }
     // The name must be a str|bytes union or a boxed PyValue union.
     let is_union = options
         .name_types

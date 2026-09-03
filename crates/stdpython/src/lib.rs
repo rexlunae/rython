@@ -4079,6 +4079,45 @@ pub fn py_int_radix_format(
     }
 }
 
+/// Python's general float format, `format(v, ".{p}g")`: round to `p`
+/// significant digits (p >= 1); with the decimal exponent X of the
+/// rounded value, render fixed-point with p-1-X decimals when
+/// -4 <= X < p, else scientific with p-1 decimals; then strip trailing
+/// zeros (and a bare point). The exponent has at least two digits
+/// (`1e-05`, `1.23457e+08`). nan and inf render as Python does.
+pub fn py_format_g(v: f64, precision: usize) -> String {
+    if v.is_nan() {
+        return String::from("nan");
+    }
+    if v.is_infinite() {
+        return String::from(if v < 0.0 { "-inf" } else { "inf" });
+    }
+    let p = precision.max(1);
+    if v == 0.0 {
+        return String::from(if v.is_sign_negative() { "-0" } else { "0" });
+    }
+    // The exponent AFTER rounding to p significant digits: Rust's `e`
+    // formatting rounds the mantissa for us.
+    let sci = alloc::format!("{:.*e}", p - 1, v);
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    fn strip_zeros(s: &str) -> String {
+        if !s.contains('.') {
+            return s.to_string();
+        }
+        let t = s.trim_end_matches('0');
+        t.trim_end_matches('.').to_string()
+    }
+    if exp >= -4 && exp < p as i32 {
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        strip_zeros(&alloc::format!("{:.*}", decimals, v))
+    } else {
+        let m = strip_zeros(mantissa);
+        let sign = if exp < 0 { '-' } else { '+' };
+        alloc::format!("{}e{}{:02}", m, sign, exp.abs())
+    }
+}
+
 /// The `,` thousands separator (Python's `f"{size:,}"`): the integer's
 /// digits group in threes from the right, preserving the sign
 /// (format(-1234567, ',') == "-1,234,567").
@@ -7518,5 +7557,27 @@ mod percent_format_tests {
             "{}",
             e.message
         );
+    }
+}
+
+#[cfg(test)]
+mod py_format_g_tests {
+    use super::py_format_g;
+
+    #[test]
+    fn general_float_matches_cpython() {
+        // The values CPython's format(v, "g") / ".3g" produce.
+        assert_eq!(py_format_g(2.5, 6), "2.5");
+        assert_eq!(py_format_g(2.0, 6), "2");
+        assert_eq!(py_format_g(100.0, 6), "100");
+        assert_eq!(py_format_g(123456789.0, 6), "1.23457e+08");
+        assert_eq!(py_format_g(0.0001, 6), "0.0001");
+        assert_eq!(py_format_g(0.00001, 6), "1e-05");
+        assert_eq!(py_format_g(-1.5, 6), "-1.5");
+        assert_eq!(py_format_g(0.0, 6), "0");
+        assert_eq!(py_format_g(3.14159, 3), "3.14");
+        assert_eq!(py_format_g(1234.5, 3), "1.23e+03");
+        assert_eq!(py_format_g(f64::INFINITY, 6), "inf");
+        assert_eq!(py_format_g(f64::NAN, 6), "nan");
     }
 }

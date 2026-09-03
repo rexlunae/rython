@@ -33,6 +33,7 @@ pub use constant::*;
 
 pub mod expression;
 pub mod fetch_provenance;
+pub mod hierarchy;
 pub use expression::*;
 
 pub mod function_def;

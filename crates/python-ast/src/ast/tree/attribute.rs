@@ -852,9 +852,33 @@ pub(crate) fn class_field_access(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<FieldRewrite> {
+    let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
+    // A polymorphic ROOT's value (hierarchy.rs) may be the sum type, which
+    // has no fields — only the accessors every variant implements (the
+    // root struct too, through its trait), so a non-`self` receiver of a
+    // root class reads and writes through them at any depth. The receiver
+    // may be any expression the inferrer types (`self.items[k].qty`, a
+    // subscript into a dict of the root; an unwrapped `Option` local).
+    if !is_self {
+        let root_typed = match crate::receiver_class_for_read(value, ctx, symbols, options) {
+            Some((class, _)) => crate::ast::tree::hierarchy::is_polymorphic_root(&class.name),
+            None => match crate::infer_type(Some(ctx), value, options, symbols) {
+                crate::TypeInfo::Class(c) => crate::ast::tree::hierarchy::is_polymorphic_root(&c),
+                crate::TypeInfo::Option(inner) => matches!(
+                    *inner,
+                    crate::TypeInfo::Class(ref c) if crate::ast::tree::hierarchy::is_polymorphic_root(c)
+                ),
+                _ => false,
+            },
+        };
+        if root_typed {
+            return Some(FieldRewrite::Accessor {
+                field: attr.to_string(),
+            });
+        }
+    }
     let (class, class_symbols) = crate::receiver_class_for_read(value, ctx, symbols, options)?;
     let depth = class.field_owner_depth(attr, &class_symbols, options)?;
-    let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
     if depth == 0 {
         // The receiver's own field. Direct access works for any concrete
         // receiver; only the generic `self` of a trait default needs the
