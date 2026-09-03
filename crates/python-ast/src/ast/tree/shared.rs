@@ -148,7 +148,9 @@ fn collect_container_elements(
         match t {
             TypeInfo::Vec(inner) | TypeInfo::HashSet(inner) => from_type(inner, true, out),
             TypeInfo::Dict(_, v) => from_type(v, true, out),
-            TypeInfo::Tuple(items) => items.iter().for_each(|i| from_type(i, in_container, out)),
+            // A tuple HOLDS its elements as a list does (`pair: tuple[Item,
+            // Item]`; Devin review on #321).
+            TypeInfo::Tuple(items) => items.iter().for_each(|i| from_type(i, true, out)),
             TypeInfo::Option(inner) => from_type(inner, in_container, out),
             TypeInfo::Class(c) => {
                 if in_container {
@@ -399,8 +401,27 @@ fn collect_external_store_fields(
             _ => {}
         }
     }
+    // A class name through its aliases (`Dial = Knob`, `from m import Knob
+    // as K`): the registry's name, so the store keys to the class the
+    // mutability decision knows (Devin review on #321).
+    let canonical = |t: TypeInfo| -> TypeInfo {
+        match t {
+            TypeInfo::Class(c) => {
+                TypeInfo::Class(crate::ast::tree::hierarchy::canonical_class_name(&c, symbols))
+            }
+            TypeInfo::Option(inner) => match *inner {
+                TypeInfo::Class(c) => TypeInfo::Option(Box::new(TypeInfo::Class(
+                    crate::ast::tree::hierarchy::canonical_class_name(&c, symbols),
+                ))),
+                other => TypeInfo::Option(Box::new(other)),
+            },
+            other => other,
+        }
+    };
     let annotated = |ann: &ExprType| -> Option<TypeInfo> {
-        crate::annotation_type_info(ann).or_else(|| crate::resolve_alias_typeinfo(ann, symbols, options))
+        crate::annotation_type_info(ann)
+            .or_else(|| crate::resolve_alias_typeinfo(ann, symbols, options))
+            .map(canonical)
     };
     // A function opens a scope: its annotated parameters, then the locals
     // its body constructs or annotates.
@@ -450,10 +471,9 @@ fn collect_external_store_fields(
                         .and_then(|ann| annotated(ann))
                         .or_else(|| match &a.value {
                             ExprType::Call(c) => match c.func.as_ref() {
-                                ExprType::Name(callee)
-                                    if crate::resolve_class_referenced(&callee.id, symbols, options).is_some() =>
-                                {
-                                    Some(TypeInfo::Class(callee.id.clone()))
+                                ExprType::Name(callee) => {
+                                    crate::resolve_class_referenced(&callee.id, symbols, options)
+                                        .map(|class| TypeInfo::Class(class.name))
                                 }
                                 _ => None,
                             },
