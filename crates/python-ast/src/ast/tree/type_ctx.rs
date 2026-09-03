@@ -2448,6 +2448,20 @@ fn analyze_statement_types(
             for target in &assign.targets {
                 count_target_reads(target, info);
             }
+            // A comprehension in the ASSIGNED value seeds its generator
+            // targets (`total = sum(s.area() for s in shapes)` — shapes,
+            // round 99): the loop variable types, so the body's method
+            // calls resolve and propagate their `?`.
+            if let (Some(options), Some(symbols)) = (options, symbols) {
+                let analysis_ctx = self_class.map(|c| CodeGenContext::Class(c.to_string()));
+                seed_comprehension_targets(
+                    &assign.value,
+                    analysis_ctx.as_ref(),
+                    options,
+                    symbols,
+                    info,
+                );
+            }
         }
         StatementType::AugAssign(a) => {
             count_expr_reads(&a.target, info);
@@ -3172,8 +3186,13 @@ fn resolve_alias_typeinfo_inner(
             }
             annotation_type_info(ann)
         }
-        // A bare name: a builtin scalar, or an alias/import chain.
+        // A bare name: a builtin scalar, an alias/import chain, or a USER
+        // CLASS (`list[Shape]` — shapes, round 99): a class-name annotation
+        // resolves to the class, so container element types and seeded loop
+        // targets carry it (the element's methods then resolve and their
+        // fallibility propagates).
         ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::ClassDef(_)) => Some(TypeInfo::Class(n.id.clone())),
             // An ALIAS (`from ._base_connection import ProxyConfig as
             // ProxyConfig` — a self-aliasing re-export): follow to the
             // canonical name (the depth guard breaks cycles) — UNLESS the
@@ -3684,6 +3703,86 @@ fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
 /// target binds the element; a (nested) TUPLE target binds each element
 /// name from the matching pair (`for (i, (name, item)) in enumerate(...)`
 /// — round 99). `or_insert`: an earlier store or annotation wins.
+/// Seed every comprehension generator target found in `expr` (a
+/// recursive walk — a comprehension nested inside a call argument
+/// (`sum(item.qty for item in ...)` — the corpus's total, and shapes'
+/// `sum(s.area() for s in shapes)`) seeds the same way a bare one does,
+/// round 99).
+fn seed_comprehension_targets(
+    expr: &ExprType,
+    analysis_ctx: Option<&CodeGenContext>,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+    info: &mut FunctionTypeInfo,
+) {
+    let generators: Vec<&crate::Comprehension> = match expr {
+        ExprType::ListComp(l) => l.generators.iter().collect(),
+        ExprType::SetComp(sc) => sc.generators.iter().collect(),
+        ExprType::DictComp(dc) => dc.generators.iter().collect(),
+        ExprType::GeneratorExp(g) => g.generators.iter().collect(),
+        ExprType::Call(c) => {
+            for a in &c.args {
+                seed_comprehension_targets(a, analysis_ctx, options, symbols, info);
+            }
+            for kw in &c.keywords {
+                seed_comprehension_targets(&kw.value, analysis_ctx, options, symbols, info);
+            }
+            return;
+        }
+        ExprType::BinOp(b) => {
+            seed_comprehension_targets(&b.left, analysis_ctx, options, symbols, info);
+            seed_comprehension_targets(&b.right, analysis_ctx, options, symbols, info);
+            return;
+        }
+        ExprType::BoolOp(b) => {
+            for v in &b.values {
+                seed_comprehension_targets(v, analysis_ctx, options, symbols, info);
+            }
+            return;
+        }
+        ExprType::UnaryOp(u) => {
+            seed_comprehension_targets(&u.operand, analysis_ctx, options, symbols, info);
+            return;
+        }
+        ExprType::Compare(cp) => {
+            seed_comprehension_targets(&cp.left, analysis_ctx, options, symbols, info);
+            for r in &cp.comparators {
+                seed_comprehension_targets(r, analysis_ctx, options, symbols, info);
+            }
+            return;
+        }
+        ExprType::IfExp(i) => {
+            seed_comprehension_targets(&i.test, analysis_ctx, options, symbols, info);
+            seed_comprehension_targets(&i.body, analysis_ctx, options, symbols, info);
+            seed_comprehension_targets(&i.orelse, analysis_ctx, options, symbols, info);
+            return;
+        }
+        _ => return,
+    };
+    for generator in generators {
+        // The ANALYSIS's own seeds are the freshest authority for the
+        // iterable's type: a name typed by an earlier annotation/assignment
+        // in this function (`shapes: list[Shape]`) is in info.name_types,
+        // which the codegen-level infer_type cannot see mid-analysis
+        // (round 99 — shapes' `sum(s.area() for s in shapes)`).
+        let iter_ty = match &generator.iter {
+            ExprType::Name(n) => info
+                .name_types
+                .get(&n.id)
+                .cloned()
+                .unwrap_or_else(|| infer_type(analysis_ctx, &generator.iter, options, symbols)),
+            _ => infer_type(analysis_ctx, &generator.iter, options, symbols),
+        };
+        if let Some(elem) = iterable_element_type(&iter_ty) {
+            seed_target_types(&generator.target, &elem, info);
+        }
+        seed_comprehension_targets(&generator.iter, analysis_ctx, options, symbols, info);
+        for cond in &generator.ifs {
+            seed_comprehension_targets(cond, analysis_ctx, options, symbols, info);
+        }
+    }
+}
+
 fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
     match target {
         ExprType::Name(n) => {

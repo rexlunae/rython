@@ -1984,7 +1984,7 @@ impl<'a> CodeGen for Call {
                  (dynamic-method divergence)",
                 expr_chain_spelling(&attr.value), attr.attr
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE1"); return Ok(quote!(stdpython::PyValue::None_));
         }
         // Calls into an EXTERNAL module (`ssl.SSLContext(...)`,
         // `socket.socket(...)`, `logging.getLogger(...)` — stdlib rython
@@ -2001,7 +2001,7 @@ impl<'a> CodeGen for Call {
                  crate (external-module divergence)",
                 root, attr.attr, root
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE2"); return Ok(quote!(stdpython::PyValue::None_));
         }
         // A name imported from an external module via `from X import name`
         // (`from logging import getLogger`, `from zlib import ...`), or
@@ -2034,7 +2034,7 @@ impl<'a> CodeGen for Call {
                  external to the generated crate (external-module divergence)",
                 n.id, n.id
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE3"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // The I/O builtins have no no_std lowering (stdpython gates them
@@ -2153,7 +2153,7 @@ impl<'a> CodeGen for Call {
             && matches!(n.id.as_str(), "object" | "memoryview")
             && symbols.get(&n.id).is_none()
         {
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE4"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // Builtins with keyword variants or by-reference runtime shapes:
@@ -3227,7 +3227,7 @@ impl<'a> CodeGen for Call {
                              divergence)"
                                 .to_string(),
                         );
-                        return Ok(quote!(stdpython::PyValue::None_));
+                        eprintln!("R99NONE5"); return Ok(quote!(stdpython::PyValue::None_));
                     }
                     // `type(x)` — Python's class object. rython cannot
                     // represent classes as values, but the COMMON pattern
@@ -3252,7 +3252,7 @@ impl<'a> CodeGen for Call {
                                  runtime values in rython)"
                                     .to_string(),
                             );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                            eprintln!("R99NONE6"); return Ok(quote!(stdpython::PyValue::None_));
                         }
                         if rendered.len() != 1 {
                             return Err("type() takes exactly one argument".to_string().into());
@@ -3272,7 +3272,7 @@ impl<'a> CodeGen for Call {
                              divergence)"
                                 .to_string(),
                         );
-                        return Ok(quote!(stdpython::PyValue::None_));
+                        eprintln!("R99NONE7"); return Ok(quote!(stdpython::PyValue::None_));
                     }
                     // `set()` / `bytearray()` — constructors whose empty
                     // form has no inferable element type: the boxed None
@@ -3288,7 +3288,7 @@ impl<'a> CodeGen for Call {
                                  empty-set divergence)",
                                 bname
                             ));
-                            return Ok(quote!(stdpython::PyValue::None_));
+                            eprintln!("R99NONE8"); return Ok(quote!(stdpython::PyValue::None_));
                         }
                         // A BOXED/unknown argument (`set(self._container.
                         // keys())` — urllib3's HTTPHeaderDict.keys, where
@@ -3306,7 +3306,7 @@ impl<'a> CodeGen for Call {
                                  None (the set-content divergence)",
                                 bname
                             ));
-                            return Ok(quote!(stdpython::PyValue::None_));
+                            eprintln!("R99NONE9"); return Ok(quote!(stdpython::PyValue::None_));
                         }
                         let bname = crate::safe_ident(&bname);
                         return Ok(quote!(#bname(#(#rendered),*)));
@@ -3325,7 +3325,7 @@ impl<'a> CodeGen for Call {
                                  empty-set divergence)"
                                     .to_string(),
                             );
-                            return Ok(quote!(stdpython::PyValue::None_));
+                            eprintln!("R99NONE10"); return Ok(quote!(stdpython::PyValue::None_));
                         }
                         let a = &rendered[0];
                         return Ok(quote!(frozenset(#a)));
@@ -4226,7 +4226,7 @@ impl<'a> CodeGen for Call {
                 "functools.partial over a non-local function is dropped (the \
                  callable-as-value divergence, issue #122)"
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE11"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // functools/heapq/copy/textwrap/re functions: their runtime shapes
@@ -5445,7 +5445,7 @@ impl<'a> CodeGen for Call {
                                  non-structural base)",
                                 class.name
                             ));
-                            return Ok(quote!(stdpython::PyValue::None_));
+                            eprintln!("R99NONE12"); return Ok(quote!(stdpython::PyValue::None_));
                         }
                         let mut args = Vec::new();
                         for arg in &self.args {
@@ -5491,7 +5491,7 @@ impl<'a> CodeGen for Call {
                              is unmodeled",
                             attr.attr, class.name, base.name
                         ));
-                        return Ok(quote!(stdpython::PyValue::None_));
+                        eprintln!("R99NONE13"); return Ok(quote!(stdpython::PyValue::None_));
                     }
                 };
                 let mut sig = method;
@@ -5579,6 +5579,9 @@ impl<'a> CodeGen for Call {
             if let Some((class, class_symbols)) =
                 receiver_class(&attr.value, &ctx, &symbols, &options)
             {
+                if attr.attr == "area" {
+                    eprintln!("R99GATE area recv={:?} class={}", match attr.value.as_ref() { crate::ExprType::Name(n) => format!("Name({})", n.id), _ => "other".into() }, class.name);
+                }
                 if let Some(method) =
                     class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
                 {
@@ -5652,7 +5655,7 @@ impl<'a> CodeGen for Call {
                             _ => false,
                         }
                     });
-                    if is_property_descriptor
+                    if false && is_property_descriptor
                         && !self.keywords.is_empty()
                         && class
                             .infer_fields(&class_symbols, &options)
@@ -5667,7 +5670,7 @@ impl<'a> CodeGen for Call {
                              and is unmodeled)",
                             class.name, attr.attr
                         ));
-                        return Ok(quote!(stdpython::PyValue::None_));
+                        eprintln!("R99NONE14"); return Ok(quote!(stdpython::PyValue::None_));
                     }
                     // The stub call can only be DROPPED when the missing
                     // arguments are NOT defaultable — a stub whose missing
@@ -5687,7 +5690,7 @@ impl<'a> CodeGen for Call {
                              call returns a boxed None)",
                             class.name, attr.attr, supplied
                         ));
-                        return Ok(quote!(stdpython::PyValue::None_));
+                        eprintln!("R99NONE15"); return Ok(quote!(stdpython::PyValue::None_));
                     }
                     let MappedArguments { prelude, args } = map_call_arguments_inner(
                         &sig,
@@ -6084,7 +6087,7 @@ impl<'a> CodeGen for Call {
                      object's method is unmodeled)",
                     bad
                 ));
-                return Ok(quote!(stdpython::PyValue::None_));
+                eprintln!("R99NONE16"); return Ok(quote!(stdpython::PyValue::None_));
             }
 
             // str.split / str.rsplit take sep and maxsplit by position or
@@ -6217,7 +6220,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE17"); return Ok(quote!(stdpython::PyValue::None_));
                         }
                     },
                     // A SELF-FIELD template (`self.default_endpoint.format(
@@ -6235,7 +6238,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE18"); return Ok(quote!(stdpython::PyValue::None_));
                         };
                         let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
                         else {
@@ -6245,7 +6248,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE19"); return Ok(quote!(stdpython::PyValue::None_));
                         };
                         // The class's class-level string constants
                         // (`self.DEFAULT_ENDPOINT` reads).
@@ -6298,7 +6301,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE20"); return Ok(quote!(stdpython::PyValue::None_));
                         };
                         match template_from_expr(v, &class_const) {
                             Some(t) => t,
@@ -6315,7 +6318,7 @@ impl<'a> CodeGen for Call {
                                      (the dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE21"); return Ok(quote!(stdpython::PyValue::None_));
                             }
                         }
                     }
@@ -6331,7 +6334,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE22"); return Ok(quote!(stdpython::PyValue::None_));
                         };
                         // The class may be imported (`from .exceptions import
                         // ResponseError` in urllib3/util/retry.py): resolve
@@ -6352,7 +6355,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE23"); return Ok(quote!(stdpython::PyValue::None_));
                         };
                         let Some(assign) = c.body.iter().find_map(|s| match &s.statement {
                             crate::StatementType::Assign(assign)
@@ -6369,7 +6372,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE24"); return Ok(quote!(stdpython::PyValue::None_));
                         };
                         match &assign.value {
                             ExprType::Constant(c)
@@ -6387,7 +6390,7 @@ impl<'a> CodeGen for Call {
                                      dynamic-format divergence)"
                                         .to_string(),
                                 );
-                                return Ok(quote!(stdpython::PyValue::None_));
+                                eprintln!("R99NONE25"); return Ok(quote!(stdpython::PyValue::None_));
                             }
                         }
                     }
@@ -6402,7 +6405,7 @@ impl<'a> CodeGen for Call {
                              (the dynamic-format divergence)"
                                 .to_string(),
                         );
-                        return Ok(quote!(stdpython::PyValue::None_));
+                        eprintln!("R99NONE26"); return Ok(quote!(stdpython::PyValue::None_));
                     }
                 };
                 return lower_str_format(
@@ -7380,7 +7383,7 @@ impl<'a> CodeGen for Call {
                          (the dynamic-dispatch divergence)",
                         callee_name.id
                     ));
-                    return Ok(quote!(stdpython::PyValue::None_));
+                    eprintln!("R99NONE27"); return Ok(quote!(stdpython::PyValue::None_));
                 };
                 // Route the whole call through the router: each axis
                 // parameter is `impl Into<Enum>`, so a boxed argument
@@ -7688,7 +7691,7 @@ impl<'a> CodeGen for Call {
                  callable-as-value divergence, issue #122)",
                 callee_name.id
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE28"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // A call through a SELF member that is neither a method nor a
@@ -7736,7 +7739,7 @@ impl<'a> CodeGen for Call {
                 attr.attr,
                 class.name
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE29"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // A call through a VALUE the model cannot hold as a callable
@@ -7780,7 +7783,7 @@ impl<'a> CodeGen for Call {
                  runtime values in rython — the callable-as-value divergence)",
                 expr_chain_spelling(self.func.as_ref())
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE30"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // A call through a SIBLING-MODULE member that is NOT a module-level
@@ -7808,7 +7811,7 @@ impl<'a> CodeGen for Call {
                 module_path.last().map(|s| s.as_str()).unwrap_or(""),
                 attr.attr
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE31"); return Ok(quote!(stdpython::PyValue::None_));
         }
 
         // A qualified STDPYTHON-CLASS construction (`collections.deque()`
@@ -8285,7 +8288,7 @@ fn lower_str_format(
                 "str.format({:?}) is dropped: {}",
                 template, e
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE32"); return Ok(quote!(stdpython::PyValue::None_));
         }
     };
 
@@ -9802,7 +9805,7 @@ fn map_call_arguments_inner(
                  the boxed None (callables cannot be runtime values in rython)",
                 param.arg
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            eprintln!("R99NONE33"); return Ok(quote!(stdpython::PyValue::None_));
         }
         // An UNANNOTATED parameter with a CLASS default (`dict_class =
         // OrderedDict` — requests' merge_setting, where dict_class has no
@@ -9874,7 +9877,7 @@ fn map_call_arguments_inner(
                 )
             }) {
                 if crate::is_none_expr(expr) {
-                    return Ok(quote!(stdpython::PyValue::None_));
+                    eprintln!("R99NONE34"); return Ok(quote!(stdpython::PyValue::None_));
                 }
                 // A present argument: an OPTION-typed value (a None-
                 // stored local like `conn` — urllib3's urlopen, whose
