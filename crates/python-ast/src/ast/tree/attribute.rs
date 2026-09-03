@@ -1388,6 +1388,17 @@ pub(crate) fn external_module_root(
 /// anything else — a non-Option receiver never unwraps. Access through
 /// an Option receiver is CPython's AttributeError-on-None, which rython
 /// lowers as a loud §12.2 panic at the access site.
+/// Whether `expr` is a name NARROWED by the enclosing guard (`response
+/// and response.get_redirect_location()` — urllib3's Retry.increment;
+/// an `is not None` test; an isinstance): its READ (name.rs) already
+/// renders the non-Option value, so a non-mutating call takes it as is —
+/// a second unwrap would be on a value that is no longer an Option. A
+/// MUTATING call renders the name as a place (the Option binding itself)
+/// and still unwraps.
+pub(crate) fn narrowed_name_read(expr: &ExprType, options: &PythonOptions) -> bool {
+    matches!(expr, ExprType::Name(n) if options.narrowed_names.contains_key(&n.id))
+}
+
 pub(crate) fn receiver_option_inner(
     expr: &ExprType,
     ctx: &CodeGenContext,
@@ -1395,12 +1406,6 @@ pub(crate) fn receiver_option_inner(
     options: &PythonOptions,
 ) -> Option<proc_macro2::TokenStream> {
     match expr {
-        // A name NARROWED by the enclosing guard (`response and
-        // response.get_redirect_location()` — urllib3's Retry.increment,
-        // where `response: BaseHTTPResponse | None`; an `is not None`
-        // test; an isinstance): every narrowed read (name.rs) already
-        // renders the non-Option value, so the call takes it as is.
-        ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => None,
         ExprType::Name(n) => match options.name_types.get(&n.id) {
             Some(crate::TypeInfo::Option(inner)) => Some(inner.to_rust_type()),
             // A None-first local (`conn = None` then `conn = ...` —

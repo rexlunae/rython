@@ -17300,6 +17300,43 @@ fn a_call_on_a_guard_narrowed_optional_name_takes_the_narrowed_value() {
     );
 }
 
+/// An instance's truth is Python's: `__bool__`, else `__len__() != 0`,
+/// else True — so `bool(x)` on a class value, or on an `Option` of one
+/// (`bool(self.proxy)` with `proxy: Url | None` — urllib3's connection),
+/// has an answer.
+#[test]
+fn an_instance_has_pythons_truth() {
+    let out = compile(
+        concat!(
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "\n",
+            "class Sized:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = []\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return len(self.items)\n",
+            "\n",
+            "def truth(p: Plain, s: Sized, q: Plain | None) -> bool:\n",
+            "    return bool(p) and bool(s) and bool(q)\n",
+        ),
+        "truth.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyBoolforPlain{fnpy_bool(self)->bool{true}}"),
+        "a plain instance is true: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyBoolforSized{fnpy_bool(self)->bool{self.__len__().expect(\"__len__raised\")!=0}}"),
+        "a sized instance is its length's truth: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the

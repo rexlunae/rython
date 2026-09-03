@@ -3287,6 +3287,26 @@ impl CodeGen for ClassDef {
         } else {
             quote!()
         };
+        // An instance's TRUTH (`bool(self.proxy)` — urllib3's connection,
+        // where `proxy: Url | None` and `PyBool for Option<T>` asks the
+        // inner value): Python's `__bool__`, else `__len__() != 0`, else
+        // True. A raise inside either is the loud §12.2 panic.
+        let truth_impl = if options.with_std_python {
+            let body = if self.methods().any(|m| m.name == "__bool__") {
+                quote!(self.__bool__().expect("__bool__ raised"))
+            } else if self.methods().any(|m| m.name == "__len__") {
+                quote!(self.__len__().expect("__len__ raised") != 0)
+            } else {
+                quote!(true)
+            };
+            quote!(impl stdpython::PyBool for #class_name {
+                fn py_bool(self) -> bool {
+                    #body
+                }
+            })
+        } else {
+            quote!()
+        };
 
         // The INHERENT base accessors: the derived struct's `base()` /
         // `base_mut()` reach its own embedded `__rython_base`. Inherent
@@ -3386,7 +3406,7 @@ impl CodeGen for ClassDef {
             // so `x is None` on an instance lowers through PyIsNone to
             // false — same contract the PyInherits tree carries for
             // ancestry bounds.
-            #is_none_impl
+            #is_none_impl #truth_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
@@ -5782,6 +5802,11 @@ impl ClassDef {
             }
             impl stdpython::PyIsNone for #any {
                 fn py_is_none(&self) -> bool { false }
+            }
+            impl stdpython::PyBool for #any {
+                fn py_bool(self) -> bool {
+                    match self { #(#any::#vnames(v) => v.py_bool()),* }
+                }
             }
             #(impl PyInherits<#ancestors> for #any {})*
             impl stdpython::PyDisplay for #any {

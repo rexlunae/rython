@@ -5899,6 +5899,8 @@ impl<'a> CodeGen for Call {
                                     #mname
                                 )
                             }))
+                        } else if crate::ast::tree::attribute::narrowed_name_read(&attr.value, &options) {
+                            receiver
                         } else {
                             quote!((#receiver).clone().unwrap_or_else(|| {
                                 panic!(
@@ -6004,6 +6006,8 @@ impl<'a> CodeGen for Call {
             let receiver = if let Some(_inner) = option_receiver {
                 if crate::ast::tree::scope::mutates_receiver(&attr.attr) {
                     quote!((#receiver).as_mut().unwrap())
+                } else if crate::ast::tree::attribute::narrowed_name_read(&attr.value, &options) {
+                    receiver
                 } else {
                     quote!((#receiver).clone().unwrap())
                 }
