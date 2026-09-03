@@ -1067,8 +1067,17 @@ impl<'a> CodeGen for Assign {
                 {
                     quote!(#target_code = PyValue::from(#value);)
                 }
+                // An Option<String> field (`note: Optional[str] = None`,
+                // later `self.note = "exhausted"`) takes the owned literal
+                // wrapped in Some — the Option-wrap arm below must not
+                // lose the literal's ownership conversion, and this arm
+                // must not lose the wrap.
                 ExprType::Attribute(_) if value_is_str_literal => {
-                    quote!(#target_code = (#value).to_string();)
+                    if attr_field_is_option(target) {
+                        quote!(#target_code = Some((#value).to_string());)
+                    } else {
+                        quote!(#target_code = (#value).to_string();)
+                    }
                 }
                 // A list/set of string literals stored into a field typed
                 // Vec<String>/HashSet<String> owns each element at the

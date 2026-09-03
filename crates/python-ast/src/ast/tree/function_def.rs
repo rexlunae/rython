@@ -5,7 +5,7 @@ use quote::quote;
 use serde::{Deserialize, Serialize};
 use crate::ast::tree::statement::PyStatementTrait;
 use crate::ast::tree::visit::{
-    Descend, Flow, any_expr_in, stmt_all_exprs, stmt_targets, walk_stmts,
+    self, Descend, Flow, any_expr_in, stmt_all_exprs, stmt_targets, walk_stmts,
 };
 
 use crate::{
@@ -2124,6 +2124,21 @@ impl FunctionDef {
                 _ => false,
             }
         );
+        // A `yield` used as a VALUE (`x = yield v`, `(yield v) or 1`) is
+        // the generator's send channel; the list lowering has no such
+        // channel, and `push(v)` in its place would evaluate to unit —
+        // silently a different program. Refuse.
+        if let Some(stmt) = expression_position_yield(&effective_body) {
+            return Err(format!(
+                "`yield` used as a value (`x = yield v`, `(yield v) or d`) in `{}` at line {}: \
+                 rython lowers a generator to build-and-return-a-list, which has no send \
+                 channel, so the expression would silently evaluate to (). Put the yield on \
+                 its own statement, or rewrite the generator to build and return a list.",
+                self.name,
+                stmt.lineno.unwrap_or(0)
+            )
+            .into());
+        }
         let gen_elt = if crate::body_has_yields(&effective_body)
             // An abstract generator STUB (`def stream(...) ->
             // typing.Iterator[bytes]: raise NotImplementedError()` —
@@ -3576,6 +3591,31 @@ pub(crate) fn body_has_yields(body: &[Statement]) -> bool {
     any_expr_in(body, Descend::SkipDefs, |e| {
         matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_))
     })
+}
+
+/// The first statement of `body` (nested defs excluded) that uses a
+/// `yield` / `yield from` as a VALUE rather than as its own statement:
+/// `x = yield v`, `(yield v) or 1`, `f((yield))`, `yield (yield v)`.
+/// That is the generator's send channel, which the build-and-return-a-list
+/// lowering cannot model.
+fn expression_position_yield(body: &[Statement]) -> Option<&Statement> {
+    let is_yield = |e: &ExprType| matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_));
+    let mut found = None;
+    visit::any_stmt(body, Descend::SkipDefs, |s| {
+        let hit = match &s.statement {
+            // A statement-level yield: only a yield NESTED in its value
+            // counts.
+            StatementType::Expr(e) if is_yield(&e.value) => visit::subexprs(&e.value)
+                .into_iter()
+                .any(|sub| visit::any_expr(sub, is_yield)),
+            _ => stmt_all_exprs(s).into_iter().any(|e| visit::any_expr(e, is_yield)),
+        };
+        if hit {
+            found = Some(s);
+        }
+        hit
+    });
+    found
 }
 
 /// The element type of a generator body: from the `Generator[T, ...]` /

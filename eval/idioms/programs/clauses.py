@@ -1,6 +1,6 @@
 """Mutations and definitions that sit only in the clauses a naive walker
 skips: a for-loop's else, a while-loop's else, try's else and finally,
-and a yield nested inside an expression."""
+and a yield that sits only in a for-loop's else."""
 from typing import Iterator, Optional
 
 
@@ -33,11 +33,13 @@ class Tally:
 
 
 def counter(limit: int) -> Iterator[int]:
-    total = 0
-    while total < limit:
-        # The yield sits inside a larger expression, not as a statement.
-        step = (yield total) or 1
-        total += step
+    for total in range(limit):
+        if total < 0:
+            break
+        yield total
+    else:
+        # The only yield of the final value is in the loop's else clause.
+        yield limit
 
 
 def drive() -> list[int]:

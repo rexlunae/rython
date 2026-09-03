@@ -18391,3 +18391,77 @@ fn an_aliased_isinstance_target_on_a_root_typed_value_is_the_variant_test() {
         out
     );
 }
+
+/// A `yield` used as a VALUE (`x = yield v`, `(yield v) or 1`) is the
+/// generator's send channel; the build-and-return-a-list lowering has no
+/// such channel, so the conversion refuses rather than emitting a
+/// `push(v)` that evaluates to unit (issue #137, drift 4's clauses
+/// program).
+#[test]
+fn a_yield_used_as_a_value_is_loud() {
+    let err = compile_err(
+        concat!(
+            "from typing import Iterator\n",
+            "def counter(limit: int) -> Iterator[int]:\n",
+            "    total = 0\n",
+            "    while total < limit:\n",
+            "        step = (yield total) or 1\n",
+            "        total += step\n",
+        ),
+        "yieldvalue.py",
+    );
+    assert!(err.contains("`yield` used as a value"), "error: {}", err);
+    assert!(err.contains("`counter` at line 5"), "error: {}", err);
+    // A statement-level yield inside control flow stays the list lowering.
+    let out = compile(
+        concat!(
+            "from typing import Iterator\n",
+            "def counter(limit: int) -> Iterator[int]:\n",
+            "    for total in range(limit):\n",
+            "        if total < 0:\n",
+            "            break\n",
+            "        yield total\n",
+            "    else:\n",
+            "        yield limit\n",
+        ),
+        "yieldstmt.py",
+    );
+    assert!(out.contains("__rython_gen . push (total)"), "generated: {}", out);
+    assert!(out.contains("__rython_gen . push (limit)"), "generated: {}", out);
+}
+
+/// A string literal stored into an `Optional[str]` field is BOTH owned and
+/// wrapped: `self.note = "exhausted"` on a `note: Optional[str] = None`
+/// slot is `Some(("exhausted").to_string())`, wherever the store sits
+/// (a for-loop's else clause here).
+#[test]
+fn a_str_literal_stored_into_an_optional_field_wraps_in_some() {
+    let out = compile(
+        concat!(
+            "from typing import Optional\n",
+            "class Tally:\n",
+            "    def __init__(self):\n",
+            "        self.note: Optional[str] = None\n",
+            "    def plain(self) -> None:\n",
+            "        self.note = \"plain\"\n",
+            "    def scan(self, words: list[str]) -> None:\n",
+            "        for w in words:\n",
+            "            if w == \"z\":\n",
+            "                break\n",
+            "        else:\n",
+            "            self.note = \"exhausted\"\n",
+        ),
+        "optnote.py",
+    );
+    assert!(out.contains("pub note : Option < String >"), "generated: {}", out);
+    assert!(
+        out.contains("self . note = Some ((\"plain\") . to_string ())"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("self . note = Some ((\"exhausted\") . to_string ())"),
+        "generated: {}",
+        out
+    );
+}
