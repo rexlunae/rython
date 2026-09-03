@@ -79,10 +79,18 @@ impl CodeGen for Lambda {
 /// CPython would let the caller catch — so loud-and-clear beats failing to
 /// compile (issues #75-family, Devin review on #103).
 fn wrap_fallible_body(body: TokenStream) -> TokenStream {
-    let has_question = body.clone().into_iter().any(|tt| {
-        matches!(&tt, TokenTree::Punct(p) if p.as_char() == '?')
-    });
-    if !has_question {
+    // The scan reaches into groups: a `?` inside a comprehension block or
+    // a parenthesized call (`lambda s: [f(x) for x in s]`) is as fallible
+    // as one at the top level, and was left unwrapped in a non-Result
+    // closure before (a rustc error).
+    fn contains_question(stream: TokenStream) -> bool {
+        stream.into_iter().any(|tt| match tt {
+            TokenTree::Punct(p) => p.as_char() == '?',
+            TokenTree::Group(g) => contains_question(g.stream()),
+            _ => false,
+        })
+    }
+    if !contains_question(body.clone()) {
         return body;
     }
     quote! {{

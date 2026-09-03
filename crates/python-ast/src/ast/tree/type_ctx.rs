@@ -739,6 +739,59 @@ fn infer_type_inner(
                     }
                     "pop" | "setdefault" => TypeInfo::PyObject,
                     _ if on_numpy => TypeInfo::NdArray,
+                    // The str/bytes codec pair, as the lowering renders them
+                    // (`decode_ascii(...)` is a String, `encode_ascii(...)`
+                    // a Vec<u8>) on a STRING-SHAPED receiver — the plain
+                    // type, a narrowed union, or a boxed value. A user
+                    // class's own `encode`/`decode` keeps its declared
+                    // return (the class-receiver authorities resolve it).
+                    "decode" | "encode"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::String
+                                | TypeInfo::StrRef
+                                | TypeInfo::Bytes
+                                | TypeInfo::StrOrBytes
+                                | TypeInfo::PyValue
+                                | TypeInfo::PyValueMember(_)
+                        ) =>
+                    {
+                        if attr.attr == "decode" {
+                            TypeInfo::String
+                        } else {
+                            TypeInfo::Bytes
+                        }
+                    }
+                    // A str method on a str receiver: the ONE typed table
+                    // the lowering shares (`StrMethod`).
+                    name if StrMethod::from_name(name).is_some()
+                        && matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::String | TypeInfo::StrRef
+                        ) =>
+                    {
+                        match StrMethod::from_name(name).expect("just checked") {
+                            // `format` renders a String only for a template
+                            // the lowering can see; a dynamic template is
+                            // dropped as the boxed None (the dynamic-format
+                            // divergence), and the type side says so.
+                            StrMethod::Format => {
+                                if crate::ast::tree::call::str_format_template(
+                                    &attr.value,
+                                    ctx,
+                                    symbols,
+                                    options,
+                                )
+                                .is_some()
+                                {
+                                    TypeInfo::String
+                                } else {
+                                    TypeInfo::PyValue
+                                }
+                            }
+                            m => m.result(),
+                        }
+                    }
                     // Dict VIEW methods carry the (key, value) pair type
                     // (`self.items.items()` → Vec<(str, Item)> — the idiom
                     // corpus's report): the receiver's Dict type is the
@@ -822,11 +875,24 @@ fn infer_type_inner(
             },
             _ => TypeInfo::PyObject,
         },
-        ExprType::ListComp(_) => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
-        ExprType::DictComp(_) => TypeInfo::Dict(
-            Box::new(TypeInfo::PyObject),
-            Box::new(TypeInfo::PyObject),
-        ),
+        // A comprehension's element type is its element expression's type
+        // in the comprehension's own scope (the targets bound to their
+        // iterables' elements — the same scope the lowering renders in).
+        ExprType::ListComp(lc) => {
+            let scope = comprehension_scope(&lc.generators, ctx, options, symbols);
+            TypeInfo::Vec(Box::new(infer_type_inner(ctx, &lc.elt, &scope, symbols)))
+        }
+        ExprType::SetComp(sc) => {
+            let scope = comprehension_scope(&sc.generators, ctx, options, symbols);
+            TypeInfo::HashSet(Box::new(infer_type_inner(ctx, &sc.elt, &scope, symbols)))
+        }
+        ExprType::DictComp(dc) => {
+            let scope = comprehension_scope(&dc.generators, ctx, options, symbols);
+            TypeInfo::Dict(
+                Box::new(infer_type_inner(ctx, &dc.key, &scope, symbols)),
+                Box::new(infer_type_inner(ctx, &dc.value, &scope, symbols)),
+            )
+        }
         ExprType::Starred(s) => infer_type_inner(ctx, &s.value, options, symbols),
         _ => TypeInfo::PyObject,
     }
@@ -842,9 +908,13 @@ fn infer_type_inner(
 /// a `range` (whose elements are Python ints). A string is deliberately
 /// absent — iterating one yields single-character strings, which is a
 /// different type from the receiver and not what any caller here wants.
-fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
+pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
     match t {
-        TypeInfo::Vec(e) => Some((**e).clone()),
+        TypeInfo::Vec(e) | TypeInfo::HashSet(e) => Some((**e).clone()),
+        // Iterating a dict yields its keys.
+        TypeInfo::Dict(k, _) => Some((**k).clone()),
+        // Iterating a str yields one-character strings.
+        TypeInfo::String | TypeInfo::StrRef => Some(TypeInfo::String),
         TypeInfo::Range => Some(TypeInfo::Int),
         TypeInfo::Borrowed(inner) => iterable_element_type(inner),
         _ => None,
@@ -2229,6 +2299,221 @@ fn analyze_function_types_inner(
     info
 }
 
+/// The options a statement's inference sees: the function's incoming
+/// options with every local the analysis has typed SO FAR overlaid, so a
+/// later statement's inference sees the earlier locals (`squares = [s for
+/// s in shapes ...]` then `[s.name() for s in squares]`) the way the
+/// lowering will. The analysis is flow-sensitive through this view; the
+/// parameters are seeded into the incoming options by the caller.
+/// The type a narrowed name's READ produces inside the branch: a boxed
+/// member (`PyValueMember(Bytes)`, the name.rs conversion marker) reads as
+/// the member itself, so a store from it is typed by the member.
+fn narrowed_value_type(t: &TypeInfo) -> TypeInfo {
+    match t {
+        TypeInfo::PyValueMember(inner) => (**inner).clone(),
+        other => other.clone(),
+    }
+}
+
+/// The `str` methods the converter knows, ONE typed table for the type
+/// side (`infer_type`'s attribute-call arm) and the lowering (the unbound
+/// `str.lower` forms in call.rs), so inference and lowering cannot drift
+/// apart through two string lists (Devin review on #318).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrMethod {
+    Upper, Lower, Strip, Lstrip, Rstrip, Title, Capitalize, Casefold, Swapcase,
+    Replace, Zfill, Center, Ljust, Rjust, Expandtabs, Format, Splitlines,
+}
+
+impl StrMethod {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "upper" => Self::Upper,
+            "lower" => Self::Lower,
+            "strip" => Self::Strip,
+            "lstrip" => Self::Lstrip,
+            "rstrip" => Self::Rstrip,
+            "title" => Self::Title,
+            "capitalize" => Self::Capitalize,
+            "casefold" => Self::Casefold,
+            "swapcase" => Self::Swapcase,
+            "replace" => Self::Replace,
+            "zfill" => Self::Zfill,
+            "center" => Self::Center,
+            "ljust" => Self::Ljust,
+            "rjust" => Self::Rjust,
+            "expandtabs" => Self::Expandtabs,
+            "format" => Self::Format,
+            "splitlines" => Self::Splitlines,
+            _ => return None,
+        })
+    }
+
+    /// The method's result on a str receiver.
+    pub(crate) fn result(self) -> TypeInfo {
+        match self {
+            Self::Splitlines => TypeInfo::Vec(Box::new(TypeInfo::String)),
+            _ => TypeInfo::String,
+        }
+    }
+
+    /// Callable with the receiver as its only argument (`str.lower(x)`),
+    /// so the unbound form lowers to the bound method on the argument.
+    pub(crate) fn takes_only_receiver(self) -> bool {
+        matches!(
+            self,
+            Self::Upper | Self::Lower | Self::Strip | Self::Lstrip | Self::Rstrip | Self::Title
+                | Self::Capitalize | Self::Casefold | Self::Swapcase | Self::Splitlines
+        )
+    }
+}
+
+/// Definite assignment of `name` by a statement list, on its fall-through
+/// paths: `Some(true)` when every path that reaches the end has written
+/// the name, `Some(false)` when some path may not have, `None` when no
+/// path falls through (the list terminates in return/raise/break/continue
+/// before the end). A nested `if` counts only when both arms do; a loop
+/// never does (it may run zero times); a `try` counts when its body and
+/// every handler do; a `with` counts through its body.
+fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
+    fn assign_target_writes(target: &ExprType, name: &str) -> bool {
+        match target {
+            ExprType::Name(n) => n.id == name,
+            ExprType::Tuple(t) => t.elts.iter().any(|e| assign_target_writes(e, name)),
+            ExprType::List(l) => l.iter().any(|e| assign_target_writes(e, name)),
+            ExprType::Starred(st) => assign_target_writes(&st.value, name),
+            _ => false,
+        }
+    }
+    // The bound name of an import alias (`import a.b` binds `a`; `import
+    // x as y` and `from m import x as y` bind `y`).
+    fn alias_binds(a: &crate::Alias, name: &str, dotted_root: bool) -> bool {
+        match &a.asname {
+            Some(as_) => as_ == name,
+            None if dotted_root => a.name.split('.').next() == Some(name),
+            None => a.name == name,
+        }
+    }
+    for stmt in stmts {
+        match &stmt.statement {
+            StatementType::Return(_)
+            | StatementType::Raise(_)
+            | StatementType::Break
+            | StatementType::Continue => return None,
+            StatementType::Assign(a) if a.targets.iter().any(|t| assign_target_writes(t, name)) => {
+                return Some(true);
+            }
+            StatementType::AugAssign(a) if assign_target_writes(&a.target, name) => {
+                return Some(true);
+            }
+            // The other definite binders: a walrus in an expression
+            // statement, an import, a def/class of that name.
+            StatementType::Expr(e) if expr_walrus_writes(&e.value, name) => return Some(true),
+            StatementType::Import(i) if i.names.iter().any(|a| alias_binds(a, name, true)) => {
+                return Some(true);
+            }
+            StatementType::ImportFrom(i)
+                if i.names.iter().any(|a| alias_binds(a, name, false)) =>
+            {
+                return Some(true);
+            }
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f)
+                if f.name == name =>
+            {
+                return Some(true);
+            }
+            StatementType::ClassDef(c) if c.name == name => return Some(true),
+            StatementType::If(s) => match (definitely_writes(&s.body, name), definitely_writes(&s.orelse, name)) {
+                (Some(true), Some(true)) | (Some(true), None) | (None, Some(true)) => return Some(true),
+                (None, None) => return None,
+                _ => {}
+            },
+            // `with ... as name:` binds before the body runs.
+            StatementType::With(s)
+                if s.items.iter().any(|it| {
+                    it.optional_vars.as_ref().is_some_and(|v| assign_target_writes(v, name))
+                }) =>
+            {
+                return Some(true);
+            }
+            StatementType::With(s) => match definitely_writes(&s.body, name) {
+                Some(true) => return Some(true),
+                None => return None,
+                _ => {}
+            },
+            StatementType::Try(t) => {
+                let body = definitely_writes(&t.body, name);
+                // A handler binds its `as name` before its body runs.
+                let handlers = t.handlers.iter().map(|h| {
+                    if h.name.as_deref() == Some(name) {
+                        Some(true)
+                    } else {
+                        definitely_writes(&h.body, name)
+                    }
+                });
+                let all_handlers_write = handlers.clone().all(|d| d != Some(false));
+                let final_writes = definitely_writes(&t.finalbody, name);
+                if final_writes == Some(true) {
+                    return Some(true);
+                }
+                if body == Some(true) && all_handlers_write {
+                    return Some(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(false)
+}
+
+/// Whether evaluating `expr` binds `name` through a walrus (`(m :=
+/// f(x))`), anywhere in its operand tree (an expression is evaluated in
+/// full, so any walrus in it runs — short-circuit operands excepted).
+fn expr_walrus_writes(expr: &ExprType, name: &str) -> bool {
+    match expr {
+        ExprType::NamedExpr(ne) => {
+            matches!(ne.left.as_ref(), ExprType::Name(n) if n.id == name)
+                || expr_walrus_writes(&ne.right, name)
+        }
+        ExprType::Attribute(a) => expr_walrus_writes(&a.value, name),
+        ExprType::Call(c) => {
+            expr_walrus_writes(&c.func, name)
+                || c.args.iter().any(|a| expr_walrus_writes(a, name))
+                || c.keywords.iter().any(|k| expr_walrus_writes(&k.value, name))
+        }
+        ExprType::BinOp(b) => {
+            expr_walrus_writes(&b.left, name) || expr_walrus_writes(&b.right, name)
+        }
+        // Only the first operand of a short-circuit chain surely runs.
+        ExprType::BoolOp(b) => b.values.first().is_some_and(|v| expr_walrus_writes(v, name)),
+        ExprType::Compare(c) => {
+            expr_walrus_writes(&c.left, name)
+                || c.comparators.iter().any(|r| expr_walrus_writes(r, name))
+        }
+        ExprType::UnaryOp(u) => expr_walrus_writes(&u.operand, name),
+        ExprType::IfExp(i) => expr_walrus_writes(&i.test, name),
+        ExprType::Subscript(sub) => expr_walrus_writes(&sub.value, name),
+        ExprType::Tuple(t) => t.elts.iter().any(|e| expr_walrus_writes(e, name)),
+        ExprType::List(l) => l.iter().any(|e| expr_walrus_writes(e, name)),
+        ExprType::Set(st) => st.elts.iter().any(|e| expr_walrus_writes(e, name)),
+        ExprType::Starred(st) => expr_walrus_writes(&st.value, name),
+        _ => false,
+    }
+}
+
+fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
+    if info.name_types.is_empty() {
+        return options.clone();
+    }
+    let mut view = options.clone();
+    let mut names = view.name_types.as_ref().clone();
+    for (n, t) in &info.name_types {
+        names.insert(n.clone(), t.clone());
+    }
+    view.name_types = std::rc::Rc::new(names);
+    view
+}
+
 fn analyze_statement_types(
     stmt: &Statement,
     info: &mut FunctionTypeInfo,
@@ -2284,7 +2569,14 @@ fn analyze_statement_types(
                     // (still pinable by later use).
                     None => match &assign.value {
                         ExprType::Call(c) => {
-                            call_return_typeinfo(c, symbols, options)
+                            // The receiver of an attribute callee (`n =
+                            // c.decode()` where `c = Codec()` was recorded
+                            // by THIS analysis) is visible only through
+                            // the analysis view — the raw options carry
+                            // the caller's seeds, not the locals typed so
+                            // far.
+                            let view = options.map(|o| analysis_view(o, info));
+                            call_return_typeinfo(c, symbols, view.as_ref())
                                 .or_else(|| {
                                     // The ctx-aware inferrer: a dict-method
                                     // fetch (`item = self.items.get(k)` —
@@ -2297,13 +2589,32 @@ fn analyze_statement_types(
                                         (Some(options), Some(symbols)) => Some(infer_type(
                                             analysis_ctx.as_ref(),
                                             &assign.value,
-                                            options,
+                                            &analysis_view(options, info),
                                             symbols,
                                         )),
                                         _ => None,
                                     }
                                 })
                                 .unwrap_or_else(|| syntactic_type(&assign.value))
+                        }
+                        // A COMPREHENSION value types from its body in the
+                        // comprehension's scope (`squares = [s for s in
+                        // shapes if ...]` is a Vec of shapes' element), which
+                        // only the context-aware inferrer can see; the
+                        // enclosing class makes a `self.<field>` iterable
+                        // resolvable.
+                        ExprType::ListComp(_) | ExprType::SetComp(_) | ExprType::DictComp(_) => {
+                            let analysis_ctx =
+                                self_class.map(|cl| CodeGenContext::Class(cl.to_string()));
+                            match (options, symbols) {
+                                (Some(options), Some(symbols)) => infer_type(
+                                    analysis_ctx.as_ref(),
+                                    &assign.value,
+                                    &analysis_view(options, info),
+                                    symbols,
+                                ),
+                                _ => syntactic_type(&assign.value),
+                            }
                         }
                         // A BINOP value needs the context-aware inferrer:
                         // `y = x + b"c"` is bytes (bytes + bytes), which
@@ -2313,7 +2624,7 @@ fn analyze_statement_types(
                         // only infer_type has the operand types.
                         ExprType::BinOp(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                infer_type(None, &assign.value, options, symbols)
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2329,7 +2640,7 @@ fn analyze_statement_types(
                         _ if crate::ast::tree::assign::is_container_literal(&assign.value) => match (options, symbols)
                         {
                             (Some(options), Some(symbols)) => {
-                                infer_type(None, &assign.value, options, symbols)
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2342,7 +2653,7 @@ fn analyze_statement_types(
                         // Some-wrap (round 45).
                         ExprType::Name(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                infer_type(None, &assign.value, options, symbols)
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2457,11 +2768,75 @@ fn analyze_statement_types(
         StatementType::Return(Some(e)) => count_expr_reads(&e.value, info),
         StatementType::If(s) => {
             count_expr_reads(&s.test, info);
+            // The analysis narrows through the SAME authority the lowering
+            // does (`isinstance_narrowing`): inside `if not isinstance(
+            // label, bytes): ... else: label_bytes = label`, the else
+            // branch reads `label` as bytes, so the alias is typed bytes,
+            // not the parameter's boxed union (idna's ulabel — a boxed
+            // alias made every later byte operation a PyValue call). The
+            // branch type is installed for the branch only and the
+            // name's prior entry restored after; stores recorded inside
+            // the branches persist, as any store does.
+            let narrowing = match (options, symbols) {
+                (Some(o), Some(sy)) => {
+                    crate::isinstance_narrowing(&s.test, &analysis_view(o, info), sy)
+                }
+                _ => None,
+            };
+            let saved = narrowing
+                .as_ref()
+                .and_then(|(n, _, _)| info.name_types.get(n).cloned());
+            if let Some((n, body_ty, _)) = &narrowing {
+                info.name_types.insert(n.clone(), narrowed_value_type(body_ty));
+            }
             for b in &s.body {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
+            let after_body = narrowing
+                .as_ref()
+                .and_then(|(n, _, _)| info.name_types.get(n).cloned());
+            if let Some((n, _, else_ty)) = &narrowing {
+                info.name_types.insert(n.clone(), narrowed_value_type(else_ty));
+            }
             for b in &s.orelse {
                 analyze_statement_types(b, info, options, symbols, self_class);
+            }
+            if let Some((n, _, _)) = &narrowing {
+                // Both branches REASSIGN the name (`label = label.decode()`
+                // in each arm): the post-if type is the join of the two
+                // branch results, as a plain sequence of stores would
+                // leave it — the narrowing is temporary, a reassignment is
+                // not (Devin review on #318). One or no reassignment
+                // restores the pre-if entry: the name may still hold the
+                // original union.
+                // DEFINITE assignment, per branch: every fall-through path
+                // writes the name (a nested `if` writing in one arm only, a
+                // loop that may run zero times, do not count), and a branch
+                // that terminates (return/raise) constrains nothing. Devin
+                // review on #318: "a write exists somewhere" is not that.
+                let body_def = definitely_writes(&s.body, n);
+                let else_def = definitely_writes(&s.orelse, n);
+                let else_result = info.name_types.get(n).cloned();
+                let joined = match (body_def, else_def) {
+                    (Some(true), Some(true)) => match (after_body.as_ref(), else_result.as_ref()) {
+                        (Some(b), Some(e)) => Some(unify(b.clone(), e.clone())),
+                        _ => None,
+                    },
+                    (Some(true), None) => after_body.clone(),
+                    (None, Some(true)) => else_result.clone(),
+                    _ => None,
+                };
+                match joined {
+                    Some(t) => {
+                        info.name_types.insert(n.clone(), t);
+                    }
+                    None => {
+                        match saved {
+                            Some(t) => info.name_types.insert(n.clone(), t),
+                            None => info.name_types.remove(n),
+                        };
+                    }
+                }
             }
         }
         StatementType::While(s) => {
@@ -2488,9 +2863,9 @@ fn analyze_statement_types(
                 // pre-ctx behavior stands (round 99).
                 let analysis_ctx = self_class.map(|c| CodeGenContext::Class(c.to_string()));
                 let iter_ty =
-                    infer_type(analysis_ctx.as_ref(), &s.iter, options, symbols);
+                    infer_type(analysis_ctx.as_ref(), &s.iter, &analysis_view(options, info), symbols);
                 if let Some(elem) = iterable_element_type(&iter_ty) {
-                    seed_target_types(&s.target, &elem, info);
+                    seed_binder_types(&s.target, &elem, &mut info.name_types, false);
                 }
             }
             for b in &s.body {
@@ -3684,18 +4059,141 @@ fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
 /// target binds the element; a (nested) TUPLE target binds each element
 /// name from the matching pair (`for (i, (name, item)) in enumerate(...)`
 /// — round 99). `or_insert`: an earlier store or annotation wins.
-fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
+/// Bind a loop/comprehension TARGET to the element type it iterates
+/// (`for (name, item) in pairs` seeds `name` and `item` from a tuple
+/// element type). THE one binder authority: the for-statement
+/// (`analyze_statement_types`), the comprehension scope
+/// (`comprehension_scope`) and a call-site-typed lambda parameter
+/// (`lambda_scope`) all seed through it, so a receiver's class resolves
+/// the same way in every scope that binds a name to an element. `shadow`
+/// decides a collision: a for-statement target keeps an earlier store or
+/// annotation (`or_insert`), while a comprehension or lambda binder is a
+/// NEW scope and overrides the outer name.
+pub(crate) fn seed_binder_types(
+    target: &ExprType,
+    ty: &TypeInfo,
+    out: &mut HashMap<String, TypeInfo>,
+    shadow: bool,
+) {
     match target {
         ExprType::Name(n) => {
-            info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
+            if shadow {
+                out.insert(n.id.clone(), ty.clone());
+            } else {
+                out.entry(n.id.clone()).or_insert_with(|| ty.clone());
+            }
         }
         ExprType::Tuple(t) => {
             if let TypeInfo::Tuple(ts) = ty {
                 for (elt, ety) in t.elts.iter().zip(ts.iter()) {
-                    seed_target_types(elt, ety, info);
+                    seed_binder_types(elt, ety, out, shadow);
                 }
             }
         }
+        _ => {}
+    }
+}
+
+/// The typing scope of a comprehension body: the outer options with each
+/// generator's target bound to its iterable's element type, left to right
+/// (a later generator may iterate an earlier target). A target whose
+/// element type is unknowable stays untyped, and the body then takes the
+/// untyped paths exactly as before. Both the LOWERING (list_comp.rs) and
+/// the TYPE side (`infer_type`'s comprehension arms) build the scope here,
+/// so the two cannot disagree about what a comprehension variable is.
+pub(crate) fn comprehension_scope(
+    generators: &[crate::Comprehension],
+    ctx: Option<&CodeGenContext>,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> PythonOptions {
+    comprehension_prefix_scopes(generators, ctx, options, symbols)
+        .pop()
+        .unwrap_or_else(|| options.clone())
+}
+
+/// The comprehension's scopes as they build, one per generator boundary:
+/// `scopes[i]` binds the targets of generators `0..i`, so generator `i`'s
+/// ITERABLE evaluates in `scopes[i]` (it cannot see its own target, nor a
+/// later one — `[x for x in xs for x in x]` iterates the OUTER `x` in the
+/// inner clause) while its target and filters, and the element, see
+/// `scopes[i + 1]`. `scopes[0]` is the outer scope; the last entry is the
+/// complete scope. Devin review on #318.
+pub(crate) fn comprehension_prefix_scopes(
+    generators: &[crate::Comprehension],
+    ctx: Option<&CodeGenContext>,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Vec<PythonOptions> {
+    let mut scopes = Vec::with_capacity(generators.len() + 1);
+    scopes.push(options.clone());
+    for g in generators {
+        let prev = scopes.last().expect("the outer scope is always present");
+        let mut next = prev.clone();
+        let elem = iterable_element_type(&infer_type(ctx, &g.iter, prev, symbols));
+        bind_fresh(&mut next, &g.target, elem.as_ref());
+        scopes.push(next);
+    }
+    scopes
+}
+
+/// The typing scope of a lambda body whose parameters are known from the
+/// call site (`key=lambda s: s.area()` over a `list[Shape]`: the parameter
+/// IS the iterable's element): the outer options with each positional
+/// parameter bound to the given type, in order.
+pub(crate) fn lambda_scope(
+    lambda: &crate::Lambda,
+    param_types: &[Option<TypeInfo>],
+    options: &PythonOptions,
+) -> PythonOptions {
+    let mut scope = options.clone();
+    for (i, p) in lambda.args.args.iter().enumerate() {
+        bind_fresh_name(&mut scope, &p.arg, param_types.get(i).and_then(|t| t.as_ref()));
+    }
+    scope
+}
+
+/// Bind a comprehension target (any destructuring shape) as FRESH names
+/// in `scope`: see `bind_fresh_name`. The element type seeds the names
+/// when known; an unknowable element leaves them untyped — never typed
+/// as a same-named outer binding.
+pub(crate) fn bind_fresh(scope: &mut PythonOptions, target: &ExprType, ty: Option<&TypeInfo>) {
+    let mut names = Vec::new();
+    binder_names(target, &mut names);
+    for n in &names {
+        bind_fresh_name(scope, n, None);
+    }
+    if let Some(ty) = ty {
+        seed_binder_types(target, ty, std::rc::Rc::make_mut(&mut scope.name_types), true);
+    }
+}
+
+/// Bind `name` as a FRESH binding in `scope` — a comprehension target or a
+/// lambda parameter shadows a same-named outer name (Python 3 scopes
+/// them), so nothing the outer scope knew about that name applies: not
+/// its type, not its Option-ness, not the flow narrowing an enclosing
+/// `if` installed (a narrowed Option read unwraps; the fresh binding is
+/// not an Option). Devin review on #318.
+pub(crate) fn bind_fresh_name(scope: &mut PythonOptions, name: &str, ty: Option<&TypeInfo>) {
+    std::rc::Rc::make_mut(&mut scope.narrowed_names).remove(name);
+    std::rc::Rc::make_mut(&mut scope.optional_names).remove(name);
+    let types = std::rc::Rc::make_mut(&mut scope.name_types);
+    match ty {
+        Some(t) => {
+            types.insert(name.to_string(), t.clone());
+        }
+        None => {
+            types.remove(name);
+        }
+    }
+}
+
+fn binder_names(target: &ExprType, out: &mut Vec<String>) {
+    match target {
+        ExprType::Name(n) => out.push(n.id.clone()),
+        ExprType::Tuple(t) => t.elts.iter().for_each(|e| binder_names(e, out)),
+        ExprType::List(l) => l.iter().for_each(|e| binder_names(e, out)),
+        ExprType::Starred(st) => binder_names(&st.value, out),
         _ => {}
     }
 }
@@ -4192,6 +4690,147 @@ mod tests {
             .as_deref()
             .expect("annotation")
             .clone()
+    }
+
+    /// The analysis after `if isinstance(label, bytes): ... else: ...` on a
+    /// `str | bytes` parameter, with the branch bodies given.
+    fn post_if_type(body: &str, orelse: &str) -> Option<TypeInfo> {
+        let src = format!(
+            "def f(label):\n    if isinstance(label, bytes):\n{body}    else:\n{orelse}    return label\n"
+        );
+        let module = parse(&src, "narrow.py").expect("parse failed");
+        let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+            panic!("expected a function def");
+        };
+        let mut options = PythonOptions::default();
+        let mut names = HashMap::new();
+        names.insert("label".to_string(), TypeInfo::StrOrBytes);
+        options.name_types = std::rc::Rc::new(names);
+        let symbols = SymbolTableScopes::new();
+        let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
+        info.name_types.get("label").cloned()
+    }
+
+    /// Devin review on #318: a narrowed name reassigned on EVERY fall-through
+    /// path of both branches keeps the reassigned type after the if (the
+    /// join of the two branch results); a write nested under a further
+    /// condition, or a branch that may not write, restores the union.
+    #[test]
+    fn a_definite_reassignment_in_both_narrowed_branches_retypes_the_name() {
+        assert_eq!(
+            post_if_type(
+                "        label = label.decode(\"ascii\")\n",
+                "        label = label.upper()\n"
+            ),
+            Some(TypeInfo::String)
+        );
+        // A terminating branch constrains nothing: the other's type stands.
+        assert_eq!(
+            post_if_type("        raise ValueError(\"bytes\")\n", "        label = label.upper()\n"),
+            Some(TypeInfo::String)
+        );
+        // A conditional write in one branch is not definite: the union stays.
+        assert_eq!(
+            post_if_type(
+                "        if len(label) > 3:\n            label = label.decode(\"ascii\")\n",
+                "        label = label.upper()\n"
+            ),
+            None
+        );
+        // A loop may run zero times: not definite either.
+        assert_eq!(
+            post_if_type(
+                "        for _ in range(3):\n            label = label.decode(\"ascii\")\n",
+                "        label = label.upper()\n"
+            ),
+            None
+        );
+    }
+
+    /// Devin review on #318: a user class's own `encode`/`decode` keeps
+    /// its declared return; only a string-shaped receiver takes the codec
+    /// answer.
+    /// The definite binders beyond plain assignment (Devin review on
+    /// #318): `with ... as`, `except ... as`, a walrus in an expression
+    /// statement, an import, a def. A loop target stays indefinite (zero
+    /// iterations).
+    #[test]
+    fn definite_writes_cover_the_other_binders() {
+        let body = |src: &str| {
+            let module = parse(&format!("def f(label):\n{}", src), "dw.py").expect("parse failed");
+            let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+                panic!("expected a function def");
+            };
+            f.body.clone()
+        };
+        assert_eq!(definitely_writes(&body("    with open(p) as label:\n        pass\n"), "label"), Some(true));
+        assert_eq!(
+            definitely_writes(&body("    try:\n        label = g()\n    except ValueError as label:\n        pass\n"), "label"),
+            Some(true)
+        );
+        assert_eq!(definitely_writes(&body("    print(label := g())\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    import os as label\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    from os import path as label\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    def label():\n        pass\n"), "label"), Some(true));
+        assert_eq!(definitely_writes(&body("    for label in xs:\n        pass\n"), "label"), Some(false));
+        assert_eq!(definitely_writes(&body("    print(a and (label := g()))\n"), "label"), Some(false));
+    }
+
+    /// `str.format` types as the lowering renders it (Devin review on
+    /// #318): a literal template is a String; a dynamic one (a str
+    /// parameter as the template) is the boxed None the lowering drops
+    /// the call to, never a String.
+    #[test]
+    fn str_format_types_as_the_lowering_renders_it() {
+        let src = "def f(tpl: str, n: int):\n    a = \"{}!\".format(n)\n    b = tpl.format(n)\n    return a\n";
+        let module = parse(src, "fmt.py").expect("parse failed");
+        let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+        let StatementType::FunctionDef(f) = &module.raw.body[0].statement else {
+            panic!("expected a function def");
+        };
+        let mut options = PythonOptions::default();
+        let mut names = HashMap::new();
+        names.insert("tpl".to_string(), TypeInfo::String);
+        names.insert("n".to_string(), TypeInfo::Int);
+        options.name_types = std::rc::Rc::new(names);
+        let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
+        assert_eq!(info.name_types.get("a"), Some(&TypeInfo::String));
+        assert_eq!(info.name_types.get("b"), Some(&TypeInfo::PyValue));
+    }
+
+    /// The binder's element authority covers every iterable whose element
+    /// is statically known (Devin review on #318): a set yields its
+    /// element, a dict its keys, a str one-character strings.
+    #[test]
+    fn iterable_element_types_cover_sets_dicts_and_strings() {
+        assert_eq!(
+            iterable_element_type(&TypeInfo::HashSet(Box::new(TypeInfo::Class("Shape".into())))),
+            Some(TypeInfo::Class("Shape".into()))
+        );
+        assert_eq!(
+            iterable_element_type(&TypeInfo::Dict(Box::new(TypeInfo::String), Box::new(TypeInfo::Int))),
+            Some(TypeInfo::String)
+        );
+        assert_eq!(iterable_element_type(&TypeInfo::String), Some(TypeInfo::String));
+        assert_eq!(iterable_element_type(&TypeInfo::StrRef), Some(TypeInfo::String));
+        assert_eq!(iterable_element_type(&TypeInfo::Int), None);
+    }
+
+    #[test]
+    fn a_user_classes_decode_keeps_its_declared_return() {
+        let src = "class Codec:\n    def decode(self) -> int:\n        return 1\n\ndef f(label: str):\n    c = Codec()\n    n = c.decode()\n    s = label.encode(\"ascii\")\n    return n\n";
+        let module = parse(src, "codec.py").expect("parse failed");
+        let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+        let StatementType::FunctionDef(f) = &module.raw.body[1].statement else {
+            panic!("expected a function def");
+        };
+        let mut options = PythonOptions::default();
+        let mut names = HashMap::new();
+        names.insert("label".to_string(), TypeInfo::String);
+        options.name_types = std::rc::Rc::new(names);
+        let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
+        assert_eq!(info.name_types.get("n"), Some(&TypeInfo::Int));
+        assert_eq!(info.name_types.get("s"), Some(&TypeInfo::Bytes));
     }
 
     /// The single type authority (issue #137's systemic review of rounds

@@ -12396,9 +12396,10 @@ fn an_untypeable_return_still_lowers_to_unit() {
     // rather than guessing at one.
     //
     // (This case used `sorted(xs)` until the iterator builtins learned to
-    // carry their element type; the assertion is about the refusal, so it
-    // moved to an expression that is still genuinely untypeable.)
-    let out = compile("def m(s: str):\n    return s.splitlines()\n", "retunk.py");
+    // carry their element type, then `s.splitlines()` until the str-method
+    // table typed it; the assertion is about the refusal, so it moves to
+    // an expression that is still genuinely untypeable.)
+    let out = compile("def m(s: str):\n    return s.partition(\",\")\n", "retunk.py");
     assert!(
         out.contains("-> Result < () , PyException >"),
         "generated: {}",
@@ -16689,6 +16690,373 @@ fn boxed_value_stored_into_a_concrete_inherited_field_converts() {
     assert!(
         !out.contains("PyValue :: from (info . is_verified)") && !out.contains("PyValue::from(info.is_verified)"),
         "a boxed value into a concrete inherited field must not box-wrap: {}",
+        out
+    );
+}
+
+// The binder authority (issue #137, the round-99 evaluation's drift 3): a
+// comprehension target, a `key=` lambda parameter, and a constructor call
+// used directly as a receiver are typed the way a for-statement target
+// is, so a user method call on them resolves its receiver's class and
+// emits the `?` its Result needs. Before, the untyped receiver fell to
+// the generic arm, the Result leaked, and rustc rejected it downstream
+// (the idiom corpus's shapes: six of its eleven errors).
+fn has_fallible_area_call(out: &str) -> bool {
+    out.contains(". area () ?") || out.contains(".area()?")
+}
+
+#[test]
+fn a_comprehension_target_over_a_class_list_types_its_method_calls() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "def total(shapes: list[Shape]) -> float:\n",
+            "    return sum([s.area() for s in shapes])\n",
+        ),
+        "comp_binder.py",
+    );
+    assert!(
+        has_fallible_area_call(&out),
+        "the comprehension target must resolve the class so the call propagates: {}",
+        out
+    );
+}
+
+#[test]
+fn a_key_lambda_parameter_is_the_iterables_element() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "def biggest(shapes: list[Shape]) -> Shape:\n",
+            "    return max(shapes, key=lambda s: s.area())\n",
+        ),
+        "key_binder.py",
+    );
+    assert!(
+        has_fallible_area_call(&out),
+        "the key lambda's parameter must resolve the class so the call propagates: {}",
+        out
+    );
+}
+
+#[test]
+fn a_constructor_call_as_receiver_resolves_its_class() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Shape().area())\n",
+        ),
+        "ctor_receiver.py",
+    );
+    assert!(
+        has_fallible_area_call(&out),
+        "a constructor call used as the receiver must resolve its class: {}",
+        out
+    );
+}
+
+#[test]
+fn a_comprehension_element_type_is_the_body_type_in_the_comprehension_scope() {
+    // The type side agrees with the lowering: `[s.name() for s in shapes]`
+    // is a Vec<String>, so a later `"-".join(names)` sees strings, not an
+    // unknown element.
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def name(self) -> str:\n",
+            "        return \"shape\"\n",
+            "\n",
+            "def names(shapes: list[Shape]) -> str:\n",
+            "    ns = [s.name() for s in shapes]\n",
+            "    return \"-\".join(ns)\n",
+        ),
+        "comp_type.py",
+    );
+    assert!(
+        out.contains(". name () ?") || out.contains(".name()?"),
+        "the comprehension body call must propagate: {}",
+        out
+    );
+}
+
+#[test]
+fn a_local_bound_to_a_comprehension_carries_its_element_type() {
+    // `squares = [s for s in shapes if ...]` is a list of shapes' element,
+    // so a later comprehension over `squares` resolves the receiver and
+    // propagates the method call's Result.
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def name(self) -> str:\n",
+            "        return \"shape\"\n",
+            "    def big(self) -> bool:\n",
+            "        return True\n",
+            "\n",
+            "def names(shapes: list[Shape]) -> list[str]:\n",
+            "    bigs = [s for s in shapes if s.big()]\n",
+            "    return [s.name() for s in bigs]\n",
+        ),
+        "comp_local.py",
+    );
+    assert!(
+        out.contains(". name () ?") || out.contains(".name()?"),
+        "the comprehension-bound local must carry the element type: {}",
+        out
+    );
+}
+
+#[test]
+fn the_analysis_narrows_an_isinstance_branch_like_the_lowering() {
+    // idna's ulabel: the else branch of `if not isinstance(label, bytes)`
+    // reads the `str | bytes` parameter as bytes, so the alias
+    // `label_bytes = label` is bytes — not the parameter's boxed union,
+    // which would box every later byte operation (E0599 on the boxed
+    // startswith/lower/slice).
+    let out = compile(
+        concat!(
+            "def ulabel(label: str | bytes) -> str:\n",
+            "    if not isinstance(label, bytes):\n",
+            "        label_bytes = label.encode(\"ascii\")\n",
+            "    else:\n",
+            "        label_bytes = label\n",
+            "    label_bytes = label_bytes.lower()\n",
+            "    return label_bytes.decode(\"ascii\")\n",
+        ),
+        "narrow_analysis.py",
+    );
+    assert!(
+        !out.contains("PyValue :: from") && !out.contains("PyValue::from"),
+        "the alias must be typed by the narrowed branch, not boxed: {}",
+        out
+    );
+}
+
+#[test]
+fn a_nested_comprehension_binds_each_generator_in_its_prefix_scope() {
+    // Devin review on #318: generator i's iterable sees only the targets
+    // bound before it, so `for s in group` resolves `group` from the outer
+    // generator, and `s` types from it — the inner call propagates.
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def name(self) -> str:\n",
+            "        return \"shape\"\n",
+            "\n",
+            "def names(groups: list[list[Shape]]) -> list[str]:\n",
+            "    return [s.name() for group in groups for s in group]\n",
+        ),
+        "nested_comp.py",
+    );
+    assert!(
+        out.contains(". name () ?") || out.contains(".name()?"),
+        "the inner generator's target must type from the outer target: {}",
+        out
+    );
+}
+
+#[test]
+fn a_write_nested_under_a_condition_in_a_narrowed_branch_keeps_the_union() {
+    // Devin review on #318: only a DEFINITE reassignment (every fall-through
+    // path of both branches) retypes the name after the if; a write nested
+    // under a further condition leaves the union in place on the other
+    // path, so post-if reads stay boxed.
+    let out = compile(
+        concat!(
+            "def norm(label: str | bytes, flag: bool) -> bool:\n",
+            "    if isinstance(label, bytes):\n",
+            "        if flag:\n",
+            "            label = label.decode(\"ascii\")\n",
+            "    else:\n",
+            "        label = label.upper()\n",
+            "    return isinstance(label, bytes)\n",
+        ),
+        "branch_partial_reassign.py",
+    );
+    // The post-if `isinstance` is a second runtime test on the union.
+    assert!(
+        out.matches("is_bytes ()").count() == 2,
+        "a conditional write must not retype the name after the if: {}",
+        out
+    );
+}
+
+/// Devin review on #318: a factory imported through the package's own
+/// root-qualified path (`from pkg.session import make`, keyed
+/// ["session"]) resolves as a receiver when its result is used directly
+/// (`make().run()`): the module key authority normalizes the path.
+#[test]
+fn a_root_qualified_imported_factory_result_is_a_method_receiver() {
+    let session = parse(
+        concat!(
+            "class Session:\n",
+            "    def run(self) -> int:\n",
+            "        return 42\n",
+            "\n",
+            "def make() -> Session:\n",
+            "    return Session()\n",
+        ),
+        "session.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["session".to_string()], std::rc::Rc::new(session));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.session import make\n\ndef go() -> int:\n    return make().run()\n",
+        "usemod.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("usemod".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". run () ?"),
+        "the factory's result must resolve its class and the call propagate: {}",
+        out
+    );
+}
+
+/// A comprehension target that reuses a NARROWED outer name (Devin
+/// review on #318): the target is a fresh binding (Python 3 scopes the
+/// comprehension), so the enclosing `if x is None: return` narrowing —
+/// whose reads unwrap the Option parameter — must not apply to it.
+#[test]
+fn a_comprehension_target_shadowing_a_narrowed_name_is_a_fresh_binding() {
+    let out = compile(
+        "def f(x: int | None, xs: list[int]) -> list[int]:\n    if x is None:\n        return []\n    return [x * 2 for x in xs]\n",
+        "shadow_comp.py",
+    );
+    assert!(
+        !out.contains("unwrap"),
+        "the fresh target reads plainly, never through the outer Option's unwrap: {}",
+        out
+    );
+}
+
+/// A key lambda's parameter that reuses a narrowed outer name is likewise
+/// a fresh binding.
+#[test]
+fn a_key_lambda_parameter_shadowing_a_narrowed_name_is_a_fresh_binding() {
+    let out = compile(
+        "def f(s: str | None, xs: list[str]) -> list[str]:\n    if s is None:\n        return []\n    return sorted(xs, key=lambda s: s.lower())\n",
+        "shadow_lambda.py",
+    );
+    assert!(
+        !out.contains("unwrap"),
+        "the fresh parameter reads plainly, never through the outer Option's unwrap: {}",
+        out
+    );
+}
+
+/// A comprehension over a SET of a class types its target from the set's
+/// element (Devin review on #318): the body's user-method call resolves
+/// its receiver and propagates the Result.
+#[test]
+fn a_set_comprehension_target_is_the_sets_element() {
+    let out = compile(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n\ndef f(shapes: set[Shape]) -> list[float]:\n    return [s.area() for s in shapes]\n",
+        "setcomp.py",
+    );
+    assert!(out.contains(". area () ?"), "the target is the set's element: {}", out);
+}
+
+/// `map(lambda x, y: ..., xs, ys)`: one parameter per iterable, each the
+/// element of its own iterable.
+#[test]
+fn a_two_iterable_map_lambda_binds_each_parameter_to_its_iterables_element() {
+    let out = compile(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n\ndef f(xs: list[Shape], ys: list[Shape]) -> list[float]:\n    return list(map(lambda x, y: x.area() + y.area(), xs, ys))\n",
+        "map2.py",
+    );
+    assert_eq!(
+        out.matches(". area () ?").count(),
+        2,
+        "both parameters resolve their class: {}",
+        out
+    );
+}
+
+/// A root-qualified IMPORTED CLASS constructed and used directly as a
+/// receiver (`Shape().area()` with `from pkg.shapes import Shape` in a
+/// src-layout package): the constructor resolves to the class, not a
+/// factory, through the module key authority.
+#[test]
+fn a_root_qualified_imported_constructor_result_is_a_method_receiver() {
+    let shapes = parse(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n",
+        "shapes.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["shapes".to_string()], std::rc::Rc::new(shapes));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.shapes import Shape\n\ndef go() -> float:\n    return Shape().area()\n",
+        "usemod2.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("usemod2".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". area () ?"),
+        "the constructed class's method call propagates: {}",
+        out
+    );
+}
+
+/// An ALIASED root-qualified import (`from pkg.shapes import Shape as S`)
+/// constructed and used directly as a receiver: the alias resolves to the
+/// canonical name the defining module knows.
+#[test]
+fn an_aliased_imported_constructor_result_is_a_method_receiver() {
+    let shapes = parse(
+        "class Shape:\n    def area(self) -> float:\n        return 1.0\n",
+        "shapes.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["shapes".to_string()], std::rc::Rc::new(shapes));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.shapes import Shape as S\n\ndef go() -> float:\n    return S().area()\n",
+        "usemod3.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("usemod3".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". area () ?"),
+        "the aliased class's method call propagates: {}",
         out
     );
 }
