@@ -2318,7 +2318,26 @@ impl<'a> CodeGen for Call {
                         let render = |e: crate::ExprType| {
                             e.to_rust(ctx.clone(), options.clone(), symbols.clone())
                         };
+                        // A (K, V)-pair element whose value type has NO
+                        // ordering (a user class — Item has no `__lt__`):
+                        // CPython sorts tuples lexicographically, so the
+                        // values compare ONLY on a key tie and raise
+                        // TypeError there. `sorted_pairs` sorts by key and
+                        // panics CPython's TypeError text on a tie — exact
+                        // for unique keys (dict items), loud otherwise
+                        // (round 99; the idiom corpus's report).
+                        let elem_is_unordered_pair = key.is_none()
+                            && matches!(
+                                crate::infer_type(Some(&ctx), self.args.first().unwrap(), &options, &symbols),
+                                crate::TypeInfo::Vec(e) if matches!(
+                                    &*e, crate::TypeInfo::Tuple(ts)
+                                        if ts.len() == 2 && matches!(ts[1], crate::TypeInfo::Class(_))
+                                )
+                            );
                         return Ok(match (key, reverse) {
+                            (None, None) if elem_is_unordered_pair => {
+                                quote!(sorted_pairs(&(#a)))
+                            }
                             (None, None) => quote!(sorted(&(#a))),
                             (Some(k), None) => {
                                 let k = render(k)?;
@@ -7935,7 +7954,20 @@ impl<'a> CodeGen for Call {
                     let name = n.id.clone();
                     quote!(#name.to_string())
                 } else {
-                    arg.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    // The reuse-clone (round 99): an unknown callee (a
+                    // runtime trait method like `"-".join(words)` — no
+                    // FunctionDef signature) renders through the SAME
+                    // clone-on-reuse renderer user calls use, so a value
+                    // read again later (`len(words)` after the join moved
+                    // it — the idiom corpus's main) clones at the earlier
+                    // read. expected=None: no coercion, just the clone.
+                    crate::render_typed_reused(
+                        &arg,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        None,
+                    )?
                 }
             };
             all_args.push(rust_arg);
@@ -8759,7 +8791,9 @@ pub(crate) fn receiver_class(
             // stores on the parameter route correctly). The class name is
             // in name_types as TypeInfo::Class.
             _ => match options.name_types.get(&n.id) {
-                Some(crate::TypeInfo::Class(cname)) => (cname.clone(), symbols.clone()),
+                Some(crate::TypeInfo::Class(cname)) => {
+                    (cname.clone(), symbols.clone())
+                }
                 _ => return None,
             },
         },
@@ -8789,7 +8823,27 @@ pub(crate) fn receiver_class(
                     .and_then(|m| m.return_class_name(options))
                 {
                     Some(class) => class,
-                    None => owner.field_class(&attr.attr, &owner_symbols, options)?,
+                    None => match owner.field_class(&attr.attr, &owner_symbols, options) {
+                        Some(class) => class,
+                        // A method returning an OPTION of a class
+                        // (`inv.find("bolt").label()` — find is
+                        // `Item | None`): the read unwraps the Option
+                        // (the AttributeError-on-None machinery), so the
+                        // receiver's class is the INNER one (round 99).
+                        None => {
+                            match crate::call_return_typeinfo(
+                                call,
+                                Some(symbols),
+                                Some(options),
+                            ) {
+                                Some(crate::TypeInfo::Option(inner)) => match *inner {
+                                    crate::TypeInfo::Class(cname) => cname,
+                                    _ => return None,
+                                },
+                                _ => return None,
+                            }
+                        }
+                    },
                 };
                 (class, owner_symbols)
             }
@@ -9973,6 +10027,27 @@ fn map_call_arguments_inner(
                 .annotation
                 .as_deref()
                 .and_then(crate::call_arg_expected_type)
+                // A bare CLASS-ANNOTATED parameter (`item: Item` —
+                // annotation_type_info answers None for class names):
+                // the slot is the class, so a DERIVED argument coerces
+                // through the generated `From<Derived> for Base` (round
+                // 99 — the idiom corpus's `add(perishable)`).
+                .or_else(|| {
+                    let ann = param.annotation.as_deref()?;
+                    let crate::ExprType::Name(cn) = ann else {
+                        return None;
+                    };
+                    let is_class = matches!(
+                        symbols.get(&cn.id),
+                        Some(crate::SymbolTableNode::ClassDef(_))
+                    ) || crate::resolve_class_referenced(&cn.id, symbols, options)
+                        .is_some();
+                    if is_class {
+                        Some(crate::TypeInfo::Class(cn.id.clone()))
+                    } else {
+                        None
+                    }
+                })
                 .or_else(|| arg_expected_fallback(param, expr, &ctx, symbols, &options))
                 .or_else(|| {
                     // A None-defaulted unannotated parameter whose VALUE is

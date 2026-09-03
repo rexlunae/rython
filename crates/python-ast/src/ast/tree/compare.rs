@@ -357,10 +357,10 @@ impl CodeGen for Compare {
                     comparator_ast,
                     crate::ExprType::Attribute(attr)
                         if matches!(attr.value.as_ref(), crate::ExprType::Name(n) if n.id == "self")
-                            && crate::ast::tree::aug_assign::self_field_rust_ty(
-                                &attr.attr, &ctx, &options, &symbols,
+                            && matches!(
+                                crate::infer_type(Some(&ctx), comparator_ast, &options, &symbols),
+                                crate::TypeInfo::Option(_)
                             )
-                            .is_some_and(|t| matches!(t, crate::TypeInfo::Option(_)))
                 ));
                 if is_py_cmp && comparator_is_option {
                     let op_name = match op {

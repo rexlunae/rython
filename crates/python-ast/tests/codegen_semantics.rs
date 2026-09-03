@@ -14643,6 +14643,71 @@ fn mutation_through_a_fetched_copy_is_a_loud_error() {
     );
 }
 
+#[test]
+fn an_overriding_derived_argument_into_a_base_slot_is_loud() {
+    // Round 99: `add(Perishable(...))` where `add(item: Item)` — the
+    // generated From-slice would LOSE Perishable's label override (the
+    // base-typed slot dispatches statically; CPython dispatches
+    // dynamically through the base-typed container). Loud refusal.
+    let err = compile_err(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "    def label(self) -> str:\n",
+            "        return \"x\"\n",
+            "\n",
+            "class Perishable(Item):\n",
+            "    def label(self) -> str:\n",
+            "        return \"p\"\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def add(self, item: Item) -> None:\n",
+            "        self.items[item.qty] = item\n",
+            "\n",
+            "def main() -> None:\n",
+            "    bag = Bag()\n",
+            "    bag.add(Perishable())\n",
+        ),
+        "override.py",
+    );
+    assert!(
+        err.contains("passing `Perishable` where `Item` is expected is not supported yet")
+            && err.contains("would lose the override"),
+        "the override-loss refusal must name the construct: {}",
+        err
+    );
+}
+
+#[test]
+fn sorted_over_class_valued_pairs_sorts_by_key_with_cpython_tie_panic() {
+    // Round 99: sorted(d.items()) where the values are class instances —
+    // the values have no ordering, so the sort routes to sorted_pairs:
+    // by-key, with CPython's TypeError at a key tie (exact for dict keys,
+    // which are unique).
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def names(self) -> list[str]:\n",
+            "        return [name for (name, item) in sorted(self.items.items())]\n",
+        ),
+        "sortedpairs.py",
+    );
+    assert!(
+        out.contains("sorted_pairs (&"),
+        "the unordered-pair sort must route to sorted_pairs: {}",
+        out
+    );
+}
+
 // `__setitem__`/`__contains__` dunders receive the subscript store,
 // membership test, and the collections.abc `.get` mixin synthesis —
 // the class's methods ARE Python's behavior (including its exceptions

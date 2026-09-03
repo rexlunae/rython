@@ -407,7 +407,7 @@ pub(crate) fn fold_operand_type(
     if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
         return inferred;
     }
-    let field_ty = crate::ast::tree::aug_assign::self_field_rust_ty(&attr.attr, ctx, options, symbols);
+    let field_ty = Some(crate::infer_type(Some(ctx), expr, options, symbols));
     if field_ty.as_ref().is_some_and(|t| matches!(t, crate::TypeInfo::Option(_))) {
         // The inner type from the field's TypeInfo, so the fold's
         // inner_matches can unify with the other operand (`self.path or
