@@ -3382,12 +3382,8 @@ impl<'a> CodeGen for Call {
                                         if matches!(
                                             ub.value.as_ref(),
                                             ExprType::Name(n) if n.id == "str"
-                                        ) && matches!(
-                                            ub.attr.as_str(),
-                                            "lower" | "upper" | "title" | "strip"
-                                                | "lstrip" | "rstrip" | "capitalize"
-                                                | "casefold" | "swapcase"
-                                        ) =>
+                                        ) && crate::ast::tree::type_ctx::StrMethod::from_name(&ub.attr)
+                                            .is_some_and(|m| m.takes_only_receiver()) =>
                                     {
                                         Some(crate::safe_ident(&ub.attr))
                                     }
@@ -5906,11 +5902,8 @@ impl<'a> CodeGen for Call {
             // two-argument bound form).
             if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "str")
                 && self.args.len() == 1
-                && matches!(
-                    attr.attr.as_str(),
-                    "lower" | "upper" | "title" | "strip" | "lstrip" | "rstrip"
-                        | "capitalize" | "casefold" | "swapcase" | "splitlines"
-                )
+                && crate::ast::tree::type_ctx::StrMethod::from_name(&attr.attr)
+                    .is_some_and(|m| m.takes_only_receiver())
             {
                 let m = crate::safe_ident(&attr.attr);
                 let arg = self.args[0].clone().to_rust(
@@ -8852,12 +8845,12 @@ fn named_call_class(
     let fdef = match symbols.get(&cn.id) {
         Some(SymbolTableNode::FunctionDef(f)) => Some((f.clone(), symbols.clone())),
         Some(SymbolTableNode::ImportFrom(ifm)) => {
+            // The module key authority (`module_defs_key`) covers the
+            // package's own root-qualified spelling (`from pkg.session
+            // import make` in a src-layout sdist, keyed ["session"]).
             let path = ifm.resolved_module_path(options);
-            if options.module_defs.contains_key(&path) {
-                crate::module_function_def(options, &path, &cn.id)
-            } else {
-                None
-            }
+            crate::module_defs_key(options, &path)
+                .and_then(|key| crate::module_function_def(options, key, &cn.id))
         }
         _ => None,
     };

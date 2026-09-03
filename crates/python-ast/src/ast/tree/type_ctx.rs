@@ -741,21 +741,36 @@ fn infer_type_inner(
                     _ if on_numpy => TypeInfo::NdArray,
                     // The str/bytes codec pair, as the lowering renders them
                     // (`decode_ascii(...)` is a String, `encode_ascii(...)`
-                    // a Vec<u8>) whatever the receiver's static shape — a
-                    // narrowed union, a boxed value, or the plain type.
-                    "decode" => TypeInfo::String,
-                    "encode" => TypeInfo::Bytes,
-                    // A str method returning str, on a str receiver: the
-                    // type side agrees with the lowering's `.upper()` etc.
-                    "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "title" | "capitalize"
-                    | "casefold" | "swapcase" | "replace" | "zfill" | "center" | "ljust"
-                    | "rjust" | "expandtabs" | "format"
+                    // a Vec<u8>) on a STRING-SHAPED receiver — the plain
+                    // type, a narrowed union, or a boxed value. A user
+                    // class's own `encode`/`decode` keeps its declared
+                    // return (the class-receiver authorities resolve it).
+                    "decode" | "encode"
                         if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::String
+                                | TypeInfo::StrRef
+                                | TypeInfo::Bytes
+                                | TypeInfo::StrOrBytes
+                                | TypeInfo::PyValue
+                                | TypeInfo::PyValueMember(_)
+                        ) =>
+                    {
+                        if attr.attr == "decode" {
+                            TypeInfo::String
+                        } else {
+                            TypeInfo::Bytes
+                        }
+                    }
+                    // A str method on a str receiver: the ONE typed table
+                    // the lowering shares (`StrMethod`).
+                    name if StrMethod::from_name(name).is_some()
+                        && matches!(
                             infer_type_inner(ctx, &attr.value, options, symbols),
                             TypeInfo::String | TypeInfo::StrRef
                         ) =>
                     {
-                        TypeInfo::String
+                        StrMethod::from_name(name).expect("just checked").result()
                     }
                     // Dict VIEW methods carry the (key, value) pair type
                     // (`self.items.items()` → Vec<(str, Item)> — the idiom
@@ -2276,6 +2291,59 @@ fn narrowed_value_type(t: &TypeInfo) -> TypeInfo {
     }
 }
 
+/// The `str` methods the converter knows, ONE typed table for the type
+/// side (`infer_type`'s attribute-call arm) and the lowering (the unbound
+/// `str.lower` forms in call.rs), so inference and lowering cannot drift
+/// apart through two string lists (Devin review on #318).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrMethod {
+    Upper, Lower, Strip, Lstrip, Rstrip, Title, Capitalize, Casefold, Swapcase,
+    Replace, Zfill, Center, Ljust, Rjust, Expandtabs, Format, Splitlines,
+}
+
+impl StrMethod {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "upper" => Self::Upper,
+            "lower" => Self::Lower,
+            "strip" => Self::Strip,
+            "lstrip" => Self::Lstrip,
+            "rstrip" => Self::Rstrip,
+            "title" => Self::Title,
+            "capitalize" => Self::Capitalize,
+            "casefold" => Self::Casefold,
+            "swapcase" => Self::Swapcase,
+            "replace" => Self::Replace,
+            "zfill" => Self::Zfill,
+            "center" => Self::Center,
+            "ljust" => Self::Ljust,
+            "rjust" => Self::Rjust,
+            "expandtabs" => Self::Expandtabs,
+            "format" => Self::Format,
+            "splitlines" => Self::Splitlines,
+            _ => return None,
+        })
+    }
+
+    /// The method's result on a str receiver.
+    pub(crate) fn result(self) -> TypeInfo {
+        match self {
+            Self::Splitlines => TypeInfo::Vec(Box::new(TypeInfo::String)),
+            _ => TypeInfo::String,
+        }
+    }
+
+    /// Callable with the receiver as its only argument (`str.lower(x)`),
+    /// so the unbound form lowers to the bound method on the argument.
+    pub(crate) fn takes_only_receiver(self) -> bool {
+        matches!(
+            self,
+            Self::Upper | Self::Lower | Self::Strip | Self::Lstrip | Self::Rstrip | Self::Title
+                | Self::Capitalize | Self::Casefold | Self::Swapcase | Self::Splitlines
+        )
+    }
+}
+
 /// Definite assignment of `name` by a statement list, on its fall-through
 /// paths: `Some(true)` when every path that reaches the end has written
 /// the name, `Some(false)` when some path may not have, `None` when no
@@ -2401,7 +2469,14 @@ fn analyze_statement_types(
                     // (still pinable by later use).
                     None => match &assign.value {
                         ExprType::Call(c) => {
-                            call_return_typeinfo(c, symbols, options)
+                            // The receiver of an attribute callee (`n =
+                            // c.decode()` where `c = Codec()` was recorded
+                            // by THIS analysis) is visible only through
+                            // the analysis view — the raw options carry
+                            // the caller's seeds, not the locals typed so
+                            // far.
+                            let view = options.map(|o| analysis_view(o, info));
+                            call_return_typeinfo(c, symbols, view.as_ref())
                                 .or_else(|| {
                                     // The ctx-aware inferrer: a dict-method
                                     // fetch (`item = self.items.get(k)` —
@@ -4526,6 +4601,26 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Devin review on #318: a user class's own `encode`/`decode` keeps
+    /// its declared return; only a string-shaped receiver takes the codec
+    /// answer.
+    #[test]
+    fn a_user_classes_decode_keeps_its_declared_return() {
+        let src = "class Codec:\n    def decode(self) -> int:\n        return 1\n\ndef f(label: str):\n    c = Codec()\n    n = c.decode()\n    s = label.encode(\"ascii\")\n    return n\n";
+        let module = parse(src, "codec.py").expect("parse failed");
+        let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+        let StatementType::FunctionDef(f) = &module.raw.body[1].statement else {
+            panic!("expected a function def");
+        };
+        let mut options = PythonOptions::default();
+        let mut names = HashMap::new();
+        names.insert("label".to_string(), TypeInfo::String);
+        options.name_types = std::rc::Rc::new(names);
+        let info = analyze_function_types_with_class(&f.body, Some(&options), Some(&symbols), None);
+        assert_eq!(info.name_types.get("n"), Some(&TypeInfo::Int));
+        assert_eq!(info.name_types.get("s"), Some(&TypeInfo::Bytes));
     }
 
     /// The single type authority (issue #137's systemic review of rounds

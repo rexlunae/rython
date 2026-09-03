@@ -12396,9 +12396,10 @@ fn an_untypeable_return_still_lowers_to_unit() {
     // rather than guessing at one.
     //
     // (This case used `sorted(xs)` until the iterator builtins learned to
-    // carry their element type; the assertion is about the refusal, so it
-    // moved to an expression that is still genuinely untypeable.)
-    let out = compile("def m(s: str):\n    return s.splitlines()\n", "retunk.py");
+    // carry their element type, then `s.splitlines()` until the str-method
+    // table typed it; the assertion is about the refusal, so it moves to
+    // an expression that is still genuinely untypeable.)
+    let out = compile("def m(s: str):\n    return s.partition(\",\")\n", "retunk.py");
     assert!(
         out.contains("-> Result < () , PyException >"),
         "generated: {}",
@@ -16885,6 +16886,48 @@ fn a_write_nested_under_a_condition_in_a_narrowed_branch_keeps_the_union() {
     assert!(
         out.matches("is_bytes ()").count() == 2,
         "a conditional write must not retype the name after the if: {}",
+        out
+    );
+}
+
+/// Devin review on #318: a factory imported through the package's own
+/// root-qualified path (`from pkg.session import make`, keyed
+/// ["session"]) resolves as a receiver when its result is used directly
+/// (`make().run()`): the module key authority normalizes the path.
+#[test]
+fn a_root_qualified_imported_factory_result_is_a_method_receiver() {
+    let session = parse(
+        concat!(
+            "class Session:\n",
+            "    def run(self) -> int:\n",
+            "        return 42\n",
+            "\n",
+            "def make() -> Session:\n",
+            "    return Session()\n",
+        ),
+        "session.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["session".to_string()], std::rc::Rc::new(session));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let usemod = parse(
+        "from pkg.session import make\n\ndef go() -> int:\n    return make().run()\n",
+        "usemod.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("usemod".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". run () ?"),
+        "the factory's result must resolve its class and the call propagate: {}",
         out
     );
 }
