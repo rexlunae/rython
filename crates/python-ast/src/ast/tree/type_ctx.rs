@@ -751,6 +751,43 @@ fn infer_type_body(
             }
             _ => TypeInfo::PyObject,
         },
+        // A FIELD read resolves through the receiver's class field table
+        // (Directive 2's R2 payoff): `self.qty` (a `self` receiver in a
+        // class context) or `obj.f` (a class-typed local/param) — the
+        // field's inferred type IS the read's type. `None` (no class
+        // context, no class) falls through to the PyObject arm below —
+        // exactly the pre-ctx behavior (round 99).
+        ExprType::Attribute(attr) => {
+            if let Some(ctx) = ctx
+                && let ExprType::Name(recv) = attr.value.as_ref()
+                && (recv.id == "self"
+                    || matches!(options.name_types.get(&recv.id), Some(TypeInfo::Class(_))))
+            {
+                let class_name = if recv.id == "self" {
+                    ctx.enclosing_class_name().map(str::to_string)
+                } else if let Some(TypeInfo::Class(cname)) = options.name_types.get(&recv.id) {
+                    Some(cname.clone())
+                } else {
+                    None
+                };
+                if let Some(cname) = class_name
+                    && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(&cname)
+                {
+                    for c in class.base_chain(symbols) {
+                        if let Ok(fields) = c.infer_fields(symbols, options)
+                            && let Some((_, ty)) =
+                                fields.iter().find(|(name, _)| *name == attr.attr)
+                        {
+                            return ty.clone();
+                        }
+                    }
+                }
+            }
+            // The dict-view methods and the numpy/named-method handling
+            // live in the Call arm above; a plain Attribute read without a
+            // resolvable receiver keeps the unknown marker.
+            TypeInfo::PyObject
+        }
         ExprType::Subscript(sub) => match infer_type_inner(ctx, &sub.value, options, symbols) {
             TypeInfo::Vec(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
