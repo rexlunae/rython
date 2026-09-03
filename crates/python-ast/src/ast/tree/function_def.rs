@@ -2939,26 +2939,50 @@ pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
     scan_deleted_names(body, &mut deleted)
 }
 
+/// The deletion state on the ways out of a statement sequence: the
+/// fall-through state (None when every path returns or raises) and the
+/// states at each `break` / `continue`, which the enclosing loop merges.
+struct DeletedPaths {
+    falls: Option<std::collections::HashSet<String>>,
+    jumps: Vec<std::collections::HashSet<String>>,
+}
+
 /// One pass over `body` from the incoming deletion state in `deleted`,
-/// leaving the outgoing state there. Deletion follows control flow, not
-/// the source order (Devin review on #323): each branch starts from the
-/// incoming state, and the state after the statement is the UNION of the
-/// paths through it — deleted on any path is deleted, so a conditional
-/// deletion stays loud, and a rebinding on one path does not revive the
-/// name for its sibling (`del x; if c: x = 2; else: print(x)`). A loop
-/// body is scanned a second time from the merged state, so a read that
-/// precedes the `del` in the next iteration is seen too. Nested defs and
-/// classes are their own scopes.
+/// leaving the fall-through state there. Deletion follows control flow,
+/// not the source order (Devin review on #323): each branch starts from
+/// the incoming state, and the state after the statement is the UNION of
+/// the paths that continue through it — deleted on any continuing path is
+/// deleted, so a conditional deletion stays loud, a rebinding on one path
+/// does not revive the name for its sibling (`del x; if c: x = 2; else:
+/// print(x)`), and a path that returns or raises contributes nothing to
+/// what follows (`del x; if c: x = 2; else: return 0; return x` is
+/// fine). A loop body is scanned a second time from the merged state, so
+/// a read that precedes the `del` in the next iteration is seen too.
+/// Nested defs and classes are their own scopes.
 fn scan_deleted_names(
     body: &[Statement],
     deleted: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
+    let paths = scan_deleted_paths(body, deleted)?;
+    *deleted = paths.falls.unwrap_or_default();
+    Ok(())
+}
+
+fn scan_deleted_paths(
+    body: &[Statement],
+    incoming: &std::collections::HashSet<String>,
+) -> Result<DeletedPaths, String> {
     type Deleted = std::collections::HashSet<String>;
-    let scan_from = |body: &[Statement], from: &Deleted| -> Result<Deleted, String> {
-        let mut state = from.clone();
-        scan_deleted_names(body, &mut state)?;
-        Ok(state)
-    };
+    let mut deleted = incoming.clone();
+    let mut jumps: Vec<Deleted> = Vec::new();
+    // The union of the continuing states, None when none continues.
+    fn merge(states: Vec<Option<Deleted>>) -> Option<Deleted> {
+        let mut out: Option<Deleted> = None;
+        for state in states.into_iter().flatten() {
+            out.get_or_insert_with(Deleted::new).extend(state);
+        }
+        out
+    }
     for stmt in body {
         if visit::opens_scope(stmt) {
             continue;
@@ -3012,78 +3036,139 @@ fn scan_deleted_names(
                     }
                 }
             }
+            // The path ends here: nothing after it in this body runs.
+            StatementType::Return(_) | StatementType::Raise(_) => {
+                return Ok(DeletedPaths { falls: None, jumps });
+            }
+            // The path leaves for the enclosing loop's exit or next
+            // iteration, carrying its state there.
+            StatementType::Break | StatementType::Continue => {
+                jumps.push(deleted);
+                return Ok(DeletedPaths { falls: None, jumps });
+            }
             _ => {}
         }
         // The paths through the statement's bodies.
-        match &stmt.statement {
+        let next = match &stmt.statement {
             StatementType::If(i) => {
-                let then = scan_from(&i.body, deleted)?;
+                let then = scan_deleted_paths(&i.body, &deleted)?;
                 // No else: the fall-through path keeps the incoming state.
                 let other = if i.orelse.is_empty() {
-                    deleted.clone()
+                    DeletedPaths { falls: Some(deleted.clone()), jumps: Vec::new() }
                 } else {
-                    scan_from(&i.orelse, deleted)?
+                    scan_deleted_paths(&i.orelse, &deleted)?
                 };
-                *deleted = then;
-                deleted.extend(other);
+                jumps.extend(then.jumps);
+                jumps.extend(other.jumps);
+                merge(vec![then.falls, other.falls])
             }
-            StatementType::For(_)
-            | StatementType::AsyncFor(_)
-            | StatementType::While(_) => {
+            StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => {
                 let bodies = visit::stmt_bodies(stmt);
                 let (loop_body, orelse) = (bodies[0], bodies[1]);
                 // Zero iterations keep the incoming state; a later
-                // iteration re-enters the body from the merged state with
-                // the loop target rebound.
-                let first = scan_from(loop_body, deleted)?;
+                // iteration re-enters the body from the merged state (a
+                // fall-through or a `continue`; a `break` merged too,
+                // conservatively) with the loop target rebound.
+                let first = scan_deleted_paths(loop_body, &deleted)?;
                 let mut again = deleted.clone();
-                again.extend(first.iter().cloned());
+                if let Some(falls) = &first.falls {
+                    again.extend(falls.iter().cloned());
+                }
+                for jump in &first.jumps {
+                    again.extend(jump.iter().cloned());
+                }
                 for target in stmt_targets(stmt) {
                     again.retain(|name| !visit::target_binds(target, name));
                 }
-                let second = scan_from(loop_body, &again)?;
-                deleted.extend(again);
-                deleted.extend(second);
-                // The else clause runs after the loop completes.
-                let after_else = scan_from(orelse, deleted)?;
-                deleted.extend(after_else);
+                let second = scan_deleted_paths(loop_body, &again)?;
+                // The loop's completion: the incoming state (zero
+                // iterations) and the merged iteration states.
+                let mut completed = again.clone();
+                completed.extend(deleted.iter().cloned());
+                if let Some(falls) = &second.falls {
+                    completed.extend(falls.iter().cloned());
+                }
+                for jump in &second.jumps {
+                    completed.extend(jump.iter().cloned());
+                }
+                // The else clause runs after a loop that completes; a
+                // break skips it and lands after the statement.
+                let after_else = scan_deleted_paths(orelse, &completed)?;
+                jumps.extend(after_else.jumps);
+                let mut exits = vec![after_else.falls];
+                if !first.jumps.is_empty() || !second.jumps.is_empty() {
+                    exits.push(Some(completed));
+                }
+                merge(exits)
             }
             StatementType::With(w) => {
-                // The body always runs.
-                let out = scan_from(&w.body, deleted)?;
-                *deleted = out;
+                let out = scan_deleted_paths(&w.body, &deleted)?;
+                jumps.extend(out.jumps);
+                out.falls
             }
             StatementType::AsyncWith(w) => {
-                let out = scan_from(&w.body, deleted)?;
-                *deleted = out;
+                let out = scan_deleted_paths(&w.body, &deleted)?;
+                jumps.extend(out.jumps);
+                out.falls
             }
             StatementType::Try(t) => {
                 // A handler may run from any point of the body: from the
-                // union of the incoming and the body's outgoing state;
-                // the else clause from the body's; finally from all.
-                let after_body = scan_from(&t.body, deleted)?;
+                // union of the incoming and the body's outgoing state,
+                // with its `as` name rebound; the else clause from the
+                // body's; finally from all of them.
+                let after_body = scan_deleted_paths(&t.body, &deleted)?;
+                jumps.extend(after_body.jumps.iter().cloned());
                 let mut at_handler = deleted.clone();
-                at_handler.extend(after_body.iter().cloned());
-                let mut merged = at_handler.clone();
-                for handler in &t.handlers {
-                    merged.extend(scan_from(&handler.body, &at_handler)?);
+                if let Some(falls) = &after_body.falls {
+                    at_handler.extend(falls.iter().cloned());
                 }
-                merged.extend(scan_from(&t.orelse, &after_body)?);
-                let after_finally = scan_from(&t.finalbody, &merged)?;
-                merged.extend(after_finally);
-                *deleted = merged;
+                let mut exits: Vec<Option<Deleted>> = Vec::new();
+                for handler in &t.handlers {
+                    let mut entry = at_handler.clone();
+                    if let Some(name) = &handler.name {
+                        entry.remove(name);
+                    }
+                    let out = scan_deleted_paths(&handler.body, &entry)?;
+                    jumps.extend(out.jumps);
+                    exits.push(out.falls);
+                }
+                if let Some(falls) = &after_body.falls {
+                    let out = scan_deleted_paths(&t.orelse, falls)?;
+                    jumps.extend(out.jumps);
+                    exits.push(out.falls);
+                }
+                match merge(exits) {
+                    Some(before_finally) => {
+                        let out = scan_deleted_paths(&t.finalbody, &before_finally)?;
+                        jumps.extend(out.jumps);
+                        out.falls
+                    }
+                    None => None,
+                }
             }
             _ => {
                 // Any other body-carrying form: every body from the
                 // incoming state, the union afterwards.
-                let incoming = deleted.clone();
-                for nested in visit::stmt_bodies(stmt) {
-                    deleted.extend(scan_from(nested, &incoming)?);
+                let bodies = visit::stmt_bodies(stmt);
+                if bodies.is_empty() {
+                    Some(deleted.clone())
+                } else {
+                    let mut exits = vec![Some(deleted.clone())];
+                    for nested in bodies {
+                        let out = scan_deleted_paths(nested, &deleted)?;
+                        jumps.extend(out.jumps);
+                        exits.push(out.falls);
+                    }
+                    merge(exits)
                 }
             }
+        };
+        match next {
+            Some(state) => deleted = state,
+            None => return Ok(DeletedPaths { falls: None, jumps }),
         }
     }
-    Ok(())
+    Ok(DeletedPaths { falls: Some(deleted), jumps })
 }
 
 /// Issue #115: every name this function's body declares `global`,
@@ -3689,27 +3774,31 @@ pub(crate) fn expr_yields_pyvalue(
 /// the generator): the body is a GENERATOR and lowers to
 /// build-and-return-a-list (issue #122-family).
 pub(crate) fn body_has_yields(body: &[Statement]) -> bool {
-    any_expr_in(body, Descend::SkipDefs, |e| {
+    any_expr_in(body, Descend::OwnScope, |e| {
         matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_))
     })
 }
 
-/// The first statement of `body` (nested defs excluded) that uses a
-/// `yield` / `yield from` as a VALUE rather than as its own statement:
-/// `x = yield v`, `(yield v) or 1`, `f((yield))`, `yield (yield v)`.
-/// That is the generator's send channel, which the build-and-return-a-list
-/// lowering cannot model.
+/// The first statement of `body` (nested defs and lambdas excluded — a
+/// yielding lambda is its own generator) that uses a `yield` / `yield
+/// from` as a VALUE rather than as its own statement: `x = yield v`,
+/// `(yield v) or 1`, `f((yield))`, `yield (yield v)`. That is the
+/// generator's send channel, which the build-and-return-a-list lowering
+/// cannot model.
 fn expression_position_yield(body: &[Statement]) -> Option<&Statement> {
     let is_yield = |e: &ExprType| matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_));
+    let own = Descend::OwnScope;
     let mut found = None;
-    visit::any_stmt(body, Descend::SkipDefs, |s| {
+    visit::any_stmt(body, own, |s| {
         let hit = match &s.statement {
             // A statement-level yield: only a yield NESTED in its value
             // counts.
-            StatementType::Expr(e) if is_yield(&e.value) => visit::subexprs(&e.value)
+            StatementType::Expr(e) if is_yield(&e.value) => visit::subexprs_for(&e.value, own)
                 .into_iter()
-                .any(|sub| visit::any_expr(sub, is_yield)),
-            _ => stmt_all_exprs(s).into_iter().any(|e| visit::any_expr(e, is_yield)),
+                .any(|sub| visit::any_expr_for(sub, own, is_yield)),
+            _ => stmt_all_exprs(s)
+                .into_iter()
+                .any(|e| visit::any_expr_for(e, own, is_yield)),
         };
         if hit {
             found = Some(s);
@@ -3768,7 +3857,7 @@ fn first_yield_type(
     symbols: &SymbolTableScopes,
 ) -> Option<crate::TypeInfo> {
     let mut found = None;
-    any_expr_in(body, Descend::SkipDefs, |e| {
+    any_expr_in(body, Descend::OwnScope, |e| {
         if let ExprType::Yield(y) = e
             && let Some(v) = y.value.as_ref()
         {

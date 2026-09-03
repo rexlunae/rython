@@ -7,15 +7,22 @@
 
 use crate::{ExprType, Statement, StatementType};
 
-/// Whether a walk enters the bodies of nested `def`s and `class`es (their
-/// own scopes) or stays in the scope it started in.
+/// Which nested scopes a walk enters: the one scope policy for statement
+/// bodies AND expression bodies (a lambda's), so no analysis filters
+/// scopes on its own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Descend {
-    /// Every body, nested definitions included.
+    /// Every body, nested definitions and lambda bodies included.
     All,
     /// Control-flow bodies only; a nested `def` / `async def` / `class`
-    /// is visited as a statement but its body is not entered.
+    /// is visited as a statement but its body is not entered. A LAMBDA's
+    /// body is entered: it is a closure over this scope, so what it
+    /// reads, mutates, or calls is this scope's business.
     SkipDefs,
+    /// The scope's own code only: nested definitions AND lambda bodies
+    /// stay out. For what the function itself does — its `yield`s (a
+    /// yielding lambda is its own generator), its `await`s.
+    OwnScope,
 }
 
 /// What the callback asks of the walk after seeing a statement.
@@ -66,7 +73,7 @@ pub fn stmt_bodies(s: &Statement) -> Vec<&[Statement]> {
 
 /// The nested statement bodies a walk with `descend` enters.
 pub fn stmt_bodies_for(s: &Statement, descend: Descend) -> Vec<&[Statement]> {
-    if descend == Descend::SkipDefs && opens_scope(s) {
+    if descend != Descend::All && opens_scope(s) {
         return Vec::new();
     }
     stmt_bodies(s)
@@ -273,7 +280,18 @@ pub fn any_stmt<'a>(
     !walk_stmts(stmts, descend, &mut |s| if pred(s) { Flow::Stop } else { Flow::Continue })
 }
 
-/// Walk an expression and every subexpression, pre-order.
+/// The direct subexpressions a walk with `descend` enters: a lambda's
+/// body is a scope of its own that only `Descend::OwnScope` stays out
+/// of.
+pub fn subexprs_for(e: &ExprType, descend: Descend) -> Vec<&ExprType> {
+    if descend == Descend::OwnScope && matches!(e, ExprType::Lambda(_)) {
+        return Vec::new();
+    }
+    subexprs(e)
+}
+
+/// Walk an expression and every subexpression, pre-order (lambda bodies
+/// included: `Descend::All`).
 pub fn walk_expr<'a>(e: &'a ExprType, f: &mut impl FnMut(&'a ExprType)) {
     f(e);
     for sub in subexprs(e) {
@@ -281,12 +299,23 @@ pub fn walk_expr<'a>(e: &'a ExprType, f: &mut impl FnMut(&'a ExprType)) {
     }
 }
 
-/// Whether the expression or any subexpression satisfies `pred`.
-pub fn any_expr<'a>(e: &'a ExprType, mut pred: impl FnMut(&'a ExprType) -> bool) -> bool {
-    fn go<'a>(e: &'a ExprType, pred: &mut impl FnMut(&'a ExprType) -> bool) -> bool {
-        pred(e) || subexprs(e).into_iter().any(|sub| go(sub, pred))
+/// Whether the expression or any subexpression satisfies `pred` (lambda
+/// bodies included: `Descend::All`).
+pub fn any_expr<'a>(e: &'a ExprType, pred: impl FnMut(&'a ExprType) -> bool) -> bool {
+    any_expr_for(e, Descend::All, pred)
+}
+
+/// Whether the expression or any subexpression a walk with `descend`
+/// enters satisfies `pred`.
+pub fn any_expr_for<'a>(
+    e: &'a ExprType,
+    descend: Descend,
+    mut pred: impl FnMut(&'a ExprType) -> bool,
+) -> bool {
+    fn go<'a>(e: &'a ExprType, descend: Descend, pred: &mut impl FnMut(&'a ExprType) -> bool) -> bool {
+        pred(e) || subexprs_for(e, descend).into_iter().any(|sub| go(sub, descend, pred))
     }
-    go(e, &mut pred)
+    go(e, descend, &mut pred)
 }
 
 /// Every expression a statement evaluates or binds, with the statement's
@@ -304,5 +333,7 @@ pub fn any_expr_in<'a>(
     descend: Descend,
     mut pred: impl FnMut(&'a ExprType) -> bool,
 ) -> bool {
-    any_stmt(stmts, descend, |s| stmt_all_exprs(s).into_iter().any(|e| any_expr(e, &mut pred)))
+    any_stmt(stmts, descend, |s| {
+        stmt_all_exprs(s).into_iter().any(|e| any_expr_for(e, descend, &mut pred))
+    })
 }

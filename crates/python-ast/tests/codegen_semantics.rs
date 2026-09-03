@@ -18629,3 +18629,73 @@ fn a_nested_def_with_its_own_same_named_parameter_keeps_the_outer_specialization
     assert!(out.contains("fn describe_int"), "generated: {}", out);
     assert!(out.contains("fn describe_any"), "generated: {}", out);
 }
+
+/// A path that returns or raises contributes nothing to what follows
+/// (Devin review on #323): every path reaching the final read rebound
+/// `x`, or exited.
+#[test]
+fn an_exited_branch_does_not_poison_a_later_read() {
+    let out = compile(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    if flag:\n",
+            "        x = 2\n",
+            "    else:\n",
+            "        return 0\n",
+            "    return x\n",
+        ),
+        "del_exit1.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "def g(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    if flag:\n",
+            "        del x\n",
+            "        return 0\n",
+            "    return x\n",
+        ),
+        "del_exit2.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// An `except ... as e` rebinds `e` for its handler (Devin review on
+/// #323).
+#[test]
+fn an_except_as_rebinds_a_deleted_name_for_its_handler() {
+    let out = compile(
+        concat!(
+            "def f() -> None:\n",
+            "    e = 1\n",
+            "    del e\n",
+            "    try:\n",
+            "        raise ValueError(\"x\")\n",
+            "    except ValueError as e:\n",
+            "        print(e)\n",
+        ),
+        "del_except_as.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// A yielding lambda is its own generator, not the enclosing function's
+/// (Devin review on #323): `f` is an ordinary function, so the lambda's
+/// own yield is what the conversion refuses — not `f` as a value-yielding
+/// generator.
+#[test]
+fn a_lambda_yield_is_not_the_enclosing_functions_yield() {
+    let err = compile_err(
+        concat!(
+            "def f() -> int:\n",
+            "    g = lambda: (yield 1)\n",
+            "    return 2\n",
+        ),
+        "lambda_yield.py",
+    );
+    assert!(!err.contains("used as a value"), "error: {}", err);
+    assert!(err.contains("not supported yet"), "error: {}", err);
+}
