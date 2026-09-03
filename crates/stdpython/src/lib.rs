@@ -602,6 +602,34 @@ pub fn sorted_reverse<T: PartialOrd + Clone>(iterable: &[T], reverse: bool) -> V
     out
 }
 
+/// Python `sorted` over (K, V) pairs whose value type has NO ordering (a
+/// user class — `sorted(self.items.items())` where the values are
+/// `Item`s): CPython sorts tuples lexicographically, so the values are
+/// compared ONLY on a key tie, and that comparison raises `TypeError:
+/// '<' not supported between instances of 'Item' and 'Item'`. This sorts
+/// by key and panics the TypeError at a tie — exact for unique keys
+/// (dict items are), loud exactly where CPython raises. The panic text
+/// names the value type through `type_name` (Rust's path form, not
+/// CPython's bare name — a cosmetic divergence on an unreachable-in-
+/// practice path, §12.3).
+pub fn sorted_pairs<K: PartialOrd + Clone, V: Clone>(iterable: &[(K, V)]) -> Vec<(K, V)> {
+    let mut out = iterable.to_vec();
+    out.sort_by(|a, b| match a.0.partial_cmp(&b.0) {
+        Some(ord) => {
+            if ord == core::cmp::Ordering::Equal {
+                let ty = core::any::type_name::<V>();
+                panic!(
+                    "'<' not supported between instances of '{}' and '{}'",
+                    ty, ty
+                );
+            }
+            ord
+        }
+        None => panic!("'<' not supported between instances of the pair's keys"),
+    });
+    out
+}
+
 /// Python sorted(iterable, key=f): decorate-sort-undecorate, so the key
 /// function runs exactly once per element, as in Python.
 pub fn sorted_key<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(

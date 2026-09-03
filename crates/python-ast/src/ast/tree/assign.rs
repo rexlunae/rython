@@ -1296,20 +1296,23 @@ impl<'a> CodeGen for Assign {
                                 .name_types
                                 .get(&n.id)
                                 .and_then(through_option),
-                            ExprType::Attribute(attr)
+                            // A `self.<field>` receiver: infer_type's
+                            // self-field arm resolves the class-table type
+                            // (round 99 — replaces the self_field_rust_ty
+                            // fallback, Directive 2).
+                            ExprType::Attribute(_)
                                 if matches!(
-                                    attr.value.as_ref(),
-                                    ExprType::Name(r) if r.id == "self"
+                                    sub.value.as_ref(),
+                                    ExprType::Attribute(a)
+                                        if matches!(a.value.as_ref(), ExprType::Name(r) if r.id == "self")
                                 ) =>
                             {
-                                crate::ast::tree::aug_assign::self_field_rust_ty(
-                                    &attr.attr,
-                                    &ctx,
+                                through_option(&crate::infer_type(
+                                    Some(&ctx),
+                                    &sub.value,
                                     &options,
                                     &symbols,
-                                )
-                                .as_ref()
-                                .and_then(through_option)
+                                ))
                             }
                             _ => None,
                         }

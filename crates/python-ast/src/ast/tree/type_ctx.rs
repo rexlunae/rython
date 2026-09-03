@@ -291,6 +291,13 @@ pub fn coerce_tokens(
         return Some(tokens);
     }
     match (from, to) {
+        // Derived → base (a subclass argument where an ancestor is
+        // expected): the generated `From<Derived> for Base` walks the
+        // embedded base structs (round 99 — the idiom corpus's
+        // `add(perishable)` where `add(item: Item)`). A pair with no
+        // generated From (unrelated classes) fails loudly in rustc (E0277)
+        // — never a silent conversion.
+        (TypeInfo::Class(_), TypeInfo::Class(_)) => Some(quote!((#tokens).into())),
         // &str → String: string literals in String-typed contexts.
         (TypeInfo::StrRef, TypeInfo::String) => Some(quote!((#tokens).to_string())),
         // String → &str: computed keys/args into &str-typed containers.
@@ -506,8 +513,6 @@ fn infer_type_inner(
     thread_local! { static R99_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
     let d = R99_DEPTH.with(|c| c.get());
     if d > 40 {
-        eprintln!("R99CYCLE at depth 40: {:?}", std::mem::discriminant(expr));
-        eprintln!("R99EXPR {:?}", expr);
         return TypeInfo::PyObject;
     }
     R99_DEPTH.with(|c| c.set(d + 1));
@@ -683,9 +688,9 @@ fn infer_type_body(
             // through (issue #222), so they are typed before the
             // name-only table below, which cannot see arguments.
             ExprType::Name(n)
-                if iterator_builtin_type(&n.id, call, options, symbols).is_some() =>
+                if iterator_builtin_type(&n.id, call, ctx, options, symbols).is_some() =>
             {
-                iterator_builtin_type(&n.id, call, options, symbols)
+                iterator_builtin_type(&n.id, call, ctx, options, symbols)
                     .expect("just checked")
             }
             ExprType::Name(n) => match builtin_call_type(&n.id) {
@@ -881,14 +886,19 @@ fn named_fn_return_type(
 fn iterator_builtin_type(
     name: &str,
     call: &crate::Call,
+    ctx: Option<&CodeGenContext>,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<TypeInfo> {
-    let elem_of = |e: &ExprType| iterable_element_type(&infer_type(None, e, options, symbols));
+    let elem_of =
+        |e: &ExprType| iterable_element_type(&infer_type(ctx, e, options, symbols));
     match name {
         // sorted/filter preserve the element type; the iterable is the
         // last positional argument (`sorted(xs)`, `filter(pred, xs)`).
-        "sorted" => Some(TypeInfo::Vec(Box::new(elem_of(call.args.first()?)?))),
+        "sorted" => {
+            let e = elem_of(call.args.first()?)?;
+            Some(TypeInfo::Vec(Box::new(e)))
+        }
         // `enumerate(xs)` materializes (int, elem) pairs — the runtime
         // enumerate is Vec<T> -> Vec<(i64, T)> (round 99: the idiom
         // corpus's `for (i, (name, item)) in enumerate(...)` — the
@@ -1206,6 +1216,53 @@ pub fn render_typed(
     } else {
         actual
     };
+    // A DERIVED argument coerced to a BASE-typed slot: the generated
+    // `From<Derived> for Base` slices the embedded base — exact ONLY when
+    // the derived class overrides nothing the base declares (no dynamic
+    // dispatch is observable through the base-typed value). An OVERRIDING
+    // derived (`add(Perishable(...))` into `add(item: Item)`, where
+    // Perishable overrides `label` — the idiom corpus's report prints the
+    // override's `[7d]` through the base-typed dict) would LOSE the
+    // override: CPython dispatches dynamically. Loud conversion error,
+    // never silently different (Directive 4's interim, round 99).
+    if let (TypeInfo::Class(from_c), TypeInfo::Class(to_c)) = (&actual, &expected)
+        && from_c != to_c
+    {
+        let from_def = crate::resolve_class_referenced(from_c, &symbols, &options)
+            .or_else(|| match symbols.get(from_c) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                _ => None,
+            });
+        if let Some(from_def) = from_def
+            && let Some(crate::SymbolTableNode::ClassDef(to_def)) = symbols.get(to_c)
+        {
+            // The derived's chain up to (excluding) the base: any method
+            // of the base defined in that slice is an override the slice
+            // would drop.
+            let chain = from_def.base_chain(&symbols);
+            let to_pos = chain.iter().position(|c| c.name == *to_c);
+            if let Some(to_pos) = to_pos {
+                // Every class BELOW the base in the derived's chain that
+                // defines one of the base's methods is an override the
+                // slice would drop.
+                let overridden = chain[..to_pos].iter().any(|overrider| {
+                    to_def.methods().any(|m| {
+                        overrider.methods().any(|om| om.name == m.name)
+                    })
+                });
+                if overridden {
+                    return Err(format!(
+                        "passing `{from_c}` where `{to_c}` is expected is not supported yet: \
+                         the derived class overrides a base method, and the base-typed slot \
+                         would lose the override (CPython dispatches dynamically through \
+                         the base-typed container); rython refuses to silently ignore it — \
+                         store the derived type directly or restructure"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     match coerce_tokens(tokens.clone(), &actual, &expected) {
         Some(coerced) => Ok(coerced),
         None => {
@@ -1356,9 +1413,24 @@ pub fn render_typed_reused(
     // round-92 boxing (`PyValue::from((x))` → the box is a fresh value)
     // NEEDS the clone or the move returns.
     let adapted_is_into = adapted && tokens.to_string().contains("into");
+    // A MODULE-attribute read (`socket.AF_INET` — a constant) never
+    // clones: the root is a module, not a class instance, so the read
+    // cannot move anything a later read needs (round 99).
+    let module_root = match expr {
+        ExprType::Attribute(a) => crate::ast::tree::call::root_name(&a.value)
+            .is_some_and(|root| {
+                crate::module_name_shadowed(&root, &symbols)
+                    || matches!(
+                        symbols.get(&root),
+                        Some(crate::SymbolTableNode::ImportFrom(_))
+                            | Some(crate::SymbolTableNode::Import(_))
+                    )
+            }),
+        _ => false,
+    };
     if let Some(root) = reuse_root_name(expr) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
-        if uses > 1 && !adapted_is_into {
+        if uses > 1 && !adapted_is_into && !module_root {
             let t = infer_type(None, expr, &options, &symbols);
             // See render_reused: clone whenever the name is not statically
             // Copy — INCLUDING inferrer-unknown (PyObject) names, whose
@@ -1833,7 +1905,7 @@ pub fn analyze_function_types_with_class(
     symbols: Option<&SymbolTableScopes>,
     self_class: Option<&str>,
 ) -> FunctionTypeInfo {
-    let mut info = analyze_function_types_inner(body, options, symbols);
+    let mut info = analyze_function_types_inner(body, options, symbols, self_class);
     if let Some(class_name) = self_class
         && let (Some(options), Some(symbols)) = (options, symbols)
         && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
@@ -2137,10 +2209,11 @@ fn analyze_function_types_inner(
     body: &[Statement],
     options: Option<&PythonOptions>,
     symbols: Option<&SymbolTableScopes>,
+    self_class: Option<&str>,
 ) -> FunctionTypeInfo {
     let mut info = FunctionTypeInfo::default();
     for stmt in body {
-        analyze_statement_types(stmt, &mut info, options, symbols);
+        analyze_statement_types(stmt, &mut info, options, symbols, self_class);
     }
     pin_empty_containers(body, &mut info, symbols, options);
     info
@@ -2151,6 +2224,7 @@ fn analyze_statement_types(
     info: &mut FunctionTypeInfo,
     options: Option<&PythonOptions>,
     symbols: Option<&SymbolTableScopes>,
+    self_class: Option<&str>,
 ) {
     match &stmt.statement {
         // A bare annotated local (`key: str` — urllib3's
@@ -2356,19 +2430,19 @@ fn analyze_statement_types(
         StatementType::If(s) => {
             count_expr_reads(&s.test, info);
             for b in &s.body {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
         StatementType::While(s) => {
             count_expr_reads(&s.test, info);
             for b in &s.body {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
         StatementType::For(s) => {
@@ -2380,16 +2454,22 @@ fn analyze_statement_types(
             // types the nested destructure, so the loop-body method calls
             // resolve their receiver's class — round 99).
             if let (Some(options), Some(symbols)) = (options, symbols) {
-                let iter_ty = infer_type(None, &s.iter, options, symbols);
+                // The enclosing CLASS makes `self.<field>` resolvable in
+                // the iterable (`sorted(self.items.items())` — the dict
+                // view types through the field table); without one the
+                // pre-ctx behavior stands (round 99).
+                let analysis_ctx = self_class.map(|c| CodeGenContext::Class(c.to_string()));
+                let iter_ty =
+                    infer_type(analysis_ctx.as_ref(), &s.iter, options, symbols);
                 if let Some(elem) = iterable_element_type(&iter_ty) {
                     seed_target_types(&s.target, &elem, info);
                 }
             }
             for b in &s.body {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
         StatementType::With(s) => {
@@ -2400,12 +2480,12 @@ fn analyze_statement_types(
                 }
             }
             for b in &s.body {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
         StatementType::Try(s) => {
             for b in &s.body {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
             for handler in &s.handlers {
                 if let Some(t) = &handler.exception_type {
@@ -2415,14 +2495,14 @@ fn analyze_statement_types(
                     info.use_counts.remove(name); // bound by except, not read
                 }
                 for b in &handler.body {
-                    analyze_statement_types(b, info, options, symbols);
+                    analyze_statement_types(b, info, options, symbols, self_class);
                 }
             }
             for b in &s.orelse {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
             for b in &s.finalbody {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
         StatementType::FunctionDef(f) => {
@@ -2447,7 +2527,7 @@ fn analyze_statement_types(
                 }
             }
             for b in &f.body {
-                analyze_statement_types(b, info, options, symbols);
+                analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
         StatementType::Raise(r) => {
@@ -3579,7 +3659,6 @@ fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
 fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
     match target {
         ExprType::Name(n) => {
-            eprintln!("R99DBG seed target {} ty={:?}", n.id, ty);
             info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
         }
         ExprType::Tuple(t) => {

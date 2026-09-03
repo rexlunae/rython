@@ -430,26 +430,6 @@ mod tests {
     create_parse_test!(test_rshift_assign, "x >>= 3", "test.py");
 }
 
-/// The RUST type of a `self.<field>` through the class table — a TypeInfo
-/// (issue #137's review: field types are structural, so consumers match
-/// `TypeInfo::Option(_)` instead of sniffing rendered tokens).
-pub(crate) fn self_field_rust_ty(
-    field: &str,
-    ctx: &CodeGenContext,
-    options: &PythonOptions,
-    symbols: &SymbolTableScopes,
-) -> Option<crate::TypeInfo> {
-    let class_name = ctx.enclosing_class_name()?;
-    let crate::SymbolTableNode::ClassDef(class) = symbols.get(class_name)? else {
-        return None;
-    };
-    let fields = class.infer_fields(symbols, options).ok()?;
-    fields
-        .iter()
-        .find(|(n, _)| *n == field)
-        .map(|(_, t)| t.clone())
-}
-
 /// The CPython type name of an Option's inner type, for the §12.2 panic
 /// messages mirroring CPython's `unsupported operand type(s)` text
 /// (`None + b""` names `'bytes'`, `x -= 1` on None names `'int'`). A
@@ -483,24 +463,32 @@ fn target_field_ty(
     symbols: &SymbolTableScopes,
 ) -> Option<crate::TypeInfo> {
     match target {
+        // infer_type's self-field arm resolves `self.<field>` through the
+        // class table (round 99 — replaces the self_field_rust_ty
+        // fallback, Directive 2).
         ExprType::Attribute(attr)
             if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
         {
-            self_field_rust_ty(&attr.attr, ctx, options, symbols)
+            Some(crate::infer_type(Some(ctx), target, options, symbols))
         }
         ExprType::Name(n) => {
             if let Some(t) = options.name_types.get(&n.id) {
                 return Some(t.clone());
             }
             // A local assigned from a self-field (`total = self.total` —
-            // urllib3's Retry): the field's type.
+            // urllib3's Retry): the field's type, through the same arm.
             if let Some(crate::SymbolTableNode::Assign {
-                value: ExprType::Attribute(attr),
+                value: field_expr @ ExprType::Attribute(attr),
                 ..
             }) = symbols.get(&n.id)
                 && matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
             {
-                return self_field_rust_ty(&attr.attr, ctx, options, symbols);
+                return Some(crate::infer_type(
+                    Some(ctx),
+                    field_expr,
+                    options,
+                    symbols,
+                ));
             }
             None
         }

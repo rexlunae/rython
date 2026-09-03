@@ -345,14 +345,8 @@ fn is_option_expr(
     if let ExprType::Attribute(attr) = expr
         && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
     {
-        if let Some(t) = crate::ast::tree::aug_assign::self_field_rust_ty(
-            &attr.attr,
-            ctx,
-            options,
-            symbols,
-        ) {
-            return matches!(t, crate::TypeInfo::Option(_));
-        }
+        let t = crate::infer_type(Some(ctx), expr, options, symbols);
+        return matches!(t, crate::TypeInfo::Option(_));
     }
     false
 }
@@ -380,17 +374,12 @@ fn py_operand_name(
     if from_infer != "int" {
         return from_infer;
     }
-    // infer_type sees a `self.<field>` only syntactically (PyObject): the
-    // class-table type carries the inner numeric kind.
+    // infer_type's self-field arm (round 99) resolves the class-table
+    // type: the inner numeric kind is the read's type.
     if let ExprType::Attribute(attr) = expr
         && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
-        && let Some(t) = crate::ast::tree::aug_assign::self_field_rust_ty(
-            &attr.attr,
-            ctx,
-            options,
-            symbols,
-        )
     {
+        let t = crate::infer_type(Some(ctx), expr, options, symbols);
         if matches!(t, crate::TypeInfo::Float) {
             return "float";
         }

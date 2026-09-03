@@ -3227,7 +3227,32 @@ impl CodeGen for ClassDef {
                 let ancestor = crate::safe_ident(&a.name);
                 quote!(impl PyInherits<#ancestor> for #class_name {})
             });
-            quote!(#(#entries)*)
+            // The UP-CAST conversions: a derived instance into each
+            // ancestor, via the embedded base structs (the slice is exact —
+            // the ancestor's fields ARE the embedded part; CPython's shared
+            // object identity is the value-semantics divergence §12.3
+            // records for the container model). `add(perishable)` where
+            // `add(item: Item)` — the idiom corpus's add (round 99). One
+            // `From` per ancestor, walking the same base_chain the
+            // PyInherits tree uses, so the two cannot drift.
+            let chain: Vec<_> = self.base_chain(&symbols).into_iter().collect();
+            // base_chain is REFLEXIVE (chain[0] is the class itself) — the
+            // From impls start at the first real ancestor.
+            let from_impls = (1..chain.len())
+                .map(|depth| {
+                    let ancestor = crate::safe_ident(&chain[depth].name);
+                    let mut tokens = quote!(v);
+                    for _ in 0..depth {
+                        tokens = quote!(#tokens.__rython_base);
+                    }
+                    quote!(impl std::convert::From<#class_name> for #ancestor {
+                        fn from(v: #class_name) -> #ancestor {
+                            #tokens
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            quote!(#(#entries)* #(#from_impls)*)
         } else {
             quote!()
         };
