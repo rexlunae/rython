@@ -133,14 +133,25 @@ fn participates(c: &ClassDef) -> bool {
         })
 }
 
-/// The bare-named real bases of a class header (`object` is not a base).
+/// The bare-named base the emission's chain follows: the FIRST real base
+/// (`object` and the metadata bases are not bases). A further base (a
+/// mixin — `HTTPConnectionPool(ConnectionPool, RequestMethods)`, urllib3)
+/// has no trait impl on the class, so the class is not a variant of that
+/// base's sum type: the sum type's variants are exactly the classes that
+/// implement its root's trait.
 fn base_names(c: &ClassDef) -> Vec<String> {
     c.bases
         .iter()
-        .filter_map(|b| match b {
-            ExprType::Name(n) if n.id != "object" => Some(n.id.clone()),
+        .find_map(|b| match b {
+            ExprType::Name(n)
+                if n.id != "object"
+                    && !crate::ast::tree::class_def::is_metadata_base_name(&n.id) =>
+            {
+                Some(n.id.clone())
+            }
             _ => None,
         })
+        .into_iter()
         .collect()
 }
 
