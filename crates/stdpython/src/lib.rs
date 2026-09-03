@@ -1646,6 +1646,17 @@ impl PyBool for bool {
     }
 }
 
+/// An optional value's truth is Python's: `None` is false, a present
+/// value has its own truth (`bool(headers.get("Retry-After"))`).
+impl<T: PyBool> PyBool for Option<T> {
+    fn py_bool(self) -> bool {
+        match self {
+            None => false,
+            Some(v) => v.py_bool(),
+        }
+    }
+}
+
 impl<T> PyBool for &PyList<T> {
     fn py_bool(self) -> bool {
         !self.inner.is_empty()
@@ -3833,6 +3844,122 @@ impl<T: Truthy> Truthy for Option<T> {
 /// are never None (a non-Option Rust value always holds something).
 pub trait PyIsNone {
     fn py_is_none(&self) -> bool;
+}
+
+/// A SHARED class instance: `Rc<RefCell<T>>` behind one name, so every
+/// holder — a container slot, a local fetched from it, a parameter — is
+/// the same object, as every Python reference is. The converter gives
+/// this representation to a class that is both container-stored and
+/// mutated after construction anywhere in the crate (issue #137, the
+/// aliasing representation): reads go through `borrow()`, mutations
+/// through `borrow_mut()`, and a clone is another reference to the one
+/// object. Everything else stays a plain struct.
+pub struct PyRef<T>(pub alloc::rc::Rc<core::cell::RefCell<T>>);
+
+impl<T> PyRef<T> {
+    pub fn new(value: T) -> Self {
+        PyRef(alloc::rc::Rc::new(core::cell::RefCell::new(value)))
+    }
+    pub fn borrow(&self) -> core::cell::Ref<'_, T> {
+        self.0.borrow()
+    }
+    pub fn borrow_mut(&self) -> core::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+    /// Python's `is`: the same object.
+    pub fn py_is(&self, other: &Self) -> bool {
+        alloc::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Clone for PyRef<T> {
+    fn clone(&self) -> Self {
+        PyRef(self.0.clone())
+    }
+}
+
+impl<T: Default> Default for PyRef<T> {
+    fn default() -> Self {
+        PyRef::new(T::default())
+    }
+}
+
+impl<T: core::fmt::Debug> core::fmt::Debug for PyRef<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.borrow().fmt(f)
+    }
+}
+
+/// Identity, as CPython's default `__eq__` is.
+impl<T> PartialEq for PyRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.py_is(other)
+    }
+}
+
+impl<T> From<T> for PyRef<T> {
+    fn from(value: T) -> Self {
+        PyRef::new(value)
+    }
+}
+
+impl<T: PyDisplay> PyDisplay for PyRef<T> {
+    fn py_display(&self) -> String {
+        self.0.borrow().py_display()
+    }
+}
+
+impl<T: PyRepr> PyRepr for PyRef<T> {
+    fn py_repr(&self) -> String {
+        self.0.borrow().py_repr()
+    }
+}
+
+/// A shared instance's truth is the object's (Python asks the one object
+/// whichever reference holds it).
+impl<T: PyBool + Clone> PyBool for PyRef<T> {
+    fn py_bool(self) -> bool {
+        self.borrow().clone().py_bool()
+    }
+}
+
+impl<T> PyIsNone for PyRef<T> {
+    fn py_is_none(&self) -> bool {
+        false
+    }
+}
+
+impl<T: PyInherits<Base>, Base> PyInherits<Base> for PyRef<T> {}
+
+#[cfg(test)]
+mod pyref_tests {
+    use super::*;
+
+    #[derive(Default, Debug)]
+    struct Counter {
+        n: i64,
+    }
+
+    #[test]
+    fn a_clone_is_the_same_object() {
+        let a = PyRef::new(Counter { n: 1 });
+        let b = a.clone();
+        b.borrow_mut().n += 2;
+        assert_eq!(a.borrow().n, 3);
+        assert!(a.py_is(&b));
+        assert!(!a.py_is(&PyRef::new(Counter { n: 3 })));
+    }
+
+    /// `bool(x)` on an optional value: None is false, a present value has
+    /// its own truth (`bool(headers.get("Retry-After"))`).
+    #[test]
+    fn an_optional_value_has_pythons_truth() {
+        assert!(!crate::bool(None::<String>));
+        assert!(!crate::bool(Some(String::new())));
+        assert!(crate::bool(Some("120".to_string())));
+        assert!(!crate::bool(Some(0i64)));
+        assert!(crate::bool(Some(3i64)));
+    }
 }
 
 impl<T> PyIsNone for Option<T> {

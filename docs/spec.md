@@ -376,20 +376,27 @@ through subscript/attribute stores marks the chain's base variable.
 - **Chained assignment** `a = b = <container literal>` is a loud error:
   CPython binds both names to one object, and the value-semantics
   lowering cannot preserve that aliasing (issue #104).
-- **Aliasing in general** (`b = a` then mutating either) is not modeled;
-  see §12.3 and issue #79.
-- **Get-then-mutate through a fetched object** (`item =
-  self.find(name)` then `item.qty -= qty`, where `find` returns an
-  `Item | None` read from a container) is a loud conversion error
-  naming the construct and the rewrite: the local holds a COPY of the
-  container-stored object, and the mutation would apply to the copy
-  and be lost — CPython's mutation reaches the stored object through
-  the reference. The rewrite is to mutate through the container
-  (`self.items[name].qty -= qty`, which lowers through the existing
-  in-place `py_index_mut`). Mutation through a `self.<field>` copy
-  local (`tmp = self.item; tmp.f = 1`) is the same class and is
-  tracked with it; borrowed-accessor lowering (reads return references
-  into the container) is the planned fix (issue #137, Directive 4).
+- **Aliasing in general** (`b = a` then mutating either) is not modeled
+  for plain-struct classes and containers; see §12.3 and issue #79. A
+  SHARED class (below) is the exception: its references alias.
+- **Shared instances (the aliasing representation, issue #137).** A
+  class whose instances are stored in a container anywhere in the crate
+  (a `list[C]`, `dict[K, C]`, `set[C]`, … annotation) AND mutated after
+  construction anywhere in the crate (a method that stores into `self`, a
+  container-mutating call on a `self` field, or a field of the class
+  stored through a non-`self` receiver) is SHARED: its values are
+  `stdpython::PyRef<C>` (`Rc<RefCell<C>>`), so the container slot, a
+  local fetched from it (`item = self.find(name)`), a loop variable, and
+  a parameter are ONE object, as every CPython reference is. Reads go
+  through `borrow()`, stores and mutating method calls through
+  `borrow_mut()` (`item.qty -= qty`, `acct.deposit(5)`, `first.balance =
+  1` all reach the stored object); a hierarchy family (a root and its
+  subtree) shares one representation, the root's sum type holding the
+  references. Every other class stays a plain struct (cloning an
+  immutable object, or one no container holds, is unobservable). The
+  `shared.rs` analysis is the one authority; a shared class's method
+  that lets `self` escape (stores or returns `self`) is loud in rustc
+  (the struct is not the reference).
 - Names first assigned inside a `try` body (which lowers to a closure)
   are pre-initialized with `Default::default()` to satisfy rustc's
   capture rules; behavior is unchanged on the paths Python defines.

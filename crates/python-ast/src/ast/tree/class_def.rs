@@ -1206,100 +1206,9 @@ impl ClassDef {
         {
             return true;
         }
-        // The fetch-writeback (round 99): a mutation through a local
-        // whose provenance resolves to a `self.<field>` container slot
-        // (`item = self.find(name)`; `item.qty -= qty`) writes the slot —
-        // the method needs `&mut self` even though no python-level store
-        // touches `self` (the generated py_set_index is invisible to the
-        // scope analysis).
-        let ctx = CodeGenContext::Class(self.name.clone());
-        Self::body_has_container_writeback_checked(&m.body, &ctx, symbols, options)
+        false
     }
 
-    /// Whether any statement in `body` mutates a field THROUGH a
-    /// fetch-local whose provenance resolves to a `self.<field>` slot
-    /// (the write-back's &mut-self trigger, round 99).
-    fn body_has_container_writeback_checked(
-        body: &[crate::Statement],
-        ctx: &CodeGenContext,
-        symbols: &SymbolTableScopes,
-        options: &PythonOptions,
-    ) -> bool {
-        fn walk(
-            stmts: &[crate::Statement],
-            ctx: &CodeGenContext,
-            symbols: &SymbolTableScopes,
-            options: &PythonOptions,
-        ) -> bool {
-            for stmt in stmts {
-                let targets: Vec<&ExprType> = match &stmt.statement {
-                    crate::StatementType::AugAssign(a) => vec![&a.target],
-                    crate::StatementType::Assign(a) => a.targets.iter().collect(),
-                    crate::StatementType::If(s) => {
-                        if walk(&s.body, ctx, symbols, options)
-                            || walk(&s.orelse, ctx, symbols, options)
-                        {
-                            return true;
-                        }
-                        continue;
-                    }
-                    crate::StatementType::For(s) => {
-                        if walk(&s.body, ctx, symbols, options)
-                            || walk(&s.orelse, ctx, symbols, options)
-                        {
-                            return true;
-                        }
-                        continue;
-                    }
-                    crate::StatementType::While(s) => {
-                        if walk(&s.body, ctx, symbols, options)
-                            || walk(&s.orelse, ctx, symbols, options)
-                        {
-                            return true;
-                        }
-                        continue;
-                    }
-                    crate::StatementType::Try(s) => {
-                        if walk(&s.body, ctx, symbols, options) {
-                            return true;
-                        }
-                        for h in &s.handlers {
-                            if walk(&h.body, ctx, symbols, options) {
-                                return true;
-                            }
-                        }
-                        if walk(&s.orelse, ctx, symbols, options)
-                            || walk(&s.finalbody, ctx, symbols, options)
-                        {
-                            return true;
-                        }
-                        continue;
-                    }
-                    crate::StatementType::With(s) => {
-                        if walk(&s.body, ctx, symbols, options) {
-                            return true;
-                        }
-                        continue;
-                    }
-                    _ => continue,
-                };
-                for t in targets {
-                    if let ExprType::Attribute(attr) = t
-                        && let ExprType::Name(n) = attr.value.as_ref()
-                        && n.id != "self"
-                        && crate::ast::tree::fetch_provenance::fetch_provenance(
-                            &n.id, ctx, options, symbols,
-                        )
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        walk(body, ctx, symbols, options)
-    }
 
     /// Infer the struct field list from the `self.attr = ...` stores in
     /// `__init__`. Stores are typed from annotated `__init__` parameters,
@@ -3378,6 +3287,26 @@ impl CodeGen for ClassDef {
         } else {
             quote!()
         };
+        // An instance's TRUTH (`bool(self.proxy)` — urllib3's connection,
+        // where `proxy: Url | None` and `PyBool for Option<T>` asks the
+        // inner value): Python's `__bool__`, else `__len__() != 0`, else
+        // True. A raise inside either is the loud §12.2 panic.
+        let truth_impl = if options.with_std_python {
+            let body = if self.methods().any(|m| m.name == "__bool__") {
+                quote!(self.__bool__().expect("__bool__ raised"))
+            } else if self.methods().any(|m| m.name == "__len__") {
+                quote!(self.__len__().expect("__len__ raised") != 0)
+            } else {
+                quote!(true)
+            };
+            quote!(impl stdpython::PyBool for #class_name {
+                fn py_bool(self) -> bool {
+                    #body
+                }
+            })
+        } else {
+            quote!()
+        };
 
         // The INHERENT base accessors: the derived struct's `base()` /
         // `base_mut()` reach its own embedded `__rython_base`. Inherent
@@ -3477,7 +3406,7 @@ impl CodeGen for ClassDef {
             // so `x is None` on an instance lowers through PyIsNone to
             // false — same contract the PyInherits tree carries for
             // ancestry bounds.
-            #is_none_impl
+            #is_none_impl #truth_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
@@ -5794,28 +5723,44 @@ impl ClassDef {
         let vnames: Vec<proc_macro2::Ident> =
             variants.iter().map(|v| crate::safe_ident(&v.name)).collect();
         let vpaths: Vec<TokenStream> = variants.iter().map(h::variant_path).collect();
+        // A SHARED family (shared.rs): every variant holds its class
+        // behind `PyRef`, so the sum type's holders share the one object;
+        // the accessors and delegators borrow it. `PyRef` is already an
+        // indirection, so a shared family is never boxed.
+        let shared_family = crate::ast::tree::shared::is_shared(&self.name);
         // A variant whose struct holds a value of this family INLINE (a
         // field typed with the root or a member — `Outer(Inner)` with
         // `self.inner: Inner`) would make the sum type recursive without
         // indirection (E0072): that variant's payload is boxed.
         let boxed: Vec<bool> = variants
             .iter()
-            .map(|v| self.variant_holds_family_inline(v, &variants, symbols, options))
+            .map(|v| !shared_family && self.variant_holds_family_inline(v, &variants, symbols, options))
             .collect();
         let vpayloads: Vec<TokenStream> = vpaths
             .iter()
             .zip(boxed.iter())
-            .map(|(vp, b)| if *b { quote!(Box<#vp>) } else { vp.clone() })
+            .map(|(vp, b)| {
+                if shared_family {
+                    quote!(stdpython::PyRef<#vp>)
+                } else if *b {
+                    quote!(Box<#vp>)
+                } else {
+                    vp.clone()
+                }
+            })
             .collect();
         let wrap = |i: usize, v: TokenStream| if boxed[i] { quote!(Box::new(#v)) } else { v };
         let unbox = |i: usize, x: TokenStream| if boxed[i] { quote!((**#x).clone()) } else { quote!(#x.clone()) };
 
         // ---- The type, its conversions, and the runtime traits ----
-        let from_impls = vnames.iter().zip(vpaths.iter()).enumerate().map(|(i, (vn, vp))| {
+        // A shared family converts from the reference (`PyRef<C>`), the
+        // form a construction yields; a value family from the struct.
+        let from_impls = vnames.iter().zip(vpayloads.iter()).enumerate().map(|(i, (vn, vp))| {
             let wrapped = wrap(i, quote!(v));
+            let from_ty = if boxed[i] { vpaths[i].clone() } else { vp.clone() };
             quote! {
-                impl std::convert::From<#vp> for #any {
-                    fn from(v: #vp) -> #any { #any::#vn(#wrapped) }
+                impl std::convert::From<#from_ty> for #any {
+                    fn from(v: #from_ty) -> #any { #any::#vn(#wrapped) }
                 }
             }
         });
@@ -5846,13 +5791,22 @@ impl ClassDef {
             .iter()
             .map(|a| crate::safe_ident(&a.name))
             .collect();
-        let root_default = wrap(0, quote!(#root_ident::default()));
+        let root_default = if shared_family {
+            quote!(stdpython::PyRef::new(#root_ident::default()))
+        } else {
+            wrap(0, quote!(#root_ident::default()))
+        };
         let runtime_impls = quote! {
             impl Default for #any {
                 fn default() -> Self { #any::#root_ident(#root_default) }
             }
             impl stdpython::PyIsNone for #any {
                 fn py_is_none(&self) -> bool { false }
+            }
+            impl stdpython::PyBool for #any {
+                fn py_bool(self) -> bool {
+                    match self { #(#any::#vnames(v) => v.py_bool()),* }
+                }
             }
             #(impl PyInherits<#ancestors> for #any {})*
             impl stdpython::PyDisplay for #any {
@@ -5893,6 +5847,7 @@ impl ClassDef {
                 }
                 None => {
                     let vp = h::variant_path(v);
+                    let vp = if shared_family { quote!(stdpython::PyRef<#vp>) } else { vp };
                     let vn = crate::safe_ident(&v.name);
                     let i = variants.iter().position(|w| w.name == v.name).unwrap_or(0);
                     let cloned = unbox(i, quote!(x));
@@ -5906,6 +5861,7 @@ impl ClassDef {
             let as_mut_fn = format_ident!("__rython_as_{}_mut", v.name);
             let mutable_view = if h::subtree(options, &v.name).is_none() {
                 let vp = h::variant_path(v);
+                let vp = if shared_family { quote!(stdpython::PyRef<#vp>) } else { vp };
                 let vn = crate::safe_ident(&v.name);
                 let i = variants.iter().position(|w| w.name == v.name).unwrap_or(0);
                 let inner = if boxed[i] { quote!(Some(&mut **x)) } else { quote!(Some(x)) };
@@ -6031,29 +5987,50 @@ impl ClassDef {
                 let (get_arms, set_arms): (Vec<TokenStream>, Vec<TokenStream>) = vnames
                     .iter()
                     .zip(vpaths.iter())
-                    .map(|(vn, vp)| match a_path {
-                        Some(_) => (
+                    .map(|(vn, vp)| match (shared_family, a_path) {
+                        // A shared family borrows the one object; the
+                        // mutable accessor maps the borrow to the field.
+                        (true, Some(_)) => (
+                            quote!(#any::#vn(v) => <#vp as #trait_path>::#f(&*v.borrow())),
+                            quote!(#any::#vn(v) => core::cell::RefMut::map(v.borrow_mut(), |s| <#vp as #trait_path>::#f_mut(s))),
+                        ),
+                        (true, None) => (
+                            quote!(#any::#vn(v) => v.borrow().#f()),
+                            quote!(#any::#vn(v) => core::cell::RefMut::map(v.borrow_mut(), |s| s.#f_mut())),
+                        ),
+                        (false, Some(_)) => (
                             quote!(#any::#vn(v) => <#vp as #trait_path>::#f(v)),
                             quote!(#any::#vn(v) => <#vp as #trait_path>::#f_mut(v)),
                         ),
-                        None => (
+                        (false, None) => (
                             quote!(#any::#vn(v) => v.#f()),
                             quote!(#any::#vn(v) => v.#f_mut()),
                         ),
                     })
                     .unzip();
-                inherent.extend(quote! {
-                    pub fn #f(&self) -> #ty {
-                        match self { #(#get_arms),* }
-                    }
-                    pub fn #f_mut(&mut self) -> &mut #ty {
-                        match self { #(#set_arms),* }
-                    }
-                });
-                fwd.extend(quote! {
-                    fn #f(&self) -> #ty { #any::#f(self) }
-                    fn #f_mut(&mut self) -> &mut #ty { #any::#f_mut(self) }
-                });
+                if shared_family {
+                    inherent.extend(quote! {
+                        pub fn #f(&self) -> #ty {
+                            match self { #(#get_arms),* }
+                        }
+                        pub fn #f_mut(&self) -> core::cell::RefMut<'_, #ty> {
+                            match self { #(#set_arms),* }
+                        }
+                    });
+                } else {
+                    inherent.extend(quote! {
+                        pub fn #f(&self) -> #ty {
+                            match self { #(#get_arms),* }
+                        }
+                        pub fn #f_mut(&mut self) -> &mut #ty {
+                            match self { #(#set_arms),* }
+                        }
+                    });
+                    fwd.extend(quote! {
+                        fn #f(&self) -> #ty { #any::#f(self) }
+                        fn #f_mut(&mut self) -> &mut #ty { #any::#f_mut(self) }
+                    });
+                }
             }
             for m in ancestor.methods() {
                 if skip_method(m) {
@@ -6102,6 +6079,11 @@ impl ClassDef {
                 }
                 let call_args = quote!(#(#args),*);
                 let fwd_args = quote!(#(, #args)*);
+                // A shared family's delegator borrows each variant's one
+                // object (mutably when the method takes `&mut self`) and
+                // itself takes `&self`: interior mutability.
+                let takes_mut_self = h::head_takes_mut_self(&head);
+                let head = if shared_family { h::head_with_shared_self(&head) } else { head };
                 if first_seen {
                     // Dispatch through the DEFINER's trait when it carries
                     // the method: every variant implements it with the
@@ -6117,10 +6099,13 @@ impl ClassDef {
                         .iter()
                         .zip(vpaths.iter())
                         .map(|(vn, vp)| {
-                            let call = if is_definer {
-                                quote!(<#vp as #trait_path>::#name(v #fwd_args))
-                            } else {
-                                quote!(v.#name(#call_args))
+                            let call = match (shared_family, is_definer, takes_mut_self) {
+                                (true, true, true) => quote!(<#vp as #trait_path>::#name(&mut *v.borrow_mut() #fwd_args)),
+                                (true, true, false) => quote!(<#vp as #trait_path>::#name(&*v.borrow() #fwd_args)),
+                                (true, false, true) => quote!(v.borrow_mut().#name(#call_args)),
+                                (true, false, false) => quote!(v.borrow().#name(#call_args)),
+                                (false, true, _) => quote!(<#vp as #trait_path>::#name(v #fwd_args)),
+                                (false, false, _) => quote!(v.#name(#call_args)),
                             };
                             quote!(#any::#vn(v) => #call)
                         })
@@ -6131,13 +6116,16 @@ impl ClassDef {
                         }
                     });
                 }
-                if is_definer {
+                if is_definer && !shared_family {
                     fwd.extend(quote! {
                         #attrs #head { #any::#name(self #fwd_args) }
                     });
                 }
             }
-            if has_trait {
+            // A shared family's sum type does not implement the traits: a
+            // trait's `&mut T` accessor cannot reach through the borrow
+            // (a generic bound on the sum type is loud in rustc).
+            if has_trait && !shared_family {
                 trait_impls.extend(quote! {
                     impl #trait_path for #any { #fwd }
                 });
