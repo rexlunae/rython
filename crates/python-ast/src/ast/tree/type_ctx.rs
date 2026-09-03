@@ -2664,6 +2664,23 @@ fn analyze_statement_types(
                             }
                             _ => syntactic_type(&assign.value),
                         },
+                        // A SUBSCRIPT value (`q = queues[0]` where `queues:
+                        // list[Backlog]` — the corpus's ledger): the
+                        // context-aware inferrer reads the element type
+                        // through the container's recorded type, so the
+                        // local is the class and a method call on it
+                        // resolves (the context-free path saw an untyped
+                        // element and the call fell to the callable-field
+                        // form).
+                        ExprType::Subscript(_) => match (options, symbols) {
+                            (Some(options), Some(symbols)) => {
+                                match infer_type(None, &assign.value, &analysis_view(options, info), symbols) {
+                                    TypeInfo::PyObject => syntactic_type(&assign.value),
+                                    t => t,
+                                }
+                            }
+                            _ => syntactic_type(&assign.value),
+                        },
                         _ => syntactic_type(&assign.value),
                     },
                 };

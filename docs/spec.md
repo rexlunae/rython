@@ -408,7 +408,13 @@ through subscript/attribute stores marks the chain's base variable.
   on its references panics at runtime and the conversion warns. An
   instance's truth (`bool(x)`, also through `Option` and the sum type)
   is `__bool__`, else `__len__() != 0`, else True, the dunder resolved
-  on the MRO.
+  on the MRO — on a shared instance it runs on the one object (a side
+  effect in `__bool__` is what every reference sees). One boundary: a
+  mutating method on a shared object holds the object for its duration,
+  so a read of the SAME object through another reference inside that
+  call (`a.merge(a)`, where `merge` mutates `self` and reads its
+  argument) is a loud runtime error naming the aliasing, not a silent
+  copy; every other alias shape is exact.
 - Names first assigned inside a `try` body (which lowers to a closure)
   are pre-initialized with `Default::default()` to satisfy rustc's
   capture rules; behavior is unchanged on the paths Python defines.

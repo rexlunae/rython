@@ -17555,6 +17555,91 @@ fn an_aliased_container_annotation_shares_its_element_class() {
     );
 }
 
+/// A mutation that sits only in a statement's own expression — the test
+/// of an `if`, the iterable of a `for`, a nested call — is a mutation
+/// (Devin review on #321): the class shares.
+#[test]
+fn a_condition_only_mutation_shares_the_class() {
+    let out = compile(
+        concat!(
+            "class Queue:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = [1]\n",
+            "\n",
+            "    def drain(self) -> int:\n",
+            "        if self.items.pop() > 0:\n",
+            "            return 1\n",
+            "        return 0\n",
+            "\n",
+            "class Nested:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = [1]\n",
+            "\n",
+            "    def total(self) -> int:\n",
+            "        return 1 + self.items.pop()\n",
+            "\n",
+            "class Store:\n",
+            "    def __init__(self):\n",
+            "        self.queues: list[Queue] = []\n",
+            "        self.nested: list[Nested] = []\n",
+        ),
+        "condition_mutation.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Queue>>"),
+        "a container-mutating call in an if test is a mutation: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Nested>>"),
+        "a container-mutating call nested in an expression is a mutation: {}",
+        out
+    );
+}
+
+/// A shared class's truth runs on the ONE object: `PyRefTruth` calls the
+/// dunder through the borrow — mutable when the dunder mutates — never on
+/// a clone (Devin review on #321).
+#[test]
+fn a_shared_classs_truth_runs_through_the_reference() {
+    let out = compile(
+        concat!(
+            "class Probe:\n",
+            "    def __init__(self):\n",
+            "        self.checks = 0\n",
+            "\n",
+            "    def __bool__(self) -> bool:\n",
+            "        self.checks += 1\n",
+            "        return self.checks > 1\n",
+            "\n",
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Store:\n",
+            "    def __init__(self):\n",
+            "        self.probes: list[Probe] = []\n",
+            "        self.plains: list[Plain] = []\n",
+        ),
+        "ref_truth.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyRefTruthforProbe{fnref_truth(r:&stdpython::PyRef<Self>)->bool{r.borrow_mut().__bool__().expect(\"__bool__raised\")}}"),
+        "a mutating __bool__ runs through the mutable borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyRefTruthforPlain{fnref_truth(r:&stdpython::PyRef<Self>)->bool{true}}"),
+        "a plain shared instance is true: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the

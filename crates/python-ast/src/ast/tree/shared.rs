@@ -182,29 +182,120 @@ fn collect_container_elements(
             StatementType::AnnotatedName { annotation, .. } => {
                 from_annotation(annotation, out);
             }
-            StatementType::If(i) => {
-                collect_container_elements(&i.body, symbols, options, out);
-                collect_container_elements(&i.orelse, symbols, options, out);
-            }
-            StatementType::For(f) => {
-                collect_container_elements(&f.body, symbols, options, out);
-                collect_container_elements(&f.orelse, symbols, options, out);
-            }
-            StatementType::While(w) => {
-                collect_container_elements(&w.body, symbols, options, out);
-                collect_container_elements(&w.orelse, symbols, options, out);
-            }
-            StatementType::With(w) => collect_container_elements(&w.body, symbols, options, out),
-            StatementType::Try(t) => {
-                collect_container_elements(&t.body, symbols, options, out);
-                for h in &t.handlers {
-                    collect_container_elements(&h.body, symbols, options, out);
+            _ => {
+                for body in stmt_bodies(s) {
+                    collect_container_elements(body, symbols, options, out);
                 }
-                collect_container_elements(&t.orelse, symbols, options, out);
-                collect_container_elements(&t.finalbody, symbols, options, out);
             }
-            _ => {}
         }
+    }
+}
+
+/// The direct subexpressions of an expression: one enumeration for every
+/// walk in this module, so a call nested anywhere (`x = 1 + self.q.pop()`,
+/// `if self.items.pop():`) is seen. A comprehension's and a lambda's body
+/// are included (they run in the method).
+fn subexprs(e: &ExprType) -> Vec<&ExprType> {
+    match e {
+        ExprType::BoolOp(b) => b.values.iter().collect(),
+        ExprType::NamedExpr(n) => vec![&n.left, &n.right],
+        ExprType::BinOp(b) => vec![&b.left, &b.right],
+        ExprType::UnaryOp(u) => vec![&u.operand],
+        ExprType::Lambda(l) => vec![&l.body],
+        ExprType::IfExp(i) => vec![&i.test, &i.body, &i.orelse],
+        ExprType::Dict(d) => d.keys.iter().flatten().chain(d.values.iter()).collect(),
+        ExprType::Set(s) => s.elts.iter().collect(),
+        ExprType::ListComp(c) => std::iter::once(c.elt.as_ref())
+            .chain(c.generators.iter().flat_map(|g| {
+                std::iter::once(&g.iter).chain(g.ifs.iter())
+            }))
+            .collect(),
+        ExprType::SetComp(c) => std::iter::once(c.elt.as_ref())
+            .chain(c.generators.iter().flat_map(|g| {
+                std::iter::once(&g.iter).chain(g.ifs.iter())
+            }))
+            .collect(),
+        ExprType::GeneratorExp(c) => std::iter::once(c.elt.as_ref())
+            .chain(c.generators.iter().flat_map(|g| {
+                std::iter::once(&g.iter).chain(g.ifs.iter())
+            }))
+            .collect(),
+        ExprType::DictComp(c) => [c.key.as_ref(), c.value.as_ref()]
+            .into_iter()
+            .chain(c.generators.iter().flat_map(|g| {
+                std::iter::once(&g.iter).chain(g.ifs.iter())
+            }))
+            .collect(),
+        ExprType::Await(a) => vec![&a.value],
+        ExprType::Yield(y) => y.value.iter().map(|v| v.as_ref()).collect(),
+        ExprType::YieldFrom(y) => vec![&y.value],
+        ExprType::Compare(c) => std::iter::once(c.left.as_ref()).chain(c.comparators.iter()).collect(),
+        ExprType::Call(c) => std::iter::once(c.func.as_ref())
+            .chain(c.args.iter())
+            .chain(c.keywords.iter().map(|k| &k.value))
+            .collect(),
+        ExprType::FormattedValue(f) => vec![&f.value],
+        ExprType::JoinedStr(j) => j.values.iter().collect(),
+        ExprType::Attribute(a) => vec![&a.value],
+        ExprType::Subscript(s) => {
+            let mut out = vec![s.value.as_ref()];
+            match &s.kind {
+                crate::SubscriptKind::Index(i) => out.push(i),
+                crate::SubscriptKind::Slice { lower, upper, step } => {
+                    out.extend(lower.iter().chain(upper.iter()).chain(step.iter()).map(|b| b.as_ref()));
+                }
+            }
+            out
+        }
+        ExprType::Starred(st) => vec![&st.value],
+        ExprType::List(l) => l.iter().collect(),
+        ExprType::Tuple(t) => t.elts.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The expressions a statement evaluates itself (its bodies aside): the
+/// test of an `if` / `while`, the iterable of a `for`, a `with` item's
+/// context, an assert, a raise, a return, an expression statement, a
+/// store's value — so a mutation in any of them is a mutation.
+fn stmt_exprs(s: &Statement) -> Vec<&ExprType> {
+    match &s.statement {
+        StatementType::Assign(a) => vec![&a.value],
+        StatementType::AugAssign(a) => vec![&a.value],
+        StatementType::Expr(e) => vec![&e.value],
+        StatementType::Return(Some(e)) => vec![&e.value],
+        StatementType::If(i) => vec![&i.test],
+        StatementType::While(w) => vec![&w.test],
+        StatementType::For(f) => vec![&f.iter],
+        StatementType::AsyncFor(f) => vec![&f.iter],
+        StatementType::With(w) => w.items.iter().map(|i| &i.context_expr).collect(),
+        StatementType::AsyncWith(w) => w.items.iter().map(|i| &i.context_expr).collect(),
+        StatementType::Assert { test, msg } => {
+            std::iter::once(test.as_ref()).chain(msg.iter().map(|m| m.as_ref())).collect()
+        }
+        StatementType::Raise(r) => r.exc.iter().chain(r.cause.iter()).collect(),
+        StatementType::Delete(targets) => targets.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The nested statement bodies of a statement, every control-flow form
+/// (the asynchronous ones included).
+fn stmt_bodies(s: &Statement) -> Vec<&[Statement]> {
+    match &s.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => vec![&f.body],
+        StatementType::ClassDef(c) => vec![&c.body],
+        StatementType::If(i) => vec![&i.body, &i.orelse],
+        StatementType::For(f) => vec![&f.body, &f.orelse],
+        StatementType::AsyncFor(f) => vec![&f.body, &f.orelse],
+        StatementType::While(w) => vec![&w.body, &w.orelse],
+        StatementType::With(w) => vec![&w.body],
+        StatementType::AsyncWith(w) => vec![&w.body],
+        StatementType::Try(t) => std::iter::once(t.body.as_slice())
+            .chain(t.handlers.iter().map(|h| h.body.as_slice()))
+            .chain([t.orelse.as_slice(), t.finalbody.as_slice()])
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -228,32 +319,11 @@ fn collect_external_store_fields(stmts: &[Statement], out: &mut HashSet<String>)
         match &s.statement {
             StatementType::Assign(a) => a.targets.iter().for_each(|t| target(t, out)),
             StatementType::AugAssign(a) => target(&a.target, out),
-            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
-                collect_external_store_fields(&f.body, out)
-            }
-            StatementType::ClassDef(c) => collect_external_store_fields(&c.body, out),
-            StatementType::If(i) => {
-                collect_external_store_fields(&i.body, out);
-                collect_external_store_fields(&i.orelse, out);
-            }
-            StatementType::For(f) => {
-                collect_external_store_fields(&f.body, out);
-                collect_external_store_fields(&f.orelse, out);
-            }
-            StatementType::While(w) => {
-                collect_external_store_fields(&w.body, out);
-                collect_external_store_fields(&w.orelse, out);
-            }
-            StatementType::With(w) => collect_external_store_fields(&w.body, out),
-            StatementType::Try(t) => {
-                collect_external_store_fields(&t.body, out);
-                for h in &t.handlers {
-                    collect_external_store_fields(&h.body, out);
-                }
-                collect_external_store_fields(&t.orelse, out);
-                collect_external_store_fields(&t.finalbody, out);
-            }
+            StatementType::Delete(targets) => targets.iter().for_each(|t| target(t, out)),
             _ => {}
+        }
+        for body in stmt_bodies(s) {
+            collect_external_store_fields(body, out);
         }
     }
 }
@@ -359,20 +429,20 @@ fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut V
     }
     fn expr_mutates(e: &ExprType, fields: &mut Vec<String>, self_calls: &mut Vec<String>) -> bool {
         let mut found = false;
-        if let ExprType::Call(c) = e {
-            if let ExprType::Attribute(a) = c.func.as_ref() {
-                if is_self(&a.value) {
-                    self_calls.push(a.attr.clone());
-                } else if let Some(f) = self_field(&a.value)
-                    && CONTAINER_MUTATING_METHODS.contains(&a.attr.as_str())
-                {
-                    fields.push(f);
-                    found = true;
-                }
+        if let ExprType::Call(c) = e
+            && let ExprType::Attribute(a) = c.func.as_ref()
+        {
+            if is_self(&a.value) {
+                self_calls.push(a.attr.clone());
+            } else if let Some(f) = self_field(&a.value)
+                && CONTAINER_MUTATING_METHODS.contains(&a.attr.as_str())
+            {
+                fields.push(f);
+                found = true;
             }
-            for a in c.args.iter().chain(c.keywords.iter().map(|k| &k.value)) {
-                found |= expr_mutates(a, fields, self_calls);
-            }
+        }
+        for sub in subexprs(e) {
+            found |= expr_mutates(sub, fields, self_calls);
         }
         found
     }
@@ -386,7 +456,6 @@ fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut V
                         found = true;
                     }
                 }
-                found |= expr_mutates(&a.value, fields, self_calls);
             }
             StatementType::AugAssign(a) => {
                 if let Some(f) = self_field(&a.target) {
@@ -404,30 +473,44 @@ fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut V
                     }
                 }
             }
-            StatementType::Expr(e) => found |= expr_mutates(&e.value, fields, self_calls),
-            StatementType::Return(Some(e)) => found |= expr_mutates(&e.value, fields, self_calls),
-            StatementType::If(i) => {
-                found |= self_stores(&i.body, fields, self_calls);
-                found |= self_stores(&i.orelse, fields, self_calls);
-            }
+            // `for self.x in ..`, `with .. as self.x`: stores too.
             StatementType::For(f) => {
-                found |= self_stores(&f.body, fields, self_calls);
-                found |= self_stores(&f.orelse, fields, self_calls);
-            }
-            StatementType::While(w) => {
-                found |= self_stores(&w.body, fields, self_calls);
-                found |= self_stores(&w.orelse, fields, self_calls);
-            }
-            StatementType::With(w) => found |= self_stores(&w.body, fields, self_calls),
-            StatementType::Try(t) => {
-                found |= self_stores(&t.body, fields, self_calls);
-                for h in &t.handlers {
-                    found |= self_stores(&h.body, fields, self_calls);
+                if let Some(f) = self_field(&f.target) {
+                    fields.push(f);
+                    found = true;
                 }
-                found |= self_stores(&t.orelse, fields, self_calls);
-                found |= self_stores(&t.finalbody, fields, self_calls);
+            }
+            StatementType::AsyncFor(f) => {
+                if let Some(f) = self_field(&f.target) {
+                    fields.push(f);
+                    found = true;
+                }
+            }
+            StatementType::With(w) => {
+                for item in &w.items {
+                    if let Some(f) = item.optional_vars.as_ref().and_then(self_field) {
+                        fields.push(f);
+                        found = true;
+                    }
+                }
+            }
+            StatementType::AsyncWith(w) => {
+                for item in &w.items {
+                    if let Some(f) = item.optional_vars.as_ref().and_then(self_field) {
+                        fields.push(f);
+                        found = true;
+                    }
+                }
             }
             _ => {}
+        }
+        // The expressions the statement itself evaluates (a call in an
+        // `if` test — Devin review on #321), then its bodies.
+        for e in stmt_exprs(s) {
+            found |= expr_mutates(e, fields, self_calls);
+        }
+        for body in stmt_bodies(s) {
+            found |= self_stores(body, fields, self_calls);
         }
     }
     found

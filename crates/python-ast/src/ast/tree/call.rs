@@ -5917,10 +5917,10 @@ impl<'a> CodeGen for Call {
                     // method mutates. `self` inside the class is the
                     // struct itself; a shared ROOT's sum type borrows in
                     // its delegators.
-                    let receiver = if crate::ast::tree::shared::is_shared(&class.name)
+                    let shared_borrow = crate::ast::tree::shared::is_shared(&class.name)
                         && !crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
-                        && !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
-                    {
+                        && !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self");
+                    let receiver = if shared_borrow {
                         if mutates_receiver {
                             quote!((#receiver).borrow_mut())
                         } else {
@@ -5930,6 +5930,19 @@ impl<'a> CodeGen for Call {
                         receiver
                     };
                     let method_name = crate::safe_ident(&attr.attr);
+                    if shared_borrow {
+                        // The borrow ends WITH the call: bound to a local,
+                        // the `Ref`/`RefMut` temporary drops at the `let`
+                        // (a tail expression's temporary would live to the
+                        // enclosing statement's end — `print(q.drain(),
+                        // len(queues[0].items))` reads the same object
+                        // next, as Python's left-to-right evaluation may).
+                        return Ok(quote!({
+                            #prelude
+                            let __rython_call = (#receiver).#method_name(#(#args),*)?;
+                            __rython_call
+                        }));
+                    }
                     return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
                 }
             }
