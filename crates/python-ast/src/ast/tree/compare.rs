@@ -426,10 +426,49 @@ impl CodeGen for Compare {
                 }
             };
             // `is` on a SHARED class's references is identity of the one
-            // object (shared.rs), never the `==` a class may define.
-            let shared_identity = matches!(
-                crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
-                crate::TypeInfo::Class(c) if crate::ast::tree::shared::is_shared(&c)
+            // object (shared.rs), never the `==` a class may define: a
+            // NARROWED name reads as the class (the guard's flow state
+            // first), a plain one by its type, and an OPTIONAL one
+            // (`a: C | None`) compares the two options by identity
+            // (Devin review on #321).
+            let identity_type = match left_ast {
+                ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => {
+                    options.narrowed_names[&n.id].clone()
+                }
+                // The analysis's record of a name (a parameter's `C | None`
+                // is the Option of the class there; the inferrer's
+                // annotation map knows no classes).
+                ExprType::Name(n) if options.name_types.contains_key(&n.id) => {
+                    options.name_types[&n.id].clone()
+                }
+                _ => crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+            };
+            let is_shared_class = |t: &crate::TypeInfo| {
+                matches!(t, crate::TypeInfo::Class(c) if crate::ast::tree::shared::is_shared(c))
+            };
+            let is_shared_option = |t: &crate::TypeInfo| {
+                matches!(t, crate::TypeInfo::Option(inner) if is_shared_class(inner))
+            };
+            let comparator_identity_type = match comparator_ast {
+                ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => {
+                    options.narrowed_names[&n.id].clone()
+                }
+                ExprType::Name(n) if options.name_types.contains_key(&n.id) => {
+                    options.name_types[&n.id].clone()
+                }
+                _ => crate::infer_type(Some(&ctx), comparator_ast, &options, &symbols),
+            };
+            // A MIXED pair (`ta is not board.tags[1]`: an optional reference
+            // against a plain one) lifts the plain side into the option.
+            let (left_is_opt, right_is_opt) = (
+                is_shared_option(&identity_type),
+                is_shared_option(&comparator_identity_type),
+            );
+            let shared_identity = is_shared_class(&identity_type) && !right_is_opt;
+            let shared_option_identity = left_is_opt || right_is_opt;
+            let (opt_left, opt_right) = (
+                if left_is_opt || !shared_option_identity { quote!(#left) } else { quote!(Some(#left)) },
+                if right_is_opt || !shared_option_identity { quote!(#comparator) } else { quote!(Some(#comparator)) },
             );
             let tokens = match op {
                 Compares::Eq => quote!((#left).py_eq(&(#comparator))),
@@ -440,6 +479,12 @@ impl CodeGen for Compare {
                 Compares::GtE => quote!((#left).py_ge(&(#comparator))),
                 Compares::Is if shared_identity => quote!((#left).py_is(&#comparator)),
                 Compares::IsNot if shared_identity => quote!(!(#left).py_is(&#comparator)),
+                Compares::Is if shared_option_identity => {
+                    quote!(stdpython::py_is_opt(&#opt_left, &#opt_right))
+                }
+                Compares::IsNot if shared_option_identity => {
+                    quote!(!stdpython::py_is_opt(&#opt_left, &#opt_right))
+                }
                 Compares::Is => quote!(&#left == &#comparator),
                 Compares::IsNot => quote!(&#left != &#comparator),
                 // Python `in` dispatches on the container: substring for

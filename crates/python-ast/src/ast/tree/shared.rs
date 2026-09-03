@@ -46,14 +46,20 @@ pub fn compute_shared(
     options: &PythonOptions,
 ) -> HashSet<String> {
     let mut classes: BTreeMap<String, ClassDef> = BTreeMap::new();
+    // How many emitted modules define each class name: the registry is
+    // keyed by the bare name the type side carries, so a name two modules
+    // both define is AMBIGUOUS — excluded from sharing, loudly (the
+    // hierarchy index applies the same rule; Devin review on #321).
+    let mut defined_in: HashMap<String, usize> = HashMap::new();
     let mut stored: HashSet<String> = HashSet::new();
-    let mut external_store_fields: HashSet<String> = HashSet::new();
+    let mut external_stores: HashSet<ExternalStore> = HashSet::new();
     let mut register = |body: &[Statement], defs: Vec<ClassDef>, symbols: &SymbolTableScopes, opts: &PythonOptions| {
         for c in defs {
+            *defined_in.entry(c.name.clone()).or_insert(0) += 1;
             classes.entry(c.name.clone()).or_insert(c);
         }
         collect_container_elements(body, symbols, opts, &mut stored);
-        collect_external_store_fields(body, &mut external_store_fields);
+        collect_external_store_fields(body, &Env::default(), symbols, opts, &mut external_stores);
     };
     register(this_body, this_classes.to_vec(), this_symbols, options);
     for (path, module) in options.module_defs.iter() {
@@ -84,9 +90,20 @@ pub fn compute_shared(
         .iter()
         .filter(|name| {
             let c = &classes[*name];
-            stored.contains(*name)
+            let qualifies = stored.contains(*name)
                 && !crate::ast::tree::class_def::is_exception_class(c)
-                && class_mutates(name, &classes, &external_store_fields, &mut memo)
+                && class_mutates(name, &classes, &external_stores, &mut memo);
+            if qualifies && defined_in.get(*name).copied().unwrap_or(0) > 1 {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "class `{}` is defined by more than one module of the crate: its \
+                     instances stay values (sharing is keyed by the class name), so a \
+                     mutation through a container-fetched alias of it does not reach \
+                     the stored object (issue #137)",
+                    name
+                ));
+                return false;
+            }
+            qualifies
         })
         .cloned()
         .collect();
@@ -299,31 +316,146 @@ fn stmt_bodies(s: &Statement) -> Vec<&[Statement]> {
     }
 }
 
-/// The attribute names stored through a NON-`self` receiver anywhere
-/// (`acct.balance = 1`, `item.qty -= qty`): a class with such a field is
-/// mutated from outside its own methods.
-fn collect_external_store_fields(stmts: &[Statement], out: &mut HashSet<String>) {
-    fn target(t: &ExprType, out: &mut HashSet<String>) {
+/// A store through a NON-`self` receiver (`acct.balance = 1`,
+/// `item.qty -= qty`): the field, with the receiver's class when the
+/// scope names it — an annotated parameter, a local constructed from a
+/// class, an element of an annotated container — and `None` when it
+/// does not (the store then counts for every class with that field: the
+/// over-approximation errs toward sharing, which is exact for every
+/// alias shape but the one the spec names; Devin review on #321).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExternalStore {
+    field: String,
+    receiver_class: Option<String>,
+}
+
+impl ExternalStore {
+    /// Whether this store mutates `class`'s field `field`.
+    fn hits(&self, class: &str, field: &str) -> bool {
+        self.field == field && self.receiver_class.as_deref().is_none_or(|c| c == class)
+    }
+}
+
+/// The names a function's scope types as CLASS INSTANCES (a parameter's
+/// annotation, a local's construction or annotation, an element of an
+/// annotated container), for the receiver of an external store.
+#[derive(Clone, Default)]
+struct Env {
+    names: HashMap<String, TypeInfo>,
+}
+
+impl Env {
+    fn class_of(&self, receiver: &ExprType) -> Option<String> {
+        let element = |t: &TypeInfo| -> Option<String> {
+            match t {
+                TypeInfo::Vec(inner) | TypeInfo::HashSet(inner) => match inner.as_ref() {
+                    TypeInfo::Class(c) => Some(c.clone()),
+                    _ => None,
+                },
+                TypeInfo::Dict(_, v) => match v.as_ref() {
+                    TypeInfo::Class(c) => Some(c.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        match receiver {
+            ExprType::Name(n) => match self.names.get(&n.id)? {
+                TypeInfo::Class(c) => Some(c.clone()),
+                TypeInfo::Option(inner) => match inner.as_ref() {
+                    TypeInfo::Class(c) => Some(c.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExprType::Subscript(sub) => match sub.value.as_ref() {
+                ExprType::Name(n) => element(self.names.get(&n.id)?),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+fn collect_external_store_fields(
+    stmts: &[Statement],
+    env: &Env,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    out: &mut HashSet<ExternalStore>,
+) {
+    fn target(t: &ExprType, env: &Env, out: &mut HashSet<ExternalStore>) {
         match t {
             ExprType::Attribute(a) => {
                 if !matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
-                    out.insert(a.attr.clone());
+                    out.insert(ExternalStore {
+                        field: a.attr.clone(),
+                        receiver_class: env.class_of(&a.value),
+                    });
                 }
             }
-            ExprType::Tuple(tu) => tu.elts.iter().for_each(|e| target(e, out)),
-            ExprType::List(l) => l.iter().for_each(|e| target(e, out)),
+            ExprType::Tuple(tu) => tu.elts.iter().for_each(|e| target(e, env, out)),
+            ExprType::List(l) => l.iter().for_each(|e| target(e, env, out)),
             _ => {}
         }
     }
+    let annotated = |ann: &ExprType| -> Option<TypeInfo> {
+        crate::annotation_type_info(ann).or_else(|| crate::resolve_alias_typeinfo(ann, symbols, options))
+    };
+    // A function opens a scope: its annotated parameters, then the locals
+    // its body constructs or annotates.
+    let function_env = |f: &FunctionDef| -> Env {
+        let mut env = env.clone();
+        for p in f.args.posonlyargs.iter().chain(f.args.args.iter()).chain(f.args.kwonlyargs.iter()) {
+            if let Some(ann) = p.annotation.as_deref()
+                && let Some(t) = annotated(ann)
+            {
+                env.names.insert(p.arg.clone(), t);
+            }
+        }
+        env
+    };
+    let mut env = env.clone();
     for s in stmts {
         match &s.statement {
-            StatementType::Assign(a) => a.targets.iter().for_each(|t| target(t, out)),
-            StatementType::AugAssign(a) => target(&a.target, out),
-            StatementType::Delete(targets) => targets.iter().for_each(|t| target(t, out)),
+            StatementType::Assign(a) => {
+                a.targets.iter().for_each(|t| target(t, &env, out));
+                if let [ExprType::Name(n)] = a.targets.as_slice() {
+                    let typed = a
+                        .annotation
+                        .as_ref()
+                        .and_then(|ann| annotated(ann))
+                        .or_else(|| match &a.value {
+                            ExprType::Call(c) => match c.func.as_ref() {
+                                ExprType::Name(callee)
+                                    if crate::resolve_class_referenced(&callee.id, symbols, options).is_some() =>
+                                {
+                                    Some(TypeInfo::Class(callee.id.clone()))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        });
+                    match typed {
+                        Some(t) => {
+                            env.names.insert(n.id.clone(), t);
+                        }
+                        None => {
+                            env.names.remove(&n.id);
+                        }
+                    }
+                }
+            }
+            StatementType::AugAssign(a) => target(&a.target, &env, out),
+            StatementType::Delete(targets) => targets.iter().for_each(|t| target(t, &env, out)),
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                collect_external_store_fields(&f.body, &function_env(f), symbols, options, out);
+                continue;
+            }
             _ => {}
         }
         for body in stmt_bodies(s) {
-            collect_external_store_fields(body, out);
+            collect_external_store_fields(body, &env, symbols, options, out);
         }
     }
 }
@@ -351,7 +483,7 @@ fn all_methods(c: &ClassDef) -> impl Iterator<Item = &FunctionDef> {
 fn class_mutates(
     name: &str,
     classes: &BTreeMap<String, ClassDef>,
-    external_store_fields: &HashSet<String>,
+    external_stores: &HashSet<ExternalStore>,
     memo: &mut HashMap<String, bool>,
 ) -> bool {
     if let Some(&m) = memo.get(name) {
@@ -363,10 +495,12 @@ fn class_mutates(
         return false;
     };
     let own = has_mutating_method(c)
-        || own_field_names(c).iter().any(|f| external_store_fields.contains(f));
+        || own_field_names(c)
+            .iter()
+            .any(|f| external_stores.iter().any(|st| st.hits(name, f)));
     let inherited = c.bases.iter().any(|b| match b {
-        ExprType::Name(n) => class_mutates(&n.id, classes, external_store_fields, memo),
-        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_store_fields, memo),
+        ExprType::Name(n) => class_mutates(&n.id, classes, external_stores, memo),
+        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_stores, memo),
         _ => false,
     });
     let result = own || inherited;

@@ -17640,6 +17640,104 @@ fn a_shared_classs_truth_runs_through_the_reference() {
     );
 }
 
+/// An external store counts for the class its receiver names (an
+/// annotated parameter, a constructed local, an element of an annotated
+/// container), not for every class with that field name (Devin review on
+/// #321): `Gauge` and `Label` both have `value`; only `Gauge` is written
+/// from outside, so only `Gauge` shares.
+#[test]
+fn an_external_store_is_keyed_by_its_receivers_class() {
+    let out = compile(
+        concat!(
+            "class Gauge:\n",
+            "    def __init__(self):\n",
+            "        self.value = 0\n",
+            "\n",
+            "class Label:\n",
+            "    def __init__(self):\n",
+            "        self.value = 0\n",
+            "\n",
+            "class Panel:\n",
+            "    def __init__(self):\n",
+            "        self.gauges: list[Gauge] = []\n",
+            "        self.labels: list[Label] = []\n",
+            "\n",
+            "def set_gauge(g: Gauge, v: int) -> None:\n",
+            "    g.value = v\n",
+        ),
+        "keyed_store.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Gauge>>"),
+        "the class the store's receiver names shares: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<Label>"),
+        "a class with the same field name but no store of its own stays a value: {}",
+        out
+    );
+}
+
+/// `is` / `is not` on OPTIONAL shared references — and on a name narrowed
+/// by its guard — is identity of the one object, never the `==` a class
+/// defines (Devin review on #321).
+#[test]
+fn identity_on_optional_and_narrowed_shared_references_is_never_equality() {
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return False\n",
+            "\n",
+            "    def hit(self) -> None:\n",
+            "        self.hits += 1\n",
+            "\n",
+            "class Board:\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[Tag] = []\n",
+            "\n",
+            "    def find(self, name: str) -> Tag | None:\n",
+            "        for t in self.tags:\n",
+            "            if t.name == name:\n",
+            "                return t\n",
+            "        return None\n",
+            "\n",
+            "def same(a: Tag | None, b: Tag | None) -> bool:\n",
+            "    if a is b:\n",
+            "        return True\n",
+            "    if a is not None:\n",
+            "        return a is board_first()\n",
+            "    return a is not b\n",
+            "\n",
+            "def board_first() -> Tag:\n",
+            "    return Tag(\"a\")\n",
+        ),
+        "opt_identity.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("stdpython::py_is_opt(&a,&b)"),
+        "two optional shared references compare by identity: {}",
+        out
+    );
+    assert!(
+        flat.contains(".clone().unwrap()).py_is(&board_first()?)"),
+        "the narrowed name compares by identity: {}",
+        out
+    );
+    assert!(
+        !flat.contains("&a==&b") && !flat.contains("&a!=&b"),
+        "no identity test goes through PartialEq: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the

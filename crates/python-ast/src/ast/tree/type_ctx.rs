@@ -1426,7 +1426,12 @@ pub fn render_reused(
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
-    if let Some(root) = reuse_root_name(expr) {
+    // A field chain rooted at `self` can never be MOVED out of the
+    // method's receiver (`for t in self.tags` in a `&self` method —
+    // E0507), whatever `self`'s use count: it is reused by definition.
+    let self_field = matches!(expr, ExprType::Attribute(_))
+        && crate::ast::tree::attribute::chain_root_is_self(expr);
+    if let Some(root) = reuse_root_name(expr).or_else(|| self_field.then(|| "self".to_string())) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
         // A NARROWED name already reads as an owned value (the unwrap or
         // member conversion clones — name.rs), so the reuse-clone would
@@ -1436,7 +1441,7 @@ pub fn render_reused(
             && options.narrowed_names.get(&root).is_some_and(|t| {
                 !matches!(t, TypeInfo::StrOrBytes | TypeInfo::PyValue)
             });
-        if uses > 1 && !narrowed_owned {
+        if (uses > 1 || self_field) && !narrowed_owned {
             let t = infer_type(None, expr, &options, &symbols);
             // Round 92: clone whenever the name is not statically Copy —
             // INCLUDING an inferrer-unknown (PyObject) name, which the

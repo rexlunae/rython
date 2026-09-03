@@ -65,6 +65,40 @@ class Journal(Book):
     pass
 
 
+class Tag:
+    # Defines __eq__: `is` on references to it must stay identity.
+    def __init__(self, name: str):
+        self.name = name
+        self.hits = 0
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def hit(self) -> None:
+        self.hits += 1
+
+
+class Board:
+    def __init__(self):
+        self.tags: list[Tag] = [Tag("a"), Tag("b")]
+
+    def find(self, name: str) -> Tag | None:
+        for t in self.tags:
+            if t.name == name:
+                return t
+        return None
+
+
+def same(a: Tag | None, b: Tag | None) -> str:
+    if a is b:
+        return "same"
+    if a is not None and b is not None:
+        if a is b:
+            return "both"
+        return "distinct"
+    return "one"
+
+
 class Probe:
     # Truth with a side effect: every bool() counts, on the one object.
     def __init__(self):
@@ -121,6 +155,13 @@ def main() -> None:
     probes: list[Probe] = [Probe()]
     p = probes[0]
     print(bool(probes[0]), bool(p), probes[0].checks)
+    board = Board()
+    ta = board.find("a")
+    tb = board.find("b")
+    print(same(ta, board.find("a")), same(ta, tb), same(ta, board.find("zz")), same(None, None))
+    if ta is not None:
+        ta.hit()
+    print(board.tags[0].hits, ta is not board.tags[1])
     queues: list[Backlog] = [Backlog()]
     q = queues[0]
     print(q.drain(), len(queues[0].items))

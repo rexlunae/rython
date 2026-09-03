@@ -9,4 +9,6 @@ True True False False
 True False no
 True 1 yes
 False True 2
+same distinct one same
+1 True
 2 2

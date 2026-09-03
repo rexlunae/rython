@@ -3497,17 +3497,21 @@ pub(crate) fn expr_yields_option_ctx(
     // nest `Some(Option<Item>)`, round 97). The field-accessor arm above
     // covers OPTION FIELDS; this covers METHODS whose return annotation
     // is an Option.
+    // A METHOD CALL whose declared return is optional (`self.find(k)`,
+    // `board.find(k)` on a class-typed local — the corpus's ledger): the
+    // receiver's class resolves through the read path (`self` through
+    // the enclosing class), the method on its MRO, the annotation in the
+    // class's scope.
     if let ExprType::Call(call) = expr
         && let ExprType::Attribute(attr) = call.func.as_ref()
-        && matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
-        && let Some(class_name) = ctx.enclosing_class_name()
-        && let Some(crate::SymbolTableNode::ClassDef(owner)) = symbols.get(class_name)
+        && let Some((owner, owner_symbols)) =
+            crate::receiver_class(&attr.value, ctx, symbols, options)
         && owner
-            .method_on_mro(&attr.attr, symbols)
+            .method_on_mro(&attr.attr, &owner_symbols)
             .and_then(|m| m.returns.as_deref().cloned())
             .is_some_and(|r| {
                 matches!(
-                    crate::resolve_alias_typeinfo(&r, symbols, options),
+                    crate::resolve_alias_typeinfo(&r, &owner_symbols, options),
                     Some(crate::TypeInfo::Option(_))
                 )
             })
@@ -3962,7 +3966,10 @@ pub(crate) fn lower_optional_value(
         return Ok(quote!(if #test { #body } else { #orelse }));
     }
     if is_none_expr(expr) || expr_yields_option(expr, &options, &symbols) {
-        return expr.clone().to_rust(ctx, options, symbols);
+        // An Option-valued NAME read more than once takes the reuse-clone
+        // like any other non-Copy name (`same(ta, tb)` then `same(ta, ..)`
+        // — the corpus's ledger, an `Option<PyRef<Tag>>` local).
+        return crate::render_reused(expr, ctx, options, symbols);
     }
     // A NAME whose recorded type is itself an Option (`host =
     // _normalize_host(...)` where the callee returns `str | None` —
@@ -3984,7 +3991,7 @@ pub(crate) fn lower_optional_value(
             Some(crate::TypeInfo::Option(_))
         )
     {
-        return expr.clone().to_rust(ctx, options, symbols);
+        return crate::render_reused(expr, ctx, options, symbols);
     }
     // A FIELD read whose field is Option-typed (`ca_cert_dir=
     // self.ca_cert_dir` — urllib3's _ssl_wrap_socket call sites): the
