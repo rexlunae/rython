@@ -3394,9 +3394,25 @@ fn resolve_alias_named(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<TypeInfo> {
+    resolve_alias_named_in("", name, symbols, options)
+}
+
+/// `resolve_alias_named` for a hop into ANOTHER module's scope (a
+/// re-export followed into its defining module, a qualified
+/// `mod.Name`): the key is the module path plus the name, so two modules
+/// re-exporting the same name from each other re-enter the same key
+/// rather than rebuilding each other's symbols until the stack overflows
+/// (Devin review on #323). `scope` is the module path joined with dots,
+/// empty for the current scope.
+fn resolve_alias_named_in(
+    scope: &str,
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
     resolving(
         Resolving::Alias,
-        ResolveKey::Name(name.to_string()),
+        ResolveKey::Name(format!("{scope}::{name}")),
         || Some(TypeInfo::PyValue),
         || {
             resolve_alias_typeinfo(
@@ -3540,13 +3556,7 @@ fn resolve_alias_typeinfo_inner(
                     )
                 })
             {
-                return resolve_alias_typeinfo(
-                    &ExprType::Name(crate::ast::tree::name::Name {
-                        id: attr.attr.clone(),
-                    }),
-                    symbols,
-                    options,
-                );
+                return resolve_alias_named(&attr.attr, symbols, options);
             }
             // The module name may itself be an ALIAS (`from . import
             // _types as _t` registers `_t` → Alias("_types")): follow the
@@ -3617,14 +3627,7 @@ fn resolve_alias_typeinfo_inner(
             let module = options.module_defs.get(&path)?;
             let module: &crate::Module = module;
             let syms = module.clone().find_symbols(SymbolTableScopes::new());
-            let r = resolve_alias_typeinfo(
-                &ExprType::Name(crate::ast::tree::name::Name {
-                    id: attr.attr.clone(),
-                }),
-                &syms,
-                options,
-            );
-            r
+            resolve_alias_named_in(&path.join("."), &attr.attr, &syms, options)
         }
         // A STRING annotation (`Sequence["JsonType"]` — a forward
         // reference): resolve it as the name (requests/_types.py).
@@ -3732,13 +3735,7 @@ fn resolve_alias_typeinfo_inner(
                     // import ProxyConfig` — urllib3): follow the chain in
                     // the DEFINING module's scope.
                     Some(SymbolTableNode::ImportFrom(_)) | Some(SymbolTableNode::Alias(_)) => {
-                        resolve_alias_typeinfo(
-                            &ExprType::Name(crate::ast::tree::name::Name {
-                                id: n.id.clone(),
-                            }),
-                            &syms,
-                            options,
-                        )
+                        resolve_alias_named_in(&path.join("."), &n.id, &syms, options)
                     }
                     _ => None,
                 }

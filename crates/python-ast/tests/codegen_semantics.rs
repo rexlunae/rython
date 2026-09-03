@@ -18844,3 +18844,86 @@ fn a_self_referential_string_alias_does_not_overflow() {
     // Either outcome is acceptable; returning at all is the pin.
     let _ = result;
 }
+
+/// `except E as e` unbinds `e` on every way out of the handler (Python's
+/// implicit `del e`), so a read after the handler is loud (Devin review
+/// on #323).
+#[test]
+fn an_except_as_name_is_unbound_after_its_handler() {
+    let err = compile_err(
+        concat!(
+            "def f() -> None:\n",
+            "    e = 1\n",
+            "    del e\n",
+            "    try:\n",
+            "        raise ValueError(\"x\")\n",
+            "    except ValueError as e:\n",
+            "        pass\n",
+            "    print(e)\n",
+        ),
+        "del_except_after.py",
+    );
+    assert!(err.contains("del e"), "error: {}", err);
+}
+
+/// A `for` target is bound only when the loop body runs: after `del x`,
+/// a loop over an empty iterable leaves `x` unbound (Devin review on
+/// #323).
+#[test]
+fn an_empty_loop_does_not_rebind_a_deleted_target() {
+    let err = compile_err(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    for x in xs:\n",
+            "        pass\n",
+            "    return x\n",
+        ),
+        "del_empty_loop.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    // Inside the body the target is bound.
+    let out = compile(
+        concat!(
+            "def g(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    t = 0\n",
+            "    for x in xs:\n",
+            "        t = t + x\n",
+            "    return t\n",
+        ),
+        "del_loop_body.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// Two modules re-exporting the same annotation name from each other are
+/// a cycle the name-keyed guard cuts (a boxed or loud result), not a
+/// stack overflow (Devin review on #323).
+#[test]
+fn a_cross_module_re_export_cycle_does_not_overflow() {
+    let a = parse(
+        concat!(
+            "from b import T\n",
+            "\n",
+            "def f(x: T) -> int:\n",
+            "    return 1\n",
+        ),
+        "a.py",
+    )
+    .unwrap();
+    let b = parse("from a import T\n", "b.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["a".to_string()], std::rc::Rc::new(a.clone()));
+    defs.insert(vec!["b".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let symbols = a.clone().find_symbols(SymbolTableScopes::new());
+    // Either outcome is acceptable; returning at all is the pin.
+    let _ = a.to_rust(CodeGenContext::Module("a".to_string()), options, symbols);
+}

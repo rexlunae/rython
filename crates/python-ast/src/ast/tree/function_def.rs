@@ -3047,10 +3047,15 @@ fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedP
             }
             _ => {}
         }
-        // A store rebinds the name: an assignment / aug-assign / loop /
-        // `with ... as` target, an import.
-        for target in stmt_targets(stmt) {
-            deleted.retain(|name| !visit::target_binds(target, name));
+        // A store rebinds the name: an assignment / aug-assign / `with
+        // ... as` target, an import. A `for` target is bound only when
+        // the loop body runs: the loop arm below rebinds it on the
+        // body-entry state, not on the zero-iteration path.
+        let is_for = matches!(stmt.statement, StatementType::For(_) | StatementType::AsyncFor(_));
+        if !is_for {
+            for target in stmt_targets(stmt) {
+                deleted.retain(|name| !visit::target_binds(target, name));
+            }
         }
         match &stmt.statement {
             StatementType::Import(i) => {
@@ -3106,12 +3111,16 @@ fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedP
             StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => {
                 let bodies = visit::stmt_bodies(stmt);
                 let (loop_body, orelse) = (bodies[0], bodies[1]);
-                // Zero iterations keep the incoming state; a later
-                // iteration re-enters the body from the merged state (a
-                // fall-through or a `continue`) with the loop target
-                // rebound.
-                let first = scan_deleted_paths(loop_body, &deleted)?;
-                let mut again = deleted.clone();
+                // Zero iterations keep the incoming state (a `for`
+                // target stays unbound); an iteration enters the body
+                // with the target rebound, and a later one re-enters it
+                // from the merged state (a fall-through or a `continue`).
+                let mut entering = deleted.clone();
+                for target in stmt_targets(stmt) {
+                    entering.retain(|name| !visit::target_binds(target, name));
+                }
+                let first = scan_deleted_paths(loop_body, &entering)?;
+                let mut again = entering.clone();
                 if let Some(falls) = &first.falls {
                     again.extend(falls.iter().cloned());
                 }
@@ -3164,12 +3173,25 @@ fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedP
                 let mut reached = at_handler.clone();
                 let mut exits: Vec<Option<Deleted>> = Vec::new();
                 for handler in &t.handlers {
+                    // `except E as e` binds `e` for the handler's body
+                    // and UNBINDS it on every way out of the handler
+                    // (Python's implicit `del e`), so a later read of
+                    // `e` is Python's NameError.
                     let mut entry = at_handler.clone();
                     if let Some(name) = &handler.name {
                         entry.remove(name);
                     }
-                    let handled = scan_deleted_paths(&handler.body, &entry)?;
+                    let mut handled = scan_deleted_paths(&handler.body, &entry)?;
                     reached.extend(handled.anywhere.iter().cloned());
+                    if let Some(name) = &handler.name {
+                        if let Some(falls) = &mut handled.falls {
+                            falls.insert(name.clone());
+                        }
+                        for state in handled.breaks.iter_mut().chain(handled.continues.iter_mut()) {
+                            state.insert(name.clone());
+                        }
+                        reached.insert(name.clone());
+                    }
                     exits.push(out.absorb(handled));
                 }
                 if let Some(falls) = &body_falls {
