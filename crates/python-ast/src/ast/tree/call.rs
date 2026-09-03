@@ -1724,6 +1724,17 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if let ExprType::Attribute(a) = self.func.as_ref() {
+            if a.attr == "area" {
+                let rc = match a.value.as_ref() {
+                    crate::ExprType::Name(n) => {
+                        format!("Name({}) name_types={:?} ctx={:?}", n.id, options.name_types.get(&n.id), std::mem::discriminant(&ctx))
+                    }
+                    _ => "other".to_string(),
+                };
+                eprintln!("R99CALLAREA {}", rc);
+            }
+        }
         // typing-module calls are compile-time-only: TypeVar, Protocol,
         // TypeAlias, runtime_checkable, Literal, ... exist only for
         // the type system (annotations are strings under `from __future__
@@ -1860,8 +1871,31 @@ impl<'a> CodeGen for Call {
             ExprType::Attribute(attr) => {
                 let root = crate::ast::tree::call::root_name(&attr.value);
                 match root {
+                    // A USER METHOD is fallible by construction (every
+                    // generated method returns Result<_, PyException>): the
+                    // receiver's class resolves (direct, unwrap-chain, or a
+                    // fetch call — the shared helper) and the method exists
+                    // on its MRO. This is the fallibility rule as a
+                    // property of the EXPRESSION (the review's fix 2), not
+                    // of the context — the generic path renders lambdas,
+                    // comprehension elements, and print arguments, and
+                    // every one of them must propagate the same way the
+                    // resolved arm does (round 99, shapes).
                     Some(root) if !crate::is_stdpython_module(&root) => {
-                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols, &options)
+                        if crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value, &symbols, &options,
+                        ) {
+                            true
+                        } else {
+                            crate::TypeInfo::enum_receiver_class(&attr.value, &options, &symbols)
+                                .and_then(|c| {
+                                    crate::resolve_class_referenced(&c, &symbols, &options)
+                                })
+                                .and_then(|class| {
+                                    class.method_on_mro(&attr.attr, &symbols)
+                                })
+                                .is_some()
+                        }
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
                         FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
@@ -2274,15 +2308,37 @@ impl<'a> CodeGen for Call {
                         let render = |e: crate::ExprType| {
                             e.to_rust(ctx.clone(), options.clone(), symbols.clone())
                         };
+                        // A FALLIBLE key (the rendered key carries a `?` —
+                        // a user-method call, round 99): the key lambda is
+                        // a RETURNING closure (`|s| Ok(key(s)?)`) and the
+                        // runtime variant propagates the key's error.
+                        let key_fallible = |k: &proc_macro2::TokenStream| {
+                            k.to_string().contains(" ? ") || k.to_string().ends_with(" ?")
+                                || k.to_string().contains(" ? ")
+                        };
                         return Ok(match (key, default) {
                             (None, None) => {
                                 let f = format_ident!("{}", bname);
                                 quote!(#f(&(#a))?)
                             }
                             (Some(k), None) => {
-                                let k = render(k)?;
-                                let f = format_ident!("{}_key", bname);
-                                quote!(#f(&(#a), #k)?)
+                                // A FALLIBLE key body (the rendered `?` — a
+                                // user-method call, round 99): the key
+                                // lambda is a RETURNING closure
+                                // (`|s| Ok(body?)`) and the runtime variant
+                                // propagates the key's error.
+                                let k_tokens = render(k.clone())?;
+                                if key_fallible(&k_tokens) {
+                                    let fallible = format_ident!("{}_key_fallible", bname);
+                                    let key_lambda = match k {
+                                        crate::ExprType::Lambda(ref l) => fallible_key_lambda(l, &ctx, &options, &symbols),
+                                        _ => quote!(| __rython_k | Ok(#k_tokens)),
+                                    };
+                                    quote!(#fallible(&(#a), #key_lambda)?)
+                                } else {
+                                    let f = format_ident!("{}_key", bname);
+                                    quote!(#f(&(#a), #k_tokens)?)
+                                }
                             }
                             (None, Some(d)) => {
                                 let d = render(d)?;
@@ -2340,8 +2396,20 @@ impl<'a> CodeGen for Call {
                             }
                             (None, None) => quote!(sorted(&(#a))),
                             (Some(k), None) => {
-                                let k = render(k)?;
-                                quote!(sorted_key(&(#a), #k))
+                                let k_tokens = render(k.clone())?;
+                                // A fallible key (a `?` in the rendered
+                                // body — a user-method call, round 99): the
+                                // lambda is a returning closure and the
+                                // runtime propagates the key's error.
+                                if k_tokens.to_string().contains(" ? ") {
+                                    let key_lambda = match k {
+                                        crate::ExprType::Lambda(ref l) => fallible_key_lambda(l, &ctx, &options, &symbols),
+                                        _ => quote!(| __rython_k | Ok(#k_tokens)),
+                                    };
+                                    quote!(sorted_key_fallible(&(#a), #key_lambda)?)
+                                } else {
+                                    quote!(sorted_key(&(#a), #k_tokens))
+                                }
                             }
                             (None, Some(r)) => {
                                 let r = render(r)?;
@@ -7984,6 +8052,9 @@ impl<'a> CodeGen for Call {
 
         // Check if we're in an async context and if the function being called is async
         let call_expr = quote!(#name(#(#all_args),*));
+        if call_expr.to_string().contains("area") {
+            eprintln!("R99GENERIC area: {}", &call_expr.to_string()[..100.min(call_expr.to_string().len())]);
+        }
 
         // Check if this function returns a Result that should be unwrapped
         let name_str = format!("{}", name);
@@ -9636,6 +9707,27 @@ fn call_returns_option(
                 .is_some_and(return_is_option)
         }
         _ => false,
+    }
+}
+
+fn fallible_key_lambda(
+    lambda: &crate::Lambda,
+    ctx: &crate::CodeGenContext,
+    options: &crate::PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> proc_macro2::TokenStream {
+    let names: Vec<_> = lambda
+        .args
+        .posonlyargs
+        .iter()
+        .chain(lambda.args.args.iter())
+        .chain(lambda.args.kwonlyargs.iter())
+        .map(|p| crate::safe_ident(&p.arg))
+        .collect();
+    let body = lambda.body.clone().to_rust(ctx.clone(), options.clone(), symbols.clone());
+    match body {
+        Ok(body) => quote!(|#(#names),*| Ok(#body)),
+        Err(_) => quote!(()),
     }
 }
 

@@ -192,6 +192,47 @@ impl TypeInfo {
 
     /// Render the Rust type name, for typed empty containers
     /// (`Vec::<f64>::new()`, `PyDict::<String, i64>::from([])`).
+    /// The class a receiver's hierarchy dispatches for: the direct
+    /// inferred type (`Class`, or `Option<Class>` — the unwrap chain holds
+    /// the inner), a CALL's return (`find(...) -> Item | None` through the
+    /// alias-aware resolver), or the ROOT name's recorded type. None when
+    /// the receiver is concrete or unknown (round 99).
+    pub fn enum_receiver_class(
+        receiver: &ExprType,
+        options: &crate::PythonOptions,
+        symbols: &crate::SymbolTableScopes,
+    ) -> Option<String> {
+        match crate::infer_type(None, receiver, options, symbols) {
+            TypeInfo::Class(c) => return Some(c),
+            TypeInfo::Option(inner) => {
+                if let TypeInfo::Class(c) = &*inner {
+                    return Some(c.clone());
+                }
+            }
+            _ => {}
+        }
+        if let ExprType::Call(call) = receiver {
+            match crate::call_return_typeinfo(call, Some(symbols), Some(options)) {
+                Some(TypeInfo::Class(c)) => return Some(c),
+                Some(TypeInfo::Option(inner)) => {
+                    if let TypeInfo::Class(c) = &*inner {
+                        return Some(c.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let root = crate::ast::tree::type_ctx::reuse_root_name(receiver)?;
+        match options.name_types.get(&root) {
+            Some(TypeInfo::Class(c)) => Some(c.clone()),
+            Some(TypeInfo::Option(inner)) => match &**inner {
+                TypeInfo::Class(c) => Some(c.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn to_rust_type(&self) -> TokenStream {
         match self {
             TypeInfo::Int => quote!(i64),
@@ -3786,7 +3827,20 @@ fn seed_comprehension_targets(
 fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
     match target {
         ExprType::Name(n) => {
-            info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
+            // A KNOWN class beats the unknown marker: the analysis's other
+            // writers (the lambda-param boxing, the boxed fallback) record
+            // PyObject for names whose iterable element the class table
+            // resolves exactly (round 99).
+            let known = matches!(ty, TypeInfo::Class(_))
+                && matches!(
+                    info.name_types.get(&n.id),
+                    Some(TypeInfo::PyObject) | None
+                );
+            if known {
+                info.name_types.insert(n.id.clone(), ty.clone());
+            } else {
+                info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
+            }
         }
         ExprType::Tuple(t) => {
             if let TypeInfo::Tuple(ts) = ty {

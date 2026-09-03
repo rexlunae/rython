@@ -526,6 +526,44 @@ pub fn min_key<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
 }
 
 /// Python max(iterable, key=f); see min_key.
+/// Python `max(iterable, key=f)` where the key is FALLIBLE (a user
+/// method returning Result — `max(shapes, key=lambda s: s.area())` with
+/// `Shape.area` raising): the key's error propagates as the result's
+/// error, exactly like CPython's exception out of the key call.
+pub fn max_key_fallible<T: Clone, K: PartialOrd, F: FnMut(&T) -> Result<K, PyException>>(
+    iterable: &[T],
+    mut key: F,
+) -> Result<T, PyException> {
+    let mut best: Option<(K, T)> = None;
+    for x in iterable {
+        let k = key(x)?;
+        match &best {
+            None => best = Some((k, x.clone())),
+            Some((bk, _)) => {
+                if k.partial_cmp(bk) == Some(core::cmp::Ordering::Greater) {
+                    best = Some((k, x.clone()));
+                }
+            }
+        }
+    }
+    best.map(|(_, x)| x)
+        .ok_or_else(|| PyException::new("ValueError", "max() arg is an empty sequence"))
+}
+
+/// Python `sorted(iterable, key=f)` with a FALLIBLE key: stable by the
+/// key, the key's error propagating (round 99, shapes).
+pub fn sorted_key_fallible<T: Clone, K: PartialOrd, F: FnMut(&T) -> Result<K, PyException>>(
+    iterable: &[T],
+    mut key: F,
+) -> Result<Vec<T>, PyException> {
+    let mut decorated: Vec<(K, T)> = iterable
+        .iter()
+        .map(|x| Ok((key(x)?, x.clone())))
+        .collect::<Result<Vec<_>, PyException>>()?;
+    decorated.sort_by(|a, b| py_sort_cmp(&a.0, &b.0));
+    Ok(decorated.into_iter().map(|(_, x)| x).collect())
+}
+
 pub fn max_key<T: Clone, K: PartialOrd, F: FnMut(&T) -> K>(
     iterable: &[T],
     mut key: F,
