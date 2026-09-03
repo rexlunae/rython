@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::ast::tree::visit::{is_self, stmt_bodies, stmt_exprs, subexprs};
 use crate::{ClassDef, CodeGen, ExprType, FunctionDef, PythonOptions, Statement, StatementType, SymbolTableScopes, TypeInfo};
 
 thread_local! {
@@ -210,114 +211,6 @@ fn collect_container_elements(
     }
 }
 
-/// The direct subexpressions of an expression: one enumeration for every
-/// walk in this module, so a call nested anywhere (`x = 1 + self.q.pop()`,
-/// `if self.items.pop():`) is seen. A comprehension's and a lambda's body
-/// are included (they run in the method).
-fn subexprs(e: &ExprType) -> Vec<&ExprType> {
-    match e {
-        ExprType::BoolOp(b) => b.values.iter().collect(),
-        ExprType::NamedExpr(n) => vec![&n.left, &n.right],
-        ExprType::BinOp(b) => vec![&b.left, &b.right],
-        ExprType::UnaryOp(u) => vec![&u.operand],
-        ExprType::Lambda(l) => vec![&l.body],
-        ExprType::IfExp(i) => vec![&i.test, &i.body, &i.orelse],
-        ExprType::Dict(d) => d.keys.iter().flatten().chain(d.values.iter()).collect(),
-        ExprType::Set(s) => s.elts.iter().collect(),
-        ExprType::ListComp(c) => std::iter::once(c.elt.as_ref())
-            .chain(c.generators.iter().flat_map(|g| {
-                std::iter::once(&g.iter).chain(g.ifs.iter())
-            }))
-            .collect(),
-        ExprType::SetComp(c) => std::iter::once(c.elt.as_ref())
-            .chain(c.generators.iter().flat_map(|g| {
-                std::iter::once(&g.iter).chain(g.ifs.iter())
-            }))
-            .collect(),
-        ExprType::GeneratorExp(c) => std::iter::once(c.elt.as_ref())
-            .chain(c.generators.iter().flat_map(|g| {
-                std::iter::once(&g.iter).chain(g.ifs.iter())
-            }))
-            .collect(),
-        ExprType::DictComp(c) => [c.key.as_ref(), c.value.as_ref()]
-            .into_iter()
-            .chain(c.generators.iter().flat_map(|g| {
-                std::iter::once(&g.iter).chain(g.ifs.iter())
-            }))
-            .collect(),
-        ExprType::Await(a) => vec![&a.value],
-        ExprType::Yield(y) => y.value.iter().map(|v| v.as_ref()).collect(),
-        ExprType::YieldFrom(y) => vec![&y.value],
-        ExprType::Compare(c) => std::iter::once(c.left.as_ref()).chain(c.comparators.iter()).collect(),
-        ExprType::Call(c) => std::iter::once(c.func.as_ref())
-            .chain(c.args.iter())
-            .chain(c.keywords.iter().map(|k| &k.value))
-            .collect(),
-        ExprType::FormattedValue(f) => vec![&f.value],
-        ExprType::JoinedStr(j) => j.values.iter().collect(),
-        ExprType::Attribute(a) => vec![&a.value],
-        ExprType::Subscript(s) => {
-            let mut out = vec![s.value.as_ref()];
-            match &s.kind {
-                crate::SubscriptKind::Index(i) => out.push(i),
-                crate::SubscriptKind::Slice { lower, upper, step } => {
-                    out.extend(lower.iter().chain(upper.iter()).chain(step.iter()).map(|b| b.as_ref()));
-                }
-            }
-            out
-        }
-        ExprType::Starred(st) => vec![&st.value],
-        ExprType::List(l) => l.iter().collect(),
-        ExprType::Tuple(t) => t.elts.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The expressions a statement evaluates itself (its bodies aside): the
-/// test of an `if` / `while`, the iterable of a `for`, a `with` item's
-/// context, an assert, a raise, a return, an expression statement, a
-/// store's value — so a mutation in any of them is a mutation.
-fn stmt_exprs(s: &Statement) -> Vec<&ExprType> {
-    match &s.statement {
-        StatementType::Assign(a) => vec![&a.value],
-        StatementType::AugAssign(a) => vec![&a.value],
-        StatementType::Expr(e) => vec![&e.value],
-        StatementType::Return(Some(e)) => vec![&e.value],
-        StatementType::If(i) => vec![&i.test],
-        StatementType::While(w) => vec![&w.test],
-        StatementType::For(f) => vec![&f.iter],
-        StatementType::AsyncFor(f) => vec![&f.iter],
-        StatementType::With(w) => w.items.iter().map(|i| &i.context_expr).collect(),
-        StatementType::AsyncWith(w) => w.items.iter().map(|i| &i.context_expr).collect(),
-        StatementType::Assert { test, msg } => {
-            std::iter::once(test.as_ref()).chain(msg.iter().map(|m| m.as_ref())).collect()
-        }
-        StatementType::Raise(r) => r.exc.iter().chain(r.cause.iter()).collect(),
-        StatementType::Delete(targets) => targets.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The nested statement bodies of a statement, every control-flow form
-/// (the asynchronous ones included).
-fn stmt_bodies(s: &Statement) -> Vec<&[Statement]> {
-    match &s.statement {
-        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => vec![&f.body],
-        StatementType::ClassDef(c) => vec![&c.body],
-        StatementType::If(i) => vec![&i.body, &i.orelse],
-        StatementType::For(f) => vec![&f.body, &f.orelse],
-        StatementType::AsyncFor(f) => vec![&f.body, &f.orelse],
-        StatementType::While(w) => vec![&w.body, &w.orelse],
-        StatementType::With(w) => vec![&w.body],
-        StatementType::AsyncWith(w) => vec![&w.body],
-        StatementType::Try(t) => std::iter::once(t.body.as_slice())
-            .chain(t.handlers.iter().map(|h| h.body.as_slice()))
-            .chain([t.orelse.as_slice(), t.finalbody.as_slice()])
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// A store through a NON-`self` receiver (`acct.balance = 1`,
 /// `item.qty -= qty`): the field, with the receiver's class when the
 /// scope names it — an annotated parameter, a local constructed from a
@@ -389,7 +282,7 @@ fn collect_external_store_fields(
     fn target(t: &ExprType, env: &Env, out: &mut HashSet<ExternalStore>) {
         match t {
             ExprType::Attribute(a) => {
-                if !matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                if !is_self(a.value.as_ref()) {
                     out.insert(ExternalStore {
                         field: a.attr.clone(),
                         receiver_class: env.class_of(&a.value),
@@ -445,7 +338,7 @@ fn collect_external_store_fields(
             && let ExprType::Attribute(method) = c.func.as_ref()
             && crate::ast::tree::scope::mutates_receiver(&method.attr)
             && let ExprType::Attribute(field) = method.value.as_ref()
-            && !matches!(field.value.as_ref(), ExprType::Name(n) if n.id == "self")
+            && !is_self(field.value.as_ref())
         {
             out.insert(ExternalStore {
                 field: field.attr.clone(),
@@ -591,9 +484,6 @@ fn has_mutating_method(c: &ClassDef) -> bool {
 /// Whether `stmts` mutate `self` (see `has_mutating_method`); collects the
 /// stored field names and the `self.<method>()` callees on the way.
 fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut Vec<String>) -> bool {
-    fn is_self(e: &ExprType) -> bool {
-        matches!(e, ExprType::Name(n) if n.id == "self")
-    }
     fn self_field(t: &ExprType) -> Option<String> {
         match t {
             ExprType::Attribute(a) if is_self(&a.value) => Some(a.attr.clone()),

@@ -1,0 +1,3 @@
+exhausted ['while-else', 'finally']
+exhausted ['while-else', 'finally', 'while-else', 'else:7', 'finally']
+[0, 1, 2, 3]

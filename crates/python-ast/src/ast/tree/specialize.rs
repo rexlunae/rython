@@ -43,6 +43,9 @@
 use std::collections::HashMap;
 
 use crate::ast::tree::statement::Statement;
+use crate::ast::tree::visit::{
+    self, def_owns_name, opens_scope, stmt_all_exprs, walk_stmts, Descend, Flow,
+};
 use crate::ast::tree::StatementType;
 use crate::{ExprType, SymbolTableNode, SymbolTableScopes};
 
@@ -458,7 +461,11 @@ pub fn detect_specializable(
 }
 
 /// Walk statements collecting plain `if isinstance(p, T):` tests (in
-/// order) and stray isinstance-of-parameter uses anywhere else.
+/// order, from every body of the function's own scope — under a loop, a
+/// `try`, a `with`) and stray isinstance-of-parameter uses anywhere else.
+/// A nested `def` / `class` is its own scope the folding never enters, so
+/// an isinstance-of-parameter use inside one is stray — when it names
+/// OUR parameter (see `stray_in_nested_scope`).
 fn collect_isinstance_tests(
     body: &[Statement],
     unannotated: &[(usize, String)],
@@ -466,75 +473,79 @@ fn collect_isinstance_tests(
     stray: &mut Vec<String>,
 ) {
     let is_param = |name: &str| unannotated.iter().any(|(_, p)| p == name);
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::If(s) => {
-                if let Some((arg, target)) = isinstance_parts(&s.test) {
-                    if is_param(arg) {
-                        tests.push((arg.to_string(), target.to_string()));
-                    }
-                } else {
-                    isinstance_args_in_expr(&s.test, stray);
-                }
-                collect_isinstance_tests(&s.body, unannotated, tests, stray);
-                collect_isinstance_tests(&s.orelse, unannotated, tests, stray);
-            }
-            other => visit_statement_exprs(other, &mut |e| {
-                isinstance_args_in_expr(e, stray)
-            }),
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if opens_scope(stmt) {
+            stray_in_nested_scope(stmt, unannotated, stray);
+            return Flow::Continue;
         }
-    }
+        if let StatementType::If(s) = &stmt.statement {
+            if let Some((arg, target)) = isinstance_parts(&s.test) {
+                if is_param(arg) {
+                    tests.push((arg.to_string(), target.to_string()));
+                }
+            } else {
+                isinstance_args_in_expr(&s.test, stray);
+            }
+        } else {
+            for e in stmt_all_exprs(stmt) {
+                isinstance_args_in_expr(e, stray);
+            }
+        }
+        Flow::Continue
+    });
 }
 
-/// Visit the expressions directly held by a statement (shallow — nested
-/// statement bodies are walked by the caller where needed; for stray
-/// detection a full walk of non-If statements suffices via their nested
-/// statements' own visits).
-fn visit_statement_exprs(stmt: &StatementType, f: &mut impl FnMut(&ExprType)) {
-    match stmt {
-        StatementType::Expr(e) => f(&e.value),
-        StatementType::Return(Some(r)) => f(&r.value),
-        StatementType::Assign(a) => {
-            f(&a.value);
-            for t in &a.targets {
-                f(t);
-            }
-        }
-        StatementType::AugAssign(a) => {
-            f(&a.target);
-            f(&a.value);
-        }
-        StatementType::While(s) => {
-            f(&s.test);
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                visit_statement_exprs(&b.statement, f);
-            }
-        }
-        StatementType::For(s) => {
-            f(&s.iter);
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                visit_statement_exprs(&b.statement, f);
-            }
-        }
-        StatementType::With(s) => {
-            for b in &s.body {
-                visit_statement_exprs(&b.statement, f);
-            }
-        }
-        StatementType::Try(t) => {
-            for b in t
-                .body
+/// The isinstance uses in `exprs` that name one of the `free` parameters.
+fn push_free_strays(exprs: Vec<&ExprType>, free: &[(usize, String)], stray: &mut Vec<String>) {
+    let mut found = Vec::new();
+    for e in exprs {
+        isinstance_args_in_expr(e, &mut found);
+    }
+    stray.extend(found.into_iter().filter(|a| free.iter().any(|(_, p)| p == a)));
+}
+
+/// The stray isinstance-of-parameter uses inside a nested scope that
+/// still name the OUTER function's parameters: a nested def's header
+/// (decorators, defaults, and annotations run in the enclosing scope)
+/// and, in its body, every parameter the def does not bind itself — a
+/// same-named parameter, local, or `global` of the nested def is its
+/// own, and an isinstance on it must not disable the outer
+/// specialization (Devin review on #323).
+/// A class body runs in place; its methods are nested defs under the
+/// same rule.
+fn stray_in_nested_scope(stmt: &Statement, free: &[(usize, String)], stray: &mut Vec<String>) {
+    match &stmt.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+            // The header (decorators, defaults, annotations) runs in the
+            // enclosing scope: the visitor's own enumeration of it.
+            push_free_strays(visit::stmt_exprs(stmt), free, stray);
+            let inner_free: Vec<(usize, String)> = free
                 .iter()
-                .chain(t.orelse.iter())
-                .chain(t.finalbody.iter())
-            {
-                visit_statement_exprs(&b.statement, f);
+                .filter(|(_, p)| !def_owns_name(f, p))
+                .cloned()
+                .collect();
+            if inner_free.is_empty() {
+                return;
             }
-            for h in &t.handlers {
-                for b in &h.body {
-                    visit_statement_exprs(&b.statement, f);
+            walk_stmts(&f.body, Descend::SkipDefs, &mut |s| {
+                if opens_scope(s) {
+                    stray_in_nested_scope(s, &inner_free, stray);
+                } else {
+                    push_free_strays(stmt_all_exprs(s), &inner_free, stray);
                 }
-            }
+                Flow::Continue
+            });
+        }
+        StatementType::ClassDef(c) => {
+            push_free_strays(visit::stmt_exprs(stmt), free, stray);
+            walk_stmts(&c.body, Descend::SkipDefs, &mut |s| {
+                if opens_scope(s) {
+                    stray_in_nested_scope(s, free, stray);
+                } else {
+                    push_free_strays(stmt_all_exprs(s), free, stray);
+                }
+                Flow::Continue
+            });
         }
         _ => {}
     }
@@ -913,33 +924,12 @@ fn variant_expr_type(
 /// Every value-carrying `return` expression in the body (nested statement
 /// bodies included; nested function definitions excluded).
 pub(crate) fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Return(Some(r)) => out.push(r.value.clone()),
-            StatementType::If(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_return_exprs(&s.body, out),
-            StatementType::Try(t) => {
-                collect_return_exprs(&t.body, out);
-                collect_return_exprs(&t.orelse, out);
-                collect_return_exprs(&t.finalbody, out);
-                for h in &t.handlers {
-                    collect_return_exprs(&h.body, out);
-                }
-            }
-            _ => {}
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(Some(r)) = &stmt.statement {
+            out.push(r.value.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Underscore-prefix parameters a folded variant/residual body no longer
@@ -965,49 +955,31 @@ fn collect_stmt_names(
     body: &[Statement],
     out: &mut std::collections::HashSet<String>,
 ) -> bool {
-    for stmt in body {
-        let ok = match &stmt.statement {
-            StatementType::Expr(e) => collect_expr_names(&e.value, out),
-            StatementType::Return(Some(r)) => collect_expr_names(&r.value, out),
-            StatementType::Return(None)
-            | StatementType::Pass
-            | StatementType::Break
-            | StatementType::Continue => true,
-            StatementType::Assign(a) => {
-                a.targets.iter().all(|t| collect_expr_names(t, out))
-                    && collect_expr_names(&a.value, out)
-            }
-            StatementType::AugAssign(a) => {
-                collect_expr_names(&a.target, out) && collect_expr_names(&a.value, out)
-            }
-            StatementType::AnnotatedName { .. } => true,
-            StatementType::If(s) => {
-                collect_expr_names(&s.test, out)
-                    && collect_stmt_names(&s.body, out)
-                    && collect_stmt_names(&s.orelse, out)
-            }
-            StatementType::While(s) => {
-                collect_expr_names(&s.test, out)
-                    && collect_stmt_names(&s.body, out)
-                    && collect_stmt_names(&s.orelse, out)
-            }
-            StatementType::For(s) => {
-                collect_expr_names(&s.target, out)
-                    && collect_expr_names(&s.iter, out)
-                    && collect_stmt_names(&s.body, out)
-                    && collect_stmt_names(&s.orelse, out)
-            }
-            StatementType::Raise(r) => {
-                r.exc.as_ref().map_or(true, |e| collect_expr_names(e, out))
-                    && r.cause.as_ref().map_or(true, |e| collect_expr_names(e, out))
-            }
-            _ => false,
+    walk_stmts(body, Descend::All, &mut |stmt| {
+        let modeled = match &stmt.statement {
+            // A handler mentions its exception class and binds its `as`
+            // name.
+            StatementType::Try(t) => t.handlers.iter().all(|h| {
+                if let Some(n) = &h.name {
+                    out.insert(n.clone());
+                }
+                h.exception_type.as_ref().map_or(true, |e| collect_expr_names(e, out))
+            }),
+            // A nested definition's decorators, defaults, annotations and
+            // bases are not among the visitor's expressions: unmodeled.
+            StatementType::FunctionDef(_)
+            | StatementType::AsyncFunctionDef(_)
+            | StatementType::ClassDef(_) => false,
+            // Every other form's mentions are the expressions it
+            // evaluates or binds.
+            _ => true,
         };
-        if !ok {
-            return false;
+        if modeled && stmt_all_exprs(stmt).into_iter().all(|e| collect_expr_names(e, out)) {
+            Flow::Continue
+        } else {
+            Flow::Stop
         }
-    }
-    true
+    })
 }
 
 /// Collect every Name in the expression; false on an unmodeled variant.

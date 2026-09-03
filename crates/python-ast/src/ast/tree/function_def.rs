@@ -4,6 +4,9 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 use crate::ast::tree::statement::PyStatementTrait;
+use crate::ast::tree::visit::{
+    self, Descend, Flow, any_expr_in, stmt_all_exprs, stmt_targets, walk_stmts,
+};
 
 use crate::{
     CodeGen, CodeGenContext, ExprType, Object, ParameterList, PythonOptions, Statement,
@@ -551,13 +554,6 @@ impl CodeGen for FunctionDef {
         options: Self::Options,
         symbols: SymbolTableScopes,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        thread_local! {
-            static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let depth = FN_DEPTH.with(|d| d.get());
-        if depth > 50 && depth % 10 == 0 {
-        }
-        FN_DEPTH.with(|d| d.set(depth + 1));
         // A module function registered for isinstance specialization
         // (specialize.rs) renders as its variants + residual instead of
         // one generic definition. Methods and nested defs never register.
@@ -570,7 +566,6 @@ impl CodeGen for FunctionDef {
         } else {
             self.to_rust_inner(ctx, options, symbols)
         };
-        FN_DEPTH.with(|d| d.set(depth));
         return result;
     }
 }
@@ -2129,6 +2124,21 @@ impl FunctionDef {
                 _ => false,
             }
         );
+        // A `yield` used as a VALUE (`x = yield v`, `(yield v) or 1`) is
+        // the generator's send channel; the list lowering has no such
+        // channel, and `push(v)` in its place would evaluate to unit —
+        // silently a different program. Refuse.
+        if let Some(stmt) = expression_position_yield(&effective_body) {
+            return Err(format!(
+                "`yield` used as a value (`x = yield v`, `(yield v) or d`) in `{}` at line {}: \
+                 rython lowers a generator to build-and-return-a-list, which has no send \
+                 channel, so the expression would silently evaluate to (). Put the yield on \
+                 its own statement, or rewrite the generator to build and return a list.",
+                self.name,
+                stmt.lineno.unwrap_or(0)
+            )
+            .into());
+        }
         let gen_elt = if crate::body_has_yields(&effective_body)
             // An abstract generator STUB (`def stream(...) ->
             // typing.Iterator[bytes]: raise NotImplementedError()` —
@@ -2710,41 +2720,14 @@ impl FunctionDef {
 
 /// Collect every `return` statement's value (None for a bare `return`)
 /// from a statement list, recursing into nested control-flow bodies but not
-/// into nested function or class definitions.
+/// into nested function or class definitions (their own return scopes).
 fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>>) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Return(value) => {
-                out.push(value.as_ref().map(|e| &e.value));
-            }
-            StatementType::If(s) => {
-                collect_returns(&s.body, out);
-                collect_returns(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_returns(&s.body, out);
-                collect_returns(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_returns(&s.body, out);
-                collect_returns(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_returns(&s.body, out),
-            StatementType::AsyncWith(s) => collect_returns(&s.body, out),
-            StatementType::AsyncFor(s) => collect_returns(&s.body, out),
-            StatementType::Try(s) => {
-                collect_returns(&s.body, out);
-                for handler in &s.handlers {
-                    collect_returns(&handler.body, out);
-                }
-                collect_returns(&s.orelse, out);
-                collect_returns(&s.finalbody, out);
-            }
-            // Nested defs/classes have their own return scopes; everything
-            // else contains no return statements we care about.
-            _ => {}
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(value) = &stmt.statement {
+            out.push(value.as_ref().map(|e| &e.value));
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Whether an unannotated-return function whose return values are all
@@ -2787,43 +2770,15 @@ fn literal_returns_need_boxing(body: &[Statement]) -> bool {
 /// enclosing scope (the closure-capture divergence), so the definitions
 /// drop (statement.rs) and calls through the names drop too.
 pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
-    use crate::StatementType as ST;
-    fn scan(stmts: &[crate::Statement], out: &mut Vec<String>) {
-        for s in stmts {
-            match &s.statement {
-                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => out.push(f.name.clone()),
-                ST::If(i) => {
-                    scan(&i.body, out);
-                    scan(&i.orelse, out);
-                }
-                ST::While(w) => {
-                    scan(&w.body, out);
-                    scan(&w.orelse, out);
-                }
-                ST::For(f) => {
-                    scan(&f.body, out);
-                    scan(&f.orelse, out);
-                }
-                ST::AsyncFor(f) => {
-                    scan(&f.body, out);
-                    scan(&f.orelse, out);
-                }
-                ST::With(w) => scan(&w.body, out),
-                ST::AsyncWith(w) => scan(&w.body, out),
-                ST::Try(t) => {
-                    scan(&t.body, out);
-                    scan(&t.orelse, out);
-                    scan(&t.finalbody, out);
-                    for h in &t.handlers {
-                        scan(&h.body, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
     let mut out = Vec::new();
-    scan(body, &mut out);
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
+            &stmt.statement
+        {
+            out.push(f.name.clone());
+        }
+        Flow::Continue
+    });
     out
 }
 
@@ -2942,60 +2897,37 @@ pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    matc
 /// non-literal (an aug-assign target, or a second assignment whose value
 /// is not a string literal). `literal_bindings` maps name → whether the
 /// (first) binding was a bare string literal; `rebound` collects names
-/// stored to by an aug-assign or a non-literal assignment.
+/// stored to by an aug-assign or a non-literal assignment. Recurses
+/// through control flow but not into nested defs/classes (their locals
+/// are their own).
 pub(crate) fn scan_str_rebindings(
     body: &[Statement],
     literal_bindings: &mut std::collections::HashMap<String, bool>,
     rebound: &mut std::collections::HashSet<String>,
 ) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Assign(a) => {
-                if let [ExprType::Name(name)] = a.targets.as_slice() {
-                    let is_literal = matches!(
-                        &a.value,
-                        ExprType::Constant(c)
-                            if matches!(&c.0, Some(litrs::Literal::String(_)))
-                    );
-                    literal_bindings
-                        .entry(name.id.clone())
-                        .and_modify(|first| *first |= is_literal)
-                        .or_insert(is_literal);
-                    if !is_literal {
-                        rebound.insert(name.id.clone());
-                    }
-                }
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Assign(a) = &stmt.statement
+            && let [ExprType::Name(name)] = a.targets.as_slice()
+        {
+            let is_literal = matches!(
+                &a.value,
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::String(_)))
+            );
+            literal_bindings
+                .entry(name.id.clone())
+                .and_modify(|first| *first |= is_literal)
+                .or_insert(is_literal);
+            if !is_literal {
+                rebound.insert(name.id.clone());
             }
-            StatementType::AugAssign(a) => {
-                if let ExprType::Name(name) = &a.target {
-                    rebound.insert(name.id.clone());
-                }
-            }
-            StatementType::If(s) => {
-                scan_str_rebindings(&s.body, literal_bindings, rebound);
-                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
-            }
-            StatementType::For(s) => {
-                scan_str_rebindings(&s.body, literal_bindings, rebound);
-                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
-            }
-            StatementType::While(s) => {
-                scan_str_rebindings(&s.body, literal_bindings, rebound);
-                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
-            }
-            StatementType::Try(t) => {
-                scan_str_rebindings(&t.body, literal_bindings, rebound);
-                for h in &t.handlers {
-                    scan_str_rebindings(&h.body, literal_bindings, rebound);
-                }
-                scan_str_rebindings(&t.orelse, literal_bindings, rebound);
-                scan_str_rebindings(&t.finalbody, literal_bindings, rebound);
-            }
-            StatementType::With(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
-            StatementType::AsyncWith(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
-            _ => {}
+        } else if let StatementType::AugAssign(a) = &stmt.statement
+            && let ExprType::Name(name) = &a.target
+        {
+            rebound.insert(name.id.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Issue #112: a `del name` whose name is referenced afterwards (or whose
@@ -3003,54 +2935,133 @@ pub(crate) fn scan_str_rebindings(
 /// still be readable where Python raises NameError. Loud error; a
 /// reassignment or import clears the deletion (Python rebinds).
 pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
-    let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let check = |stmt: &Statement, deleted: &mut std::collections::HashSet<String>| -> Result<(), String> {
-        let walk_expr = |expr: &ExprType, deleted: &std::collections::HashSet<String>| -> Result<(), String> {
-            for name in deleted {
-                if crate::expr_references(expr, name) {
-                    return Err(format!(
-                        "`del {name}` then a use of `{name}`: rython cannot unbind a \
-                         binding (the value would still be readable where Python raises \
-                         NameError). Remove the del, or reassign `{name}` first (issue \
-                         #112)"
-                    ));
-                }
-            }
-            Ok(())
-        };
+    let mut deleted = std::collections::HashSet::new();
+    scan_deleted_names(body, &mut deleted)
+}
+
+type Deleted = std::collections::HashSet<String>;
+
+/// The deletion state on the ways out of a statement sequence: the
+/// fall-through state (None when every path returns or raises), the
+/// states at each `break` and each `continue` (the enclosing loop merges
+/// them: a continue into the next iteration, a break past the else
+/// clause), and the union of the state at EVERY statement boundary inside
+/// — where an exception may leave from, and what a `finally` may see.
+struct DeletedPaths {
+    falls: Option<Deleted>,
+    breaks: Vec<Deleted>,
+    continues: Vec<Deleted>,
+    anywhere: Deleted,
+}
+
+impl DeletedPaths {
+    /// Take the states that leave `nested` for an outer statement — its
+    /// breaks and continues (an enclosing loop's business), and everything
+    /// it reached — and hand back its fall-through.
+    fn absorb(&mut self, nested: DeletedPaths) -> Option<Deleted> {
+        self.breaks.extend(nested.breaks);
+        self.continues.extend(nested.continues);
+        self.anywhere.extend(nested.anywhere);
+        nested.falls
+    }
+}
+
+/// The union of the continuing states, None when none continues.
+fn merge_deleted(states: Vec<Option<Deleted>>) -> Option<Deleted> {
+    let mut out: Option<Deleted> = None;
+    for state in states.into_iter().flatten() {
+        out.get_or_insert_with(Deleted::new).extend(state);
+    }
+    out
+}
+
+/// A read of a deleted name in `exprs` is the loud issue-#112 error.
+fn check_deleted_reads(deleted: &Deleted, exprs: &[&ExprType]) -> Result<(), String> {
+    if let Some(name) = deleted
+        .iter()
+        .find(|name| exprs.iter().any(|e| crate::expr_references(e, name)))
+    {
+        return Err(format!(
+            "`del {name}` then a use of `{name}`: rython cannot unbind a \
+             binding (the value would still be readable where Python raises \
+             NameError). Remove the del, or reassign `{name}` first (issue \
+             #112)"
+        ));
+    }
+    Ok(())
+}
+
+/// One pass over `body` from the incoming deletion state in `deleted`,
+/// leaving the fall-through state there. Deletion follows control flow,
+/// not the source order (Devin review on #323): each branch starts from
+/// the incoming state, and the state after the statement is the UNION of
+/// the paths that continue through it — deleted on any continuing path is
+/// deleted, so a conditional deletion stays loud, a rebinding on one path
+/// does not revive the name for its sibling (`del x; if c: x = 2; else:
+/// print(x)`), and a path that returns or raises contributes nothing to
+/// what follows (`del x; if c: x = 2; else: return 0; return x` is
+/// fine). A loop body is scanned a second time from the merged state, so
+/// a read that precedes the `del` in the next iteration is seen too; a
+/// `break` skips the else clause. A `try`'s handlers and `finally` start
+/// from every state the body reached, since an exception may leave from
+/// any statement boundary. Nested defs and classes are their own scopes.
+fn scan_deleted_names(body: &[Statement], deleted: &mut Deleted) -> Result<(), String> {
+    let paths = scan_deleted_paths(body, deleted)?;
+    *deleted = paths.falls.unwrap_or_default();
+    Ok(())
+}
+
+fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedPaths, String> {
+    let mut deleted = incoming.clone();
+    let mut out = DeletedPaths {
+        falls: None,
+        breaks: Vec::new(),
+        continues: Vec::new(),
+        anywhere: incoming.clone(),
+    };
+    for stmt in body {
+        out.anywhere.extend(deleted.iter().cloned());
+        // A read of a deleted name: the statement's own expressions (a
+        // definition's header included), and a store target that reads
+        // its base (`x[i] = v`, `x.a = v`); a name / tuple target only
+        // binds.
+        let reads: Vec<&ExprType> = visit::stmt_exprs(stmt)
+            .into_iter()
+            .chain(stmt_targets(stmt).into_iter().filter(|t| {
+                !matches!(
+                    t,
+                    ExprType::Name(_) | ExprType::Tuple(_) | ExprType::List(_) | ExprType::Starred(_)
+                )
+            }))
+            .collect();
+        check_deleted_reads(&deleted, &reads)?;
+        // A definition binds its name here; its body is its own scope.
         match &stmt.statement {
-            StatementType::Delete(targets) => {
-                for target in targets {
-                    if let ExprType::Name(n) = target {
-                        deleted.insert(n.id.clone());
-                    }
-                }
-                Ok(())
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                deleted.remove(&f.name);
+                continue;
             }
-            StatementType::Assign(a) => {
-                for target in &a.targets {
-                    if let ExprType::Name(n) = target {
-                        deleted.remove(&n.id);
-                    }
-                }
-                walk_expr(&a.value, deleted)?;
-                for target in &a.targets {
-                    walk_expr(target, deleted)?;
-                }
-                Ok(())
+            StatementType::ClassDef(c) => {
+                deleted.remove(&c.name);
+                continue;
             }
-            StatementType::AugAssign(a) => {
-                if let ExprType::Name(n) = &a.target {
-                    deleted.remove(&n.id);
-                }
-                walk_expr(&a.target, deleted)?;
-                walk_expr(&a.value, deleted)
+            _ => {}
+        }
+        // A store rebinds the name: an assignment / aug-assign / `with
+        // ... as` target, an import. A `for` target is bound only when
+        // the loop body runs: the loop arm below rebinds it on the
+        // body-entry state, not on the zero-iteration path.
+        let is_for = matches!(stmt.statement, StatementType::For(_) | StatementType::AsyncFor(_));
+        if !is_for {
+            for target in stmt_targets(stmt) {
+                deleted.retain(|name| !visit::target_binds(target, name));
             }
+        }
+        match &stmt.statement {
             StatementType::Import(i) => {
                 for alias in &i.names {
                     deleted.remove(&alias.name);
                 }
-                Ok(())
             }
             StatementType::ImportFrom(i) => {
                 for alias in &i.names {
@@ -3059,102 +3070,199 @@ pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
                         deleted.remove(asname);
                     }
                 }
-                Ok(())
             }
-            StatementType::For(f) => {
-                // The loop target rebinds each iteration.
-                deleted.remove(&loop_target_name(&f.target));
-                walk_expr(&f.iter, deleted)?;
-                walk_expr(&f.target, deleted)?;
-                check_deleted_names(&f.body)?;
-                check_deleted_names(&f.orelse)?;
-                Ok(())
-            }
-            StatementType::If(s) => {
-                walk_expr(&s.test, deleted)?;
-                check_deleted_names(&s.body)?;
-                check_deleted_names(&s.orelse)?;
-                Ok(())
-            }
-            StatementType::While(s) => {
-                walk_expr(&s.test, deleted)?;
-                check_deleted_names(&s.body)?;
-                check_deleted_names(&s.orelse)?;
-                Ok(())
-            }
-            StatementType::Try(t) => {
-                check_deleted_names(&t.body)?;
-                for h in &t.handlers {
-                    check_deleted_names(&h.body)?;
+            StatementType::Delete(targets) => {
+                for target in targets {
+                    if let ExprType::Name(n) = target {
+                        deleted.insert(n.id.clone());
+                    }
                 }
-                check_deleted_names(&t.orelse)?;
-                check_deleted_names(&t.finalbody)?;
-                Ok(())
             }
-            StatementType::With(w) => check_deleted_names(&w.body),
-            StatementType::AsyncWith(w) => check_deleted_names(&w.body),
-            StatementType::AsyncFor(f) => {
-                deleted.remove(&loop_target_name(&f.target));
-                walk_expr(&f.iter, deleted)?;
-                walk_expr(&f.target, deleted)?;
-                check_deleted_names(&f.body)?;
-                check_deleted_names(&f.orelse)?;
-                Ok(())
+            // The path ends here: nothing after it in this body runs.
+            StatementType::Return(_) | StatementType::Raise(_) => {
+                out.anywhere.extend(deleted);
+                return Ok(out);
             }
-            StatementType::Expr(e) => walk_expr(&e.value, deleted),
-            StatementType::Return(Some(e)) => walk_expr(&e.value, deleted),
-            StatementType::Return(None) => Ok(()),
-            StatementType::Call(c) => {
-                walk_expr(&c.func, deleted)?;
-                for arg in &c.args {
-                    walk_expr(arg, deleted)?;
-                }
-                for kw in &c.keywords {
-                    walk_expr(&kw.value, deleted)?;
-                }
-                Ok(())
+            // The path leaves for the enclosing loop, carrying its state.
+            StatementType::Break => {
+                out.anywhere.extend(deleted.iter().cloned());
+                out.breaks.push(deleted);
+                return Ok(out);
             }
-            StatementType::Assert { test, msg } => {
-                walk_expr(test, deleted)?;
-                if let Some(m) = msg {
-                    walk_expr(m, deleted)?;
-                }
-                Ok(())
+            StatementType::Continue => {
+                out.anywhere.extend(deleted.iter().cloned());
+                out.continues.push(deleted);
+                return Ok(out);
             }
-            StatementType::Raise(r) => {
-                if let Some(exc) = &r.exc {
-                    walk_expr(exc, deleted)?;
-                }
-                if let Some(cause) = &r.cause {
-                    walk_expr(cause, deleted)?;
-                }
-                Ok(())
-            }
-            // Nested functions/classes have their own scope.
-            StatementType::FunctionDef(_)
-            | StatementType::AsyncFunctionDef(_)
-            | StatementType::ClassDef(_)
-            | StatementType::Global(_)
-            | StatementType::Nonlocal(_)
-            | StatementType::AnnotatedName { .. }
-            | StatementType::Pass
-            | StatementType::Break
-            | StatementType::Continue
-            | StatementType::Unimplemented(_) => Ok(()),
+            _ => {}
         }
-    };
-    for stmt in body {
-        check(stmt, &mut deleted)?;
+        // The paths through the statement's bodies.
+        let next = match &stmt.statement {
+            StatementType::If(i) => {
+                let then = out.absorb(scan_deleted_paths(&i.body, &deleted)?);
+                // No else: the fall-through path keeps the incoming state.
+                let other = if i.orelse.is_empty() {
+                    Some(deleted.clone())
+                } else {
+                    out.absorb(scan_deleted_paths(&i.orelse, &deleted)?)
+                };
+                merge_deleted(vec![then, other])
+            }
+            StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => {
+                let bodies = visit::stmt_bodies(stmt);
+                let (loop_body, orelse) = (bodies[0], bodies[1]);
+                // Zero iterations keep the incoming state (a `for`
+                // target stays unbound); an iteration enters the body
+                // with the target rebound, and a later one re-enters it
+                // from the merged state (a fall-through or a `continue`).
+                let mut entering = deleted.clone();
+                for target in stmt_targets(stmt) {
+                    entering.retain(|name| !visit::target_binds(target, name));
+                }
+                let first = scan_deleted_paths(loop_body, &entering)?;
+                let mut again = entering.clone();
+                if let Some(falls) = &first.falls {
+                    again.extend(falls.iter().cloned());
+                }
+                for state in &first.continues {
+                    again.extend(state.iter().cloned());
+                }
+                for target in stmt_targets(stmt) {
+                    again.retain(|name| !visit::target_binds(target, name));
+                }
+                // A `while` re-evaluates its test each iteration.
+                if matches!(stmt.statement, StatementType::While(_)) {
+                    check_deleted_reads(&again, &visit::stmt_exprs(stmt))?;
+                }
+                let second = scan_deleted_paths(loop_body, &again)?;
+                // The loop's completion (no break): the incoming state
+                // (zero iterations) and the merged iteration states.
+                let mut completed = again.clone();
+                completed.extend(deleted.iter().cloned());
+                if let Some(falls) = &second.falls {
+                    completed.extend(falls.iter().cloned());
+                }
+                for state in &second.continues {
+                    completed.extend(state.iter().cloned());
+                }
+                // A break lands after the statement, skipping the else
+                // clause; the else clause runs after a completion.
+                let mut exits: Vec<Option<Deleted>> = first
+                    .breaks
+                    .iter()
+                    .chain(second.breaks.iter())
+                    .map(|b| Some(b.clone()))
+                    .collect();
+                out.anywhere.extend(first.anywhere);
+                out.anywhere.extend(second.anywhere);
+                exits.push(out.absorb(scan_deleted_paths(orelse, &completed)?));
+                merge_deleted(exits)
+            }
+            StatementType::With(w) => out.absorb(scan_deleted_paths(&w.body, &deleted)?),
+            StatementType::AsyncWith(w) => out.absorb(scan_deleted_paths(&w.body, &deleted)?),
+            StatementType::Try(t) => {
+                // An exception may leave the body from any statement
+                // boundary: a handler starts from every state the body
+                // reached, with its `as` name rebound; the else clause
+                // from the body's fall-through. `finally` runs on EVERY
+                // way out, per path: the continuing state, each pending
+                // break and continue (the finally's own state is what
+                // leaves — a `finally: del x` on a break path deletes
+                // `x` past the loop), and, for the reads only, every
+                // state a return or raise inside may leave from. A
+                // finally that itself returns, raises, breaks, or
+                // continues overrides the pending exit.
+                let body = scan_deleted_paths(&t.body, &deleted)?;
+                let at_handler = body.anywhere.clone();
+                let mut reached = at_handler.clone();
+                let mut pending_breaks = body.breaks;
+                let mut pending_continues = body.continues;
+                out.anywhere.extend(body.anywhere);
+                let mut exits: Vec<Option<Deleted>> = vec![];
+                let body_falls = body.falls;
+                for handler in &t.handlers {
+                    // `except E as e` binds `e` for the handler's body
+                    // and UNBINDS it on every way out of the handler
+                    // (Python's implicit `del e`), so a later read of
+                    // `e` is Python's NameError.
+                    let mut entry = at_handler.clone();
+                    if let Some(name) = &handler.name {
+                        entry.remove(name);
+                    }
+                    let mut handled = scan_deleted_paths(&handler.body, &entry)?;
+                    if let Some(name) = &handler.name {
+                        if let Some(falls) = &mut handled.falls {
+                            falls.insert(name.clone());
+                        }
+                        for state in handled.breaks.iter_mut().chain(handled.continues.iter_mut()) {
+                            state.insert(name.clone());
+                        }
+                        handled.anywhere.insert(name.clone());
+                    }
+                    reached.extend(handled.anywhere.iter().cloned());
+                    out.anywhere.extend(handled.anywhere);
+                    pending_breaks.extend(handled.breaks);
+                    pending_continues.extend(handled.continues);
+                    exits.push(handled.falls);
+                }
+                if let Some(falls) = &body_falls {
+                    let orelse = scan_deleted_paths(&t.orelse, falls)?;
+                    reached.extend(orelse.anywhere.iter().cloned());
+                    out.anywhere.extend(orelse.anywhere);
+                    pending_breaks.extend(orelse.breaks);
+                    pending_continues.extend(orelse.continues);
+                    exits.push(orelse.falls);
+                }
+                let continuing = merge_deleted(exits);
+                if t.finalbody.is_empty() {
+                    out.breaks.extend(pending_breaks);
+                    out.continues.extend(pending_continues);
+                    continuing
+                } else {
+                    let next = match &continuing {
+                        Some(state) => out.absorb(scan_deleted_paths(&t.finalbody, state)?),
+                        None => None,
+                    };
+                    for state in &pending_breaks {
+                        if let Some(after) = out.absorb(scan_deleted_paths(&t.finalbody, state)?) {
+                            out.breaks.push(after);
+                        }
+                    }
+                    for state in &pending_continues {
+                        if let Some(after) = out.absorb(scan_deleted_paths(&t.finalbody, state)?) {
+                            out.continues.push(after);
+                        }
+                    }
+                    // The return and raise paths: the finally's reads
+                    // are checked from every state the try reached; its
+                    // fall-through goes nowhere.
+                    out.absorb(scan_deleted_paths(&t.finalbody, &reached)?);
+                    next
+                }
+            }
+            _ => {
+                // Any other body-carrying form: every body from the
+                // incoming state, the union afterwards.
+                let bodies = visit::stmt_bodies(stmt);
+                if bodies.is_empty() {
+                    Some(deleted.clone())
+                } else {
+                    let mut exits = vec![Some(deleted.clone())];
+                    for nested in bodies {
+                        exits.push(out.absorb(scan_deleted_paths(nested, &deleted)?));
+                    }
+                    merge_deleted(exits)
+                }
+            }
+        };
+        match next {
+            Some(state) => deleted = state,
+            None => return Ok(out),
+        }
     }
-    Ok(())
-}
-
-/// The name bound by a for-loop target (single-name targets only).
-fn loop_target_name(target: &ExprType) -> String {
-    match target {
-        ExprType::Name(n) => n.id.clone(),
-        _ => String::new(),
-    }
+    out.anywhere.extend(deleted.iter().cloned());
+    out.falls = Some(deleted);
+    Ok(out)
 }
 
 /// Issue #115: every name this function's body declares `global`,
@@ -3162,41 +3270,12 @@ fn loop_target_name(target: &ExprType) -> String {
 /// its own scope with its own declarations).
 fn collect_global_decls(body: &[Statement]) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
-    fn walk(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
-        for stmt in stmts {
-            match &stmt.statement {
-                StatementType::Global(names) => out.extend(names.iter().cloned()),
-                StatementType::If(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::For(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::AsyncFor(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::While(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::Try(s) => {
-                    walk(&s.body, out);
-                    for h in &s.handlers {
-                        walk(&h.body, out);
-                    }
-                    walk(&s.orelse, out);
-                    walk(&s.finalbody, out);
-                }
-                StatementType::With(s) => walk(&s.body, out),
-                StatementType::AsyncWith(s) => walk(&s.body, out),
-                _ => {}
-            }
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Global(names) = &stmt.statement {
+            out.extend(names.iter().cloned());
         }
-    }
-    walk(body, &mut out);
+        Flow::Continue
+    });
     out
 }
 
@@ -3271,128 +3350,107 @@ pub(crate) fn rust_type_to_py_name(ty: &proc_macro2::TokenStream) -> Option<&'st
     })
 }
 
+/// The obviously-inferable types of a body's locals, by name: an
+/// annotated or literal-valued assignment, a container literal, a local
+/// import, a bare annotated name — recursing through control flow but not
+/// into nested defs/classes (their locals are their own).
 pub(crate) fn collect_local_types(
     body: &[Statement],
     out: &mut std::collections::HashMap<String, crate::TypeInfo>,
 ) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Assign(assign) => {
-                if let [ExprType::Name(name)] = assign.targets.as_slice() {
-                    // An annotated local (`flags: int = _character_flags(c)`)
-                    // types from the annotation.
-                    if let Some(ann) = assign.annotation.as_ref()
-                        && let Some(t) = crate::annotation_type_info(ann)
-                    {
-                        out.insert(name.id.clone(), t);
-                    } else if let Some(ty) = simple_expr_typeinfo(&assign.value) {
-                        out.insert(name.id.clone(), ty);
-                    } else {
-                        // A CONTAINER literal local types like the literal
-                        // lowering (issue #180): a dict gets String keys and
-                        // boxes heterogeneous-but-boxable values (`{
-                        // 'ProviderType': 'sso', 'Credentials': {...}}` —
-                        // botocore), a list gets its concrete element type.
-                        // Without this, an unannotated function returning
-                        // such a local collapses to unit and every use of
-                        // the returned container breaks.
-                        match &assign.value {
-                            ExprType::Dict(d) if !d.keys.is_empty() => {
-                                if let crate::TypeInfo::Dict(k, v) =
-                                    crate::syntactic_type(&assign.value)
-                                {
-                                    let k = if matches!(
-                                        *k,
-                                        crate::TypeInfo::StrRef | crate::TypeInfo::PyObject
-                                    ) {
-                                        crate::TypeInfo::String
-                                    } else {
-                                        *k
-                                    };
-                                    let v = if matches!(*v, crate::TypeInfo::PyObject) {
-                                        crate::TypeInfo::PyValue
-                                    } else {
-                                        *v
-                                    };
-                                    out.insert(
-                                        name.id.clone(),
-                                        crate::TypeInfo::Dict(Box::new(k), Box::new(v)),
-                                    );
-                                }
-                            }
-                            ExprType::List(l) if !l.is_empty() => {
-                                if let crate::TypeInfo::Vec(elt) =
-                                    crate::syntactic_type(&assign.value)
-                                {
-                                    if !matches!(*elt, crate::TypeInfo::PyObject) {
-                                        out.insert(name.id.clone(), crate::TypeInfo::Vec(elt));
-                                    }
-                                }
-                            }
-                            // An EMPTY container local (`allowed = {}` then
-                            // `allowed[alg] = ...` — pip's Hashes): the
-                            // boxed heterogeneous container (the element
-                            // types are unknowable at the store).
-                            ExprType::Dict(d) if d.keys.is_empty() => {
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Assign(assign) = &stmt.statement {
+            if let [ExprType::Name(name)] = assign.targets.as_slice() {
+                // An annotated local (`flags: int = _character_flags(c)`)
+                // types from the annotation.
+                if let Some(ann) = assign.annotation.as_ref()
+                    && let Some(t) = crate::annotation_type_info(ann)
+                {
+                    out.insert(name.id.clone(), t);
+                } else if let Some(ty) = simple_expr_typeinfo(&assign.value) {
+                    out.insert(name.id.clone(), ty);
+                } else {
+                    // A CONTAINER literal local types like the literal
+                    // lowering (issue #180): a dict gets String keys and
+                    // boxes heterogeneous-but-boxable values (`{
+                    // 'ProviderType': 'sso', 'Credentials': {...}}` —
+                    // botocore), a list gets its concrete element type.
+                    // Without this, an unannotated function returning
+                    // such a local collapses to unit and every use of
+                    // the returned container breaks.
+                    match &assign.value {
+                        ExprType::Dict(d) if !d.keys.is_empty() => {
+                            if let crate::TypeInfo::Dict(k, v) =
+                                crate::syntactic_type(&assign.value)
+                            {
+                                let k = if matches!(
+                                    *k,
+                                    crate::TypeInfo::StrRef | crate::TypeInfo::PyObject
+                                ) {
+                                    crate::TypeInfo::String
+                                } else {
+                                    *k
+                                };
+                                let v = if matches!(*v, crate::TypeInfo::PyObject) {
+                                    crate::TypeInfo::PyValue
+                                } else {
+                                    *v
+                                };
                                 out.insert(
                                     name.id.clone(),
-                                    crate::TypeInfo::Dict(
-                                        Box::new(crate::TypeInfo::String),
-                                        Box::new(crate::TypeInfo::PyValue),
-                                    ),
+                                    crate::TypeInfo::Dict(Box::new(k), Box::new(v)),
                                 );
                             }
-                            ExprType::List(l) if l.is_empty() => {
-                                out.insert(
-                                    name.id.clone(),
-                                    crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
-                                );
-                            }
-                            _ => {}
                         }
+                        ExprType::List(l) if !l.is_empty() => {
+                            if let crate::TypeInfo::Vec(elt) =
+                                crate::syntactic_type(&assign.value)
+                            {
+                                if !matches!(*elt, crate::TypeInfo::PyObject) {
+                                    out.insert(name.id.clone(), crate::TypeInfo::Vec(elt));
+                                }
+                            }
+                        }
+                        // An EMPTY container local (`allowed = {}` then
+                        // `allowed[alg] = ...` — pip's Hashes): the
+                        // boxed heterogeneous container (the element
+                        // types are unknowable at the store).
+                        ExprType::Dict(d) if d.keys.is_empty() => {
+                            out.insert(
+                                name.id.clone(),
+                                crate::TypeInfo::Dict(
+                                    Box::new(crate::TypeInfo::String),
+                                    Box::new(crate::TypeInfo::PyValue),
+                                ),
+                            );
+                        }
+                        ExprType::List(l) if l.is_empty() => {
+                            out.insert(
+                                name.id.clone(),
+                                crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
+        } else if let StatementType::Import(im) = &stmt.statement {
             // A local IMPORT (`import keyring` inside __init__, then
             // `self.keyring = keyring` — pip's KeyRingPythonProvider): a
             // module object — a boxed value.
-            StatementType::Import(im) => {
-                for a in &im.names {
-                    out.insert(a.name.clone(), crate::TypeInfo::PyValue);
-                }
+            for a in &im.names {
+                out.insert(a.name.clone(), crate::TypeInfo::PyValue);
             }
+        } else if let StatementType::AnnotatedName { name, annotation } = &stmt.statement
+            && let Some(t) = crate::annotation_type_info(annotation)
+        {
             // A bare annotated local (`key: str` / `value: str` — urllib3's
             // ssl_match_hostname): types the name for downstream use
             // (dnsnames.append(value) pins Vec<String>).
-            StatementType::AnnotatedName { name, annotation } => {
-                if let Some(t) = crate::annotation_type_info(annotation) {
-                    out.insert(name.clone(), t);
-                }
-            }
-            StatementType::Try(s) => {
-                collect_local_types(&s.body, out);
-                for h in &s.handlers {
-                    collect_local_types(&h.body, out);
-                }
-                collect_local_types(&s.orelse, out);
-                collect_local_types(&s.finalbody, out);
-            }
-            StatementType::If(s) => {
-                collect_local_types(&s.body, out);
-                collect_local_types(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_local_types(&s.body, out);
-                collect_local_types(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_local_types(&s.body, out);
-                collect_local_types(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_local_types(&s.body, out),
-            _ => {}
+            out.insert(name.clone(), t);
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Whether an annotation expression means `None` (`-> None` marks a
@@ -3630,7 +3688,7 @@ pub(crate) fn expr_yields_option_ctx(
             // annotation.
             if let ExprType::Call(call) = attr.value.as_ref()
                 && let ExprType::Attribute(fn_attr) = call.func.as_ref()
-                && matches!(fn_attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+                && crate::ast::tree::visit::is_self(fn_attr.value.as_ref())
                 && let Some(class_name) = ctx.enclosing_class_name()
                 && let Some(crate::SymbolTableNode::ClassDef(owner)) = symbols.get(class_name)
                 && let Some(method) = owner.method_on_mro(&fn_attr.attr, symbols)
@@ -3804,27 +3862,44 @@ pub(crate) fn expr_yields_pyvalue(
     }
 }
 
-/// Whether a function body contains a `yield`/`yield from` anywhere
-/// (control-flow nested included): the body is a GENERATOR and lowers to
+/// Whether a function body contains a `yield`/`yield from` anywhere in
+/// its own scope (control-flow nested, and inside a larger expression —
+/// `x = yield v`, `f((yield))`; a nested def's yields make THAT function
+/// the generator): the body is a GENERATOR and lowers to
 /// build-and-return-a-list (issue #122-family).
 pub(crate) fn body_has_yields(body: &[Statement]) -> bool {
-    body.iter().any(|s| match &s.statement {
-        StatementType::Expr(e) => matches!(
-            e.value,
-            ExprType::Yield(_) | ExprType::YieldFrom(_)
-        ),
-        StatementType::If(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
-        StatementType::While(s) => body_has_yields(&s.body),
-        StatementType::For(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
-        StatementType::With(s) => body_has_yields(&s.body),
-        StatementType::Try(s) => {
-            body_has_yields(&s.body)
-                || s.handlers.iter().any(|h| body_has_yields(&h.body))
-                || body_has_yields(&s.orelse)
-                || body_has_yields(&s.finalbody)
-        }
-        _ => false,
+    any_expr_in(body, Descend::OwnScope, |e| {
+        matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_))
     })
+}
+
+/// The first statement of `body` (nested defs and lambdas excluded — a
+/// yielding lambda is its own generator) that uses a `yield` / `yield
+/// from` as a VALUE rather than as its own statement: `x = yield v`,
+/// `(yield v) or 1`, `f((yield))`, `yield (yield v)`. That is the
+/// generator's send channel, which the build-and-return-a-list lowering
+/// cannot model.
+fn expression_position_yield(body: &[Statement]) -> Option<&Statement> {
+    let is_yield = |e: &ExprType| matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_));
+    let own = Descend::OwnScope;
+    let mut found = None;
+    visit::any_stmt(body, own, |s| {
+        let hit = match &s.statement {
+            // A statement-level yield: only a yield NESTED in its value
+            // counts.
+            StatementType::Expr(e) if is_yield(&e.value) => visit::subexprs_for(&e.value, own)
+                .into_iter()
+                .any(|sub| visit::any_expr_for(sub, own, is_yield)),
+            _ => stmt_all_exprs(s)
+                .into_iter()
+                .any(|e| visit::any_expr_for(e, own, is_yield)),
+        };
+        if hit {
+            found = Some(s);
+        }
+        hit
+    });
+    found
 }
 
 /// The element type of a generator body: from the `Generator[T, ...]` /
@@ -3867,46 +3942,28 @@ pub(crate) fn generator_element_type(
     first_yield_type(body, options, symbols)
 }
 
-/// The inferred type of the first `yield <value>` in a body.
+/// The inferred type of the first `yield <value>` (in source order,
+/// anywhere in the function's own scope) whose value infers to a
+/// concrete type.
 fn first_yield_type(
     body: &[Statement],
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<crate::TypeInfo> {
-    for s in body {
-        match &s.statement {
-            StatementType::Expr(e) => {
-                if let ExprType::Yield(y) = &e.value
-                    && let Some(v) = y.value.as_ref()
-                {
-                    let t = crate::infer_type(None, v, options, symbols);
-                    if !matches!(t, crate::TypeInfo::PyObject) {
-                        return Some(t);
-                    }
-                }
+    let mut found = None;
+    any_expr_in(body, Descend::OwnScope, |e| {
+        if let ExprType::Yield(y) = e
+            && let Some(v) = y.value.as_ref()
+        {
+            let t = crate::infer_type(None, v, options, symbols);
+            if !matches!(t, crate::TypeInfo::PyObject) {
+                found = Some(t);
+                return true;
             }
-            StatementType::If(s) => {
-                if let Some(t) = first_yield_type(&s.body, options, symbols) {
-                    return Some(t);
-                }
-                if let Some(t) = first_yield_type(&s.orelse, options, symbols) {
-                    return Some(t);
-                }
-            }
-            StatementType::For(f) => {
-                if let Some(t) = first_yield_type(&f.body, options, symbols) {
-                    return Some(t);
-                }
-            }
-            StatementType::While(w) => {
-                if let Some(t) = first_yield_type(&w.body, options, symbols) {
-                    return Some(t);
-                }
-            }
-            _ => {}
         }
-    }
-    None
+        false
+    });
+    found
 }
 
 /// Whether `param` is a None-defaulted, unannotated parameter of `func`
@@ -4332,7 +4389,7 @@ impl FunctionDef {
                 let crate::ExprType::Attribute(attr) = &a.value else {
                     continue;
                 };
-                if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
+                if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
                     continue;
                 }
                 found = fields
@@ -4672,17 +4729,11 @@ impl FunctionDef {
         // `call_return_typeinfo` (a recursive callee — `def f(x): return
         // f(x-1)`) which consults this again — the same thread_local
         // pattern the alias resolver uses.
-        thread_local! {
-            static IRT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let d = IRT_DEPTH.with(|c| c.get());
-        if d > 16 {
-            return None;
-        }
-        IRT_DEPTH.with(|c| c.set(d + 1));
-        let result = self.inferred_return_typeinfo_inner(symbols, options);
-        IRT_DEPTH.with(|c| c.set(d));
-        result
+        crate::ast::tree::type_ctx::resolving_return(
+            self as *const FunctionDef as usize,
+            || None,
+            || self.inferred_return_typeinfo_inner(symbols, options),
+        )
     }
 
     fn inferred_return_typeinfo_inner(

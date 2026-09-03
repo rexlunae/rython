@@ -18391,3 +18391,591 @@ fn an_aliased_isinstance_target_on_a_root_typed_value_is_the_variant_test() {
         out
     );
 }
+
+/// A `yield` used as a VALUE (`x = yield v`, `(yield v) or 1`) is the
+/// generator's send channel; the build-and-return-a-list lowering has no
+/// such channel, so the conversion refuses rather than emitting a
+/// `push(v)` that evaluates to unit (issue #137, drift 4's clauses
+/// program).
+#[test]
+fn a_yield_used_as_a_value_is_loud() {
+    let err = compile_err(
+        concat!(
+            "from typing import Iterator\n",
+            "def counter(limit: int) -> Iterator[int]:\n",
+            "    total = 0\n",
+            "    while total < limit:\n",
+            "        step = (yield total) or 1\n",
+            "        total += step\n",
+        ),
+        "yieldvalue.py",
+    );
+    assert!(err.contains("`yield` used as a value"), "error: {}", err);
+    assert!(err.contains("`counter` at line 5"), "error: {}", err);
+    // A statement-level yield inside control flow stays the list lowering.
+    let out = compile(
+        concat!(
+            "from typing import Iterator\n",
+            "def counter(limit: int) -> Iterator[int]:\n",
+            "    for total in range(limit):\n",
+            "        if total < 0:\n",
+            "            break\n",
+            "        yield total\n",
+            "    else:\n",
+            "        yield limit\n",
+        ),
+        "yieldstmt.py",
+    );
+    assert!(out.contains("__rython_gen . push (total)"), "generated: {}", out);
+    assert!(out.contains("__rython_gen . push (limit)"), "generated: {}", out);
+}
+
+/// A string literal stored into an `Optional[str]` field is BOTH owned and
+/// wrapped: `self.note = "exhausted"` on a `note: Optional[str] = None`
+/// slot is `Some(("exhausted").to_string())`, wherever the store sits
+/// (a for-loop's else clause here).
+#[test]
+fn a_str_literal_stored_into_an_optional_field_wraps_in_some() {
+    let out = compile(
+        concat!(
+            "from typing import Optional\n",
+            "class Tally:\n",
+            "    def __init__(self):\n",
+            "        self.note: Optional[str] = None\n",
+            "    def plain(self) -> None:\n",
+            "        self.note = \"plain\"\n",
+            "    def scan(self, words: list[str]) -> None:\n",
+            "        for w in words:\n",
+            "            if w == \"z\":\n",
+            "                break\n",
+            "        else:\n",
+            "            self.note = \"exhausted\"\n",
+        ),
+        "optnote.py",
+    );
+    assert!(out.contains("pub note : Option < String >"), "generated: {}", out);
+    assert!(
+        out.contains("self . note = Some ((\"plain\") . to_string ())"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("self . note = Some ((\"exhausted\") . to_string ())"),
+        "generated: {}",
+        out
+    );
+}
+
+/// Deletion follows control flow (Devin review on #323): after `del x`, a
+/// rebinding on one branch does not revive `x` for its sibling — the else
+/// read is still Python's NameError, so it stays loud.
+#[test]
+fn a_rebinding_on_one_branch_does_not_revive_a_deleted_name_for_its_sibling() {
+    let err = compile_err(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    if flag:\n",
+            "        x = 2\n",
+            "    else:\n",
+            "        return x\n",
+            "    return 0\n",
+        ),
+        "del_branch1.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    assert!(err.contains("issue #112"), "error: {}", err);
+    // Both branches rebinding: every path reaches the read bound.
+    let out = compile(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    if flag:\n",
+            "        x = 2\n",
+            "    else:\n",
+            "        x = 3\n",
+            "    return x\n",
+        ),
+        "del_branch2.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// A deletion confined to one branch does not contaminate its sibling;
+/// a read AFTER the `if` is loud (the deletion is conditional), a read on
+/// the other branch is not.
+#[test]
+fn a_del_confined_to_one_branch_does_not_reach_its_sibling() {
+    let out = compile(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    if flag:\n",
+            "        del x\n",
+            "        return 0\n",
+            "    else:\n",
+            "        return x\n",
+        ),
+        "del_sibling.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "def g(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    if flag:\n",
+            "        del x\n",
+            "    return x\n",
+        ),
+        "del_after_if.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// A loop body is scanned again from the merged state: a read that
+/// precedes the `del` in the next iteration is Python's NameError.
+#[test]
+fn a_read_before_the_del_in_a_later_iteration_is_loud() {
+    let err = compile_err(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    t = 0\n",
+            "    for i in xs:\n",
+            "        t = t + i\n",
+            "        del t\n",
+            "    return 0\n",
+        ),
+        "del_loop.py",
+    );
+    assert!(err.contains("del t"), "error: {}", err);
+    // Rebinding before the read each iteration is fine.
+    let out = compile(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    for i in xs:\n",
+            "        t = i\n",
+            "        print(t)\n",
+            "        del t\n",
+            "    return 0\n",
+        ),
+        "del_loop_ok.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// The mutation scan is scope-aware (Devin review on #323): a nested def
+/// mutating its OWN same-named parameter is no mutation of the outer
+/// parameter, while a closure mutating the free name is.
+#[test]
+fn a_nested_def_binding_the_name_itself_is_not_a_mutation_of_the_parameter() {
+    let out = compile(
+        concat!(
+            "def touch(xs: list[int]) -> int:\n",
+            "    def inner(xs: list[int]) -> int:\n",
+            "        xs.append(99)\n",
+            "        return len(xs)\n",
+            "    return inner([]) + len(xs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    a = [1, 2]\n",
+            "    touch(a)\n",
+            "    print(a)\n",
+        ),
+        "alias_nested_own.py",
+    );
+    assert!(!out.contains("mutates it"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "def touch(xs: list[int]) -> int:\n",
+            "    def bump() -> None:\n",
+            "        xs.append(99)\n",
+            "    bump()\n",
+            "    return len(xs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    a = [1, 2]\n",
+            "    touch(a)\n",
+            "    print(a)\n",
+        ),
+        "alias_nested_free.py",
+    );
+    assert!(err.contains("mutates it"), "error: {}", err);
+}
+
+/// An isinstance on a nested def's OWN same-named parameter is not a
+/// stray use of the outer parameter: the outer dispatcher still
+/// specializes (Devin review on #323).
+#[test]
+fn a_nested_def_with_its_own_same_named_parameter_keeps_the_outer_specialization() {
+    let out = compile(
+        concat!(
+            "def describe(x):\n",
+            "    def inner(x: int) -> str:\n",
+            "        if isinstance(x, int):\n",
+            "            return \"inner-int\"\n",
+            "        return \"inner\"\n",
+            "    if isinstance(x, int):\n",
+            "        return inner(x)\n",
+            "    return \"other\"\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(describe(5))\n",
+            "    print(describe(\"s\"))\n",
+        ),
+        "specialize_nested.py",
+    );
+    assert!(out.contains("fn describe_int"), "generated: {}", out);
+    assert!(out.contains("fn describe_any"), "generated: {}", out);
+}
+
+/// A path that returns or raises contributes nothing to what follows
+/// (Devin review on #323): every path reaching the final read rebound
+/// `x`, or exited.
+#[test]
+fn an_exited_branch_does_not_poison_a_later_read() {
+    let out = compile(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    if flag:\n",
+            "        x = 2\n",
+            "    else:\n",
+            "        return 0\n",
+            "    return x\n",
+        ),
+        "del_exit1.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "def g(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    if flag:\n",
+            "        del x\n",
+            "        return 0\n",
+            "    return x\n",
+        ),
+        "del_exit2.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// An `except ... as e` rebinds `e` for its handler (Devin review on
+/// #323).
+#[test]
+fn an_except_as_rebinds_a_deleted_name_for_its_handler() {
+    let out = compile(
+        concat!(
+            "def f() -> None:\n",
+            "    e = 1\n",
+            "    del e\n",
+            "    try:\n",
+            "        raise ValueError(\"x\")\n",
+            "    except ValueError as e:\n",
+            "        print(e)\n",
+        ),
+        "del_except_as.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// A yielding lambda is its own generator, not the enclosing function's
+/// (Devin review on #323): `f` is an ordinary function, so the lambda's
+/// own yield is what the conversion refuses — not `f` as a value-yielding
+/// generator.
+#[test]
+fn a_lambda_yield_is_not_the_enclosing_functions_yield() {
+    let err = compile_err(
+        concat!(
+            "def f() -> int:\n",
+            "    g = lambda: (yield 1)\n",
+            "    return 2\n",
+        ),
+        "lambda_yield.py",
+    );
+    assert!(!err.contains("used as a value"), "error: {}", err);
+    assert!(err.contains("not supported yet"), "error: {}", err);
+}
+
+/// Conversion as a Result, for pins whose point is what the conversion
+/// does NOT say (a refusal that must not fire, a crash that must not
+/// happen) rather than a fixed outcome.
+fn compile_result(src: &str, name: &str) -> Result<String, String> {
+    let module = parse(src, name).map_err(|e| format!("parse failed: {}", e))?;
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            PythonOptions::default(),
+            symbols,
+        )
+        .map(|t| t.to_string())
+        .map_err(|e| format!("{}", e))
+}
+
+/// A `break` skips the loop's else clause (Devin review on #323): a
+/// deletion on the break path does not reach the else, and a read after
+/// the loop, which the break path does reach, stays loud.
+#[test]
+fn a_break_skips_the_loop_else_for_deletion() {
+    let out = compile(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        if i > 2:\n",
+            "            del x\n",
+            "            break\n",
+            "    else:\n",
+            "        return x\n",
+            "    return 0\n",
+        ),
+        "del_break_else.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "def g(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        if i > 2:\n",
+            "            del x\n",
+            "            break\n",
+            "    return x\n",
+        ),
+        "del_break_after.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// `finally` runs on every way out of the try, a return inside included
+/// (Devin review on #323).
+#[test]
+fn a_finally_after_a_return_still_sees_the_deletion() {
+    let err = compile_err(
+        concat!(
+            "def f() -> int:\n",
+            "    x = 1\n",
+            "    try:\n",
+            "        del x\n",
+            "        return 0\n",
+            "    finally:\n",
+            "        print(x)\n",
+        ),
+        "del_finally.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// An exception may leave the try body between the `del` and the
+/// rebinding, so the handler sees the deletion (Devin review on #323).
+#[test]
+fn a_handler_sees_a_deletion_a_raise_may_interrupt() {
+    let err = compile_err(
+        concat!(
+            "def may_raise() -> None:\n",
+            "    raise ValueError(\"x\")\n",
+            "\n",
+            "def f() -> int:\n",
+            "    x = 1\n",
+            "    try:\n",
+            "        del x\n",
+            "        may_raise()\n",
+            "        x = 2\n",
+            "    except ValueError:\n",
+            "        return x\n",
+            "    return x\n",
+        ),
+        "del_handler.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// A `global xs` in a nested def names the module's binding, not the
+/// enclosing parameter (Devin review on #323): mutating it is no
+/// mutation of the argument, so passing and reusing the argument is not
+/// the aliasing refusal.
+#[test]
+fn a_global_declaration_in_a_nested_def_is_not_the_outer_parameter() {
+    let result = compile_result(
+        concat!(
+            "xs: list[int] = []\n",
+            "\n",
+            "def touch(xs: list[int]) -> int:\n",
+            "    def bump() -> None:\n",
+            "        global xs\n",
+            "        xs.append(1)\n",
+            "    bump()\n",
+            "    return len(xs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    a = [1, 2]\n",
+            "    touch(a)\n",
+            "    print(a)\n",
+        ),
+        "alias_global.py",
+    );
+    let text = match &result {
+        Ok(out) => out.clone(),
+        Err(err) => err.clone(),
+    };
+    assert!(!text.contains("mutates it"), "result: {}", text);
+}
+
+/// A self-referential alias chain is followed by NAME, so a string
+/// forward reference to the alias being defined is a cycle the guard
+/// cuts — not a fresh node at every hop until the stack overflows (Devin
+/// review on #323).
+#[test]
+fn a_self_referential_string_alias_does_not_overflow() {
+    let result = compile_result(
+        concat!(
+            "from typing import Sequence, Union\n",
+            "JsonType = Union[int, str, Sequence[\"JsonType\"]]\n",
+            "\n",
+            "def depth(x: JsonType) -> int:\n",
+            "    return 1\n",
+        ),
+        "alias_cycle.py",
+    );
+    // Either outcome is acceptable; returning at all is the pin.
+    let _ = result;
+}
+
+/// `except E as e` unbinds `e` on every way out of the handler (Python's
+/// implicit `del e`), so a read after the handler is loud (Devin review
+/// on #323).
+#[test]
+fn an_except_as_name_is_unbound_after_its_handler() {
+    let err = compile_err(
+        concat!(
+            "def f() -> None:\n",
+            "    e = 1\n",
+            "    del e\n",
+            "    try:\n",
+            "        raise ValueError(\"x\")\n",
+            "    except ValueError as e:\n",
+            "        pass\n",
+            "    print(e)\n",
+        ),
+        "del_except_after.py",
+    );
+    assert!(err.contains("del e"), "error: {}", err);
+}
+
+/// A `for` target is bound only when the loop body runs: after `del x`,
+/// a loop over an empty iterable leaves `x` unbound (Devin review on
+/// #323).
+#[test]
+fn an_empty_loop_does_not_rebind_a_deleted_target() {
+    let err = compile_err(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    for x in xs:\n",
+            "        pass\n",
+            "    return x\n",
+        ),
+        "del_empty_loop.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    // Inside the body the target is bound.
+    let out = compile(
+        concat!(
+            "def g(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    t = 0\n",
+            "    for x in xs:\n",
+            "        t = t + x\n",
+            "    return t\n",
+        ),
+        "del_loop_body.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// Two modules re-exporting the same annotation name from each other are
+/// a cycle the name-keyed guard cuts (a boxed or loud result), not a
+/// stack overflow (Devin review on #323).
+#[test]
+fn a_cross_module_re_export_cycle_does_not_overflow() {
+    let a = parse(
+        concat!(
+            "from b import T\n",
+            "\n",
+            "def f(x: T) -> int:\n",
+            "    return 1\n",
+        ),
+        "a.py",
+    )
+    .unwrap();
+    let b = parse("from a import T\n", "b.py").unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["a".to_string()], std::rc::Rc::new(a.clone()));
+    defs.insert(vec!["b".to_string()], std::rc::Rc::new(b));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let symbols = a.clone().find_symbols(SymbolTableScopes::new());
+    // Either outcome is acceptable; returning at all is the pin.
+    let _ = a.to_rust(CodeGenContext::Module("a".to_string()), options, symbols);
+}
+
+/// `finally` runs on a pending `break` / `continue` too, and its state is
+/// what leaves the try (Devin review on #323): a `finally: del x` on a
+/// break path deletes `x` past the loop; a `finally: x = 2` on it rebinds.
+#[test]
+fn a_finally_on_an_abrupt_path_is_what_leaves_the_try() {
+    let err = compile_err(
+        concat!(
+            "def f() -> int:\n",
+            "    x = 1\n",
+            "    for _ in range(1):\n",
+            "        try:\n",
+            "            break\n",
+            "        finally:\n",
+            "            del x\n",
+            "    return x\n",
+        ),
+        "del_finally_break.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "def g(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        try:\n",
+            "            continue\n",
+            "        finally:\n",
+            "            del x\n",
+            "    return x\n",
+        ),
+        "del_finally_continue.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    // The break path deletes, the finally rebinds before the break lands;
+    // the zero-iteration path never deleted.
+    let out = compile(
+        concat!(
+            "def h(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        try:\n",
+            "            del x\n",
+            "            break\n",
+            "        finally:\n",
+            "            x = 2\n",
+            "    return x\n",
+        ),
+        "rebind_finally_break.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}

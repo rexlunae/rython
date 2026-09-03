@@ -34,6 +34,7 @@ pub use constant::*;
 pub mod expression;
 pub mod hierarchy;
 pub mod shared;
+pub mod visit;
 pub use expression::*;
 
 pub mod function_def;

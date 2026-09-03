@@ -1,0 +1,123 @@
+{
+  "converter_commit": "dae6cda",
+  "repo_head": "d5498d5",
+  "rypip_path": "target/release/rypip",
+  "oracle": "CPython 3.11.15",
+  "passed": 5,
+  "total": 13,
+  "passing": [
+    "clauses",
+    "inventory",
+    "ledger",
+    "shapes",
+    "views"
+  ],
+  "programs": {
+    "bank": {
+      "program": "bank",
+      "warnings": 3,
+      "status": "build-failed",
+      "errors": 11,
+      "histogram": {
+        "E0308": 8,
+        "E0425": 2,
+        "E0599": 1
+      }
+    },
+    "clauses": {
+      "program": "clauses",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "inventory": {
+      "program": "inventory",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "ledger": {
+      "program": "ledger",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 3,
+      "histogram": {
+        "E0425": 1,
+        "E0061": 1,
+        "E0277": 1
+      }
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 13,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0277": 3,
+        "E0308": 2,
+        "E0282": 1
+      }
+    },
+    "records": {
+      "program": "records",
+      "warnings": 4,
+      "status": "build-failed",
+      "errors": 16,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 4,
+        "E0599": 3,
+        "E0615": 3,
+        "E0369": 1
+      }
+    },
+    "schedule": {
+      "program": "schedule",
+      "status": "convert-failed",
+      "detail": ") -> core::result::Result<(), anyhow::Error>, core::result::Result<(), anyhow::Error>>\n   5: std::rt::lang_start::<core::result::Result<(), anyhow::Error>>::{closure#0}\n   6: std::rt::lang_start_internal\n   7: main\n   8: __libc_start_call_main\n             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n   9: __libc_start_main_impl\n             at ./csu/../csu/libc-start.c:360:3\n  10: _start"
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 9,
+      "histogram": {
+        "E0599": 4,
+        "E0308": 3,
+        "E0277": 2
+      }
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0308": 5,
+        "E0599": 1
+      }
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 1,
+      "histogram": {
+        "E0072": 1
+      }
+    },
+    "views": {
+      "program": "views",
+      "warnings": 0,
+      "status": "pass"
+    }
+  }
+}

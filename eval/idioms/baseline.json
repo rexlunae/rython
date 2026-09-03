@@ -4,6 +4,9 @@
       "status": "build-failed",
       "errors": 11
     },
+    "clauses": {
+      "status": "pass"
+    },
     "inventory": {
       "status": "pass"
     },
@@ -12,7 +15,7 @@
     },
     "matrix": {
       "status": "build-failed",
-      "errors": 4
+      "errors": 3
     },
     "pipeline": {
       "status": "build-failed",
@@ -23,8 +26,7 @@
       "errors": 16
     },
     "schedule": {
-      "status": "build-failed",
-      "errors": 10
+      "status": "convert-failed"
     },
     "shapes": {
       "status": "pass"

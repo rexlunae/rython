@@ -9,6 +9,7 @@ use crate::{
     JoinedStr, Lambda, ListComp, Name, NamedExpr, Node, PythonOptions, Set, SetComp, Starred,
     Subscript, SymbolTableScopes, Tuple, UnaryOp, Yield, YieldFrom,
 };
+use crate::ast::tree::visit::{self, Descend, Flow};
 
 /// Mostly this shouldn't be used, but it exists so that we don't have to manually implement FromPyObject on all of ExprType
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -230,16 +231,7 @@ impl<'a> CodeGen for ExprType {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        thread_local! {
-            static E_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let d = E_DEPTH.with(|c| c.get());
-        if d > 100 && d % 20 == 0 {
-        }
-        E_DEPTH.with(|c| c.set(d + 1));
-        let result = self.to_rust_inner(ctx, options, symbols);
-        E_DEPTH.with(|c| c.set(d));
-        return result;
+        self.to_rust_inner(ctx, options, symbols)
     }
 }
 
@@ -1276,12 +1268,6 @@ pub fn isinstance_narrowing(
     Some((n.id.clone(), body_ty, else_ty))
 }
 
-/// Issue #125: update the function-level narrowed set after a statement.
-/// An `if x is not None: <body> else: <else>` where BOTH branches leave x
-/// non-None narrows x for the rest of the function. Any statement that can
-/// assign None to a narrowed name drops it from the set (a store of a
-/// possibly-None value — conservative: an `x = ...` whose value is not
-/// statically non-None removes x).
 /// Whether a statement WRITES (rebinds) `name` anywhere — an else
 /// branch that rebinds the narrowed name invalidates the is-None
 /// early-exit narrowing (the following statements can then see a fresh
@@ -1292,74 +1278,34 @@ pub fn isinstance_narrowing(
 /// Attribute and subscript stores do NOT rebind the name — they mutate
 /// the object (Devin review on #283/#284).
 pub(crate) fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
+    // A nested def or class is visited for its HEADER (`stmt_binds_name`:
+    // the name, decorators, defaults, annotations and bases evaluate in
+    // the enclosing scope) but its body runs in its own scope and is not
+    // entered.
+    !visit::walk_stmts(std::slice::from_ref(stmt), Descend::SkipDefs, &mut |s| {
+        let writes = visit::stmt_targets(s).into_iter().any(|t| expr_writes_name(t, name))
+            || visit::stmt_exprs(s).into_iter().any(|e| expr_walrus_binds(e, name))
+            || stmt_binds_name(s, name);
+        if writes { Flow::Stop } else { Flow::Continue }
+    })
+}
+
+/// The bindings of `name` a statement makes OUTSIDE its targets and its
+/// evaluated expressions (those `stmt_writes_name` reads off the
+/// visitor's enumerations): `del`, `global` / `nonlocal`, an `except ...
+/// as` clause, imports, and a def's or class's header.
+fn stmt_binds_name(stmt: &crate::Statement, name: &str) -> bool {
+    use crate::StatementType as S;
     match &stmt.statement {
-        crate::StatementType::Assign(a) => {
-            a.targets.iter().any(|t| expr_writes_name(t, name))
-                || expr_walrus_binds(&a.value, name)
-        }
-        crate::StatementType::AugAssign(a) => expr_writes_name(&a.target, name),
-        crate::StatementType::AnnotatedName { .. } => false,
-        crate::StatementType::Delete(targets) => {
-            targets.iter().any(|t| expr_writes_name(t, name))
-        }
-        crate::StatementType::Expr(e) => expr_walrus_binds(&e.value, name),
-        crate::StatementType::Global(names) | crate::StatementType::Nonlocal(names) => {
-            names.iter().any(|n| n == name)
-        }
-        crate::StatementType::For(f) => {
-            expr_writes_name(&f.target, name)
-                || f.body.iter().chain(f.orelse.iter()).any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::AsyncFor(f) => {
-            expr_writes_name(&f.target, name)
-                || f.body.iter().chain(f.orelse.iter()).any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::While(w) => {
-            expr_walrus_binds(&w.test, name)
-                || w.body
-                    .iter()
-                    .chain(w.orelse.iter())
-                    .any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::If(i) => {
-            expr_walrus_binds(&i.test, name)
-                || i.body
-                    .iter()
-                    .chain(i.orelse.iter())
-                    .any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::With(w) => {
-            w.items.iter().any(|item| {
-                item.optional_vars
+        S::Delete(targets) => targets.iter().any(|t| expr_writes_name(t, name)),
+        S::Global(names) | S::Nonlocal(names) => names.iter().any(|n| n == name),
+        S::Try(t) => t.handlers.iter().any(|h| {
+            h.name.as_deref() == Some(name)
+                || h.exception_type
                     .as_ref()
-                    .is_some_and(|v| expr_writes_name(v, name))
-                    || expr_walrus_binds(&item.context_expr, name)
-            }) || w.body.iter().any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::AsyncWith(w) => {
-            w.items.iter().any(|item| {
-                item.optional_vars
-                    .as_ref()
-                    .is_some_and(|v| expr_writes_name(v, name))
-                    || expr_walrus_binds(&item.context_expr, name)
-            }) || w.body.iter().any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::Try(t) => {
-            let handler_binds = t.handlers.iter().any(|h| {
-                h.name.as_deref() == Some(name)
-                    || h.exception_type
-                        .as_ref()
-                        .is_some_and(|e| expr_walrus_binds(e, name))
-                    || h.body.iter().any(|b| stmt_writes_name(b, name))
-            });
-            handler_binds
-                || t.body
-                    .iter()
-                    .chain(t.orelse.iter())
-                    .chain(t.finalbody.iter())
-                    .any(|b| stmt_writes_name(b, name))
-        }
-        crate::StatementType::Import(im) => im.names.iter().any(|a| {
+                    .is_some_and(|e| expr_walrus_binds(e, name))
+        }),
+        S::Import(im) => im.names.iter().any(|a| {
             if let Some(asname) = a.asname.as_deref() {
                 // An ALIASED `import pkg.mod as alias` binds only the
                 // alias — the package name is untouched (Devin review on
@@ -1370,16 +1316,16 @@ pub(crate) fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
                 a.name == name || a.name.split('.').next() == Some(name)
             }
         }),
-        crate::StatementType::ImportFrom(im) => im.names.iter().any(|a| {
-            a.asname.as_deref() == Some(name) || a.name == name
-        }),
-        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+        S::ImportFrom(im) => im
+            .names
+            .iter()
+            .any(|a| a.asname.as_deref() == Some(name) || a.name == name),
+        S::FunctionDef(f) | S::AsyncFunctionDef(f) => {
             // Everything the ENCLOSING scope evaluates when the def runs:
             // decorators, parameter defaults, parameter annotations, and
-            // the return annotation (the body runs in its own scope — not
-            // inspected).
+            // the return annotation.
             let args = &f.args;
-            let param_parts = || {
+            let params = || {
                 args.posonlyargs
                     .iter()
                     .chain(args.args.iter())
@@ -1388,10 +1334,8 @@ pub(crate) fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
                     .chain(args.kwarg.iter())
             };
             f.name == name
-                || f.decorator_list
-                    .iter()
-                    .any(|d| expr_walrus_binds(d, name))
-                || param_parts().any(|p| {
+                || f.decorator_list.iter().any(|d| expr_walrus_binds(d, name))
+                || params().any(|p| {
                     p.annotation
                         .as_deref()
                         .is_some_and(|a| expr_walrus_binds(a, name))
@@ -1406,33 +1350,33 @@ pub(crate) fn stmt_writes_name(stmt: &crate::Statement, name: &str) -> bool {
                     .as_deref()
                     .is_some_and(|r| expr_walrus_binds(r, name))
         }
-        crate::StatementType::ClassDef(c) => {
+        S::ClassDef(c) => {
             // The class HEADER's expressions evaluate in the enclosing
-            // scope: decorators, bases, and keyword values (the body runs
-            // in its own scope — not inspected).
+            // scope: decorators, bases, and keyword values.
             c.name == name
-                || c.decorator_list
-                    .iter()
-                    .any(|d| expr_walrus_binds(d, name))
+                || c.decorator_list.iter().any(|d| expr_walrus_binds(d, name))
                 || c.bases.iter().any(|b| expr_walrus_binds(b, name))
-                || c.keywords
-                    .iter()
-                    .any(|k| expr_walrus_binds(&k.value, name))
+                || c.keywords.iter().any(|k| expr_walrus_binds(&k.value, name))
         }
-        crate::StatementType::Assert { test, msg } => {
-            expr_walrus_binds(test, name)
-                || msg.as_deref().is_some_and(|m| expr_walrus_binds(m, name))
-        }
-        crate::StatementType::Return(r) => r
-            .as_ref()
-            .is_some_and(|e| expr_walrus_binds(&e.value, name)),
-        crate::StatementType::Raise(r) => {
-            r.exc.as_ref().is_some_and(|e| expr_walrus_binds(e, name))
-                || r.cause
-                    .as_ref()
-                    .is_some_and(|e| expr_walrus_binds(e, name))
-        }
-        _ => false,
+        // Every binding of these is a target or an evaluated expression.
+        S::Assign(_)
+        | S::AugAssign(_)
+        | S::AnnotatedName { .. }
+        | S::Expr(_)
+        | S::Call(_)
+        | S::For(_)
+        | S::AsyncFor(_)
+        | S::While(_)
+        | S::If(_)
+        | S::With(_)
+        | S::AsyncWith(_)
+        | S::Assert { .. }
+        | S::Return(_)
+        | S::Raise(_)
+        | S::Pass
+        | S::Break
+        | S::Continue
+        | S::Unimplemented(_) => false,
     }
 }
 
@@ -1456,98 +1400,21 @@ fn expr_writes_name(e: &crate::ExprType, name: &str) -> bool {
 }
 
 /// Whether a WALRUS anywhere in the expression tree binds `name`
-/// (`y = (x := 1)`, `f((x := 2))`, ...).
+/// (`y = (x := 1)`, `f((x := 2))`, ...). A comprehension's loop target is
+/// the comprehension's own and never rebinds the enclosing scope (Devin
+/// review on #285) — `visit::subexprs` leaves it out.
 fn expr_walrus_binds(e: &crate::ExprType, name: &str) -> bool {
-    match e {
-        crate::ExprType::NamedExpr(ne) => {
-            expr_writes_name(&ne.left, name) || expr_walrus_binds(&ne.right, name)
-        }
-        crate::ExprType::Call(c) => {
-            expr_walrus_binds(&c.func, name)
-                || c.args.iter().any(|a| expr_walrus_binds(a, name))
-                || c.keywords.iter().any(|k| expr_walrus_binds(&k.value, name))
-        }
-        crate::ExprType::BoolOp(b) => b.values.iter().any(|v| expr_walrus_binds(v, name)),
-        crate::ExprType::BinOp(b) => {
-            expr_walrus_binds(&b.left, name) || expr_walrus_binds(&b.right, name)
-        }
-        crate::ExprType::UnaryOp(u) => expr_walrus_binds(&u.operand, name),
-        crate::ExprType::IfExp(i) => {
-            expr_walrus_binds(&i.test, name)
-                || expr_walrus_binds(&i.body, name)
-                || expr_walrus_binds(&i.orelse, name)
-        }
-        crate::ExprType::Dict(d) => {
-            d.keys.iter().flatten().any(|k| expr_walrus_binds(k, name))
-                || d.values.iter().any(|v| expr_walrus_binds(v, name))
-        }
-        crate::ExprType::Set(s) => s.elts.iter().any(|x| expr_walrus_binds(x, name)),
-        crate::ExprType::List(items) => items.iter().any(|x| expr_walrus_binds(x, name)),
-        crate::ExprType::Tuple(t) => t.elts.iter().any(|x| expr_walrus_binds(x, name)),
-        crate::ExprType::Subscript(s) => {
-            expr_walrus_binds(&s.value, name)
-                || match &s.kind {
-                    crate::SubscriptKind::Index(i) => expr_walrus_binds(i, name),
-                    crate::SubscriptKind::Slice { lower, upper, step } => {
-                        lower.as_deref().is_some_and(|b| expr_walrus_binds(b, name))
-                            || upper.as_deref().is_some_and(|b| expr_walrus_binds(b, name))
-                            || step.as_deref().is_some_and(|b| expr_walrus_binds(b, name))
-                    }
-                }
-        }
-        crate::ExprType::Attribute(a) => expr_walrus_binds(&a.value, name),
-        crate::ExprType::Compare(c) => {
-            expr_walrus_binds(&c.left, name)
-                || c.comparators.iter().any(|x| expr_walrus_binds(x, name))
-        }
-        crate::ExprType::Starred(s) => expr_walrus_binds(&s.value, name),
-        crate::ExprType::JoinedStr(j) => {
-            j.values.iter().any(|v| expr_walrus_binds(v, name))
-        }
-        crate::ExprType::FormattedValue(f) => expr_walrus_binds(&f.value, name),
-        crate::ExprType::Await(a) => expr_walrus_binds(&a.value, name),
-        crate::ExprType::Yield(y) => y
-            .value
-            .as_deref()
-            .is_some_and(|v| expr_walrus_binds(v, name)),
-        crate::ExprType::YieldFrom(y) => expr_walrus_binds(&y.value, name),
-        crate::ExprType::Lambda(l) => expr_walrus_binds(&l.body, name),
-        crate::ExprType::ListComp(lc) => {
-            expr_walrus_binds(&lc.elt, name)
-                || lc.generators.iter().any(|g| {
-                    // The comp's loop TARGET is scoped to the
-                    // comprehension in Python — it does NOT rebind the
-                    // enclosing function's name (Devin review on #285).
-                    expr_walrus_binds(&g.iter, name)
-                        || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
-                })
-        }
-        crate::ExprType::SetComp(sc) => {
-            expr_walrus_binds(&sc.elt, name)
-                || sc.generators.iter().any(|g| {
-                    expr_walrus_binds(&g.iter, name)
-                        || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
-                })
-        }
-        crate::ExprType::DictComp(dc) => {
-            expr_walrus_binds(&dc.value, name)
-                || expr_walrus_binds(&dc.key, name)
-                || dc.generators.iter().any(|g| {
-                    expr_walrus_binds(&g.iter, name)
-                        || g.ifs.iter().any(|i| expr_walrus_binds(i, name))
-                })
-        }
-        crate::ExprType::GeneratorExp(g) => {
-            expr_walrus_binds(&g.elt, name)
-                || g.generators.iter().any(|comp| {
-                    expr_walrus_binds(&comp.iter, name)
-                        || comp.ifs.iter().any(|i| expr_walrus_binds(i, name))
-                })
-        }
-        _ => false,
-    }
+    visit::any_expr(e, |x| {
+        matches!(x, crate::ExprType::NamedExpr(ne) if expr_writes_name(&ne.left, name))
+    })
 }
 
+/// Issue #125: update the function-level narrowed set after a statement.
+/// An `if x is not None: <body> else: <else>` where BOTH branches leave x
+/// non-None narrows x for the rest of the function. Any statement that can
+/// assign None to a narrowed name drops it from the set (a store of a
+/// possibly-None value — conservative: an `x = ...` whose value is not
+/// statically non-None removes x).
 pub fn update_narrowed_after_statement(
     stmt: &crate::Statement,
     narrowed: &mut std::collections::HashMap<String, crate::TypeInfo>,
