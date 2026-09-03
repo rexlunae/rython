@@ -45,6 +45,7 @@ use crate::{
     Assign, CodeGen, CodeGenContext, ExprType, FunctionDef, PythonOptions, Statement,
     StatementType, SymbolTableNode, SymbolTableScopes,
 };
+use crate::ast::tree::visit::{self, Descend, Flow};
 use pyo3::{Borrowed, PyAny, PyResult};
 
 use serde::{Deserialize, Serialize};
@@ -2268,60 +2269,38 @@ struct FieldStore<'a> {
 /// Collect `self.attr = ...` stores anywhere in a body (recursing into
 /// control flow), in first-store order.
 fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>) {
-    for stmt in body {
-        match &stmt.statement {
-            // A bare ANNOTATED declaration (`self._trusted_host_adapter:
-            // InsecureCacheControlAdapter | InsecureHTTPAdapter` — pip's
-            // PipSession): pins the field type even though nothing is
-            // stored on that statement.
-            StatementType::AnnotatedName { name, annotation } => {
-                let name = name.to_string();
-                if let Some(attr) = name.strip_prefix("self.") {
+    // Nested defs and classes stay out: a `self.x = ...` in a closure or
+    // a nested class runs on that scope's schedule (if ever), not the
+    // constructor's, so it declares no field of this class.
+    visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        // A bare ANNOTATED declaration (`self._trusted_host_adapter:
+        // InsecureCacheControlAdapter | InsecureHTTPAdapter` — pip's
+        // PipSession): pins the field type even though nothing is
+        // stored on that statement.
+        if let StatementType::AnnotatedName { name, annotation } = &stmt.statement
+            && let Some(attr) = name.strip_prefix("self.")
+        {
+            out.push(FieldStore {
+                attr: attr.to_string(),
+                value: &crate::ExprType::NoneType(crate::ast::tree::constant::Constant(None)),
+                annotation: Some(annotation),
+            });
+        }
+        if let StatementType::Assign(assign) = &stmt.statement {
+            for target in &assign.targets {
+                if let ExprType::Attribute(attr) = target
+                    && visit::is_self(attr.value.as_ref())
+                {
                     out.push(FieldStore {
-                        attr: attr.to_string(),
-                        value: &crate::ExprType::NoneType(
-                            crate::ast::tree::constant::Constant(None),
-                        ),
-                        annotation: Some(annotation),
+                        attr: attr.attr.clone(),
+                        value: &assign.value,
+                        annotation: assign.annotation.as_ref(),
                     });
                 }
             }
-            StatementType::Assign(assign) => {
-                for target in &assign.targets {
-                    if let ExprType::Attribute(attr) = target {
-                        if crate::ast::tree::visit::is_self(attr.value.as_ref()) {
-                            out.push(FieldStore {
-                                attr: attr.attr.clone(),
-                                value: &assign.value,
-                                annotation: assign.annotation.as_ref(),
-                            });
-                        }
-                    }
-                }
-            }            StatementType::If(s) => {
-                collect_field_stores(&s.body, out);
-                collect_field_stores(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_field_stores(&s.body, out);
-                collect_field_stores(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_field_stores(&s.body, out);
-                collect_field_stores(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_field_stores(&s.body, out),
-            StatementType::Try(s) => {
-                collect_field_stores(&s.body, out);
-                for h in &s.handlers {
-                    collect_field_stores(&h.body, out);
-                }
-                collect_field_stores(&s.orelse, out);
-                collect_field_stores(&s.finalbody, out);
-            }
-            _ => {}
         }
-    }
+        Flow::Continue
+    });
 }
 
 impl CodeGen for ClassDef {
@@ -5579,159 +5558,30 @@ enum ObservedStore {
 }
 
 /// Every `self.X` attribute READ in a body, recursing through control
-/// flow and nested expressions (issue #137 round 23). Used to find the
-/// attributes a class uses but never assigns — the ones its base owns.
-///
-/// Expression and statement shapes this does not model contribute
-/// NOTHING, deliberately: a missed read leaves the status quo (the
+/// flow, nested expressions and nested defs (issue #137 round 23). Used
+/// to find the attributes a class uses but never assigns — the ones its
+/// base owns. A read this walk misses costs only the status quo (the
 /// attribute stays unknown and the generated crate fails loudly on it),
 /// which is always safer than synthesizing a field the class does not
 /// really have.
-fn collect_self_attr_reads(
-    body: &[Statement],
-    out: &mut std::collections::BTreeSet<String>,
-) {
-    fn walk_expr(e: &ExprType, out: &mut std::collections::BTreeSet<String>) {
-        match e {
-            ExprType::Attribute(a) => {
-                if crate::ast::tree::visit::is_self(a.value.as_ref()) {
+fn collect_self_attr_reads(body: &[Statement], out: &mut std::collections::BTreeSet<String>) {
+    visit::walk_stmts(body, Descend::All, &mut |stmt| {
+        // A nested class's `self` is another object: its reads say
+        // nothing about this class's attributes.
+        if matches!(stmt.statement, StatementType::ClassDef(_)) {
+            return Flow::Skip;
+        }
+        for e in visit::stmt_all_exprs(stmt) {
+            visit::walk_expr(e, &mut |e| {
+                if let ExprType::Attribute(a) = e
+                    && visit::is_self(a.value.as_ref())
+                {
                     out.insert(a.attr.clone());
                 }
-                walk_expr(&a.value, out);
-            }
-            ExprType::Call(c) => {
-                walk_expr(&c.func, out);
-                for a in &c.args {
-                    walk_expr(a, out);
-                }
-                for kw in &c.keywords {
-                    walk_expr(&kw.value, out);
-                }
-            }
-            ExprType::BinOp(op) => {
-                walk_expr(&op.left, out);
-                walk_expr(&op.right, out);
-            }
-            ExprType::BoolOp(op) => {
-                for v in &op.values {
-                    walk_expr(v, out);
-                }
-            }
-            ExprType::UnaryOp(op) => walk_expr(&op.operand, out),
-            ExprType::Compare(cmp) => {
-                walk_expr(&cmp.left, out);
-                for c in &cmp.comparators {
-                    walk_expr(c, out);
-                }
-            }
-            ExprType::IfExp(e) => {
-                walk_expr(&e.test, out);
-                walk_expr(&e.body, out);
-                walk_expr(&e.orelse, out);
-            }
-            ExprType::NamedExpr(e) => walk_expr(&e.right, out),
-            ExprType::Dict(d) => {
-                for k in d.keys.iter().flatten() {
-                    walk_expr(k, out);
-                }
-                for v in &d.values {
-                    walk_expr(v, out);
-                }
-            }
-            ExprType::Set(s) => {
-                for e in &s.elts {
-                    walk_expr(e, out);
-                }
-            }
-            ExprType::List(elts) => {
-                for e in elts {
-                    walk_expr(e, out);
-                }
-            }
-            ExprType::Tuple(t) => {
-                for e in &t.elts {
-                    walk_expr(e, out);
-                }
-            }
-            ExprType::Subscript(sub) => {
-                walk_expr(&sub.value, out);
-                match &sub.kind {
-                    crate::SubscriptKind::Index(i) => walk_expr(i, out),
-                    crate::SubscriptKind::Slice { lower, upper, step } => {
-                        for o in [lower, upper, step].into_iter().flatten() {
-                            walk_expr(o, out);
-                        }
-                    }
-                }
-            }
-            ExprType::Starred(s) => walk_expr(&s.value, out),
-            ExprType::Await(e) => walk_expr(&e.value, out),
-            ExprType::Yield(y) => {
-                if let Some(v) = &y.value {
-                    walk_expr(v, out);
-                }
-            }
-            ExprType::YieldFrom(y) => walk_expr(&y.value, out),
-            ExprType::FormattedValue(f) => walk_expr(&f.value, out),
-            ExprType::JoinedStr(j) => {
-                for v in &j.values {
-                    walk_expr(v, out);
-                }
-            }
-            _ => {}
+            });
         }
-    }
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Expr(e) => walk_expr(&e.value, out),
-            StatementType::Call(c) => walk_expr(&ExprType::Call(c.clone()), out),
-            StatementType::Return(Some(e)) => walk_expr(&e.value, out),
-            StatementType::Assign(a) => {
-                walk_expr(&a.value, out);
-                for t in &a.targets {
-                    walk_expr(t, out);
-                }
-            }
-            StatementType::AugAssign(a) => {
-                walk_expr(&a.target, out);
-                walk_expr(&a.value, out);
-            }
-            StatementType::If(i) => {
-                walk_expr(&i.test, out);
-                collect_self_attr_reads(&i.body, out);
-                collect_self_attr_reads(&i.orelse, out);
-            }
-            StatementType::While(w) => {
-                walk_expr(&w.test, out);
-                collect_self_attr_reads(&w.body, out);
-                collect_self_attr_reads(&w.orelse, out);
-            }
-            StatementType::For(f) => {
-                walk_expr(&f.iter, out);
-                collect_self_attr_reads(&f.body, out);
-                collect_self_attr_reads(&f.orelse, out);
-            }
-            StatementType::AsyncFor(f) => {
-                walk_expr(&f.iter, out);
-                collect_self_attr_reads(&f.body, out);
-                collect_self_attr_reads(&f.orelse, out);
-            }
-            StatementType::With(w) => collect_self_attr_reads(&w.body, out),
-            StatementType::AsyncWith(w) => collect_self_attr_reads(&w.body, out),
-            StatementType::Try(t) => {
-                collect_self_attr_reads(&t.body, out);
-                for h in &t.handlers {
-                    collect_self_attr_reads(&h.body, out);
-                }
-                collect_self_attr_reads(&t.orelse, out);
-                collect_self_attr_reads(&t.finalbody, out);
-            }
-            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
-                collect_self_attr_reads(&f.body, out);
-            }
-            _ => {}
-        }
-    }
+        Flow::Continue
+    });
 }
 
 impl ClassDef {

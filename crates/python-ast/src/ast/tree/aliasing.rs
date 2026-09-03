@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::tree::StatementType;
+use crate::ast::tree::visit::{self, Descend};
 use crate::{ExprType, FunctionDef, Statement, SymbolTableNode, SymbolTableScopes, TypeInfo};
 
 /// Methods that mutate their receiver in place, for the container types
@@ -152,32 +153,6 @@ impl<'a> AliasingGuard<'a> {
                     self.visit_call(c, lineno);
                 }
                 StatementType::Expr(e) => self.visit_expr(&e.value),
-                StatementType::If(i) => {
-                    self.walk(&i.body);
-                    self.walk(&i.orelse);
-                }
-                StatementType::For(f) => {
-                    self.walk(&f.body);
-                    self.walk(&f.orelse);
-                }
-                StatementType::AsyncFor(f) => {
-                    self.walk(&f.body);
-                    self.walk(&f.orelse);
-                }
-                StatementType::While(w) => {
-                    self.walk(&w.body);
-                    self.walk(&w.orelse);
-                }
-                StatementType::Try(t) => {
-                    self.walk(&t.body);
-                    for handler in &t.handlers {
-                        self.walk(&handler.body);
-                    }
-                    self.walk(&t.orelse);
-                    self.walk(&t.finalbody);
-                }
-                StatementType::With(w) => self.walk(&w.body),
-                StatementType::AsyncWith(w) => self.walk(&w.body),
                 StatementType::Return(Some(e)) => self.visit_expr(&e.value),
                 StatementType::Raise(r) => {
                     if let Some(exc) = &r.exc {
@@ -221,6 +196,19 @@ impl<'a> AliasingGuard<'a> {
                 | StatementType::Continue
                 | StatementType::Return(None)
                 | StatementType::Unimplemented(_) => {}
+                // Control flow: the guard reads none of a statement's own
+                // expressions here (an `if` test, a `for` iterable, a
+                // `with` context); the bodies are walked below.
+                StatementType::If(_)
+                | StatementType::For(_)
+                | StatementType::AsyncFor(_)
+                | StatementType::While(_)
+                | StatementType::Try(_)
+                | StatementType::With(_)
+                | StatementType::AsyncWith(_) => {}
+            }
+            for nested in visit::stmt_bodies_for(stmt, Descend::SkipDefs) {
+                self.walk(nested);
             }
         }
     }
@@ -451,85 +439,31 @@ fn function_mutates_param(func: &FunctionDef, index: usize) -> bool {
     else {
         return false;
     };
-    let name = &param.arg;
-    let mut found = false;
-    scan_mutations(&func.body, name, &mut found);
-    found
+    scan_mutations(&func.body, &param.arg)
 }
 
-fn scan_mutations(body: &[Statement], name: &str, found: &mut bool) {
-    if *found {
-        return;
-    }
-    for stmt in body {
-        if *found {
-            return;
-        }
-        match &stmt.statement {
-            StatementType::Assign(a) => {
-                // `param[i] = v` mutates the container; a bare-name target
-                // rebinds the local parameter, which does not touch the
-                // caller's object.
-                for target in &a.targets {
-                    if let ExprType::Subscript(_) = target {
-                        if root_name_of(target) == Some(name) {
-                            *found = true;
-                        }
-                    }
-                }
-            }
-            StatementType::AugAssign(a) => {
-                if root_name_of(&a.target) == Some(name) {
-                    *found = true;
-                }
-            }
-            StatementType::Call(c) => {
-                if let ExprType::Attribute(attr) = c.func.as_ref() {
-                    if root_name_of(&attr.value) == Some(name)
-                        && MUTATING_METHODS.contains(&attr.attr.as_str())
-                    {
-                        *found = true;
-                    }
-                }
-            }
-            StatementType::Expr(e) => {
-                if let ExprType::Call(c) = &e.value {
-                    if let ExprType::Attribute(attr) = c.func.as_ref() {
-                        if root_name_of(&attr.value) == Some(name)
-                            && MUTATING_METHODS.contains(&attr.attr.as_str())
-                        {
-                            *found = true;
-                        }
-                    }
-                }
-            }
-            StatementType::If(i) => {
-                scan_mutations(&i.body, name, found);
-                scan_mutations(&i.orelse, name, found);
-            }
-            StatementType::For(f) => {
-                scan_mutations(&f.body, name, found);
-                scan_mutations(&f.orelse, name, found);
-            }
-            StatementType::AsyncFor(f) => {
-                scan_mutations(&f.body, name, found);
-                scan_mutations(&f.orelse, name, found);
-            }
-            StatementType::While(w) => {
-                scan_mutations(&w.body, name, found);
-                scan_mutations(&w.orelse, name, found);
-            }
-            StatementType::Try(t) => {
-                scan_mutations(&t.body, name, found);
-                for handler in &t.handlers {
-                    scan_mutations(&handler.body, name, found);
-                }
-                scan_mutations(&t.orelse, name, found);
-                scan_mutations(&t.finalbody, name, found);
-            }
-            StatementType::With(w) => scan_mutations(&w.body, name, found),
-            StatementType::AsyncWith(w) => scan_mutations(&w.body, name, found),
-            _ => {}
-        }
-    }
+/// Whether `body` mutates the container bound to `name`: a subscript
+/// store (`name[i] = v`), an augmented assignment rooted at it (`name +=
+/// v`, `name.n += 1`), a `del name[i]`, or a mutating-method call on it
+/// anywhere in a statement's expressions (`x = name.pop()` included). A
+/// bare-name store only rebinds the local, which does not touch the
+/// caller's object.
+fn scan_mutations(body: &[Statement], name: &str) -> bool {
+    let rooted = |e: &ExprType| root_name_of(e) == Some(name);
+    visit::any_stmt(body, Descend::All, |stmt| {
+        let aug = matches!(stmt.statement, StatementType::AugAssign(_));
+        let stores = visit::stmt_targets(stmt)
+            .into_iter()
+            .any(|t| (aug || matches!(t, ExprType::Subscript(_))) && rooted(t));
+        let deletes = matches!(&stmt.statement, StatementType::Delete(targets)
+            if targets.iter().any(|t| matches!(t, ExprType::Subscript(_)) && rooted(t)));
+        let calls = visit::stmt_all_exprs(stmt).into_iter().any(|e| {
+            visit::any_expr(e, |e| {
+                matches!(e, ExprType::Call(c)
+                    if matches!(c.func.as_ref(), ExprType::Attribute(attr)
+                        if rooted(&attr.value) && MUTATING_METHODS.contains(&attr.attr.as_str())))
+            })
+        });
+        stores || deletes || calls
+    })
 }

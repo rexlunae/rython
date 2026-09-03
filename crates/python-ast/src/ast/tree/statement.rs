@@ -7,6 +7,7 @@ use crate::{
     CodeGen, CodeGenContext, Expr, ExprType, For, FunctionDef, If, Import, ImportFrom, Node,
     PythonOptions, Raise, StatementNotYetImplemented, SymbolTableScopes, Try, While, With,
 };
+use crate::ast::tree::visit::{self, Descend, Flow};
 
 use tracing::debug;
 
@@ -433,65 +434,33 @@ fn name_binds_dropped_call(
     }
 }
 
-/// Whether a statement list contains a function-level `return` anywhere —
-/// looking through control flow (including nested trys and their handlers)
-/// but not into nested function or class definitions. The try lowering uses
-/// this to pick its closure's carrier type: bodies with returns thread the
-/// returned value out through PyFlow.
 /// Does this statement list contain a `break`/`continue` that targets a
 /// loop OUTSIDE the list? A loop nested *within* the list owns its own
 /// breaks, so its body is not searched — but its `else` clause is, since
 /// a break there targets the enclosing loop, as in Python. Nested
 /// function and class bodies are separate scopes and never searched.
 pub fn body_breaks_outward(body: &[Statement]) -> bool {
-    body.iter().any(|stmt| match &stmt.statement {
-        StatementType::Break | StatementType::Continue => true,
-        StatementType::If(s) => {
-            body_breaks_outward(&s.body) || body_breaks_outward(&s.orelse)
-        }
+    !visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| match &stmt.statement {
+        StatementType::Break | StatementType::Continue => Flow::Stop,
         // A loop captures breaks in its BODY; only its else clause can
         // break outward.
-        StatementType::For(s) => body_breaks_outward(&s.orelse),
-        StatementType::While(s) => body_breaks_outward(&s.orelse),
-        StatementType::AsyncFor(s) => body_breaks_outward(&s.orelse),
-        StatementType::Try(s) => {
-            body_breaks_outward(&s.body)
-                || s.handlers.iter().any(|h| body_breaks_outward(&h.body))
-                || body_breaks_outward(&s.orelse)
-                || body_breaks_outward(&s.finalbody)
+        StatementType::For(For { orelse, .. })
+        | StatementType::AsyncFor(AsyncFor { orelse, .. })
+        | StatementType::While(While { orelse, .. }) => {
+            if body_breaks_outward(orelse) { Flow::Stop } else { Flow::Skip }
         }
-        StatementType::With(s) => body_breaks_outward(&s.body),
-        StatementType::AsyncWith(s) => body_breaks_outward(&s.body),
-        _ => false,
+        _ => Flow::Continue,
     })
 }
 
+/// Whether a statement list contains a function-level `return` anywhere —
+/// looking through control flow (including nested trys and their handlers)
+/// but not into nested function or class definitions. The try lowering uses
+/// this to pick its closure's carrier type: bodies with returns thread the
+/// returned value out through PyFlow.
 pub fn body_contains_function_return(body: &[Statement]) -> bool {
-    body.iter().any(|stmt| match &stmt.statement {
-        StatementType::Return(_) => true,
-        StatementType::If(s) => {
-            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
-        }
-        StatementType::For(s) => {
-            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
-        }
-        StatementType::While(s) => {
-            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
-        }
-        StatementType::AsyncFor(s) => {
-            body_contains_function_return(&s.body) || body_contains_function_return(&s.orelse)
-        }
-        StatementType::Try(s) => {
-            body_contains_function_return(&s.body)
-                || s.handlers
-                    .iter()
-                    .any(|h| body_contains_function_return(&h.body))
-                || body_contains_function_return(&s.orelse)
-                || body_contains_function_return(&s.finalbody)
-        }
-        StatementType::With(s) => body_contains_function_return(&s.body),
-        StatementType::AsyncWith(s) => body_contains_function_return(&s.body),
-        _ => false,
+    visit::any_stmt(body, Descend::SkipDefs, |stmt| {
+        matches!(stmt.statement, StatementType::Return(_))
     })
 }
 
@@ -500,22 +469,13 @@ pub fn body_contains_function_return(body: &[Statement]) -> bool {
 /// (whose breaks are their own) or nested definitions. Loops with an `else`
 /// clause only need break-tracking machinery when this is true.
 pub fn loop_body_has_direct_break(body: &[Statement]) -> bool {
-    body.iter().any(|stmt| match &stmt.statement {
-        StatementType::Break => true,
-        StatementType::If(s) => {
-            loop_body_has_direct_break(&s.body) || loop_body_has_direct_break(&s.orelse)
+    !visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| match &stmt.statement {
+        StatementType::Break => Flow::Stop,
+        // A nested loop's breaks are its own.
+        StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => {
+            Flow::Skip
         }
-        StatementType::Try(s) => {
-            loop_body_has_direct_break(&s.body)
-                || s.handlers
-                    .iter()
-                    .any(|h| loop_body_has_direct_break(&h.body))
-                || loop_body_has_direct_break(&s.orelse)
-                || loop_body_has_direct_break(&s.finalbody)
-        }
-        StatementType::With(s) => loop_body_has_direct_break(&s.body),
-        StatementType::AsyncWith(s) => loop_body_has_direct_break(&s.body),
-        _ => false,
+        _ => Flow::Continue,
     })
 }
 
