@@ -17517,6 +17517,211 @@ fn a_mutation_through_a_narrowed_root_typed_name_takes_the_mutable_view() {
     );
 }
 
+/// A TUPLE of class targets on a root-typed value (Devin review on #319)
+/// is the OR of the registry's tests: two subtree classes are two variant
+/// tests, and an ancestor in the tuple makes the check true outright.
+#[test]
+fn a_tuple_of_class_targets_on_a_root_typed_value_ors_the_variant_tests() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "class Rect(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 4.0\n",
+            "\n",
+            "class Blob:\n",
+            "    pass\n",
+            "\n",
+            "def either(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Circle, Rect))\n",
+            "\n",
+            "def any_shape(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Blob, Shape))\n",
+            "\n",
+            "def neither(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Blob,))\n",
+        ),
+        "tupleisinstance.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((s).__rython_is_Circle()||(s).__rython_is_Rect())"),
+        "two subtree targets are two variant tests: {}",
+        out
+    );
+    assert!(
+        flat.contains("fnany_shape(s:AnyShape)->Result<bool,PyException>{returnOk(true);}"),
+        "an ancestor in the tuple is true outright: {}",
+        out
+    );
+    assert!(
+        flat.contains("fnneither(s:AnyShape)->Result<bool,PyException>{returnOk(false);}"),
+        "a tuple of unrelated classes is false: {}",
+        out
+    );
+}
+
+/// `isinstance(other, type(self))` on a root-typed value (Devin review on
+/// #319) is the runtime variant test for the enclosing class — not a fold
+/// of the static root type.
+#[test]
+fn a_type_self_target_on_a_root_typed_value_is_the_variant_test() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "    def same_kind(self, other: \"Shape\") -> bool:\n",
+            "        return isinstance(other, type(self))\n",
+        ),
+        "typeselfisinstance.py",
+    );
+    assert!(
+        out.contains("(other) . __rython_is_Circle ()"),
+        "type(self) in Circle's method tests the Circle variant: {}",
+        out
+    );
+}
+
+/// A mutation through a CHAIN rooted at a narrowed root-typed name
+/// (`s.tags.append(..)`, `s.center.bump()` — Devin review on #319)
+/// renders the whole chain as a place from the mutable view, so the
+/// store lands on the value the name holds, not on the read view's clone.
+#[test]
+fn a_mutation_through_a_chain_rooted_at_a_narrowed_name_takes_the_mutable_view() {
+    let out = compile(
+        concat!(
+            "class Point:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.x += 1\n",
+            "\n",
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[str] = []\n",
+            "        self.center = Point()\n",
+            "\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "def touch(s: Shape) -> None:\n",
+            "    if isinstance(s, Circle):\n",
+            "        s.tags.append(\"t\")\n",
+            "        s.center.bump()\n",
+        ),
+        "nestednarrow.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((s).__rython_as_Circle_mut().unwrap().tags).push("),
+        "the container store goes through the mutable view: {}",
+        out
+    );
+    assert!(
+        flat.contains("((s).__rython_as_Circle_mut().unwrap().center).bump()"),
+        "the composed field's mutating call goes through the mutable view: {}",
+        out
+    );
+}
+
+/// The hierarchy registry is installed per module conversion (Devin
+/// review on #319): a conversion after one that had a hierarchy — on the
+/// same thread, after a FAILED conversion too — sees no root that its own
+/// module does not have.
+#[test]
+fn the_hierarchy_registry_is_per_conversion() {
+    let with_hierarchy = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "def total(s: Shape) -> float:\n",
+            "    return s.area()\n",
+        ),
+        "roots_a.py",
+    );
+    assert!(with_hierarchy.contains("AnyShape"), "{}", with_hierarchy);
+    // A conversion that FAILS between the two (a construct rython refuses)
+    // must not leave the earlier index installed either.
+    let _ = compile_err("@my_decorator\nclass C:\n    pass\n", "roots_fail.py");
+    let without = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "def total(s: Shape) -> float:\n",
+            "    return s.area()\n",
+            "\n",
+            "def is_shape(s: Shape) -> bool:\n",
+            "    return isinstance(s, Shape)\n",
+        ),
+        "roots_b.py",
+    );
+    assert!(
+        !without.contains("AnyShape") && !without.contains("__rython_is_"),
+        "the earlier conversion's roots do not leak: {}",
+        without
+    );
+}
+
+/// `isinstance(x, Base)` on a root-typed value whose root's ANCESTOR is
+/// imported (`Base`, `Mid(Base)` in one module; `isinstance(x: Mid,
+/// Base)` in another — Devin review on #319) is true by the crate-wide
+/// registry: the class tree of the current module cannot see the
+/// imported base.
+#[test]
+fn an_imported_ancestor_of_a_root_is_true_by_the_registry() {
+    let out = compile(
+        concat!(
+            "class Base:\n",
+            "    def tag(self) -> int:\n",
+            "        return 0\n",
+            "\n",
+            "class Mid(Base):\n",
+            "    def tag(self) -> int:\n",
+            "        return 1\n",
+            "\n",
+            "class Leaf(Mid):\n",
+            "    def tag(self) -> int:\n",
+            "        return 2\n",
+            "\n",
+            "def is_base(x: Mid) -> bool:\n",
+            "    return isinstance(x, Base)\n",
+        ),
+        "ancestor.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("fnis_base(x:AnyMid)->Result<bool,PyException>{returnOk(true);}"),
+        "an ancestor of the root is true outright: {}",
+        out
+    );
+}
+
 /// An ALIASED `isinstance` target (`C = Circle`, `isinstance(s, C)`) on a
 /// root-typed value resolves to the class the registry knows.
 #[test]

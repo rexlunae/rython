@@ -19,11 +19,26 @@ class Circle(Shape):
     def name(self) -> str:
         return "circle"
 
+    def same_kind(self, other: "Shape") -> bool:
+        # `type(self)` on a Circle's own method is Circle; `other` is a
+        # root-typed value, so the check is its runtime variant.
+        return isinstance(other, type(self))
+
+
+class Corner:
+    def __init__(self):
+        self.x = 0
+
+    def bump(self) -> None:
+        self.x += 1
+
 
 class Rect(Shape):
     def __init__(self, w: float, h: float):
         self.w = w
         self.h = h
+        self.tags: list[str] = []
+        self.corner = Corner()
 
     def area(self) -> float:
         return self.w * self.h
@@ -40,22 +55,39 @@ def describe(s: Shape) -> str:
     return f"{s.name()}:{s.area():.2f}"
 
 
-def grown(s: Shape) -> float:
+def marks(s: Shape) -> str:
+    if isinstance(s, Rect):
+        return f"{len(s.tags)}/{s.corner.x}"
+    return "-"
+
+
+def grown(s: Shape) -> str:
     # A mutation through a NARROWED name reaches the value the name
-    # holds: the area read after it sees the change.
+    # holds: the area and the marks read after it see the change.
     if isinstance(s, C):
         s.radius = s.radius + 1.0
     if isinstance(s, Rect):
         s.scale(2.0)
-    return s.area()
+        # A mutation through a FIELD CHAIN rooted at the narrowed name
+        # (a container field, a composed object) lands on the same value.
+        s.tags.append("grown")
+        s.corner.bump()
+    return f"{s.area():8.3g}| {marks(s)}"
 
 
 def main() -> None:
     shapes: list[Shape] = [Circle(1.0), Rect(2.0, 3.0), Shape()]
     for s in shapes:
-        print(describe(s), f"{grown(s):8.3g}|")
+        print(describe(s), grown(s))
     circles = sum(1 for s in shapes if isinstance(s, C))
     print(circles)
+    # A TUPLE of class targets on a root-typed value: the OR of the
+    # variant tests; an ancestor in the tuple answers for every value.
+    quads = sum(1 for s in shapes if isinstance(s, (Rect, C)))
+    anything = sum(1 for s in shapes if isinstance(s, (Shape, Rect)))
+    print(quads, anything)
+    probe = Circle(0.5)
+    print(probe.same_kind(shapes[0]), probe.same_kind(shapes[1]), probe.same_kind(shapes[2]))
     for v in [3.14159, 1234567.0, 0.0001234, 1e16, 100.0, -0.0, 2.5e-5]:
         print(f"{v:g}|{v:10.4g}|{v:<8.2g}|")
 

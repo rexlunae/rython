@@ -838,6 +838,22 @@ pub(crate) fn chain_root_is_self(expr: &ExprType) -> bool {
     }
 }
 
+/// Whether an expression is, or is a field chain rooted at, a root-typed
+/// name NARROWED to a class of its subtree (`s` after `isinstance(s,
+/// Circle)`): a mutation through it must render the chain as a place
+/// from the sum type's mutable view (`__rython_as_Circle_mut`), never
+/// from the read view's clone — `s.radius = ..`, `s.tags.append(..)`,
+/// `s.center.bump()` alike (Devin review on #319).
+pub(crate) fn chain_root_is_narrowed_class(expr: &ExprType, options: &PythonOptions) -> bool {
+    match expr {
+        ExprType::Attribute(a) => chain_root_is_narrowed_class(&a.value, options),
+        ExprType::Name(n) => options.narrowed_class_origin.get(&n.id).is_some_and(|root| {
+            matches!(options.narrowed_names.get(&n.id), Some(crate::TypeInfo::Class(t)) if t != root)
+        }),
+        _ => false,
+    }
+}
+
 /// `.__rython_base` repeated `depth` times: reaches an ancestor's embedded
 /// struct from a concrete receiver (`self.__rython_base.name`).
 pub(crate) fn base_field_chain(depth: usize) -> TokenStream {
