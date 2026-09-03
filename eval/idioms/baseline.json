@@ -1,3 +1,43 @@
 {
-  "passing": []
+  "programs": {
+    "bank": {
+      "status": "build-failed",
+      "errors": 11
+    },
+    "inventory": {
+      "status": "convert-failed"
+    },
+    "matrix": {
+      "status": "build-failed",
+      "errors": 4
+    },
+    "pipeline": {
+      "status": "build-failed",
+      "errors": 7
+    },
+    "records": {
+      "status": "build-failed",
+      "errors": 16
+    },
+    "schedule": {
+      "status": "build-failed",
+      "errors": 10
+    },
+    "shapes": {
+      "status": "build-failed",
+      "errors": 11
+    },
+    "text_stats": {
+      "status": "build-failed",
+      "errors": 9
+    },
+    "tokenizer": {
+      "status": "build-failed",
+      "errors": 6
+    },
+    "tree": {
+      "status": "build-failed",
+      "errors": 1
+    }
+  }
 }

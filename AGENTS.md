@@ -125,9 +125,11 @@ message text, ordering, and float formatting.
 - The **idiom corpus** (`eval/idioms/`) is the sweep's complement: small
   idiomatic programs (the shapes a Python programmer writes, not urllib3's)
   that must convert, build, and print exactly what CPython prints.
-  `run_idioms.py` reports per-program status; `baseline.json` is a ratchet
-  CI enforces (`--check-baseline` fails only when a program that passed
-  stops passing). A round that claims a shape fixed adds the program that
+  `run_idioms.py` reports per-program status; `baseline.json` records every
+  program's stage and, for a build failure, its rustc error count, and CI
+  enforces it as a ratchet (`--check-baseline` fails when any program gets
+  worse: a lower stage, or more errors — the frontier is allowed to be red
+  but not to retreat). A round that claims a shape fixed adds the program that
   exercises it **before** the fix, written so state is observable in the
   output (a printed total after a mutation), and bumps the baseline in the
   same PR. Report the idiom pass count next to the sweep delta.

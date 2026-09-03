@@ -23,7 +23,7 @@ cargo build -p python-ast -p rypip          # a stale rypip measures stale codeg
 python3 eval/idioms/run_idioms.py            # everything; prints a status table
 python3 eval/idioms/run_idioms.py --only inventory tree
 python3 eval/idioms/run_idioms.py --check-baseline    # what CI runs
-python3 eval/idioms/run_idioms.py --update-baseline   # in the PR that makes more pass
+python3 eval/idioms/run_idioms.py --update-baseline   # in the PR that improves a program
 python3 eval/sweep/run_sweep.py --with-idioms         # embed the pass count in a sweep run
 ```
 
@@ -37,6 +37,9 @@ and the oracle's version; it carries no machine-local paths or timestamps,
 so a committed result file changes only when a measurement does. A branch that only edits `eval/`
 therefore measures, and is named by, the same converter as its merge-base.
 
+Generated crates are built with the default rustc flags whatever the
+caller's `RUSTFLAGS` says (CI's `-D warnings` would count every warning as
+an error and the ratchet would compare counts taken under different rules).
 Per-program status is one of `convert-failed`, `build-failed` (with the
 rustc error histogram), `run-failed`, `timeout` (a hang in any stage is that
 program's result, not the corpus's), `output-mismatch` (with the first
@@ -46,11 +49,25 @@ with a `build.log` for diagnosis.
 
 ## The ratchet
 
-`baseline.json` lists the programs that pass today. `--check-baseline` exits
-non-zero only if one of them stops passing; programs that have never passed
-are the frontier, not a regression, so CI stays green while the corpus is
-mostly red. When a round makes a program pass, bump the baseline in the same
-PR — that is the claim the PR is making, recorded where CI can hold it.
+`baseline.json` records every program's **stage** (`convert-failed` <
+`build-failed` < `run-failed` < `output-mismatch` < `pass`) and, for a build
+failure, its rustc **error count**. `--check-baseline` exits non-zero when a
+program is worse than recorded: a lower stage, or more errors at the same
+build-failed stage. Programs that have never passed are the frontier, not a
+regression, so CI stays green while the corpus is mostly red — but the
+frontier cannot retreat silently either: a 3-error program becoming an
+11-error one, or a building program becoming a conversion refusal, fails
+CI until the PR that does it records the new state with `--update-baseline
+--force-baseline`, which makes the trade visible where it is reviewed.
+Improvements are reported, never failed; bump the baseline in the same PR
+— that is the claim the PR is making, recorded where CI can hold it.
+
+A result that is not a measurement of the generated code — a missing or
+stale pin, a missing binary, a cargo failure before rustc ran (dependency
+resolution, a manifest error: no `could not compile` in the log) — is
+**unmeasured**: `--check-baseline` fails on it and `--update-baseline`
+refuses to record it, forced or not. Otherwise a harness failure would read
+as an improvement over any recorded error count.
 
 ## Adding a program
 

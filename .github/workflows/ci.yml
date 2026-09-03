@@ -43,7 +43,9 @@ jobs:
 
   # The idiom corpus: small idiomatic programs that must convert, build, and
   # print exactly what CPython prints. A ratchet, not a gate: it fails only
-  # when a program listed in eval/idioms/baseline.json stops passing.
+  # when a program gets worse than eval/idioms/baseline.json records (a
+  # lower stage, or more rustc errors at build-failed); a red frontier is
+  # allowed, a retreating one is not.
   idioms:
     runs-on: ubuntu-latest
     steps:
