@@ -433,54 +433,7 @@ impl<'a> CodeGen for Attribute {
             _ => None,
         };
         // The fallibility rule (the review's fix 2, round 99): a method
-        let wrapped_expr = crate::ExprType::Attribute(self.clone());
-        // The boxed self-referential field's read (round 99, E0072): the
-        // field's slot is Option<Box<Class>> — the value read map-derefs to
-        // Option<Class>, the type every other slot uses. Computed BEFORE
-        // the moves.
-        // The receiver's class (the field's owner): direct, or through an
-        // Option-typed receiver (the unwrap chain holds the inner).
-        let owner = match crate::infer_type(Some(&ctx), &self.value, &options, &symbols) {
-            crate::TypeInfo::Class(c) => Some(c),
-            crate::TypeInfo::Option(ref inner)
-                if matches!(**inner, crate::TypeInfo::Class(_)) =>
-            {
-                match **inner {
-                    crate::TypeInfo::Class(ref c) => Some(c.clone()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        let boxed_field_read = field_access.is_none()
-            && owner
-                .as_ref()
-                .and_then(|c| crate::resolve_class_referenced(c, &symbols, &options))
-                .and_then(|class| {
-                    class
-                        .infer_fields(&symbols, &options)
-                        .ok()
-                        .and_then(|fields| {
-                            fields
-                                .iter()
-                                .find(|(name, _)| name == &self.attr)
-                                .map(|(_, t)| t.clone())
-                        })
-                })
-                .is_some_and(|t| {
-                    matches!(
-                        t,
-                        crate::TypeInfo::Option(ref inner)
-                            if matches!(
-                                **inner,
-                                crate::TypeInfo::Class(ref fc)
-                                    if Some(fc.as_str())
-                                        == owner.as_ref().map(|x| x.as_str())
-                            )
-                    )
-                });
         let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
-        let option_receiver_some = option_receiver.is_some();
         if let Some(_inner) = option_receiver {
             let attr_name = self.attr.clone();
             value_tokens = quote!((#value_tokens).clone().unwrap_or_else(|| {

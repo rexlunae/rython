@@ -5325,7 +5325,6 @@ impl<'a> CodeGen for Call {
             // produced `urlparse::new(...)` (E0433 — a function used as a
             // module path) at every requests/urllib3/charset_normalizer call
             // site (round 55). Direct from-imports check the module's class
-                        eprintln!("R99SITE5318");
             // registry; re-export chains (requests' compat re-exports
             // urllib.parse's functions) check the terminal item.
             let stdpython_class = !stdpython_fn
@@ -5463,7 +5462,6 @@ impl<'a> CodeGen for Call {
                     if !sig.args.posonlyargs.is_empty() {
                         sig.args.posonlyargs.remove(0);
                     } else if !sig.args.args.is_empty() {
-                        eprintln!("R99SITE5455");
                         sig.args.args.remove(0);
                     }
                 }
@@ -5567,7 +5565,6 @@ impl<'a> CodeGen for Call {
                                     super_owner
                                 )
                                 .into());
-                        eprintln!("R99SITE5558");
                             }
                         }
                     }
@@ -5747,8 +5744,7 @@ impl<'a> CodeGen for Call {
             if let Some((class, class_symbols)) =
                 receiver_class(&attr.value, &ctx, &symbols, &options)
             {
-                eprintln!("R99GATE {}.{} -> {}", match attr.value.as_ref() { crate::ExprType::Name(n) => format!("Name({})", n.id), crate::ExprType::Attribute(a) => format!("Attr(.{})", a.attr), crate::ExprType::Call(_) => "Call".into(), _ => "other".into() }, attr.attr, class.name);
-                if let Some(mut method) =
+                if let Some(method) =
                     class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
                 {
                     if attr.attr == "depth" {
