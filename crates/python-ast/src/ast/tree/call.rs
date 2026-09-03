@@ -2553,6 +2553,24 @@ impl<'a> CodeGen for Call {
                                 _ => None,
                             };
                             if let Some(cname) = inner_class {
+                                // A ROOT-typed value (hierarchy.rs) answers
+                                // by its runtime variant, not by the static
+                                // fold below (Devin review on #319): the
+                                // one registry test the class-target form
+                                // uses.
+                                if let ExprType::Name(n) = &self.args[0]
+                                    && let Some(crate::TypeInfo::Class(c)) =
+                                        options.name_types.get(&n.id)
+                                    && crate::ast::tree::hierarchy::is_polymorphic_root(c)
+                                {
+                                    let arg = self.args[0].clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
+                                    let target = crate::ast::tree::hierarchy::canonical_class_name(&cname, &symbols);
+                                    return Ok(root_isinstance_test(c, &target, &arg, &symbols));
+                                }
                                 // isinstance also accepts subclasses of the
                                 // resolved class: walk the inheritance tree.
                                 let same_class = matches!(
@@ -2619,23 +2637,12 @@ impl<'a> CodeGen for Call {
                                 // an alias target (`C = Circle`, `import
                                 // Rect as R`) resolves to it first.
                                 let target = crate::ast::tree::hierarchy::canonical_class_name(&t.id, &symbols);
-                                if target == *c
-                                    || crate::ast::tree::class_def::ClassDef::class_extends(
-                                        c, &target, &symbols,
-                                    )
-                                {
-                                    return Ok(quote!(true));
-                                }
-                                if crate::ast::tree::hierarchy::in_subtree_by_name(&target, c) {
-                                    let arg = self.args[0].clone().to_rust(
-                                        ctx.clone(),
-                                        options.clone(),
-                                        symbols.clone(),
-                                    )?;
-                                    let is_fn = format_ident!("__rython_is_{}", target);
-                                    return Ok(quote!((#arg).#is_fn()));
-                                }
-                                return Ok(quote!(false));
+                                let arg = self.args[0].clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                return Ok(root_isinstance_test(c, &target, &arg, &symbols));
                             }
                             let result = match &arg_class {
                                 Some(c) => {
@@ -2656,6 +2663,44 @@ impl<'a> CodeGen for Call {
                                 }
                             };
                             return Ok(quote!(#result));
+                        }
+                        // A TUPLE of class targets on a ROOT-typed value
+                        // (`isinstance(s, (Circle, Rect))` — Devin review
+                        // on #319): the OR of the registry's test per
+                        // element — an ancestor makes the whole check true,
+                        // a subtree class contributes its variant test, an
+                        // unrelated class nothing.
+                        if let ExprType::Name(n) = &self.args[0]
+                            && let Some(crate::TypeInfo::Class(c)) = options.name_types.get(&n.id)
+                            && crate::ast::tree::hierarchy::is_polymorphic_root(c)
+                            && let ExprType::Tuple(tup) = &self.args[1]
+                            && !tup.elts.is_empty()
+                            && tup.elts.iter().all(|e| {
+                                matches!(e, ExprType::Name(t) if is_class_target(&t.id, &symbols, &options, 0))
+                            })
+                        {
+                            let arg = self.args[0].clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            let mut tests: Vec<TokenStream> = Vec::new();
+                            for e in &tup.elts {
+                                let ExprType::Name(t) = e else { unreachable!() };
+                                let target = crate::ast::tree::hierarchy::canonical_class_name(&t.id, &symbols);
+                                let test = root_isinstance_test(c, &target, &arg, &symbols);
+                                let flat = test.to_string();
+                                if flat == "true" {
+                                    return Ok(quote!(true));
+                                }
+                                if flat != "false" {
+                                    tests.push(test);
+                                }
+                            }
+                            if tests.is_empty() {
+                                return Ok(quote!(false));
+                            }
+                            return Ok(quote!((#(#tests)||*)));
                         }
                         // Resolve a name that aliases a TUPLE of builtin
                         // type names (`basestring = (str, bytes)` in
@@ -9492,6 +9537,29 @@ fn lower_threading_thread(
 }
 
 /// The name at the root of a dotted expression chain (`os` in `os.path`,
+/// A ROOT-typed value's `isinstance` against ONE class target, by the
+/// hierarchy registry (the single authority every target form — a class
+/// name, an element of a tuple, `type(self)` — consults): the root itself
+/// or an ancestor is true, a class of the subtree is the runtime variant
+/// test on the sum type, anything else is false.
+pub(crate) fn root_isinstance_test(
+    root: &str,
+    target: &str,
+    arg: &TokenStream,
+    symbols: &SymbolTableScopes,
+) -> TokenStream {
+    if target == root
+        || crate::ast::tree::class_def::ClassDef::class_extends(root, target, symbols)
+    {
+        return quote!(true);
+    }
+    if crate::ast::tree::hierarchy::in_subtree_by_name(target, root) {
+        let is_fn = format_ident!("__rython_is_{}", target);
+        return quote!((#arg).#is_fn());
+    }
+    quote!(false)
+}
+
 /// `np` in `np.linalg.inv`), for module-vs-value resolution.
 pub(crate) fn root_name(expr: &ExprType) -> Option<&str> {
     match expr {

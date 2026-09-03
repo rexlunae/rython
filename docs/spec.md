@@ -1605,7 +1605,10 @@ impl Point {
   an override stored through a base-typed container runs — CPython's
   dynamic dispatch, decided by a `match`. `isinstance(x, T)` on a
   root-typed value is a runtime variant test (`x.__rython_is_T()`), true
-  for an ancestor and false outside the subtree; inside the guarded
+  for an ancestor and false outside the subtree — one registry test that
+  every target form consults: a class name (through its aliases), each
+  element of a tuple of classes (their OR; an ancestor among them is true
+  outright), and `type(self)` (the enclosing class); inside the guarded
   branch the name reads as the sum type's view of `T`
   (`x.__rython_as_T()`, an owned clone), so `T`'s own fields and methods
   resolve. A leaf class IS its struct, and `isinstance` on it folds

@@ -19,6 +19,11 @@ class Circle(Shape):
     def name(self) -> str:
         return "circle"
 
+    def same_kind(self, other: "Shape") -> bool:
+        # `type(self)` on a Circle's own method is Circle; `other` is a
+        # root-typed value, so the check is its runtime variant.
+        return isinstance(other, type(self))
+
 
 class Rect(Shape):
     def __init__(self, w: float, h: float):
@@ -56,6 +61,13 @@ def main() -> None:
         print(describe(s), f"{grown(s):8.3g}|")
     circles = sum(1 for s in shapes if isinstance(s, C))
     print(circles)
+    # A TUPLE of class targets on a root-typed value: the OR of the
+    # variant tests; an ancestor in the tuple answers for every value.
+    quads = sum(1 for s in shapes if isinstance(s, (Rect, C)))
+    anything = sum(1 for s in shapes if isinstance(s, (Shape, Rect)))
+    print(quads, anything)
+    probe = Circle(0.5)
+    print(probe.same_kind(shapes[0]), probe.same_kind(shapes[1]), probe.same_kind(shapes[2]))
     for v in [3.14159, 1234567.0, 0.0001234, 1e16, 100.0, -0.0, 2.5e-5]:
         print(f"{v:g}|{v:10.4g}|{v:<8.2g}|")
 

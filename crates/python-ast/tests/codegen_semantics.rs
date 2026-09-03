@@ -17335,6 +17335,84 @@ fn a_mutation_through_a_narrowed_root_typed_name_takes_the_mutable_view() {
     );
 }
 
+/// A TUPLE of class targets on a root-typed value (Devin review on #319)
+/// is the OR of the registry's tests: two subtree classes are two variant
+/// tests, and an ancestor in the tuple makes the check true outright.
+#[test]
+fn a_tuple_of_class_targets_on_a_root_typed_value_ors_the_variant_tests() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "class Rect(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 4.0\n",
+            "\n",
+            "class Blob:\n",
+            "    pass\n",
+            "\n",
+            "def either(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Circle, Rect))\n",
+            "\n",
+            "def any_shape(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Blob, Shape))\n",
+            "\n",
+            "def neither(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Blob,))\n",
+        ),
+        "tupleisinstance.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((s).__rython_is_Circle()||(s).__rython_is_Rect())"),
+        "two subtree targets are two variant tests: {}",
+        out
+    );
+    assert!(
+        flat.contains("fnany_shape(s:AnyShape)->Result<bool,PyException>{returnOk(true);}"),
+        "an ancestor in the tuple is true outright: {}",
+        out
+    );
+    assert!(
+        flat.contains("fnneither(s:AnyShape)->Result<bool,PyException>{returnOk(false);}"),
+        "a tuple of unrelated classes is false: {}",
+        out
+    );
+}
+
+/// `isinstance(other, type(self))` on a root-typed value (Devin review on
+/// #319) is the runtime variant test for the enclosing class — not a fold
+/// of the static root type.
+#[test]
+fn a_type_self_target_on_a_root_typed_value_is_the_variant_test() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "    def same_kind(self, other: \"Shape\") -> bool:\n",
+            "        return isinstance(other, type(self))\n",
+        ),
+        "typeselfisinstance.py",
+    );
+    assert!(
+        out.contains("(other) . __rython_is_Circle ()"),
+        "type(self) in Circle's method tests the Circle variant: {}",
+        out
+    );
+}
+
 /// An ALIASED `isinstance` target (`C = Circle`, `isinstance(s, C)`) on a
 /// root-typed value resolves to the class the registry knows.
 #[test]
