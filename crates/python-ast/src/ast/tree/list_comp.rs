@@ -227,23 +227,30 @@ impl Node for DictComp {
 /// condition expressions can reference it) and applying `if` guards with
 /// `continue`. Generators nest left-to-right, matching Python's evaluation
 /// order, and later generators may reference earlier targets.
+///
+/// `options` is the OUTER scope and `scope` the comprehension's own (the
+/// targets typed from their iterables — `comprehension_scope`): the first
+/// generator's iterable is evaluated outside the comprehension, everything
+/// else inside it.
 fn build_comprehension_loops(
     generators: &[Comprehension],
     inner: TokenStream,
     ctx: &CodeGenContext,
     options: &PythonOptions,
+    scope: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     let mut acc = inner;
-    for generator in generators.iter().rev() {
+    for (i, generator) in generators.iter().enumerate().rev() {
         let target = generator
             .target
             .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            .to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
+        let iter_options = if i == 0 { options } else { scope };
         let iter_expr = generator
             .iter
             .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            .to_rust(ctx.clone(), iter_options.clone(), symbols.clone())?;
         let conditions: Result<Vec<_>, _> = generator
             .ifs
             .iter()
@@ -257,7 +264,7 @@ fn build_comprehension_loops(
                 crate::condition_to_rust(
                     if_expr,
                     ctx.clone(),
-                    options.clone(),
+                    scope.clone(),
                     symbols.clone(),
                 )
             })
@@ -299,12 +306,14 @@ impl CodeGen for ListComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.push(#elt); },
             &ctx,
             &options,
+            &scope,
             &symbols,
         )?;
         Ok(quote! {
@@ -338,12 +347,14 @@ impl CodeGen for SetComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.insert(#elt); },
             &ctx,
             &options,
+            &scope,
             &symbols,
         )?;
         Ok(quote! {
@@ -380,12 +391,14 @@ impl CodeGen for GeneratorExp {
         // Generator expressions are lowered eagerly (like a list
         // comprehension) and then turned back into an iterator; Python's lazy
         // evaluation is not modeled yet.
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.push(#elt); },
             &ctx,
             &options,
+            &scope,
             &symbols,
         )?;
         Ok(quote! {
@@ -420,13 +433,15 @@ impl CodeGen for DictComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let key = (*self.key).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let value = (*self.value).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        let key = (*self.key).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
+        let value = (*self.value).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.insert(#key, #value); },
             &ctx,
             &options,
+            &scope,
             &symbols,
         )?;
         // PyDict, like dict literals: comprehension-built dicts preserve

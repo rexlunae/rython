@@ -2280,7 +2280,7 @@ impl<'a> CodeGen for Call {
                                 quote!(#f(&(#a))?)
                             }
                             (Some(k), None) => {
-                                let k = render(k)?;
+                                let k = render_key_fn(&k, &self.args[0], &ctx, &options, &symbols)?;
                                 let f = format_ident!("{}_key", bname);
                                 quote!(#f(&(#a), #k)?)
                             }
@@ -2290,7 +2290,7 @@ impl<'a> CodeGen for Call {
                                 quote!(#f(&(#a), #d))
                             }
                             (Some(k), Some(d)) => {
-                                let k = render(k)?;
+                                let k = render_key_fn(&k, &self.args[0], &ctx, &options, &symbols)?;
                                 let d = render(d)?;
                                 let f = format_ident!("{}_key_default", bname);
                                 quote!(#f(&(#a), #k, #d))
@@ -2340,7 +2340,7 @@ impl<'a> CodeGen for Call {
                             }
                             (None, None) => quote!(sorted(&(#a))),
                             (Some(k), None) => {
-                                let k = render(k)?;
+                                let k = render_key_fn(&k, &self.args[0], &ctx, &options, &symbols)?;
                                 quote!(sorted_key(&(#a), #k))
                             }
                             (None, Some(r)) => {
@@ -2348,7 +2348,7 @@ impl<'a> CodeGen for Call {
                                 quote!(sorted_reverse(&(#a), #r))
                             }
                             (Some(k), Some(r)) => {
-                                let k = render(k)?;
+                                let k = render_key_fn(&k, &self.args[0], &ctx, &options, &symbols)?;
                                 let r = render(r)?;
                                 quote!(sorted_key_reverse(&(#a), #k, #r))
                             }
@@ -3338,6 +3338,16 @@ impl<'a> CodeGen for Call {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
+                        // A lambda function argument's parameter is the
+                        // iterable's element — typed like a `key=` lambda.
+                        let rendered = match (self.args.first(), self.args.get(1)) {
+                            (Some(f @ ExprType::Lambda(_)), Some(xs)) if self.args.len() == 2 => {
+                                let mut r = rendered.clone();
+                                r[0] = render_key_fn(f, xs, &ctx, &options, &symbols)?;
+                                r
+                            }
+                            _ => rendered,
+                        };
                         let fallible = matches!(self.args.first(), Some(ExprType::Name(f))
                             if matches!(symbols.get(&f.id), Some(SymbolTableNode::FunctionDef(_))));
                         if bname == "filter" {
@@ -5986,11 +5996,11 @@ impl<'a> CodeGen for Call {
                         quote!((#receiver).py_sort_reverse(#r))
                     }
                     (Some(k), None) => {
-                        let k = render(k)?;
+                        let k = render_key_fn(&k, &attr.value, &ctx, &options, &symbols)?;
                         quote!((#receiver).py_sort_key(#k))
                     }
                     (Some(k), Some(r)) => {
-                        let k = render(k)?;
+                        let k = render_key_fn(&k, &attr.value, &ctx, &options, &symbols)?;
                         let r = render(r)?;
                         quote!((#receiver).py_sort_key_reverse(#k, #r))
                     }
@@ -8738,52 +8748,13 @@ pub(crate) fn receiver_class(
             return Some((base, symbols.clone()));
         }
         ExprType::Name(n) => match symbols.get(&n.id) {
+            // A local bound to a call (`c = make()`, `c = Counter()`): the
+            // class the call produces, through the one authority below.
             Some(SymbolTableNode::Assign {
                 value: ExprType::Call(call),
                 ..
             }) => match call.func.as_ref() {
-                ExprType::Name(cn) => {
-                    // A local factory call: `c = make()` where `def
-                    // make() -> Counter` (or the unannotated
-                    // lazy-singleton getter, issue #189) — the receiver's
-                    // class comes from the function's return. An
-                    // IMPORTED factory (`u = parse_url(url)` — urllib3,
-                    // where parse_url comes from .util) resolves through
-                    // the defining module the same way (round 58: the
-                    // double-wrap family — `Some(u.host)` nested because
-                    // the local's class was never resolved).
-                    let fdef = match symbols.get(&cn.id) {
-                        Some(SymbolTableNode::FunctionDef(f)) => {
-                            Some((f.clone(), symbols.clone()))
-                        }
-                        Some(SymbolTableNode::ImportFrom(ifm)) => {
-                            let path = ifm.resolved_module_path(options);
-                            if options.module_defs.contains_key(&path) {
-                                // KEEP the defining module's symbol
-                                // table: an imported factory's return
-                                // annotation names classes in THAT module
-                                // (Devin review on #264 — dropping them
-                                // left the field unidentified and the
-                                // double-wrap in place).
-                                crate::module_function_def(options, &path, &cn.id)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some((f, f_symbols)) = fdef {
-                        match f.return_class_name(options) {
-                            Some(class) => (class, f_symbols),
-                            None => return None,
-                        }
-                    } else {
-                        // A constructor (local or imported — the tail
-                        // resolves an imported class through its defining
-                        // module).
-                        (cn.id.clone(), symbols.clone())
-                    }
-                }
+                ExprType::Name(_) => named_call_class(call, symbols, options)?,
                 _ => return None,
             },
             // A TYPED PARAMETER receiver (`def f(c: C): return c.x` — the
@@ -8811,6 +8782,10 @@ pub(crate) fn receiver_class(
         // shape — resolve the method's return class through the
         // receiver's class (round 58).
         ExprType::Call(call) => match call.func.as_ref() {
+            // A CONSTRUCTOR or factory call as the receiver itself
+            // (`Shape().area()`, `make().run()`): the same class the local
+            // bound to that call would have (the idiom corpus's shapes).
+            ExprType::Name(_) => named_call_class(call, symbols, options)?,
             ExprType::Attribute(attr) => {
                 let (owner, owner_symbols) =
                     receiver_class(&attr.value, ctx, symbols, options)?;
@@ -8852,6 +8827,69 @@ pub(crate) fn receiver_class(
         _ => return None,
     };
     receiver_class_tail(&class_name, class_symbols, options)
+}
+
+/// The class a NAME-callee call produces, with the symbol table its name
+/// resolves in: a local factory (`make()` where `def make() -> Counter`,
+/// or the unannotated lazy-singleton getter, issue #189) through the
+/// function's return; an IMPORTED factory (`parse_url(url)` — urllib3,
+/// from .util) through the defining module the same way (round 58: the
+/// double-wrap family — `Some(u.host)` nested because the local's class
+/// was never resolved; Devin review on #264: KEEP the defining module's
+/// symbol table, its return annotation names classes THERE); otherwise a
+/// constructor, local or imported (the tail resolves an imported class
+/// through its defining module). `None` when the callee is a function
+/// without a class-typed return. One authority for a local bound to the
+/// call AND for the call used directly as a receiver.
+fn named_call_class(
+    call: &crate::Call,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(String, SymbolTableScopes)> {
+    let ExprType::Name(cn) = call.func.as_ref() else {
+        return None;
+    };
+    let fdef = match symbols.get(&cn.id) {
+        Some(SymbolTableNode::FunctionDef(f)) => Some((f.clone(), symbols.clone())),
+        Some(SymbolTableNode::ImportFrom(ifm)) => {
+            let path = ifm.resolved_module_path(options);
+            if options.module_defs.contains_key(&path) {
+                crate::module_function_def(options, &path, &cn.id)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    match fdef {
+        Some((f, f_symbols)) => f.return_class_name(options).map(|class| (class, f_symbols)),
+        None => Some((cn.id.clone(), symbols.clone())),
+    }
+}
+
+/// Render a `key=` function for a builtin over `iterable`. A LAMBDA's
+/// parameter is the iterable's element (`key=lambda s: s.area()` over a
+/// `list[Shape]`), typed through the same binder authority the
+/// for-statement and the comprehension use, so the body's method calls
+/// resolve their receiver's class — and emit the `?` a user method's
+/// Result needs (the idiom corpus's shapes: an untyped `s` left `s.area()`
+/// a Result inside the key closure, E0277). Anything else renders as is.
+fn render_key_fn(
+    key: &ExprType,
+    iterable: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let ExprType::Lambda(lam) = key
+        && let Some(elem) = crate::ast::tree::type_ctx::iterable_element_type(
+            &crate::infer_type(Some(ctx), iterable, options, symbols),
+        )
+    {
+        let scope = crate::lambda_scope(lam, &[elem], options);
+        return key.clone().to_rust(ctx.clone(), scope, symbols.clone());
+    }
+    key.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
 }
 
 /// Resolve a class NAME to its ClassDef (and the defining module's symbol

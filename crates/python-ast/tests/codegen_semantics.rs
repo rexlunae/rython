@@ -16692,3 +16692,98 @@ fn boxed_value_stored_into_a_concrete_inherited_field_converts() {
         out
     );
 }
+
+// The binder authority (issue #137, the round-99 evaluation's drift 3): a
+// comprehension target, a `key=` lambda parameter, and a constructor call
+// used directly as a receiver are typed the way a for-statement target
+// is, so a user method call on them resolves its receiver's class and
+// emits the `?` its Result needs. Before, the untyped receiver fell to
+// the generic arm, the Result leaked, and rustc rejected it downstream
+// (the idiom corpus's shapes: six of its eleven errors).
+fn has_fallible_area_call(out: &str) -> bool {
+    out.contains(". area () ?") || out.contains(".area()?")
+}
+
+#[test]
+fn a_comprehension_target_over_a_class_list_types_its_method_calls() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "def total(shapes: list[Shape]) -> float:\n",
+            "    return sum([s.area() for s in shapes])\n",
+        ),
+        "comp_binder.py",
+    );
+    assert!(
+        has_fallible_area_call(&out),
+        "the comprehension target must resolve the class so the call propagates: {}",
+        out
+    );
+}
+
+#[test]
+fn a_key_lambda_parameter_is_the_iterables_element() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "def biggest(shapes: list[Shape]) -> Shape:\n",
+            "    return max(shapes, key=lambda s: s.area())\n",
+        ),
+        "key_binder.py",
+    );
+    assert!(
+        has_fallible_area_call(&out),
+        "the key lambda's parameter must resolve the class so the call propagates: {}",
+        out
+    );
+}
+
+#[test]
+fn a_constructor_call_as_receiver_resolves_its_class() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 1.0\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Shape().area())\n",
+        ),
+        "ctor_receiver.py",
+    );
+    assert!(
+        has_fallible_area_call(&out),
+        "a constructor call used as the receiver must resolve its class: {}",
+        out
+    );
+}
+
+#[test]
+fn a_comprehension_element_type_is_the_body_type_in_the_comprehension_scope() {
+    // The type side agrees with the lowering: `[s.name() for s in shapes]`
+    // is a Vec<String>, so a later `"-".join(names)` sees strings, not an
+    // unknown element.
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def name(self) -> str:\n",
+            "        return \"shape\"\n",
+            "\n",
+            "def names(shapes: list[Shape]) -> str:\n",
+            "    ns = [s.name() for s in shapes]\n",
+            "    return \"-\".join(ns)\n",
+        ),
+        "comp_type.py",
+    );
+    assert!(
+        out.contains(". name () ?") || out.contains(".name()?"),
+        "the comprehension body call must propagate: {}",
+        out
+    );
+}

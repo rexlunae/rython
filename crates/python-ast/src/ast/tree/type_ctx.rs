@@ -822,11 +822,24 @@ fn infer_type_inner(
             },
             _ => TypeInfo::PyObject,
         },
-        ExprType::ListComp(_) => TypeInfo::Vec(Box::new(TypeInfo::PyObject)),
-        ExprType::DictComp(_) => TypeInfo::Dict(
-            Box::new(TypeInfo::PyObject),
-            Box::new(TypeInfo::PyObject),
-        ),
+        // A comprehension's element type is its element expression's type
+        // in the comprehension's own scope (the targets bound to their
+        // iterables' elements — the same scope the lowering renders in).
+        ExprType::ListComp(lc) => {
+            let scope = comprehension_scope(&lc.generators, ctx, options, symbols);
+            TypeInfo::Vec(Box::new(infer_type_inner(ctx, &lc.elt, &scope, symbols)))
+        }
+        ExprType::SetComp(sc) => {
+            let scope = comprehension_scope(&sc.generators, ctx, options, symbols);
+            TypeInfo::HashSet(Box::new(infer_type_inner(ctx, &sc.elt, &scope, symbols)))
+        }
+        ExprType::DictComp(dc) => {
+            let scope = comprehension_scope(&dc.generators, ctx, options, symbols);
+            TypeInfo::Dict(
+                Box::new(infer_type_inner(ctx, &dc.key, &scope, symbols)),
+                Box::new(infer_type_inner(ctx, &dc.value, &scope, symbols)),
+            )
+        }
         ExprType::Starred(s) => infer_type_inner(ctx, &s.value, options, symbols),
         _ => TypeInfo::PyObject,
     }
@@ -842,7 +855,7 @@ fn infer_type_inner(
 /// a `range` (whose elements are Python ints). A string is deliberately
 /// absent — iterating one yields single-character strings, which is a
 /// different type from the receiver and not what any caller here wants.
-fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
+pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
     match t {
         TypeInfo::Vec(e) => Some((**e).clone()),
         TypeInfo::Range => Some(TypeInfo::Int),
@@ -2490,7 +2503,7 @@ fn analyze_statement_types(
                 let iter_ty =
                     infer_type(analysis_ctx.as_ref(), &s.iter, options, symbols);
                 if let Some(elem) = iterable_element_type(&iter_ty) {
-                    seed_target_types(&s.target, &elem, info);
+                    seed_binder_types(&s.target, &elem, &mut info.name_types, false);
                 }
             }
             for b in &s.body {
@@ -3684,20 +3697,77 @@ fn ty_to_typeinfo(ty: &TokenStream) -> TypeInfo {
 /// target binds the element; a (nested) TUPLE target binds each element
 /// name from the matching pair (`for (i, (name, item)) in enumerate(...)`
 /// — round 99). `or_insert`: an earlier store or annotation wins.
-fn seed_target_types(target: &ExprType, ty: &TypeInfo, info: &mut FunctionTypeInfo) {
+/// Bind a loop/comprehension TARGET to the element type it iterates
+/// (`for (name, item) in pairs` seeds `name` and `item` from a tuple
+/// element type). THE one binder authority: the for-statement
+/// (`analyze_statement_types`), the comprehension scope
+/// (`comprehension_scope`) and a call-site-typed lambda parameter
+/// (`lambda_scope`) all seed through it, so a receiver's class resolves
+/// the same way in every scope that binds a name to an element. `shadow`
+/// decides a collision: a for-statement target keeps an earlier store or
+/// annotation (`or_insert`), while a comprehension or lambda binder is a
+/// NEW scope and overrides the outer name.
+pub(crate) fn seed_binder_types(
+    target: &ExprType,
+    ty: &TypeInfo,
+    out: &mut HashMap<String, TypeInfo>,
+    shadow: bool,
+) {
     match target {
         ExprType::Name(n) => {
-            info.name_types.entry(n.id.clone()).or_insert_with(|| ty.clone());
+            if shadow {
+                out.insert(n.id.clone(), ty.clone());
+            } else {
+                out.entry(n.id.clone()).or_insert_with(|| ty.clone());
+            }
         }
         ExprType::Tuple(t) => {
             if let TypeInfo::Tuple(ts) = ty {
                 for (elt, ety) in t.elts.iter().zip(ts.iter()) {
-                    seed_target_types(elt, ety, info);
+                    seed_binder_types(elt, ety, out, shadow);
                 }
             }
         }
         _ => {}
     }
+}
+
+/// The typing scope of a comprehension body: the outer options with each
+/// generator's target bound to its iterable's element type, left to right
+/// (a later generator may iterate an earlier target). A target whose
+/// element type is unknowable stays untyped, and the body then takes the
+/// untyped paths exactly as before. Both the LOWERING (list_comp.rs) and
+/// the TYPE side (`infer_type`'s comprehension arms) build the scope here,
+/// so the two cannot disagree about what a comprehension variable is.
+pub(crate) fn comprehension_scope(
+    generators: &[crate::Comprehension],
+    ctx: Option<&CodeGenContext>,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> PythonOptions {
+    let mut scope = options.clone();
+    for g in generators {
+        if let Some(elem) = iterable_element_type(&infer_type(ctx, &g.iter, &scope, symbols)) {
+            seed_binder_types(&g.target, &elem, std::rc::Rc::make_mut(&mut scope.name_types), true);
+        }
+    }
+    scope
+}
+
+/// The typing scope of a lambda body whose parameters are known from the
+/// call site (`key=lambda s: s.area()` over a `list[Shape]`: the parameter
+/// IS the iterable's element): the outer options with each positional
+/// parameter bound to the given type, in order.
+pub(crate) fn lambda_scope(
+    lambda: &crate::Lambda,
+    param_types: &[TypeInfo],
+    options: &PythonOptions,
+) -> PythonOptions {
+    let mut scope = options.clone();
+    for (p, ty) in lambda.args.args.iter().zip(param_types.iter()) {
+        std::rc::Rc::make_mut(&mut scope.name_types).insert(p.arg.clone(), ty.clone());
+    }
+    scope
 }
 
 fn count_expr_reads(expr: &ExprType, info: &mut FunctionTypeInfo) {
