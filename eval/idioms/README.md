@@ -62,6 +62,13 @@ CI until the PR that does it records the new state with `--update-baseline
 Improvements are reported, never failed; bump the baseline in the same PR
 — that is the claim the PR is making, recorded where CI can hold it.
 
+A result that is not a measurement of the generated code — a missing or
+stale pin, a missing binary, a cargo failure before rustc ran (dependency
+resolution, a manifest error: no `could not compile` in the log) — is
+**unmeasured**: `--check-baseline` fails on it and `--update-baseline`
+refuses to record it, forced or not. Otherwise a harness failure would read
+as an improvement over any recorded error count.
+
 ## Adding a program
 
 - 30–100 lines, one file, `if __name__ == "__main__": main()`, no imports

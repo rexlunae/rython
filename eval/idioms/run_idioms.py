@@ -219,14 +219,28 @@ def measure(program: Path, rypip: Path, workdir: Path, keep: bool, python: str |
     # warnings for the workspace, which turns every warning in a generated
     # crate into an uncoded `error:` line -- bank measured 11 errors
     # locally and 18 on CI -- so the ratchet would compare counts taken
-    # under different rules. The generated code's warnings are a separate
-    # signal (`warnings` in the result), not part of the error count.
-    build_env = {**os.environ, "CARGO_TERM_COLOR": "never"}
-    build_env.pop("RUSTFLAGS", None)
+    # under different rules. Every flag-carrying variable goes (RUSTFLAGS,
+    # CARGO_ENCODED_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS, the per-target
+    # CARGO_TARGET_*_RUSTFLAGS): they are equivalent spellings. The
+    # generated code's warnings are a separate signal (`warnings` in the
+    # result), not part of the error count.
+    build_env = {k: v for k, v in os.environ.items() if "RUSTFLAGS" not in k}
+    build_env["CARGO_TERM_COLOR"] = "never"
     build = run(["cargo", "build", "--quiet"], cwd=crate, timeout=1800, env=build_env)
     log = build.stderr
     (crate / "build.log").write_text(log)
     if build.returncode != 0:
+        # A build-failed stage is a MEASUREMENT of the generated code:
+        # rustc ran on the crate and cargo reported "could not compile".
+        # A failure before that (dependency resolution, a manifest error,
+        # a toolchain problem) has no rustc diagnostics, and its one
+        # `error:` line would read as an IMPROVEMENT over any recorded
+        # count. It is unmeasured: the ratchet refuses it (Devin review
+        # on #317).
+        if "could not compile" not in log:
+            result["status"] = "build-unmeasured"
+            result["detail"] = log.strip()[-300:]
+            return result
         hist = error_histogram(log)
         result["status"] = "build-failed"
         result["errors"] = sum(hist.values())
@@ -273,10 +287,17 @@ def first_difference(want: str, got: str) -> str:
 
 # The ratchet's stage order. A program's result is worse than the recorded
 # one when its stage is lower, or when both are build failures and the
-# error count rose. `expected-stale` is a pin problem, not a program
-# result, and is excluded (the run already exits 2 for it).
+# error count rose. Every other status (`no-expected`, `expected-stale`,
+# `no-binary`, `build-unmeasured`) is a measurement that did not happen --
+# a harness or pin problem, not a program result -- and is UNMEASURED:
+# it never compares equal, --check-baseline fails on it, and
+# --update-baseline refuses to persist it, forced or not.
 STAGES = {"timeout": 0, "convert-failed": 0, "build-failed": 1,
           "run-failed": 2, "output-mismatch": 3, "pass": 4}
+
+
+def measured(rec: dict) -> bool:
+    return rec["status"] in STAGES
 
 
 def record_of(result: dict) -> dict:
@@ -288,10 +309,12 @@ def record_of(result: dict) -> dict:
 
 def compare(now: dict, then: dict) -> int:
     """-1 when `now` is worse than the recorded `then`, +1 when better, 0
-    when equal or incomparable (a stale pin on either side)."""
+    when equal. Both must be measured (see `measured`); the callers keep
+    unmeasured results out, and an unmeasured recorded entry (which the
+    updater never writes, but a hand edit could) counts as worse."""
     sn, st = STAGES.get(now["status"]), STAGES.get(then["status"])
     if sn is None or st is None:
-        return 0
+        return -1
     if sn != st:
         return -1 if sn < st else 1
     if sn == STAGES["build-failed"]:
@@ -406,11 +429,18 @@ def main() -> int:
     print(f"wrote {out}")
 
     rc = 0
-    if stale:
-        rc = 2
     baseline = load_baseline()
     current = {n: record_of(r) for n, r in results.items()}
+    unmeasured = {n: rec["status"] for n, rec in current.items() if not measured(rec)}
+    if unmeasured:
+        print(f"UNMEASURED (a harness or pin problem, not a program result): {unmeasured}")
+        rc = 2
     if args.update_baseline:
+        if unmeasured:
+            # Never persisted, forced or not: a record is a claim about
+            # the generated code, and nothing was measured.
+            print("REFUSED: an unmeasured program cannot be recorded; fix the measurement first")
+            return 2
         # Under --only, programs that were not run keep their entry; only
         # the selected ones are re-decided. Without --only every program
         # ran, so an absent entry is a deleted program.
@@ -446,11 +476,13 @@ def main() -> int:
         for n, then in to_check.items():
             if n not in current:
                 regressed[n] = f"{describe(then)} -> missing from programs/"
+            elif n in unmeasured:
+                regressed[n] = f"{describe(then)} -> {unmeasured[n]} (unmeasured)"
             elif compare(current[n], then) < 0:
                 regressed[n] = f"{describe(then)} -> {describe(current[n])}"
         improved = {n: f"{describe(then)} -> {describe(current[n])}"
                     for n, then in to_check.items()
-                    if n in current and compare(current[n], then) > 0}
+                    if n in current and n not in unmeasured and compare(current[n], then) > 0}
         unrecorded = [n for n in current if n not in baseline]
         if regressed:
             print("REGRESSION: worse than baseline.json records: "
@@ -461,7 +493,7 @@ def main() -> int:
                   + "; ".join(f"{n}: {why}" for n, why in improved.items()))
         if unrecorded:
             print(f"not in baseline.json (add with --update-baseline): {unrecorded}")
-        if not regressed:
+        if not regressed and not unmeasured:
             print(f"baseline holds: {len(to_check)} program(s)")
     return rc
 
