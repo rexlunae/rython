@@ -18,11 +18,14 @@ Usage:
     python3 eval/idioms/run_idioms.py --check-baseline   # CI: fail on regression
     python3 eval/idioms/run_idioms.py --update-baseline  # after a round makes more pass
 
-The baseline (baseline.json) is a ratchet: it lists the programs that pass
-today. --check-baseline exits non-zero if any of them stops passing, and
-merely reports programs that newly pass (bump the baseline in the PR that
-makes them pass). Nothing here fails because a program has never passed;
-that is the frontier, not a regression.
+The baseline (baseline.json) is a ratchet over every program's STAGE and,
+for a build failure, its rustc error count. --check-baseline exits non-zero
+when a program gets worse than recorded: a lower stage (pass -> build
+failure, build failure -> conversion refusal) or more errors at the same
+build-failed stage. Improvements are reported, never failed (bump the
+baseline in the PR that makes them). Nothing here fails because a program
+has never passed; the frontier is recorded, not a regression -- but the
+frontier cannot silently retreat either.
 
 Expected outputs are pinned files (programs/NAME.expected) captured from
 python3. The runner re-derives them from python3 when it is available and
@@ -261,10 +264,54 @@ def first_difference(want: str, got: str) -> str:
     return "trailing whitespace or newline differs"
 
 
-def load_baseline() -> list[str]:
+# The ratchet's stage order. A program's result is worse than the recorded
+# one when its stage is lower, or when both are build failures and the
+# error count rose. `expected-stale` is a pin problem, not a program
+# result, and is excluded (the run already exits 2 for it).
+STAGES = {"timeout": 0, "convert-failed": 0, "build-failed": 1,
+          "run-failed": 2, "output-mismatch": 3, "pass": 4}
+
+
+def record_of(result: dict) -> dict:
+    rec = {"status": result["status"]}
+    if result["status"] == "build-failed":
+        rec["errors"] = result["errors"]
+    return rec
+
+
+def compare(now: dict, then: dict) -> int:
+    """-1 when `now` is worse than the recorded `then`, +1 when better, 0
+    when equal or incomparable (a stale pin on either side)."""
+    sn, st = STAGES.get(now["status"]), STAGES.get(then["status"])
+    if sn is None or st is None:
+        return 0
+    if sn != st:
+        return -1 if sn < st else 1
+    if sn == STAGES["build-failed"]:
+        en, et = now.get("errors", 0), then.get("errors", 0)
+        return -1 if en > et else (1 if en < et else 0)
+    return 0
+
+
+def describe(rec: dict) -> str:
+    if rec["status"] == "build-failed":
+        return f"build-failed ({rec.get('errors', 0)} errors)"
+    return rec["status"]
+
+
+def load_baseline() -> dict[str, dict]:
     if not BASELINE.is_file():
-        return []
-    return sorted(json.loads(BASELINE.read_text()).get("passing", []))
+        return {}
+    data = json.loads(BASELINE.read_text())
+    if "programs" in data:
+        return dict(sorted(data["programs"].items()))
+    # The pre-ratchet shape: a list of passing programs only.
+    return {n: {"status": "pass"} for n in sorted(data.get("passing", []))}
+
+
+def save_baseline(programs: dict[str, dict]) -> None:
+    ordered = {n: programs[n] for n in sorted(programs)}
+    BASELINE.write_text(json.dumps({"programs": ordered}, indent=2) + "\n")
 
 
 def main() -> int:
@@ -276,11 +323,13 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="keep every generated crate, not just failing ones")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--check-baseline", action="store_true",
-                      help="exit 1 if a program listed in baseline.json no longer passes")
+                      help="exit 1 if a program is worse than baseline.json records "
+                           "(a lower stage, or more rustc errors at build-failed)")
     mode.add_argument("--update-baseline", action="store_true",
-                      help="rewrite baseline.json with the programs that pass now")
+                      help="record every program's current stage and error count in baseline.json")
     ap.add_argument("--force-baseline", action="store_true",
-                    help="with --update-baseline: drop programs that regressed or were deleted (the ratchet refuses otherwise)")
+                    help="with --update-baseline: accept programs that got worse or were deleted "
+                         "(the ratchet refuses otherwise)")
     ap.add_argument("--allow-stale", action="store_true",
                     help="measure with a rypip older than the converter source (the result file will be misnamed)")
     args = ap.parse_args()
@@ -353,40 +402,58 @@ def main() -> int:
     if stale:
         rc = 2
     baseline = load_baseline()
+    current = {n: record_of(r) for n, r in results.items()}
     if args.update_baseline:
         # Under --only, programs that were not run keep their entry; only
         # the selected ones are re-decided. Without --only every program
         # ran, so an absent entry is a deleted program.
-        kept = [n for n in baseline if n not in results] if args.only else []
-        lost = [n for n in baseline if n not in kept and n not in passing]
-        if lost and not args.force_baseline:
+        kept = {n: rec for n, rec in baseline.items() if n not in results} if args.only else {}
+        worse = {n: f"{describe(then)} -> {describe(current[n])}"
+                 for n, then in baseline.items()
+                 if n in current and compare(current[n], then) < 0}
+        deleted = [n for n in baseline if n not in current and n not in kept]
+        if (worse or deleted) and not args.force_baseline:
             # The ratchet only ever tightens on its own: a transient failure
-            # must not silently remove a guarantee. Dropping one is a
-            # deliberate act, taken with --force-baseline.
-            print(f"REFUSED: updating would drop baseline programs that no longer pass "
-                  f"or no longer exist: {lost} (pass --force-baseline to drop them)")
+            # must not silently loosen a guarantee. Loosening one is a
+            # deliberate act, taken with --force-baseline, visible in the
+            # PR that takes it.
+            print("REFUSED: updating would loosen the baseline"
+                  + (f"; worse: {worse}" if worse else "")
+                  + (f"; deleted: {deleted}" if deleted else "")
+                  + " (pass --force-baseline to accept)")
             return 1
-        merged = sorted(set(kept) | set(passing))
-        BASELINE.write_text(json.dumps({"passing": merged}, indent=2) + "\n")
-        print(f"baseline updated: {merged}" + (f" (dropped {lost})" if lost else ""))
+        merged = {**kept, **current}
+        save_baseline(merged)
+        print(f"baseline updated: {len(merged)} program(s)"
+              + (f"; loosened: {worse}" if worse else "")
+              + (f"; dropped: {deleted}" if deleted else ""))
     elif args.check_baseline:
         if args.only:
             skipped = [n for n in baseline if n not in results]
             if skipped:
                 print(f"not run (--only), not checked: {skipped}")
-            to_check = [n for n in baseline if n in results]
+            to_check = {n: rec for n, rec in baseline.items() if n in results}
         else:
             to_check = baseline  # everything ran: a missing entry is a deleted program
-        regressed = [n for n in to_check
-                     if n not in results or results[n]["status"] != "pass"]
-        missing = [n for n in regressed if n not in results]
-        new = [n for n in passing if n not in baseline]
+        regressed = {}
+        for n, then in to_check.items():
+            if n not in current:
+                regressed[n] = f"{describe(then)} -> missing from programs/"
+            elif compare(current[n], then) < 0:
+                regressed[n] = f"{describe(then)} -> {describe(current[n])}"
+        improved = {n: f"{describe(then)} -> {describe(current[n])}"
+                    for n, then in to_check.items()
+                    if n in current and compare(current[n], then) > 0}
+        unrecorded = [n for n in current if n not in baseline]
         if regressed:
-            print(f"REGRESSION: baseline programs no longer pass: {regressed}"
-                  + (f" (missing from programs/: {missing})" if missing else ""))
+            print("REGRESSION: worse than baseline.json records: "
+                  + "; ".join(f"{n}: {why}" for n, why in regressed.items()))
             rc = 1
-        if new:
-            print(f"newly passing (add to baseline.json in this PR): {new}")
+        if improved:
+            print("improved (bump baseline.json in this PR): "
+                  + "; ".join(f"{n}: {why}" for n, why in improved.items()))
+        if unrecorded:
+            print(f"not in baseline.json (add with --update-baseline): {unrecorded}")
         if not regressed:
             print(f"baseline holds: {len(to_check)} program(s)")
     return rc
