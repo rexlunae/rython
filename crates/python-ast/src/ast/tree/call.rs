@@ -6056,6 +6056,12 @@ impl<'a> CodeGen for Call {
             // boxed self-ref field): the clone-unwrap would mutate a COPY
             // of the child; the mutation must reach the real child through
             // the Box's as_mut (round 99).
+            // A BOXED self-referential field chain (`root.left.insert(k)`
+            // — the local root: Class(Node), the field left: the boxed
+            // self-ref field): the clone-unwrap would mutate a COPY of
+            // the child. The func renders through the place machinery
+            // (`self.left.as_mut().unwrap()`), keeping the method name on
+            // the call — the mutation reaches the real child (round 99).
             let boxed_field_chain = matches!(attr.value.as_ref(), ExprType::Attribute(_))
                 && crate::TypeInfo::enum_receiver_class(&attr.value, Some(&ctx), &options, &symbols)
                     .map(|c| {
@@ -7937,13 +7943,18 @@ let mutating_self_field = boxed_self_ref_receiver
                     && class.method_needs_mut_self(&attr.attr, &symbols, &options)
             });
             if is_user_mut && crate::ast::tree::scope::mutates_receiver(&attr.attr) {
-                crate::ast::tree::attribute::to_rust_place_expr(
+                let place = crate::ast::tree::attribute::to_rust_place_expr(
                     &attr.value,
                     &ctx,
                     &options,
                     &symbols,
                     false,
-                )?
+                )?;
+                let m_ident = crate::safe_ident(&attr.attr);
+                // The slot is Option<Box<Class>>: as_mut gives
+                // &mut Box<Class> (autoderefs to &mut Class for the
+                // method) — the mutation reaches the real child.
+                quote!(#place . as_mut () . unwrap () . #m_ident)
             } else {
                 self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?
             }
