@@ -551,13 +551,6 @@ impl CodeGen for FunctionDef {
         options: Self::Options,
         symbols: SymbolTableScopes,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        thread_local! {
-            static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let depth = FN_DEPTH.with(|d| d.get());
-        if depth > 50 && depth % 10 == 0 {
-        }
-        FN_DEPTH.with(|d| d.set(depth + 1));
         // A module function registered for isinstance specialization
         // (specialize.rs) renders as its variants + residual instead of
         // one generic definition. Methods and nested defs never register.
@@ -570,7 +563,6 @@ impl CodeGen for FunctionDef {
         } else {
             self.to_rust_inner(ctx, options, symbols)
         };
-        FN_DEPTH.with(|d| d.set(depth));
         return result;
     }
 }
@@ -3630,7 +3622,7 @@ pub(crate) fn expr_yields_option_ctx(
             // annotation.
             if let ExprType::Call(call) = attr.value.as_ref()
                 && let ExprType::Attribute(fn_attr) = call.func.as_ref()
-                && matches!(fn_attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+                && crate::ast::tree::visit::is_self(fn_attr.value.as_ref())
                 && let Some(class_name) = ctx.enclosing_class_name()
                 && let Some(crate::SymbolTableNode::ClassDef(owner)) = symbols.get(class_name)
                 && let Some(method) = owner.method_on_mro(&fn_attr.attr, symbols)
@@ -4332,7 +4324,7 @@ impl FunctionDef {
                 let crate::ExprType::Attribute(attr) = &a.value else {
                     continue;
                 };
-                if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
+                if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
                     continue;
                 }
                 found = fields
@@ -4672,17 +4664,11 @@ impl FunctionDef {
         // `call_return_typeinfo` (a recursive callee — `def f(x): return
         // f(x-1)`) which consults this again — the same thread_local
         // pattern the alias resolver uses.
-        thread_local! {
-            static IRT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let d = IRT_DEPTH.with(|c| c.get());
-        if d > 16 {
-            return None;
-        }
-        IRT_DEPTH.with(|c| c.set(d + 1));
-        let result = self.inferred_return_typeinfo_inner(symbols, options);
-        IRT_DEPTH.with(|c| c.set(d));
-        result
+        crate::ast::tree::type_ctx::resolving_return(
+            self as *const FunctionDef as usize,
+            || None,
+            || self.inferred_return_typeinfo_inner(symbols, options),
+        )
     }
 
     fn inferred_return_typeinfo_inner(

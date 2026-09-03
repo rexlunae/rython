@@ -3147,15 +3147,7 @@ impl<'a> Collector<'a> {
     }
 
     fn walk(&mut self, body: &[Statement]) {
-        thread_local! {
-            static W_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let d = W_DEPTH.with(|c| c.get());
-        if d > 100 && d % 10 == 0 {
-        }
-        W_DEPTH.with(|c| c.set(d + 1));
         self.walk_inner(body);
-        W_DEPTH.with(|c| c.set(d));
     }
 
     fn walk_inner(&mut self, body: &[Statement]) {
@@ -4540,16 +4532,7 @@ impl<'a> Collector<'a> {
         &mut self,
         callee: &crate::FunctionDef,
     ) -> Result<HashMap<String, Vec<ParamReq>>, String> {
-        thread_local! {
-            static CR_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let cd = CR_DEPTH.with(|c| c.get());
-        if cd > 50 && cd % 10 == 0 {
-        }
-        CR_DEPTH.with(|c| c.set(cd + 1));
-        let result = self.callee_requirements_inner(callee);
-        CR_DEPTH.with(|c| c.set(cd));
-        return result;
+        self.callee_requirements_inner(callee)
     }
 
     fn callee_requirements_inner(

@@ -343,7 +343,7 @@ fn is_option_expr(
         return true;
     }
     if let ExprType::Attribute(attr) = expr
-        && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+        && crate::ast::tree::visit::is_self(attr.value.as_ref())
     {
         let t = crate::infer_type(Some(ctx), expr, options, symbols);
         return matches!(t, crate::TypeInfo::Option(_));
@@ -377,7 +377,7 @@ fn py_operand_name(
     // infer_type's self-field arm (round 99) resolves the class-table
     // type: the inner numeric kind is the read's type.
     if let ExprType::Attribute(attr) = expr
-        && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+        && crate::ast::tree::visit::is_self(attr.value.as_ref())
     {
         let t = crate::infer_type(Some(ctx), expr, options, symbols);
         if matches!(t, crate::TypeInfo::Float) {

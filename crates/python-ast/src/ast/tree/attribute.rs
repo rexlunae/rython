@@ -862,7 +862,7 @@ pub(crate) fn chain_root_is_shared_instance(
     while let ExprType::Attribute(inner) = root {
         root = inner.value.as_ref();
     }
-    if matches!(root, ExprType::Name(n) if n.id == "self") {
+    if crate::ast::tree::visit::is_self(root) {
         return false;
     }
     shared_receiver(root, ctx, symbols, options)
@@ -930,7 +930,7 @@ pub(crate) fn class_field_access(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<FieldRewrite> {
-    let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
+    let is_self = crate::ast::tree::visit::is_self(value);
     // A polymorphic ROOT's value (hierarchy.rs) may be the sum type, which
     // has no fields — only the accessors every variant implements (the
     // root struct too, through its trait), so a non-`self` receiver of a
@@ -1003,7 +1003,7 @@ pub(crate) fn shared_receiver(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> bool {
-    if matches!(value, ExprType::Name(n) if n.id == "self") {
+    if crate::ast::tree::visit::is_self(value) {
         return false;
     }
     let class = match crate::receiver_class_for_read(value, ctx, symbols, options) {

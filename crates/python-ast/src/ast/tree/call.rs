@@ -5942,7 +5942,7 @@ impl<'a> CodeGen for Call {
                     // its delegators.
                     let shared_borrow = crate::ast::tree::shared::is_shared(&class.name)
                         && !crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
-                        && !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self");
+                        && !crate::ast::tree::visit::is_self(attr.value.as_ref());
                     let receiver = if shared_borrow {
                         if mutates_receiver {
                             quote!((#receiver).borrow_mut())
@@ -6628,7 +6628,7 @@ impl<'a> CodeGen for Call {
                         // serialize, where DEFAULT_ENCODING = 'utf-8' is a
                         // class constant): resolve the constant's literal.
                         let codec = if let ExprType::Attribute(a) = self.args.first().unwrap()
-                            && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                            && crate::ast::tree::visit::is_self(a.value.as_ref())
                             && let Some(enclosing) = ctx.enclosing_class_name()
                             && let Some(SymbolTableNode::ClassDef(class)) = symbols.get(enclosing)
                             && let Some(lit) = class.body.iter().find_map(|s| match &s.statement {
@@ -8325,7 +8325,7 @@ pub(crate) fn str_format_template(
         // `default_endpoint or self.DEFAULT_ENDPOINT`): resolve
         // the field's stored value to a string template.
         ExprType::Attribute(a)
-            if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+            if crate::ast::tree::visit::is_self(a.value.as_ref()) =>
         {
             let Some(enclosing) = ctx.and_then(|c| c.enclosing_class_name()) else {
                     return None;
@@ -8367,10 +8367,7 @@ pub(crate) fn str_format_template(
                             && matches!(
                                 &assign.targets[0],
                                 ExprType::Attribute(t)
-                                    if matches!(
-                                        t.value.as_ref(),
-                                        ExprType::Name(n) if n.id == "self"
-                                    ) && t.attr == a.attr
+                                    if crate::ast::tree::visit::is_self(t.value.as_ref()) && t.attr == a.attr
                             ) =>
                     {
                         Some(&assign.value)
@@ -9240,10 +9237,7 @@ pub(crate) fn receiver_class_for_read(
         // receiver: a deeper receiver would recurse through arbitrary
         // assign chains (cycle risk).
         ExprType::Attribute(attr)
-            if matches!(
-                attr.value.as_ref(),
-                ExprType::Name(s) if s.id == "self"
-            ) =>
+            if crate::ast::tree::visit::is_self(attr.value.as_ref()) =>
         {
             let (owner, _) = receiver_class(&attr.value, ctx, symbols, options)?;
             let method = owner.methods().find(|m| m.name == attr.attr)?;
@@ -9304,7 +9298,7 @@ pub(crate) fn receiver_is_pyvalue_self_field(
     let ExprType::Attribute(attr) = recv else {
         return false;
     };
-    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+    if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
         return false;
     }
     let Some((class, class_symbols)) = receiver_class(&attr.value, ctx, symbols, options) else {

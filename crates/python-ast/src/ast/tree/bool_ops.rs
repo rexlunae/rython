@@ -404,7 +404,7 @@ pub(crate) fn fold_operand_type(
     let crate::ExprType::Attribute(attr) = expr else {
         return inferred;
     };
-    if !matches!(attr.value.as_ref(), crate::ExprType::Name(r) if r.id == "self") {
+    if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
         return inferred;
     }
     let field_ty = Some(crate::infer_type(Some(ctx), expr, options, symbols));

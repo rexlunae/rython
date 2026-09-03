@@ -1121,7 +1121,7 @@ impl CodeGen for StatementType {
                             // module-object / class-as-value divergence).
                             // `del self.field` remains a loud error (a
                             // real struct-member removal).
-                            if !matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                            if !crate::ast::tree::visit::is_self(a.value.as_ref()) {
                                 options.definition_warnings.borrow_mut().push(format!(
                                     "del of `{}` attribute is dropped (removing an \
                                      attribute from a non-self object is unmodeled — \

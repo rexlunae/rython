@@ -440,7 +440,7 @@ fn target_field_ty(
         // class table (round 99 — replaces the self_field_rust_ty
         // fallback, Directive 2).
         ExprType::Attribute(attr)
-            if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+            if crate::ast::tree::visit::is_self(attr.value.as_ref()) =>
         {
             Some(crate::infer_type(Some(ctx), target, options, symbols))
         }
@@ -454,7 +454,7 @@ fn target_field_ty(
                 value: field_expr @ ExprType::Attribute(attr),
                 ..
             }) = symbols.get(&n.id)
-                && matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == "self")
+                && crate::ast::tree::visit::is_self(attr.value.as_ref())
             {
                 return Some(crate::infer_type(
                     Some(ctx),

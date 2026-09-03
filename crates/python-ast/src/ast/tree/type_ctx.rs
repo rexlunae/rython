@@ -502,6 +502,48 @@ pub fn is_ndarray_expr(
     }
 }
 
+/// What a resolver is in the middle of resolving, so a self-referential
+/// chain is cut at the point it re-enters the SAME node — a name whose
+/// recorded assignment references itself (`label_bytes = label_bytes[lo:]`
+/// — idna/core.py) recurses Name → Assign value → Subscript → the same
+/// Name; a type alias naming itself; a function whose inferred return
+/// reads its own call. One guard keyed by the node, in place of the
+/// depth counters that cut every chain at an arbitrary length (issue
+/// #137, drift 4).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Resolving {
+    ExprType,
+    Alias,
+    Return,
+}
+
+thread_local! {
+    static IN_PROGRESS: std::cell::RefCell<std::collections::HashSet<(Resolving, usize)>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Run `body` unless the same node is already being resolved by the same
+/// resolver (a cycle), in which case `on_cycle` answers.
+fn resolving<R>(
+    what: Resolving,
+    node: usize,
+    on_cycle: impl FnOnce() -> R,
+    body: impl FnOnce() -> R,
+) -> R {
+    let entered = IN_PROGRESS.with(|s| s.borrow_mut().insert((what, node)));
+    if !entered {
+        return on_cycle();
+    }
+    let result = body();
+    IN_PROGRESS.with(|s| s.borrow_mut().remove(&(what, node)));
+    result
+}
+
+/// The cycle guard for a function's inferred return (function_def.rs).
+pub(crate) fn resolving_return<R>(node: usize, on_cycle: impl FnOnce() -> R, body: impl FnOnce() -> R) -> R {
+    resolving(Resolving::Return, node, on_cycle, body)
+}
+
 /// Infer the Rust type an expression will produce, bottom-up, from syntax
 /// plus the per-function annotation/assignment maps.
 pub fn infer_type(
@@ -510,20 +552,12 @@ pub fn infer_type(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> TypeInfo {
-    // Cycle guard: a name whose recorded assignment references itself
-    // (`label_bytes = label_bytes[lo:]`) would recurse forever through
-    // Name → Assign value → Subscript → value Name → ... (idna/core.py).
-    thread_local! {
-        static INFER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    let d = INFER_DEPTH.with(|c| c.get());
-    if d > 64 {
-        return TypeInfo::PyObject;
-    }
-    INFER_DEPTH.with(|c| c.set(d + 1));
-    let result = infer_type_inner(ctx, expr, options, symbols);
-    INFER_DEPTH.with(|c| c.set(d));
-    return result;
+    resolving(
+        Resolving::ExprType,
+        expr as *const ExprType as usize,
+        || TypeInfo::PyObject,
+        || infer_type_inner(ctx, expr, options, symbols),
+    )
 }
 
 fn infer_type_inner(
@@ -1398,7 +1432,7 @@ pub(crate) fn self_field_move_clone(
     let ExprType::Attribute(attr) = expr else {
         return None;
     };
-    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+    if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
         return None;
     }
     let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
@@ -2131,10 +2165,7 @@ pub fn analyze_function_types_with_class(
                         let crate::ExprType::Attribute(attr) = call.func.as_ref() else {
                             continue;
                         };
-                        if !matches!(
-                            attr.value.as_ref(),
-                            crate::ExprType::Name(r) if r.id == "self"
-                        ) {
+                        if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
                             continue;
                         }
                         if let Some(method) = class.method_on_mro(&attr.attr, symbols)
@@ -2192,10 +2223,7 @@ pub fn analyze_function_types_with_class(
                         // own field table). The field may live on a BASE
                         // whose struct is embedded (`self._tunnel_host` in
                         // a derived method): walk the chain.
-                        let self_read = matches!(
-                            attr.value.as_ref(),
-                            crate::ExprType::Name(r) if r.id == "self"
-                        );
+                        let self_read = crate::ast::tree::visit::is_self(attr.value.as_ref());
                         let field_ty = if self_read {
                             class
                                 .base_chain(symbols)
@@ -3367,20 +3395,12 @@ pub fn resolve_alias_typeinfo(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<TypeInfo> {
-    thread_local! {
-        static RA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    let d = RA_DEPTH.with(|c| c.get());
-    // A self-referential alias (`JsonType = ... | Sequence["JsonType"]`)
-    // recurses through the chain; the boxed PyValue is the correct
-    // resolution for the cycle.
-    if d > 64 {
-        return Some(TypeInfo::PyValue);
-    }
-    RA_DEPTH.with(|c| c.set(d + 1));
-    let result = resolve_alias_typeinfo_inner(ann, symbols, options);
-    RA_DEPTH.with(|c| c.set(d));
-    return result;
+    resolving(
+        Resolving::Alias,
+        ann as *const ExprType as usize,
+        || Some(TypeInfo::PyValue),
+        || resolve_alias_typeinfo_inner(ann, symbols, options),
+    )
 }
 
 /// The bare container name of a Subscript's value (`Optional` for both
@@ -4053,7 +4073,7 @@ fn self_method_return_typeinfo(
     let ExprType::Attribute(attr) = call.func.as_ref() else {
         return None;
     };
-    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+    if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
         return None;
     }
     let (class_name, symbols, options) = (self_class?, symbols?, options?);
@@ -4093,16 +4113,7 @@ fn resolve_type(
     symbols: Option<&SymbolTableScopes>,
     options: Option<&PythonOptions>,
 ) -> TypeInfo {
-    thread_local! {
-        static RT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    let d = RT_DEPTH.with(|c| c.get());
-    if d > 200 && d % 50 == 0 {
-    }
-    RT_DEPTH.with(|c| c.set(d + 1));
-    let result = resolve_type_inner(expr, info, symbols, options);
-    RT_DEPTH.with(|c| c.set(d));
-    return result;
+    resolve_type_inner(expr, info, symbols, options)
 }
 
 fn resolve_type_inner(

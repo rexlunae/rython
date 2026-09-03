@@ -356,7 +356,7 @@ impl CodeGen for Compare {
                 ) || matches!(
                     comparator_ast,
                     crate::ExprType::Attribute(attr)
-                        if matches!(attr.value.as_ref(), crate::ExprType::Name(n) if n.id == "self")
+                        if crate::ast::tree::visit::is_self(attr.value.as_ref())
                             && matches!(
                                 crate::infer_type(Some(&ctx), comparator_ast, &options, &symbols),
                                 crate::TypeInfo::Option(_)

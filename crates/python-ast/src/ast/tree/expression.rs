@@ -230,16 +230,7 @@ impl<'a> CodeGen for ExprType {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        thread_local! {
-            static E_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        let d = E_DEPTH.with(|c| c.get());
-        if d > 100 && d % 20 == 0 {
-        }
-        E_DEPTH.with(|c| c.set(d + 1));
-        let result = self.to_rust_inner(ctx, options, symbols);
-        E_DEPTH.with(|c| c.set(d));
-        return result;
+        self.to_rust_inner(ctx, options, symbols)
     }
 }
 

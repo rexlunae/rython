@@ -1782,7 +1782,7 @@ impl ClassDef {
                 // colliding with the typed field it was copied from.
                 let from_sibling_field = match store.value {
                     ExprType::Attribute(a)
-                        if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+                        if crate::ast::tree::visit::is_self(a.value.as_ref()) =>
                     {
                         fields
                             .iter()
@@ -2289,7 +2289,7 @@ fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>
             StatementType::Assign(assign) => {
                 for target in &assign.targets {
                     if let ExprType::Attribute(attr) = target {
-                        if matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                        if crate::ast::tree::visit::is_self(attr.value.as_ref()) {
                             out.push(FieldStore {
                                 attr: attr.attr.clone(),
                                 value: &assign.value,
@@ -4259,7 +4259,7 @@ fn infer_field_type(
             // falls back to the boxed PyValue and every typed use of it
             // mismatches.
             ExprType::Attribute(a)
-                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") =>
+                if crate::ast::tree::visit::is_self(a.value.as_ref()) =>
             {
                 let Some(SymbolTableNode::ClassDef(cls)) = symbols.get(class_name) else {
                     return None;
@@ -4652,7 +4652,7 @@ fn infer_field_type(
                 // A SELF-method call (`self._init_length(...)` — urllib3's
                 // emscripten response): the method's return annotation types
                 // the field.
-                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                if crate::ast::tree::visit::is_self(a.value.as_ref()) {
                     let Some(SymbolTableNode::ClassDef(class)) = symbols.get(class_name) else {
                         return None;
                     };
@@ -4666,7 +4666,7 @@ fn infer_field_type(
                 // ...)` — boto3's ServiceDocumenter): the field is a boxed
                 // PyValue, so the call result is too.
                 if let ExprType::Attribute(inner) = a.value.as_ref()
-                    && matches!(inner.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                    && crate::ast::tree::visit::is_self(inner.value.as_ref())
                 {
                     return Some(crate::TypeInfo::PyValue);
                 }
@@ -5083,7 +5083,7 @@ fn infer_field_type(
             // divergence, issue #122).
             if let ExprType::Subscript(s) = a.value.as_ref()
                 && matches!(s.value.as_ref(), ExprType::Attribute(t)
-                    if matches!(t.value.as_ref(), ExprType::Name(n) if n.id == "self"))
+                    if crate::ast::tree::visit::is_self(t.value.as_ref()))
             {
                 return Some(crate::TypeInfo::PyValue);
             }
@@ -5144,7 +5144,7 @@ fn infer_field_type(
             // self-field is a boxed PyValue (the member's type is not
             // statically known at this depth).
             if let ExprType::Attribute(inner) = a.value.as_ref()
-                && matches!(inner.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                && crate::ast::tree::visit::is_self(inner.value.as_ref())
             {
                 return Some(crate::TypeInfo::PyValue);
             }
@@ -5234,7 +5234,7 @@ fn infer_field_type(
             // (`self._path_to_urls = self._paths_to_urls[path]` — pip's
             // sources): the member of a field dict — a boxed value.
             if let ExprType::Attribute(attr) = s.value.as_ref()
-                && matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                && crate::ast::tree::visit::is_self(attr.value.as_ref())
             {
                 return Some(crate::TypeInfo::PyValue);
             }
@@ -5594,7 +5594,7 @@ fn collect_self_attr_reads(
     fn walk_expr(e: &ExprType, out: &mut std::collections::BTreeSet<String>) {
         match e {
             ExprType::Attribute(a) => {
-                if matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+                if crate::ast::tree::visit::is_self(a.value.as_ref()) {
                     out.insert(a.attr.clone());
                 }
                 walk_expr(&a.value, out);
