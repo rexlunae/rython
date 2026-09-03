@@ -1,0 +1,114 @@
+{
+  "converter_commit": "de61382",
+  "repo_head": "de61382",
+  "rypip_path": "target/debug/rypip",
+  "oracle": "CPython 3.11.15",
+  "passed": 0,
+  "total": 10,
+  "passing": [],
+  "programs": {
+    "bank": {
+      "program": "bank",
+      "warnings": 3,
+      "status": "build-failed",
+      "errors": 11,
+      "histogram": {
+        "E0308": 8,
+        "E0425": 2,
+        "E0599": 1
+      }
+    },
+    "inventory": {
+      "program": "inventory",
+      "status": "convert-failed",
+      "detail": "4da85685d449ea/library/std/src/rt.rs:171:5\n  18: std::rt::lang_start::<core::result::Result<(), anyhow::Error>>\n             at /rustc/88d9e12ae178fab0fb5cc050a94da85685d449ea/library/std/src/rt.rs:205:5\n  19: main\n  20: __libc_start_call_main\n             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n  21: __libc_start_main_impl\n             at ./csu/../csu/libc-start.c:360:3\n  22: _start"
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 4,
+      "histogram": {
+        "E0425": 2,
+        "E0061": 1,
+        "E0277": 1
+      }
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 13,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0277": 3,
+        "E0308": 2,
+        "E0282": 1
+      }
+    },
+    "records": {
+      "program": "records",
+      "warnings": 4,
+      "status": "build-failed",
+      "errors": 16,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 4,
+        "E0599": 3,
+        "E0615": 3,
+        "E0369": 1
+      }
+    },
+    "schedule": {
+      "program": "schedule",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 10,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 2,
+        "E0599": 2,
+        "E0369": 1
+      }
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 5,
+      "histogram": {
+        "E0277": 4,
+        "E0308": 1
+      }
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 9,
+      "histogram": {
+        "E0599": 4,
+        "E0308": 3,
+        "E0277": 2
+      }
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0308": 5,
+        "E0599": 1
+      }
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 1,
+      "histogram": {
+        "E0072": 1
+      }
+    }
+  }
+}
