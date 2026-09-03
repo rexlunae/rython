@@ -693,6 +693,8 @@ impl FunctionDef {
             };
             let mut sig_params = TokenStream::new();
             let mut forward_args: Vec<TokenStream> = Vec::new();
+            // Which axis (if any) each forwarded argument is, in order.
+            let mut forward_axis: Vec<Option<usize>> = Vec::new();
             let mut axis_arg_idents: Vec<proc_macro2::Ident> = Vec::new();
             for (i, p) in self.args.args.iter().enumerate() {
                 if let Some(k) = spec.axes.iter().position(|a| a.index == i) {
@@ -702,6 +704,7 @@ impl FunctionDef {
                     axis_arg_idents.push(ident);
                     let v = format_ident!("v{}", k + 1);
                     forward_args.push(quote!(#v));
+                    forward_axis.push(Some(k));
                     continue;
                 }
                 let (_, name, id) = router
@@ -713,6 +716,7 @@ impl FunctionDef {
                 let ty = extra_param_ty(id);
                 sig_params.extend(quote!(#ident: #ty,));
                 forward_args.push(quote!(#ident));
+                forward_axis.push(None);
             }
 
             // The return shape: the unified type, or the OUTPUT enum
@@ -895,7 +899,25 @@ impl FunctionDef {
                         }
                     })
                     .collect();
-                let call = arm_body(quote!(#morph(#(#forward_args),*)));
+                // A morph for a polymorphic ROOT (hierarchy.rs) takes the
+                // root's sum type; the axis enum's variant holds the
+                // concrete struct — it converts on the way in.
+                let args: Vec<TokenStream> = forward_args
+                    .iter()
+                    .zip(forward_axis.iter())
+                    .map(|(fa, ax)| match ax {
+                        Some(k) => match &assignment[*k] {
+                            Some(SpecTarget::Class(c))
+                                if crate::ast::tree::hierarchy::is_polymorphic_root(c) =>
+                            {
+                                quote!((#fa).into())
+                            }
+                            _ => fa.clone(),
+                        },
+                        None => fa.clone(),
+                    })
+                    .collect();
+                let call = arm_body(quote!(#morph(#(#args),*)));
                 if pats.len() == 1 {
                     let p = &pats[0];
                     match_arms.extend(quote!(#p => #call,));
@@ -2259,6 +2281,20 @@ impl FunctionDef {
                     None
                 };
                 t.filter(|_| !options.fn_return_is_pyvalue && !options.fn_return_is_option)
+            })
+            // A declared return naming a polymorphic ROOT (hierarchy.rs):
+            // the slot is the sum type, and the return site converts a
+            // subtree struct into it.
+            .or_else(|| {
+                self.returns
+                    .as_deref()
+                    .and_then(|ann| crate::resolve_alias_typeinfo(ann, &symbols, &options))
+                    .filter(|t| {
+                        matches!(t, crate::TypeInfo::Class(r)
+                            if crate::ast::tree::hierarchy::is_polymorphic_root(r))
+                            && !options.fn_return_is_pyvalue
+                            && !options.fn_return_is_option
+                    })
             });
 
         // A `-> List[Union[...]]` return whose element resolves to the

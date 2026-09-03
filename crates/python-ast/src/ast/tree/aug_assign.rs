@@ -131,6 +131,14 @@ impl CodeGen for AugAssign {
                     Some(crate::TypeInfo::String),
                 )?;
                 let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                // A polymorphic ROOT's value is the sum type: its fields are
+                // reached through the accessors (hierarchy.rs).
+                let field_mut = quote::format_ident!("{}_mut", attr.attr);
+                let writeback_store = if matches!(&**inner, crate::TypeInfo::Class(c) if crate::ast::tree::hierarchy::is_polymorphic_root(c)) {
+                    quote!(*__rython_v.#field_mut() = (__rython_v.#field_ident()).#method_ident(&(#value));)
+                } else {
+                    quote!(__rython_v.#field_ident = (__rython_v.#field_ident).#method_ident(&(#value));)
+                };
                 return Ok(quote!({
                     let mut __rython_v = (#recv_ident).clone().unwrap_or_else(|| {
                         panic!(
@@ -138,8 +146,7 @@ impl CodeGen for AugAssign {
                             stringify!(#field_ident)
                         )
                     });
-                    __rython_v.#field_ident =
-                        (__rython_v.#field_ident).#method_ident(&(#value));
+                    #writeback_store
                     (#container).py_set_index(#key, __rython_v.clone())?;
                     #recv_ident = Some(__rython_v);
                 }));

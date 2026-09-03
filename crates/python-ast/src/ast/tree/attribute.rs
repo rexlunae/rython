@@ -784,6 +784,29 @@ pub(crate) fn to_rust_place_expr(
                 symbols.clone(),
             )
         }
+        // A NAME narrowed from a polymorphic root to a class of its subtree
+        // (hierarchy.rs): as a PLACE it is the sum type's mutable view, so
+        // a store or a mutating call through it reaches the real value
+        // (the read view is a clone). A narrowing to a nested root has no
+        // place: loud.
+        ExprType::Name(n)
+            if let Some(root) = options.narrowed_class_origin.get(&n.id)
+                && let Some(crate::TypeInfo::Class(t)) = options.narrowed_names.get(&n.id)
+                && t != root =>
+        {
+            if crate::ast::tree::hierarchy::is_polymorphic_root(t) {
+                return Err(format!(
+                    "mutating `{}` inside `isinstance({}, {})` is not supported: `{}` is \
+                     itself a base class, and its narrowed view is a copy — test for \
+                     the concrete class, or mutate through a method of `{}`",
+                    n.id, n.id, t, t, root
+                )
+                .into());
+            }
+            let name = crate::safe_ident(&n.id);
+            let as_mut = format_ident!("__rython_as_{}_mut", t);
+            Ok(quote!((#name).#as_mut().unwrap()))
+        }
         _ => expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()),
     }
 }
@@ -852,9 +875,51 @@ pub(crate) fn class_field_access(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<FieldRewrite> {
+    let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
+    // A polymorphic ROOT's value (hierarchy.rs) may be the sum type, which
+    // has no fields — only the accessors every variant implements (the
+    // root struct too, through its trait), so a non-`self` receiver of a
+    // root class reads and writes through them at any depth. The receiver
+    // may be any expression the inferrer types (`self.items[k].qty`, a
+    // subscript into a dict of the root; an unwrapped `Option` local).
+    if !is_self {
+        // The receiver's class with its defining scope: the read path's
+        // resolution, else the inferred type's class resolved by name.
+        let resolved = crate::receiver_class_for_read(value, ctx, symbols, options).or_else(|| {
+            // A NAME's recorded type first: the inferrer answers a
+            // parameter from the annotation-string map, which knows no
+            // classes (`response: BaseHTTPResponse | None` is the boxed
+            // value there), while the analysis recorded the Option of
+            // the class.
+            let typed = match value {
+                ExprType::Name(n) => options.name_types.get(&n.id).cloned(),
+                _ => None,
+            }
+            .unwrap_or_else(|| crate::infer_type(Some(ctx), value, options, symbols));
+            let name = match typed {
+                crate::TypeInfo::Class(c) => c,
+                crate::TypeInfo::Option(inner) => match *inner {
+                    crate::TypeInfo::Class(c) => c,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            crate::ast::tree::call::receiver_class_tail(&name, symbols.clone(), options)
+                .or_else(|| crate::ast::tree::hierarchy::root_class_def(&name, symbols, options))
+        });
+        if let Some((class, class_symbols)) = resolved
+            && crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
+            // A FIELD of the root's chain (its accessors are what the sum
+            // type carries); a method or property keeps the call path.
+            && class.field_owner_depth(attr, &class_symbols, options).is_some()
+        {
+            return Some(FieldRewrite::Accessor {
+                field: attr.to_string(),
+            });
+        }
+    }
     let (class, class_symbols) = crate::receiver_class_for_read(value, ctx, symbols, options)?;
     let depth = class.field_owner_depth(attr, &class_symbols, options)?;
-    let is_self = matches!(value, ExprType::Name(n) if n.id == "self");
     if depth == 0 {
         // The receiver's own field. Direct access works for any concrete
         // receiver; only the generic `self` of a trait default needs the

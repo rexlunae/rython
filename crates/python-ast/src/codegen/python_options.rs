@@ -440,6 +440,18 @@ pub struct PythonOptions {
     /// trait. Set once per module; empty outside module generation.
     pub hierarchy_classes: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// The closed-world class hierarchy of the crate (hierarchy.rs): every
+    /// polymorphic ROOT (a class some class derives from) with the classes
+    /// in its subtree, root first. A root's slot type renders as its sum
+    /// type `Any<Root>`. Computed once per module conversion over every
+    /// module of the crate; empty outside module generation.
+    pub hierarchy_roots: std::rc::Rc<crate::ast::tree::hierarchy::HierarchyRoots>,
+
+    /// Names narrowed by `isinstance` from a polymorphic ROOT to a class of
+    /// its subtree (if_stmt.rs), mapped to the root: a read of the name in
+    /// the narrowed branch is the sum type's view of that class.
+    pub narrowed_class_origin: std::rc::Rc<std::collections::HashMap<String, String>>,
+
     /// Module functions monomorphized over an isinstance-tested parameter
     /// (see `specialize.rs`): the renderer emits one variant per tested
     /// type plus a residual, and call sites dispatch by the argument's
@@ -641,6 +653,8 @@ impl Default for PythonOptions {
             no_std: false,
             numpy_backend: None,
             hierarchy_classes: std::rc::Rc::new(std::collections::HashSet::new()),
+            hierarchy_roots: std::rc::Rc::new(std::collections::HashMap::new()),
+            narrowed_class_origin: std::rc::Rc::new(std::collections::HashMap::new()),
             specialized_fns: std::rc::Rc::new(std::collections::HashMap::new()),
             rendering_specialization: false,
             residual_fold_false: std::rc::Rc::new(std::collections::HashSet::new()),

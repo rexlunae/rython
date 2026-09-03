@@ -719,9 +719,12 @@ fn composition_chain_mutating_method_uses_mut_receivers() {
         "user-defined mutating callee must go through self.inner_mut(): {}",
         out
     );
+    // `Inner` has a subclass here, so the `inner: Inner` field is the
+    // hierarchy sum type (§7) and its field is reached through the
+    // accessor: `self.inner_mut().nums_mut()`.
     assert!(
-        out.contains("(self . inner_mut () . nums) . push"),
-        "builtin mutating method must go through self.inner_mut().nums: {}",
+        out.contains("(self . inner_mut () . nums_mut ()) . push"),
+        "builtin mutating method must go through self.inner_mut().nums_mut(): {}",
         out
     );
     assert!(
@@ -14610,12 +14613,14 @@ fn sum_over_a_generator_comprehension_sums_the_collected_list() {
 
 
 #[test]
-fn an_overriding_derived_argument_into_a_base_slot_is_loud() {
-    // Round 99: `add(Perishable(...))` where `add(item: Item)` — the
-    // generated From-slice would LOSE Perishable's label override (the
-    // base-typed slot dispatches statically; CPython dispatches
-    // dynamically through the base-typed container). Loud refusal.
-    let err = compile_err(
+fn a_derived_argument_into_a_base_slot_converts_into_the_sum_type() {
+    // The closed-world hierarchy (issue #137, drift 2): `Item` has a
+    // subclass, so an `Item` slot is the sum type `AnyItem` — one variant
+    // per class of the subtree, dispatching by match — and a `Perishable`
+    // flows into `add(item: Item)` through `From<Perishable> for AnyItem`,
+    // keeping its override and its identity. This replaces the struct
+    // slice (which dropped the override) and the loud refusal.
+    let out = compile(
         concat!(
             "class Item:\n",
             "    def __init__(self) -> None:\n",
@@ -14631,19 +14636,39 @@ fn an_overriding_derived_argument_into_a_base_slot_is_loud() {
             "    def __init__(self) -> None:\n",
             "        self.items: dict[str, Item] = {}\n",
             "    def add(self, item: Item) -> None:\n",
-            "        self.items[item.qty] = item\n",
+            "        self.items[item.label()] = item\n",
             "\n",
             "def main() -> None:\n",
             "    bag = Bag()\n",
             "    bag.add(Perishable())\n",
         ),
-        "override.py",
+        "sumtype.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubenumAnyItem{Item(Item),Perishable(Perishable)}"),
+        "the root's slot type is the sum type with one variant per class: {}",
+        out
     );
     assert!(
-        err.contains("passing `Perishable` where `Item` is expected is not supported yet")
-            && err.contains("would lose the override"),
-        "the override-loss refusal must name the construct: {}",
-        err
+        flat.contains("From<Perishable>forAnyItem"),
+        "a derived value converts into the sum type: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyDict<String,AnyItem>"),
+        "a container of the root holds the sum type: {}",
+        out
+    );
+    assert!(
+        flat.contains("matchself{AnyItem::Item(v)=><ItemasItemTrait>::label(v),AnyItem::Perishable(v)=><PerishableasItemTrait>::label(v)}"),
+        "every method of the root's MRO dispatches by match to the variant's implementation of the definer's trait (an override re-emitted there wins, as Python's dynamic dispatch does): {}",
+        out
+    );
+    assert!(
+        !out.contains("is not supported yet"),
+        "no loud refusal remains for the polymorphic store: {}",
+        out
     );
 }
 
@@ -16841,6 +16866,89 @@ fn the_analysis_narrows_an_isinstance_branch_like_the_lowering() {
     );
 }
 
+// The closed-world hierarchy (issue #137, drift 2): a slot declared with
+// a class that other classes derive from holds the sum type; isinstance on
+// it is a runtime variant test, and the guarded branch reads the name as
+// the variant's view.
+const SHAPES_SRC: &str = concat!(
+    "class Shape:\n",
+    "    def name(self) -> str:\n",
+    "        return \"shape\"\n",
+    "\n",
+    "class Rect(Shape):\n",
+    "    def __init__(self, w: float):\n",
+    "        self.w = w\n",
+    "    def name(self) -> str:\n",
+    "        return \"rect\"\n",
+    "\n",
+    "class Square(Rect):\n",
+    "    def name(self) -> str:\n",
+    "        return \"square\"\n",
+    "\n",
+    "def describe(s: Shape) -> str:\n",
+    "    if isinstance(s, Rect):\n",
+    "        return f\"rect {s.w}\"\n",
+    "    return s.name()\n",
+    "\n",
+    "def main() -> None:\n",
+    "    shapes: list[Shape] = [Rect(2.0), Square(1.0)]\n",
+    "    for s in shapes:\n",
+    "        print(describe(s))\n",
+);
+
+#[test]
+fn isinstance_on_a_root_typed_value_is_a_runtime_variant_test() {
+    let out = compile(SHAPES_SRC, "hier_isinstance.py");
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(s).__rython_is_Rect()"),
+        "isinstance on a root-typed parameter must test the variant at runtime, never fold: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfn__rython_is_Rect(&self)->bool{matches!(self,AnyShape::Rect(_)|AnyShape::Square(_))}"),
+        "the predicate covers the target's whole subtree: {}",
+        out
+    );
+}
+
+#[test]
+fn a_root_typed_name_narrowed_by_isinstance_reads_as_the_variants_view() {
+    let out = compile(SHAPES_SRC, "hier_narrow.py");
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(s).__rython_as_Rect().unwrap().w()"),
+        "inside the guard the name reads as the narrowed class's view, and its field through the accessor: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfn__rython_as_Rect(&self)->Option<AnyRect>"),
+        "a nested root narrows to its own sum type: {}",
+        out
+    );
+}
+
+#[test]
+fn a_list_of_a_root_holds_the_sum_type_and_its_elements_convert() {
+    let out = compile(SHAPES_SRC, "hier_list.py");
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Rect::new(2.0)?}).into()") && flat.contains("Square::new(1.0)?}).into()"),
+        "every element converts into the root's sum type: {}",
+        out
+    );
+    assert!(
+        flat.contains("describe(s)?") || flat.contains("describe((s).clone())?"),
+        "a root-typed value passes into a root slot as is: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyDisplayforAnyShape") && flat.contains("implDefaultforAnyShape"),
+        "the sum type carries the runtime traits: {}",
+        out
+    );
+}
+
 #[test]
 fn a_nested_comprehension_binds_each_generator_in_its_prefix_scope() {
     // Devin review on #318: generator i's iterable sees only the targets
@@ -16964,6 +17072,93 @@ fn a_key_lambda_parameter_shadowing_a_narrowed_name_is_a_fresh_binding() {
     );
 }
 
+/// A field read on a root-typed receiver whose class this module imports
+/// only under `TYPE_CHECKING` (urllib3's retry.py reading
+/// `response.status` on a `BaseHTTPResponse | None`): the sum type has
+/// no fields, so the read must take the accessor form, resolving the
+/// root through the hierarchy registry.
+#[test]
+fn a_field_read_on_a_type_checking_imported_root_takes_the_accessor_form() {
+    let response = parse(
+        concat!(
+            "class Base:\n",
+            "    def __init__(self, status: int) -> None:\n",
+            "        self.status = status\n",
+            "\n",
+            "class Derived(Base):\n",
+            "    pass\n",
+        ),
+        "response.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["pkg".to_string(), "response".to_string()],
+        std::rc::Rc::new(response),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        module_path: vec!["pkg".to_string()],
+        this_module_path: vec!["pkg".to_string(), "retry".to_string()],
+        ..Default::default()
+    };
+    let usemod = parse(
+        concat!(
+            "import typing\n",
+            "if typing.TYPE_CHECKING:\n",
+            "    from .response import Base\n",
+            "\n",
+            "def f(response: Base | None = None) -> int:\n",
+            "    if response and response.status:\n",
+            "        return response.status\n",
+            "    return 0\n",
+        ),
+        "retry.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("retry".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". status ()") && !out.contains(". status ;") && !out.contains(". status)"),
+        "the read routes through the accessor: {}",
+        out
+    );
+}
+
+/// A factory whose declared return is a polymorphic ROOT returns a struct
+/// of the subtree: the return converts into the sum type, as an argument
+/// or a store into the root's slot does (urllib3's connection_from_url,
+/// `-> HTTPConnectionPool`, returning either pool class).
+#[test]
+fn a_return_of_a_subtree_class_converts_into_the_roots_sum_type() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "def make(kind: str) -> Shape:\n",
+            "    if kind == \"c\":\n",
+            "        return Circle()\n",
+            "    return Shape()\n",
+        ),
+        "factory.py",
+    );
+    assert_eq!(
+        out.matches(") . into ()").count(),
+        2,
+        "both returns convert into the sum type: {}",
+        out
+    );
+}
+
 /// A comprehension over a SET of a class types its target from the set's
 /// element (Devin review on #318): the body's user-method call resolves
 /// its receiver and propagates the Result.
@@ -17057,6 +17252,191 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
     assert!(
         out.contains(". area () ?"),
         "the aliased class's method call propagates: {}",
+        out
+    );
+}
+
+/// A class that both DERIVES from a root and HOLDS one (`Outer(Inner)`
+/// with `self.inner: Inner`) would make the sum type recursive without
+/// indirection: that variant's payload is boxed, and the store into the
+/// root-typed field converts the constructed struct into the sum type.
+#[test]
+fn a_variant_holding_its_family_inline_is_boxed_and_the_field_store_converts() {
+    let out = compile(
+        concat!(
+            "class Inner:\n",
+            "    def __init__(self, x: int):\n",
+            "        self.x = x\n",
+            "\n",
+            "class Outer(Inner):\n",
+            "    def __init__(self):\n",
+            "        self.inner: Inner = Inner(0)\n",
+            "\n",
+            "    def mutate(self) -> int:\n",
+            "        self.inner.x = 5\n",
+            "        return self.inner.x\n",
+        ),
+        "selfhold.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubenumAnyInner{Inner(Inner),Outer(Box<Outer>)}"),
+        "the self-holding variant is boxed: {}",
+        out
+    );
+    assert!(
+        flat.contains("self.inner=({Inner::new(0)?}).into();"),
+        "the store into the root-typed field converts: {}",
+        out
+    );
+}
+
+/// A store or a mutating method call through a NARROWED root-typed name
+/// (Devin review on #319) reaches the real value: the place is the sum
+/// type's mutable view, not the read view's clone.
+#[test]
+fn a_mutation_through_a_narrowed_root_typed_name_takes_the_mutable_view() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def __init__(self, r: float):\n",
+            "        self.r = r\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0 * self.r\n",
+            "    def grow(self, k: float) -> None:\n",
+            "        self.r *= k\n",
+            "\n",
+            "def bump(s: Shape) -> None:\n",
+            "    if isinstance(s, Circle):\n",
+            "        s.r = s.r + 1.0\n",
+            "        s.grow(2.0)\n",
+        ),
+        "narrowmut.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(s).__rython_as_Circle_mut().unwrap().r="),
+        "the store goes through the mutable view: {}",
+        out
+    );
+    assert!(
+        flat.contains("((s).__rython_as_Circle_mut().unwrap()).grow(2.0)?"),
+        "the mutating call goes through the mutable view: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfn__rython_as_Circle_mut(&mutself)->Option<&mutCircle>"),
+        "the sum type offers the mutable view: {}",
+        out
+    );
+}
+
+/// A TUPLE of class targets on a root-typed value (Devin review on #319)
+/// is the OR of the registry's tests: two subtree classes are two variant
+/// tests, and an ancestor in the tuple makes the check true outright.
+#[test]
+fn a_tuple_of_class_targets_on_a_root_typed_value_ors_the_variant_tests() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "class Rect(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 4.0\n",
+            "\n",
+            "class Blob:\n",
+            "    pass\n",
+            "\n",
+            "def either(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Circle, Rect))\n",
+            "\n",
+            "def any_shape(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Blob, Shape))\n",
+            "\n",
+            "def neither(s: Shape) -> bool:\n",
+            "    return isinstance(s, (Blob,))\n",
+        ),
+        "tupleisinstance.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((s).__rython_is_Circle()||(s).__rython_is_Rect())"),
+        "two subtree targets are two variant tests: {}",
+        out
+    );
+    assert!(
+        flat.contains("fnany_shape(s:AnyShape)->Result<bool,PyException>{returnOk(true);}"),
+        "an ancestor in the tuple is true outright: {}",
+        out
+    );
+    assert!(
+        flat.contains("fnneither(s:AnyShape)->Result<bool,PyException>{returnOk(false);}"),
+        "a tuple of unrelated classes is false: {}",
+        out
+    );
+}
+
+/// `isinstance(other, type(self))` on a root-typed value (Devin review on
+/// #319) is the runtime variant test for the enclosing class — not a fold
+/// of the static root type.
+#[test]
+fn a_type_self_target_on_a_root_typed_value_is_the_variant_test() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "    def same_kind(self, other: \"Shape\") -> bool:\n",
+            "        return isinstance(other, type(self))\n",
+        ),
+        "typeselfisinstance.py",
+    );
+    assert!(
+        out.contains("(other) . __rython_is_Circle ()"),
+        "type(self) in Circle's method tests the Circle variant: {}",
+        out
+    );
+}
+
+/// An ALIASED `isinstance` target (`C = Circle`, `isinstance(s, C)`) on a
+/// root-typed value resolves to the class the registry knows.
+#[test]
+fn an_aliased_isinstance_target_on_a_root_typed_value_is_the_variant_test() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "C = Circle\n",
+            "\n",
+            "def is_round(s: Shape) -> bool:\n",
+            "    return isinstance(s, C)\n",
+        ),
+        "aliasisinstance.py",
+    );
+    assert!(
+        out.contains("__rython_is_Circle ()"),
+        "the alias resolves to the registry's class: {}",
         out
     );
 }

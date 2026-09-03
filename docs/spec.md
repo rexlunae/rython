@@ -1588,6 +1588,35 @@ impl Point {
   operator overloading, `super()`, multiple inheritance — are out of
   the current subset; uses that reach codegen fail in rustc rather
   than at conversion time (§12.1).
+- **Inheritance and the hierarchy sum type.** A class with a base (or
+  used as one) lowers with the trait machinery: its methods live on a
+  `{Name}Trait`, the derived struct embeds its base (`__rython_base`),
+  and every ancestor trait is implemented for it, so `super()` and
+  inherited calls resolve. Rust structs have no subtyping, so a slot
+  declared with a class that other classes derive from — a
+  **polymorphic root**: a parameter `item: Item`, a field `dict[str,
+  Item]`, a local `list[Shape]`, a return `-> Shape` — is the
+  generated **sum type** `Any{Name}` with one variant per class of the
+  root's subtree (the root included), computed once over the whole
+  crate. A value of any class in the subtree flows into the slot through
+  `From<Class> for Any{Name}` (a nested root's own sum type converts
+  variant by variant); every method of the root's MRO and every field
+  accessor dispatches by `match` to the variant's own implementation, so
+  an override stored through a base-typed container runs — CPython's
+  dynamic dispatch, decided by a `match`. `isinstance(x, T)` on a
+  root-typed value is a runtime variant test (`x.__rython_is_T()`), true
+  for an ancestor and false outside the subtree — one registry test that
+  every target form consults: a class name (through its aliases), each
+  element of a tuple of classes (their OR; an ancestor among them is true
+  outright), and `type(self)` (the enclosing class); inside the guarded
+  branch the name reads as the sum type's view of `T`
+  (`x.__rython_as_T()`, an owned clone), so `T`'s own fields and methods
+  resolve. A leaf class IS its struct, and `isinstance` on it folds
+  exactly through the class tree. Every class implements `PyDisplay`
+  (`__str__`, else `__repr__`, else `<module.Class object>`) and
+  `PyRepr` (`__repr__`, else the default form), so instances and
+  containers of them print. Multiple inheritance beyond the first base
+  is still dropped (loud where a call needs it).
 
 ---
 
@@ -1731,9 +1760,11 @@ pins the Output, issue #133), `abs`, `round`
 `enumerate`, `zip`, `map`/`filter`, `all`/`any`, `repr`, `hash`
 (CPython's algorithms under `PYTHONHASHSEED=0`, including siphash13 for
 strings over the internal representation), `ord`/`chr`, `isinstance`
-(decided at conversion time on statically-known types, walking the class
-inheritance tree — `isinstance(dog, Animal)` folds true for `dog: Dog` —
-with constant branches pruned; a module function whose unannotated
+(decided at conversion time on a statically-known LEAF class, walking
+the class inheritance tree — `isinstance(dog, Animal)` folds true for
+`dog: Dog` — with constant branches pruned; a RUNTIME variant test on a
+value of a polymorphic root, whose slot holds any class of the subtree
+(§7); a module function whose unannotated
 parameter(s) are isinstance-dispatched in plain `if` tests
 monomorphizes — one specialized Rust function per input type, and with
 SEVERAL tested parameters one per combination in their cartesian

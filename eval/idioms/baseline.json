@@ -5,7 +5,7 @@
       "errors": 11
     },
     "inventory": {
-      "status": "convert-failed"
+      "status": "pass"
     },
     "matrix": {
       "status": "build-failed",
@@ -24,8 +24,7 @@
       "errors": 10
     },
     "shapes": {
-      "status": "build-failed",
-      "errors": 5
+      "status": "pass"
     },
     "text_stats": {
       "status": "build-failed",
@@ -38,6 +37,9 @@
     "tree": {
       "status": "build-failed",
       "errors": 1
+    },
+    "views": {
+      "status": "pass"
     }
   }
 }

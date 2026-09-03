@@ -407,9 +407,12 @@ fn composition_stores_and_tuple_targets_persist_through_mut_accessors() {
 
     // The generic trait defaults must store through the mut accessors.
     let app_rs = fs::read_to_string(out.join("src/app.rs")).unwrap();
+    // `Inner` is a polymorphic ROOT (Outer derives from it), so the
+    // composition field's slot is its sum type and the store goes through
+    // the root's mutable accessor pair (hierarchy.rs).
     assert!(
-        app_rs.contains("self.inner_mut().x = 5"),
-        "chain store must go through inner_mut: {}",
+        app_rs.contains("*self.inner_mut().x_mut() = 5"),
+        "chain store must go through inner_mut and the root's accessor: {}",
         app_rs
     );
     assert!(

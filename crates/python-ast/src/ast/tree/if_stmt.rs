@@ -135,11 +135,27 @@ impl CodeGen for If {
             crate::isinstance_narrowing(&self.test, &options, &symbols)
         {
             let mut body_n = options.narrowed_names.as_ref().clone();
-            body_n.insert(name.clone(), body_ty);
+            body_n.insert(name.clone(), body_ty.clone());
             body_options.narrowed_names = std::rc::Rc::new(body_n);
             let mut else_n = options.narrowed_names.as_ref().clone();
-            else_n.insert(name.clone(), else_ty);
+            else_n.insert(name.clone(), else_ty.clone());
             else_options.narrowed_names = std::rc::Rc::new(else_n);
+            // A CLASS narrowing (a root-typed name to a class of its
+            // subtree — hierarchy.rs) also retypes the name for the branch,
+            // so method and field resolution see the narrowed class, and
+            // records the root the sum type's view is taken from.
+            if let Some(crate::TypeInfo::Class(root)) = options.name_types.get(&name).cloned()
+                && matches!(body_ty, crate::TypeInfo::Class(_))
+            {
+                for (opts, ty) in [(&mut body_options, &body_ty), (&mut else_options, &else_ty)] {
+                    let mut nt = opts.name_types.as_ref().clone();
+                    nt.insert(name.clone(), ty.clone());
+                    opts.name_types = std::rc::Rc::new(nt);
+                    let mut origin = opts.narrowed_class_origin.as_ref().clone();
+                    origin.insert(name.clone(), root.clone());
+                    opts.narrowed_class_origin = std::rc::Rc::new(origin);
+                }
+            }
         }
 
         // A test that folded to a compile-time CONSTANT — an isinstance

@@ -1960,11 +1960,16 @@ pub fn convert(
     // block, test utilities) is SKIPPED, so a divergent module the program
     // never imports no longer blocks conversion.
     let reachable = reachable_module_paths(package, &python_deps);
+    // Only the modules the crate EMITS enter the shared map: a crate-wide
+    // index over it (the class hierarchy's sum-type variants) must never
+    // name a module that was skipped as unreachable (`crate::urllib3::
+    // contrib::socks::...` in a crate with no contrib module — E0433).
     let module_defs = module_def_map(
         python_deps
             .iter()
             .flat_map(|(_, dep)| dep.modules.iter())
-            .chain(package.modules.iter()),
+            .chain(package.modules.iter())
+            .filter(|m| reachable.contains(&m.path)),
     );
     // One options object per conversion: the shared `module_defs` and the
     // cross-module trait-mut cache (computed once, reused by every module's
@@ -2409,11 +2414,16 @@ fn convert_driver(
     // block, test utilities) is SKIPPED, so a divergent module the program
     // never imports no longer blocks conversion.
     let reachable = reachable_module_paths(package, &python_deps);
+    // Only the modules the crate EMITS enter the shared map: a crate-wide
+    // index over it (the class hierarchy's sum-type variants) must never
+    // name a module that was skipped as unreachable (`crate::urllib3::
+    // contrib::socks::...` in a crate with no contrib module — E0433).
     let module_defs = module_def_map(
         python_deps
             .iter()
             .flat_map(|(_, dep)| dep.modules.iter())
-            .chain(package.modules.iter()),
+            .chain(package.modules.iter())
+            .filter(|m| reachable.contains(&m.path)),
     );
     let (package_uses_async, _) = package_async_flags(package);
     let base_options = conversion_base_options(

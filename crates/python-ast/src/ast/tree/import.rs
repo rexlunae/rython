@@ -1325,6 +1325,15 @@ impl CodeGen for ImportFrom {
             // plain structs get none (the per-module map is empty for
             // them).
             let import_module_path = self.resolved_module_path(&options);
+            // A polymorphic ROOT's slot type is its sum type, defined in
+            // the root's module (hierarchy.rs): import it alongside.
+            if options.hierarchy_roots.contains_key(&alias.name) {
+                let any = crate::ast::tree::hierarchy::any_ident(&alias.name);
+                tokens.extend(quote! {
+                    #[allow(unused_imports)]
+                    use #root #(::#base_parts)* #(::#module_path)*::#any;
+                });
+            }
             if let Some(key) = crate::module_defs_key(&options, &import_module_path)
                 && let Some(traits) = crate::module_class_traits(&options, key).get(&alias.name)
             {

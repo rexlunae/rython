@@ -665,6 +665,26 @@ impl CodeGen for StatementType {
                 // consults it.
                 let value_yields_option =
                     crate::expr_yields_option_ctx(&e.value, &ctx, &options, &symbols);
+                // A class value returned from a function whose declared
+                // return is a polymorphic ROOT (hierarchy.rs): the slot is
+                // the sum type, so a struct of the subtree converts —
+                // the same rule `coerce_tokens` applies to an argument or
+                // a store (`return HTTPConnectionPool(...)` in a
+                // `-> HTTPConnectionPool` factory — urllib3's
+                // connection_from_url). Computed before `symbols` moves.
+                let value_class_into_root = match options.fn_return_typed.as_ref() {
+                    Some(crate::TypeInfo::Class(root))
+                        if crate::ast::tree::hierarchy::is_polymorphic_root(root) =>
+                    {
+                        matches!(
+                            crate::ast::tree::type_ctx::infer_type(None, &e.value, &options, &symbols),
+                            crate::TypeInfo::Class(a)
+                                if a == *root
+                                    || crate::ast::tree::class_def::ClassDef::extends_by_name(&a, root)
+                        )
+                    }
+                    _ => false,
+                };
                 // Round 81 (the generics directive): whether the returned
                 // VALUE is (or wraps) a boxed PyValue inside a CONCRETE
                 // typed return — computed here, BEFORE the tokens below
@@ -675,9 +695,14 @@ impl CodeGen for StatementType {
                 // local like `returned_chunk` in a `-> bytes` fn: map the
                 // conversion, and the None case is a LOUD panic — Python
                 // would fail at use on a None chunk, §12.2).
-                let value_infers_pyvalue_in_typed_return = options
-                    .fn_return_typed
-                    .is_some()
+                // A ROOT-typed return has no `From<PyValue>`: a boxed
+                // value returned there stays as is (loud E0308), so the
+                // conversion below is for the primitive returns only.
+                let typed_primitive_return = matches!(
+                    options.fn_return_typed,
+                    Some(ref t) if !matches!(t, crate::TypeInfo::Class(_))
+                );
+                let value_infers_pyvalue_in_typed_return = typed_primitive_return
                     && (matches!(
                         crate::ast::tree::type_ctx::infer_type(None, 
                             &e.value,
@@ -700,9 +725,7 @@ impl CodeGen for StatementType {
                     || matches!(&e.value, ExprType::Name(n)
                         if name_binds_dropped_call(&n.id, &symbols, &options, &ctx)
                             && !options.optional_names.contains(&n.id)));
-                let value_infers_option_pyvalue_in_typed_return = options
-                    .fn_return_typed
-                    .is_some()
+                let value_infers_option_pyvalue_in_typed_return = typed_primitive_return
                     && (matches!(
                         crate::ast::tree::type_ctx::infer_type(None, 
                             &e.value,
@@ -936,7 +959,9 @@ impl CodeGen for StatementType {
                 // maps the conversion over the Option — the None case is
                 // a LOUD panic (Python would fail at use on a None chunk,
                 // §12.2).
-                let value = if value_infers_pyvalue_in_typed_return {
+                let value = if value_class_into_root {
+                    quote!((#value).into())
+                } else if value_infers_pyvalue_in_typed_return {
                     quote!((#value).into())
                 } else if value_infers_option_pyvalue_in_typed_return {
                     quote!((#value).map(Into::into).expect(

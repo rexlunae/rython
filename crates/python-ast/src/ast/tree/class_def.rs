@@ -814,6 +814,13 @@ impl ClassDef {
         }
     }
 
+    /// `class_extends` by the hierarchy registry alone (no symbol table in
+    /// hand — the coercion authority): whether `child` is in `ancestor`'s
+    /// subtree.
+    pub(crate) fn extends_by_name(child: &str, ancestor: &str) -> bool {
+        child == ancestor || crate::ast::tree::hierarchy::in_subtree_by_name(child, ancestor)
+    }
+
     /// The class name that closes an inheritance cycle (`class A(A)`), or
     /// None for a valid chain. Walks bases like base_chain but reports the
     /// repeat instead of silently stopping.
@@ -2183,9 +2190,17 @@ fn qualify_tokens(
                     ) {
                     None
                 } else if is_capword {
+                    // A root's SUM TYPE (`AnyContentDecoder` — hierarchy.rs)
+                    // lives beside its root class.
+                    let root_of_any = name
+                        .strip_prefix("Any")
+                        .filter(|r| crate::ast::tree::hierarchy::is_polymorphic_root(r));
                     if crate::ast::tree::module::module_class_traits(a_opts, definer_path)
                         .contains_key(&name)
                         || crate::module_class_def(a_opts, definer_path, &name).is_some()
+                        || root_of_any.is_some_and(|r| {
+                            crate::module_class_def(a_opts, definer_path, r).is_some()
+                        })
                     {
                         Some(definer_path.to_vec())
                     } else {
@@ -3323,32 +3338,7 @@ impl CodeGen for ClassDef {
                 let ancestor = crate::safe_ident(&a.name);
                 quote!(impl PyInherits<#ancestor> for #class_name {})
             });
-            // The UP-CAST conversions: a derived instance into each
-            // ancestor, via the embedded base structs (the slice is exact —
-            // the ancestor's fields ARE the embedded part; CPython's shared
-            // object identity is the value-semantics divergence §12.3
-            // records for the container model). `add(perishable)` where
-            // `add(item: Item)` — the idiom corpus's add (round 99). One
-            // `From` per ancestor, walking the same base_chain the
-            // PyInherits tree uses, so the two cannot drift.
-            let chain: Vec<_> = self.base_chain(&symbols).into_iter().collect();
-            // base_chain is REFLEXIVE (chain[0] is the class itself) — the
-            // From impls start at the first real ancestor.
-            let from_impls = (1..chain.len())
-                .map(|depth| {
-                    let ancestor = crate::safe_ident(&chain[depth].name);
-                    let mut tokens = quote!(v);
-                    for _ in 0..depth {
-                        tokens = quote!(#tokens.__rython_base);
-                    }
-                    quote!(impl std::convert::From<#class_name> for #ancestor {
-                        fn from(v: #class_name) -> #ancestor {
-                            #tokens
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            quote!(#(#entries)* #(#from_impls)*)
+            quote!(#(#entries)*)
         } else {
             quote!()
         };
@@ -3442,16 +3432,40 @@ impl CodeGen for ClassDef {
                 };
                 quote!(format!("<{} object>", #class_display))
             };
+            // repr(obj) is `__repr__` alone (str falls back to it, not the
+            // other way round); a class without one reprs as the default
+            // object form. Every class carries PyRepr so a container of
+            // instances prints (`print(sorted(shapes, key=...))`) and the
+            // hierarchy sum type can delegate.
+            let repr_expr = if defines_dunder("__repr__") {
+                quote!(self.__repr__().unwrap_or_else(|e| panic!("{}", e)))
+            } else {
+                let module = options.module_path.join(".");
+                let class_display = if module.is_empty() {
+                    self.name.clone()
+                } else {
+                    format!("{module}.{}", self.name)
+                };
+                quote!(format!("<{} object>", #class_display))
+            };
             quote! {
                 impl stdpython::PyDisplay for #class_name {
                     fn py_display(&self) -> String {
                         #display_expr
                     }
                 }
+                impl stdpython::PyRepr for #class_name {
+                    fn py_repr(&self) -> String {
+                        #repr_expr
+                    }
+                }
             }
         } else {
             quote!()
         };
+
+        // A polymorphic ROOT's sum type (hierarchy.rs), after the class.
+        let any_enum = self.emit_any_enum(in_hierarchy, &symbols, &options)?;
 
         Ok(quote! {
             #docs
@@ -3480,6 +3494,7 @@ impl CodeGen for ClassDef {
                 #base_inherent_accessors
                 #methods_stream
             }
+            #any_enum
         })
     }
 }
@@ -5708,5 +5723,437 @@ fn collect_self_attr_reads(
             }
             _ => {}
         }
+    }
+}
+
+impl ClassDef {
+    /// The sum type of a polymorphic ROOT (hierarchy.rs): `enum AnyShape {
+    /// Shape(Shape), Circle(Circle), ... }` with one variant per class in
+    /// the root's subtree, plus everything a root-typed slot needs —
+    /// `From` per variant (and per nested root), the root's accessors and
+    /// every method of its MRO dispatching by `match` to the variant's own
+    /// implementation, the runtime traits (`PyDisplay`, `PyRepr`,
+    /// `PyIsNone`, `PyInherits`), a `Default` (the root variant), and the
+    /// `isinstance` predicates and narrowing views (`__rython_is_X`,
+    /// `__rython_as_X`) the lowering emits instead of the constant fold.
+    /// Empty for a class that is not a root.
+    /// Whether `variant`'s struct holds a value of the family INLINE: a
+    /// field (own or inherited) typed with the root or a member, bare or
+    /// in an Option/tuple (a Vec/Dict/Set is heap-indirected). Such a
+    /// payload must be boxed in the sum type (E0072 otherwise).
+    fn variant_holds_family_inline(
+        &self,
+        variant: &crate::ast::tree::hierarchy::Variant,
+        family: &[crate::ast::tree::hierarchy::Variant],
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> bool {
+        fn inline_class(t: &crate::TypeInfo, family: &[crate::ast::tree::hierarchy::Variant]) -> bool {
+            match t {
+                crate::TypeInfo::Class(c) => family.iter().any(|v| v.name == *c),
+                crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {
+                    inline_class(inner, family)
+                }
+                crate::TypeInfo::Tuple(ts) => ts.iter().any(|t| inline_class(t, family)),
+                _ => false,
+            }
+        }
+        let resolved = match &variant.module_path {
+            Some(path) => crate::module_class_def(options, path, &variant.name),
+            None => match symbols.get(&variant.name) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+                _ => None,
+            },
+        };
+        let Some((class, class_symbols)) = resolved else {
+            return false;
+        };
+        class
+            .base_chain(&class_symbols)
+            .iter()
+            .filter_map(|c| c.infer_fields(&class_symbols, options).ok())
+            .flatten()
+            .any(|(_, t)| inline_class(&t, family))
+    }
+
+    pub(crate) fn emit_any_enum(
+        &self,
+        in_hierarchy: bool,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        use crate::ast::tree::hierarchy as h;
+        let Some(variants) = h::subtree(options, &self.name) else {
+            return Ok(quote!());
+        };
+        if !options.with_std_python {
+            return Ok(quote!());
+        }
+        let any = h::any_ident(&self.name);
+        let root_ident = crate::safe_ident(&self.name);
+        let vnames: Vec<proc_macro2::Ident> =
+            variants.iter().map(|v| crate::safe_ident(&v.name)).collect();
+        let vpaths: Vec<TokenStream> = variants.iter().map(h::variant_path).collect();
+        // A variant whose struct holds a value of this family INLINE (a
+        // field typed with the root or a member — `Outer(Inner)` with
+        // `self.inner: Inner`) would make the sum type recursive without
+        // indirection (E0072): that variant's payload is boxed.
+        let boxed: Vec<bool> = variants
+            .iter()
+            .map(|v| self.variant_holds_family_inline(v, &variants, symbols, options))
+            .collect();
+        let vpayloads: Vec<TokenStream> = vpaths
+            .iter()
+            .zip(boxed.iter())
+            .map(|(vp, b)| if *b { quote!(Box<#vp>) } else { vp.clone() })
+            .collect();
+        let wrap = |i: usize, v: TokenStream| if boxed[i] { quote!(Box::new(#v)) } else { v };
+        let unbox = |i: usize, x: TokenStream| if boxed[i] { quote!((**#x).clone()) } else { quote!(#x.clone()) };
+
+        // ---- The type, its conversions, and the runtime traits ----
+        let from_impls = vnames.iter().zip(vpaths.iter()).enumerate().map(|(i, (vn, vp))| {
+            let wrapped = wrap(i, quote!(v));
+            quote! {
+                impl std::convert::From<#vp> for #any {
+                    fn from(v: #vp) -> #any { #any::#vn(#wrapped) }
+                }
+            }
+        });
+        // A NESTED root in the subtree (Rect inside Shape's): its own sum
+        // type converts variant by variant.
+        let nested_from = variants.iter().skip(1).filter(|v| h::subtree(options, &v.name).is_some()).map(|v| {
+            let inner_any = h::any_ident(&v.name);
+            let inner_any_path = match &v.module_path {
+                None => quote!(#inner_any),
+                Some(path) => {
+                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    quote!(crate #(::#segs)* :: #inner_any)
+                }
+            };
+            let members: Vec<proc_macro2::Ident> = h::subtree(options, &v.name)
+                .map(|s| s.iter().map(|m| crate::safe_ident(&m.name)).collect())
+                .unwrap_or_default();
+            quote! {
+                impl std::convert::From<#inner_any_path> for #any {
+                    fn from(v: #inner_any_path) -> #any {
+                        match v { #(#inner_any_path::#members(x) => #any::#members(x.into())),* }
+                    }
+                }
+            }
+        });
+        let ancestors: Vec<proc_macro2::Ident> = self
+            .base_chain(symbols)
+            .iter()
+            .map(|a| crate::safe_ident(&a.name))
+            .collect();
+        let root_default = wrap(0, quote!(#root_ident::default()));
+        let runtime_impls = quote! {
+            impl Default for #any {
+                fn default() -> Self { #any::#root_ident(#root_default) }
+            }
+            impl stdpython::PyIsNone for #any {
+                fn py_is_none(&self) -> bool { false }
+            }
+            #(impl PyInherits<#ancestors> for #any {})*
+            impl stdpython::PyDisplay for #any {
+                fn py_display(&self) -> String {
+                    match self { #(#any::#vnames(v) => v.py_display()),* }
+                }
+            }
+            impl stdpython::PyRepr for #any {
+                fn py_repr(&self) -> String {
+                    match self { #(#any::#vnames(v) => v.py_repr()),* }
+                }
+            }
+        };
+
+        // ---- isinstance predicates and narrowing views ----
+        let mut views = TokenStream::new();
+        for v in variants.iter().skip(1) {
+            let is_fn = format_ident!("__rython_is_{}", v.name);
+            let as_fn = format_ident!("__rython_as_{}", v.name);
+            let members: Vec<proc_macro2::Ident> = match h::subtree(options, &v.name) {
+                Some(s) => s.iter().map(|m| crate::safe_ident(&m.name)).collect(),
+                None => vec![crate::safe_ident(&v.name)],
+            };
+            let (view_ty, arms) = match h::subtree(options, &v.name) {
+                Some(_) => {
+                    let inner_any = h::any_ident(&v.name);
+                    let inner_any_path = match &v.module_path {
+                        None => quote!(#inner_any),
+                        Some(path) => {
+                            let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                            quote!(crate #(::#segs)* :: #inner_any)
+                        }
+                    };
+                    (
+                        inner_any_path.clone(),
+                        quote!(#(#any::#members(x) => Some(#inner_any_path::#members((*x).clone().into()))),*),
+                    )
+                }
+                None => {
+                    let vp = h::variant_path(v);
+                    let vn = crate::safe_ident(&v.name);
+                    let i = variants.iter().position(|w| w.name == v.name).unwrap_or(0);
+                    let cloned = unbox(i, quote!(x));
+                    (vp, quote!(#any::#vn(x) => Some(#cloned)))
+                }
+            };
+            // The MUTABLE view of a plain variant: a store or a mutating
+            // call through a narrowed name reaches the real value (a
+            // nested root has no place to view; its mutation is loud at
+            // the lowering).
+            let as_mut_fn = format_ident!("__rython_as_{}_mut", v.name);
+            let mutable_view = if h::subtree(options, &v.name).is_none() {
+                let vp = h::variant_path(v);
+                let vn = crate::safe_ident(&v.name);
+                let i = variants.iter().position(|w| w.name == v.name).unwrap_or(0);
+                let inner = if boxed[i] { quote!(Some(&mut **x)) } else { quote!(Some(x)) };
+                quote! {
+                    pub fn #as_mut_fn(&mut self) -> Option<&mut #vp> {
+                        match self { #any::#vn(x) => #inner, _ => None }
+                    }
+                }
+            } else {
+                quote!()
+            };
+            views.extend(quote! {
+                pub fn #is_fn(&self) -> bool {
+                    matches!(self, #(#any::#members(_))|*)
+                }
+                pub fn #as_fn(&self) -> Option<#view_ty> {
+                    match self { #arms, _ => None }
+                }
+                #mutable_view
+            });
+        }
+
+        // ---- Accessors and method delegators, per class of the MRO ----
+        let chain = self.cross_module_chain(symbols, options);
+        let mut inherent = TokenStream::new();
+        let mut trait_impls = TokenStream::new();
+        let mut seen_methods: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // A method is a member of the trait of the class that FIRST
+        // defines it (the topmost definer in the chain): an override
+        // forwards under that ancestor's trait, never under the
+        // overrider's (E0407). The chain runs root-first, so the last
+        // index defining a name is its definer.
+        let skip_method = |m: &FunctionDef| {
+            m.name == "__init__"
+                || m.decorator_list.iter().any(|d| {
+                    matches!(d, ExprType::Name(n) if n.id == "staticmethod" || n.id == "classmethod")
+                })
+        };
+        let mut definer: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, (anc, _, _, _)) in chain.iter().enumerate() {
+            for m in anc.methods() {
+                if skip_method(m) {
+                    continue;
+                }
+                let name = if anc.is_property_setter(&m.name) {
+                    anc.emitted_method_name(m)
+                } else {
+                    m.name.clone()
+                };
+                definer.insert(name, i);
+            }
+        }
+        for (depth, (ancestor, a_syms, a_opts, a_path)) in chain.iter().enumerate() {
+            let a_trait = format_ident!("{}Trait", ancestor.name);
+            let trait_path = match a_path {
+                Some(path) => {
+                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    quote!(crate #(::#segs)* :: #a_trait)
+                }
+                None => quote!(#a_trait),
+            };
+            // Does this class's trait carry its METHODS (the full
+            // machinery) or only its accessors? Same rule the emission
+            // uses: same-module, the module's hierarchy set; cross-module,
+            // the defining module's trait registry.
+            let full_trait = if depth == 0 {
+                in_hierarchy
+            } else {
+                match a_path {
+                    None => options.hierarchy_classes.contains(&ancestor.name),
+                    Some(path) => crate::ast::tree::module::module_class_traits(a_opts, path)
+                        .contains_key(&ancestor.name),
+                }
+            };
+            let has_trait = full_trait
+                || (a_path.is_none()
+                    && crate::ast::tree::module::class_subclassed_crate_wide(&ancestor.name, options))
+                || a_path.is_some();
+            let mut fwd = TokenStream::new();
+            // base()/base_mut(): the trait's required accessors for a class
+            // with a base — trait-qualified on the variant, since the
+            // variant's INHERENT base() is its own base, not this one's.
+            if let Some(b) = ancestor.base_class_with_options(a_syms, a_opts) {
+                let b_ident = crate::safe_ident(&b.name);
+                fwd.extend(quote! {
+                    fn base(&self) -> &#b_ident {
+                        match self { #(#any::#vnames(v) => <#vpaths as #trait_path>::base(v)),* }
+                    }
+                    fn base_mut(&mut self) -> &mut #b_ident {
+                        match self { #(#any::#vnames(v) => <#vpaths as #trait_path>::base_mut(v)),* }
+                    }
+                });
+            }
+            let fields = ancestor.own_fields(a_syms, a_opts)?;
+            for (fname, fty) in &fields {
+                if ancestor.base_class_with_options(a_syms, a_opts).is_some()
+                    && matches!(fname.as_str(), "base" | "base_mut")
+                {
+                    continue;
+                }
+                if !seen_fields.insert(fname.clone()) {
+                    continue;
+                }
+                let f = crate::safe_ident(fname);
+                let f_mut = format_ident!("{}_mut", fname);
+                // A cross-module ancestor's field type names classes of
+                // ITS module bare: qualify to crate paths (this module
+                // need not import them) — the same rule the derived
+                // class's own ancestor impls apply.
+                let ty = match a_path {
+                    Some(path) => qualify_cross_module_types(
+                        fty.to_rust_type(),
+                        path,
+                        a_syms,
+                        a_opts,
+                        options,
+                    ),
+                    None => fty.to_rust_type(),
+                };
+                // A cross-module ancestor's accessors live on ITS trait,
+                // which this module need not import: trait-qualified.
+                let (get_arms, set_arms): (Vec<TokenStream>, Vec<TokenStream>) = vnames
+                    .iter()
+                    .zip(vpaths.iter())
+                    .map(|(vn, vp)| match a_path {
+                        Some(_) => (
+                            quote!(#any::#vn(v) => <#vp as #trait_path>::#f(v)),
+                            quote!(#any::#vn(v) => <#vp as #trait_path>::#f_mut(v)),
+                        ),
+                        None => (
+                            quote!(#any::#vn(v) => v.#f()),
+                            quote!(#any::#vn(v) => v.#f_mut()),
+                        ),
+                    })
+                    .unzip();
+                inherent.extend(quote! {
+                    pub fn #f(&self) -> #ty {
+                        match self { #(#get_arms),* }
+                    }
+                    pub fn #f_mut(&mut self) -> &mut #ty {
+                        match self { #(#set_arms),* }
+                    }
+                });
+                fwd.extend(quote! {
+                    fn #f(&self) -> #ty { #any::#f(self) }
+                    fn #f_mut(&mut self) -> &mut #ty { #any::#f_mut(self) }
+                });
+            }
+            for m in ancestor.methods() {
+                if skip_method(m) {
+                    continue;
+                }
+                let mut emitted = m.clone();
+                if ancestor.is_property_setter(&m.name) {
+                    emitted.name = ancestor.emitted_method_name(m);
+                }
+                // The inherent delegator takes the most-derived rendering
+                // (first seen); the trait forwarder goes under the
+                // definer's trait, rendered in the definer's own scope.
+                let first_seen = seen_methods.insert(emitted.name.clone());
+                let is_definer = definer.get(&emitted.name) == Some(&depth);
+                if !first_seen && !is_definer {
+                    continue;
+                }
+                let force_mut_self = options
+                    .trait_mut_self
+                    .get(&ancestor.name)
+                    .is_some_and(|s| s.contains(&m.name));
+                let trait_ctx = CodeGenContext::Trait {
+                    class: ancestor.name.clone(),
+                    generic: false,
+                    super_target: None,
+                    force_mut_self,
+                };
+                let rendered = emitted.to_rust(trait_ctx, a_opts.clone(), a_syms.clone())?;
+                let rendered = match a_path {
+                    Some(path) => qualify_cross_module_types(rendered, path, a_syms, a_opts, options),
+                    None => rendered,
+                };
+                let Some((attrs, head, name, args)) = h::split_fn(&rendered) else {
+                    continue;
+                };
+                // A definer whose trait is ACCESSOR-ONLY (a class
+                // subclassed only cross-module — urllib3's RequestMethods)
+                // keeps its methods inherent, on ITS struct alone: a
+                // variant reaches them through its base chain, and its
+                // own same-named method may take other parameters
+                // (`urlopen` on PoolManager). No uniform arm exists, so
+                // the sum type carries no delegator — a call on it is
+                // loud in rustc, never a wrong dispatch.
+                if !full_trait {
+                    continue;
+                }
+                let call_args = quote!(#(#args),*);
+                let fwd_args = quote!(#(, #args)*);
+                if first_seen {
+                    // Dispatch through the DEFINER's trait when it carries
+                    // the method: every variant implements it with the
+                    // trait's one signature (a conforming override is
+                    // re-emitted there; a non-conforming one falls to the
+                    // default, the covariant-override divergence the
+                    // trait path already documents). A variant's inherent
+                    // override may take different parameters (`urlopen(
+                    // method, url, redirect, **kw)` on PoolManager vs the
+                    // RequestMethods signature — urllib3), which the
+                    // uniform arm cannot call.
+                    let arms: Vec<TokenStream> = vnames
+                        .iter()
+                        .zip(vpaths.iter())
+                        .map(|(vn, vp)| {
+                            let call = if is_definer {
+                                quote!(<#vp as #trait_path>::#name(v #fwd_args))
+                            } else {
+                                quote!(v.#name(#call_args))
+                            };
+                            quote!(#any::#vn(v) => #call)
+                        })
+                        .collect();
+                    inherent.extend(quote! {
+                        #attrs pub #head {
+                            match self { #(#arms),* }
+                        }
+                    });
+                }
+                if is_definer {
+                    fwd.extend(quote! {
+                        #attrs #head { #any::#name(self #fwd_args) }
+                    });
+                }
+            }
+            if has_trait {
+                trait_impls.extend(quote! {
+                    impl #trait_path for #any { #fwd }
+                });
+            }
+        }
+        Ok(quote! {
+            #[derive(Clone)]
+            pub enum #any { #(#vnames(#vpayloads)),* }
+            #(#from_impls)*
+            #(#nested_from)*
+            #runtime_impls
+            impl #any {
+                #views
+                #inherent
+            }
+            #trait_impls
+        })
     }
 }
