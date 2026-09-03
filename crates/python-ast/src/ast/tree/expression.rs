@@ -1127,10 +1127,11 @@ pub fn isinstance_narrowing(
     if let Some(crate::TypeInfo::Class(r)) = options.name_types.get(&n.id)
         && crate::ast::tree::hierarchy::is_polymorphic_root(r)
         && let ExprType::Name(t) = &call.args[1]
-        && t.id != *r
-        && crate::ast::tree::hierarchy::in_subtree_by_name(&t.id, r)
+        && let target = crate::ast::tree::hierarchy::canonical_class_name(&t.id, symbols)
+        && target != *r
+        && crate::ast::tree::hierarchy::in_subtree_by_name(&target, r)
     {
-        let narrowed = crate::TypeInfo::Class(t.id.clone());
+        let narrowed = crate::TypeInfo::Class(target.clone());
         let original = crate::TypeInfo::Class(r.clone());
         return Some(if negated {
             (n.id.clone(), original, narrowed)

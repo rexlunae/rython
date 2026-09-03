@@ -37,6 +37,9 @@
     "tree": {
       "status": "build-failed",
       "errors": 1
+    },
+    "views": {
+      "status": "pass"
     }
   }
 }

@@ -5646,6 +5646,45 @@ impl ClassDef {
     /// `isinstance` predicates and narrowing views (`__rython_is_X`,
     /// `__rython_as_X`) the lowering emits instead of the constant fold.
     /// Empty for a class that is not a root.
+    /// Whether `variant`'s struct holds a value of the family INLINE: a
+    /// field (own or inherited) typed with the root or a member, bare or
+    /// in an Option/tuple (a Vec/Dict/Set is heap-indirected). Such a
+    /// payload must be boxed in the sum type (E0072 otherwise).
+    fn variant_holds_family_inline(
+        &self,
+        variant: &crate::ast::tree::hierarchy::Variant,
+        family: &[crate::ast::tree::hierarchy::Variant],
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> bool {
+        fn inline_class(t: &crate::TypeInfo, family: &[crate::ast::tree::hierarchy::Variant]) -> bool {
+            match t {
+                crate::TypeInfo::Class(c) => family.iter().any(|v| v.name == *c),
+                crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {
+                    inline_class(inner, family)
+                }
+                crate::TypeInfo::Tuple(ts) => ts.iter().any(|t| inline_class(t, family)),
+                _ => false,
+            }
+        }
+        let resolved = match &variant.module_path {
+            Some(path) => crate::module_class_def(options, path, &variant.name),
+            None => match symbols.get(&variant.name) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+                _ => None,
+            },
+        };
+        let Some((class, class_symbols)) = resolved else {
+            return false;
+        };
+        class
+            .base_chain(&class_symbols)
+            .iter()
+            .filter_map(|c| c.infer_fields(&class_symbols, options).ok())
+            .flatten()
+            .any(|(_, t)| inline_class(&t, family))
+    }
+
     pub(crate) fn emit_any_enum(
         &self,
         in_hierarchy: bool,
@@ -5666,18 +5705,42 @@ impl ClassDef {
         let vpaths: Vec<TokenStream> = variants.iter().map(h::variant_path).collect();
         // A SHARED family (shared.rs): every variant holds its class
         // behind `PyRef`, so the sum type's holders share the one object;
-        // the accessors and delegators borrow it.
+        // the accessors and delegators borrow it. `PyRef` is already an
+        // indirection, so a shared family is never boxed.
         let shared_family = crate::ast::tree::shared::is_shared(&self.name);
+        // A variant whose struct holds a value of this family INLINE (a
+        // field typed with the root or a member — `Outer(Inner)` with
+        // `self.inner: Inner`) would make the sum type recursive without
+        // indirection (E0072): that variant's payload is boxed.
+        let boxed: Vec<bool> = variants
+            .iter()
+            .map(|v| !shared_family && self.variant_holds_family_inline(v, &variants, symbols, options))
+            .collect();
         let vpayloads: Vec<TokenStream> = vpaths
             .iter()
-            .map(|vp| if shared_family { quote!(stdpython::PyRef<#vp>) } else { vp.clone() })
+            .zip(boxed.iter())
+            .map(|(vp, b)| {
+                if shared_family {
+                    quote!(stdpython::PyRef<#vp>)
+                } else if *b {
+                    quote!(Box<#vp>)
+                } else {
+                    vp.clone()
+                }
+            })
             .collect();
+        let wrap = |i: usize, v: TokenStream| if boxed[i] { quote!(Box::new(#v)) } else { v };
+        let unbox = |i: usize, x: TokenStream| if boxed[i] { quote!((**#x).clone()) } else { quote!(#x.clone()) };
 
         // ---- The type, its conversions, and the runtime traits ----
-        let from_impls = vnames.iter().zip(vpayloads.iter()).map(|(vn, vp)| {
+        // A shared family converts from the reference (`PyRef<C>`), the
+        // form a construction yields; a value family from the struct.
+        let from_impls = vnames.iter().zip(vpayloads.iter()).enumerate().map(|(i, (vn, vp))| {
+            let wrapped = wrap(i, quote!(v));
+            let from_ty = if boxed[i] { vpaths[i].clone() } else { vp.clone() };
             quote! {
-                impl std::convert::From<#vp> for #any {
-                    fn from(v: #vp) -> #any { #any::#vn(v) }
+                impl std::convert::From<#from_ty> for #any {
+                    fn from(v: #from_ty) -> #any { #any::#vn(#wrapped) }
                 }
             }
         });
@@ -5698,7 +5761,7 @@ impl ClassDef {
             quote! {
                 impl std::convert::From<#inner_any_path> for #any {
                     fn from(v: #inner_any_path) -> #any {
-                        match v { #(#inner_any_path::#members(x) => #any::#members(x)),* }
+                        match v { #(#inner_any_path::#members(x) => #any::#members(x.into())),* }
                     }
                 }
             }
@@ -5711,7 +5774,7 @@ impl ClassDef {
         let root_default = if shared_family {
             quote!(stdpython::PyRef::new(#root_ident::default()))
         } else {
-            quote!(#root_ident::default())
+            wrap(0, quote!(#root_ident::default()))
         };
         let runtime_impls = quote! {
             impl Default for #any {
@@ -5754,15 +5817,36 @@ impl ClassDef {
                     };
                     (
                         inner_any_path.clone(),
-                        quote!(#(#any::#members(x) => Some(#inner_any_path::#members(x.clone()))),*),
+                        quote!(#(#any::#members(x) => Some(#inner_any_path::#members((*x).clone().into()))),*),
                     )
                 }
                 None => {
                     let vp = h::variant_path(v);
                     let vp = if shared_family { quote!(stdpython::PyRef<#vp>) } else { vp };
                     let vn = crate::safe_ident(&v.name);
-                    (vp, quote!(#any::#vn(x) => Some(x.clone())))
+                    let i = variants.iter().position(|w| w.name == v.name).unwrap_or(0);
+                    let cloned = unbox(i, quote!(x));
+                    (vp, quote!(#any::#vn(x) => Some(#cloned)))
                 }
+            };
+            // The MUTABLE view of a plain variant: a store or a mutating
+            // call through a narrowed name reaches the real value (a
+            // nested root has no place to view; its mutation is loud at
+            // the lowering).
+            let as_mut_fn = format_ident!("__rython_as_{}_mut", v.name);
+            let mutable_view = if h::subtree(options, &v.name).is_none() {
+                let vp = h::variant_path(v);
+                let vp = if shared_family { quote!(stdpython::PyRef<#vp>) } else { vp };
+                let vn = crate::safe_ident(&v.name);
+                let i = variants.iter().position(|w| w.name == v.name).unwrap_or(0);
+                let inner = if boxed[i] { quote!(Some(&mut **x)) } else { quote!(Some(x)) };
+                quote! {
+                    pub fn #as_mut_fn(&mut self) -> Option<&mut #vp> {
+                        match self { #any::#vn(x) => #inner, _ => None }
+                    }
+                }
+            } else {
+                quote!()
             };
             views.extend(quote! {
                 pub fn #is_fn(&self) -> bool {
@@ -5771,6 +5855,7 @@ impl ClassDef {
                 pub fn #as_fn(&self) -> Option<#view_ty> {
                     match self { #arms, _ => None }
                 }
+                #mutable_view
             });
         }
 

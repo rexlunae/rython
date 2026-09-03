@@ -17339,6 +17339,41 @@ fn a_shared_class_is_a_reference_everywhere_it_is_held() {
     );
 }
 
+/// A class that both DERIVES from a root and HOLDS one (`Outer(Inner)`
+/// with `self.inner: Inner`) would make the sum type recursive without
+/// indirection: that variant's payload is boxed, and the store into the
+/// root-typed field converts the constructed struct into the sum type.
+#[test]
+fn a_variant_holding_its_family_inline_is_boxed_and_the_field_store_converts() {
+    let out = compile(
+        concat!(
+            "class Inner:\n",
+            "    def __init__(self, x: int):\n",
+            "        self.x = x\n",
+            "\n",
+            "class Outer(Inner):\n",
+            "    def __init__(self):\n",
+            "        self.inner: Inner = Inner(0)\n",
+            "\n",
+            "    def mutate(self) -> int:\n",
+            "        self.inner.x = 5\n",
+            "        return self.inner.x\n",
+        ),
+        "selfhold.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubenumAnyInner{Inner(Inner),Outer(Box<Outer>)}"),
+        "the self-holding variant is boxed: {}",
+        out
+    );
+    assert!(
+        flat.contains("self.inner=({Inner::new(0)?}).into();"),
+        "the store into the root-typed field converts: {}",
+        out
+    );
+}
+
 /// A shared HIERARCHY family: the root's sum type holds `PyRef` variants,
 /// its accessors borrow, its `f_mut` is a mapped `RefMut`, and its
 /// delegators borrow — mutably when the method mutates — while taking
@@ -17400,6 +17435,78 @@ fn a_shared_family_sum_type_holds_references_and_borrows_in_its_delegators() {
     assert!(
         flat.contains("PyRef::new(Perishable::new()?)}).into()"),
         "a subtree construction converts into the sum type: {}",
+        out
+    );
+}
+
+/// A store or a mutating method call through a NARROWED root-typed name
+/// (Devin review on #319) reaches the real value: the place is the sum
+/// type's mutable view, not the read view's clone.
+#[test]
+fn a_mutation_through_a_narrowed_root_typed_name_takes_the_mutable_view() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def __init__(self, r: float):\n",
+            "        self.r = r\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0 * self.r\n",
+            "    def grow(self, k: float) -> None:\n",
+            "        self.r *= k\n",
+            "\n",
+            "def bump(s: Shape) -> None:\n",
+            "    if isinstance(s, Circle):\n",
+            "        s.r = s.r + 1.0\n",
+            "        s.grow(2.0)\n",
+        ),
+        "narrowmut.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(s).__rython_as_Circle_mut().unwrap().r="),
+        "the store goes through the mutable view: {}",
+        out
+    );
+    assert!(
+        flat.contains("((s).__rython_as_Circle_mut().unwrap()).grow(2.0)?"),
+        "the mutating call goes through the mutable view: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfn__rython_as_Circle_mut(&mutself)->Option<&mutCircle>"),
+        "the sum type offers the mutable view: {}",
+        out
+    );
+}
+
+/// An ALIASED `isinstance` target (`C = Circle`, `isinstance(s, C)`) on a
+/// root-typed value resolves to the class the registry knows.
+#[test]
+fn an_aliased_isinstance_target_on_a_root_typed_value_is_the_variant_test() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "C = Circle\n",
+            "\n",
+            "def is_round(s: Shape) -> bool:\n",
+            "    return isinstance(s, C)\n",
+        ),
+        "aliasisinstance.py",
+    );
+    assert!(
+        out.contains("__rython_is_Circle ()"),
+        "the alias resolves to the registry's class: {}",
         out
     );
 }

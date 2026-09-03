@@ -309,8 +309,12 @@ pub(crate) fn translate_format_spec(spec: &str) -> Result<SpecLowering, String> 
             if let Some(f) = fill {
                 suffix.push(f);
             }
+            // A number right-aligns under a bare width (Python's default
+            // for numeric types); the rendered String would left-align.
             if let Some(a) = align {
                 suffix.push(a);
+            } else if !width.is_empty() {
+                suffix.push('>');
             }
             suffix.push_str(&width);
             if sign == Some('+') || alternate || zero {
@@ -420,6 +424,17 @@ mod tests {
         assert_eq!(
             translate_format_spec(">8.3g").unwrap(),
             GeneralFloat { precision: 3, suffix: ">8".into() }
+        );
+        // A bare width right-aligns a number, as Python's default does
+        // (`format(3.14159, "8.3g")` is "    3.14"); a String would
+        // left-align (Devin review on #319).
+        assert_eq!(
+            translate_format_spec("8.3g").unwrap(),
+            GeneralFloat { precision: 3, suffix: ">8".into() }
+        );
+        assert_eq!(
+            translate_format_spec("<8.2g").unwrap(),
+            GeneralFloat { precision: 2, suffix: "<8".into() }
         );
         assert!(translate_format_spec("=10").is_err());
     }

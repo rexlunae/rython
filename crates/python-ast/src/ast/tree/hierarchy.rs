@@ -418,3 +418,36 @@ pub fn head_with_shared_self(head: &proc_macro2::TokenStream) -> proc_macro2::To
     }
     out.into_iter().collect()
 }
+
+/// The class name the registry knows for an `isinstance` target: a local
+/// alias (`C = Circle`), an import alias (`from m import Rect as R`), and
+/// a re-export chain resolve to the class's own name; anything else is
+/// the name itself.
+pub fn canonical_class_name(name: &str, symbols: &SymbolTableScopes) -> String {
+    let mut cur = name.to_string();
+    for _ in 0..16 {
+        match symbols.get(&cur) {
+            Some(crate::SymbolTableNode::Alias(canonical)) if *canonical != cur => {
+                cur = canonical.clone();
+            }
+            Some(crate::SymbolTableNode::Assign { value: ExprType::Name(n), .. })
+                if n.id != cur =>
+            {
+                cur = n.id.clone();
+            }
+            Some(crate::SymbolTableNode::ImportFrom(i)) => {
+                // `from m import Rect as R` binds R; the alias entry names
+                // the canonical class.
+                if let Some(a) = i.names.iter().find(|a| a.asname.as_deref() == Some(&cur))
+                    && a.name != cur
+                {
+                    cur = a.name.clone();
+                    continue;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    cur
+}
