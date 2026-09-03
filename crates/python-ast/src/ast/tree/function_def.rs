@@ -3164,14 +3164,22 @@ fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedP
                 // An exception may leave the body from any statement
                 // boundary: a handler starts from every state the body
                 // reached, with its `as` name rebound; the else clause
-                // from the body's fall-through; `finally` runs on every
-                // way out — from every state the try reached, a return
-                // or raise inside included.
+                // from the body's fall-through. `finally` runs on EVERY
+                // way out, per path: the continuing state, each pending
+                // break and continue (the finally's own state is what
+                // leaves — a `finally: del x` on a break path deletes
+                // `x` past the loop), and, for the reads only, every
+                // state a return or raise inside may leave from. A
+                // finally that itself returns, raises, breaks, or
+                // continues overrides the pending exit.
                 let body = scan_deleted_paths(&t.body, &deleted)?;
                 let at_handler = body.anywhere.clone();
-                let body_falls = out.absorb(body);
                 let mut reached = at_handler.clone();
-                let mut exits: Vec<Option<Deleted>> = Vec::new();
+                let mut pending_breaks = body.breaks;
+                let mut pending_continues = body.continues;
+                out.anywhere.extend(body.anywhere);
+                let mut exits: Vec<Option<Deleted>> = vec![];
+                let body_falls = body.falls;
                 for handler in &t.handlers {
                     // `except E as e` binds `e` for the handler's body
                     // and UNBINDS it on every way out of the handler
@@ -3182,7 +3190,6 @@ fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedP
                         entry.remove(name);
                     }
                     let mut handled = scan_deleted_paths(&handler.body, &entry)?;
-                    reached.extend(handled.anywhere.iter().cloned());
                     if let Some(name) = &handler.name {
                         if let Some(falls) = &mut handled.falls {
                             falls.insert(name.clone());
@@ -3190,24 +3197,47 @@ fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedP
                         for state in handled.breaks.iter_mut().chain(handled.continues.iter_mut()) {
                             state.insert(name.clone());
                         }
-                        reached.insert(name.clone());
+                        handled.anywhere.insert(name.clone());
                     }
-                    exits.push(out.absorb(handled));
+                    reached.extend(handled.anywhere.iter().cloned());
+                    out.anywhere.extend(handled.anywhere);
+                    pending_breaks.extend(handled.breaks);
+                    pending_continues.extend(handled.continues);
+                    exits.push(handled.falls);
                 }
                 if let Some(falls) = &body_falls {
                     let orelse = scan_deleted_paths(&t.orelse, falls)?;
                     reached.extend(orelse.anywhere.iter().cloned());
-                    exits.push(out.absorb(orelse));
+                    out.anywhere.extend(orelse.anywhere);
+                    pending_breaks.extend(orelse.breaks);
+                    pending_continues.extend(orelse.continues);
+                    exits.push(orelse.falls);
                 }
                 let continuing = merge_deleted(exits);
                 if t.finalbody.is_empty() {
+                    out.breaks.extend(pending_breaks);
+                    out.continues.extend(pending_continues);
                     continuing
                 } else {
-                    let finally = out.absorb(scan_deleted_paths(&t.finalbody, &reached)?);
-                    match (continuing, finally) {
-                        (Some(_), Some(after)) => Some(after),
-                        _ => None,
+                    let next = match &continuing {
+                        Some(state) => out.absorb(scan_deleted_paths(&t.finalbody, state)?),
+                        None => None,
+                    };
+                    for state in &pending_breaks {
+                        if let Some(after) = out.absorb(scan_deleted_paths(&t.finalbody, state)?) {
+                            out.breaks.push(after);
+                        }
                     }
+                    for state in &pending_continues {
+                        if let Some(after) = out.absorb(scan_deleted_paths(&t.finalbody, state)?) {
+                            out.continues.push(after);
+                        }
+                    }
+                    // The return and raise paths: the finally's reads
+                    // are checked from every state the try reached; its
+                    // fall-through goes nowhere.
+                    out.absorb(scan_deleted_paths(&t.finalbody, &reached)?);
+                    next
                 }
             }
             _ => {

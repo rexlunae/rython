@@ -523,6 +523,13 @@ enum Resolving {
 /// resolver synthesizes afresh at every hop (`A -> B -> A`, a string
 /// forward reference `Sequence["JsonType"]`), so its identity is the
 /// name, not a node (Devin review on #323).
+///
+/// A `Node` key is only a cycle key for a BORROWED, stable node — one
+/// the resolver re-enters by reference (`&ann`, a name's recorded
+/// assignment value in the same symbol table). A resolver that builds a
+/// node for the hop (a fresh `Name`) or clones a module and re-derives
+/// its symbols gets a different address every time; such a hop must key
+/// by name (`resolve_alias_named`, `resolve_alias_named_in`).
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ResolveKey {
     Node(usize),

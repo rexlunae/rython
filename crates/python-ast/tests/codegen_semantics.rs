@@ -18927,3 +18927,55 @@ fn a_cross_module_re_export_cycle_does_not_overflow() {
     // Either outcome is acceptable; returning at all is the pin.
     let _ = a.to_rust(CodeGenContext::Module("a".to_string()), options, symbols);
 }
+
+/// `finally` runs on a pending `break` / `continue` too, and its state is
+/// what leaves the try (Devin review on #323): a `finally: del x` on a
+/// break path deletes `x` past the loop; a `finally: x = 2` on it rebinds.
+#[test]
+fn a_finally_on_an_abrupt_path_is_what_leaves_the_try() {
+    let err = compile_err(
+        concat!(
+            "def f() -> int:\n",
+            "    x = 1\n",
+            "    for _ in range(1):\n",
+            "        try:\n",
+            "            break\n",
+            "        finally:\n",
+            "            del x\n",
+            "    return x\n",
+        ),
+        "del_finally_break.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "def g(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        try:\n",
+            "            continue\n",
+            "        finally:\n",
+            "            del x\n",
+            "    return x\n",
+        ),
+        "del_finally_continue.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    // The break path deletes, the finally rebinds before the break lands;
+    // the zero-iteration path never deleted.
+    let out = compile(
+        concat!(
+            "def h(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        try:\n",
+            "            del x\n",
+            "            break\n",
+            "        finally:\n",
+            "            x = 2\n",
+            "    return x\n",
+        ),
+        "rebind_finally_break.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
