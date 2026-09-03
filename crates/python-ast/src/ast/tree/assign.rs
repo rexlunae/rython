@@ -1586,14 +1586,17 @@ impl<'a> CodeGen for Assign {
                 // `Optional[Node]` inside Node — round 99, E0072): the
                 // binding holds Option<Box<Node>> and plain-value stores
                 // wrap in Some(Box::new(...)).
+                // The slot's type comes from the ANALYSIS's record (the
+                // annotation may live on a separate AnnotatedName
+                // statement — `node: Optional[Node] = self` — whose plain
+                // re-stores carry no annotation): Option(Class(C)) where
+                // C is the enclosing class is the boxed self-referential
+                // slot (round 99, E0072).
                 let boxed_slot = matches!(
-                    self.annotation.as_ref(),
-                    Some(ann) if matches!(
-                        crate::resolve_alias_typeinfo(ann, &symbols, &options),
-                        Some(crate::TypeInfo::Option(ref inner))
-                            if matches!(**inner, crate::TypeInfo::Class(ref c)
-                                if c.as_str() == ctx.enclosing_class_name().unwrap_or_default())
-                    )
+                    options.name_types.get(&name.id),
+                    Some(crate::TypeInfo::Option(inner))
+                        if matches!(**inner, crate::TypeInfo::Class(ref c)
+                            if c.as_str() == ctx.enclosing_class_name().unwrap_or_default())
                 );
                 let target_code = {
                     let mut store_options = options.clone();
@@ -1616,13 +1619,21 @@ impl<'a> CodeGen for Assign {
                         quote!(Some(#value))
                     }
                 } else {
-                    crate::lower_optional_value(
+                    let tokens = crate::lower_optional_value(
                         &value_expr,
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
                         boxed_slot,
-                    )?
+                    )?;
+                    // A boxed slot whose value is already the PLAIN Option
+                    // (a boxed-field read — `node = node.left` — round 99):
+                    // re-box the inner to the slot's Option<Box<Class>>.
+                    if boxed_slot && value_yields_option {
+                        quote!(#tokens . map (| __rython_v | Box :: new (__rython_v)))
+                    } else {
+                        tokens
+                    }
                 };
                 return Ok(quote!(#target_code = #value;));
             }

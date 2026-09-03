@@ -2659,8 +2659,16 @@ fn analyze_statement_types(
             if let Some(t) = crate::annotation_type_info(annotation)
                 .or_else(|| crate::resolve_alias_typeinfo(annotation, symbols?, options?))
             {
+                let is_option = matches!(t, TypeInfo::Option(_));
                 info.name_types.insert(name.clone(), t);
                 info.annotated_names.insert(name.clone());
+                // An `Optional[...]`-annotated local is an Option binding:
+                // the stores pass through unwrapped and None is a value
+                // (`node: Optional[Node] = self` — the corpus's contains,
+                // round 99).
+                if is_option {
+                    info.optional_names.insert(name.clone());
+                }
             }
         }
         StatementType::Assign(assign) => {
@@ -2692,7 +2700,16 @@ fn analyze_statement_types(
                     })
                 {
                     // An annotation pins the type outright.
-                    Some(ann) => ann,
+                    Some(ann) => {
+                        // An `Optional[...]`-annotated local is an Option
+                        // binding (`node: Optional[Node] = self` — the
+                        // corpus's contains, round 99): the stores pass
+                        // through unwrapped and None is a value.
+                        if matches!(ann, TypeInfo::Option(_)) {
+                            info.optional_names.insert(name.id.clone());
+                        }
+                        ann
+                    }
                     // Unparseable annotation: a call to a known function
                     // resolves through its (alias-aware) return type
                     // (`chunk_languages = cached_coherence_ratio(...)` →
